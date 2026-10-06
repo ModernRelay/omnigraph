@@ -198,7 +198,7 @@ pub(super) fn refuse_statement_envelope(
 /// counts are `0`, `commit` is this merge's own publication, or null for a no-op.
 pub(super) async fn run_branch_statement(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,

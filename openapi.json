@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.11.0"
+    "version": "0.12.0"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
@@ -29,6 +29,506 @@
             "description": "OAuth resource identity is not configured"
           }
         }
+      }
+    },
+    "/cluster/deployments": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_status",
+        "parameters": [
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.12"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_apply",
+        "parameters": [
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.12"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "; Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/cluster/deployments/{id}": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_lookup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Original deployment identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.12"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.12"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
       }
     },
     "/graphs": {
@@ -793,7 +1293,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1182,7 +1682,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1347,7 +1847,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1590,7 +2090,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1856,7 +2356,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2058,7 +2558,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2324,7 +2824,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2692,7 +3192,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2958,7 +3458,7 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3141,7 +3641,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3343,7 +3843,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3675,7 +4175,7 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -3958,7 +4458,7 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4224,7 +4724,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4491,7 +4991,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -4840,7 +5340,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5127,7 +5627,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5423,7 +5923,7 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5595,7 +6095,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5918,7 +6418,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6271,7 +6771,7 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6516,7 +7016,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6761,7 +7261,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6934,7 +7434,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -6968,7 +7468,7 @@
           "mutations"
         ],
         "summary": "Apply a schema migration.",
-        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
+        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nsubmit schema changes with `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\na drop removes data from the branch head; older commits keep reading it\nuntil `omnigraph cleanup` stops retaining them. Returns the list of steps\napplied; if `applied` is false the diff was unsupported and no changes\nwere made.",
         "operationId": "cluster_applySchema",
         "parameters": [
           {
@@ -7110,7 +7610,7 @@
             }
           },
           "409": {
-            "description": "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart",
+            "description": "Use `omnigraph cluster apply --server <SERVER> --config <CONFIG>` for live schema deployment",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7179,7 +7679,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7362,7 +7862,7 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7469,7 +7969,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids stay behind authenticated catalog endpoints. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph\nids stay behind authenticated catalog endpoints. Partial availability is\nready but degraded after loading finishes; loading, no available graph or\nshutdown returns 503. A valid\nempty registry is ready. `/healthz` reports liveness independently.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -7494,7 +7994,7 @@
             }
           },
           "503": {
-            "description": "Draining",
+            "description": "Graphs loading, no graph available or stopping",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -8336,6 +8836,52 @@
           }
         }
       },
+      "DeploymentRequest": {
+        "type": "object",
+        "required": [
+          "deployment_id",
+          "deployment"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "object"
+          },
+          "deployment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeploymentResponse": {
+        "type": "object",
+        "required": [
+          "deployment",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "deployment": {
+            "type": "object"
+          }
+        }
+      },
+      "DeploymentStatusResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "object"
+          }
+        }
+      },
       "DiagnosticOutput": {
         "type": "object",
         "description": "The diagnostics contract for a refused query (RFC 0047): a stable code\n(`Q…` parse, `T…` typecheck); where the failure is, as a source position\nor as the stage and expression when it is post-parse; what was expected or\nviolated; and one concrete fix, absent when `expected` names the decision.\nRides `ErrorOutput.diagnostic` as an additive detail because\n[`ErrorCode`] is a closed compatibility contract.",
@@ -8454,6 +9000,7 @@
           "conflict",
           "too_many_requests",
           "service_unavailable",
+          "graph_unavailable",
           "internal"
         ]
       },
@@ -8671,6 +9218,26 @@
           }
         }
       },
+      "GraphAvailability": {
+        "type": "string",
+        "enum": [
+          "loading",
+          "ready",
+          "transitioning",
+          "blocked",
+          "stopping"
+        ]
+      },
+      "GraphAvailabilityAction": {
+        "type": "string",
+        "enum": [
+          "none",
+          "wait_for_startup",
+          "wait_for_transition",
+          "restart_after_correction",
+          "wait_for_restart"
+        ]
+      },
       "GraphBatchDeclarationOutput": {
         "type": "object",
         "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not a backing dataset\nselector, path, or Lance identity.",
@@ -8697,7 +9264,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8735,6 +9303,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this batch, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -8791,14 +9370,41 @@
         "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. This legacy metadata includes the storage `uri`; identity-only\nexistence discovery uses [`GraphDiscoveryEntry`] instead.",
         "required": [
           "graph_id",
-          "uri"
+          "uri",
+          "state",
+          "read_available",
+          "write_available",
+          "action"
         ],
         "properties": {
+          "action": {
+            "$ref": "#/components/schemas/GraphAvailabilityAction"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphStartupFailure"
+              }
+            ]
+          },
           "graph_id": {
             "type": "string"
           },
+          "read_available": {
+            "type": "boolean",
+            "description": "Runtime availability; actor policy still gates every operation."
+          },
+          "state": {
+            "$ref": "#/components/schemas/GraphAvailability"
+          },
           "uri": {
             "type": "string"
+          },
+          "write_available": {
+            "type": "boolean"
           }
         }
       },
@@ -8814,15 +9420,19 @@
             "items": {
               "$ref": "#/components/schemas/GraphInfo"
             }
-          },
-          "quarantined": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Graphs the applied revision names that this process does not serve,\nfor any reason, sorted (RFC 0049). Empty when every applied graph is\nserved."
           }
         }
+      },
+      "GraphStartupFailure": {
+        "type": "string",
+        "description": "Bounded startup classification, without storage paths or error text.",
+        "enum": [
+          "invalid_configuration",
+          "invalid_policy",
+          "invalid_external_blob_policy",
+          "open_failed",
+          "invalid_stored_queries"
+        ]
       },
       "HealthOutput": {
         "type": "object",
@@ -8835,7 +9445,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes, the\ntop of the range it serves (v11 and v12 today; a v11 branch converts on\nits next publish); a graph outside that range is refused until an\nexplicit upgrade.",
+            "description": "The internal-schema (storage-format) version this binary writes and\nthe only one it serves; a graph at any other version is refused until\nit is upgraded offline or rebuilt.",
             "minimum": 0
           },
           "source_version": {
@@ -8861,7 +9471,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8899,6 +9510,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this load, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -9048,6 +9670,13 @@
             "$ref": "#/components/schemas/ReadTargetOutput"
           }
         }
+      },
+      "LoadEmbeddingGeneration": {
+        "type": "string",
+        "description": "Load capability for a batch touching a node type with declared `@embed`.",
+        "enum": [
+          "unsupported"
+        ]
       },
       "LoadMode": {
         "type": "string",
@@ -9458,10 +10087,17 @@
           "status",
           "state_revision",
           "served_graph_count",
-          "quarantined_graph_count",
+          "ready_graph_count",
+          "loading_graph_count",
+          "blocked_graph_count",
           "shutdown_grace_seconds"
         ],
         "properties": {
+          "blocked_graph_count": {
+            "type": "integer",
+            "description": "Unavailable graphs outside startup, including closed transitions.",
+            "minimum": 0
+          },
           "booted_serving_digest": {
             "type": [
               "string",
@@ -9469,18 +10105,23 @@
             ],
             "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
           },
-          "quarantined_graph_count": {
+          "loading_graph_count": {
             "type": "integer",
-            "description": "How many graphs the applied revision names that this process does\nnot serve, for any reason. `GET /graphs` names them.",
+            "description": "Registered graphs waiting for their initial startup admission.",
             "minimum": 0
           },
           "ready": {
             "type": "boolean",
-            "description": "False once shutdown has begun; the response is then 503."
+            "description": "False during shutdown or when a nonempty inventory has no ready graph."
+          },
+          "ready_graph_count": {
+            "type": "integer",
+            "description": "Registered graphs whose startup completed successfully.",
+            "minimum": 0
           },
           "served_graph_count": {
             "type": "integer",
-            "description": "How many graphs this process serves.",
+            "description": "Number of registered graphs, including blocked entries.",
             "minimum": 0
           },
           "shutdown_grace_seconds": {
@@ -9504,7 +10145,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`serving` or `draining`."
+            "description": "`loading`, `serving`, `degraded`, `blocked` or `draining`."
           }
         }
       },
@@ -9584,10 +10225,6 @@
           "schema_source"
         ],
         "properties": {
-          "allow_data_loss": {
-            "type": "boolean",
-            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
-          },
           "schema_source": {
             "type": "string",
             "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",
@@ -9632,6 +10269,12 @@
             "enum": [
               "v2"
             ]
+          },
+          "history_release_bytes": {
+            "type": "integer",
+            "description": "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
+            "maximum": 262144,
+            "minimum": 1024
           },
           "merge_lineage": {
             "type": "string",
@@ -9714,7 +10357,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. Branches of one graph can differ (v11 beside v12) while a\nv11 graph converts branch by branch on publish.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. This binary serves only its own storage-format version; a\ngraph at any other version is refused until it is upgraded offline or rebuilt.",
             "minimum": 0
           }
         }

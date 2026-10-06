@@ -10,19 +10,24 @@ use axum::middleware::Next;
 use axum::response::Response;
 use futures::Stream;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::time::Instant;
 
 use crate::operations::ReadObserver;
+use crate::serving::GraphRequest;
 use crate::workload::IngressLease;
 use crate::{
-    ApiError, AppState, AuthenticatedActor, DEFAULT_REQUEST_BODY_LIMIT_BYTES, GraphHandle,
+    ApiError, AppState, AuthenticatedActor, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
     INGEST_REQUEST_BODY_LIMIT_BYTES, PolicyAction, PolicyRequest,
 };
 
 #[derive(Clone, Copy)]
 pub(crate) struct BodyDeadline(pub(crate) Instant);
+
+/// MCP selects its graph after HTTP body collection. The response and owned
+/// producer retain the same slot even when selection happens after disconnect.
+pub(crate) type McpGraphRequest = Arc<OnceLock<GraphRequest>>;
 
 pub(crate) fn body_timeout() -> ApiError {
     let mut error =
@@ -43,7 +48,7 @@ async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiE
     {
         let handle = parts
             .extensions
-            .get::<Arc<GraphHandle>>()
+            .get::<GraphRequest>()
             .ok_or_else(|| ApiError::internal("stored query admission is missing its graph"))?
             .clone();
         // Resolve permission before kind: otherwise saturated lanes could
@@ -112,6 +117,14 @@ pub(crate) async fn admit(
         .strip_prefix("/graphs/{graph_id}")
         .unwrap_or(matched.as_str());
     let class = classify(&mut parts, route).await?;
+    let graph = parts.extensions.get::<GraphRequest>().cloned();
+    let mcp_graph = if route == "/mcp" {
+        let slot = McpGraphRequest::default();
+        parts.extensions.insert(slot.clone());
+        Some(slot)
+    } else {
+        None
+    };
     let observer = match class {
         AdmissionClass::Read => state.operations.try_observe()?,
         AdmissionClass::Write => state.operations.try_observe_write()?,
@@ -120,6 +133,8 @@ pub(crate) async fn admit(
     let raw = receives_body && route == "/load/ndjson";
     let limit = if !receives_body {
         0
+    } else if route == "/cluster/deployments" {
+        crate::deployment::REQUEST_BYTES
     } else if route == "/mcp" {
         crate::mcp::REQUEST_BYTES
     } else if matches!(route, "/load/ndjson" | "/load" | "/ingest") {
@@ -170,20 +185,66 @@ pub(crate) async fn admit(
     };
     // Raw NDJSON authorizes its branch scope before polling any body bytes.
     // Its collector consumes BodyDeadline and the same retained lease.
-    let response = next.run(Request::from_parts(parts, body)).await;
+    let request = Request::from_parts(parts, body);
+    match class {
+        AdmissionClass::Read => {
+            // Wrap before offering the owned result: even an unpolled oneshot
+            // response must retain its graph through the stream's destruction.
+            let response_observer = observer.clone();
+            let response_input = lease.clone();
+            let response_graph = graph.clone();
+            let response_mcp_graph = mcp_graph.clone();
+            observer
+                .spawn_read((lease, graph, mcp_graph), async move {
+                    Ok(observe_response(
+                        next.run(request).await,
+                        response_observer,
+                        response_input,
+                        response_graph,
+                        response_mcp_graph,
+                    ))
+                })
+                .result()
+                .await
+        }
+        // Effectful handlers register through the owned-write boundary once
+        // their typed input, actor and operation reservations are captured.
+        AdmissionClass::Write => Ok(observe_response(
+            next.run(request).await,
+            observer,
+            lease,
+            graph,
+            mcp_graph,
+        )),
+    }
+}
+
+fn observe_response(
+    response: Response,
+    observer: ReadObserver,
+    input: IngressLease,
+    graph: Option<GraphRequest>,
+    mcp_graph: Option<McpGraphRequest>,
+) -> Response {
     let (parts, body) = response.into_parts();
     let stream = ObservedBody {
         stream: Box::pin(body.into_data_stream()),
         observer,
-        input: lease,
+        input,
+        graph,
+        mcp_graph,
     };
-    Ok(Response::from_parts(parts, Body::from_stream(stream)))
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 struct ObservedBody<S> {
     stream: Pin<Box<S>>,
     observer: ReadObserver,
     input: IngressLease,
+    // Guards follow the stream and its resources, so their final drop cannot
+    // release logical ownership before wrapped response destructors have run.
+    graph: Option<GraphRequest>,
+    mcp_graph: Option<McpGraphRequest>,
 }
 
 impl<S> Stream for ObservedBody<S>
@@ -200,6 +261,8 @@ where
                         bytes,
                         _observer: self.observer.clone(),
                         _input: self.input.clone(),
+                        _graph: self.graph.clone(),
+                        _mcp_graph: self.mcp_graph.clone(),
                     })
                 })
             })
@@ -211,6 +274,8 @@ struct ObservedBytes {
     bytes: Bytes,
     _observer: ReadObserver,
     _input: IngressLease,
+    _graph: Option<GraphRequest>,
+    _mcp_graph: Option<McpGraphRequest>,
 }
 
 impl AsRef<[u8]> for ObservedBytes {
@@ -225,7 +290,7 @@ mod tests {
     use axum::Router;
     use axum::extract::State;
     use axum::middleware;
-    use axum::routing::{get, post};
+    use axum::routing::{MethodRouter, get, post};
     use futures::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,6 +301,13 @@ mod tests {
     use crate::workload::{WorkloadController, WorkloadLimits, WorkloadSnapshot};
 
     fn router(limits: WorkloadLimits) -> (Router, AppState, Arc<AtomicUsize>) {
+        router_with_read(limits, post(|| async { "read response" }))
+    }
+
+    fn router_with_read(
+        limits: WorkloadLimits,
+        read: MethodRouter,
+    ) -> (Router, AppState, Arc<AtomicUsize>) {
         // Admission itself needs no graph fixture: an independent handler
         // census proves whether the refused request reached execution.
         let state = AppState::new_multi(
@@ -251,7 +323,7 @@ mod tests {
         let observed = Arc::clone(&entered);
         let app = Router::new()
             .route("/snapshot", get(|| async { "read response" }))
-            .route("/query", post(|| async { "read response" }))
+            .route("/query", read)
             .route(
                 "/write",
                 post(move || {
@@ -278,6 +350,63 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disconnected_read_keeps_handler_input_and_shutdown_ownership() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicUsize::new(0));
+            let (app, state, _) = router_with_read(
+                WorkloadLimits::default(),
+                post({
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    let completed = Arc::clone(&completed);
+                    move |body: Bytes| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        let completed = Arc::clone(&completed);
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            assert_eq!(body.as_ref(), b"query input");
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            "read response"
+                        }
+                    }
+                }),
+            );
+            let caller = tokio::spawn(
+                app.clone().oneshot(
+                    Request::post("/query")
+                        .body(Body::from("query input"))
+                        .unwrap(),
+                ),
+            );
+            entered.notified().await;
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert_eq!(state.operations.snapshot().active_reads, 1);
+            assert_eq!(state.workload.snapshot().read_ingress_bytes, 11);
+            assert_eq!(state.workload.snapshot().read_ingress_count, 1);
+            let refused = app
+                .oneshot(Request::get("/snapshot").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+            state.operations.close();
+            let shutdown = state.operations.wait_logical_owners();
+            tokio::pin!(shutdown);
+            assert!(futures::poll!(&mut shutdown).is_pending());
+            release.notify_one();
+            assert!(shutdown.await);
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert_eq!(state.workload.snapshot(), WorkloadSnapshot::default());
+        })
+        .await
+        .expect("disconnected read did not settle");
     }
 
     #[tokio::test]
@@ -332,39 +461,82 @@ mod tests {
 
     #[tokio::test]
     async fn yielded_bytes_keep_observer_and_input_after_response_body_drops() {
-        let operations = OperationRuntime::with_read_limit(1);
-        let workload = WorkloadController::with_limits(WorkloadLimits {
-            read_ingress_inflight_max: 1,
-            ..WorkloadLimits::default()
-        });
-        let input = workload.try_read_ingress(8).unwrap();
-        let observer = operations.try_observe().unwrap();
-        let mut body = ObservedBody {
-            stream: Box::pin(futures::stream::iter([
-                Ok::<_, axum::Error>(Bytes::from_static(b"first")),
-                Ok(Bytes::from_static(b"second")),
-            ])),
-            observer,
-            input,
-        };
-        assert!(operations.try_observe().is_err());
-        assert!(workload.try_read_ingress(0).is_err());
-        let first = body.next().await.unwrap().unwrap();
-        let second = body.next().await.unwrap().unwrap();
-        let retained_slice = first.slice(1..4);
-        assert_eq!(retained_slice.as_ref(), b"irs");
-        drop(body);
-        drop(first);
-        assert_eq!(operations.snapshot().active_reads, 1);
-        assert_eq!(workload.snapshot().read_ingress_bytes, 8);
-        drop(second);
-        assert!(operations.try_observe().is_err());
-        assert!(workload.try_read_ingress(0).is_err());
-        drop(retained_slice);
-        assert_eq!(operations.snapshot().active_reads, 0);
-        assert_eq!(workload.snapshot(), WorkloadSnapshot::default());
-        assert!(operations.try_observe().is_ok());
-        assert!(workload.try_read_ingress(0).is_ok());
+        use crate::registry::{GraphHandle, GraphRegistry, RegistryCapture};
+        use crate::{GraphId, GraphKey};
+
+        for deferred in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let uri = temp.path().join("graph").to_string_lossy().into_owned();
+            let key = GraphKey::cluster(GraphId::try_from("alpha").unwrap());
+            let handle = Arc::new(GraphHandle {
+                key: key.clone(),
+                uri: uri.clone(),
+                engine: Arc::new(
+                    omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }\n")
+                        .await
+                        .unwrap(),
+                ),
+                policy: None,
+                queries: None,
+            });
+            let registry = Arc::new(GraphRegistry::from_handles(vec![handle]).unwrap());
+            let operations = OperationRuntime::with_read_limit(1);
+            let RegistryCapture::Ready(graph) = registry.capture(&operations, &key).unwrap() else {
+                panic!("fixture graph must be available");
+            };
+            let workload = WorkloadController::with_limits(WorkloadLimits {
+                read_ingress_inflight_max: 1,
+                ..WorkloadLimits::default()
+            });
+            let input = workload.try_read_ingress(8).unwrap();
+            let observer = operations.try_observe().unwrap();
+            let slot = McpGraphRequest::default();
+            let mut late_graph = Some(graph);
+            let mut body = ObservedBody {
+                stream: Box::pin(futures::stream::iter([
+                    Ok::<_, axum::Error>(Bytes::from_static(b"first")),
+                    Ok(Bytes::from_static(b"second")),
+                ])),
+                observer,
+                input,
+                graph: if deferred { None } else { late_graph.take() },
+                mcp_graph: deferred.then(|| slot.clone()),
+            };
+            assert!(operations.try_observe().is_err());
+            assert!(workload.try_read_ingress(0).is_err());
+            let first = body.next().await.unwrap().unwrap();
+            let second = body.next().await.unwrap().unwrap();
+            let retained_slice = first.slice(1..4);
+            assert_eq!(retained_slice.as_ref(), b"irs");
+            drop(body);
+            drop(first);
+            if deferred {
+                // MCP may select a graph after the HTTP response disappeared.
+                // Even bytes yielded before selection retain this shared slot.
+                assert!(slot.set(late_graph.take().unwrap()).is_ok());
+            }
+            drop(slot);
+            let transition = registry
+                .prepare_same_view(&operations, &key, Instant::now() + Duration::from_secs(2))
+                .unwrap()
+                .close()
+                .unwrap();
+            let settled = transition.wait_requests();
+            tokio::pin!(settled);
+            assert!(futures::poll!(&mut settled).is_pending());
+            assert_eq!(operations.snapshot().active_reads, 1);
+            assert_eq!(workload.snapshot().read_ingress_bytes, 8);
+            drop(second);
+            assert!(operations.try_observe().is_err());
+            assert!(workload.try_read_ingress(0).is_err());
+            assert!(futures::poll!(&mut settled).is_pending());
+            drop(retained_slice);
+            settled.await.unwrap();
+            assert_eq!(operations.snapshot().active_reads, 0);
+            assert_eq!(workload.snapshot(), WorkloadSnapshot::default());
+            assert!(operations.try_observe().is_ok());
+            assert!(workload.try_read_ingress(0).is_ok());
+        }
     }
 
     #[tokio::test]
@@ -385,6 +557,8 @@ mod tests {
             stream: Box::pin(futures::stream::pending::<Result<Bytes, axum::Error>>()),
             observer,
             input,
+            graph: None,
+            mcp_graph: None,
         };
         operations.close();
         drop(body);

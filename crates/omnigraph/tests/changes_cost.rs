@@ -716,10 +716,9 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
     .await;
 }
 
-/// A backlog walk pays one manifest snapshot resolution per commit examined
-/// (plus one), and at most two data opens per effectful commit — both honest
-/// linear-in-backlog terms, pinned as growing with the backlog while the
-/// per-commit open ratio stays bounded.
+/// A backlog walk reads the records of the commits it examines in one scan of
+/// `__history`, so its manifest reads are flat in the backlog, and pays at
+/// most two data opens per effectful commit, a term that grows with it.
 #[tokio::test]
 async fn change_feed_backlog_walk_grows_with_commits_examined() {
     use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
@@ -792,11 +791,11 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
             );
             curve.push((backlog, io));
         }
-        assert_grows(
+        assert_flat(
             &curve,
             |io| io.manifest_reads,
-            1,
-            "one manifest snapshot resolution per commit examined",
+            0,
+            "one `__history` scan reads the records of every commit a poll examines",
         );
         assert_grows(
             &curve,

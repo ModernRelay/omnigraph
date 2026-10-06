@@ -16,7 +16,6 @@ use arrow_schema::{DataType, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationOpIR, ParamMap};
@@ -29,7 +28,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::db::Snapshot;
 use crate::db::manifest::ManifestCoordinator;
-use crate::db::{MergeOutcome, MergeResult, Omnigraph, WriteTxn, is_internal_system_branch};
+use crate::db::{MergeOutcome, MergeResult, Omnigraph, WriteTxn};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};

@@ -1778,17 +1778,14 @@ graphs:
 "#,
     )
     .unwrap();
-    for command in ["import", "apply"] {
-        let output = cli()
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "cluster {command} failed");
-    }
+    let output = cli()
+        .args(["cluster", "apply", "--config"])
+        .arg(temp.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "cluster apply failed: {output:?}");
+    unlock_cluster_fixture(temp.path());
     // Seed a row through the graph plane so the stored query has data.
     let data = temp.path().join("seed.jsonl");
     std::fs::write(&data, "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n").unwrap();
@@ -1802,6 +1799,7 @@ graphs:
         .output()
         .unwrap();
     assert!(output.status.success(), "graph load failed");
+    unlock_cluster_fixture(temp.path());
 
     let server = spawn_server_with_cluster(temp.path());
     let client = graph_http_client();
@@ -1843,9 +1841,8 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
         "version: 1\ngroups:\n  admins: [act-admin]\nrules:\n  - id: list\n    allow:\n      actors: { group: admins }\n      actions: [graph_list]\n").unwrap();
     fs::write(temp.path().join("cluster.yaml"),
         "version: 1\ngraphs: {}\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n").unwrap();
-    assert_eq!(cluster_cli(temp.path(), &["import"])["ok"], true);
     let applied = cluster_cli(temp.path(), &["apply"]);
-    assert_eq!(applied["converged"], true, "{applied}");
+    assert_eq!(applied["result"]["converged"], true, "{applied}");
     let state_path = temp.path().join("__cluster/state.json");
     let bytes = fs::read(&state_path).unwrap();
     let ledger: Value = serde_json::from_slice(&bytes).unwrap();
@@ -1882,6 +1879,7 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
             .json()
             .unwrap();
         assert_eq!(ready["ready"], true, "{ready}");
+        assert_eq!(ready["status"], "serving");
         assert_eq!(
             ready["booted_serving_digest"],
             ledger["applied_revision"]["config_digest"]
@@ -1889,7 +1887,8 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
         assert_eq!(ready["state_revision"], ledger["state_revision"]);
         assert_eq!(ready["state_cas"], state_cas);
         assert_eq!(ready["served_graph_count"], 0);
-        assert_eq!(ready["quarantined_graph_count"], 0);
+        assert_eq!(ready["ready_graph_count"], 0);
+        assert_eq!(ready["blocked_graph_count"], 0);
         let inventory = format!("{}/graphs", server.base_url);
         assert_eq!(
             client.get(&inventory).send().unwrap().status().as_u16(),
@@ -1926,15 +1925,17 @@ fn local_applied_empty_cluster_serves_exact_witness_and_empty_inventory() {
         assert_eq!(absent.status().as_u16(), 404);
         assert!(!temp.path().join("graphs").exists());
         assert_eq!(fs::read(&state_path).unwrap(), bytes);
+        drop(server);
+        unlock_cluster_fixture(temp.path());
     }
 }
 
 // ---- Comprehensive full-cycle cluster e2e (Phases 1-5 composed) ----
 
 /// Run a `cluster` subcommand and return its JSON output. Deliberately does
-/// NOT assert a zero exit code: blocked/unconverged runs (e.g. an `apply`
-/// awaiting an approval) exit non-zero by contract while still emitting the
-/// structured output the caller asserts on (`ok`/`converged`/dispositions).
+/// NOT assert a zero exit code: deployment refusals emit structured diagnostics
+/// and a nonzero exit. Successful direct apply explicitly hands off its exact
+/// fixture lock after the local child process has exited.
 /// Commands where failure is never expected must assert on those fields
 /// (every call here checks `ok` or `converged`) or use `cli()` directly with
 /// `status.success()`.
@@ -1950,6 +1951,9 @@ fn cluster_cli(dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
         .arg("--json")
         .output()
         .unwrap();
+    if args.first() == Some(&"apply") && output.status.success() {
+        unlock_cluster_fixture(dir);
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
         panic!(
@@ -2017,6 +2021,7 @@ fn seed_graph(dir: &std::path::Path, graph: &str, row: &str) {
         "seed {graph} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    unlock_cluster_fixture(dir);
 }
 
 fn invoke_query(
@@ -2052,12 +2057,12 @@ fn skip_system_e2e(test_name: &str) -> bool {
 }
 
 /// The whole control-plane story in one test: declare two graphs → converge
-/// (apply creates them) → serve → evolve schema+query in one apply → restart
-/// serves the new shape → out-of-band drift converged back → approved graph
-/// delete → restart serves the survivor only → plan empty.
+/// (apply creates them) → serve → direct schema/query evolution → serve the new
+/// shape → exact acknowledged drift correction → unsupported deletion refuses.
+/// The live same-PID journey is owned by cli_cluster_e2e.
 #[test]
-fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
-    if skip_system_e2e("local_cluster_full_lifecycle_declare_serve_evolve_delete") {
+fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
+    if skip_system_e2e("local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -2065,10 +2070,9 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     write_two_graph_cluster(dir);
 
     // Phase 1-2: declare + record.
-    assert_eq!(cluster_cli(dir, &["import"])["ok"], true);
     // Phase 3-4: one apply creates both graphs and publishes the catalog.
     let converge = cluster_cli(dir, &["apply"]);
-    assert_eq!(converge["converged"], true, "{converge}");
+    assert_eq!(converge["result"]["converged"], true, "{converge}");
     seed_graph(
         dir,
         "knowledge",
@@ -2104,6 +2108,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         assert_eq!(body["rows"][0]["s.name"], "billing", "{body}");
     }
 
+    unlock_cluster_fixture(dir);
     // Evolve: schema gains a field, the query returns it — one apply, with
     // the migration previewed in plan.
     std::fs::write(
@@ -2125,7 +2130,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         .unwrap();
     assert_eq!(schema_change["migration"]["supported"], true, "{plan}");
     let evolve = cluster_cli(dir, &["apply"]);
-    assert_eq!(evolve["converged"], true, "{evolve}");
+    assert_eq!(evolve["result"]["converged"], true, "{evolve}");
 
     // Restart: the server serves the evolved shape.
     {
@@ -2148,24 +2153,33 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         );
     }
 
-    // Out-of-band drift: the live graph evolves behind the cluster's back;
-    // refresh observes it, apply converges it back to the declared schema. RFC-011
-    // D10 makes the CLI `schema apply` refuse a cluster-managed graph, so a true
-    // bypass is a direct engine apply against the storage root.
-    let rogue_pg = "\nnode Person {\n  name: String @key\n  bio: String?\n  rogue: String?\n}\n";
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    unlock_cluster_fixture(dir);
+    // A raw storage holder deliberately changes the accepted contract. Desired
+    // text alone must not adopt that drift; acknowledgement binds its identity.
+    let rogue_pg = "node Person { name: String @key bio: String? rogue: String? }\n";
+    let observed = tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(dir.join("graphs/knowledge.omni").to_string_lossy().as_ref())
             .await
             .unwrap();
         db.apply_schema(rogue_pg).await.unwrap();
+        db.schema_contract_digest()
     });
-    let refresh = cluster_cli(dir, &["refresh"]);
-    assert_eq!(
-        refresh["resource_statuses"]["schema.knowledge"]["status"], "drifted",
-        "{refresh}"
+    let before = fs::read(dir.join("__cluster/state.json")).unwrap();
+    let refused = cluster_cli(dir, &["apply"]);
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["diagnostics"][0]["code"], "applied_schema_drift");
+    assert_eq!(fs::read(dir.join("__cluster/state.json")).unwrap(), before);
+    let correction = dir.join("correction.json");
+    fs::write(
+        &correction,
+        serde_json::to_vec(&serde_json::json!({"knowledge":observed})).unwrap(),
+    )
+    .unwrap();
+    let heal = cluster_cli(
+        dir,
+        &["apply", "--schema-correction", correction.to_str().unwrap()],
     );
-    let heal = cluster_cli(dir, &["apply"]);
-    assert_eq!(heal["converged"], true, "{heal}");
+    assert_eq!(heal["result"]["converged"], true, "{heal}");
     let schema_show = cli()
         .arg("schema")
         .arg("show")
@@ -2184,72 +2198,27 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     );
     assert!(
         !shown.contains("rogue"),
-        "drift must be soft-dropped back to the declared schema: {shown}"
+        "drift must be dropped back to the declared schema: {shown}"
     );
 
-    // Retire engineering: gated delete, then the server serves the survivor.
-    std::fs::write(
-        dir.join("cluster.yaml"),
-        r#"
-version: 1
-graphs:
-  knowledge:
-    schema: ./people.pg
-    queries:
-      find_person:
-        file: ./people.gq
-"#,
-    )
-    .unwrap();
+    // Removal is outside the deployment class. Refusal preserves the whole
+    // achieved projection and both graph roots; no approval command exists.
+    fs::write(dir.join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n").unwrap();
+    let before = fs::read(dir.join("__cluster/state.json")).unwrap();
     let blocked = cluster_cli(dir, &["apply"]);
-    assert_eq!(blocked["converged"], false, "{blocked}");
-    let approve_output = cli()
-        .arg("--as")
-        .arg("andrew")
-        .arg("cluster")
-        .arg("approve")
-        .arg("graph.engineering")
-        .arg("--config")
-        .arg(dir)
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(approve_output.status.success(), "approve failed");
-    let delete = cluster_cli(dir, &["apply"]);
-    assert_eq!(delete["converged"], true, "{delete}");
-    assert!(!dir.join("graphs/engineering.omni").exists());
-
-    {
-        let server = spawn_server_with_cluster(dir);
-        let (status, body) = invoke_query(
-            &client,
-            &server.base_url,
-            "knowledge",
-            "find_person",
-            serde_json::json!({"name": "Ada"}),
-        );
-        assert_eq!(status, 200, "{body}");
-        let response = client
-            .post(format!(
-                "{}/graphs/engineering/queries/find_service",
-                server.base_url
-            ))
-            .json(&serde_json::json!({"params": {"name": "billing"}}))
-            .send()
-            .unwrap();
-        assert_eq!(
-            response.status().as_u16(),
-            404,
-            "a deleted graph must vanish from the serving surface"
-        );
-    }
-
-    // The story ends converged: nothing left to do.
-    let final_plan = cluster_cli(dir, &["plan"]);
-    assert!(
-        final_plan["changes"].as_array().unwrap().is_empty(),
-        "{final_plan}"
+    assert_eq!(blocked["ok"], false, "{blocked}");
+    assert_eq!(fs::read(dir.join("__cluster/state.json")).unwrap(), before);
+    assert!(dir.join("graphs/engineering.omni").exists());
+    let server = spawn_server_with_cluster(dir);
+    let (status, body) = invoke_query(
+        &client,
+        &server.base_url,
+        "engineering",
+        "find_service",
+        serde_json::json!({"name":"billing"}),
     );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"][0]["s.name"], "billing");
 }
 
 /// Applied policy bundles gate serving per their bindings: the cluster-bound
@@ -2326,9 +2295,8 @@ policies:
 "#,
     )
     .unwrap();
-    assert_eq!(cluster_cli(dir, &["import"])["ok"], true);
     let converge = cluster_cli(dir, &["apply"]);
-    assert_eq!(converge["converged"], true, "{converge}");
+    assert_eq!(converge["result"]["converged"], true, "{converge}");
     seed_graph(
         dir,
         "knowledge",
@@ -2392,16 +2360,13 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
         "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n",
     )
     .unwrap();
-    for command in ["import", "apply"] {
-        let output = cli()
-            .arg("cluster")
-            .arg(command)
-            .arg("--config")
-            .arg(cluster.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "cluster {command} failed");
-    }
+    let output = cli()
+        .args(["cluster", "apply", "--config"])
+        .arg(cluster.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "cluster apply failed: {output:?}");
+    unlock_cluster_fixture(cluster.path());
     let cwd = tempfile::tempdir().unwrap();
     std::fs::write(cwd.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
 
@@ -2562,20 +2527,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
     )
     .unwrap();
-    output_success(
-        cli()
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(cluster.path()),
-    );
-    output_success(
-        cli()
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(cluster.path()),
-    );
+    apply_cluster_fixture(cluster.path());
     output_success(
         cli()
             .arg("load")
@@ -2585,6 +2537,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
             .arg("overwrite")
             .arg(cluster.path().join("graphs").join("local.omni")),
     );
+    unlock_cluster_fixture(cluster.path());
     let server = spawn_server_with_cluster_env(
         cluster.path(),
         &[(

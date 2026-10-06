@@ -37,7 +37,14 @@ it with a `table version … already exists` error.
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
-- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Fast-forward**: the target still has the merge base's schema and table
+  versions, so it takes the source's state. The check reads state, not
+  history: a target merged again from a branch it fast-forwarded before, with
+  no write in between, fast-forwards again. One exception: when a
+  fast-forward into `main` carried a table whose changes cancel out on the
+  branch, or a table on a fork left by a branch created before storage format
+  v11, `main` ends on its own version of that table, so a later merge from
+  that branch can report **Merged**. The merged data is the same.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
@@ -170,5 +177,8 @@ Indexes do not define merge correctness. Newly merged entities remain queryable 
 when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
+
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

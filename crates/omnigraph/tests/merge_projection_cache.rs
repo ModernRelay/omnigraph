@@ -1,10 +1,10 @@
-//! Structural gates for the incremental merge-authority projection cache: a
-//! repeated merge reuses acknowledged local publication views and refreshes
-//! foreign changes through an incremental projection fold, retains at most
-//! one non-bound branch's complete authority, and a
-//! delete/recreate of a cached branch must be fenced to a full re-read, never
-//! a stale reuse. The explicit fold-vs-full correctness oracle lives with the
-//! manifest unit tests; it is not hidden in the measured production path.
+//! Structural gates for the merge-authority cache: a repeated merge reuses
+//! acknowledged local publication views and refreshes foreign changes from
+//! `__manifest` without reading `__history`, retains at most one non-bound
+//! branch's authority, and a delete/recreate of a cached branch must be fenced
+//! to a full re-read, never a stale reuse. The refresh-vs-reopen correctness
+//! oracle lives with the manifest unit tests; it is not hidden in the measured
+//! production path.
 
 #![recursion_limit = "512"]
 
@@ -34,30 +34,6 @@ where
         .unwrap()
         .join()
         .unwrap();
-}
-
-/// Defense-in-depth for the physical cost boundary: selecting a fragment is
-/// not selecting rows. Keep the deletion-vector classifier on Lance's public
-/// physical-address take primitive, and reject the whole-fragment scanner
-/// shape that originally made a post-compaction refresh O(history).
-#[test]
-fn deleted_head_classifier_uses_physical_addresses_not_fragment_scan() {
-    let source = include_str!("../../omnigraph-catalog/src/state.rs");
-    let helper = source
-        .split("pub(crate) async fn read_object_identities_at_offsets")
-        .nth(1)
-        .and_then(|tail| tail.split("/// Reduce raw manifest rows").next())
-        .expect("read_object_identities_at_offsets source body");
-    assert!(
-        helper.contains("TakeBuilder::try_new_from_addresses"),
-        "deleted manifest heads must be hydrated with Lance's physical-address take"
-    );
-    for forbidden in [".scan()", "with_fragments", "try_into_stream"] {
-        assert!(
-            !helper.contains(forbidden),
-            "deleted-head classifier regressed to whole-fragment scan primitive {forbidden}"
-        );
-    }
 }
 
 /// Cache invalidation and merge insertion share the branch gate. Purging
@@ -106,10 +82,10 @@ async fn diverge(db: &Session, round: i64) {
 }
 
 /// Acknowledged local publishes retain exact projections; an external publish
-/// still requires the physical-address incremental fold. Both paths avoid a
-/// full history rebuild and must preserve the merged payload.
+/// still requires a refresh of the replaced manifest fragment. The local path
+/// performs no projection rebuild; both paths must preserve the merged payload.
 #[test]
-fn repeated_merge_refreshes_projection_incrementally() {
+fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
     on_big_stack(|| async {
         cost_harness(async {
             let dir = tempfile::tempdir().unwrap();
@@ -126,12 +102,9 @@ fn repeated_merge_refreshes_projection_incrementally() {
 
             let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
             assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
-            assert!(
-                io.projection_incremental_refreshes >= 1,
-                "the repeated merge must refresh at least one cached branch authority \
-                 through the incremental projection fold (incremental {}, full {})",
-                io.projection_incremental_refreshes,
-                io.projection_full_refreshes,
+            assert_eq!(
+                io.projection_incremental_refreshes, 0,
+                "acknowledged local publication needs only an incarnation probe, not a projection fold",
             );
             eprintln!("local publication reuse: {io:?}");
             assert_eq!(
@@ -151,7 +124,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
                 "the ground-truth object-store tracker must measure returned bytes"
             );
             eprintln!(
-                "incremental repeated merge: manifest_reads={} manifest_read_bytes={}",
+                "local projection reuse: manifest_reads={} manifest_read_bytes={}",
                 io.manifest_reads, io.manifest_read_bytes,
             );
             // Keep a fixed ground-truth request ceiling alongside the
@@ -160,7 +133,7 @@ fn repeated_merge_refreshes_projection_incrementally() {
             // full coordinator reopen to multiply the measured reads.
             assert!(
                 io.manifest_reads <= 32,
-                "incremental repeated merge used {} manifest object reads; hidden full scans must not ride the measured path",
+                "local projection reuse used {} manifest object reads; hidden full scans must not ride the measured path",
                 io.manifest_reads,
             );
 
@@ -178,14 +151,14 @@ fn repeated_merge_refreshes_projection_incrementally() {
             eprintln!("foreign publication refresh: {foreign_io:?}");
             assert_eq!(
                 (foreign_io.projection_full_refreshes, foreign_io.projection_identity_rows),
-                (1, 0),
-                "a foreign copy-on-write publish replaces the fragment set, so the refresh is one \
-                 full scan of the one live fragment and hydrates no row by physical address",
+                (0, 0),
+                "a foreign publish one commit ahead is refreshed from `__manifest`: the head it \
+                 replaced is the parent of the new head, so `__history` is not read",
             );
             assert!(foreign_io.manifest_reads > 0 && foreign_io.manifest_read_bytes > 0);
             assert!(
                 foreign_io.manifest_reads <= 40,
-                "foreign-source merge input protection and incremental refresh used {} manifest reads",
+                "foreign-source merge input protection and projection refresh used {} manifest reads",
                 foreign_io.manifest_reads,
             );
 
@@ -203,6 +176,148 @@ fn repeated_merge_refreshes_projection_incrementally() {
                     let actual_age = batch.column(1).as_any()
                         .downcast_ref::<arrow_array::Int32Array>().unwrap().value(0);
                     assert_eq!(actual_age, age, "{branch}/{name}");
+                }
+            }
+        })
+        .await;
+    });
+}
+
+/// A cold merge uses held tails for recent divergence and addressed history
+/// blocks for an older base, without enumerating all settled ancestry.
+#[test]
+fn cold_merge_uses_held_tail_before_settled_history() {
+    on_big_stack(|| async {
+        cost_harness(async {
+            for divergence in [1, 33] {
+                let dir = tempfile::tempdir().unwrap();
+                let db = init_and_load(&dir).await;
+                for age in 40..88 {
+                    mutate_main(
+                        &db,
+                        MUTATION_QUERIES,
+                        "set_age",
+                        &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+                    )
+                    .await
+                    .unwrap();
+                }
+                db.branch_create("feature").await.unwrap();
+                for round in 0..divergence {
+                    diverge(&db, 100 + round).await;
+                }
+                drop(db);
+
+                let db =
+                    helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+                let (outcome, io) = measure(db.branch_merge("feature", "main")).await;
+                assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
+                assert_eq!(
+                    io.projection_full_refreshes, 0,
+                    "divergence {divergence}: cold merge must use held tails or addressed blocks"
+                );
+                for (name, age) in [("Alice", 130 + divergence), ("Bob", 125 + divergence)] {
+                    let result = db
+                        .query(
+                            omnigraph::db::ReadTarget::branch("main"),
+                            TEST_QUERIES,
+                            "get_person",
+                            &params(&[("$name", name)]),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result.num_rows(), 1);
+                    let batch = result.concat_batches().unwrap();
+                    assert_eq!(
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int32Array>()
+                            .unwrap()
+                            .value(0),
+                        i32::try_from(age).unwrap(),
+                        "the selected base must preserve both sides' changes for {name}"
+                    );
+                }
+            }
+        })
+        .await;
+    });
+}
+
+/// Forking again from an acknowledged merge leaves its merged parent outside
+/// the new branch's first-parent tail. That older frontier must not force a
+/// history scan when both new heads prove the more recent shared base.
+#[test]
+fn consecutive_recent_fork_merges_avoid_settled_history() {
+    on_big_stack(|| async {
+        cost_harness(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = init_and_load(&dir).await;
+            for age in 40..88 {
+                mutate_main(
+                    &db,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            drop(db);
+            let db = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+
+            for (branch, alice_age, bob_age) in
+                [("feature-first", 131, 126), ("feature-second", 132, 127)]
+            {
+                db.branch_create(branch).await.unwrap();
+                mutate_branch(
+                    &db,
+                    branch,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Alice")], &[("$age", alice_age)]),
+                )
+                .await
+                .unwrap();
+                mutate_main(
+                    &db,
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", "Bob")], &[("$age", bob_age)]),
+                )
+                .await
+                .unwrap();
+
+                let (outcome, io) = measure(db.branch_merge(branch, "main")).await;
+                assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
+                assert_eq!(
+                    io.projection_full_refreshes, 0,
+                    "{branch}: both captured heads share the recent fork base; an older \
+                     merged-parent frontier must not cause a settled-lineage scan"
+                );
+                for (name, age) in [("Alice", alice_age), ("Bob", bob_age)] {
+                    let result = db
+                        .query(
+                            omnigraph::db::ReadTarget::branch("main"),
+                            TEST_QUERIES,
+                            "get_person",
+                            &params(&[("$name", name)]),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result.num_rows(), 1);
+                    let batch = result.concat_batches().unwrap();
+                    assert_eq!(
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<arrow_array::Int32Array>()
+                            .unwrap()
+                            .value(0),
+                        i32::try_from(age).unwrap(),
+                        "{branch}: merge must preserve both sides' changes for {name}"
+                    );
                 }
             }
         })

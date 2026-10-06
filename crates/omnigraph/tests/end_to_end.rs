@@ -5,8 +5,6 @@ use base64::Engine as _;
 use futures::TryStreamExt;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-#[cfg(feature = "failpoints")]
-use omnigraph::db::{UpgradeOptions, UpgradeOutcome, upgrade_storage};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
@@ -36,7 +34,7 @@ async fn init_creates_schema_file_and_manifest() {
 
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    assert!(dir.path().join("_schema.pg").exists());
+    assert!(!dir.path().join("_schema.pg").exists());
     assert!(dir.path().join("__manifest").exists());
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
@@ -1016,7 +1014,29 @@ query insert_doc($title: String, $content: Blob) {
 query update_doc_content($title: String, $content: Blob) {
     update Document set { content: $content } where title = $title
 }
+
+query clear_doc_content($title: String, $content: Blob?) {
+    update Document set { content: $content } where title = $title
+}
+
+query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
+    insert Document { title: $title, content: $content }
+    update Document set { content: $cleared } where title = $title
+}
 "#;
+
+/// Parameters binding `$content` (and `$cleared`, when present) to null: `null`
+/// is a reserved word in `.gq`, so a null reaches a Blob only as a parameter.
+fn null_blob_params(title: &str, names: &[&str]) -> ParamMap {
+    let mut map = params(&[("$title", title)]);
+    for name in names {
+        map.insert(
+            name.to_string(),
+            omnigraph_compiler::query::ast::Literal::Null,
+        );
+    }
+    map
+}
 
 #[tokio::test]
 async fn blob_schema_parses_and_init_succeeds() {
@@ -1431,201 +1451,6 @@ async fn blob_read_returns_bytes() {
         panic!("expected managed edge content")
     };
     assert_eq!(etag.to_string(), edge_etag);
-}
-
-#[cfg(feature = "failpoints")]
-#[tokio::test]
-async fn blob_read_on_upgraded_unmarked_v6_table_fails_closed_for_old_snapshots() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
-    db.load_jsonl(
-        r#"{"type":"Document","data":{"title":"legacy","content":"base64:T2xk"}}"#,
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap();
-
-    // Deliberately model a pre-0.10 v6 physical schema: retain every Lance
-    // extension/PK metadata entry, but remove the graph property-lifetime
-    // marker that this release starts writing on newly created/rebuilt fields.
-    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let table_path = snapshot
-        .dataset("node:Document")
-        .unwrap()
-        .dataset_path
-        .clone();
-    helpers::forge_linear_head_from_pin(&db, "main", "node:Document", 0).await;
-    let mut table = lance::Dataset::open(dir.path().join(table_path).to_string_lossy().as_ref())
-        .await
-        .unwrap();
-    let replacements = ["title", "content"]
-        .into_iter()
-        .map(|name| {
-            let mut metadata = table.schema().field(name).unwrap().metadata.clone();
-            assert!(metadata.remove("omnigraph.stable_property_id").is_some());
-            (name, metadata)
-        })
-        .collect::<Vec<_>>();
-    let mut update = table.update_field_metadata();
-    for (name, metadata) in replacements {
-        update = update.replace(name, metadata).unwrap();
-    }
-    update.await.unwrap();
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
-        .await
-        .unwrap();
-
-    let legacy_cell = node_blob_cell("Document", "legacy", "content");
-    let exact_current_snapshot = db.resolve_snapshot("main").await.unwrap();
-    assert_eq!(
-        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell.clone()).await,
-        b"Old"
-    );
-    assert_eq!(
-        read_managed_blob_bytes(
-            &db,
-            ReadTarget::snapshot(exact_current_snapshot.clone()),
-            legacy_cell.clone(),
-        )
-        .await,
-        b"Old",
-        "an unmarked upgraded table remains readable at its exact current physical entry"
-    );
-
-    let before_upgrade = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let physical_version = before_upgrade
-        .dataset("node:Document")
-        .unwrap()
-        .published_dataset_version;
-    drop(db);
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
-        .await
-        .unwrap();
-    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, 10)
-        .await
-        .unwrap();
-    drop(manifest);
-    let upgraded = upgrade_storage(uri, UpgradeOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(upgraded.outcome, UpgradeOutcome::Completed, "{upgraded:?}");
-    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
-    let after_upgrade = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(
-        after_upgrade
-            .dataset("node:Document")
-            .unwrap()
-            .published_dataset_version,
-        physical_version,
-        "recording the linear boundary must preserve the physical Blob version"
-    );
-    assert!(
-        !after_upgrade
-            .open_dataset("node:Document")
-            .await
-            .unwrap()
-            .schema()
-            .field("content")
-            .unwrap()
-            .metadata
-            .contains_key("omnigraph.stable_property_id"),
-        "storage upgrade must not invent a historical property-lifetime witness"
-    );
-    assert_eq!(
-        read_managed_blob_bytes(
-            &db,
-            ReadTarget::snapshot(exact_current_snapshot.clone()),
-            legacy_cell.clone(),
-        )
-        .await,
-        b"Old",
-        "metadata-only upgrade keeps the exact physical Blob snapshot readable"
-    );
-
-    // A schema-preserving Append must not pretend to retrofit physical field
-    // identity. The new current entry remains readable, while the now-older
-    // unmarked snapshot cannot prove that the same spelling is the same
-    // property lifetime and therefore fails closed.
-    db.load_jsonl(
-        r#"{"type":"Document","data":{"title":"later"}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_table = current.open_dataset("node:Document").await.unwrap();
-    assert!(
-        !current_table
-            .schema()
-            .field("content")
-            .unwrap()
-            .metadata
-            .contains_key("omnigraph.stable_property_id"),
-        "a schema-preserving Append must not claim to retrofit property-lifetime metadata"
-    );
-    assert_eq!(
-        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell.clone()).await,
-        b"Old"
-    );
-    let current_snapshot = db.resolve_snapshot("main").await.unwrap();
-    assert_eq!(
-        read_managed_blob_bytes(
-            &db,
-            ReadTarget::snapshot(current_snapshot),
-            legacy_cell.clone(),
-        )
-        .await,
-        b"Old"
-    );
-
-    let error = db
-        .read_blob_at(
-            ReadTarget::snapshot(exact_current_snapshot),
-            legacy_cell.clone(),
-        )
-        .await
-        .expect_err("an older unmarked v6 table version has no property-lifetime proof");
-    assert!(
-        matches!(
-            error,
-            OmniError::Manifest(ref manifest)
-                if manifest.kind == ManifestErrorKind::BadRequest
-                    && manifest.message
-                        == "Blob property 'Document.content' has no persisted property-lifetime witness at the selected target"
-        ),
-        "older unmarked v6 snapshots must fail with the exact compatibility refusal, got {error:?}"
-    );
-
-    db.load_jsonl(
-        r#"{"type":"Document","data":{"title":"legacy","content":"base64:UmVidWlsdA=="}}"#,
-        LoadMode::Overwrite,
-    )
-    .await
-    .unwrap();
-    let rebuilt = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let rebuilt_table = rebuilt.open_dataset("node:Document").await.unwrap();
-    let expected_property_id = db
-        .catalog()
-        .node_property_id("Document", "content")
-        .unwrap()
-        .get()
-        .to_string();
-    assert_eq!(
-        rebuilt_table
-            .schema()
-            .field("content")
-            .unwrap()
-            .metadata
-            .get("omnigraph.stable_property_id")
-            .map(String::as_str),
-        Some(expected_property_id.as_str()),
-        "full-table Overwrite rebuilds from the 0.10 catalog and adopts the property marker"
-    );
-    assert_eq!(
-        read_managed_blob_bytes(&db, ReadTarget::branch("main"), legacy_cell).await,
-        b"Rebuilt"
-    );
 }
 
 #[tokio::test]
@@ -2162,10 +1987,10 @@ query get_article($slug: String) {
     assert!(attachment.is_empty());
 }
 
-// ─── Regression: blob update null → non-null ─────────────────────────────────
+// ─── Regression: blob update null → non-null → null ──────────────────────────
 
 #[tokio::test]
-async fn blob_update_null_to_non_null() {
+async fn blob_update_null_round_trip() {
     // Regression: updating a blob column that was previously all-null panicked
     // with assertion `left: 0, right: 1` in lance-table stream.rs because the
     // two-phase blob update sent a blob-only batch to merge_insert on a dataset
@@ -2197,6 +2022,281 @@ async fn blob_update_null_to_non_null() {
     )
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
+
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "clear_doc_content",
+        &null_blob_params("kid-a", &["content"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before + 1,
+        "a null parameter clears the cell and publishes once"
+    );
+    let assert_null = |error: OmniError| {
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::NotFound
+                        && manifest.message.contains("is null")
+            ),
+            "cleared Blob must read as null, got {error:?}"
+        );
+    };
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "kid-a", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
+    insert_then_clear.insert(
+        "content".to_string(),
+        omnigraph_compiler::query::ast::Literal::String("base64:AQID".to_string()),
+    );
+    let result = mutate_main(
+        &db,
+        BLOB_MUTATIONS,
+        "insert_then_clear_doc_content",
+        &insert_then_clear,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+    assert_null(
+        db.read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "ok-computer", "content"),
+        )
+        .await
+        .unwrap_err(),
+    );
+}
+
+/// The control, the same update with a value, opens the table, so the zero
+/// open count belongs to the refusal and not to a skipped scan.
+#[tokio::test]
+async fn blob_null_on_non_nullable_refuses_before_table_open_or_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Document {\n    title: String @key\n    content: Blob\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(
+        r#"{"type": "Document", "data": {"title": "kid-a", "content": "base64:AQID"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let head = || async {
+        omnigraph::db::commit_graph::CommitGraph::open(uri)
+            .await
+            .unwrap()
+            .head_commit()
+            .await
+            .unwrap()
+            .expect("loaded graph has a commit")
+            .graph_commit_id
+    };
+    let manifest_before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let pin_before = pinned_version(&db, "main", "node:Document").await;
+    let head_before = head().await;
+
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("kid-a", &["content"]),
+        ),
+    )
+    .await;
+    let error = refused.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot assign null to non-nullable property 'content' of Document"),
+        "{error}"
+    );
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        0,
+        "the refusal must precede the table open and its scan"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        manifest_before
+    );
+    assert_eq!(
+        pinned_version(&db, "main", "node:Document").await,
+        pin_before
+    );
+    assert_eq!(head().await, head_before);
+
+    let probes = MergeWriteProbes::default();
+    let matched = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            BLOB_MUTATIONS,
+            "update_doc_content",
+            &params(&[("$title", "nobody"), ("$content", "base64:BAUG")]),
+        ),
+    )
+    .await;
+    assert_eq!(matched.unwrap().affected_nodes, 0);
+    assert_eq!(
+        probes.mutation_table_open_calls(),
+        1,
+        "the control update with a value opens the table to scan it"
+    );
+}
+
+// ─── External Blob bases stay outside the graph's own storage ────────────────
+
+/// A base over the graph root would let any authorized writer copy manifest
+/// and table bytes into a managed cell served as ordinary Blob data. Every
+/// spelling of an overlap is refused at install time, before any write, and a
+/// graph-internal URI stays outside a disjoint base. The root is also opened
+/// through a local path that contains `://` (a directory literally named
+/// `og:`), which is a local root and not a URI scheme.
+#[tokio::test]
+async fn external_blob_policy_refuses_base_overlapping_graph_root() {
+    let plain = tempfile::tempdir().unwrap();
+    let graph = plain.path().join("graph");
+    assert_graph_root_refuses_overlapping_bases(plain.path(), &graph, graph.to_str().unwrap())
+        .await;
+
+    let colon = tempfile::tempdir().unwrap();
+    let graph = colon.path().join("og:").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    let graph_uri = format!("{}/og://graph", colon.path().display());
+    assert_graph_root_refuses_overlapping_bases(colon.path(), &graph, &graph_uri).await;
+}
+
+async fn assert_graph_root_refuses_overlapping_bases(
+    dir: &std::path::Path,
+    graph: &std::path::Path,
+    graph_uri: &str,
+) {
+    let graph = graph.to_path_buf();
+    let graph_uri = graph_uri.to_string();
+    let external = dir.join("external");
+    std::fs::create_dir_all(&external).unwrap();
+    let db = helpers::session(Omnigraph::init(&graph_uri, BLOB_SCHEMA).await.unwrap());
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "seed", "content": "base64:AQID"},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let graph_state = |uri: String| async move {
+        let db = Omnigraph::open_read_only(&uri).await.unwrap();
+        (
+            version_main(&db).await.unwrap(),
+            pinned_version(&db, "main", "node:Document").await,
+        )
+    };
+    let before = graph_state(graph_uri.clone()).await;
+
+    let directory_base = |path: &std::path::Path| {
+        url::Url::from_directory_path(path)
+            .expect("base path is absolute")
+            .to_string()
+    };
+    let mut overlapping = vec![
+        directory_base(&graph),
+        directory_base(dir),
+        directory_base(&graph.join("__manifest")),
+        // On macOS the temporary directory is `/var/...`, a symlink to
+        // `/private/var/...`: the canonical spelling must overlap as well.
+        directory_base(&std::fs::canonicalize(&graph).unwrap()),
+    ];
+    #[cfg(unix)]
+    {
+        let link = dir.join("graph-link");
+        std::os::unix::fs::symlink(&graph, &link).unwrap();
+        overlapping.push(directory_base(&link));
+    }
+    for base in overlapping {
+        let policy = ExternalBlobPolicy::allow(vec![
+            ExternalBlobBase::new(&base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+        ])
+        .unwrap();
+        match Omnigraph::open(&graph_uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+        {
+            Err(OmniError::ExternalBlobPolicy { reason, .. }) => assert!(
+                reason.contains("overlaps an OmniGraph storage root"),
+                "{base}: {reason}"
+            ),
+            Err(other) => panic!("{base}: expected a policy refusal, got {other}"),
+            Ok(_) => panic!("{base}: a base overlapping the graph root must be refused"),
+        }
+    }
+    assert_eq!(graph_state(graph_uri.clone()).await, before);
+
+    // A sibling base is admitted, and a URI naming the graph's own ledger is
+    // outside it: the keyed load that would have copied it is refused with the
+    // graph unchanged.
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            directory_base(&external),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = helpers::session(
+        Omnigraph::open(&graph_uri)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let transaction = std::fs::read_dir(graph.join("__manifest").join("_transactions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_file())
+        .expect("the graph ledger holds a transaction file");
+    let error = db
+        .load_jsonl(
+            &serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": "ledger",
+                    "content": url::Url::from_file_path(&transaction).unwrap().to_string(),
+                },
+            })
+            .to_string(),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::ExternalBlobPolicy { .. }),
+        "unexpected error: {error}"
+    );
+    drop(db);
+    assert_eq!(graph_state(graph_uri).await, before);
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────
@@ -2411,6 +2511,37 @@ async fn blob_load_external_file_uri() {
     assert_eq!(read_probes.external_blob_probe_calls(), 0);
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
     assert_eq!(read_probes.blob_payload_read_calls(), 0);
+    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
+
+    let clear_probes = MergeWriteProbes::default();
+    let result = with_merge_write_probes(
+        clear_probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_MUTATIONS,
+            "clear_doc_content",
+            &null_blob_params("from-file", &["content"]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(
+        clear_probes.external_blob_probe_calls(),
+        0,
+        "clearing a cell whose source vanished never reads the old reference"
+    );
+    assert_eq!(clear_probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(clear_probes.blob_payload_read_calls(), 0);
+    assert_eq!(clear_probes.blob_managed_batch_read_calls(), 0);
+    let cleared = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "from-file", "content"),
+        )
+        .await
+        .unwrap_err();
+    assert!(cleared.to_string().contains("is null"), "{cleared}");
 }
 
 // ─── Regression: execute_update on edge type ─────────────────────────────────

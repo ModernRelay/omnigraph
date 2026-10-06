@@ -63,7 +63,9 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
         if path == "/.well-known/oauth-protected-resource" {
             continue;
         }
-        let protected = path == "/graphs" || path.starts_with("/graphs/");
+        let protected = path == "/graphs"
+            || path.starts_with("/graphs/")
+            || path.starts_with("/cluster/deployments");
         for operation in crate::handlers::path_item_operations_mut(item) {
             if protected {
                 let mut parameter = Parameter::new(HTTP_API_CONTRACT_HEADER);
@@ -93,7 +95,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     );
                 }
             }
-            if path.starts_with("/graphs/{graph_id}/") {
+            if path.starts_with("/graphs/{graph_id}/") || path.starts_with("/cluster/deployments") {
                 for (status, description) in [
                     (
                         "429",
@@ -101,7 +103,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     ),
                     (
                         "503",
-                        "Server operation admission is closed; reconcile any earlier write before retrying",
+                        "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
                     ),
                     (
                         "408",

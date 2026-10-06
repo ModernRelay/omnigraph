@@ -1,11 +1,11 @@
 //! The `__recovery/` directory of graphs written before RFC 0067.
 //!
 //! No writer arms a recovery sidecar any more: every table effect is a
-//! detached commit published as a pin, and a staged schema contract names the
-//! graph commit that publishes it. A sidecar can therefore only come from a
+//! detached commit published as a pin beside its schema contract row. A sidecar
+//! can therefore only come from a
 //! build that predates detached table commits and stopped mid-write. This
-//! binary cannot interpret one, so a read-write open and the storage upgrade
-//! refuse the graph until the build that wrote the sidecar has resolved it.
+//! binary cannot interpret one, so a read-write open refuses the graph until
+//! the build that wrote the sidecar has resolved it.
 //! Reads stay pinned to published manifest versions and never look here.
 
 use crate::error::{OmniError, Result};
@@ -64,10 +64,9 @@ pub(crate) async fn refuse_legacy_sidecars(
 
 /// Nonmutating absence proof for callers without recovery authority (the
 /// cluster admission probe): every JSON object under `__recovery/` blocks,
-/// including malformed ones — absence is the only provable state — and so
-/// does any staged schema contract file, since only a read-write open may
-/// settle one. Listing is bounded; exceeding the bound refuses rather than
-/// walking an unbounded directory.
+/// including malformed ones — absence is the only provable state. Listing is
+/// bounded; exceeding the bound refuses rather than walking an unbounded
+/// directory.
 pub(crate) async fn refuse_pending_recovery(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -88,18 +87,6 @@ pub(crate) async fn refuse_pending_recovery(
             "pending-recovery",
             "graph has pending recovery; resolve it with explicit recovery authority before retrying",
         ));
-    }
-    for staging in [
-        crate::db::schema_state::schema_source_staging_uri(root_uri),
-        crate::db::schema_state::schema_ir_staging_uri(root_uri),
-        crate::db::schema_state::schema_state_staging_uri(root_uri),
-    ] {
-        if storage.exists(&staging).await? {
-            return Err(OmniError::recovery_required(
-                "pending-schema-recovery",
-                "graph has staged schema recovery; resolve it with explicit recovery authority before retrying",
-            ));
-        }
     }
     Ok(())
 }

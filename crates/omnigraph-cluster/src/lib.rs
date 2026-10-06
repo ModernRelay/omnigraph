@@ -3,12 +3,11 @@
 // (with or without failpoints). Production builds keep the default.
 #![cfg_attr(test, recursion_limit = "256")]
 
-use omnigraph_seams::decide_seam;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
 
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::ast::QueryFile;
@@ -24,40 +23,43 @@ use ulid::Ulid;
 
 pub mod seams;
 
+mod admission;
 mod authorization;
 mod config;
+mod deployment;
 mod diff;
+mod graph_read;
 mod serve;
 mod state_lock;
 mod store;
-mod sweep;
 mod types;
+pub use admission::{
+    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
+};
 pub use authorization::{
-    AuthorizedApplyOutput, AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization,
-    PlanAuthorization, PlanReadAuthorization, PolicyAuthorizationCheck, authorize_apply_plan,
-    authorize_plan_read,
+    AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,
+    PlanReadAuthorization, PolicyAuthorizationCheck, authorize_apply_plan, authorize_plan_read,
 };
 use config::{
-    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs,
-    parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests,
-    validate_cluster_header,
+    QueriesDecl, graph_address, load_desired, observe_declared_graphs, parse_cluster_config,
+    preview_schema_migration, schema_address, state_resource_digests, validate_cluster_header,
 };
+pub use deployment::*;
 use diff::{
-    FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
-    append_policy_binding_changes, approved_resources, classify_changes, compute_approvals,
-    compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind,
+    ResourceKind, append_embedding_profile_changes, append_policy_binding_changes,
+    compute_blast_radius, diff_resources, resource_kind,
 };
+pub use graph_read::GraphReadAuthority;
+#[cfg(any(test, feature = "test-util"))]
+pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{
-    RootBoundServingSnapshot, ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot,
-    cluster_graph_ids, cluster_root_for_graph_uri, read_root_bound_serving_snapshot,
-    read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
-    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+    AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
+    ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
+    admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
+    read_root_bound_serving_snapshot, read_root_bound_serving_snapshot_from_storage,
+    read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
 use store::ClusterStore;
-use sweep::{
-    mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars,
-    tombstone_graph_subtree, warn_pending_recovery_sidecars,
-};
 pub use types::*;
 
 pub const CLUSTER_CONFIG_FILE: &str = "cluster.yaml";
@@ -67,7 +69,6 @@ pub const CLUSTER_STATE_FILE: &str = "__cluster/state.json";
 pub const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 pub const CLUSTER_RESOURCES_DIR: &str = "__cluster/resources";
 pub const CLUSTER_RECOVERIES_DIR: &str = "__cluster/recoveries";
-pub const CLUSTER_APPROVALS_DIR: &str = "__cluster/approvals";
 
 /// The store for a load outcome: the declared `storage:` root when present,
 /// the config directory itself otherwise. A bad root is a loud error.
@@ -214,7 +215,6 @@ async fn plan_config_dir_impl(
             state_observations: observations,
             changes: Vec::new(),
             blast_radius: Vec::new(),
-            approvals_required: Vec::new(),
             diagnostics,
         };
     };
@@ -232,7 +232,6 @@ async fn plan_config_dir_impl(
             state_observations: observations,
             changes: Vec::new(),
             blast_radius: Vec::new(),
-            approvals_required: Vec::new(),
             diagnostics,
         };
     }
@@ -289,21 +288,41 @@ async fn plan_config_dir_impl(
         append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
         append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
     }
-    // Plan previews dispositions without sweeping; a pending recovery is
-    // surfaced as the cluster_recovery_pending warning above instead.
-    let artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
-    let approved = approved_resources(
-        &artifacts,
-        &changes,
-        &desired.config_digest,
-        &mut diagnostics,
-    );
-    classify_changes(
-        &mut changes,
-        &desired.dependencies,
-        &BTreeSet::new(),
-        &approved,
-    );
+    // The same v2 scope rules govern previews and execution. A refused scope
+    // is wholly pre-effect; no approval artifact can authorize a removed path.
+    let scope_error = prior_state.as_ref().and_then(|state| {
+        if state.version != 2 {
+            return Some(Diagnostic::error(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "convert the stopped cluster ledger to v2 before planning deployments",
+            ));
+        }
+        match capture_deployment(config_dir, &BTreeMap::new()) {
+            Ok(bundle) => preview_deployment_scope(state, &bundle).err(),
+            Err(error) => Some(error),
+        }
+    });
+    for change in &mut changes {
+        if let Some(error) = &scope_error {
+            change.disposition = Some(ApplyDisposition::Blocked);
+            change.reason = Some(error.code.clone());
+        } else {
+            change.disposition = Some(
+                if matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
+                    && change.operation == PlanOperation::Update
+                {
+                    ApplyDisposition::Derived
+                } else {
+                    ApplyDisposition::Applied
+                },
+            );
+            change.reason = None;
+        }
+    }
+    if let Some(error) = scope_error {
+        diagnostics.push(error);
+    }
 
     if !has_errors(&diagnostics) {
         if let Some(identity) = identity {
@@ -356,7 +375,6 @@ async fn plan_config_dir_impl(
         }
     }
     let blast_radius = compute_blast_radius(&changes, &desired.dependencies);
-    let approvals_required = compute_approvals(&changes, &approved);
     let ok = !has_errors(&diagnostics);
 
     PlanOutput {
@@ -371,1194 +389,6 @@ async fn plan_config_dir_impl(
         state_observations: observations,
         changes,
         blast_radius,
-        approvals_required,
-        diagnostics,
-    }
-}
-
-/// Config-only `cluster apply` (Stage 3A): execute the query/policy subset of
-/// the plan against the local cluster catalog. The plan is recomputed under
-/// the state lock, so freshness is structural; the state CAS inside
-/// `write_state` is the second fence. Graph/schema changes are never executed
-/// here — they are deferred to the graph-lifecycle phase and reported loudly.
-///
-/// Payloads are content-addressed and written BEFORE the state CAS because
-/// state is the publish point: a failure after payload writes leaves inert
-/// digest-named blobs and no success acknowledgement; re-running apply is the
-/// repair.
-/// Options for `cluster apply`. `actor` attributes graph-moving operations
-/// (recorded in sidecars and audit entries, threaded to the engine's
-/// `apply_schema_as` so Cedar enforcement fires wherever a policy checker is
-/// installed).
-#[derive(Debug, Clone, Default)]
-pub struct ApplyOptions {
-    pub actor: Option<String>,
-}
-
-pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
-    apply_config_dir_with_options(config_dir, ApplyOptions::default()).await
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_BEFORE_STATE_WRITE = ("cluster_apply.before_state_write", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_AFTER_GRAPH_DELETE = ("cluster_apply.after_graph_delete", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_BEFORE_GRAPH_DELETE = ("cluster_apply.before_graph_delete", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_AFTER_PAYLOAD_PHASE = ("cluster_apply.after_payload_phase", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_AFTER_SCHEMA_APPLY = ("cluster_apply.after_schema_apply", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_BEFORE_SCHEMA_APPLY = ("cluster_apply.before_schema_apply", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_AFTER_GRAPH_CREATE = ("cluster_apply.after_graph_create", Unreachable, [Fail]);
-}
-
-decide_seam! {
-    pub static CLUSTER_APPLY_BEFORE_GRAPH_CREATE = ("cluster_apply.before_graph_create", Unreachable, [Fail]);
-}
-
-pub async fn apply_config_dir_with_options(
-    config_dir: impl AsRef<Path>,
-    options: ApplyOptions,
-) -> ApplyOutput {
-    // Preserve the existing embedded caller's stack budget when forwarding
-    // into the shared implementation and nested graph recovery operations.
-    Box::pin(apply_config_dir_impl(
-        config_dir.as_ref(),
-        options,
-        None,
-        &mut None,
-    ))
-    .await
-}
-
-/// Apply the exact authorized candidate after rechecking current applied policy
-/// for the initiating identity under the existing cluster lock. The receipt is
-/// a base/effect precondition, not transferable authorization.
-pub async fn apply_config_dir_authorized(
-    config_dir: impl AsRef<Path>,
-    options: ApplyOptions,
-    identity: &IdentityAuthorization,
-    expected: &PlanAuthorization,
-) -> AuthorizedApplyOutput {
-    let mut authorization = None;
-    let apply = Box::pin(apply_config_dir_impl(
-        config_dir.as_ref(),
-        options,
-        Some((identity, expected)),
-        &mut authorization,
-    ))
-    .await;
-    AuthorizedApplyOutput {
-        apply,
-        authorization,
-    }
-}
-
-async fn apply_config_dir_impl(
-    config_dir: &Path,
-    mut options: ApplyOptions,
-    identity: Option<(&IdentityAuthorization, &PlanAuthorization)>,
-    authorization: &mut Option<PlanAuthorization>,
-) -> ApplyOutput {
-    if let Some((identity, _)) = identity {
-        // Attribution comes from authenticated identity on this entry point.
-        options.actor = Some(identity.actor().to_string());
-    }
-    let outcome = load_desired(config_dir);
-    let mut diagnostics = outcome.diagnostics;
-    let storage_root = outcome
-        .desired
-        .as_ref()
-        .and_then(|desired| desired.storage_root.clone());
-    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
-        Ok(backend) => backend,
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            ClusterStore::for_config_dir(&outcome.config_dir)
-        }
-    };
-    let mut observations = backend.observations();
-
-    let actor_for_output = options.actor.clone();
-    let early_return = |config_dir: String,
-                        config_digest: Option<String>,
-                        observations: StateObservations,
-                        changes: Vec<PlanChange>,
-                        resource_statuses: BTreeMap<String, ResourceStatusRecord>,
-                        diagnostics: Vec<Diagnostic>| {
-        ApplyOutput {
-            ok: !has_errors(&diagnostics),
-            config_dir,
-            actor: actor_for_output.clone(),
-            desired_revision: DesiredRevision { config_digest },
-            state_observations: observations,
-            changes,
-            applied_count: 0,
-            deferred_count: 0,
-            converged: false,
-            state_written: false,
-            resource_statuses,
-            diagnostics,
-        }
-    };
-
-    let Some(desired) = outcome.desired else {
-        return early_return(
-            display_path(&outcome.config_dir),
-            None,
-            observations,
-            Vec::new(),
-            BTreeMap::new(),
-            diagnostics,
-        );
-    };
-
-    if has_errors(&diagnostics) {
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            Vec::new(),
-            BTreeMap::new(),
-            diagnostics,
-        );
-    }
-
-    // Named guard: the lock must be held until the state outcome is recorded.
-    let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("apply", &mut observations).await {
-            Ok(guard) => Some(guard),
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                None
-            }
-        }
-    } else {
-        diagnostics.push(Diagnostic::warning(
-            "state_lock_disabled",
-            "state.lock",
-            "state.lock is false; apply wrote state without acquiring the cluster state lock",
-        ));
-        None
-    };
-
-    if has_errors(&diagnostics) {
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            Vec::new(),
-            BTreeMap::new(),
-            diagnostics,
-        );
-    }
-
-    let snapshot = match backend.read_state(&mut observations).await {
-        Ok(snapshot) => snapshot,
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            return early_return(
-                display_path(&desired.config_dir),
-                Some(desired.config_digest),
-                observations,
-                Vec::new(),
-                BTreeMap::new(),
-                diagnostics,
-            );
-        }
-    };
-    let expected_cas = snapshot.state_cas;
-    let Some(mut state) = snapshot.state else {
-        diagnostics.push(Diagnostic::error(
-            "state_missing",
-            CLUSTER_STATE_FILE,
-            "apply requires an existing state.json; run `cluster import` to bootstrap state",
-        ));
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            Vec::new(),
-            BTreeMap::new(),
-            diagnostics,
-        );
-    };
-
-    // State metadata is an authority boundary. Validate the as-read graph
-    // composites before the recovery sweep can reuse any embedded policy or
-    // binding metadata while rolling the ledger forward.
-    if !validate_state_graph_resource_digests(&state, &mut diagnostics) {
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            Vec::new(),
-            state.resource_statuses,
-            diagnostics,
-        );
-    }
-
-    // Authenticate every exact candidate effect against the as-read applied
-    // revision BEFORE recovery cleanup, sidecars, graph opens or payload writes.
-    // Pending recovery refuses; a new caller cannot inherit its original actor.
-    let mut applied_policies = None;
-    if let Some((identity, expected)) = identity {
-        let mut candidate_changes =
-            diff_resources(&state_resource_digests(&state), &desired.resource_digests);
-        append_policy_binding_changes(&mut candidate_changes, Some(&state), &desired);
-        append_embedding_profile_changes(&mut candidate_changes, Some(&state), &desired);
-        match authorization::authorize_candidate(
-            &backend,
-            &desired,
-            Some(&state),
-            &observations,
-            &candidate_changes,
-            identity,
-            true,
-        )
-        .await
-        {
-            Ok((evidence, policies)) => {
-                match authorization::compare_authorization(expected, &evidence) {
-                    Ok(()) => {
-                        *authorization = Some(evidence);
-                        applied_policies = policies;
-                    }
-                    Err(diagnostic) => diagnostics.push(diagnostic),
-                }
-            }
-            Err(diagnostic) => diagnostics.push(diagnostic),
-        }
-        if has_errors(&diagnostics) {
-            return early_return(
-                display_path(&desired.config_dir),
-                Some(desired.config_digest),
-                observations,
-                Vec::new(),
-                state.resource_statuses,
-                diagnostics,
-            );
-        }
-    }
-
-    // Snapshot the as-read state BEFORE the sweep so sweep mutations count as
-    // changes for the final dirty check and get persisted by the state CAS.
-    let before_value =
-        serde_json::to_value(&state).expect("cluster state must serialize deterministically");
-    let sweep = sweep_recovery_sidecars(&backend, &mut state, &mut diagnostics).await;
-
-    let prior_resources = state_resource_digests(&state);
-    let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
-    append_policy_binding_changes(&mut changes, Some(&state), &desired);
-    append_embedding_profile_changes(&mut changes, Some(&state), &desired);
-    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
-    let approved = approved_resources(
-        &approval_artifacts,
-        &changes,
-        &desired.config_digest,
-        &mut diagnostics,
-    );
-    classify_changes(
-        &mut changes,
-        &desired.dependencies,
-        &sweep.pending_graphs,
-        &approved,
-    );
-    // Defensive invariant: nothing the approval gate covers may be executable
-    // WITHOUT a matching approval. Gated changes with a valid artifact are the
-    // sanctioned exception (stage 4C).
-    let approvals = compute_approvals(&changes, &approved);
-    let approval_violation = changes.iter().any(|change| {
-        change.disposition == Some(ApplyDisposition::Applied)
-            && approvals
-                .iter()
-                .any(|approval| approval.resource == change.resource && !approval.satisfied)
-    });
-    if approval_violation {
-        diagnostics.push(Diagnostic::error(
-            "apply_approval_invariant_violation",
-            "changes",
-            "an executable change requires approval; refusing to apply",
-        ));
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            changes,
-            state.resource_statuses,
-            diagnostics,
-        );
-    }
-
-    // Graph creates execute first (RFC-004 §D5), sequentially, sidecar-fenced:
-    // sidecar written before the init, rewritten with the post-init manifest
-    // version, deleted only after the final state CAS lands. A failure stops
-    // further graph-moving work and demotes that graph's dependents.
-    let source_paths: BTreeMap<&str, &str> = desired
-        .resources
-        .iter()
-        .filter_map(|resource| {
-            resource
-                .path
-                .as_deref()
-                .map(|path| (resource.address.as_str(), path))
-        })
-        .collect();
-    let graph_creates_to_run: Vec<String> = changes
-        .iter()
-        .filter(|change| {
-            change.disposition == Some(ApplyDisposition::Applied)
-                && change.operation == PlanOperation::Create
-                && matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
-        })
-        .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
-        .collect();
-    let mut completed_op_sidecars: Vec<String> = Vec::new();
-    let mut failed_graphs: BTreeMap<String, FailedGraphOrigin> = BTreeMap::new();
-    let mut graph_moving_aborted = false;
-    for graph_id in &graph_creates_to_run {
-        if graph_moving_aborted {
-            // A prior create failed: stop graph-moving work (loud partials).
-            diagnostics.push(Diagnostic::warning(
-                "graph_create_skipped",
-                graph_address(graph_id),
-                "skipped after an earlier graph create failed in this run",
-            ));
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
-            continue;
-        }
-        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id) else {
-            continue;
-        };
-        let graph_uri = backend.graph_root(graph_id);
-        let mut sidecar = RecoverySidecar {
-            schema_version: 1,
-            operation_id: Ulid::new().to_string(),
-            started_at: now_rfc3339(),
-            actor: options.actor.clone(),
-            kind: RecoverySidecarKind::GraphCreate,
-            graph_id: graph_id.clone(),
-            graph_uri: graph_uri.clone(),
-            observed_manifest_version: None,
-            expected_manifest_version: None,
-            desired_schema_digest: desired_graph.schema_digest.clone(),
-            state_cas_base: expected_cas.clone(),
-            approval_id: None,
-        };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_BEFORE_GRAPH_CREATE) {
-            // Simulated crash before the init: the sidecar stays for the
-            // sweep (row 1: root absent -> intent removed next run).
-            diagnostics.push(diagnostic);
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
-            graph_moving_aborted = true;
-            continue;
-        }
-        // Re-read + re-verify the schema source under the lock — the same
-        // TOCTOU posture as write_resource_payload.
-        let schema_source = source_paths
-            .get(schema_address(graph_id).as_str())
-            .ok_or_else(|| {
-                Diagnostic::error(
-                    "graph_create_failed",
-                    graph_address(graph_id),
-                    "no schema source recorded for graph",
-                )
-            })
-            .and_then(|path| {
-                fs::read_to_string(Path::new(path)).map_err(|err| {
-                    Diagnostic::error(
-                        "graph_create_failed",
-                        graph_address(graph_id),
-                        format!("could not read schema source '{path}': {err}"),
-                    )
-                })
-            })
-            .and_then(|source| {
-                if sha256_hex(source.as_bytes()) == desired_graph.schema_digest {
-                    Ok(source)
-                } else {
-                    Err(Diagnostic::error(
-                        "resource_content_changed",
-                        schema_address(graph_id),
-                        "schema source changed while apply was running; re-run `cluster apply`",
-                    ))
-                }
-            });
-        let schema_source = match schema_source {
-            Ok(source) => source,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                backend.delete_object(&sidecar_path).await; // nothing moved
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        match Omnigraph::init(&graph_uri, &schema_source).await {
-            Ok(_) => {}
-            Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "graph_create_failed",
-                    graph_address(graph_id),
-                    format!("could not initialize graph at '{graph_uri}': {err}"),
-                ));
-                // The sidecar stays: the sweep classifies whether the failed
-                // init left a partial root (row 5) or nothing (row 1).
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
-                graph_moving_aborted = true;
-                continue;
-            }
-        }
-        // Record the post-init pin in the sidecar (best effort — a failure
-        // here leaves expected = null and the sweep classifies by digest).
-        if let Ok(db) = Omnigraph::open_read_only(&graph_uri).await {
-            if let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await {
-                sidecar.expected_manifest_version = Some(snapshot.graph_manifest_version());
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
-                    diagnostics.push(diagnostic);
-                }
-            }
-        }
-        // Crash point: the graph exists, the cluster state does not record it
-        // yet. A failure here must acknowledge nothing; the next run's sweep
-        // rolls the ledger forward (row 4).
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_AFTER_GRAPH_CREATE) {
-            diagnostics.push(diagnostic);
-            return early_return(
-                display_path(&desired.config_dir),
-                Some(desired.config_digest),
-                observations,
-                changes,
-                state.resource_statuses,
-                diagnostics,
-            );
-        }
-        completed_op_sidecars.push(sidecar_path);
-    }
-
-    // Schema applies execute next (RFC-004 §D5): the first cluster operation
-    // that moves an EXISTING graph manifest, sidecar-fenced the same way.
-    let schema_updates_to_run: Vec<String> = changes
-        .iter()
-        .filter(|change| {
-            change.disposition == Some(ApplyDisposition::Applied)
-                && change.operation == PlanOperation::Update
-                && matches!(resource_kind(&change.resource), ResourceKind::Schema(_))
-        })
-        .filter_map(|change| change.resource.strip_prefix("schema.").map(str::to_string))
-        .collect();
-    for graph_id in &schema_updates_to_run {
-        if graph_moving_aborted {
-            diagnostics.push(Diagnostic::warning(
-                "schema_apply_skipped",
-                schema_address(graph_id),
-                "skipped after an earlier graph-moving operation failed in this run",
-            ));
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-            continue;
-        }
-        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id) else {
-            continue;
-        };
-        let graph_uri = backend.graph_root(graph_id);
-        // Read-write open: the engine's own recovery sweep runs here, which
-        // is exactly what we want before moving its manifest.
-        let db = match Omnigraph::open(&graph_uri).await {
-            Ok(db) => db,
-            Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "schema_apply_failed",
-                    schema_address(graph_id),
-                    format!("could not open graph at '{graph_uri}': {err}"),
-                ));
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        let db = match applied_policies
-            .as_ref()
-            .and_then(|policies| policies.graph(graph_id))
-        {
-            Some(policy) => db.with_policy(policy),
-            None => db,
-        };
-        // Re-read + digest-verify the desired schema source before the
-        // cluster sidecar exists. Parser/planner rejections cannot have
-        // moved graph state, so they must not leave recovery work behind.
-        let schema_source = source_paths
-            .get(schema_address(graph_id).as_str())
-            .ok_or_else(|| {
-                Diagnostic::error(
-                    "schema_apply_failed",
-                    schema_address(graph_id),
-                    "no schema source recorded for graph",
-                )
-            })
-            .and_then(|path| {
-                fs::read_to_string(Path::new(path)).map_err(|err| {
-                    Diagnostic::error(
-                        "schema_apply_failed",
-                        schema_address(graph_id),
-                        format!("could not read schema source '{path}': {err}"),
-                    )
-                })
-            })
-            .and_then(|source| {
-                if sha256_hex(source.as_bytes()) == desired_graph.schema_digest {
-                    Ok(source)
-                } else {
-                    Err(Diagnostic::error(
-                        "resource_content_changed",
-                        schema_address(graph_id),
-                        "schema source changed while apply was running; re-run `cluster apply`",
-                    ))
-                }
-            });
-        let schema_source = match schema_source {
-            Ok(source) => source,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        if let Err(err) = db
-            .preview_schema_apply_with_options(&schema_source, SchemaApplyOptions::default())
-            .await
-        {
-            diagnostics.push(Diagnostic::error(
-                "schema_apply_failed",
-                schema_address(graph_id),
-                format!("schema apply is not supported on '{graph_uri}': {err}"),
-            ));
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-            graph_moving_aborted = true;
-            continue;
-        }
-        let observed_manifest_version = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(snapshot) => Some(snapshot.graph_manifest_version()),
-            Err(_) => None,
-        };
-        let recorded_schema_digest = state
-            .applied_revision
-            .resources
-            .get(&schema_address(graph_id))
-            .map(|entry| entry.digest.clone());
-        let mut sidecar = RecoverySidecar {
-            schema_version: 1,
-            operation_id: Ulid::new().to_string(),
-            started_at: now_rfc3339(),
-            actor: options.actor.clone(),
-            kind: RecoverySidecarKind::SchemaApply,
-            graph_id: graph_id.clone(),
-            graph_uri: graph_uri.clone(),
-            observed_manifest_version,
-            expected_manifest_version: None,
-            desired_schema_digest: desired_graph.schema_digest.clone(),
-            state_cas_base: expected_cas.clone(),
-            approval_id: None,
-        };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_BEFORE_SCHEMA_APPLY) {
-            // Simulated crash before the engine call: the sidecar stays; the
-            // sweep retires it next run (ledger still consistent with live).
-            diagnostics.push(diagnostic);
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-            graph_moving_aborted = true;
-            continue;
-        }
-        // Soft drops only: allow_data_loss stays false until the approval
-        // artifacts of stage 4C exist (RFC-004 §D4).
-        match db
-            .apply_schema_as(
-                &schema_source,
-                SchemaApplyOptions::default(),
-                options.actor.as_deref(),
-            )
-            .await
-        {
-            Ok(result) => {
-                sidecar.expected_manifest_version = Some(result.graph_manifest_version);
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
-                    diagnostics.push(diagnostic);
-                }
-            }
-            Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "schema_apply_failed",
-                    schema_address(graph_id),
-                    format!("schema apply failed on '{graph_uri}': {err}"),
-                ));
-                if live_schema_matches_recorded_digest(
-                    &graph_uri,
-                    recorded_schema_digest.as_deref(),
-                    observed_manifest_version,
-                )
-                .await
-                {
-                    // Pre-movement rejection: nothing moved, so retire the
-                    // sidecar eagerly. A delete failure leaves it safe (the
-                    // graph is quarantined until the next sweep), but surface
-                    // it so an operator isn't left debugging a silent stick.
-                    if let Err(err) = backend.try_delete_object(&sidecar_path).await {
-                        diagnostics.push(Diagnostic::warning(
-                            "recovery_sidecar_cleanup_failed",
-                            sidecar_path.clone(),
-                            format!(
-                                "could not delete the stale recovery sidecar after a pre-movement \
-                                 schema-apply rejection; graph `{graph_id}` stays quarantined until \
-                                 a state-mutating cluster command sweeps it: {err}"
-                            ),
-                        ));
-                    }
-                }
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
-                graph_moving_aborted = true;
-                continue;
-            }
-        }
-        // Crash point: the manifest moved, the ledger does not record it yet.
-        // A failure here acknowledges nothing; the sweep rolls forward.
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_AFTER_SCHEMA_APPLY) {
-            diagnostics.push(diagnostic);
-            return early_return(
-                display_path(&desired.config_dir),
-                Some(desired.config_digest),
-                observations,
-                changes,
-                state.resource_statuses,
-                diagnostics,
-            );
-        }
-        completed_op_sidecars.push(sidecar_path);
-    }
-
-    if !failed_graphs.is_empty() {
-        demote_dependents_of_failed_graphs(&mut changes, &failed_graphs, &desired.dependencies);
-    }
-
-    for change in &changes {
-        match change.disposition {
-            Some(ApplyDisposition::Deferred) => diagnostics.push(Diagnostic::warning(
-                "apply_unsupported_change",
-                change.resource.clone(),
-                "graph/schema changes are not applied in this stage; they are deferred to the graph-lifecycle phase",
-            )),
-            Some(ApplyDisposition::Blocked) => diagnostics.push(Diagnostic::warning(
-                "apply_dependency_blocked",
-                change.resource.clone(),
-                format!(
-                    "blocked by an unapplied or missing dependency ({})",
-                    change.reason.as_deref().unwrap_or("dependency")
-                ),
-            )),
-            _ => {}
-        }
-    }
-
-    // Payload phase: content-addressed writes before the state CAS. Any
-    // failure aborts before state moves; blobs already written are inert.
-    // Gate on payload-phase errors only — sweep errors (e.g. a kept row-5
-    // sidecar) must not abort the run, or their statuses would never persist.
-    let errors_before_payloads = count_errors(&diagnostics);
-    for change in &changes {
-        if change.disposition != Some(ApplyDisposition::Applied)
-            || change.operation == PlanOperation::Delete
-        {
-            continue;
-        }
-        let kind = resource_kind(&change.resource);
-        let digest = change
-            .after_digest
-            .as_deref()
-            .expect("create/update always carries an after digest");
-        if ClusterStore::payload_relative(&kind, digest).is_none() {
-            continue;
-        }
-        let Some(source) = source_paths.get(change.resource.as_str()) else {
-            diagnostics.push(Diagnostic::error(
-                "resource_payload_write_error",
-                change.resource.clone(),
-                "no source file recorded for resource",
-            ));
-            continue;
-        };
-        if let Err(diagnostic) =
-            write_resource_payload(&backend, &kind, Path::new(source), digest, &change.resource)
-                .await
-        {
-            diagnostics.push(diagnostic);
-        }
-    }
-    if count_errors(&diagnostics) > errors_before_payloads {
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            changes,
-            state.resource_statuses,
-            diagnostics,
-        );
-    }
-
-    // Crash point: payloads are on disk, state has not moved. A failure here
-    // must leave state.json byte-identical and acknowledge nothing; re-running
-    // apply repairs via the skip-if-exists blob reuse.
-    if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_AFTER_PAYLOAD_PHASE) {
-        diagnostics.push(diagnostic);
-        return early_return(
-            display_path(&desired.config_dir),
-            Some(desired.config_digest),
-            observations,
-            changes,
-            state.resource_statuses,
-            diagnostics,
-        );
-    }
-
-    // Approved graph deletes execute LAST (RFC-004 §D5): catalog writes for
-    // surviving resources land first, then the irreversible work.
-    let graph_deletes_to_run: Vec<String> = changes
-        .iter()
-        .filter(|change| {
-            change.disposition == Some(ApplyDisposition::Applied)
-                && change.operation == PlanOperation::Delete
-                && matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
-        })
-        .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
-        .collect();
-    let mut executed_deletes: Vec<(String, Option<String>)> = Vec::new(); // (graph_id, approval_id)
-    let mut consumed_approval_ids: Vec<String> = Vec::new();
-    for graph_id in &graph_deletes_to_run {
-        if graph_moving_aborted {
-            diagnostics.push(Diagnostic::warning(
-                "graph_delete_skipped",
-                graph_address(graph_id),
-                "skipped after an earlier graph-moving operation failed in this run",
-            ));
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-            continue;
-        }
-        let graph_addr = graph_address(graph_id);
-        // Re-locate the consumable approval (classification verified one exists).
-        let approval_id = approval_artifacts
-            .iter()
-            .map(|(_, artifact)| artifact)
-            .find(|artifact| {
-                artifact.consumed_at.is_none()
-                    && artifact.resource == graph_addr
-                    && artifact.bound_config_digest == desired.config_digest
-            })
-            .map(|artifact| artifact.approval_id.clone());
-        let graph_uri = backend.graph_root(graph_id);
-        let _export_exclusion = match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
-            Ok(guard) => guard,
-            Err(error) => {
-                diagnostics.push(Diagnostic::error(
-                        "graph_delete_export_in_progress",
-                        graph_addr.clone(),
-                        format!(
-                            "cannot remove graph root '{graph_uri}' while an immutable export owns it: {error}"
-                        ),
-                    ));
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
-            Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
-                Ok(snapshot) => Some(snapshot.graph_manifest_version()),
-                Err(_) => None,
-            },
-            Err(_) => None, // partial/unopenable roots still get deleted
-        };
-        let sidecar = RecoverySidecar {
-            schema_version: 1,
-            operation_id: Ulid::new().to_string(),
-            started_at: now_rfc3339(),
-            actor: options.actor.clone(),
-            kind: RecoverySidecarKind::GraphDelete,
-            graph_id: graph_id.clone(),
-            graph_uri: graph_uri.clone(),
-            observed_manifest_version,
-            expected_manifest_version: None, // no post-op manifest exists
-            desired_schema_digest: String::new(),
-            state_cas_base: expected_cas.clone(),
-            approval_id: approval_id.clone(),
-        };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
-            Ok(path) => path,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-                graph_moving_aborted = true;
-                continue;
-            }
-        };
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_BEFORE_GRAPH_DELETE) {
-            // Simulated crash before removal: row 8 retires the intent and
-            // the still-valid approval lets a later run retry.
-            diagnostics.push(diagnostic);
-            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-            graph_moving_aborted = true;
-            continue;
-        }
-        // Prefix delete through the storage layer: remove_dir_all locally,
-        // list+delete on object stores (idempotent; already-gone is fine).
-        match backend.delete_graph_root(&graph_uri).await {
-            Ok(()) => {}
-            Err(err) => {
-                diagnostics.push(Diagnostic::error(
-                    "graph_delete_failed",
-                    graph_addr.clone(),
-                    format!("could not remove graph root '{graph_uri}': {err}"),
-                ));
-                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
-                graph_moving_aborted = true;
-                continue;
-            }
-        }
-        // Crash point: the root is gone, the ledger does not record it yet.
-        // The sweep rolls forward (row 7b) and consumes the approval.
-        if let Err(diagnostic) = seams::fail(&CLUSTER_APPLY_AFTER_GRAPH_DELETE) {
-            diagnostics.push(diagnostic);
-            return early_return(
-                display_path(&desired.config_dir),
-                Some(desired.config_digest),
-                observations,
-                changes,
-                state.resource_statuses,
-                diagnostics,
-            );
-        }
-        executed_deletes.push((graph_id.clone(), approval_id.clone()));
-        if let Some(approval_id) = approval_id {
-            consumed_approval_ids.push(approval_id);
-        }
-        completed_op_sidecars.push(sidecar_path);
-    }
-    if !failed_graphs.is_empty() {
-        demote_dependents_of_failed_graphs(&mut changes, &failed_graphs, &desired.dependencies);
-    }
-
-    // State mutation. Apply owns query/policy statuses only; graph/schema
-    // statuses belong to refresh/import observation and must not be clobbered
-    // (the sweep above is the one exception: it owns recovery statuses).
-    let mut new_state = state.clone();
-    for change in &changes {
-        match change.disposition {
-            Some(ApplyDisposition::Applied) => match change.operation {
-                PlanOperation::Create | PlanOperation::Update => {
-                    new_state.applied_revision.resources.insert(
-                        change.resource.clone(),
-                        StateResource {
-                            digest: change
-                                .after_digest
-                                .clone()
-                                .expect("create/update always carries an after digest"),
-                            // Policies record their applied bindings so the
-                            // ledger is serving-sufficient (RFC-005 §D3).
-                            applies_to: desired.policy_bindings.get(&change.resource).cloned(),
-                            embedding_provider: None,
-                            embedding_profile: desired
-                                .embedding_providers
-                                .get(&change.resource)
-                                .cloned(),
-                            external_blob_policy: None,
-                        },
-                    );
-                    set_resource_status_applied(&mut new_state, &change.resource);
-                }
-                PlanOperation::Delete => {
-                    new_state
-                        .applied_revision
-                        .resources
-                        .remove(&change.resource);
-                    new_state.resource_statuses.remove(&change.resource);
-                }
-            },
-            Some(ApplyDisposition::Blocked)
-                // The sweep owns recovery statuses (Drifted/Error with their
-                // conditions); a generic Blocked must not clobber them.
-                if change.reason.as_deref() != Some("cluster_recovery_pending") => {
-                    set_resource_status(
-                        &mut new_state,
-                        &change.resource,
-                        ResourceLifecycleStatus::Blocked,
-                        change.reason.as_deref().unwrap_or("dependency_not_applied"),
-                        "waiting on an unapplied or missing dependency",
-                    );
-                }
-            _ => {}
-        }
-    }
-    for (graph_id, approval_id) in &executed_deletes {
-        tombstone_graph_subtree(
-            &mut new_state,
-            graph_id,
-            approval_id.as_deref(),
-            options.actor.as_deref(),
-        );
-        if let Some(approval_id) = approval_id {
-            record_approval_consumed(&mut new_state, approval_id, "apply");
-        }
-    }
-    recompute_state_graph_digests(&mut new_state, &desired, &changes);
-
-    let mut residual = diff_resources(
-        &state_resource_digests(&new_state),
-        &desired.resource_digests,
-    );
-    append_policy_binding_changes(&mut residual, Some(&new_state), &desired);
-    append_embedding_profile_changes(&mut residual, Some(&new_state), &desired);
-    let converged = residual.is_empty();
-    if converged {
-        new_state.applied_revision.config_digest = Some(desired.config_digest.clone());
-    }
-
-    let after_value =
-        serde_json::to_value(&new_state).expect("cluster state must serialize deterministically");
-    let mut state_written = false;
-    let mut state_write_failed = false;
-    if after_value != before_value {
-        new_state.state_revision = new_state.state_revision.saturating_add(1);
-        // The failpoint error routes through state_write_failed so the
-        // persisted-statuses revert contract below is exercised; a cfg_callback
-        // on this point can mutate state.json to simulate a concurrent writer,
-        // making write_state's CAS check fail organically.
-        let write_result = match seams::fail(&CLUSTER_APPLY_BEFORE_STATE_WRITE) {
-            Ok(()) => {
-                backend
-                    .write_state(&new_state, expected_cas.as_deref(), &mut observations)
-                    .await
-            }
-            Err(diagnostic) => Err(diagnostic),
-        };
-        match write_result {
-            Ok(()) => state_written = true,
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                state_write_failed = true;
-            }
-        }
-    }
-    // Completed (rows 2/4) sweep sidecars are deleted only once their outcome
-    // is durably recorded; on a failed write they stay and re-sweep next run.
-    if !state_write_failed {
-        for sidecar_uri in sweep
-            .completed_sidecars
-            .iter()
-            .chain(completed_op_sidecars.iter())
-        {
-            backend.delete_object(sidecar_uri).await;
-        }
-        let mut all_consumed = sweep.consumed_approvals.clone();
-        all_consumed.extend(consumed_approval_ids.iter().cloned());
-        mark_approvals_consumed(&backend, &all_consumed).await;
-    }
-    // On a failed state write, report the statuses that are actually on disk
-    // (the pre-apply snapshot), not the in-memory mutations that were never
-    // persisted — automation reading `resource_statuses` independently of `ok`
-    // must not see phantom status updates.
-    let resource_statuses = if state_write_failed {
-        state.resource_statuses
-    } else {
-        new_state.resource_statuses
-    };
-
-    let applied_count = changes
-        .iter()
-        .filter(|change| change.disposition == Some(ApplyDisposition::Applied))
-        .count();
-    let deferred_count = changes
-        .iter()
-        .filter(|change| {
-            matches!(
-                change.disposition,
-                Some(ApplyDisposition::Deferred) | Some(ApplyDisposition::Blocked)
-            )
-        })
-        .count();
-
-    ApplyOutput {
-        ok: !has_errors(&diagnostics),
-        config_dir: display_path(&desired.config_dir),
-        actor: options.actor.clone(),
-        desired_revision: DesiredRevision {
-            config_digest: Some(desired.config_digest),
-        },
-        state_observations: observations,
-        changes,
-        applied_count,
-        deferred_count,
-        converged,
-        state_written,
-        resource_statuses,
-        diagnostics,
-    }
-}
-
-/// Record a digest-bound human approval for a gated (irreversible) change —
-/// today: graph deletes. The artifact binds to the exact desired config
-/// digest and the change's before/after digests, so config or state drift
-/// invalidates it automatically (a stale approval can never authorize a
-/// different change).
-pub async fn approve_config_dir(
-    config_dir: impl AsRef<Path>,
-    resource: &str,
-    approved_by: &str,
-) -> ApproveOutput {
-    let outcome = load_desired(config_dir.as_ref());
-    let mut diagnostics = outcome.diagnostics;
-    let storage_root = outcome
-        .desired
-        .as_ref()
-        .and_then(|desired| desired.storage_root.clone());
-    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
-        Ok(backend) => backend,
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            ClusterStore::for_config_dir(&outcome.config_dir)
-        }
-    };
-    let mut observations = backend.observations();
-
-    let fail = |config_dir: String, diagnostics: Vec<Diagnostic>| ApproveOutput {
-        ok: false,
-        config_dir,
-        approval_id: None,
-        resource: None,
-        operation: None,
-        approved_by: None,
-        diagnostics,
-    };
-
-    let Some(desired) = outcome.desired else {
-        return fail(display_path(&outcome.config_dir), diagnostics);
-    };
-    if has_errors(&diagnostics) {
-        return fail(display_path(&desired.config_dir), diagnostics);
-    }
-
-    let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("approve", &mut observations).await {
-            Ok(guard) => Some(guard),
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                return fail(display_path(&desired.config_dir), diagnostics);
-            }
-        }
-    } else {
-        diagnostics.push(Diagnostic::warning(
-            "state_lock_disabled",
-            "state.lock",
-            "state.lock is false; approve ran without acquiring the cluster state lock",
-        ));
-        None
-    };
-
-    let state = match backend.read_state(&mut observations).await {
-        Ok(snapshot) => match snapshot.state {
-            Some(state) => state,
-            None => {
-                diagnostics.push(Diagnostic::error(
-                    "state_missing",
-                    CLUSTER_STATE_FILE,
-                    "approve requires an existing state.json; run `cluster import` first",
-                ));
-                return fail(display_path(&desired.config_dir), diagnostics);
-            }
-        },
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            return fail(display_path(&desired.config_dir), diagnostics);
-        }
-    };
-
-    let prior_resources = state_resource_digests(&state);
-    let changes = diff_resources(&prior_resources, &desired.resource_digests);
-    let gates = compute_approvals(&changes, &BTreeSet::new());
-    let Some(change) = changes.iter().find(|change| {
-        change.resource == resource && gates.iter().any(|gate| gate.resource == resource)
-    }) else {
-        diagnostics.push(Diagnostic::error(
-            "approval_not_required",
-            resource,
-            "no pending change for this resource requires approval (check `cluster plan`)",
-        ));
-        return fail(display_path(&desired.config_dir), diagnostics);
-    };
-
-    let artifact = ApprovalArtifact {
-        schema_version: 1,
-        approval_id: Ulid::new().to_string(),
-        resource: change.resource.clone(),
-        operation: match change.operation {
-            PlanOperation::Create => "create",
-            PlanOperation::Update => "update",
-            PlanOperation::Delete => "delete",
-        }
-        .to_string(),
-        reason: gates
-            .iter()
-            .find(|gate| gate.resource == resource)
-            .map(|gate| gate.reason.clone())
-            .unwrap_or_default(),
-        bound_config_digest: desired.config_digest.clone(),
-        bound_before_digest: change.before_digest.clone(),
-        bound_after_digest: change.after_digest.clone(),
-        approved_by: approved_by.to_string(),
-        created_at: now_rfc3339(),
-        consumed_at: None,
-        consumed_by_operation: None,
-    };
-    if let Err(diagnostic) = backend.write_approval_artifact(&artifact).await {
-        diagnostics.push(diagnostic);
-        return fail(display_path(&desired.config_dir), diagnostics);
-    }
-
-    ApproveOutput {
-        ok: !has_errors(&diagnostics),
-        config_dir: display_path(&desired.config_dir),
-        approval_id: Some(artifact.approval_id),
-        resource: Some(artifact.resource),
-        operation: Some(change.operation.clone()),
-        approved_by: Some(artifact.approved_by),
         diagnostics,
     }
 }
@@ -1597,8 +427,8 @@ pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
                 Ok(snapshot) => {
                     if let Some(state) = snapshot.state {
                         // Read-only point-in-time catalog check: report the
-                        // findings as diagnostics; persisting Drifted statuses
-                        // is refresh's job. Status never writes state.
+                        // findings as diagnostics. Status never rewrites the
+                        // achieved revision or adopts observed graph state.
                         for (address, finding) in verify_catalog_payloads(&backend, &state).await {
                             diagnostics.push(payload_finding_diagnostic(&address, &finding));
                         }
@@ -1674,36 +504,18 @@ pub async fn force_unlock_config_dir(
     }
 }
 
-pub async fn refresh_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
-    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Refresh).await
-}
-
-pub async fn import_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
-    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Import).await
-}
-
-/// `refresh` without the lock, the recovery sweep, or the write (RFC 0049):
-/// verify catalog payloads and observe every declared graph through the
-/// read-only open, and report the statuses and observations `refresh` would
-/// have recorded. The ledger's bytes and revision are untouched; the output
-/// is labeled `authority: observed` and names the `state_cas` it read.
+/// Inspect the current catalog and graph observations without changing authority.
+/// The ledger bytes, revision and ownership lock remain untouched.
 pub async fn observe_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
-    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Observe).await
-}
-
-async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> StateSyncOutput {
-    let mut authority = if operation == StateSyncOperation::Observe {
-        LedgerAuthority::Observed
-    } else {
-        LedgerAuthority::Locked
-    };
-    let outcome = load_desired(config_dir);
+    let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let storage_root = outcome
-        .desired
-        .as_ref()
-        .and_then(|desired| desired.storage_root.clone());
-    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+    let backend = match store_for(
+        &outcome.config_dir,
+        outcome
+            .desired
+            .as_ref()
+            .and_then(|desired| desired.storage_root.as_deref()),
+    ) {
         Ok(backend) => backend,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -1711,316 +523,93 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         }
     };
     let mut observations = backend.observations();
-
-    let Some(desired) = outcome.desired else {
-        return StateSyncOutput {
-            ok: false,
-            operation,
-            authority,
-            config_dir: display_path(&outcome.config_dir),
-            state_observations: observations,
-            resource_digests: BTreeMap::new(),
-            resource_statuses: BTreeMap::new(),
-            observations: BTreeMap::new(),
-            diagnostics,
-        };
-    };
-
-    if has_errors(&diagnostics) {
-        return StateSyncOutput {
-            ok: false,
-            operation,
-            authority,
-            config_dir: display_path(&desired.config_dir),
-            state_observations: observations,
-            resource_digests: desired.resource_digests,
-            resource_statuses: BTreeMap::new(),
-            observations: BTreeMap::new(),
-            diagnostics,
-        };
-    }
-
-    let operation_label = state_sync_operation_label(operation);
-    if operation != StateSyncOperation::Observe && !desired.state_lock {
-        authority = LedgerAuthority::Unlocked;
-    }
-    let _lock_guard = if operation == StateSyncOperation::Observe {
-        backend
-            .observe_lock(&mut observations, &mut diagnostics)
-            .await;
+    backend
+        .observe_lock(&mut observations, &mut diagnostics)
+        .await;
+    warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
+    let mut state = if has_errors(&diagnostics) {
         None
-    } else if desired.state_lock {
-        match backend
-            .acquire_lock(operation_label, &mut observations)
-            .await
-        {
-            Ok(guard) => Some(guard),
+    } else {
+        match backend.read_state(&mut observations).await {
+            Ok(snapshot) => match snapshot.state {
+                Some(state) if state.version == 2 => Some(state),
+                Some(_) => {
+                    diagnostics.push(Diagnostic::error(
+                        "ledger_upgrade_required",
+                        CLUSTER_STATE_FILE,
+                        "convert the stopped cluster ledger to v2 before observing its graphs",
+                    ));
+                    None
+                }
+                None => {
+                    diagnostics.push(Diagnostic::error(
+                        "state_missing",
+                        CLUSTER_STATE_FILE,
+                        "no applied cluster state; run `cluster apply` first",
+                    ));
+                    None
+                }
+            },
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 None
             }
         }
-    } else {
-        diagnostics.push(Diagnostic::warning(
-            "state_lock_disabled",
-            "state.lock",
-            format!(
-                "state.lock is false; {operation_label} wrote state without acquiring the cluster state lock"
-            ),
-        ));
-        None
     };
-
-    if has_errors(&diagnostics) {
-        return StateSyncOutput {
-            ok: false,
-            operation,
-            authority,
-            config_dir: display_path(&desired.config_dir),
-            state_observations: observations,
-            resource_digests: desired.resource_digests,
-            resource_statuses: BTreeMap::new(),
-            observations: BTreeMap::new(),
-            diagnostics,
-        };
-    }
-
-    let snapshot = match backend.read_state(&mut observations).await {
-        Ok(snapshot) => snapshot,
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            return StateSyncOutput {
-                ok: false,
-                operation,
-                authority,
-                config_dir: display_path(&desired.config_dir),
-                state_observations: observations,
-                resource_digests: desired.resource_digests,
-                resource_statuses: BTreeMap::new(),
-                observations: BTreeMap::new(),
-                diagnostics,
-            };
-        }
-    };
-
-    let expected_cas = snapshot.state_cas;
-    let mut state = match (operation, snapshot.state) {
-        (StateSyncOperation::Refresh, Some(state)) => state,
-        (StateSyncOperation::Refresh, None) => {
-            diagnostics.push(Diagnostic::error(
-                "state_missing",
-                CLUSTER_STATE_FILE,
-                "refresh requires an existing state.json; run `cluster import` to bootstrap state",
-            ));
-            return StateSyncOutput {
-                ok: false,
-                operation,
-                authority,
-                config_dir: display_path(&desired.config_dir),
-                state_observations: observations,
-                resource_digests: BTreeMap::new(),
-                resource_statuses: BTreeMap::new(),
-                observations: BTreeMap::new(),
-                diagnostics,
-            };
-        }
-        (StateSyncOperation::Observe, Some(state)) => state,
-        (StateSyncOperation::Observe, None) => {
-            diagnostics.push(Diagnostic::error(
-                "state_missing",
-                CLUSTER_STATE_FILE,
-                "observe requires an existing state.json; run `cluster import` to bootstrap state",
-            ));
-            return StateSyncOutput {
-                ok: false,
-                operation,
-                authority,
-                config_dir: display_path(&desired.config_dir),
-                state_observations: observations,
-                resource_digests: BTreeMap::new(),
-                resource_statuses: BTreeMap::new(),
-                observations: BTreeMap::new(),
-                diagnostics,
-            };
-        }
-        (StateSyncOperation::Import, Some(state)) => {
-            diagnostics.push(Diagnostic::error(
-                "state_already_exists",
-                CLUSTER_STATE_FILE,
-                "import creates initial state only when state.json is missing; use `cluster refresh` for an existing state ledger",
-            ));
-            return StateSyncOutput {
-                ok: false,
-                operation,
-                authority,
-                config_dir: display_path(&desired.config_dir),
-                state_observations: observations,
-                resource_digests: state_resource_digests(&state),
-                resource_statuses: state.resource_statuses,
-                observations: state.observations,
-                diagnostics,
-            };
-        }
-        (StateSyncOperation::Import, None) => initial_import_state(&desired),
-    };
-
-    // Refresh and recovery may derive a replacement graph composite from
-    // state-resident metadata. Refuse a severed binding before either pass can
-    // turn hand-edited metadata into a newly self-consistent applied revision.
-    if !validate_state_graph_resource_digests(&state, &mut diagnostics) {
-        return StateSyncOutput {
-            ok: false,
-            operation,
-            authority,
-            config_dir: display_path(&desired.config_dir),
-            state_observations: observations,
-            resource_digests: state_resource_digests(&state),
-            resource_statuses: state.resource_statuses,
-            observations: state.observations,
-            diagnostics,
-        };
-    }
-
-    // Recovery sweep first (RFC-004 §D3): classify any interrupted graph
-    // operation before observation/verification so a rolled-forward outcome
-    // is what those passes see.
-    let sweep = match operation {
-        StateSyncOperation::Refresh | StateSyncOperation::Import => {
-            Some(sweep_recovery_sidecars(&backend, &mut state, &mut diagnostics).await)
-        }
-        // Observe never sweeps: pending sidecars are reported, not acted on.
-        StateSyncOperation::Observe => {
-            warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
-            None
-        }
-    };
-
-    {
-        // Catalog payload verification must run BEFORE graph observation: removing
-        // a drifted query digest first means the live-graph composite recompute
-        // below already excludes it, so the persisted graph.<id> composite stays
-        // consistent and the next plan shows exactly the create + derived update.
-        for (address, finding) in verify_catalog_payloads(&backend, &state).await {
-            diagnostics.push(payload_finding_diagnostic(&address, &finding));
-            match finding {
-                PayloadFinding::Missing => {
-                    state.applied_revision.resources.remove(&address);
-                    set_resource_status(
-                        &mut state,
-                        &address,
+    if let Some(state) = state.as_mut() {
+        if validate_state_graph_resource_digests(state, &mut diagnostics) {
+            for (address, finding) in verify_catalog_payloads(&backend, state).await {
+                diagnostics.push(payload_finding_diagnostic(&address, &finding));
+                let (status, code, message) = match finding {
+                    PayloadFinding::Missing => (
                         ResourceLifecycleStatus::Drifted,
                         "payload_missing",
-                        "catalog payload blob is missing; re-run `cluster apply` to republish",
-                    );
-                }
-                PayloadFinding::Mismatch { .. } => {
-                    state.applied_revision.resources.remove(&address);
-                    set_resource_status(
-                        &mut state,
-                        &address,
+                        "catalog payload blob is missing".to_owned(),
+                    ),
+                    PayloadFinding::Mismatch { .. } => (
                         ResourceLifecycleStatus::Drifted,
                         "payload_mismatch",
-                        "catalog payload blob does not match the recorded digest; re-run `cluster apply` to republish",
-                    );
-                }
-                // Transient IO must not trigger a spurious republish: keep the
-                // digest, surface the error, let a later clean refresh converge.
-                PayloadFinding::ReadError(error) => {
-                    set_resource_status(
-                        &mut state,
-                        &address,
-                        ResourceLifecycleStatus::Error,
-                        "payload_read_error",
-                        &error,
-                    );
-                }
-            }
-        }
-
-        let graph_error_count = observe_declared_graphs(&desired, &backend, &mut state).await;
-        if graph_error_count > 0 {
-            diagnostics.push(Diagnostic::error(
-                "graph_observation_error",
-                CLUSTER_GRAPHS_DIR,
-                format!("{graph_error_count} graph observation(s) failed"),
-            ));
-        }
-    }
-
-    if operation == StateSyncOperation::Import && has_errors(&diagnostics) {
-        return StateSyncOutput {
-            ok: false,
-            operation,
-            authority,
-            config_dir: display_path(&desired.config_dir),
-            state_observations: observations,
-            resource_digests: state_resource_digests(&state),
-            resource_statuses: state.resource_statuses,
-            observations: state.observations,
-            diagnostics,
-        };
-    }
-
-    match operation {
-        StateSyncOperation::Import => state.state_revision = 1,
-        StateSyncOperation::Refresh => match state.state_revision.checked_add(1) {
-            Some(next) => state.state_revision = next,
-            None => {
-                diagnostics.push(Diagnostic::error(
-                    "state_revision_overflow",
-                    CLUSTER_STATE_FILE,
-                    "state_revision is at u64::MAX and cannot advance; the ledger was left unchanged",
-                ));
-                return StateSyncOutput {
-                    ok: false,
-                    operation,
-                    authority,
-                    config_dir: display_path(&desired.config_dir),
-                    state_observations: observations,
-                    resource_digests: state_resource_digests(&state),
-                    resource_statuses: state.resource_statuses,
-                    observations: state.observations,
-                    diagnostics,
-                };
-            }
-        },
-        // Observe never moves the revision.
-        StateSyncOperation::Observe => {}
-    }
-
-    if operation != StateSyncOperation::Observe {
-        match backend
-            .write_state(&state, expected_cas.as_deref(), &mut observations)
-            .await
-        {
-            Ok(()) => {
-                if let Some(sweep) = &sweep {
-                    // Completed sweep sidecars are deleted only after their
-                    // outcome is durably recorded; on failure they stay and
-                    // re-sweep.
-                    for sidecar_uri in &sweep.completed_sidecars {
-                        backend.delete_object(sidecar_uri).await;
+                        "catalog payload does not match its recorded digest".to_owned(),
+                    ),
+                    PayloadFinding::ReadError(error) => {
+                        (ResourceLifecycleStatus::Error, "payload_read_error", error)
                     }
-                    mark_approvals_consumed(&backend, &sweep.consumed_approvals).await;
+                };
+                set_resource_status(state, &address, status, code, &message);
+            }
+            if let Some(desired) = outcome.desired {
+                if observe_declared_graphs(&desired, &backend, state).await > 0 {
+                    diagnostics.push(Diagnostic::error(
+                        "graph_observation_error",
+                        CLUSTER_GRAPHS_DIR,
+                        "one or more graph observations failed",
+                    ));
                 }
             }
-            Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
-
-    let resource_digests = state_resource_digests(&state);
-    let ok = !has_errors(&diagnostics);
-
     StateSyncOutput {
-        ok,
-        operation,
-        authority,
-        config_dir: display_path(&desired.config_dir),
+        ok: !has_errors(&diagnostics),
+        operation: StateSyncOperation::Observe,
+        authority: LedgerAuthority::Observed,
+        config_dir: display_path(&outcome.config_dir),
         state_observations: observations,
-        resource_digests,
-        resource_statuses: state.resource_statuses,
-        observations: state.observations,
+        resource_digests: state
+            .as_ref()
+            .map(state_resource_digests)
+            .unwrap_or_default(),
+        resource_statuses: state
+            .as_ref()
+            .map(|state| state.resource_statuses.clone())
+            .unwrap_or_default(),
+        observations: state.map(|state| state.observations).unwrap_or_default(),
         diagnostics,
+    }
+}
+
+async fn warn_pending_recovery_sidecars(backend: &ClusterStore, diagnostics: &mut Vec<Diagnostic>) {
+    for location in backend.list_recovery_sidecar_locations(diagnostics).await {
+        diagnostics.push(Diagnostic::warning("legacy_recovery_pending", location, "legacy recovery evidence must be resolved before explicit ledger conversion; this build never sweeps or adopts it"));
     }
 }
 
@@ -2087,128 +676,6 @@ fn payload_finding_diagnostic(address: &str, finding: &PayloadFinding) -> Diagno
 /// digest-named file is trusted as-is. The digest re-check is the apply-side
 /// TOCTOU detector — the source file changing between `load_desired` and the
 /// payload write must fail loudly, never publish mismatched content.
-async fn write_resource_payload(
-    backend: &ClusterStore,
-    kind: &ResourceKind,
-    source: &Path,
-    expected_digest: &str,
-    resource: &str,
-) -> Result<(), Diagnostic> {
-    if backend.payload_exists(kind, expected_digest).await {
-        // Content-addressed: an existing digest-named object is identical.
-        return Ok(());
-    }
-    let bytes = fs::read(source).map_err(|err| {
-        Diagnostic::error(
-            "resource_payload_write_error",
-            resource,
-            format!(
-                "could not read resource source '{}': {err}",
-                source.display()
-            ),
-        )
-    })?;
-    if sha256_hex(&bytes) != expected_digest {
-        // The apply-side TOCTOU detector: the source changing between
-        // load_desired and this write must fail loudly, never publish
-        // mismatched content.
-        return Err(Diagnostic::error(
-            "resource_content_changed",
-            resource,
-            format!(
-                "resource source '{}' changed while apply was running; re-run `cluster apply`",
-                source.display()
-            ),
-        ));
-    }
-    let content = String::from_utf8(bytes).map_err(|err| {
-        Diagnostic::error(
-            "resource_payload_write_error",
-            resource,
-            format!("resource source is not valid UTF-8: {err}"),
-        )
-    })?;
-    backend
-        .write_payload(kind, expected_digest, &content)
-        .await
-        .map_err(|err| {
-            Diagnostic::error(
-                "resource_payload_write_error",
-                resource,
-                format!("could not write payload: {err}"),
-            )
-        })
-}
-
-/// Recompute the composite `graph.<id>` digests for state-resident graphs from
-/// state's own schema/query components. Without this, an applied query change
-/// would leave the prior composite digest in state and `graph.<id>` would show
-/// a phantom update in every later plan — apply could never converge.
-fn recompute_state_graph_digests(
-    state: &mut ClusterState,
-    desired: &DesiredCluster,
-    changes: &[PlanChange],
-) {
-    for graph in &desired.graphs {
-        let graph_address = graph_address(&graph.id);
-        if !state
-            .applied_revision
-            .resources
-            .contains_key(&graph_address)
-        {
-            continue;
-        }
-        let schema_digest = state
-            .applied_revision
-            .resources
-            .get(&schema_address(&graph.id))
-            .map(|resource| resource.digest.clone());
-        let query_digests = state_query_digests_for_graph(state, &graph.id);
-        let embedding_provider = graph.embedding_provider.as_deref();
-        let embedding_provider_digest = embedding_provider
-            .and_then(|address| state.applied_revision.resources.get(address))
-            .map(|resource| resource.digest.clone());
-        // A graph composite is normally derived from desired graph metadata
-        // after its executable changes settle. A blocked graph/schema change
-        // is different: that run did not apply the desired graph authority, so
-        // keep the policy already recorded in the applied ledger. Otherwise a
-        // failed schema migration could still broaden Deny to Allow (or revoke
-        // an existing Allow) for the next serving process.
-        let graph_change_blocked = changes.iter().any(|change| {
-            change.disposition == Some(ApplyDisposition::Blocked)
-                && match resource_kind(&change.resource) {
-                    ResourceKind::Graph(graph_id) | ResourceKind::Schema(graph_id) => {
-                        graph_id == graph.id
-                    }
-                    _ => false,
-                }
-        });
-        let external_blob_policy = if graph_change_blocked {
-            state_graph_external_blob_policy(state, &graph.id)
-        } else {
-            graph.external_blob_policy.clone()
-        };
-        let digest = graph_digest_with_external_blob_policy(
-            &graph.id,
-            schema_digest.as_ref(),
-            Some(&query_digests),
-            embedding_provider,
-            embedding_provider_digest.as_ref(),
-            &external_blob_policy,
-        );
-        state.applied_revision.resources.insert(
-            graph_address,
-            StateResource {
-                digest,
-                applies_to: None,
-                embedding_provider: graph.embedding_provider.clone(),
-                embedding_profile: None,
-                external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
-            },
-        );
-    }
-}
-
 fn duplicate_key_diagnostics(text: &str) -> Vec<Diagnostic> {
     #[derive(Debug)]
     struct Frame {
@@ -2510,29 +977,6 @@ fn embedding_provider_digest(profile: &EmbeddingProviderConfig) -> String {
     sha256_hex(input.as_bytes())
 }
 
-async fn live_schema_matches_recorded_digest(
-    graph_uri: &str,
-    recorded_schema_digest: Option<&str>,
-    observed_manifest_version: Option<u64>,
-) -> bool {
-    let Some(recorded_schema_digest) = recorded_schema_digest else {
-        return false;
-    };
-    let Some(observed_manifest_version) = observed_manifest_version else {
-        return false;
-    };
-    let Ok(db) = Omnigraph::open_read_only(graph_uri).await else {
-        return false;
-    };
-    let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await else {
-        return false;
-    };
-    if snapshot.graph_manifest_version() != observed_manifest_version {
-        return false;
-    }
-    sha256_hex(db.schema_source().as_bytes()) == recorded_schema_digest
-}
-
 fn desired_config_digest(
     raw: &RawClusterConfig,
     resource_digests: &BTreeMap<String, String>,
@@ -2584,14 +1028,6 @@ fn lock_age_seconds(created_at: &str) -> Option<u64> {
             .whole_seconds()
             .max(0) as u64,
     )
-}
-
-fn state_sync_operation_label(operation: StateSyncOperation) -> &'static str {
-    match operation {
-        StateSyncOperation::Refresh => "refresh",
-        StateSyncOperation::Import => "import",
-        StateSyncOperation::Observe => "observe",
-    }
 }
 
 fn has_errors(diagnostics: &[Diagnostic]) -> bool {

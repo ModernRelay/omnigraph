@@ -4,6 +4,110 @@
 //! state never lives here (see store.rs).
 
 use super::*;
+use std::io::Read;
+use std::sync::Arc;
+
+pub(crate) const MAX_CONFIG_SOURCE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_CONFIG_TOTAL_BYTES: usize = 8_388_608;
+pub(crate) const MAX_CONFIG_RESOURCES: usize = 4096;
+const MAX_CONFIG_DISCOVERY_ENTRIES: usize = 4096;
+
+/// The validated desired projection and the exact bytes used to derive it.
+/// Content digests deduplicate shared source files; execution never reopens them.
+pub(crate) struct CapturedDesired {
+    pub(crate) outcome: LoadOutcome,
+    pub(crate) sources: BTreeMap<String, Arc<str>>,
+}
+
+#[derive(Default)]
+struct SourceCapture {
+    paths: BTreeMap<PathBuf, String>,
+    sources: BTreeMap<String, Arc<str>>,
+    total_bytes: usize,
+    resources: usize,
+    discovery_entries: usize,
+}
+
+impl SourceCapture {
+    fn read(&mut self, path: &Path) -> std::io::Result<Arc<str>> {
+        // Cache the declared spelling as well as its canonical file, so an
+        // already captured file remains immutable even if removed or retargeted.
+        if let Some(digest) = self.paths.get(path) {
+            return Ok(Arc::clone(&self.sources[digest]));
+        }
+        let canonical = fs::canonicalize(path)?;
+        if let Some(digest) = self.paths.get(&canonical).cloned() {
+            self.paths.insert(path.to_path_buf(), digest.clone());
+            return Ok(Arc::clone(&self.sources[&digest]));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(&canonical)?
+            .take(MAX_CONFIG_SOURCE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_CONFIG_SOURCE_BYTES {
+            return Err(source_limit("source bytes", MAX_CONFIG_SOURCE_BYTES));
+        }
+        let digest = sha256_hex(&bytes);
+        let source = if let Some(source) = self.sources.get(&digest) {
+            Arc::clone(source)
+        } else {
+            if bytes.len() > MAX_CONFIG_TOTAL_BYTES - self.total_bytes {
+                return Err(source_limit(
+                    "distinct source bytes",
+                    MAX_CONFIG_TOTAL_BYTES,
+                ));
+            }
+            let source: Arc<str> = String::from_utf8(bytes)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?
+                .into();
+            self.total_bytes += source.len();
+            self.sources.insert(digest.clone(), Arc::clone(&source));
+            source
+        };
+        self.paths.insert(canonical, digest.clone());
+        self.paths.insert(path.to_path_buf(), digest);
+        Ok(source)
+    }
+
+    fn reserve_resources(&mut self, count: usize) -> bool {
+        if count > MAX_CONFIG_RESOURCES - self.resources {
+            return false;
+        }
+        self.resources += count;
+        true
+    }
+
+    fn visit_discovery_entry(&mut self) -> bool {
+        if self.discovery_entries == MAX_CONFIG_DISCOVERY_ENTRIES {
+            return false;
+        }
+        self.discovery_entries += 1;
+        true
+    }
+}
+
+fn source_limit(resource: &str, limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("configuration {resource} exceeds limit {limit}"),
+    )
+}
+
+fn source_error_code(error: &std::io::Error, fallback: &'static str) -> &'static str {
+    if error.kind() == std::io::ErrorKind::FileTooLarge {
+        "config_source_limit"
+    } else {
+        fallback
+    }
+}
+
+fn resource_limit_diagnostic(path: impl Into<String>) -> Diagnostic {
+    Diagnostic::error(
+        "config_resource_limit",
+        path,
+        format!("configuration exceeds {MAX_CONFIG_RESOURCES} resources"),
+    )
+}
 
 /// How a graph declares its stored queries. Terraform-style: the `.gq`
 /// files ARE the declaration — point at them (or a directory) and every
@@ -31,73 +135,57 @@ impl Default for QueriesDecl {
 /// Discovery reads and parses each `.gq`; unreadable or unparseable files
 /// and duplicate query names are loud validation errors — a declaration the
 /// tool cannot enumerate is broken, not partially usable.
-pub(crate) fn resolve_query_decls(
+fn resolve_query_decls(
     config_dir: &Path,
     graph_id: &str,
     decl: &QueriesDecl,
+    capture: &mut SourceCapture,
     diagnostics: &mut Vec<Diagnostic>,
-) -> (BTreeMap<String, QueryConfig>, BTreeMap<PathBuf, String>) {
-    let paths: Vec<PathBuf> = match decl {
+) -> BTreeMap<String, QueryConfig> {
+    let setting = format!("graphs.{graph_id}.queries");
+    let paths = match decl {
         QueriesDecl::Explicit(map) => {
-            return (
-                map.iter()
-                    .map(|(name, config)| {
-                        (
-                            name.clone(),
-                            QueryConfig {
-                                file: config.file.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-                BTreeMap::new(),
-            );
+            if !capture.reserve_resources(map.len()) {
+                diagnostics.push(resource_limit_diagnostic(setting));
+                return BTreeMap::new();
+            }
+            return map
+                .iter()
+                .map(|(name, config)| {
+                    (
+                        name.clone(),
+                        QueryConfig {
+                            file: config.file.clone(),
+                        },
+                    )
+                })
+                .collect();
         }
-        QueriesDecl::Discover(path) => vec![path.clone()],
-        QueriesDecl::DiscoverMany(paths) => paths.clone(),
+        QueriesDecl::Discover(path) => std::slice::from_ref(path),
+        QueriesDecl::DiscoverMany(paths) => paths.as_slice(),
     };
 
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (declared-relative, resolved)
-    for declared in &paths {
-        if !check_config_path(
-            config_dir,
-            declared,
-            &format!("graphs.{graph_id}.queries"),
-            diagnostics,
-        ) {
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for declared in paths {
+        if !capture.visit_discovery_entry() {
+            diagnostics.push(Diagnostic::error(
+                "config_discovery_limit",
+                &setting,
+                format!("query discovery exceeds {MAX_CONFIG_DISCOVERY_ENTRIES} paths/entries"),
+            ));
+            return BTreeMap::new();
+        }
+        if !check_config_path(config_dir, declared, &setting, diagnostics) {
             continue;
         }
         let resolved = resolve_config_path(config_dir, declared);
         if resolved.is_dir() {
-            let mut entries: Vec<PathBuf> = match fs::read_dir(&resolved) {
-                Ok(read) => read
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "gq"))
-                    // A discovered entry is checked with no-follow metadata
-                    // before anything reads it: a symbolic link inside a
-                    // checked directory is refused the same way as one on the
-                    // way to it.
-                    .filter(|path| {
-                        let is_symlink = fs::symlink_metadata(path)
-                            .is_ok_and(|meta| meta.file_type().is_symlink());
-                        if is_symlink {
-                            diagnostics.push(Diagnostic::error(
-                                "config_path_symlink",
-                                format!("graphs.{graph_id}.queries"),
-                                format!(
-                                    "query file '{}' is a symbolic link; declare the target directly",
-                                    path.display()
-                                ),
-                            ));
-                        }
-                        !is_symlink
-                    })
-                    .collect(),
+            let read = match fs::read_dir(&resolved) {
+                Ok(read) => read,
                 Err(err) => {
                     diagnostics.push(Diagnostic::error(
                         "query_dir_unreadable",
-                        format!("graphs.{graph_id}.queries"),
+                        &setting,
                         format!(
                             "could not list query directory '{}': {err}",
                             resolved.display()
@@ -106,11 +194,55 @@ pub(crate) fn resolve_query_decls(
                     continue;
                 }
             };
+            let mut entries = Vec::new();
+            for entry in read {
+                // Charge every entry, even non-query files. Never collect an
+                // unbounded directory and then filter or truncate it.
+                if !capture.visit_discovery_entry() {
+                    diagnostics.push(Diagnostic::error(
+                        "config_discovery_limit",
+                        &setting,
+                        format!(
+                            "query discovery exceeds {MAX_CONFIG_DISCOVERY_ENTRIES} paths/entries"
+                        ),
+                    ));
+                    return BTreeMap::new();
+                }
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(err) => {
+                        diagnostics.push(Diagnostic::error(
+                            "query_dir_unreadable",
+                            &setting,
+                            format!(
+                                "could not enumerate query directory '{}': {err}",
+                                resolved.display()
+                            ),
+                        ));
+                        return BTreeMap::new();
+                    }
+                };
+                if !path.extension().is_some_and(|ext| ext == "gq") {
+                    continue;
+                }
+                if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                    diagnostics.push(Diagnostic::error(
+                        "config_path_symlink",
+                        &setting,
+                        format!(
+                            "query file '{}' is a symbolic link; declare the target directly",
+                            path.display()
+                        ),
+                    ));
+                    continue;
+                }
+                entries.push(path);
+            }
             entries.sort();
             if entries.is_empty() {
                 diagnostics.push(Diagnostic::warning(
                     "query_dir_empty",
-                    format!("graphs.{graph_id}.queries"),
+                    &setting,
                     format!(
                         "query directory '{}' contains no .gq files",
                         resolved.display()
@@ -126,19 +258,15 @@ pub(crate) fn resolve_query_decls(
         }
     }
 
-    let mut registry: BTreeMap<String, QueryConfig> = BTreeMap::new();
+    let mut registry = BTreeMap::new();
     let mut origin: BTreeMap<String, PathBuf> = BTreeMap::new();
-    // Content read once at discovery and handed to the caller — the per-query
-    // digest/typecheck pass reuses it instead of re-reading (no N+1 reads, no
-    // window for the file to change between enumeration and validation).
-    let mut contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (declared, resolved) in files {
-        let source = match fs::read_to_string(&resolved) {
+        let source = match capture.read(&resolved) {
             Ok(source) => source,
             Err(err) => {
                 diagnostics.push(Diagnostic::error(
-                    "query_file_missing",
-                    format!("graphs.{graph_id}.queries"),
+                    source_error_code(&err, "query_file_missing"),
+                    &setting,
                     format!("could not read query file '{}': {err}", resolved.display()),
                 ));
                 continue;
@@ -150,7 +278,7 @@ pub(crate) fn resolve_query_decls(
                 Err(message) => {
                     diagnostics.push(Diagnostic::error(
                         "query_parse_error",
-                        format!("graphs.{graph_id}.queries"),
+                        &setting,
                         format!(
                             "'{}' is not a stored-query file: {message}",
                             resolved.display()
@@ -163,7 +291,7 @@ pub(crate) fn resolve_query_decls(
                 diagnostics.push(
                     Diagnostic::error(
                         "query_parse_error",
-                        format!("graphs.{graph_id}.queries"),
+                        &setting,
                         format!("'{}' does not parse: {err}", resolved.display()),
                     )
                     .with_detail(err.diagnostic().cloned()),
@@ -176,7 +304,7 @@ pub(crate) fn resolve_query_decls(
             if let Some(previous) = origin.get(&name) {
                 diagnostics.push(Diagnostic::error(
                     "duplicate_query_name",
-                    format!("graphs.{graph_id}.queries.{name}"),
+                    format!("{setting}.{name}"),
                     format!(
                         "query '{name}' is declared in both '{}' and '{}'",
                         previous.display(),
@@ -184,6 +312,10 @@ pub(crate) fn resolve_query_decls(
                     ),
                 ));
                 continue;
+            }
+            if !capture.reserve_resources(1) {
+                diagnostics.push(resource_limit_diagnostic(&setting));
+                return BTreeMap::new();
             }
             origin.insert(name.clone(), declared.clone());
             registry.insert(
@@ -193,12 +325,15 @@ pub(crate) fn resolve_query_decls(
                 },
             );
         }
-        contents.insert(declared, source);
     }
-    (registry, contents)
+    registry
 }
 
 pub(crate) fn parse_cluster_config(config_dir: &Path) -> ParsedConfig {
+    parse_cluster_config_captured(config_dir, &mut SourceCapture::default())
+}
+
+fn parse_cluster_config_captured(config_dir: &Path, capture: &mut SourceCapture) -> ParsedConfig {
     let config_dir = config_dir.to_path_buf();
     let config_file = config_dir.join(CLUSTER_CONFIG_FILE);
     let mut diagnostics = Vec::new();
@@ -217,11 +352,11 @@ pub(crate) fn parse_cluster_config(config_dir: &Path) -> ParsedConfig {
         };
     }
 
-    let text = match fs::read_to_string(&config_file) {
+    let text = match capture.read(&config_file) {
         Ok(text) => text,
         Err(err) => {
             diagnostics.push(Diagnostic::error(
-                "cluster_config_read_error",
+                source_error_code(&err, "cluster_config_read_error"),
                 CLUSTER_CONFIG_FILE,
                 format!("could not read cluster.yaml: {err}"),
             ));
@@ -351,11 +486,18 @@ pub(crate) fn state_resource_digests(state: &ClusterState) -> BTreeMap<String, S
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
     ClusterState {
         version: 1,
+        ledger_id: None,
+        next_sequence: None,
+        outstanding: None,
+        deployment_results: None,
         state_revision: 0,
         applied_revision: AppliedRevisionState {
+            schema_contracts: None,
+            result_revision: None,
             config_digest: Some(desired.config_digest.clone()),
             resources: BTreeMap::new(),
         },
@@ -551,7 +693,7 @@ pub(crate) async fn preview_schema_migration(
         .await
         .map_err(|err| err.to_string())?;
     let preview = db
-        .preview_schema_apply_with_options(&source, SchemaApplyOptions::default())
+        .preview_schema_apply(&source)
         .await
         .map_err(|err| err.to_string())?;
     Ok(preview.plan)
@@ -605,7 +747,20 @@ pub(crate) fn graph_observation_json(observation: GraphObservationJson<'_>) -> s
 }
 
 pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
-    let parsed = parse_cluster_config(config_dir);
+    capture_desired(config_dir).outcome
+}
+
+pub(crate) fn capture_desired(config_dir: &Path) -> CapturedDesired {
+    let mut capture = SourceCapture::default();
+    let outcome = load_desired_captured(config_dir, &mut capture);
+    CapturedDesired {
+        outcome,
+        sources: capture.sources,
+    }
+}
+
+fn load_desired_captured(config_dir: &Path, capture: &mut SourceCapture) -> LoadOutcome {
+    let parsed = parse_cluster_config_captured(config_dir, capture);
     let config_dir = parsed.config_dir;
     let config_file = parsed.config_file;
     let mut diagnostics = parsed.diagnostics;
@@ -617,7 +772,32 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             config_file,
         };
     };
+    // Graph and schema are separate resources; queries are charged as their
+    // declarations expand. Bound known resources before reading any payload.
+    let fixed_resources = raw
+        .graphs
+        .len()
+        .saturating_mul(2)
+        .saturating_add(raw.policies.len())
+        .saturating_add(raw.providers.embedding.len());
+    if !capture.reserve_resources(fixed_resources) {
+        diagnostics.push(resource_limit_diagnostic(CLUSTER_CONFIG_FILE));
+        return LoadOutcome {
+            desired: None,
+            diagnostics,
+            config_dir,
+            config_file,
+        };
+    }
     let settings = validate_cluster_header(&raw, &mut diagnostics);
+    // Every graph root and the cluster ledger live under this one root, so a
+    // Blob base disjoint from it is disjoint from all of them. An invalid
+    // declared root already carries its own error, and has no layout to guard.
+    let storage_root = match (&raw.storage, &settings.storage_root) {
+        (_, Some(root)) => Some(root.clone()),
+        (None, None) => Some(config_dir.to_string_lossy().into_owned()),
+        (Some(_), None) => None,
+    };
 
     let mut resources = BTreeMap::new();
     let mut dependencies = BTreeSet::new();
@@ -666,7 +846,12 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         let schema_address = schema_address(graph_id);
         graph_external_blob_policies.insert(
             graph_id.clone(),
-            validate_external_blob_policy(graph_id, &graph.external_blobs, &mut diagnostics),
+            validate_external_blob_policy(
+                graph_id,
+                &graph.external_blobs,
+                storage_root.as_deref(),
+                &mut diagnostics,
+            ),
         );
         dependencies.insert(Dependency {
             from: schema_address.clone(),
@@ -710,7 +895,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             &mut diagnostics,
         );
         let schema_source = match if schema_readable {
-            fs::read_to_string(&schema_path)
+            capture.read(&schema_path)
         } else {
             Err(std::io::Error::other("path refused"))
         } {
@@ -731,7 +916,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             Err(err) => {
                 if schema_readable {
                     diagnostics.push(Diagnostic::error(
-                        "schema_file_missing",
+                        source_error_code(&err, "schema_file_missing"),
                         format!("graphs.{graph_id}.schema"),
                         format!(
                             "could not read schema file '{}': {err}",
@@ -765,8 +950,13 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             }
         });
 
-        let (graph_queries, query_contents) =
-            resolve_query_decls(&config_dir, graph_id, &graph.queries, &mut diagnostics);
+        let graph_queries = resolve_query_decls(
+            &config_dir,
+            graph_id,
+            &graph.queries,
+            capture,
+            &mut diagnostics,
+        );
         for (query_name, query) in &graph_queries {
             validate_id(
                 "query name",
@@ -793,10 +983,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 continue;
             }
             let query_path = resolve_config_path(&config_dir, &query.file);
-            let source = match query_contents.get(&query.file) {
-                Some(cached) => Ok(cached.clone()),
-                None => fs::read_to_string(&query_path),
-            };
+            let source = capture.read(&query_path);
             match source {
                 Ok(source) => {
                     let digest = sha256_hex(source.as_bytes());
@@ -822,7 +1009,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                     );
                 }
                 Err(err) => diagnostics.push(Diagnostic::error(
-                    "query_file_missing",
+                    source_error_code(&err, "query_file_missing"),
                     format!("graphs.{graph_id}.queries.{query_name}.file"),
                     format!(
                         "could not read query file '{}': {err}",
@@ -949,7 +1136,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
             continue;
         }
         let policy_path = resolve_config_path(&config_dir, &policy.file);
-        match fs::read_to_string(&policy_path) {
+        match capture.read(&policy_path) {
             Ok(source) => {
                 resources.insert(
                     policy_address.clone(),
@@ -988,7 +1175,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 }
             }
             Err(err) => diagnostics.push(Diagnostic::error(
-                "policy_file_missing",
+                source_error_code(&err, "policy_file_missing"),
                 format!("policies.{policy_name}.file"),
                 format!(
                     "could not read policy file '{}': {err}",
@@ -1045,9 +1232,10 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     }
 }
 
-fn validate_external_blob_policy(
+pub(crate) fn validate_external_blob_policy(
     graph_id: &str,
     config: &ExternalBlobsConfig,
+    storage_root: Option<&str>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> omnigraph::ExternalBlobPolicy {
     if config.allow.is_empty() {
@@ -1057,13 +1245,27 @@ fn validate_external_blob_policy(
     let mut bases = Vec::with_capacity(config.allow.len());
     let mut invalid = false;
     for (index, configured) in config.allow.iter().enumerate() {
+        let path = format!("graphs.{graph_id}.external_blobs.allow[{index}].base");
         match omnigraph::ExternalBlobBase::new(&configured.base, configured.scope.into()) {
-            Ok(base) => bases.push(base),
+            Ok(base) => {
+                if let Some(Err(conflict)) =
+                    storage_root.map(|root| base.ensure_disjoint_from_storage_root(root))
+                {
+                    invalid = true;
+                    diagnostics.push(Diagnostic::error(
+                        storage_root_conflict_code(&conflict),
+                        path,
+                        conflict.to_string(),
+                    ));
+                } else {
+                    bases.push(base);
+                }
+            }
             Err(error) => {
                 invalid = true;
                 diagnostics.push(Diagnostic::error(
                     "invalid_external_blob_base",
-                    format!("graphs.{graph_id}.external_blobs.allow[{index}].base"),
+                    path,
                     error.to_string(),
                 ));
             }
@@ -1083,6 +1285,20 @@ fn validate_external_blob_policy(
             ));
             omnigraph::ExternalBlobPolicy::Deny
         }
+    }
+}
+
+pub(crate) fn storage_root_conflict_code(
+    conflict: &omnigraph::StorageRootConflict,
+) -> &'static str {
+    match conflict {
+        omnigraph::StorageRootConflict::Overlap { .. } => {
+            "external_blob_base_overlaps_storage_root"
+        }
+        omnigraph::StorageRootConflict::UncomparableRoot { .. } => {
+            "external_blob_storage_root_uncomparable"
+        }
+        omnigraph::StorageRootConflict::InvalidPolicy(_) => "invalid_external_blob_base",
     }
 }
 
@@ -1235,12 +1451,12 @@ pub(crate) fn normalize_policy_target(value: &str) -> PolicyTarget {
     }
 }
 
-enum EmbeddingProviderTarget {
+pub(crate) enum EmbeddingProviderTarget {
     Provider(String),
     WrongKind(String),
 }
 
-fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
+pub(crate) fn normalize_embedding_provider_target(value: &str) -> EmbeddingProviderTarget {
     if let Some(name) = value.strip_prefix("provider.embedding.") {
         EmbeddingProviderTarget::Provider(name.to_string())
     } else if value.contains('.') {

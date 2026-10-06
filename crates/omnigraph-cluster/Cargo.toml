@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-cluster"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 description = "Cluster configuration validation, planning, and config-only apply for Omnigraph."
 license = "MIT"
@@ -12,13 +12,16 @@ documentation = "https://docs.rs/omnigraph-cluster"
 # Fault-injection hooks for the apply protocol (crash-mid-apply, CAS-race
 # tests), including cluster/engine boundary failures.
 failpoints = ["omnigraph/failpoints"]
+# Test support reached by the server's tests: read a local cluster's serving
+# snapshot as if its storage root were spelled differently.
+test-util = []
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.11.0" }
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.11.0" }
-omnigraph-seams = { path = "../omnigraph-seams", version = "0.11.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.12.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.12.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.12.0" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.12.0" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.12.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

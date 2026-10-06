@@ -222,10 +222,9 @@ repeats the leading `order` key (`T33`); without an alias the column is
 the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
 (`T35`, they belong in `match`) are refused at compile time. Aggregated
 queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
-with no secondary keys reads a bounded set of top-scoring matches, so among
-rows tied exactly at that bound's cut, which rows enter the result follows
-the scan bound rather than entity ids.
+results are not score-ranked and cannot project a score (`T9`). A `bm25()`
+ordering reads every matching entity before the final limit, so rows tied on
+score are ordered by entity id.
 
 ## Blobs
 
@@ -270,10 +269,15 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
-On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
-carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
-load value, a param, or a `date(...)` literal, and an instant belongs in a
-`DateTime` property.
+On input, a JSON number for an `F64` parses to the nearest `F64` value, the one
+a GQ literal with the same digits names, so an `F64` value read from `rows`
+loads back unchanged. A `Date` string is a calendar day, `"2024-01-01"`; a
+string that carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is
+refused as a load value, a param, or a `date(...)` literal, and an instant
+belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string
+with a non-zero digit past the third fractional digit, such as
+`"2024-01-01T00:00:00.123456Z"`, is refused as a load value, a param, or a
+`datetime(...)` literal; trailing zeros, as in `.123000`, are accepted.
 
 A `Date` or `DateTime` count outside the range the writer can format is refused
 on load. A read that meets one fails with status 500; the error names the

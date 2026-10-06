@@ -32,8 +32,8 @@ documentation structure check.
 PRs outside the engine-input class (documentation, `.gqt` cases, deployment
 files; see the classes in [ci.md](ci.md)) still receive every required
 context; work-heavy steps may report as skipped. `Storage Upgrade Compatibility` is an explicit exception:
-both genuine predecessor migration journeys execute on every change, whatever
-its class. Its fixture availability and required-context
+its storage format report, Lance and protocol tests execute on every change,
+whatever its class. Its exact commands and required-context
 contract are checked by `scripts/check-storage-upgrade-ci.py`. The repository
 policy change must still be applied by an administrator to affect GitHub.
 `Dependency Guard (cargo deny)` is required on every change: it builds nothing

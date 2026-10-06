@@ -98,6 +98,44 @@ Branch protection currently requires these reporting contexts:
 - `Storage Upgrade Compatibility`
 - `Dependency Guard (cargo deny)`
 
+`Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
+runs on every change and in the merge queue. It builds the genuine stamp-13
+CLI from the immutable `STAMP_13_SOURCE_COMMIT` in a detached worktree into
+the job's target directory, copies the binary out, cleans the path-package
+artifacts through both manifests (the predecessor and current packages share
+names and versions) and exports `OMNIGRAPH_V13_BIN`. The step
+`Install released v0.10.0 and v0.11.0 CLIs` downloads the two releases with
+`scripts/install.sh` and exports `OMNIGRAPH_V6_BIN` and `OMNIGRAPH_V011_BIN`:
+0.11.0 writes stamp 9, and 0.10.0 followed by the 0.11.0 `upgrade` gives the
+stamp-8 source (`--to-format 8`) and the stamp-9 source its default target
+leaves. The step trusts the release assets exactly as the `test` job's
+v0.9.0 and v0.10.0 installs do: `install.sh` downloads the archive and its
+`.sha256` from the same GitHub release and verifies the one against the other
+before extracting; no digest is pinned in the workflow. Each download gets
+three attempts (`install_release`), the only retry in the job; a failed
+attempt leaves no binary behind. The job's added runtime (two downloads and
+the five journeys) is UNVERIFIED against its `timeout-minutes: 90` until the
+first hosted run; the timeout was not changed. With
+`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` a missing binary fails the five
+genuine journeys (`genuine_v13_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
+`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
+`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`)
+instead of skipping them; the v6 format fence in the `test` job keeps its own
+resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
+scopes then run, each checked against its log by
+`scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
+cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
+`lance_version_columns` and `forbidden_apis`. The script's `--self-test` pins
+the scopes, the predecessor build and install scripts (compared exactly) and
+the required case names, so removing or altering one fails `Check Workflow Action Pins` and
+this job. The 90-minute budget covers two cold builds into one target
+directory: the predecessor CLI alone (one package, one bin, no test features),
+then the current tree's test targets, whose dev-dependency features (lance-io
+defaults and `test-util`) differ, so only dependency artifacts with matching
+features are reused.
+
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
@@ -352,6 +390,10 @@ step runs from the repo root under the workspace Cargo configuration; the
 refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
 guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
+`gqt-slow-nightly.yml` (cron 03:30 UTC + manual dispatch) runs the cases under
+`crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
+a time; it is not a required context, and it is its own workflow because the
+GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
 
 ## Local pre-push checks
 

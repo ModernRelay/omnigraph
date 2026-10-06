@@ -21,6 +21,8 @@ const MAX_HISTORY_DEPTH: u64 = 1_000_000;
 pub(crate) const MAX_WARMUP_ITERATIONS: u32 = 1_000;
 const MAX_DEADLINE_SECONDS: u64 = 3_600;
 pub(crate) const SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION: u32 = 3;
+pub(crate) const MAX_PREPARATION_COMMITS: u64 = 10_000;
+pub(crate) const MAX_PREPARATION_ROWS_PER_COMMIT: u64 = 4_096;
 
 /// A complete V1 branch-merge experiment. `id` is a human selector only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +49,52 @@ pub struct Fixture {
     pub builder: FixtureBuilder,
     pub data: Data,
     pub state: State,
+    /// Optional, independently versioned preparation. Omitting this field must
+    /// preserve the canonical bytes of every existing builder-v3 point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<FixturePreparation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum FixturePreparation {
+    #[serde(rename = "reversible-updates-v1")]
+    ReversibleUpdatesV1 {
+        additional_commits: u64,
+        rows_per_commit: u64,
+        seed: u64,
+        maintenance: PreparationMaintenance,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreparationMaintenance {
+    None,
+}
+
+impl FixturePreparation {
+    pub fn additional_commits(self) -> u64 {
+        match self {
+            Self::ReversibleUpdatesV1 {
+                additional_commits, ..
+            } => additional_commits,
+        }
+    }
+
+    pub fn rows_per_commit(self) -> u64 {
+        match self {
+            Self::ReversibleUpdatesV1 {
+                rows_per_commit, ..
+            } => rows_per_commit,
+        }
+    }
+
+    pub fn seed(self) -> u64 {
+        match self {
+            Self::ReversibleUpdatesV1 { seed, .. } => seed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +190,7 @@ pub enum IndexFreshness {
 pub enum DeletionHistory {
     None,
     Heavy,
+    ReversibleUpdates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -768,6 +817,40 @@ fn validate_fixture_scale(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
 }
 
 fn validate_fixture_state(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) {
+    if let Some(preparation) = fixture.preparation {
+        if !(2..=MAX_PREPARATION_COMMITS).contains(&preparation.additional_commits())
+            || !preparation.additional_commits().is_multiple_of(2)
+        {
+            diagnostics.push(Diagnostic::error(
+                "invalid_preparation_commits", "fixture.preparation.additional_commits",
+                format!("reversible updates require an even number of real commits in 2..={MAX_PREPARATION_COMMITS}"),
+            ));
+        }
+        if !(1..=MAX_PREPARATION_ROWS_PER_COMMIT).contains(&preparation.rows_per_commit())
+            || preparation.rows_per_commit() > fixture.data.rows_per_table
+        {
+            diagnostics.push(Diagnostic::error(
+                "invalid_preparation_rows", "fixture.preparation.rows_per_commit",
+                format!("rows_per_commit must be in 1..={MAX_PREPARATION_ROWS_PER_COMMIT} and no greater than rows_per_table"),
+            ));
+        }
+        if fixture.state.aging != Aging::SmallCommits
+            || fixture.state.deletion_history != DeletionHistory::ReversibleUpdates
+            || fixture.state.compaction_recency != CompactionRecency::NotOptimized
+            || !fixture.state.indexes.is_empty()
+        {
+            diagnostics.push(Diagnostic::error(
+                "preparation_state_mismatch", "fixture.state",
+                "reversible-updates-v1 requires small-commits aging, reversible-updates deletion history, not-optimized compaction, and indexes: []",
+            ));
+        }
+    } else if fixture.state.deletion_history == DeletionHistory::ReversibleUpdates {
+        diagnostics.push(Diagnostic::error(
+            "missing_preparation",
+            "fixture.preparation",
+            "reversible-updates deletion history requires its preparation recipe",
+        ));
+    }
     if fixture.builder.kind == FixtureBuilderKind::SyntheticBranchMerge
         && fixture.builder.version == SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION
         && fixture.state.compaction_recency == CompactionRecency::Optimized
@@ -1084,6 +1167,82 @@ protocol:
         assert_eq!(case.case_digest.len(), 64);
         assert_ne!(case.point_id, case.case_digest);
         assert!(case.point_name.ends_with(&case.point_id[..12]));
+    }
+
+    #[test]
+    fn absent_preparation_preserves_existing_canonical_point_and_case_bytes() {
+        let case = parse_case(include_str!(
+            "../../../benchmarks/cases/branch-merge-d50-process-cold-xfs.case-v1.yaml"
+        ))
+        .into_result()
+        .unwrap();
+        assert_eq!(
+            case.point_id,
+            "3a79a396ccb95f383370f55665136396ed8c83636b3cd08648eb3290c859bc33"
+        );
+        assert_eq!(
+            case.case_digest,
+            "0f16aa99402d2359b934cdc3ac478a56bac46ec8ed245662c4e7ea9ce3ff3e7a"
+        );
+        let bytes = serde_json::to_string(&case.definition).unwrap();
+        assert!(!bytes.contains("\"preparation\":"));
+        assert_eq!(
+            serde_json::from_str::<CaseV1>(&bytes).unwrap(),
+            case.definition
+        );
+    }
+
+    #[test]
+    fn reversible_preparation_is_strict_bounded_and_identity_bearing() {
+        let source = VALID.replace("fixture:\n", "fixture:\n  preparation: { kind: reversible-updates-v1, additional_commits: 64, rows_per_commit: 7, seed: 42, maintenance: none }\n")
+            .replace("aging: bulk-loaded", "aging: small-commits")
+            .replace("deletion_history: none", "deletion_history: reversible-updates")
+            .replace("history_depth: 1", "history_depth: 277");
+        let aged = parse_case(&source).into_result().unwrap();
+        assert_eq!(
+            crate::branch_merge::BranchMergePlan::try_from(&aged)
+                .unwrap()
+                .preflight()
+                .unwrap()
+                .expected_history_depth,
+            277
+        );
+        for (from, to) in [
+            ("additional_commits: 64", "additional_commits: 2"),
+            ("rows_per_commit: 7", "rows_per_commit: 1"),
+            ("seed: 42", "seed: 43"),
+        ] {
+            let other = parse_case(&source.replace(from, to)).into_result().unwrap();
+            assert_ne!(aged.point_id, other.point_id);
+        }
+        for (from, to) in [
+            ("additional_commits: 64", "additional_commits: 0"),
+            ("additional_commits: 64", "additional_commits: 3"),
+            ("additional_commits: 64", "additional_commits: 10002"),
+            ("rows_per_commit: 7", "rows_per_commit: 0"),
+            ("rows_per_commit: 7", "rows_per_commit: 4097"),
+            ("rows_per_table: 100000", "rows_per_table: 6"),
+            ("reversible-updates-v1", "reversible-updates-v2"),
+            ("maintenance: none", "maintenance: optimize"),
+            (", maintenance: none", ""),
+            (", seed: 42", ""),
+            ("maintenance: none", "maintenance: none, typo: true"),
+            ("aging: small-commits", "aging: bulk-loaded"),
+            (
+                "deletion_history: reversible-updates",
+                "deletion_history: none",
+            ),
+        ] {
+            assert!(
+                parse_case(&source.replace(from, to)).into_result().is_err(),
+                "accepted {to}"
+            );
+        }
+        let without_recipe = VALID.replace(
+            "deletion_history: none",
+            "deletion_history: reversible-updates",
+        );
+        assert!(parse_case(&without_recipe).into_result().is_err());
     }
 
     #[test]

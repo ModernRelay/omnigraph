@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-08-30
-updated: 2026-09-25
+updated: 2026-10-04
 discussion: https://github.com/ModernRelay/omnigraph/issues/562
 supersedes: []
 superseded_by: []
@@ -15,6 +15,13 @@ blocked_on: []
 ---
 
 # RFC 0042: Incarnation-suffixed native branch refs
+
+> **RFC 0067 disposition:** [RFC 0067](0067-detached-table-commits.md) removed
+> the recovery sidecar, the effect classifier, and compensation. Historical:
+> every recovery-sidecar statement in the Summary, User and operational
+> behavior, and Design, and Invariant 5's prepared fork name, effect
+> classification, and compensation. Current: incarnation-suffixed
+> `{logical}.{ULID}` refs for graph branches.
 
 ## Summary
 

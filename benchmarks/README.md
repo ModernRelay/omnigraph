@@ -257,7 +257,7 @@ and `freshness`. Synthetic branch-merge builder v3 supports only
 `compaction_recency: not-optimized`, because OmniGraph optimization
 materializes physical indexes outside this builder's exact inventory contract.
 
-Builder v2 interprets `fixture.data.tables` as the total user-table count and
+Builder v3 interprets `fixture.data.tables` as the total user-table count and
 requires an even value: half are immutable node endpoint tables and half are
 edge tables in a uniform type ring. Every edge row connects equal ordinals in
 adjacent node types. `workload.diverged_tables` selects edge tables only, so it
@@ -319,11 +319,68 @@ case's experiment identity.
 `fixture.state.history_depth` is the exact number of reachable OmniGraph graph
 commits on **each already-diverged frozen branch**, including the history
 shared before the branch was created. It is not merely the number of commits
-made after branching. Builder v2 measures both frozen branches and refuses a
+made after branching. Builder v3 measures both frozen branches and refuses a
 case whose declaration does not match; it does not silently pad or squash
 history. For the checked case, the reachable depth is 213: one genesis commit,
 200 base-load publications (25 chunks for each of four node and four edge
 tables), and 12 branch-local edge-divergence publications on each branch.
+
+### Preparing additional write history
+
+To vary accumulated write history while keeping the current graph contents
+fixed, add a versioned `fixture.preparation` recipe to a synthetic builder-v3
+case. For the checked-in 213-commit case, these fixture fields add 64 real
+commits and require a frozen depth of 277:
+
+```yaml
+# Fields within fixture; retain its existing builder and data declarations.
+preparation:
+  kind: reversible-updates-v1
+  additional_commits: 64
+  rows_per_commit: 1
+  seed: 42
+  maintenance: none
+state:
+  aging: small-commits
+  indexes: []
+  deletion_history: reversible-updates
+  compaction_recency: not-optimized
+  history_depth: 277
+```
+
+After the base load and before either branch is created, each pair chooses
+one existing edge table and a wrapping batch of distinct row IDs from the seed
+and pair number. The first public Merge load replaces every selected row's
+nonnegative `val` with `-1 - val`; the second restores it. Each load publishes
+once. Keys, endpoints, cohorts and payloads stay fixed. The builder checks exact
+history growth and every restored row before branching, then performs its
+normal full fixture verification and freezes the result. Each measured
+repetition still starts from those same frozen bytes; preparation is outside
+the merge timer.
+
+All recipe fields are required. `additional_commits` must be even, from 2 to
+10,000; omission of the recipe is the zero-history control. `rows_per_commit`
+is 1 through 4,096, cannot exceed the existing rows per table, and must fit the
+payload-derived single-load bound. Only `maintenance: none` is supported:
+no optimization, index build or cleanup runs during preparation. The update
+history retains its replacement files and commits, so it is declared explicitly
+as `deletion_history: reversible-updates` even though final logical rows match
+the base graph.
+
+Preflight includes preparation in the exact history, generated-row, file-count
+and free-space budgets. Its scratch estimate separately reserves space for
+quadratically growing retained manifest history and three physical copies.
+The existing one-hour fixture-process watchdog includes preparation, full
+verification and freezing; failure produces no measured sample. The 1,000- and
+10,000-commit boundary tests qualify planning arithmetic, not runtime or disk
+cost on a particular machine. Start with a small history count before scheduling
+larger acquisitions.
+
+The recipe and state fields enter point identity and the stamped logical
+fixture. Omitting preparation preserves existing case and record identities.
+Build-proof requirements and claim eligibility remain unchanged. Imported
+fixture references describe already-built history; this recipe applies only
+to the synthetic CaseV1 builder.
 
 ## Validate and inspect
 

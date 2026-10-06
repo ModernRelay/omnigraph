@@ -45,23 +45,23 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
-| `snapshot` | Show a branch snapshot | direct or served |
+| `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
 | `schema apply` | Apply a schema to a standalone graph | direct |
 | `schema plan` | Preview a schema migration | direct |
-| `schema upgrade-system-columns` | Respell a v8 graph's system columns in place (storage format v8 to v9) | direct |
+| `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
-| `upgrade` | Check or execute a registered offline storage migration | direct standalone |
+| `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes | direct |
 | `rebuild-full-text-indexes` | Replace full-text indexes on one branch | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative cluster state | cluster config or managed context |
+| `cluster validate/plan/apply/...` | Operate declarative state; [deployment/recovery flags](../clusters/index.md) | config, Core server, explicit root, or managed context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
@@ -123,7 +123,7 @@ omnigraph mutate update_person --query queries.gq --store graph.omni \
 `--if-commit` runs the mutation only while the target branch is still at that
 commit. Any intervening commit on the branch invalidates the condition, even
 when it changed unrelated data. A mismatch has no effect and exits with code
-4; JSON output includes `precondition_failure` with `expected` and optional
+4 against a server, 1 on an embedded `--store` run; JSON output includes `precondition_failure` with `expected` and optional
 `actual` commit ids. Re-read and decide again instead of retrying blindly.
 
 ## Storage upgrade
@@ -134,18 +134,18 @@ omnigraph upgrade ./graph.omni --json
 omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
-`--store` is an alternative to the positional storage URI. Target format defaults
-to 11: qualified v6 inputs run v6 → v7 → v8 → v10 → v11, v7 inputs
-v7 → v8 → v10 → v11, v8 and v9 inputs v10 → v11, v10 inputs the v11 step alone;
-`--to-format 8` or `--to-format 10` stops there with the older format.
-Explicit target 7 remains available, but the current binary refuses normal open
-of v7. `--check` performs read-only preflight and reports output-dependent checks
-in `work.deferred_checks`; execution validates those before the affected handler
-has effects. Execution requires stopped writers, stopped maintenance and a
-verified whole-root backup. A failed check, refusal or
-required recovery exits 1. JSON reports the route, formats, findings, durable
-boundary, recovery action and work categories. Server and cluster addressing
-are refused. See [storage migration](../operations/upgrade.md#explicit-storage-migration).
+`--store` is an alternative to the positional storage URI. `omnigraph upgrade`
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v14, offline and
+in place, keeping branches and commit history; stop every process using the
+graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 14 only. `check_passed`, `already_current` (a
+v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 14, `unsupported_target`)
+and `recovery_required` (a pending attempt, finished as `recovery.action` says,
+or leftover recovery files) exit 1. The report names the formats, the route,
+the `work` counts, findings and the recovery action. Server and cluster
+addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-upgrade).
+`schema upgrade-system-columns` is a separate operation on a served graph: [system-column upgrade](../operations/upgrade.md#system-column-upgrade-legacy-spellings).
 
 ## Load modes
 
@@ -321,8 +321,8 @@ Without a context, existing direct cluster commands behave as before.
 `--direct` explicitly selects that path, ignoring even a malformed context;
 `cluster.yaml` still owns the storage root. Managed-only arguments with
 `--direct` or without a context refuse. Other cluster verbs, including
-`approve`, `observe`, `refresh`, and `force-unlock`, refuse when a managed
-context is present. API failures never trigger direct execution.
+`observe` and `force-unlock`, refuse when a managed context is present. API
+failures never trigger direct execution.
 
 ## Managed data access
 

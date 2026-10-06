@@ -57,7 +57,6 @@ rules:
 "#;
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_server_and_cli_end_to_end_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -313,7 +312,6 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_schema_apply_refuses_additive_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -332,7 +330,6 @@ fn remote_schema_apply_refuses_additive_change_for_cluster_backed_graph() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -350,7 +347,6 @@ fn remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -384,7 +380,6 @@ fn remote_schema_apply_refuses_branched_cluster_backed_graph() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_read_preserves_projection_order_in_json_and_csv() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -446,7 +441,6 @@ query ordered_person($name: String) {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_branch_create_list_merge_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -556,7 +550,6 @@ query insert_person($name: String, $age: I32) {
 }
 
 #[test]
-#[ignore = "loopback: actual CLI/server/proxy processes qualify lost merge delivery"]
 fn remote_merge_delivery_loss_never_replays_committed_effect() {
     use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
@@ -727,7 +720,6 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_branch_delete_removes_branch() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -775,7 +767,6 @@ fn remote_branch_delete_removes_branch() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_export_round_trips_full_branch_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -914,7 +905,6 @@ query add_friend($from: String, $to: String) {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -987,7 +977,6 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
 /// `/ingest` endpoint: without `--from` a missing branch is a hard error
 /// (no implicit fork), with `--from` it forks like ingest did.
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_load_round_trips_and_requires_from_for_new_branches() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -1061,7 +1050,6 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -1151,7 +1139,6 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
 }
 
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_policy_enforces_branch_first_cli_workflow() {
     // Served policy enforcement: the cluster binds REMOTE_POLICY_E2E_YAML to the
     // graph, and the server maps bearer tokens to actors. The actor is resolved
@@ -1358,10 +1345,8 @@ query insert_person($name: String, $age: I32) {
 ///   4. Addressing the server via `--server <url>` with NO `--graph` errors and
 ///      lists the candidate graphs (RFC-011 D7).
 ///
-/// Ignored by default — spawning servers needs loopback socket
-/// permissions some sandboxes lack.
+/// Runs real server processes over loopback in the ordinary workspace gate.
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn graphs_list_against_multi_graph_server() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let dir = cfg_dir.path();
@@ -1376,8 +1361,7 @@ fn graphs_list_against_multi_graph_server() {
         "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  alpha:\n    schema: ./alpha.pg\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
 
     let server = spawn_server_with_cluster_env(
         dir,
@@ -1435,7 +1419,6 @@ fn graphs_list_against_multi_graph_server() {
 /// stdout. Guards the CLI's typed-error downcast seam: a wrapped error on
 /// that path degrades exit 4 to the generic 1.
 #[test]
-#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn mutate_if_commit_lost_cas_exits_4_issue_365() {
     const FIND_ALICE: &str =
         "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";

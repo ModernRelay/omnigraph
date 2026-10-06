@@ -146,6 +146,12 @@ pub(crate) const LATENT_MARKER: &str = "latent sector error (dst)";
 pub struct FaultPlan {
     pub seed: u64,
     pub error_pct: u64,
+    /// Seeded failures at current engine pre-publication effect boundaries.
+    /// Unlike Lance IO weather, selection follows the sequential workload,
+    /// not internal call order, so these universes retain strict replay.
+    /// Requires failpoints and a serialized `FailScenario`; zero leaves
+    /// the existing schedule unchanged.
+    pub engine_effect_error_pct: u64,
     /// Slatedb-derived doctrine (probe/list failpoints): faults on READ-class
     /// calls too — reads and listings (`read_fault` call sites) — one seam knob instead of
     /// per-point instrumentation.
@@ -275,6 +281,7 @@ impl FaultPlan {
         Self {
             seed: 0,
             error_pct: 0,
+            engine_effect_error_pct: 0,
             read_error_pct: 0,
             latency_pct: 0,
             max_latency_ms: 1,
@@ -1063,6 +1070,10 @@ pub struct UniverseReport {
     /// model-predicted merge conflict, keep-serving deferral refusals —
     /// the watched streak and the maintenance-barrier spelling).
     pub legal_rejections: usize,
+    /// Counted engine effect seams that fired and returned their exact error.
+    pub engine_effects_injected: usize,
+    /// Successful model-changing data writes after at least one such failure.
+    pub writes_after_engine_effect: usize,
     /// errors the Lance-realm injector actually delivered —
     /// evidence the table realm saw weather (0 in clean universes).
     pub lance_realm_injected: usize,
@@ -5254,6 +5265,14 @@ pub fn run_universe(root: &str, scenario: &Scenario) -> UniverseReport {
 /// Retain detector panic payloads while the shared executor finalizes resources.
 pub fn run_universe_caught(root: &str, sc: &Scenario) -> std::thread::Result<UniverseReport> {
     assert!(
+        cfg!(feature = "failpoints")
+            || sc
+                .faults
+                .as_ref()
+                .is_none_or(|plan| plan.engine_effect_error_pct == 0),
+        "engine effect weather requires --features failpoints"
+    );
+    assert!(
         !(sc.keep_handle
             && (sc.crash_at.is_some()
                 || sc.crash_on_match.is_some()
@@ -5391,6 +5410,14 @@ impl UniverseScenario<RustResources> for Scenario {
         let mut crashes = 0usize;
         let mut verified = 0usize;
         let mut legal_rejections = 0usize;
+        #[cfg(feature = "failpoints")]
+        let mut engine_effects_injected = 0usize;
+        #[cfg(not(feature = "failpoints"))]
+        let engine_effects_injected = 0usize;
+        let mut writes_after_engine_effect = 0usize;
+        #[cfg(feature = "failpoints")]
+        let mut effect_rng =
+            SplitMix64(sc.faults.as_ref().map_or(0, |plan| plan.seed) ^ 0x4546_4645_4354_4453);
         // Reopens performed while judging failures (reconcile / crash
         // recovery). A `keep_handle` universe must end with zero.
         let mut reopens = 0usize;
@@ -5708,7 +5735,49 @@ impl UniverseScenario<RustResources> for Scenario {
                     }
                     _ => None,
                 };
-                exec_world_op(&db, &wop).await
+                let effect_window = sc.faults.as_ref().and_then(|plan| {
+                    if plan.engine_effect_error_pct == 0
+                        || sc.probe_window.is_some()
+                        || (sc.probe_only && crash_now.is_some())
+                        || !matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op))
+                        || effect_rng.below(100) >= plan.engine_effect_error_pct
+                    {
+                        return None;
+                    }
+                    let windows = [
+                        "mutation.post_table_commit",
+                        "graph_publish.before_commit_append",
+                    ];
+                    Some(windows[effect_rng.below(windows.len() as u64) as usize])
+                });
+                let effect_guard = effect_window.map(|window| {
+                    omnigraph::seams::catalog::decide(window)
+                        .expect("engine effect weather names a catalog seam")
+                        .count_and_fire_at(1)
+                });
+                let result = exec_world_op(&db, &wop).await;
+                let fired = effect_guard
+                    .as_ref()
+                    .is_some_and(|(_, count)| count.fired());
+                drop(effect_guard);
+                if fired {
+                    let window = effect_window.expect("a counted injection has a selected seam");
+                    let error = result.expect_err("pre-publication effect failure was absorbed");
+                    assert!(
+                        matches!(&error, OmniError::Manifest(detail)
+                            if detail.kind == omnigraph::error::ManifestErrorKind::BadRequest
+                                && detail.details.is_none()
+                                && !detail.publication_in_doubt
+                                && detail.message == format!("injected failpoint triggered: {window}")),
+                        "counted effect fired but an unrelated error escaped: {error}"
+                    );
+                    engine_effects_injected += 1;
+                    Err(OmniError::manifest(format!(
+                        "{FAULT_MARKER}: engine effect {window}: {error}"
+                    )))
+                } else {
+                    result
+                }
             };
             #[cfg(not(feature = "failpoints"))]
             let exec_result = exec_world_op(&db, &wop).await;
@@ -5862,7 +5931,13 @@ impl UniverseScenario<RustResources> for Scenario {
                                 f.resume();
                             }
                         }
+                        let prior_data = (engine_effects_injected > 0
+                            && matches!(&wop, WorldOp::Data { op, .. } if is_mutation_op(op) || is_load_op(op)))
+                            .then(|| world.render());
                         apply_world(&mut world, &wop);
+                        if prior_data.is_some_and(|before| before != world.render()) {
+                            writes_after_engine_effect += 1;
+                        }
                     }
                     Err(err) => {
                         // One damage snapshot for the WHOLE failure handling:
@@ -6421,6 +6496,8 @@ impl UniverseScenario<RustResources> for Scenario {
             bystander_trail,
             verified,
             legal_rejections,
+            engine_effects_injected,
+            writes_after_engine_effect,
             lance_realm_injected,
             writes_observed,
             crash_state_hit,

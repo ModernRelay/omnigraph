@@ -15,6 +15,26 @@ use omnigraph_compiler::settings::SettingId;
 use super::*;
 use crate::operator;
 
+pub(crate) fn read_schema_corrections(
+    path: Option<&std::path::Path>,
+) -> Result<std::collections::BTreeMap<String, omnigraph::db::SchemaContractDigest>> {
+    use std::io::Read;
+
+    let Some(path) = path else {
+        return Ok(Default::default());
+    };
+    let limit = omnigraph_cluster::MAX_BUNDLE_BYTES;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        bail!("schema correction file exceeds the {limit}-byte deployment input limit");
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| color_eyre::eyre::eyre!("invalid schema correction JSON: {error}"))
+}
+
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;
@@ -1036,7 +1056,7 @@ pub(crate) async fn execute_query_lint(
     }
 
     let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = Omnigraph::open(&uri).await?;
+    let db = crate::admission::open_read_only(&uri, None).await?;
     Ok(lint_query_file(
         &db.catalog(),
         &query_source,
@@ -1110,7 +1130,11 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
-        let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
+        let db = crate::admission::open_read_only(
+            &serving_graph.root.to_string_lossy(),
+            snapshot.state_cas.as_deref(),
+        )
+        .await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();
         for b in &report.breakages {
