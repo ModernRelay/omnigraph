@@ -2361,7 +2361,23 @@ async fn live_deployment_fixture(mode: &str) {
         )
         .unwrap();
         let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
-        let owners_before_plan = state.operation_runtime().snapshot();
+        // Response delivery can precede the producer's final observer drop on
+        // another worker. Settle read owners before comparing stable snapshots;
+        // the held merge's write and response owners must remain charged.
+        let settled_owners = || async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let owners = state.operation_runtime().snapshot();
+                    if owners.active_reads == 0 {
+                        return owners;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed read producers must release their observers")
+        };
+        let owners_before_plan = settled_owners().await;
         let plan_request = Request::post("/cluster/plan")
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .header("authorization", "Bearer operator-token")
@@ -2403,12 +2419,12 @@ async fn live_deployment_fixture(mode: &str) {
             }),
             "{plan}"
         );
+        assert_eq!(settled_owners().await, owners_before_plan);
         assert!(
             !merger.is_finished(),
             "planning must not release the parked writer"
         );
         assert!(!hold.timed_out());
-        assert_eq!(state.operation_runtime().snapshot(), owners_before_plan);
         assert_eq!(
             fs::read(temp.path().join("__cluster/state.json")).unwrap(),
             before
