@@ -24,8 +24,14 @@
 
 <hr>
 
-Omnigraph is the operational state and coordination layer for fleets of agents.\
-Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
+Omnigraph is engineered working backwards from the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and storea context and coordinate work. 
+
+**Multi-Modal retrieval**: because assembling context for agents requires fusing vector/fts search, graph traversal and filtering <br>
+**Branching**: agents propose reviewable changes rather than writing directly. <br>
+**Typed ontology**: agents have a shared enforceable model of the domain.<br>
+**Object-storage**: scales at the lowest cost.
+
+
 
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
