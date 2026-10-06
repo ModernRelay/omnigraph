@@ -362,9 +362,10 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .send().unwrap()
         };
         assert_eq!(read_peer().status(), 503);
-        // Change only the tools query; the unavailable peer is unchanged.
+        // Change only the tools query. Unrelated unavailable graphs must not
+        // turn a converged, activated deployment into a CLI failure.
         fs::write(&tools, format!(" {}", fs::read_to_string(&tools).unwrap())).unwrap();
-        let unrelated = parse_stdout_json(&output_failure(
+        let unrelated = parse_stdout_json(&output_success(
             cli()
                 .env("OMNIGRAPH_BEARER_TOKEN", "live-deployment-token")
                 .args([
@@ -382,7 +383,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             unrelated["deployment"]["result"]["converged"], true,
             "{unrelated}"
         );
-        assert_eq!(unrelated["active"], false, "{unrelated}");
+        assert_eq!(unrelated["active"], true, "{unrelated}");
         assert_eq!(read_peer().status(), 503);
         // Drift and missing storage cannot be repaired by accepting new identity.
         for (file, expected) in [

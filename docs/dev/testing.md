@@ -130,7 +130,8 @@ timeout without replaying a committed merge.
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
-own capture/close ordering, deadlines, schema identity and candidate bounds;
+own capture/close ordering, drain-only deployment deadlines, affected activation
+scope, schema identity and candidate bounds;
 `operations`, `ingress` and `mcp` own detached execution and output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
@@ -155,7 +156,8 @@ exact applied schema identity after receipt eviction; `admission.rs` pins lifeti
 exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
 interruption windows, killed-process recovery and corrective successors, including
 deletion before start, during partial removal, after root absence and before
-terminal ledger acknowledgement;
+terminal ledger acknowledgement, same-lifetime older manifest survivors,
+replacement refusal and corrective creation in empty local settlement residue;
 `tests/identity_recovery.rs` owns current-actor authorization and adoption of a
 persisted settlement without replacing its author. CLI
 `tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and

@@ -53,16 +53,26 @@ pub(crate) struct StateSnapshot {
 fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diagnostic> {
     let invalid =
         |message: String| Diagnostic::error("invalid_state_json", CLUSTER_STATE_FILE, message);
-    let strict = serde_json::from_str::<ClusterState>(text);
-    if !upgrade || strict.is_ok() {
-        return strict
-            .map(|state| (state, false))
-            .map_err(|error| invalid(error.to_string()));
+    let strict_error = match serde_json::from_str::<ClusterState>(text) {
+        Ok(state) => return Ok((state, false)),
+        Err(error) => error,
+    };
+    if !upgrade {
+        // Reuse the bounded converter only to recognize a qualified prior
+        // receipt shape. Ordinary reads never consume the converted state.
+        if matches!(decode_ledger(text, true), Ok((_, true))) {
+            return Err(Diagnostic::error(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "completed receipts contain obsolete runtime fields; stop serving, writers and maintenance, establish prior I/O quiescence, then run `omnigraph --cluster <cluster-root> cluster upgrade-ledger --writers-stopped`",
+            ));
+        }
+        return Err(invalid(strict_error.to_string()));
     }
     let mut value =
         omnigraph::loader::parse_unique_json(text).map_err(|error| invalid(error.to_string()))?;
     if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
-        return Err(invalid(strict.unwrap_err().to_string()));
+        return Err(invalid(strict_error.to_string()));
     }
     if value
         .get("outstanding")
@@ -394,6 +404,46 @@ impl ClusterStore {
             }
         }
         out
+    }
+
+    /// Exact birth cleanup can leave directory skeletons on local filesystems.
+    /// Admit only a bounded tree of real directories: object-store listings
+    /// follow symlinks and hide broken ones, so their zero-object result alone
+    /// cannot prove this local exception safe. Engine preparation still checks
+    /// the target before minting creation authority. Cloud markers never qualify.
+    pub(crate) fn graph_root_is_empty_local_directory(
+        &self,
+        graph_uri: &str,
+    ) -> omnigraph_storage::Result<bool> {
+        if storage_kind_for_uri(graph_uri)? != StorageKind::Local {
+            return Ok(false);
+        }
+        let root = Path::new(graph_uri.trim_start_matches("file://"));
+        if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+            return Ok(false);
+        }
+        let mut pending = vec![root.to_path_buf()];
+        let mut directories = 1usize;
+        let mut path_bytes = root.as_os_str().len();
+        while let Some(directory) = pending.pop() {
+            if path_bytes > 64 * 1024 {
+                return Ok(false);
+            }
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                directories += 1;
+                if directories > 64 || !entry.file_type()?.is_dir() {
+                    return Ok(false);
+                }
+                let path = entry.path();
+                path_bytes = path_bytes.saturating_add(path.as_os_str().len());
+                if path_bytes > 64 * 1024 {
+                    return Ok(false);
+                }
+                pending.push(path);
+            }
+        }
+        Ok(true)
     }
 
     /// Existence probe before graph creation or read-only observation. A bare local

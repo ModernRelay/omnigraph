@@ -300,7 +300,8 @@ impl Drop for PreparedTransition {
 
 /// Closed predecessors. Dropping this ticket retires its scheduling record;
 /// the registry retains closed views and their resources until process shutdown.
-/// Successful validated activation opens fresh epochs under the original deadline.
+/// Standalone transitions keep their deadline. A drained deployment transfers
+/// completion to its owned executor under the process shutdown boundary.
 pub struct GraphTransition {
     registry: Arc<GraphRegistry>,
     record: Arc<TransitionRecord>,
@@ -337,6 +338,13 @@ impl GraphTransition {
                 .map(|view| (view.key.clone(), Arc::clone(&view.engine)))
                 .collect())
         })
+    }
+
+    /// Transfer a drained deployment to its completion owner before entering
+    /// the shared executor. Pre-effect refusals still restore unchanged views.
+    pub(crate) fn retain_deployment_completion(&self) -> Result<(), ServingTransitionError> {
+        self.operations
+            .while_open(|| self.registry.retain_deployment_completion(&self.record))
     }
 
     /// Publish graph lifecycle and authorization changes in one registry snapshot.

@@ -1953,13 +1953,12 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
         }
         let previous_bytes = serde_json::to_vec(&previous).unwrap();
         fs::write(&legacy_path, &previous_bytes).unwrap();
-        assert_eq!(
-            deployment_status(root, None, &caller)
-                .await
-                .unwrap_err()
-                .code,
-            "invalid_state_json"
-        );
+        let needs_upgrade = deployment_status(root, None, &caller).await.unwrap_err();
+        assert_eq!(needs_upgrade.code, "ledger_upgrade_required");
+        assert!(needs_upgrade.message.contains(
+            "omnigraph --cluster <cluster-root> cluster upgrade-ledger --writers-stopped"
+        ));
+        assert_eq!(fs::read(&legacy_path).unwrap(), previous_bytes);
         assert_eq!(
             upgrade_deployment_ledger(root, false, &caller)
                 .await
@@ -1987,6 +1986,14 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
             }
             let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
             fs::write(&legacy_path, &corrupt_bytes).unwrap();
+            assert_eq!(
+                deployment_status(root, None, &caller)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_state_json",
+                "{invalid} must not be diagnosed as a qualified ledger conversion",
+            );
             let refused = upgrade_deployment_ledger(root, true, &caller)
                 .await
                 .unwrap_err();

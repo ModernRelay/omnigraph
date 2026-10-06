@@ -187,6 +187,7 @@ struct RegistryState {
 struct TransitionCandidate {
     record: Arc<TransitionRecord>,
     closed: bool,
+    completion_owned: bool,
 }
 
 pub struct GraphRegistry {
@@ -399,11 +400,9 @@ impl GraphRegistry {
             }
             // Expiry retires bookkeeping only. Closed graphs and every
             // admitted descendant remain retained by their registry entries.
-            if state
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| Instant::now() >= candidate.record.deadline)
-            {
+            if state.candidate.as_ref().is_some_and(|candidate| {
+                !candidate.completion_owned && Instant::now() >= candidate.record.deadline
+            }) {
                 state.candidate = None;
             }
             if state.candidate.is_some() {
@@ -459,6 +458,7 @@ impl GraphRegistry {
             state.candidate = Some(TransitionCandidate {
                 record: Arc::clone(&record),
                 closed: false,
+                completion_owned: false,
             });
             Ok(PreparedTransition::new(
                 Arc::clone(self),
@@ -532,6 +532,19 @@ impl GraphRegistry {
         record: &Arc<TransitionRecord>,
     ) -> Result<(), ServingTransitionError> {
         validate_closed(&locked(&self.state), record)
+    }
+
+    /// Once affected requests drain, the owned executor retains this exact
+    /// candidate through preparation, durable effects and activation. The drain
+    /// deadline cannot expire completion authority; process shutdown still can.
+    pub(crate) fn retain_deployment_completion(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<(), ServingTransitionError> {
+        let mut state = locked(&self.state);
+        validate_closed(&state, record)?;
+        state.candidate.as_mut().unwrap().completion_owned = true;
+        Ok(())
     }
 
     /// Reopen unchanged admission after the controller proves that no effect
@@ -752,9 +765,7 @@ impl GraphRegistry {
         if views.iter().any(|view| !view.contract_is_current()) {
             return Err(ServingTransitionError::SchemaChanged);
         }
-        if Instant::now() >= record.deadline {
-            return Err(ServingTransitionError::DeadlineElapsed);
-        }
+        validate_candidate(&state, record)?;
         state.snapshot = snapshot;
         state.candidate = None;
         Ok(epochs)
@@ -800,7 +811,7 @@ fn validate_candidate(
     }) {
         return Err(ServingTransitionError::StaleAttempt);
     }
-    if Instant::now() >= record.deadline {
+    if !state.candidate.as_ref().unwrap().completion_owned && Instant::now() >= record.deadline {
         return Err(ServingTransitionError::DeadlineElapsed);
     }
     Ok(())
@@ -1858,6 +1869,87 @@ mod tests {
             Err(ServingTransitionError::InvalidGraph(_))
         ));
         assert_eq!(registry.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drained_deployment_completion_outlives_deadline_but_not_process_closure() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let peer = build_handle("peer", dir.path()).await;
+        for outcome in ["activate", "shutdown", "abort"] {
+            let registry = Arc::new(
+                GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&peer)]).unwrap(),
+            );
+            let operations = OperationRuntime::new();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let transition = registry
+                .prepare_deployment_transition(
+                    &operations,
+                    std::slice::from_ref(&alpha.key),
+                    deadline,
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            transition.wait_requests().await.unwrap();
+            transition.retain_deployment_completion().unwrap();
+            let prior = alpha.engine.schema_contract_digest();
+            if outcome != "abort" {
+                alpha
+                    .engine
+                    .apply_schema(&format!(
+                        "// {outcome}\nnode Person {{ name: String @key nickname: String? }}\n"
+                    ))
+                    .await
+                    .unwrap();
+                assert_ne!(alpha.engine.schema_contract_digest(), prior);
+            }
+            tokio::time::sleep_until(deadline).await;
+            assert!(
+                matches!(
+                    registry.prepare_same_view(&operations, &peer.key, transition_deadline()),
+                    Err(ServingTransitionError::Busy)
+                ),
+                "drain expiry cannot supersede the completion owner"
+            );
+            if outcome == "abort" {
+                transition.abort_before_effects().unwrap();
+                assert!(matches!(registry.get(&alpha.key), RegistryLookup::Ready(_)));
+                assert_eq!(alpha.engine.schema_contract_digest(), prior);
+                continue;
+            }
+            let management = Arc::new(PolicyEngine::load_cluster_from_source(
+                "version: 1\ngroups:\n  admins: [successor]\nrules:\n  - id: admin\n    allow:\n      actors: {group: admins}\n      actions: [config_manage]\n").unwrap());
+            if outcome == "shutdown" {
+                operations.close();
+            }
+            let result = transition.activate_deployment(
+                vec![activation_binding(&alpha, "nickname")],
+                Vec::new(),
+                Vec::new(),
+                Some(Arc::clone(&management)),
+                None,
+            );
+            if outcome == "shutdown" {
+                assert_eq!(result, Err(ServingTransitionError::ProcessClosed));
+                assert!(matches!(
+                    registry.get(&alpha.key),
+                    RegistryLookup::Transitioning(_)
+                ));
+                assert!(registry.snapshot_ref().server_policy.is_none());
+            } else {
+                result.unwrap();
+                let request = captured(&registry, &operations, &alpha.key);
+                assert_eq!(
+                    request.schema_contract(),
+                    &alpha.engine.schema_contract_digest()
+                );
+                assert!(Arc::ptr_eq(
+                    registry.snapshot_ref().server_policy.as_ref().unwrap(),
+                    &management
+                ));
+            }
+        }
     }
 
     #[tokio::test]

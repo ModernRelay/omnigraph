@@ -266,11 +266,14 @@ reachable path before E1 is qualified. Generic engine disposal/reuse still
 requires full B; retaining an engine alone proves neither contract.
 
 Activation rechecks attempt identity, predecessor epoch, content, ledger
-reference, transition completion, budget ownership, stopping state and absolute
-deadline under the final synchronous boundary. An old candidate cannot activate
-against a later epoch. Check expiry even if its timer has not fired. Expired
-candidates remain charged until disposal settles; successful candidates transfer
-their reservations to serving ownership.
+reference, transition completion, budget ownership and stopping state under the
+final synchronous boundary. Standalone transitions retain their absolute
+deadline. A deployment transfers the drained transition to its owned executor
+before full preparation; the drain deadline cannot expire completion or
+activation authority. Process shutdown still fences installation. An old
+candidate cannot activate against a later epoch. Expired standalone candidates
+remain charged until disposal settles; successful candidates transfer their
+reservations to serving ownership.
 Safe resumption of the previous coherent view allocates a fresh epoch; a closed
 epoch never reopens, so an old callback cannot regain admission authority.
 
@@ -475,7 +478,7 @@ stores every prepared intent/certificate and its reserved completion capacity in
    graph order; persist `Settled` with its own exact receipt or proved refusal
    before continuing. Uncertain effects stop later schema execution and keep the
    slot occupied. An uncertain original intent is never prepared again or replayed.
-3. After a lost owner and prior-work quiescence, settle `NotStarted` graphs as
+3. After a lost owner and prior-work quiescence, settle `NotStarted` schema intents as
    `not_attempted` without an engine invocation or fence. Reconcile unresolved
    `Started` intents against their protected exact candidate; record positive
    results without applying again and use the fence protocol below when needed.
@@ -498,7 +501,10 @@ text at the same path never proves ownership. A partial initialization retains
 its exact claim. After prior-owner quiescence, settlement may remove only that
 claim's verified unpublished, empty birth artifacts; a committed, foreign or
 advanced graph is never reset. Interrupted settlement keeps the claim and is
-repeatable. A later deployment can create a fresh graph after proved absence.
+repeatable. A later deployment can create a fresh graph after proved absence,
+including a bounded empty local directory tree left by settlement. Files,
+symlinks and cloud markers refuse; engine preparation still proves the target
+empty before minting new creation authority.
 
 A prepared schema intent uses **intent version 2**, binding canonical root,
 native main incarnation, numeric manifest base `M`, predecessor, exact accepted
@@ -585,9 +591,11 @@ Graph-format conversion remains separately gated by the storage-upgrade decision
 The same explicit converter removes obsolete `activation` and `restart_required`
 fields from completed v2 receipts after validating their old shape. It preserves
 ledger identity, sequence and exact achieved outcomes and advances the ledger
-CAS revision once. Ordinary readers remain strict; unknown fields, unsupported
-receipt variants and outstanding work refuse conversion. Repeating a completed
-conversion is a no-op.
+CAS revision once. Ordinary readers use the same validation to recognize an old
+completed receipt and return `ledger_upgrade_required` with the stopped-upgrade
+command; they never consume converted state. Unknown fields, unsupported receipt
+variants and outstanding work refuse conversion. Repeating a completed conversion
+is a no-op.
 
 ### Deployment scope and preparation
 
@@ -619,9 +627,12 @@ and admission; timeout does not prove a remote delete request has settled.
 Accepted deletion cannot become a not-attempted or refused terminal outcome.
 After supported owner handoff,
 reconciliation resumes the original ID and root even if the manifest is already
-gone, verifies absence, and completes the result. A readable foreign contract
-refuses recovery; an unreadable partial root remains owned by the original
-intent under the stated quiescence boundary. Recovery does not create missing
+gone, verifies absence, and completes the result. Before `Started`, a readable
+root must still match the exact accepted contract. After `Started`, partial
+removal may expose an older manifest; recovery accepts a readable contract from
+the same graph lifetime and refuses a replacement identity. An unreadable partial
+root remains owned by the original intent under the stated quiescence boundary.
+Recovery does not create missing
 storage, adopt replacement contents or reinterpret changed configuration as a
 cancellation. A repeated completed-ID lookup never deletes again.
 
@@ -665,15 +676,18 @@ validation to the v2 executor. One process gate owns the complete operation,
 including activation; competing POSTs refuse without queueing. The accepted
 future belongs to the server through completion even if its HTTP caller leaves.
 
-Before any effect, validate captured input through the shared serving projection,
-resolve required provider secrets and validate all changed runtime bindings. Close only
-affected graph admissions in one batch. Drain their request descendants, then
-execute prepared intents under the server's retained root admission, using
-existing engines for retained graphs. Deletion keeps its predecessor owned until
+Before closing admission, validate captured input, current authorization and the
+shared serving projection without opening graphs or acquiring schema gates.
+Resolve required provider secrets and validate changed runtime bindings before
+effects. Close only affected graph admissions in one batch and drain their request
+descendants under a bounded deadline. Then prepare and execute exact intents
+under the server's retained root admission, using existing engines for retained
+graphs. The owned executor retains preparation, completion and activation after
+drain; the drain deadline does not cancel it. Deletion keeps its predecessor owned until
 the destructive operation settles; it never serves a partially deleted root.
 Unaffected graphs continue serving. Install exact achieved schema
 contracts, validated query registries, engine runtime bindings, management policy
-and graph inventory in one registry snapshot under the shutdown/attempt/deadline
+and graph inventory in one registry snapshot under the shutdown/attempt
 fence. Remove an inventory entry only for an exact durable `Deleted` outcome
 belonging to this closed transition; never retain it for re-adoption.
 Deterministic pre-effect
@@ -685,9 +699,11 @@ installed bindings. It contains canonical root, admission incarnation, original
 ID/input digest, achieved revision and config digest. Keep the durable achieved
 receipt unchanged; there is no post-activation ledger CAS or mutable durable
 restart-needed flag. Status reports `active` only when this exact identity
-matches the requested current receipt, every graph is ready under its installed
-schema contract, and process admission remains open. Partial convergence,
-loading, blocked or transitioning graphs and shutdown report inactive. Ordinary
+matches the requested current receipt, its affected bindings are ready under
+their installed schema contracts, deleted entries are absent, and process
+admission remains open. Unrelated blocked graphs do not invalidate activation.
+Partial convergence, unavailable
+affected bindings and shutdown report inactive. Ordinary
 row commits do not invalidate unchanged deployment bindings. Boot revision/digest
 stays a boot fact.
 Original-ID resubmission is lookup-only before graph closure, including a
@@ -839,7 +855,7 @@ Keep boot revision/digest as boot facts. Direct apply records achieved results
 without a runtime claim. Online activation installs exact identity in the
 registry snapshot alongside verified bindings. A normal configured boot captures
 the latest matching converged receipt under root admission, then establishes
-fresh runtime evidence as its verified opens complete. Generic embedding
+fresh runtime evidence when every configured graph opens successfully. Generic embedding
 constructors do not attest deployment bindings. Missing/expired receipt identity
 is not inferred from schema text or a successful apply. Status reads bounded snapshots outside blocked data lanes;
 it cannot open graphs, start completion or reconstruct history. Protect inventory
@@ -1209,6 +1225,15 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v14 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-06: Review corrections amend the serving-transition and Online
+  deployment sections: close and drain before full engine preparation, retain
+  owned completion beyond the drain deadline, and qualify activation against
+  affected bindings and deleted entries rather than unrelated graph health.
+  Deployment scope now distinguishes exact-contract deletion preparation from
+  same-lifetime recovery after `Started`; the graph-creation paragraph permits
+  verified empty local settlement residue. The CLI and conversion section now specifies
+  recognized old receipts without accepting them through normal reads.
 
 - 2026-10-06: The maintainer requested physical graph deletion through ordinary
   `cluster apply`, with no deletion flag or unregister mode. This replaces the

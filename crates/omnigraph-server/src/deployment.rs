@@ -2,7 +2,7 @@
 //! Input and graph outcomes belong to the cluster ledger; this controller owns
 //! only request lifetime, graph admission and activation of serving bindings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::{
@@ -26,9 +26,9 @@ use crate::{
 };
 
 pub(crate) const REQUEST_BYTES: usize = omnigraph_cluster::MAX_BUNDLE_BYTES + 1024;
-// One absolute transition deadline, including drain and activation. Expiry after
-// effects never reopens old bindings. The process shutdown deadline remains authoritative.
-const TRANSITION_TIMEOUT: Duration = Duration::from_secs(300);
+// Bound only the pre-effect drain. The owned executor retains completion and
+// activation after drainage; the process shutdown deadline remains authoritative.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 pub(crate) struct DeploymentRuntime {
@@ -111,6 +111,9 @@ pub(crate) struct ActiveDeployment {
     input_digest: String,
     result_revision: u64,
     config_digest: String,
+    /// Installed scope: true requires a ready binding, false requires absence.
+    /// Boot expands the ready set to its complete captured inventory.
+    graphs: HashMap<GraphKey, bool>,
 }
 
 impl ActiveDeployment {
@@ -126,6 +129,16 @@ impl ActiveDeployment {
             input_digest: result.input_digest.clone(),
             result_revision: result.result_revision,
             config_digest: result.config_digest.clone()?,
+            graphs: result
+                .graphs
+                .iter()
+                .map(|(id, outcome)| {
+                    Some((
+                        GraphKey::cluster(GraphId::try_from(id.as_str()).ok()?),
+                        !matches!(outcome, GraphDeploymentResult::Deleted { .. }),
+                    ))
+                })
+                .collect::<Option<_>>()?,
         })
     }
 }
@@ -138,6 +151,19 @@ pub(crate) fn initialize_boot_activation(state: &AppState) {
             .serving_deployment()
             .filter(|result| result.config_digest == state.witness.booted_serving_digest)
             .and_then(|result| ActiveDeployment::new(owner, result))
+    });
+    let activation = activation.map(|mut activation| {
+        activation.graphs.extend(
+            state
+                .routing
+                .registry
+                .snapshot_ref()
+                .graphs
+                .keys()
+                .cloned()
+                .map(|key| (key, true)),
+        );
+        activation
     });
     state.routing.registry.initialize_deployment(activation);
 }
@@ -153,18 +179,27 @@ fn active_result(
     let Some(DeploymentLookup::Complete { result }) = lookup else {
         return false;
     };
-    if result.result_revision != current_revision {
+    if !result.converged || result.result_revision != current_revision {
         return false;
     }
     state
         .operations
         .while_open(|| {
             let snapshot = state.routing.registry.snapshot_ref();
-            let expected = ActiveDeployment::new(owner, result);
-            Ok::<_, ApiError>(expected.is_some()
-            && snapshot.deployment == expected
-            && snapshot.graphs.values().all(|entry| {
-                matches!(entry, crate::GraphEntry::Ready(view) if view.contract_is_current())
+            Ok::<_, ApiError>(snapshot.deployment.as_ref().is_some_and(|active| {
+                active.canonical_root == owner.canonical_root()
+                    && active.process_incarnation == owner.lock_id()
+                    && active.id == result.id
+                    && active.input_digest == result.input_digest
+                    && active.result_revision == result.result_revision
+                    && Some(&active.config_digest) == result.config_digest.as_ref()
+                    && active.graphs.iter().all(|(key, present)| {
+                        if *present {
+                            matches!(snapshot.graphs.get(key), Some(crate::GraphEntry::Ready(view)) if view.contract_is_current())
+                        } else {
+                            !snapshot.graphs.contains_key(key)
+                        }
+                    })
             }))
         })
         .unwrap_or(false)
@@ -302,6 +337,7 @@ async fn execute(
             .map_err(refusal)?;
     let affected = preview.affected_graphs;
     validate_serving_candidate(&state, &owner, preview.serving)?;
+    let desired = request.deployment.graph_ids();
     let mut keys = Vec::new();
     for id in &affected {
         let key = GraphKey::cluster(
@@ -312,7 +348,12 @@ async fn execute(
             RegistryLookup::Ready(_)
             | RegistryLookup::Transitioning(_)
             | RegistryLookup::Blocked(_) => keys.push(key),
-            RegistryLookup::Gone => {} // a new graph becomes visible only after achieved publication
+            RegistryLookup::Gone if desired.contains(id) => {} // new graph
+            RegistryLookup::Gone => {
+                return Err(ApiError::conflict(format!(
+                    "graph {id} is absent from the serving registry; restart before deletion"
+                )));
+            }
             _ => {
                 return Err(ApiError::conflict(format!(
                     "graph {id} is unavailable for deployment"
@@ -323,11 +364,7 @@ async fn execute(
     let transition = state
         .routing
         .registry
-        .prepare_deployment_transition(
-            &state.operations,
-            &keys,
-            Instant::now() + TRANSITION_TIMEOUT,
-        )
+        .prepare_deployment_transition(&state.operations, &keys, Instant::now() + DRAIN_TIMEOUT)
         .map_err(|error| ApiError::conflict(error.to_string()))?
         .close()
         .map_err(|error| ApiError::conflict(error.to_string()))?;
@@ -360,6 +397,13 @@ async fn execute(
             .into_iter()
             .map(|(key, engine)| (key.graph_id.to_string(), engine)),
     );
+    if let Err(error) = transition.retain_deployment_completion() {
+        return Err(abort_before_effects(
+            &state,
+            transition,
+            ApiError::conflict(error.to_string()),
+        ));
+    }
     let mut effects_started = false;
     let applied = omnigraph_cluster::apply_captured_deployment(
         &request.deployment,

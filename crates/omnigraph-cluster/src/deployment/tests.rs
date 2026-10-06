@@ -182,9 +182,15 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         )
         .unwrap();
         let bundle = capture_deployment(dir.path()).unwrap();
-        let preview = prepare_deployment_preview(&bundle, &admission, &owner())
-            .await
-            .unwrap();
+        // The serving preview reads control metadata only. Full engine
+        // preparation runs after the server closes and drains affected work;
+        // reopening here would queue an exclusive schema gate behind writers.
+        let graph_root = dir.path().join("graphs/knowledge.omni");
+        let parked_root = dir.path().join("parked-knowledge.omni");
+        fs::rename(&graph_root, &parked_root).unwrap();
+        let preview = prepare_deployment_preview(&bundle, &admission, &owner()).await;
+        fs::rename(&parked_root, &graph_root).unwrap();
+        let preview = preview.expect("serving preview must not open an affected graph");
         assert_eq!(preview.affected_graphs, ["knowledge"]);
         let mut started = false;
         let applied = apply_captured_deployment(
@@ -354,6 +360,80 @@ async fn graph_creation_refuses_foreign_root_without_holding_new_admission() {
     unlock(root).await;
     add_second_graph(dir.path());
     let foreign = dir.path().join("graphs/second.omni");
+    let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    for residue in ["root_file", "nested_file", "directory_bound"] {
+        match residue {
+            "root_file" => fs::write(&foreign, b"unmanaged marker").unwrap(),
+            "nested_file" => {
+                fs::create_dir_all(foreign.join("nested")).unwrap();
+                fs::write(foreign.join("nested/keep"), b"unmanaged data").unwrap();
+            }
+            _ => {
+                fs::create_dir(&foreign).unwrap();
+                for index in 0..64 {
+                    fs::create_dir(foreign.join(index.to_string())).unwrap();
+                }
+            }
+        }
+        let error = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "graph_root_exists", "{residue}: {error:?}");
+        assert_eq!(
+            fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+            ledger
+        );
+        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+        if residue == "root_file" {
+            assert_eq!(fs::read(&foreign).unwrap(), b"unmanaged marker");
+            fs::remove_file(&foreign).unwrap();
+        } else {
+            if residue == "nested_file" {
+                assert_eq!(
+                    fs::read(foreign.join("nested/keep")).unwrap(),
+                    b"unmanaged data"
+                );
+            }
+            fs::remove_dir_all(&foreign).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    for broken in [false, true] {
+        let external = tempfile::tempdir().unwrap();
+        let target = if broken {
+            external.path().join("missing")
+        } else {
+            external.path().to_path_buf()
+        };
+        fs::create_dir(&foreign).unwrap();
+        std::os::unix::fs::symlink(&target, foreign.join("__manifest")).unwrap();
+        let error = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "graph_root_exists");
+        assert_eq!(
+            fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+            ledger
+        );
+        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+        assert!(fs::read_dir(external.path()).unwrap().next().is_none());
+        assert!(
+            fs::symlink_metadata(foreign.join("__manifest"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(&foreign).unwrap();
+    }
+    // Existing cloud prefixes (including exact marker objects) never use the
+    // local directory exception; their normal existence refusal stays intact.
+    let store = ClusterStore::for_storage_root(root).unwrap();
+    for uri in [
+        "s3://test/graphs/second.omni",
+        "az://test/graphs/second.omni",
+    ] {
+        assert!(!store.graph_root_is_empty_local_directory(uri).unwrap());
+    }
     Omnigraph::init(foreign.to_str().unwrap(), crate::tests::SCHEMA)
         .await
         .unwrap();

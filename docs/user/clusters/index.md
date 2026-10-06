@@ -94,7 +94,7 @@ storage paths refuse. The CLI reads only local source files and needs no local
 mount or storage credentials for the server’s root.
 
 The CLI prints the deployment ID before submission. The server keeps its PID,
-listener and writer ownership. It briefly closes admission on affected graphs,
+listener and writer ownership. It closes admission on affected graphs,
 finishes their admitted requests, publishes schema changes, and activates
 matching schemas, queries and runtime permissions together. Unaffected graphs
 keep serving.
@@ -102,7 +102,8 @@ Graph additions and removals use the same deployment; see
 [deletion semantics](#deployment-boundaries) before removing a declaration.
 
 The response separates the durable deployment result from `active`, which means
-that result is currently serving in this process. A successful response requires
+that result's affected bindings are installed in this process. An unrelated
+blocked graph does not invalidate that activation. A successful response requires
 both convergence and activation. Each graph publishes atomically; deployment
 across multiple graphs is not one transaction. Query-only changes create no graph
 commit and also work with multiple branches. Schema changes remain main-only
@@ -113,7 +114,9 @@ change on existing graphs. Current permissions authorize the deployment; propose
 permissions cannot authorize themselves. Provider changes do not re-embed stored
 vectors. Roots, format and credential/trust configuration stay fixed.
 A refusal before effects restores unchanged serving views, including after a
-drain timeout. There is one deployment protocol and no legacy execution fallback.
+drain timeout. That timeout bounds draining admitted requests; once drained,
+the server owns preparation, completion and activation through the existing
+shutdown boundary. There is one deployment protocol and no legacy execution fallback.
 
 Upgrade the CLI, server and cluster tools together. Finish outstanding deployments
 with the build that accepted them before upgrading: captured inputs are exact
@@ -144,6 +147,8 @@ For v2, conversion removes only those obsolete runtime fields, preserving the
 ledger identity, next deployment sequence and exact achieved receipts. Outstanding
 deployments and unsupported receipt shapes refuse; finish accepted work with
 its originating build before upgrading.
+Normal reads report `ledger_upgrade_required` with the stopped-upgrade command
+for a recognized prior receipt; malformed or unknown state remains an error.
 
 A completed read-only preflight refusal releases a newly acquired direct lock.
 Accepted work, cancellation and uncertain effects retain it for reconciliation.
@@ -181,11 +186,12 @@ omnigraph --cluster file:///srv/company-brain \
 ```
 
 Reconciliation uses captured input and exact publication evidence; it never
-replays an uncertain schema or graph-creation invocation. Work that never
-started is recorded as not attempted. A partial graph birth can be abandoned
-only when its exact unpublished, empty artifacts are proved to belong to that
+replays an uncertain schema or graph-creation invocation. Unstarted schema or
+graph-creation work can be recorded as not attempted. A partial graph birth can
+be abandoned only when its exact unpublished, empty artifacts belong to that
 attempt. A foreign or committed graph is never reset. Unknown outcomes stay
-outstanding and block new writes.
+outstanding and block new writes. A later creation may reuse an empty local
+directory tree left by that cleanup; files, symlinks and cloud markers still refuse.
 
 A settled partial result permits a corrective successor from achieved state;
 it does not roll back graphs that committed. Recovery retains a new admission

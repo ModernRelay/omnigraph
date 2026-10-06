@@ -65,7 +65,9 @@ The same explicit `cluster upgrade-ledger --writers-stopped` path removes
 obsolete runtime fields from completed v2 receipts after validating their prior
 shape and consistency. It preserves ledger identity, deployment sequence, exact
 outcomes and applied resources with one conditional replacement. Normal decoding
-stays strict; outstanding work must finish under its originating build.
+uses that same validation to report `ledger_upgrade_required` for a recognized
+prior receipt, never to accept converted state. Malformed or unknown state stays
+invalid; outstanding work must finish under its originating build.
 
 Apply manages graphs, schemas, queries, policies and provider/Blob bindings.
 Runtime changes are validated before effects and activated with the achieved
@@ -110,8 +112,11 @@ installed graph policy's `read` and `schema_apply` gates before effects or recov
 Accepted deletion cannot settle as refused or not attempted. An error leaves
 it outstanding; reconciliation resumes only that root under exclusive admission,
 including after its manifest is gone. Fresh deletion accepts an already-absent
-root; a present root must match the applied contract. Recovery refuses a readable
-foreign contract, while a partial root remains bound to its original intent.
+root; a present root must match the applied contract before deletion starts.
+After `Started`, recovery checks a readable manifest's graph lifetime rather than
+its schema revision: partial removal can expose an older manifest of the same
+graph. A replacement lifetime refuses, while an unreadable partial root remains
+bound to its original intent.
 Completion requires verified root absence before a `Deleted` outcome removes
 the graph's applied resources and contract. A lost completion acknowledgement is
 reconciled by original ID. No deletion queue, side record or retained-owner pool
@@ -126,6 +131,9 @@ engine genesis retains its existing actorless initialization contract. Later
 schema commits record the actor in their engine receipt.
 Foreign, committed or advanced roots are preserved and refused. The durable
 claim remains until cleanup completes; interrupted cleanup is resumable.
+A later creation may reuse a bounded empty local directory tree left by cleanup,
+with engine preparation still proving an empty target. Files, symlinks and cloud
+markers refuse; this does not adopt existing graph contents.
 
 Terminal results advance only the achieved resources. Partial convergence is a
 valid base for a corrective successor under the same owner or after a qualified
@@ -198,11 +206,14 @@ the graph permissions required by the shared executor. Graph-scoped data tokens
 cannot deploy. One process gate owns execution and activation after caller
 disconnect; no polling worker or second storage-writing CLI is involved.
 
-The controller projects captured input through the existing serving validator,
-resolves required provider secrets and validates new graph bindings before any
-deployment effect. It reserves one batch transition, atomically closes affected graph
-admission and drains request descendants, including held response bytes. Existing
-engine handles remain owned through execution. A removal cannot delete storage
+The controller validates captured input, current authorization and the serving
+projection before closing admission, without opening affected graphs or acquiring
+their schema gates. It resolves required provider secrets and validates runtime
+bindings before effects. It reserves one batch transition, atomically closes affected graph
+admission and drains request descendants, including held response bytes. Full
+engine preparation then uses the retained live handles. The drain deadline does
+not expire owned preparation, completion or activation; process shutdown remains
+authoritative. A removal cannot delete storage
 before this boundary; a pre-effect refusal can resume the unchanged predecessor
 under a fresh epoch only when the existing abort proof permits it.
 It executes under the server's lifetime admission, loads the achieved bindings,
@@ -216,14 +227,16 @@ Activation identity is installed in the same immutable registry snapshot as
 serving bindings: canonical root, process incarnation, original ID/input digest,
 achieved revision and config digest. The durable achieved receipt stays unchanged;
 there is no second ledger write after activation. `GET /cluster/deployments/{id}`
-reports active only for that exact current identity while every graph is ready
-under its installed schema contract and process admission remains open. Row
-commits do not invalidate unchanged deployment bindings. Partial convergence,
-blocked/loading/transitioning entries and shutdown report inactive.
+reports active only for that exact current identity while its affected bindings
+are ready under their installed schema contracts, deleted entries are absent,
+and process admission remains open. An unrelated blocked graph does not invalidate
+activation. Row commits do not invalidate unchanged deployment bindings. Partial convergence, an unavailable
+affected binding and shutdown report inactive.
 
 A normal configured boot captures the latest matching converged receipt under
-root admission and establishes fresh runtime evidence only as its verified graph
-opens complete. Generic embedding constructors do not attest deployment bindings.
+root admission and establishes fresh runtime evidence only as all configured graph
+opens complete successfully. Generic embedding constructors do not attest
+deployment bindings.
 Missing or expired receipt identity is not inferred from schema text or boot
 revision alone. Old-ID submission validates immutable input and returns the
 original record before graph closure; it cannot reinstall an old view. Boot

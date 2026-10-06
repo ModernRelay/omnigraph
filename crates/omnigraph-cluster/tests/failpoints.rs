@@ -286,6 +286,14 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
             "foreign",
         ),
         (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED,
+            "older_schema",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_ACCEPTANCE,
+            "older_schema_before_started",
+        ),
+        (
             &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_SCHEMA,
             "none",
         ),
@@ -301,6 +309,18 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
         let dir = offline_fixture().await;
         let root = dir.path().to_str().unwrap();
         let graph = dir.path().join("graphs/knowledge.omni");
+        if damage.starts_with("older_schema") {
+            // Commit a new schema before deleting. A partial
+            // prefix purge may remove its newest manifest while older versions
+            // still expose this same graph lifetime's previous schema.
+            let evolved = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+                .await
+                .unwrap();
+            assert!(
+                matches!(evolved, DeploymentLookup::Complete { ref result } if result.converged)
+            );
+            unlock_offline(dir.path()).await;
+        }
         let contract = Omnigraph::open_read_only(graph.to_str().unwrap())
             .await
             .unwrap()
@@ -341,6 +361,64 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
             unlock_offline(dir.path()).await;
         }
         match damage {
+            "older_schema" | "older_schema_before_started" => {
+                let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                    .await
+                    .unwrap();
+                let version = db
+                    .graph_manifest_version_of(omnigraph::db::ReadTarget::branch("main"))
+                    .await
+                    .unwrap();
+                drop(db);
+                // Lance 11 V2 manifests invert the version for lexical ordering.
+                let latest = graph
+                    .join("__manifest/_versions")
+                    .join(format!("{:020}.manifest", u64::MAX - version));
+                assert!(latest.exists());
+                // Model an interruption after the sequential lexicographic
+                // object-store purge has removed every file through this key,
+                // including __history and __manifest/_transactions.
+                fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+                    for entry in fs::read_dir(dir).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            files(&path, out);
+                        } else {
+                            out.push(path);
+                        }
+                    }
+                }
+                let mut inventory = Vec::new();
+                files(&graph, &mut inventory);
+                inventory.sort();
+                let prefix = inventory
+                    .into_iter()
+                    .take_while(|path| path <= &latest)
+                    .collect::<Vec<_>>();
+                assert!(prefix.contains(&latest));
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|path| path.starts_with(graph.join("__history")))
+                );
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|path| path.starts_with(graph.join("__manifest/_transactions")))
+                );
+                for path in prefix {
+                    fs::remove_file(path).unwrap();
+                }
+                let older = Omnigraph::open_read_only(graph.to_str().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(older.schema_source().as_str(), SCHEMA);
+                assert_eq!(
+                    older.schema_contract_digest().schema_identity_domain,
+                    contract.schema_identity_domain
+                );
+                assert_ne!(older.schema_contract_digest(), contract);
+            }
             "partial" => fs::remove_dir_all(graph.join("__manifest")).unwrap(),
             "foreign" => {
                 fs::remove_dir_all(&graph).unwrap();
@@ -353,7 +431,7 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
         fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
         fs::remove_file(dir.path().join("people.pg")).unwrap();
         let recovered = reconcile_deployment(root, &id, true, &deployment_owner()).await;
-        if damage == "foreign" {
+        if matches!(damage, "foreign" | "older_schema_before_started") {
             assert_eq!(recovered.unwrap_err().code, "deployment_outcome_unknown");
             assert!(graph.exists());
             assert_eq!(
@@ -900,6 +978,11 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
         (&seams::DEPLOYMENT_AFTER_STARTED, false, false),
         (&seams::DEPLOYMENT_AFTER_SCHEMA, true, false),
         (&seams::DEPLOYMENT_AFTER_SCHEMA, true, true),
+        (
+            &omnigraph::seams::catalog::INIT_TABLE_CREATE_POST_NATIVE,
+            false,
+            false,
+        ),
     ] {
         let dir = fixture();
         let root = dir.path().to_str().unwrap();
@@ -924,7 +1007,14 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
             })
             .await
             .unwrap_err();
-            assert_eq!(error.code, "injected_failpoint");
+            assert_eq!(
+                error.code,
+                if seam.name() == "init.table_create_post_native" {
+                    "deployment_outcome_unknown"
+                } else {
+                    "injected_failpoint"
+                }
+            );
         }
         unlock_offline(dir.path()).await;
         if replace {
@@ -959,6 +1049,41 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
                     | GraphDeploymentResult::Refused { .. }
                     | GraphDeploymentResult::NotAttempted
             ));
+            if seam.name() == "init.table_create_post_native" {
+                // Exact unpublished cleanup has completed. A new
+                // invocation should be able to create the declared graph.
+                let graph = dir.path().join(format!("graphs/{target}.omni"));
+                assert!(graph.is_dir());
+                let mut dirs = vec![graph.clone()];
+                let mut files = Vec::new();
+                while let Some(dir) = dirs.pop() {
+                    for entry in fs::read_dir(dir).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            dirs.push(path);
+                        } else {
+                            files.push(path);
+                        }
+                    }
+                }
+                assert!(files.is_empty(), "cleanup left files: {files:?}");
+                Omnigraph::prepare_graph_create(graph.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap();
+                unlock_offline(dir.path()).await;
+                fs::write(
+                    &path,
+                    source.replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n"),
+                )
+                .unwrap();
+                fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+                let retry =
+                    apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {}).await;
+                assert!(
+                    matches!(retry, Ok(DeploymentLookup::Complete { ref result }) if result.converged),
+                    "cleaned abandoned creation must permit fresh apply: {retry:?}"
+                );
+            }
         }
     }
 }

@@ -12,7 +12,11 @@
   `activation` or `restart_required`. Finish outstanding deployments with their
   originating build and run the stopped-ledger upgrade before starting the new
   build on a ledger containing those completed-result fields. Conversion preserves
-  graph data and exact achieved receipts.
+  graph data and exact achieved receipts. Normal reads identify qualified old
+  receipts with `ledger_upgrade_required` and the stopped-upgrade command.
+  Unrelated blocked graphs no longer invalidate activation of an independent
+  deployment. The drain timeout bounds admitted-request drainage; owned deployment
+  preparation and completion continue under the process shutdown boundary.
 
 - The CLI also rejects the obsolete `repair --confirm` and `repair --force`
   controls. Repair continues diagnosing foreign linear table commits without

@@ -2104,6 +2104,25 @@ mod owned_shutdown {
 /// listener survive schema/query replacement and graph addition.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_deployment_retains_disconnected_owner_and_never_replays_original_id() {
+    live_deployment_fixture("journey").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn independent_live_deployment_activates_beside_a_blocked_graph() {
+    live_deployment_fixture("blocked_peer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deletion_of_missing_registry_entry_refuses_before_effects() {
+    live_deployment_fixture("missing_peer").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_query_deployment_closes_admission_before_waiting_for_a_merge() {
+    live_deployment_fixture("merge").await;
+}
+
+async fn live_deployment_fixture(mode: &str) {
     use omnigraph_cluster::{CapturedDeployment, DeploymentStatus};
     use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
     use std::sync::Arc;
@@ -2149,6 +2168,10 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
     fs::write(temp.path().join("policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\n  readers: [reader]\nrules:\n  - id: admins\n    allow:\n      actors: { group: admins }\n      actions: [schema_apply, read, invoke_query]\n  - id: readers\n    allow:\n      actors: { group: readers }\n      actions: [read]\n").unwrap();
     fs::write(temp.path().join("cluster-policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\nrules:\n  - id: manage\n    allow:\n      actors: { group: admins }\n      actions: [config_manage]\n").unwrap();
     fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n  peer:\n    schema: ./peer.pg\npolicies:\n  access:\n    file: ./policy.yaml\n    applies_to: [knowledge, peer]\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n").unwrap();
+    if mode == "merge" {
+        let policy = fs::read_to_string(temp.path().join("policy.yaml")).unwrap();
+        fs::write(temp.path().join("policy.yaml"), policy.replace("[schema_apply, read, invoke_query]", "[schema_apply, read, invoke_query, change, branch_create, branch_merge, branch_delete]")).unwrap();
+    }
     apply_cluster_fixture(temp.path()).await;
     let mut settings = cluster_settings(temp.path()).await.unwrap();
     settings
@@ -2159,10 +2182,17 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
         .await
         .unwrap();
     let ServerConfigMode::Multi {
-        graphs,
+        mut graphs,
         config_path,
         server_policy,
     } = settings.mode;
+    if mode == "blocked_peer" {
+        fs::remove_dir_all(temp.path().join("graphs/peer.omni")).unwrap();
+    } else if mode == "missing_peer" {
+        // An embedding supplied an incomplete registry: refuse deletion before
+        // touching the managed root rather than fail activation after purge.
+        graphs.retain(|graph| graph.graph_id != "peer");
+    }
     let state = omnigraph_server::open_multi_graph_state(
         graphs,
         vec![
@@ -2205,6 +2235,141 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
     assert_eq!(code, StatusCode::FORBIDDEN);
     let (initial_status, _) = status(&app, None).await;
     let id = initial_status.next_deployment_id();
+    if mode == "merge" {
+        use omnigraph::seams::catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE;
+        struct RequestHold {
+            thread: std::thread::ThreadId,
+            hold: Arc<omnigraph::seams::Hold>,
+        }
+        impl omnigraph::seams::Behavior for RequestHold {
+            fn uninstalling(&self) {
+                self.hold.release();
+            }
+        }
+        impl omnigraph::seams::Decide for RequestHold {
+            fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+                if std::thread::current().id() == self.thread {
+                    omnigraph::seams::Decide::decide(self.hold.as_ref(), name)
+                } else {
+                    omnigraph::seams::Decision::Pass
+                }
+            }
+        }
+        original_engine
+            .branch_create_as("feature", Some("operator"))
+            .await
+            .unwrap();
+        omnigraph::Session::from_defaults(Arc::clone(&original_engine), Default::default())
+            .mutate_as(
+                "feature",
+                "query add() { insert Person { name: \"Merged\" } }",
+                "add",
+                &Default::default(),
+                Some("operator"),
+            )
+            .await
+            .unwrap();
+        let merge_request = Request::post("/graphs/knowledge/branches/merge")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"source":"feature","delete_branch":true}"#))
+            .unwrap();
+        let merger_app = app.clone();
+        let (start, started) = std::sync::mpsc::channel();
+        let merger = std::thread::spawn(move || {
+            started.recv().unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move { json_response(&merger_app, merge_request).await })
+        });
+        let hold = Arc::new(omnigraph::seams::Hold::default());
+        let guard = BRANCH_MERGE_POST_AUTHORITY_CAPTURE.install(Arc::new(RequestHold {
+            thread: merger.thread().id(),
+            hold: Arc::clone(&hold),
+        }));
+        start.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached() {
+                assert!(
+                    !merger.is_finished(),
+                    "merge must retain its shared schema gate"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::write(temp.path().join("people.gq"), "// query-only deployment\nquery find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
+        let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let deploy_app = app.clone();
+        let request = submit(&id, &deployment, "operator-token");
+        let deployer = tokio::spawn(async move { json_response(&deploy_app, request).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                state.routing().registry.get(&key),
+                RegistryLookup::Transitioning(_)
+            ) {
+                assert!(
+                    !deployer.is_finished(),
+                    "deployment must reach closure before the merge finishes"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preview must not queue an exclusive graph open ahead of admission closure");
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert!(!deployer.is_finished());
+        assert_eq!(
+            json_response(
+                &app,
+                get_request("/graphs/knowledge/snapshot", "operator-token")
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            json_response(&app, get_request("/graphs/peer/snapshot", "operator-token"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        hold.release();
+        let (code, merge) = tokio::task::spawn_blocking(move || merger.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::OK, "{merge}");
+        assert!(!hold.timed_out());
+        drop(guard);
+        let (code, applied) = deployer.await.unwrap();
+        assert_eq!(code, StatusCode::OK, "{applied}");
+        assert_eq!(applied["active"], true);
+        assert_eq!(
+            applied["deployment"]["result"]["graphs"]["knowledge"]["outcome"],
+            "query_only"
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        let RegistryLookup::Ready(view) = state.routing().registry.get(&key) else {
+            panic!("ready");
+        };
+        assert!(
+            view.queries
+                .as_ref()
+                .unwrap()
+                .lookup("find_person")
+                .unwrap()
+                .source
+                .starts_with("// query-only deployment")
+        );
+        return;
+    }
     fs::write(
         temp.path().join("people.pg"),
         "node Person { name: String @key bio: String? }\n",
@@ -2218,6 +2383,56 @@ async fn live_deployment_retains_disconnected_owner_and_never_replays_original_i
         fs::read(temp.path().join("__cluster/state.json")).unwrap(),
         before
     );
+
+    if mode == "blocked_peer" {
+        let (code, response) =
+            json_response(&app, submit(&id, &deployment, "operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{response}");
+        assert_eq!(response["deployment"]["result"]["converged"], true);
+        assert!(matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Ready(_)
+        ));
+        let peer_key = GraphKey::cluster(GraphId::try_from("peer").unwrap());
+        assert!(matches!(
+            state.routing().registry.get(&peer_key),
+            RegistryLookup::Blocked(_)
+        ));
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert_eq!(
+            response["active"], true,
+            "unrelated availability is not activation"
+        );
+        assert!(status(&app, Some(&id)).await.1);
+        return;
+    }
+    if mode == "missing_peer" {
+        let config = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            config
+                .replace("  peer:\n    schema: ./peer.pg\n", "")
+                .replace("[knowledge, peer]", "[knowledge]"),
+        )
+        .unwrap();
+        let removal = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let (code, response) = json_response(&app, submit(&id, &removal, "operator-token")).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("absent from the serving registry")
+        );
+        assert!(temp.path().join("graphs/peer.omni").exists());
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        return;
+    }
 
     // Runtime-only configuration is checked before creation or ledger acceptance.
     // A typo in a new graph's secret reference must not stop healthy service.

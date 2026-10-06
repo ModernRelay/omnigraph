@@ -1224,8 +1224,8 @@ fn verify_recorded_input(
     Ok(())
 }
 
-/// Runtime preview derived from one captured ledger and one preparation.
-/// It is descriptive only; execution prepares again after the affected requests drain.
+/// Runtime preview derived from captured control metadata, without graph opens
+/// or schema-gate acquisition. Full engine preparation follows request drainage.
 pub struct DeploymentPreview {
     pub affected_graphs: Vec<String>,
     pub serving: ServingSnapshot,
@@ -1247,35 +1247,21 @@ pub async fn prepare_deployment_preview(
     let store = ClusterStore::for_storage_root(admission.canonical_root())?;
     let (state, cas) = read_existing(&store).await?;
     require_v2(&state)?;
-    let id = format!(
-        "{}:{}:{}",
-        state.ledger_id.as_ref().unwrap(),
-        state.next_sequence.unwrap(),
-        Ulid::new()
-    );
-    let input_digest = sha256_hex(
-        &serde_json::to_vec(bundle)
-            .map_err(|error| refusal("deployment_encode", error.to_string()))?,
-    );
-    let prepared = prepare_deployment(
-        &store,
-        bundle,
-        caller,
-        (state.clone(), cas.clone()),
-        &BTreeMap::new(),
-        &id,
-        &input_digest,
-    )
-    .await?;
-    let affected_graphs: Vec<_> = prepared
-        .state
-        .outstanding
-        .as_ref()
-        .unwrap()
-        .graphs
-        .keys()
-        .cloned()
+    let policy = deployment_policies(&store, &state, bundle, caller).await?;
+    if state.outstanding.is_some() {
+        return Err(refusal(
+            "cluster_deployment_outstanding",
+            "original deployment remains outstanding",
+        ));
+    }
+    authorization::refuse_pending_recovery(&store).await?;
+    let effects = preview_deployment_scope(&state, bundle)?;
+    let affected_graphs: Vec<_> = affected_graphs(&state, bundle, &effects)
+        .into_iter()
         .collect();
+    for graph in &affected_graphs {
+        authorize_graph_change(&state, bundle, caller, &policy, graph)?;
+    }
     let serving = serve::preview_snapshot_with_store(&store, bundle, &affected_graphs, state, cas)
         .await
         .map_err(|mut diagnostics| diagnostics.remove(0))?;
@@ -1283,6 +1269,35 @@ pub async fn prepare_deployment_preview(
         affected_graphs,
         serving,
     })
+}
+
+/// Authorize from applied control metadata before any graph gate or open.
+/// The executor repeats the same check at its fresh accepted-base capture.
+fn authorize_graph_change(
+    state: &ClusterState,
+    bundle: &DeploymentBundle,
+    caller: &DeploymentCaller,
+    policy: &AppliedPolicies,
+    graph: &str,
+) -> Result<(), Diagnostic> {
+    if !state
+        .applied_revision
+        .resources
+        .contains_key(&graph_address(graph))
+    {
+        return Ok(());
+    }
+    if !bundle.resources.contains_key(&graph_address(graph)) {
+        return authorize_graph_deletion(policy, caller, graph);
+    }
+    let schema = schema_address(graph);
+    if state.applied_revision.resources[&schema].digest != bundle.resources[&schema].digest
+        && let DeploymentCaller::AuthenticatedIdentity(identity) = caller
+    {
+        policy.check_graph(identity.actor(), graph, PolicyAction::Read)?;
+        policy.check_graph(identity.actor(), graph, PolicyAction::SchemaApply)?;
+    }
+    Ok(())
 }
 
 /// Submit a frozen deployment under direct writer admission. `report_id` runs before acceptance and
@@ -1755,6 +1770,7 @@ async fn prepare_graphs(
     let mut graphs = BTreeMap::new();
     let mut migrations = BTreeMap::new();
     for graph in affected {
+        authorize_graph_change(state, bundle, caller, policy, &graph)?;
         let existing = state
             .applied_revision
             .resources
@@ -1786,6 +1802,9 @@ async fn prepare_graphs(
                 .graph_root_exists(&uri)
                 .await
                 .map_err(|error| refusal("graph_unavailable", error.to_string()))?
+                && !store
+                    .graph_root_is_empty_local_directory(&uri)
+                    .map_err(|error| refusal("graph_unavailable", error.to_string()))?
             {
                 return Err(refusal(
                     "graph_root_exists",
@@ -1808,7 +1827,6 @@ async fn prepare_graphs(
             continue;
         }
         if !bundle.resources.contains_key(&graph_address(&graph)) {
-            authorize_graph_deletion(policy, caller, &graph)?;
             let root = store.canonical_managed_graph_root(&graph)?;
             let contract =
                 state.applied_revision.schema_contracts.as_ref().unwrap()[&graph].clone();
@@ -1868,10 +1886,6 @@ async fn prepare_graphs(
             ));
         }
         if schema_changed {
-            if let DeploymentCaller::AuthenticatedIdentity(identity) = caller {
-                policy.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                policy.check_graph(identity.actor(), &graph, PolicyAction::SchemaApply)?;
-            }
             let (intent, migration) = db
                 .prepare_schema_apply_with_plan_as(
                     source_for(bundle, &schema_address)?,
@@ -2352,11 +2366,24 @@ pub async fn reconcile_deployment(
                         .map_err(|error| refusal("graph_unavailable", error.to_string()))
                 };
                 match opened {
-                    Ok(db) if db.schema_contract_digest() != delete.contract => {
-                        return Err(refusal(
-                            "deployment_outcome_unknown",
-                            "graph deletion root contains a foreign schema identity",
-                        ));
+                    Ok(db) => {
+                        let observed = db.schema_contract_digest();
+                        let matches_authority =
+                            if matches!(entry.state, GraphDeploymentState::NotStarted) {
+                                observed == delete.contract
+                            } else {
+                                // A partial purge may remove newer manifests before old
+                                // ones. An older schema of this lifetime is still owned
+                                // by the accepted deletion; a replacement lifetime is not.
+                                observed.schema_identity_domain
+                                    == delete.contract.schema_identity_domain
+                            };
+                        if !matches_authority {
+                            return Err(refusal(
+                                "deployment_outcome_unknown",
+                                "graph deletion root contains a foreign schema identity",
+                            ));
+                        }
                     }
                     Err(error) if matches!(entry.state, GraphDeploymentState::NotStarted) => {
                         return Err(error);
