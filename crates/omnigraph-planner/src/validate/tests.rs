@@ -387,17 +387,49 @@ fn another_limit_fails_the_row_cut() {
     assert_eq!(check, "row cut");
 }
 
-/// A row cut the query does not write is refused wherever it sits: over the
-/// root of a query without `limit`, and below the root of one with it.
+/// Every count cut a plan declares must be one the query requires, where it
+/// requires it. Refused: a `Limit` over the root of a query without `limit`,
+/// a second `Limit` below a written one, and a capped `Sort` below the final
+/// sort, with and without a written `limit`; the final sort's own top-k under
+/// a written `limit` stays accepted.
 #[test]
 fn an_unwritten_row_cut_fails_the_row_cut() {
-    let cut_over = |plan: &mut PhysicalPlan, input: usize| {
+    let cut_over = |plan: &mut PhysicalPlan, node: PhysicalNode, input: usize| {
         let properties = plan.properties(input).cloned();
-        let cut = plan.add(PhysicalNode::Limit { input, rows: 0 });
+        let cut = plan.add(node);
         if let Some(properties) = properties {
             plan.set_properties(cut, properties);
         }
         cut
+    };
+    let limit_over = |plan: &mut PhysicalPlan, input: usize| {
+        cut_over(plan, PhysicalNode::Limit { input, rows: 0 }, input)
+    };
+    // A capped sort spliced below the plan's final sort, ordered as it is.
+    let capped_below_final = |plan: &mut PhysicalPlan| {
+        let final_sort = node_ids(plan, |node| matches!(node, PhysicalNode::Sort { .. }))[0];
+        let Some(PhysicalNode::Sort {
+            input,
+            order_by,
+            tiebreak,
+            ..
+        }) = plan.node(final_sort).cloned()
+        else {
+            unreachable!("the id names a sort");
+        };
+        let capped = cut_over(
+            plan,
+            PhysicalNode::Sort {
+                input,
+                order_by,
+                fetch: Some(0),
+                tiebreak,
+            },
+            input,
+        );
+        if let Some(PhysicalNode::Sort { input, .. }) = plan.node_mut(final_sort) {
+            *input = capped;
+        }
     };
 
     let unlimited = Fixture::new(
@@ -406,7 +438,7 @@ fn an_unwritten_row_cut_fails_the_row_cut() {
     );
     let mut plan = unlimited.plan();
     let root = plan.root();
-    let cut = cut_over(&mut plan, root);
+    let cut = limit_over(&mut plan, root);
     plan.set_root(cut);
     let (check, detail) = unlimited.refused(plan);
     assert_eq!(check, "row cut", "{detail}");
@@ -416,12 +448,26 @@ fn an_unwritten_row_cut_fails_the_row_cut() {
     let Some(PhysicalNode::Limit { input, .. }) = plan.node(plan.root()).cloned() else {
         panic!("the limited plan's root is its cut");
     };
-    let below = cut_over(&mut plan, input);
+    let below = limit_over(&mut plan, input);
     if let Some(PhysicalNode::Limit { input, .. }) = plan.node_mut(plan.root()) {
         *input = below;
     }
     let (check, detail) = limited.refused(plan);
     assert_eq!(check, "row cut", "{detail}");
+
+    let ordered = Fixture::new(
+        "query q() { match { $d: Doc } return { $d.slug } order { $d.year } }",
+        &[],
+    );
+    for fixture in [&ordered, &limited] {
+        fixture
+            .accept(fixture.plan())
+            .expect("the planned final sort is the cut the query requires");
+        let mut plan = fixture.plan();
+        capped_below_final(&mut plan);
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "row cut", "{detail}");
+    }
 }
 
 /// An order key constant for every row (a parameter, `now()`) orders

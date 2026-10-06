@@ -682,6 +682,33 @@ pub enum PhysicalNode {
 }
 
 impl PhysicalNode {
+    /// The most rows this node keeps of its input whatever any predicate
+    /// holds: its count cut. Every variant is listed, so a node kind that
+    /// gains a cut cannot compile without declaring it here, and plan
+    /// acceptance justifies every declared cut against the query.
+    pub fn row_cut(&self) -> Option<usize> {
+        match self {
+            Self::Limit { rows, .. } | Self::Page { rows, .. } => Some(*rows),
+            Self::Sort { fetch, .. } => *fetch,
+            Self::RankFuse { limit, .. } => *limit,
+            Self::Scan { ranked, .. } => ranked.as_ref().and_then(|ranked| ranked.fetch),
+            Self::MetadataCount { .. }
+            | Self::SortMergeJoin { .. }
+            | Self::HashJoin { .. }
+            | Self::HydrateByAddress { .. }
+            | Self::RowCompare { .. }
+            | Self::ClassifyThreeWay { .. }
+            | Self::CrossJoin { .. }
+            | Self::ContainsJoin { .. }
+            | Self::Filter { .. }
+            | Self::Expand { .. }
+            | Self::AntiJoin { .. }
+            | Self::OuterReference { .. }
+            | Self::Projection { .. }
+            | Self::Aggregate { .. } => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Scan { .. } => "Scan",

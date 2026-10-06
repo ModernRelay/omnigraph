@@ -138,6 +138,7 @@ impl Requirements {
         }
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_search(plan, &matcher, budget)?;
+        self.check_row_cuts(plan, budget)?;
         self.check_returns(plan, &top, &matcher, budget)?;
         self.check_order_and_cut(plan, &top, &matcher, budget)?;
         check_policies(plan, budget)?;
@@ -426,6 +427,56 @@ impl Requirements {
         Ok(())
     }
 
+    /// Every count cut the plan declares (`PhysicalNode::row_cut`) is one the
+    /// query requires, where it requires it: the root `Limit` and the final
+    /// sort's `fetch` carry the query's `limit`, a fusion keeps that `limit`,
+    /// and a ranked scan's candidate cap is the one its declared policy sets
+    /// (checked with its access). Any other cut is refused, a capped sort
+    /// below the final one and a cut in a correlated block's tree included.
+    fn check_row_cuts(
+        &self,
+        plan: &PhysicalPlan,
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
+        let limit = self
+            .limit
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        let root = plan.root();
+        let mut id = match plan.node(root) {
+            Some(PhysicalNode::Limit { input, .. }) => *input,
+            _ => root,
+        };
+        while let Some(PhysicalNode::Projection { input, .. }) = plan.node(id) {
+            id = *input;
+        }
+        let final_sort = matches!(plan.node(id), Some(PhysicalNode::Sort { .. })).then_some(id);
+        for (id, node) in plan.live() {
+            let Some(cut) = node.row_cut() else {
+                continue;
+            };
+            let required = match node {
+                PhysicalNode::Limit { .. } => id == root && limit == Some(cut),
+                PhysicalNode::Sort { .. } => Some(id) == final_sort && limit == Some(cut),
+                PhysicalNode::RankFuse { .. } => limit == Some(cut),
+                PhysicalNode::Scan {
+                    ranked: Some(_), ..
+                } => true,
+                _ => false,
+            };
+            if !required {
+                return Err(ValidationError::violated(
+                    "row cut",
+                    format!(
+                        "node {id} ({}) keeps at most {cut} rows; the query's `limit` is {limit:?} and requires no such cut there",
+                        node.name()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The candidate cap, probe cap and overfetch ladder a ranked scan
     /// declares, from the cut its scope requires: an ordering `nearest`
     /// fetches the `limit` and may widen it by the declared ladder, a
@@ -601,25 +652,6 @@ impl Requirements {
         matcher: &Matcher<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        // A row cut is the query's `limit` and nothing else: one, at the
-        // root (checked next), when the query writes it, and none anywhere
-        // when it does not, a correlated block's tree included.
-        budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
-        let cuts = plan
-            .live()
-            .filter(|(_, node)| {
-                matches!(node, PhysicalNode::Limit { .. } | PhysicalNode::Page { .. })
-            })
-            .count();
-        let allowed = usize::from(self.limit.is_some());
-        if cuts != allowed {
-            return Err(ValidationError::violated(
-                "row cut",
-                format!(
-                    "the plan cuts its rows {cuts} times; the query's `limit` allows {allowed}"
-                ),
-            ));
-        }
         let mut id = plan.root();
         if let Some(limit) = self.limit {
             let rows = usize::try_from(limit).unwrap_or(usize::MAX);

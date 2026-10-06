@@ -632,7 +632,14 @@ catalog, not from the IR: binding identity, search identity and its declared
 approximation, every eligibility conjunct (checked per `rrf` arm, since each
 arm copies the match), correlated blocks, the projection and the origin of
 every projected score, order and cut, and the policies the plan declares
-for its search. A matcher relates each written expression to the IR through
+for its search. Every node declares its count cut (`PhysicalNode::row_cut`,
+a match over every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s
+`fetch`, a `RankFuse`'s limit, a ranked scan's candidate cap), and the
+validator justifies each one by its position: the root `Limit` and the final
+`Sort` (below the root `Limit` and its projections) at the query's `limit`, a
+fusion at that `limit`, and a ranked scan's cap as its declared policy sets
+it. Any other cut, a capped sort below the final one or a cut in a
+correlated block's tree, is refused as `row cut`. A matcher relates each written expression to the IR through
 the compiler's lowering patterns (property leaves on physical columns, `in`
 as a swapped `contains`, a bare search call as `= true`, a folded constant as
 the value the engine's evaluator gives it). The order check recomputes the

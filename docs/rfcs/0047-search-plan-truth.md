@@ -1038,3 +1038,10 @@ None.
   every counter passed; it now releases a replaced node, and the statement
   that the byte and node limits bound evidence memory is replaced by the
   linear bound above.
+- 2026-10-06: a further review finding: the row-cut check counted `Limit`
+  and `Page` nodes only, so a capped `Sort` below the final sort cut rows
+  unseen. Every node kind now declares its count cut through one exhaustive
+  match, so a kind that gains a cut cannot compile without declaring it,
+  and acceptance justifies each declared cut by its position (root `Limit`
+  and final sort `fetch` at the query's `limit`, the fusion's limit, a
+  ranked scan's policy cap) and refuses every other.

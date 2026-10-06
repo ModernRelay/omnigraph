@@ -1268,42 +1268,81 @@ query instants() {
     );
 }
 
-/// A saved plan carrying a row cut the query does not write is invalid
-/// evidence: a `Limit(0)` over the unfiltered count would replay as no rows
-/// where the query returns its one count row.
+/// A saved plan carrying a count cut the query does not require is invalid
+/// evidence, wherever the cut sits: a `Limit(0)` over the unfiltered count
+/// would replay as no rows where the query returns its one count row, and a
+/// capped sort below `liked`'s final sort as no rows where it returns three.
 #[tokio::test]
-async fn an_unwritten_row_cut_refuses_the_replay_of_a_count() {
+async fn an_unwritten_row_cut_refuses_the_replay() {
     let dir = tempfile::tempdir().unwrap();
     let db = people(&dir).await;
-    let mut run = db
-        .query_inspected(
-            ReadTarget::branch("main"),
-            PEOPLE_QUERIES,
-            "count_people",
-            &ParamMap::new(),
-        )
-        .await
-        .unwrap();
-    let plan = &mut run.plan.plan;
-    let root = plan.root();
-    let properties = plan.properties(root).cloned();
-    let cut = plan.add(PhysicalNode::Limit {
-        input: root,
-        rows: 0,
-    });
-    if let Some(properties) = properties {
-        plan.set_properties(cut, properties);
+    for query in ["count_people", "liked"] {
+        let mut run = db
+            .query_inspected(
+                ReadTarget::branch("main"),
+                PEOPLE_QUERIES,
+                query,
+                &ParamMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!rows_of(&run.result).is_empty(), "{query} returns rows");
+        let plan = &mut run.plan.plan;
+        let final_sort = plan
+            .live()
+            .find(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+            .map(|(id, node)| (id, node.clone()));
+        assert_eq!(final_sort.is_some(), query == "liked", "{query}");
+        match final_sort {
+            Some((
+                id,
+                PhysicalNode::Sort {
+                    input,
+                    order_by,
+                    tiebreak,
+                    ..
+                },
+            )) => {
+                let properties = plan.properties(input).cloned();
+                let capped = plan.add(PhysicalNode::Sort {
+                    input,
+                    order_by,
+                    fetch: Some(0),
+                    tiebreak,
+                });
+                if let Some(properties) = properties {
+                    plan.set_properties(capped, properties);
+                }
+                if let Some(PhysicalNode::Sort { input, .. }) = plan.node_mut(id) {
+                    *input = capped;
+                }
+            }
+            _ => {
+                let root = plan.root();
+                let properties = plan.properties(root).cloned();
+                let cut = plan.add(PhysicalNode::Limit {
+                    input: root,
+                    rows: 0,
+                });
+                if let Some(properties) = properties {
+                    plan.set_properties(cut, properties);
+                }
+                plan.set_root(cut);
+            }
+        }
+        let refused = db
+            .replay_bound_plan(
+                ReadTarget::branch("main"),
+                &run.replay_envelope(PEOPLE_QUERIES, query),
+            )
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{query}: the added cut is refused"));
+        assert!(
+            refused.to_string().contains("row cut"),
+            "{query}: {refused}"
+        );
     }
-    plan.set_root(cut);
-    let refused = db
-        .replay_bound_plan(
-            ReadTarget::branch("main"),
-            &run.replay_envelope(PEOPLE_QUERIES, "count_people"),
-        )
-        .await
-        .err()
-        .expect("the added cut is refused");
-    assert!(refused.to_string().contains("row cut"), "{refused}");
 }
 
 #[tokio::test]
