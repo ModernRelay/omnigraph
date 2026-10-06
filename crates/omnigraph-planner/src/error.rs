@@ -1,3 +1,5 @@
+use omnigraph_compiler::QueryDiagnostic;
+use omnigraph_compiler::query::diagnostic::QueryCode;
 use thiserror::Error;
 
 /// A planning failure. For a change-feed or merge operation the gate turns
@@ -9,11 +11,27 @@ pub enum PlanError {
     #[error("the plan source could not resolve: {detail}")]
     Unresolved { detail: String },
     /// A well-formed query shape the planner refuses by design; the caller's
-    /// error, answered as a bad request, never as a planner defect.
-    #[error("{detail}")]
-    Unsupported { detail: String },
+    /// error, answered as a bad request carrying its diagnostic, never as a
+    /// planner defect.
+    #[error("{0}")]
+    Unsupported(Box<QueryDiagnostic>),
     /// A pass met a plan it has no rule for. A registered shape never reaches
     /// this arm; the registry test pins that.
     #[error("planner internal error: {0}")]
     Internal(String),
 }
+
+impl PlanError {
+    /// A refusal by design: the planner code, what was refused, and the one
+    /// fix that answers it, or `None` when the message names the decision.
+    pub fn refused(code: QueryCode, message: impl Into<String>, fix: Option<&str>) -> Self {
+        let diagnostic = QueryDiagnostic::plan(code, message);
+        Self::Unsupported(Box::new(match fix {
+            Some(fix) => diagnostic.with_fix(fix),
+            None => diagnostic,
+        }))
+    }
+}
+
+/// The fix of a traversal that needs a work limit (`P002`).
+pub(crate) const SET_TRAVERSAL_WORK_LIMIT: &str = "set `traversal_work_limit` before the query, for example `set traversal_work_limit = 1000000;`";

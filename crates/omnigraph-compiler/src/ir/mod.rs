@@ -2,6 +2,8 @@ pub mod fold;
 pub(crate) mod lower;
 pub(crate) mod validate;
 
+pub use lower::is_fresh_variable;
+
 use std::collections::HashMap;
 
 use crate::query::ast::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Param, Precedence};

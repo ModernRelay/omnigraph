@@ -1,5 +1,5 @@
 # issue: none
-# notes: A search-only order over a pipeline with a second, unranked binding sorts by the score and tie-breaks on every scope binding's id, which the planner reads for the scan; a search order on a traversal destination is refused at planning with the shape named.
+# notes: A search-only order over a pipeline with a second, unranked binding sorts by the score and tie-breaks on every scope binding's id, which the planner reads for the scan; a search order on a traversal destination is refused at planning with the shape named and planner code P001.
 # red_on: 2026-09-23, task 0226 tree before the one-pass tie-break: step 1 failed with `the planned tie-break column 'z.__id' is not in the sort input` (the tie-break was derived at lowering, after projection pushdown); step 2 failed with `column 'd._distance' not found for ordering` instead of a planning refusal.
 
 --- runner
@@ -62,4 +62,4 @@ query nearest_on_a_traversal_destination($q: Vector(4)) {
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0]}
---- expect error: a traversal destination, which engine v2 does not support
+--- expect error: plan error: P001: `nearest()` orders `$d`, a traversal destination

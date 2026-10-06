@@ -2,6 +2,7 @@
 //! claim is the call sequence an engine sees, which no query result shows.
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_planner::EmptyEligible;
 use omnigraph_planner::{
     ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
     PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
@@ -13,6 +14,8 @@ fn no_prefilter() -> Prefilter {
         ranked_type: "Doc".to_string(),
         hops: Vec::new(),
         feeds: Vec::new(),
+        on_empty: EmptyEligible::Postfilter,
+        coverage_admits: true,
     }
 }
 

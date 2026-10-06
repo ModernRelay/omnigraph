@@ -19,15 +19,15 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap};
 use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{
-    BoundPlan, DatasetPin, ExpandMode, ExpandPolicy, NodeId, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, RankKind, RankScope,
+    AcceptedBoundPlan, BoundPlan, DatasetPin, Evidence, ExpandMode, ExpandPolicy, NodeId,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankKind, RankScope,
 };
 
 use crate::db::{DatasetEntry, Omnigraph, Snapshot};
@@ -38,6 +38,7 @@ use crate::instrumentation::{
     RrfGateFallback, RrfGatePlan, RrfGateVerdict, record_ann_prefilter_verdict,
     record_rrf_gate_verdict,
 };
+use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
 mod bind;
@@ -71,7 +72,8 @@ use context::QueryContext;
 pub(crate) use explain::{explain_document, explain_rows};
 pub(crate) use graph::{EmbeddingResolver, GraphIndexHandle};
 use lower::Lowering;
-use plan_source::{ExplainedQuery, QuerySource, explain_query, plan_query};
+use plan_source::{ExplainedQuery, QuerySource, accept_query, explain_query};
+pub(crate) use plan_source::{accept_replay, replay_refused, replayed_coverage_holds};
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
@@ -102,7 +104,8 @@ pub(crate) fn dataset_pin(entry: &DatasetEntry) -> DatasetPin {
 
 /// Refuse a snapshot that is not the one `plan` was built on: the planner
 /// recorded every dataset it read in the plan's `Assumptions`, by path,
-/// branch and version, and a replay reads exactly those or nothing.
+/// branch and version, and a replay reads exactly those or nothing. A
+/// changed prerequisite is a conflict: replan against the current view.
 pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Result<()> {
     for (table, planned) in &plan.assumptions().datasets {
         let pinned = snapshot.dataset(table).map(dataset_pin);
@@ -119,7 +122,7 @@ pub(crate) fn plan_pins_snapshot(plan: &PhysicalPlan, snapshot: &Snapshot) -> Re
                 ),
                 None => "no such table".to_string(),
             };
-            return Err(OmniError::manifest_internal(format!(
+            return Err(OmniError::manifest_conflict(format!(
                 "`{table}` was planned at dataset {}; the snapshot holds {}",
                 spell(planned),
                 spell(&pinned)
@@ -171,14 +174,15 @@ async fn run_once(
     ctx: &QueryContext,
     pass: &Pass,
     rung: usize,
-) -> Result<(RecordBatch, ScanReport, Vec<ReportRow>)> {
+) -> Result<(RecordBatch, ScanReports, Vec<ReportRow>)> {
     let lowered = lowering.lower_query(pass)?;
     lowered.record_in_memory_filters();
     let batch = run_plan(&lowered, lowering.plan, ctx).await?;
-    let report = *lowered
+    let report = lowered
         .report
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let rows = pass_rows(&lowered, lowering.plan, rung)?;
     Ok((batch, report, rows))
 }
@@ -191,10 +195,10 @@ struct NearestScan<'p> {
     overfetch: &'p [OverfetchRung],
 }
 
-/// The two arms of an `rrf()` in arm order, and the pre-pass their
-/// `RankFuse` declares.
+/// An `rrf()` with both its arms: the `RankFuse` node and the pre-pass it
+/// declares.
 struct Fusion<'p> {
-    arms: [ArmTarget<'p>; 2],
+    id: NodeId,
     prefilter: &'p Prefilter,
 }
 
@@ -206,11 +210,11 @@ struct RankedScans<'p> {
 
 fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
     let mut nearest = None;
-    let mut arms: [Option<ArmTarget<'_>>; 2] = [None, None];
+    let mut arms = [false, false];
     let mut fuse = None;
     for (id, node) in plan.live() {
         if let PhysicalNode::RankFuse { prefilter, .. } = node {
-            fuse = Some(prefilter);
+            fuse = Some((id, prefilter));
             continue;
         }
         let PhysicalNode::Scan {
@@ -219,10 +223,6 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
         } = node
         else {
             continue;
-        };
-        let target = ArmTarget {
-            kind: ranked.kind,
-            property: &ranked.property,
         };
         match ranked.scope {
             RankScope::Order => {
@@ -234,17 +234,14 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
                     });
                 }
             }
-            RankScope::Primary => arms[0] = Some(target),
-            RankScope::Secondary => arms[1] = Some(target),
+            RankScope::Primary => arms[0] = true,
+            RankScope::Secondary => arms[1] = true,
         }
     }
     RankedScans {
         nearest,
         fusion: match (arms, fuse) {
-            ([Some(primary), Some(secondary)], Some(prefilter)) => Some(Fusion {
-                arms: [primary, secondary],
-                prefilter,
-            }),
+            ([true, true], Some((id, prefilter))) => Some(Fusion { id, prefilter }),
             _ => None,
         },
     }
@@ -273,7 +270,7 @@ impl ResolvedParams {
 /// Widen nearest candidates when traversal or filtering leaves a full scan's
 /// answer short of the limit.
 pub(crate) async fn execute_query(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: GraphIndexHandle,
@@ -281,9 +278,9 @@ pub(crate) async fn execute_query(
     embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let physical = plan_query(&source)?;
-    let bound = bind(physical, &source, embedding).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
+    let accepted = accept_query(&source)?;
+    let bound = bind(accepted, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
         catalog,
@@ -298,7 +295,7 @@ pub(crate) async fn execute_query(
 /// [`execute_query`] as an [`Executed`]: the gate plans once, and that one
 /// plan is both the plan the run executes and the plan its explain renders.
 pub(crate) async fn execute_query_inspected(
-    ir: &QueryIR,
+    query: &CompiledQuery,
     params: &ParamMap,
     snapshot: &Snapshot,
     graph_index: GraphIndexHandle,
@@ -306,9 +303,9 @@ pub(crate) async fn execute_query_inspected(
     embedding: &EmbeddingResolver<'_>,
     settings: &SessionSettings,
 ) -> Result<Executed> {
-    let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let ExplainedQuery { explain, physical } = explain_query(&source)?;
-    let bound = bind(physical, &source, embedding).await?;
+    let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
+    let ExplainedQuery { explain, accepted } = explain_query(&source)?;
+    let bound = bind(accepted, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
         catalog,
@@ -317,11 +314,14 @@ pub(crate) async fn execute_query_inspected(
     let PlanRun {
         result,
         plan,
+        evidence,
         report,
     } = Box::pin(execute(bound, &context)).await?;
     Ok(Executed {
         result,
         plan,
+        evidence,
+        catalog: omnigraph_planner::catalog_digest(catalog),
         explain,
         report,
     })
@@ -407,18 +407,23 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
 
 /// Run `bound` under `context` and report what each of its nodes did, every
 /// pass of the overfetch ladder folded into one report.
-pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Result<PlanRun> {
+pub(crate) async fn execute(
+    accepted: AcceptedBoundPlan,
+    context: &EngineContext<'_>,
+) -> Result<PlanRun> {
+    let (bound, evidence) = accepted.into_parts();
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
-    ctx.run_owned(execute_with_context(bound, context, &ctx))
+    ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))
         .await
 }
 
 async fn execute_with_context(
     bound: BoundPlan,
+    evidence: Evidence,
     context: &EngineContext<'_>,
     ctx: &QueryContext,
 ) -> Result<PlanRun> {
@@ -426,8 +431,14 @@ async fn execute_with_context(
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
-    if let Some(Fusion { arms, prefilter }) = fusion {
-        let eligible = Box::pin(rrf_prefilter_gate(context, arms, prefilter, policy)).await;
+    if let Some(Fusion { id, prefilter }) = fusion {
+        let (eligible, verdict) = Box::pin(rrf_prefilter_gate(context, prefilter, policy)).await;
+        let plan = if eligible.is_some() {
+            "prefilter"
+        } else {
+            "postfilter"
+        };
+        executed.decide(id, 0, report::Taken::gate(plan, &verdict));
         let mut pass = Pass::default();
         if let Some(ids) = eligible {
             for id in &prefilter.feeds {
@@ -438,9 +449,27 @@ async fn execute_with_context(
         lowered.record_in_memory_filters();
         let fused = Box::pin(run_plan(&lowered, &bound.plan, ctx)).await?;
         executed.record(pass_rows(&lowered, &bound.plan, 0)?);
+        // Each nearest arm's probe ladder, by its scan, after the fusion's gate.
+        let reports = lowered
+            .report
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for (scan, report) in reports {
+            if !report.probes.is_empty() {
+                executed.decide(
+                    scan,
+                    0,
+                    report::Taken::Probes {
+                        attempts: report.probes,
+                    },
+                );
+            }
+        }
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
             plan: bound,
+            evidence,
             report: executed,
         });
     }
@@ -452,15 +481,36 @@ async fn execute_with_context(
         ..
     }) = &nearest
     {
-        pass = match Box::pin(nearest_prefilter_gate(context, prefilter, policy)).await {
-            NearestGatePlan::Prefilter(ids) => pass.prefiltered(*id, ids),
-            NearestGatePlan::Postfilter => pass,
-            NearestGatePlan::ProvenEmpty => pass.proven_empty(*id),
+        let (plan, verdict) = Box::pin(nearest_prefilter_gate(context, prefilter, policy)).await;
+        let (taken, next) = match plan {
+            NearestGatePlan::Prefilter(ids) => ("prefilter", pass.prefiltered(*id, ids)),
+            NearestGatePlan::Postfilter => ("postfilter", pass),
+            NearestGatePlan::ProvenEmpty => ("proven_empty", pass.proven_empty(*id)),
         };
+        executed.decide(*id, 0, report::Taken::gate(taken, &verdict));
+        pass = next;
     }
 
-    let (result_batch, report, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
+    let (result_batch, reports, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
+    let nearest_report = |mut reports: ScanReports| {
+        nearest
+            .as_ref()
+            .and_then(|scan| reports.remove(&scan.id))
+            .unwrap_or_default()
+    };
+    let report = nearest_report(reports);
+    if let Some(NearestScan { id, .. }) = &nearest
+        && !report.probes.is_empty()
+    {
+        executed.decide(
+            *id,
+            0,
+            report::Taken::Probes {
+                attempts: report.probes.clone(),
+            },
+        );
+    }
     let mut result_batch = result_batch;
     let mut report = report;
     let aggregate = bound
@@ -523,9 +573,19 @@ async fn execute_with_context(
                         pass.with_exact_nearest(id, k)
                     }
                 };
-                let (retried, retried_report, rows) =
+                let (retried, retried_reports, rows) =
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
+                let retried_report = nearest_report(retried_reports);
+                if !retried_report.probes.is_empty() {
+                    executed.decide(
+                        id,
+                        rung,
+                        report::Taken::Probes {
+                            attempts: retried_report.probes.clone(),
+                        },
+                    );
+                }
                 result_batch = retried;
                 report = retried_report;
                 if let PassStep::Exact { k } = step {
@@ -553,6 +613,7 @@ async fn execute_with_context(
     Ok(PlanRun {
         result: QueryResult::new(result_batch.schema(), vec![result_batch]),
         plan: bound,
+        evidence,
         report: executed,
     })
 }
@@ -709,6 +770,8 @@ mod traversal_admission_tests {
                 direction: Direction::Out,
             }],
             feeds,
+            on_empty: omnigraph_planner::EmptyEligible::ProvenEmpty,
+            coverage_admits: true,
         };
         let mut plan = selected_plan();
         let input = 0;
@@ -744,6 +807,8 @@ mod traversal_admission_tests {
                 scope: RankScope::Order,
                 overfetch: vec![],
                 prefilter: None,
+                eligibility: omnigraph_planner::Eligibility::BeforeScoring,
+                policy: Some(omnigraph_planner::NearestPolicy::DEFAULT),
             }),
         };
         validate_traversal_admission(&plan).unwrap();

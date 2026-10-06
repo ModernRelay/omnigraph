@@ -1,0 +1,73 @@
+# issue: none
+# notes: An order key that is constant for every row (a parameter, or a single edge type's
+# notes: `@type` in a grouped query) orders nothing. Written as the expression or as its
+# notes: `return` alias, the planner binds it to that alias, and acceptance sees the key as the
+# notes: constant it names: the rows fall to the identity tie-break, and the query is accepted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"a"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"a"}
+
+--- query
+query by_parameter($x: I64) {
+    match { $p: Person }
+    return { $p.name, $x as x }
+    order { $x }
+}
+
+--- params
+{"x": 7}
+
+--- expect ordered
+{"p.name": "a", "x": 7}
+{"p.name": "b", "x": 7}
+
+--- expect shape
+p.name: String
+x: I64
+
+--- query
+query by_parameter_alias($x: I64) {
+    match { $p: Person }
+    return { $p.name, $x as x }
+    order { x desc }
+}
+
+--- params
+{"x": 7}
+
+--- expect ordered
+{"p.name": "a", "x": 7}
+{"p.name": "b", "x": 7}
+
+--- expect shape
+p.name: String
+x: I64
+
+--- query
+query by_single_edge_type() {
+    match { $from: Person $from $edge: knows $to }
+    return { $edge.@type as edge_type, count($to) as n }
+    order { $edge.@type }
+}
+
+--- expect unordered
+{"edge_type": "Knows", "n": 2}
+
+--- expect shape
+edge_type: String
+n: I64
