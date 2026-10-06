@@ -3,7 +3,7 @@
 //! Snapshot readers retain one immutable view. Request capture and transitions
 //! use the same synchronous registry boundary under process admission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use omnigraph::db::{Omnigraph, SchemaContractDigest};
@@ -11,6 +11,7 @@ use omnigraph::storage::normalize_root_uri;
 use tokio::time::Instant;
 
 use crate::ApiError;
+use crate::deployment::ActiveDeployment;
 use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
 use crate::policy::PolicyEngine;
@@ -111,6 +112,9 @@ impl GraphEntry {
 pub struct RegistrySnapshot {
     pub graphs: HashMap<GraphKey, GraphEntry>,
     pub any_per_graph_policy: bool,
+    /// Management policy published in the same snapshot as graph bindings.
+    pub server_policy: Option<Arc<PolicyEngine>>,
+    pub(crate) deployment: Option<ActiveDeployment>,
 }
 
 impl RegistrySnapshot {
@@ -119,7 +123,18 @@ impl RegistrySnapshot {
         Self {
             graphs,
             any_per_graph_policy,
+            server_policy: None,
+            deployment: None,
         }
+    }
+}
+
+impl RegistrySnapshot {
+    fn with_graphs(&self, graphs: HashMap<GraphKey, GraphEntry>) -> Self {
+        let mut snapshot = Self::new(graphs);
+        snapshot.server_policy = self.server_policy.clone();
+        snapshot.deployment = self.deployment.clone();
+        snapshot
     }
 }
 
@@ -172,6 +187,7 @@ struct RegistryState {
 struct TransitionCandidate {
     record: Arc<TransitionRecord>,
     closed: bool,
+    completion_owned: bool,
 }
 
 pub struct GraphRegistry {
@@ -180,6 +196,11 @@ pub struct GraphRegistry {
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn root_identity(uri: &str) -> Result<String, ServingTransitionError> {
+    omnigraph_cluster::canonical_graph_uri(uri)
+        .map_err(|error| ServingTransitionError::InvalidGraph(error.message))
 }
 
 impl GraphRegistry {
@@ -218,8 +239,22 @@ impl GraphRegistry {
         })
     }
 
+    pub(crate) fn initialize_server_policy(&self, policy: Option<Arc<PolicyEngine>>) {
+        let mut state = locked(&self.state);
+        let mut snapshot = RegistrySnapshot::new(state.snapshot.graphs.clone());
+        snapshot.server_policy = policy;
+        state.snapshot = Arc::new(snapshot);
+    }
+
     pub fn snapshot_ref(&self) -> Arc<RegistrySnapshot> {
         Arc::clone(&locked(&self.state).snapshot)
+    }
+
+    pub(crate) fn initialize_deployment(&self, deployment: Option<ActiveDeployment>) {
+        let mut state = locked(&self.state);
+        let mut snapshot = state.snapshot.with_graphs(state.snapshot.graphs.clone());
+        snapshot.deployment = deployment;
+        state.snapshot = Arc::new(snapshot);
     }
 
     pub fn get(&self, key: &GraphKey) -> RegistryLookup {
@@ -261,14 +296,24 @@ impl GraphRegistry {
 
     /// Process admission is always acquired before the registry lock. Only
     /// AppState's HTTP/MCP boundary passes its actual process runtime here.
+    #[cfg(test)]
     pub(crate) fn capture(
         &self,
         operations: &OperationRuntime,
         key: &GraphKey,
     ) -> Result<RegistryCapture, ApiError> {
+        self.capture_with_policy(operations, key)
+            .map(|(capture, _)| capture)
+    }
+
+    pub(crate) fn capture_with_policy(
+        &self,
+        operations: &OperationRuntime,
+        key: &GraphKey,
+    ) -> Result<(RegistryCapture, Option<Arc<PolicyEngine>>), ApiError> {
         operations.while_open(|| {
             let state = locked(&self.state);
-            Ok(match state.snapshot.graphs.get(key) {
+            let capture = match state.snapshot.graphs.get(key) {
                 Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
                 Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
                 Some(GraphEntry::Transitioning(view)) => {
@@ -276,7 +321,8 @@ impl GraphRegistry {
                 }
                 Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
                 None => RegistryCapture::Gone,
-            })
+            };
+            Ok((capture, state.snapshot.server_policy.clone()))
         })
     }
 
@@ -303,7 +349,7 @@ impl GraphRegistry {
             for (pending, result) in results {
                 graphs.insert(pending.key.clone(), result);
             }
-            state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+            state.snapshot = Arc::new(state.snapshot.with_graphs(graphs));
             Ok(())
         })
     }
@@ -328,6 +374,25 @@ impl GraphRegistry {
         keys: &[GraphKey],
         deadline: Instant,
     ) -> Result<PreparedTransition, ServingTransitionError> {
+        self.prepare_transition_inner(operations, keys, deadline, false)
+    }
+
+    pub(crate) fn prepare_deployment_transition(
+        self: &Arc<Self>,
+        operations: &OperationRuntime,
+        keys: &[GraphKey],
+        deadline: Instant,
+    ) -> Result<PreparedTransition, ServingTransitionError> {
+        self.prepare_transition_inner(operations, keys, deadline, true)
+    }
+
+    fn prepare_transition_inner(
+        self: &Arc<Self>,
+        operations: &OperationRuntime,
+        keys: &[GraphKey],
+        deadline: Instant,
+        recovery: bool,
+    ) -> Result<PreparedTransition, ServingTransitionError> {
         operations.while_open(|| {
             let mut state = locked(&self.state);
             if Instant::now() >= deadline {
@@ -335,11 +400,9 @@ impl GraphRegistry {
             }
             // Expiry retires bookkeeping only. Closed graphs and every
             // admitted descendant remain retained by their registry entries.
-            if state
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| Instant::now() >= candidate.record.deadline)
-            {
+            if state.candidate.as_ref().is_some_and(|candidate| {
+                !candidate.completion_owned && Instant::now() >= candidate.record.deadline
+            }) {
                 state.candidate = None;
             }
             if state.candidate.is_some() {
@@ -347,12 +410,27 @@ impl GraphRegistry {
             }
             let mut seen = std::collections::HashSet::with_capacity(keys.len());
             let mut predecessors = Vec::with_capacity(keys.len());
+            let mut unavailable = Vec::new();
+            let mut recovering = HashSet::new();
             for key in keys {
                 if !seen.insert(key) {
                     return Err(ServingTransitionError::InvalidBindings);
                 }
                 let predecessor = match state.snapshot.graphs.get(key) {
-                    Some(GraphEntry::Ready(view)) => Arc::clone(view),
+                    Some(GraphEntry::Ready(view)) => {
+                        if recovery && !view.contract_is_current() {
+                            recovering.insert(key.clone());
+                        }
+                        Arc::clone(view)
+                    }
+                    Some(GraphEntry::Blocked(graph)) if recovery => {
+                        unavailable.push(Arc::clone(graph));
+                        continue;
+                    }
+                    Some(GraphEntry::Transitioning(view)) if recovery => {
+                        recovering.insert(key.clone());
+                        Arc::clone(view)
+                    }
                     Some(
                         GraphEntry::Loading(_)
                         | GraphEntry::Transitioning(_)
@@ -362,7 +440,7 @@ impl GraphRegistry {
                     }
                     None => return Err(ServingTransitionError::Gone),
                 };
-                if !predecessor.contract_is_current() {
+                if !recovering.contains(key) && !predecessor.contract_is_current() {
                     return Err(ServingTransitionError::SchemaChanged);
                 }
                 predecessor.epoch().successor()?;
@@ -370,6 +448,8 @@ impl GraphRegistry {
             }
             let record = Arc::new(TransitionRecord {
                 predecessors,
+                unavailable,
+                recovering,
                 deadline,
             });
             if Instant::now() >= deadline {
@@ -378,6 +458,7 @@ impl GraphRegistry {
             state.candidate = Some(TransitionCandidate {
                 record: Arc::clone(&record),
                 closed: false,
+                completion_owned: false,
             });
             Ok(PreparedTransition::new(
                 Arc::clone(self),
@@ -398,11 +479,11 @@ impl GraphRegistry {
         }
         for predecessor in &record.predecessors {
             if !matches!(state.snapshot.graphs.get(&predecessor.key),
-                Some(GraphEntry::Ready(view)) if Arc::ptr_eq(view, predecessor))
+                Some(GraphEntry::Ready(view) | GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, predecessor))
             {
                 return Err(ServingTransitionError::StaleAttempt);
             }
-            if !predecessor.contract_is_current() {
+            if !record.recovering.contains(&predecessor.key) && !predecessor.contract_is_current() {
                 return Err(ServingTransitionError::SchemaChanged);
             }
         }
@@ -413,7 +494,7 @@ impl GraphRegistry {
                 GraphEntry::Transitioning(Arc::clone(predecessor)),
             );
         }
-        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        let snapshot = Arc::new(state.snapshot.with_graphs(graphs));
         if Instant::now() >= record.deadline {
             return Err(ServingTransitionError::DeadlineElapsed);
         }
@@ -453,6 +534,19 @@ impl GraphRegistry {
         validate_closed(&locked(&self.state), record)
     }
 
+    /// Once affected requests drain, the owned executor retains this exact
+    /// candidate through preparation, durable effects and activation. The drain
+    /// deadline cannot expire completion authority; process shutdown still can.
+    pub(crate) fn retain_deployment_completion(
+        &self,
+        record: &Arc<TransitionRecord>,
+    ) -> Result<(), ServingTransitionError> {
+        let mut state = locked(&self.state);
+        validate_closed(&state, record)?;
+        state.candidate.as_mut().unwrap().completion_owned = true;
+        Ok(())
+    }
+
     /// Reopen unchanged admission after the controller proves that no effect
     /// began. Deadline and drainage are deliberately not preconditions here:
     /// every older descendant remains in the successor's shared counter.
@@ -471,11 +565,14 @@ impl GraphRegistry {
         let mut graphs = state.snapshot.graphs.clone();
         let mut epochs = HashMap::with_capacity(record.predecessors.len());
         for predecessor in &record.predecessors {
+            if record.recovering.contains(&predecessor.key) {
+                continue;
+            }
             if !matches!(graphs.get(&predecessor.key), Some(GraphEntry::Transitioning(view)) if Arc::ptr_eq(view, predecessor))
             {
                 return Err(ServingTransitionError::StaleAttempt);
             }
-            if !predecessor.contract_is_current() {
+            if !record.recovering.contains(&predecessor.key) && !predecessor.contract_is_current() {
                 return Err(ServingTransitionError::SchemaChanged);
             }
             let epoch = predecessor.epoch().successor()?;
@@ -485,11 +582,11 @@ impl GraphRegistry {
             );
             epochs.insert(predecessor.key.clone(), epoch);
         }
-        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        let snapshot = Arc::new(state.snapshot.with_graphs(graphs));
         if record
             .predecessors
             .iter()
-            .any(|view| !view.contract_is_current())
+            .any(|view| !record.recovering.contains(&view.key) && !view.contract_is_current())
         {
             return Err(ServingTransitionError::SchemaChanged);
         }
@@ -517,90 +614,101 @@ impl GraphRegistry {
             .iter()
             .map(|view| Ok(Arc::new(view.successor(view.epoch().successor()?))))
             .collect::<Result<Vec<_>, ServingTransitionError>>()?;
-        self.activate(record, views)
+        let snapshot = self.snapshot_ref();
+        self.activate_deployment(
+            record,
+            views,
+            Vec::new(),
+            Vec::new(),
+            snapshot.server_policy.clone(),
+            snapshot.deployment.clone(),
+        )
     }
 
-    /// Compile the complete replacement set before entering the short final
-    /// publication boundary. The exact engine contract is checked both before
-    /// compilation and again by activate, so no query registry crosses schemas.
-    pub(crate) fn validate_activation(
+    /// Validate every replacement before the short final publication boundary.
+    pub(crate) fn validate_deployment_activation(
         &self,
         record: &Arc<TransitionRecord>,
-        mut bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
-        additions: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
+        handles: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
     ) -> Result<Vec<Arc<ServingView>>, ServingTransitionError> {
         self.check_drained(record)?;
-        if bindings.len() != record.predecessors.len() {
-            return Err(ServingTransitionError::InvalidBindings);
-        }
-        let mut views = Vec::with_capacity(bindings.len() + additions.len());
-        for predecessor in &record.predecessors {
-            let (contract, queries) = bindings
-                .remove(&predecessor.key)
-                .ok_or(ServingTransitionError::InvalidBindings)?;
-            if contract != predecessor.engine.schema_contract_digest() {
-                return Err(ServingTransitionError::SchemaChanged);
-            }
-            crate::validate_registry_against_catalog(
-                &queries,
-                &predecessor.engine.catalog(),
-                predecessor.key.graph_id.as_str(),
-            )
-            .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;
-            let handle = Arc::new(GraphHandle {
-                key: predecessor.key.clone(),
-                uri: predecessor.uri.clone(),
-                engine: Arc::clone(&predecessor.engine),
-                policy: predecessor.policy.clone(),
-                queries: (!queries.is_empty()).then(|| Arc::new(queries)),
-            });
-            let view = Arc::new(ServingView::new(handle, predecessor.epoch().successor()?));
-            if view.schema_contract() != &contract {
-                return Err(ServingTransitionError::SchemaChanged);
-            }
-            views.push(view);
-        }
-        for (handle, contract) in additions {
-            let (_, handle) = canonicalize_handle_uri(handle)
-                .map_err(|error| ServingTransitionError::InvalidGraph(error.to_string()))?;
-            if contract != handle.engine.schema_contract_digest() {
-                return Err(ServingTransitionError::SchemaChanged);
-            }
-            if let Some(queries) = &handle.queries {
-                crate::validate_registry_against_catalog(
-                    queries,
-                    &handle.engine.catalog(),
-                    handle.key.graph_id.as_str(),
-                )
-                .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;
-            }
-            let view = Arc::new(ServingView::new(handle, ServingEpoch::INITIAL));
-            if view.schema_contract() != &contract {
-                return Err(ServingTransitionError::SchemaChanged);
-            }
-            views.push(view);
-        }
-        Ok(views)
+        handles
+            .into_iter()
+            .map(|(handle, contract)| {
+                let (_, handle) = canonicalize_handle_uri(handle)
+                    .map_err(|error| ServingTransitionError::InvalidGraph(error.to_string()))?;
+                if contract != handle.engine.schema_contract_digest() {
+                    return Err(ServingTransitionError::SchemaChanged);
+                }
+                if let Some(queries) = &handle.queries {
+                    crate::validate_registry_against_catalog(
+                        queries,
+                        &handle.engine.catalog(),
+                        handle.key.graph_id.as_str(),
+                    )
+                    .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;
+                }
+                let epoch = match record.predecessors.iter().find(|old| old.key == handle.key) {
+                    Some(old) => old.epoch().successor()?,
+                    None => ServingEpoch::INITIAL,
+                };
+                let view = Arc::new(ServingView::new(handle, epoch));
+                if view.schema_contract() != &contract {
+                    return Err(ServingTransitionError::SchemaChanged);
+                }
+                Ok(view)
+            })
+            .collect()
     }
 
-    pub(crate) fn activate(
+    pub(crate) fn activate_deployment(
         &self,
         record: &Arc<TransitionRecord>,
         views: Vec<Arc<ServingView>>,
+        unavailable: Vec<Arc<BlockedGraph>>,
+        deleted: Vec<(GraphKey, SchemaContractDigest)>,
+        server_policy: Option<Arc<PolicyEngine>>,
+        deployment: Option<ActiveDeployment>,
     ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
         let mut state = locked(&self.state);
         validate_closed(&state, record)?;
         let mut graphs = state.snapshot.graphs.clone();
+        let mut deleted_keys = HashSet::new();
+        for (key, contract) in deleted {
+            if !deleted_keys.insert(key.clone()) {
+                return Err(ServingTransitionError::InvalidBindings);
+            }
+            if let Some(predecessor) = record.predecessors.iter().find(|old| old.key == key) {
+                if predecessor.schema_contract() != &contract
+                    || predecessor.engine.schema_contract_digest() != contract
+                {
+                    return Err(ServingTransitionError::SchemaChanged);
+                }
+            } else if !record.unavailable.iter().any(|old| old.key == key) {
+                return Err(ServingTransitionError::InvalidBindings);
+            }
+            // Only a completed deletion receipt can retire an exact closed
+            // predecessor. No retired-engine or re-adoption cache is created.
+            graphs.remove(&key);
+        }
         let mut epochs = HashMap::with_capacity(views.len());
         for view in &views {
-            if epochs.insert(view.key.clone(), view.epoch()).is_some() {
+            let root = root_identity(&view.uri)?;
+            if deleted_keys.contains(&view.key)
+                || epochs.insert(view.key.clone(), view.epoch()).is_some()
+            {
                 return Err(ServingTransitionError::InvalidBindings);
             }
             if let Some(predecessor) = record.predecessors.iter().find(|old| old.key == view.key) {
-                if !Arc::ptr_eq(&predecessor.engine, &view.engine)
-                    || predecessor.uri != view.uri
+                if !predecessor.engine.shares_runtime_owner(&view.engine)
+                    || root_identity(&predecessor.uri)? != root
                     || view.epoch() != predecessor.epoch().successor()?
                 {
+                    return Err(ServingTransitionError::InvalidBindings);
+                }
+            } else if let Some(blocked) = record.unavailable.iter().find(|old| old.key == view.key)
+            {
+                if root_identity(&blocked.uri)? != root || view.epoch() != ServingEpoch::INITIAL {
                     return Err(ServingTransitionError::InvalidBindings);
                 }
             } else if graphs.contains_key(&view.key) {
@@ -608,30 +716,56 @@ impl GraphRegistry {
                     InsertError::DuplicateKey(view.key.clone()).to_string(),
                 ));
             }
-            if graphs
-                .values()
-                .any(|entry| entry.key() != &view.key && entry.uri() == view.uri)
-            {
-                return Err(ServingTransitionError::InvalidGraph(
-                    InsertError::DuplicateUri(view.uri.clone()).to_string(),
-                ));
+            for entry in graphs.values() {
+                if entry.key() != &view.key && root_identity(entry.uri())? == root {
+                    return Err(ServingTransitionError::InvalidGraph(
+                        InsertError::DuplicateUri(view.uri.clone()).to_string(),
+                    ));
+                }
             }
             graphs.insert(view.key.clone(), GraphEntry::Ready(Arc::clone(view)));
+        }
+        let mut unavailable_keys = HashSet::new();
+        for graph in unavailable {
+            let root = root_identity(&graph.uri)?;
+            if !unavailable_keys.insert(graph.key.clone())
+                || epochs.contains_key(&graph.key)
+                || deleted_keys.contains(&graph.key)
+                || record.predecessors.iter().any(|old| old.key == graph.key)
+            {
+                return Err(ServingTransitionError::InvalidBindings);
+            }
+            for entry in graphs.values() {
+                if entry.key() != &graph.key && root_identity(entry.uri())? == root {
+                    return Err(ServingTransitionError::InvalidBindings);
+                }
+            }
+            if let Some(existing) = graphs.get(&graph.key) {
+                if !record.unavailable.iter().any(|old| {
+                    old.key == graph.key
+                        && root_identity(&old.uri).is_ok_and(|old_root| old_root == root)
+                }) || !matches!(existing, GraphEntry::Blocked(_))
+                {
+                    return Err(ServingTransitionError::InvalidBindings);
+                }
+            }
+            graphs.insert(graph.key.clone(), GraphEntry::Blocked(graph));
         }
         if record
             .predecessors
             .iter()
-            .any(|view| !epochs.contains_key(&view.key))
+            .any(|view| !epochs.contains_key(&view.key) && !deleted_keys.contains(&view.key))
         {
             return Err(ServingTransitionError::InvalidBindings);
         }
-        let snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        let mut snapshot = state.snapshot.with_graphs(graphs);
+        snapshot.server_policy = server_policy;
+        snapshot.deployment = deployment;
+        let snapshot = Arc::new(snapshot);
         if views.iter().any(|view| !view.contract_is_current()) {
             return Err(ServingTransitionError::SchemaChanged);
         }
-        if Instant::now() >= record.deadline {
-            return Err(ServingTransitionError::DeadlineElapsed);
-        }
+        validate_candidate(&state, record)?;
         state.snapshot = snapshot;
         state.candidate = None;
         Ok(epochs)
@@ -655,7 +789,7 @@ impl GraphRegistry {
         }
         let mut graphs = state.snapshot.graphs.clone();
         graphs.insert(handle.key.clone(), GraphEntry::ready(handle));
-        state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+        state.snapshot = Arc::new(state.snapshot.with_graphs(graphs));
         Ok(())
     }
 }
@@ -671,7 +805,13 @@ fn validate_candidate(
     {
         return Err(ServingTransitionError::StaleAttempt);
     }
-    if Instant::now() >= record.deadline {
+    if record.unavailable.iter().any(|old| {
+        !matches!(state.snapshot.graphs.get(&old.key),
+        Some(GraphEntry::Blocked(current)) if Arc::ptr_eq(old, current))
+    }) {
+        return Err(ServingTransitionError::StaleAttempt);
+    }
+    if !state.candidate.as_ref().unwrap().completion_owned && Instant::now() >= record.deadline {
         return Err(ServingTransitionError::DeadlineElapsed);
     }
     Ok(())
@@ -1296,6 +1436,22 @@ mod tests {
         .unwrap()
     }
 
+    fn activation_binding(
+        handle: &Arc<GraphHandle>,
+        property: &str,
+    ) -> (Arc<GraphHandle>, SchemaContractDigest) {
+        (
+            Arc::new(GraphHandle {
+                key: handle.key.clone(),
+                uri: handle.uri.clone(),
+                engine: Arc::clone(&handle.engine),
+                policy: handle.policy.clone(),
+                queries: Some(Arc::new(activation_queries(property))),
+            }),
+            handle.engine.schema_contract_digest(),
+        )
+    }
+
     #[tokio::test]
     async fn batch_activation_drains_all_affected_graphs_and_keeps_the_same_engines() {
         let dir = TempDir::new().unwrap();
@@ -1353,22 +1509,17 @@ mod tests {
                 .unwrap();
         }
         let added = build_handle("added", dir.path()).await;
-        let bindings = [&alpha, &beta]
-            .into_iter()
-            .map(|handle| {
-                (
-                    handle.key.clone(),
-                    (
-                        handle.engine.schema_contract_digest(),
-                        activation_queries("nickname"),
-                    ),
-                )
-            })
-            .collect();
         let epochs = transition
-            .activate(
-                bindings,
-                vec![(Arc::clone(&added), added.engine.schema_contract_digest())],
+            .activate_deployment(
+                vec![
+                    activation_binding(&alpha, "nickname"),
+                    activation_binding(&beta, "nickname"),
+                    (Arc::clone(&added), added.engine.schema_contract_digest()),
+                ],
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(epochs.len(), 3);
@@ -1407,6 +1558,120 @@ mod tests {
             captured(&registry, &operations, &peer.key).epoch(),
             peer_epoch
         );
+
+        // A completed/expired deployment may leave an exact closed view. Its
+        // successor retains request owners and can repair the achieved contract
+        // without reopening a second engine or reviving stale admission.
+        let retained = captured(&registry, &operations, &beta.key);
+        let stopped = registry
+            .prepare_transition(
+                &operations,
+                std::slice::from_ref(&beta.key),
+                transition_deadline(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        drop(stopped);
+        let attempted = registry
+            .prepare_deployment_transition(
+                &operations,
+                std::slice::from_ref(&beta.key),
+                transition_deadline(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(attempted.abort_before_effects().unwrap().is_empty());
+        assert!(matches!(
+            registry.get(&beta.key),
+            RegistryLookup::Transitioning(_)
+        ));
+
+        let blocked_handle = build_handle("recoverable", dir.path()).await;
+        {
+            let mut state = locked(&registry.state);
+            let mut graphs = state.snapshot.graphs.clone();
+            graphs.insert(
+                blocked_handle.key.clone(),
+                GraphEntry::Blocked(Arc::new(BlockedGraph {
+                    key: blocked_handle.key.clone(),
+                    uri: blocked_handle.uri.clone(),
+                    policy: None,
+                    failure: StartupFailure::OpenFailed,
+                })),
+            );
+            state.snapshot = Arc::new(state.snapshot.with_graphs(graphs));
+        }
+        let transition = registry
+            .prepare_deployment_transition(
+                &operations,
+                &[
+                    alpha.key.clone(),
+                    beta.key.clone(),
+                    blocked_handle.key.clone(),
+                ],
+                transition_deadline(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        {
+            let waiting = transition.wait_requests();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(retained);
+            waiting.await.unwrap();
+        }
+        beta.engine.apply_schema("// accepted during deployment\nnode Person { name: String @key nickname: String? }\n").await.unwrap();
+        let rebound = Arc::new(GraphHandle {
+            key: beta.key.clone(),
+            uri: beta.uri.clone(),
+            policy: None,
+            queries: None,
+            engine: Arc::new(
+                beta.engine
+                    .with_runtime_bindings(None, None, Default::default())
+                    .unwrap(),
+            ),
+        });
+        let management = Arc::new(PolicyEngine::load_cluster_from_source(
+            "version: 1\ngroups:\n  admins: [successor]\nrules:\n  - id: admin\n    allow:\n      actors: {group: admins}\n      actions: [config_manage]\n").unwrap());
+        let previous = registry.snapshot_ref();
+        transition
+            .activate_deployment(
+                vec![
+                    activation_binding(&alpha, "nickname"),
+                    (rebound, beta.engine.schema_contract_digest()),
+                    (
+                        Arc::clone(&blocked_handle),
+                        blocked_handle.engine.schema_contract_digest(),
+                    ),
+                ],
+                Vec::new(),
+                Vec::new(),
+                Some(Arc::clone(&management)),
+                None,
+            )
+            .unwrap();
+        let activated = registry.snapshot_ref();
+        assert!(Arc::ptr_eq(
+            activated.server_policy.as_ref().unwrap(),
+            &management
+        ));
+        assert!(previous.server_policy.is_none());
+        assert!(previous.graphs.contains_key(&alpha.key));
+        assert!(activated.graphs.contains_key(&alpha.key));
+        assert!(matches!(
+            registry.get(&blocked_handle.key),
+            RegistryLookup::Ready(_)
+        ));
+        let beta_current = captured(&registry, &operations, &beta.key);
+        assert!(beta_current.engine.shares_runtime_owner(&beta.engine));
+        assert_eq!(
+            beta_current.schema_contract(),
+            &beta.engine.schema_contract_digest()
+        );
     }
 
     #[tokio::test]
@@ -1414,7 +1679,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let alpha = build_handle("alpha", dir.path()).await;
         let beta = build_handle("beta", dir.path()).await;
-        for refusal in ["missing", "queries", "contract", "duplicate"] {
+        for refusal in [
+            "missing",
+            "queries",
+            "contract",
+            "duplicate",
+            "foreign_delete",
+            "duplicate_delete",
+            "wrong_delete_contract",
+            "delete_and_replace",
+        ] {
             let registry = Arc::new(
                 GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
             );
@@ -1429,41 +1703,50 @@ mod tests {
                 .close()
                 .unwrap();
             transition.wait_requests().await.unwrap();
-            let mut bindings: HashMap<_, _> = [&alpha, &beta]
-                .into_iter()
-                .map(|handle| {
-                    (
-                        handle.key.clone(),
-                        (
-                            handle.engine.schema_contract_digest(),
-                            activation_queries("name"),
-                        ),
-                    )
-                })
-                .collect();
-            let additions = match refusal {
+            let mut bindings = vec![
+                activation_binding(&alpha, "name"),
+                activation_binding(&beta, "name"),
+            ];
+            let mut deleted = Vec::new();
+            match refusal {
                 "missing" => {
-                    bindings.remove(&beta.key);
-                    Vec::new()
+                    bindings.pop();
                 }
                 "queries" => {
-                    bindings.get_mut(&beta.key).unwrap().1 = activation_queries("nonexistent");
-                    Vec::new()
+                    bindings[1] = activation_binding(&beta, "nonexistent");
                 }
                 "contract" => {
                     beta.engine
                         .apply_schema(&format!("// changed\n{TEST_SCHEMA}"))
                         .await
                         .unwrap();
-                    Vec::new()
                 }
-                "duplicate" => vec![(Arc::clone(&alpha), alpha.engine.schema_contract_digest())],
+                "duplicate" => bindings.push(activation_binding(&alpha, "name")),
+                "foreign_delete" => deleted.push((
+                    GraphKey::cluster(GraphId::try_from("unrelated").unwrap()),
+                    beta.engine.schema_contract_digest(),
+                )),
+                "duplicate_delete" => {
+                    bindings.pop();
+                    deleted = vec![(beta.key.clone(), beta.engine.schema_contract_digest()); 2];
+                }
+                "wrong_delete_contract" => {
+                    bindings.pop();
+                    deleted.push((beta.key.clone(), alpha.engine.schema_contract_digest()));
+                }
+                "delete_and_replace" => {
+                    deleted.push((beta.key.clone(), beta.engine.schema_contract_digest()));
+                }
                 _ => unreachable!(),
-            };
-            let error = transition.activate(bindings, additions).unwrap_err();
+            }
+            let error = transition
+                .activate_deployment(bindings, Vec::new(), deleted, None, None)
+                .unwrap_err();
             match refusal {
                 "queries" => assert!(matches!(error, ServingTransitionError::InvalidQueries(_))),
-                "contract" => assert_eq!(error, ServingTransitionError::SchemaChanged),
+                "contract" | "wrong_delete_contract" => {
+                    assert_eq!(error, ServingTransitionError::SchemaChanged)
+                }
                 _ => assert_eq!(error, ServingTransitionError::InvalidBindings),
             }
             assert!(registry.list().is_empty());
@@ -1478,7 +1761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_only_activation_and_unchanged_batch_resumption_share_the_candidate_boundary() {
+    async fn create_delete_and_unchanged_batch_resumption_share_the_candidate_boundary() {
         let dir = TempDir::new().unwrap();
         let alpha = build_handle("alpha", dir.path()).await;
         let beta = build_handle("beta", dir.path()).await;
@@ -1497,9 +1780,12 @@ mod tests {
         assert!(transition.engines().unwrap().is_empty());
         assert_eq!(
             transition
-                .activate(
-                    HashMap::new(),
-                    vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())]
+                .activate_deployment(
+                    vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())],
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
                 )
                 .unwrap()
                 .len(),
@@ -1522,19 +1808,148 @@ mod tests {
         assert_ne!(resumed[&beta.key], prior_beta);
         assert_eq!(registry.list().len(), 2);
 
+        let peer = captured(&registry, &operations, &beta.key);
+        let predecessor = captured(&registry, &operations, &alpha.key);
+        let descendant = predecessor.clone();
+        let transition = registry
+            .prepare_transition(
+                &operations,
+                std::slice::from_ref(&alpha.key),
+                transition_deadline(),
+            )
+            .unwrap()
+            .close()
+            .unwrap();
+        let stale = Arc::clone(&locked(&registry.state).candidate.as_ref().unwrap().record);
+        drop(predecessor);
+        {
+            let waiting = transition.wait_requests();
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(descendant);
+            waiting.await.unwrap();
+        }
+        transition
+            .activate_deployment(
+                Vec::new(),
+                Vec::new(),
+                vec![(alpha.key.clone(), alpha.engine.schema_contract_digest())],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(registry.get(&alpha.key), RegistryLookup::Gone));
+        assert!(matches!(
+            registry.capture(&operations, &alpha.key).unwrap(),
+            RegistryCapture::Gone
+        ));
+        assert_eq!(
+            registry.resume_same_views(&stale),
+            Err(ServingTransitionError::StaleAttempt)
+        );
+        assert_eq!(
+            captured(&registry, &operations, &beta.key).epoch(),
+            peer.epoch()
+        );
+        assert_eq!(registry.len(), 1);
+
         let transition = registry
             .prepare_transition(&operations, &[], transition_deadline())
             .unwrap()
             .close()
             .unwrap();
         assert!(matches!(
-            transition.activate(
-                HashMap::new(),
-                vec![(Arc::clone(&alpha), alpha.engine.schema_contract_digest())]
+            transition.activate_deployment(
+                vec![(Arc::clone(&beta), beta.engine.schema_contract_digest())],
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
             ),
             Err(ServingTransitionError::InvalidGraph(_))
         ));
-        assert_eq!(registry.list().len(), 2);
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drained_deployment_completion_outlives_deadline_but_not_process_closure() {
+        let dir = TempDir::new().unwrap();
+        let alpha = build_handle("alpha", dir.path()).await;
+        let peer = build_handle("peer", dir.path()).await;
+        for outcome in ["activate", "shutdown", "abort"] {
+            let registry = Arc::new(
+                GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&peer)]).unwrap(),
+            );
+            let operations = OperationRuntime::new();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let transition = registry
+                .prepare_deployment_transition(
+                    &operations,
+                    std::slice::from_ref(&alpha.key),
+                    deadline,
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            transition.wait_requests().await.unwrap();
+            transition.retain_deployment_completion().unwrap();
+            let prior = alpha.engine.schema_contract_digest();
+            if outcome != "abort" {
+                alpha
+                    .engine
+                    .apply_schema(&format!(
+                        "// {outcome}\nnode Person {{ name: String @key nickname: String? }}\n"
+                    ))
+                    .await
+                    .unwrap();
+                assert_ne!(alpha.engine.schema_contract_digest(), prior);
+            }
+            tokio::time::sleep_until(deadline).await;
+            assert!(
+                matches!(
+                    registry.prepare_same_view(&operations, &peer.key, transition_deadline()),
+                    Err(ServingTransitionError::Busy)
+                ),
+                "drain expiry cannot supersede the completion owner"
+            );
+            if outcome == "abort" {
+                transition.abort_before_effects().unwrap();
+                assert!(matches!(registry.get(&alpha.key), RegistryLookup::Ready(_)));
+                assert_eq!(alpha.engine.schema_contract_digest(), prior);
+                continue;
+            }
+            let management = Arc::new(PolicyEngine::load_cluster_from_source(
+                "version: 1\ngroups:\n  admins: [successor]\nrules:\n  - id: admin\n    allow:\n      actors: {group: admins}\n      actions: [config_manage]\n").unwrap());
+            if outcome == "shutdown" {
+                operations.close();
+            }
+            let result = transition.activate_deployment(
+                vec![activation_binding(&alpha, "nickname")],
+                Vec::new(),
+                Vec::new(),
+                Some(Arc::clone(&management)),
+                None,
+            );
+            if outcome == "shutdown" {
+                assert_eq!(result, Err(ServingTransitionError::ProcessClosed));
+                assert!(matches!(
+                    registry.get(&alpha.key),
+                    RegistryLookup::Transitioning(_)
+                ));
+                assert!(registry.snapshot_ref().server_policy.is_none());
+            } else {
+                result.unwrap();
+                let request = captured(&registry, &operations, &alpha.key);
+                assert_eq!(
+                    request.schema_contract(),
+                    &alpha.engine.schema_contract_digest()
+                );
+                assert!(Arc::ptr_eq(
+                    registry.snapshot_ref().server_policy.as_ref().unwrap(),
+                    &management
+                ));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1556,17 +1971,7 @@ mod tests {
             transition.wait_requests().await.unwrap();
             let record = Arc::clone(&locked(&registry.state).candidate.as_ref().unwrap().record);
             let replacements = registry
-                .validate_activation(
-                    &record,
-                    HashMap::from([(
-                        alpha.key.clone(),
-                        (
-                            alpha.engine.schema_contract_digest(),
-                            activation_queries("name"),
-                        ),
-                    )]),
-                    vec![],
-                )
+                .validate_deployment_activation(&record, vec![activation_binding(&alpha, "name")])
                 .unwrap();
             let expected = if refusal == "contract" {
                 alpha
@@ -1580,7 +1985,14 @@ mod tests {
                 ServingTransitionError::ProcessClosed
             };
             assert_eq!(
-                operations.while_open(|| registry.activate(&record, replacements)),
+                operations.while_open(|| registry.activate_deployment(
+                    &record,
+                    replacements,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None
+                )),
                 Err(expected)
             );
             assert!(matches!(
@@ -1963,7 +2375,7 @@ mod tests {
                     ServingEpoch::MAX,
                 ))),
             );
-            state.snapshot = Arc::new(RegistrySnapshot::new(graphs));
+            state.snapshot = Arc::new(state.snapshot.with_graphs(graphs));
         }
         assert!(matches!(
             registry.prepare_same_view(&operations, &alpha.key, transition_deadline()),

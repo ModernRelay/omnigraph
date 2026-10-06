@@ -223,6 +223,18 @@ struct HandleSchemaView {
     schema_identity_domain: String,
 }
 
+impl HandleSchemaView {
+    fn contract_digest(&self) -> SchemaContractDigest {
+        use sha2::Digest;
+        SchemaContractDigest {
+            source_hash: format!("{:x}", sha2::Sha256::digest(self.source.as_bytes())),
+            schema_ir_hash: self.schema_ir_hash.clone(),
+            schema_identity_domain: self.schema_identity_domain.clone(),
+            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
+        }
+    }
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -788,15 +800,7 @@ impl Omnigraph {
     /// This does not refresh storage; callers comparing current durable
     /// authority must open or refresh under their writer-exclusion boundary.
     pub fn schema_contract_digest(&self) -> SchemaContractDigest {
-        use sha2::Digest;
-
-        let view = self.schema_view.load();
-        SchemaContractDigest {
-            source_hash: format!("{:x}", sha2::Sha256::digest(view.source.as_bytes())),
-            schema_ir_hash: view.schema_ir_hash.clone(),
-            schema_identity_domain: view.schema_identity_domain.clone(),
-            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
-        }
+        self.schema_view.load().contract_digest()
     }
 
     /// Publish one coherent handle-local projection after the durable schema
@@ -894,6 +898,49 @@ impl Omnigraph {
     pub fn with_embedding_config(mut self, config: Arc<crate::embedding::EmbeddingConfig>) -> Self {
         self.embedding_config = Some(config);
         self
+    }
+
+    /// Prepare an immutable runtime view over this handle's existing owner.
+    ///
+    /// No storage is opened or written. The coordinator, schema authority,
+    /// writer gates and Lance sessions remain shared; policy, embedding client
+    /// and external Blob admission belong to the returned view. A serving
+    /// caller must drain the old view before admitting requests on this one.
+    /// Existing views deliberately retain their original authorization.
+    pub fn with_runtime_bindings(
+        &self,
+        policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
+        embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
+        external_blob_policy: crate::blob::ExternalBlobPolicy,
+    ) -> Result<Self> {
+        let table_store = self
+            .table_store
+            .clone()
+            .with_external_blob_policy(external_blob_policy)?;
+        Ok(Self {
+            root_uri: self.root_uri.clone(),
+            storage: Arc::clone(&self.storage),
+            lance_access: self.lance_access.clone(),
+            coordinator: Arc::clone(&self.coordinator),
+            table_store,
+            runtime_cache: RuntimeCache::default(),
+            feed_cut_cache: tokio::sync::RwLock::new(None),
+            read_caches: Arc::clone(&self.read_caches),
+            schema_view: Arc::clone(&self.schema_view),
+            write_queue: Arc::clone(&self.write_queue),
+            merge_authority_cache: tokio::sync::Mutex::new(None),
+            history: self.history.clone(),
+            policy,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config,
+        })
+    }
+
+    /// Whether two immutable runtime views share the same engine owner.
+    /// Equal root strings alone do not establish this relationship.
+    pub fn shares_runtime_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.coordinator, &other.coordinator)
+            && Arc::ptr_eq(&self.write_queue, &other.write_queue)
     }
 
     /// The injected embedding config, if any (see the `embedding_config` field).
@@ -1077,6 +1124,17 @@ impl Omnigraph {
         schema_apply::plan_schema(self, desired_schema_source).await
     }
 
+    /// Describe schema evolution from one exact handle-local accepted contract.
+    /// This performs no storage I/O or gate acquisition. It is advisory: branch,
+    /// physical and current durable eligibility are checked again before apply.
+    pub fn plan_schema_at_contract(
+        &self,
+        desired_schema_source: &str,
+        expected: &SchemaContractDigest,
+    ) -> Result<SchemaMigrationPlan> {
+        schema_apply::plan_schema_at_contract(self, desired_schema_source, expected)
+    }
+
     pub async fn preview_schema_apply(
         &self,
         desired_schema_source: &str,
@@ -1096,6 +1154,18 @@ impl Omnigraph {
         desired_schema_source: &str,
         actor: Option<&str>,
     ) -> Result<PreparedSchemaApply> {
+        self.prepare_schema_apply_with_plan_as(desired_schema_source, actor)
+            .await
+            .map(|(intent, _)| intent)
+    }
+
+    /// Return the migration preview and exact intent from the same accepted
+    /// schema capture. The plan is descriptive; execution revalidates the intent.
+    pub async fn prepare_schema_apply_with_plan_as(
+        &self,
+        desired_schema_source: &str,
+        actor: Option<&str>,
+    ) -> Result<(PreparedSchemaApply, SchemaMigrationPlan)> {
         schema_apply::prepare_schema_apply(self, desired_schema_source, actor).await
     }
 

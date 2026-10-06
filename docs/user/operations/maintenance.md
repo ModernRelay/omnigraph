@@ -4,7 +4,7 @@ OmniGraph provides four direct-storage maintenance commands:
 
 - `optimize` compacts data and reconciles declared indexes.
 - `rebuild-full-text-indexes` replaces full-text indexes on one branch.
-- `repair` classifies storage drift and can publish an approved repair.
+- `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
@@ -138,17 +138,13 @@ directory; no read or write of the graph resolves the linear HEAD, so
 foreign drift changes no query result and blocks no writer. For a
 `foreign_drift` table `repair` prints the last linear version, the HEAD and
 the number of foreign versions in `operations`, takes no action (`no_op`)
-and exits 0. It never adopts the foreign commit, with or without
-`--force --confirm`. `cleanup` leaves foreign versions and their files in
+and exits 0. It never adopts the foreign commit. `cleanup` leaves foreign versions and their files in
 place and lists them per table under `foreign_versions`. A HEAD below the
 recorded last linear version is reported as an internal manifest error.
 Each `repair --json` row carries `type_key`, `published_dataset_version`,
 `lance_head_version`, `classification`, `action`, `operations` and `error`.
 
-`--confirm` and `--force --confirm` remain accepted and publish nothing on a
-v11 graph: the classes they used to publish (`verified_maintenance`,
-`suspicious`, `unverifiable`) described a table whose registration named its
-linear HEAD, which no v11 registration does. To discard foreign commits,
+The removed `--confirm` and `--force` options are rejected. To discard foreign commits,
 export the graph and load it into a new one; see
 [Troubleshooting](troubleshooting.md#foreign-drift).
 

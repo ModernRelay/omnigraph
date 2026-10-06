@@ -1,4 +1,4 @@
-//! Data commands: load/read/change/branch/commit/export/snapshot/policy/embed/maintenance.
+//! Data commands: load/query/mutate/branch/commit/export/snapshot/policy/embed/maintenance.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
@@ -950,8 +950,8 @@ fn repair_json_reports_noop_on_clean_graph() {
     let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(payload["confirm"], false);
-    assert_eq!(payload["force"], false);
+    assert!(payload.get("confirm").is_none());
+    assert!(payload.get("force").is_none());
     assert_eq!(payload["graph_manifest_version"], Value::Null);
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
@@ -962,7 +962,7 @@ fn repair_json_reports_noop_on_clean_graph() {
     }));
 
     let human = stdout_string(&output_success(cli().arg("repair").arg(&graph)));
-    assert!(human.contains("preview mode, 4 datasets"), "{human}");
+    assert!(human.contains("4 datasets"), "{human}");
     assert!(human.contains("node type 'Person'"), "{human}");
     assert!(!human.contains("node:Person"), "{human}");
 }
@@ -999,7 +999,7 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
 }
 
 #[test]
-fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_forced() {
+fn repair_reports_foreign_drift_and_refuses_removed_flags() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -1007,42 +1007,36 @@ fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_for
     let graph_manifest_before = manifest_dataset_version(&graph);
     let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
 
-    for force in [false, true] {
-        let mut command = cli();
-        command.arg("repair").arg("--confirm");
-        if force {
-            command.arg("--force");
-        }
-        let output = output_success(command.arg("--json").arg(&graph));
-        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            payload["graph_manifest_version"],
-            Value::Null,
-            "force {force}"
-        );
-        let person = payload["datasets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|dataset| dataset["type_key"] == "node:Person")
-            .unwrap();
-        assert_eq!(person["classification"], "foreign_drift", "force {force}");
-        assert_eq!(person["action"], "no_op", "force {force}");
-        assert_eq!(person["published_dataset_version"], table_manifest_before);
-        assert_eq!(person["lance_head_version"], table_head_before);
-        assert!(
-            person["operations"][0]
-                .as_str()
-                .is_some_and(|operation| operation.contains("foreign linear version")),
-            "force {force}: {}",
-            person["operations"]
-        );
+    let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    let person = payload["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dataset| dataset["type_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "foreign_drift");
+    assert_eq!(person["action"], "no_op");
+    assert_eq!(person["published_dataset_version"], table_manifest_before);
+    assert_eq!(person["lance_head_version"], table_head_before);
+    assert!(
+        person["operations"][0]
+            .as_str()
+            .is_some_and(|operation| operation.contains("foreign linear version")),
+        "{}",
+        person["operations"]
+    );
+    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    for flag in ["--confirm", "--force"] {
+        let refused = output_failure(cli().arg("repair").arg(flag).arg(&graph));
+        assert_eq!(refused.status.code(), Some(2));
         assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     }
 }
 
 #[test]
-fn query_lint_json_with_schema_reports_warnings() {
+fn lint_json_with_schema_reports_warnings() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1072,7 +1066,6 @@ query list_policies() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1121,7 +1114,7 @@ query list_policies() {
 }
 
 #[test]
-fn query_lint_json_omits_operation_after_compile_failure() {
+fn lint_json_omits_operation_after_compile_failure() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1144,7 +1137,6 @@ query broken($slug: String) {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1160,187 +1152,46 @@ query broken($slug: String) {
 }
 
 #[test]
-fn lint_top_level_matches_deprecated_query_lint_output() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let canonical = output_success(
-        cli()
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_lint = output_success(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_check = output_success(
-        cli()
-            .arg("query")
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_lint));
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
-
-    // Canonical form must NOT emit the deprecation warning.
-    let canonical_stderr = String::from_utf8(canonical.stderr).unwrap();
-    assert!(
-        !canonical_stderr.contains("deprecated"),
-        "`omnigraph lint` is canonical and must not warn; got stderr: {canonical_stderr}"
-    );
-
-    // Deprecated forms MUST emit the one-line warning, pointing at the
-    // new top-level `omnigraph lint`.
-    let lint_stderr = String::from_utf8(deprecated_lint.stderr).unwrap();
-    assert!(
-        lint_stderr.contains("`omnigraph query lint` is deprecated")
-            && lint_stderr.contains("`omnigraph lint`"),
-        "expected deprecation warning pointing at `omnigraph lint`; got: {lint_stderr}"
-    );
-    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
-    assert!(
-        check_stderr.contains("`omnigraph query check` is deprecated")
-            && check_stderr.contains("`omnigraph lint`"),
-        "expected deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
-    );
+fn removed_cli_spellings_refuse_and_canonical_commands_remain_available() {
+    for args in [
+        vec!["read"],
+        vec!["change"],
+        vec!["ingest"],
+        vec!["check"],
+        vec![
+            "query",
+            "lint",
+            "--query",
+            "missing.gq",
+            "--schema",
+            "missing.pg",
+        ],
+        vec![
+            "query",
+            "check",
+            "--query",
+            "missing.gq",
+            "--schema",
+            "missing.pg",
+        ],
+        vec!["export", "--jsonl"],
+    ] {
+        let output = output_failure(cli().args(&args));
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+            "{args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+    }
+    for command in ["query", "mutate", "load", "lint", "export"] {
+        output_success(cli().args([command, "--help"]));
+    }
 }
 
 #[test]
-fn deprecated_check_top_level_rewrites_to_lint() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let canonical = output_success(
-        cli()
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_check = output_success(
-        cli()
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
-
-    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
-    assert!(
-        check_stderr.contains("`omnigraph check` is deprecated")
-            && check_stderr.contains("`omnigraph lint`"),
-        "expected `omnigraph check` deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
-    );
-
-    // `check` must NOT appear in the canonical `omnigraph --help` output —
-    // agents copy the surface from help text and would otherwise emit both
-    // names interchangeably.
-    let help = cli().arg("--help").output().unwrap();
-    let stdout = String::from_utf8(help.stdout).unwrap();
-    let check_aliased = stdout
-        .lines()
-        .any(|line| line.trim_start().starts_with("lint") && line.contains("check"));
-    assert!(
-        !check_aliased,
-        "`check` must not be advertised as a visible alias of `lint`; help output: {stdout}"
-    );
-}
-
-#[test]
-fn deprecated_read_and_change_subcommands_emit_warnings() {
-    // Both subcommands require `--query`/`--query-string`, so invoking them
-    // with no args will exit non-zero. That's fine -- we only care that the
-    // deprecation warning is printed before the argument-required error.
-    let output = cli().arg("read").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("`omnigraph read` is deprecated") && stderr.contains("`omnigraph query`"),
-        "expected `omnigraph read` deprecation warning; got: {stderr}"
-    );
-
-    let output = cli().arg("change").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("`omnigraph change` is deprecated")
-            && stderr.contains("`omnigraph mutate`"),
-        "expected `omnigraph change` deprecation warning; got: {stderr}"
-    );
-
-    // Sanity check the inverse: the canonical names must NOT print the
-    // deprecation banner.
-    let output = cli().arg("query").arg("--help").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !stderr.contains("deprecated"),
-        "`omnigraph query` is canonical and must not warn; got: {stderr}"
-    );
-    let output = cli().arg("mutate").arg("--help").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !stderr.contains("deprecated"),
-        "`omnigraph mutate` is canonical and must not warn; got: {stderr}"
-    );
-}
-
-#[test]
-fn query_lint_can_use_local_graph_via_positional_uri() {
+fn lint_can_use_local_graph_via_positional_uri() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let query_path = temp.path().join("queries.gq");
@@ -1357,7 +1208,6 @@ query list_people() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1375,7 +1225,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_can_resolve_graph_from_store_scope() {
+fn lint_can_resolve_graph_from_store_scope() {
     // RFC-011: lint resolves its graph target through `--store` (the direct
     // scope), not omnigraph.yaml's cli.graph; the .gq path is plain cwd-relative.
     let temp = tempdir().unwrap();
@@ -1394,7 +1244,6 @@ query list_people() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1413,7 +1262,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_rejects_http_targets_without_schema() {
+fn lint_rejects_http_targets_without_schema() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -1428,7 +1277,6 @@ query list_people() {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1446,7 +1294,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_requires_schema_or_resolvable_graph_target() {
+fn lint_requires_schema_or_resolvable_graph_target() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -1459,13 +1307,7 @@ query list_people() {
 "#,
     );
 
-    let output = output_failure(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path),
-    );
+    let output = output_failure(cli().arg("lint").arg("--query").arg(&query_path));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("lint requires --schema <schema.pg>")
@@ -1475,7 +1317,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_human_output_reports_warnings() {
+fn lint_human_output_reports_warnings() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1500,7 +1342,6 @@ query update_policy($slug: String, $name: String) {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1519,7 +1360,7 @@ query update_policy($slug: String, $name: String) {
 }
 
 #[test]
-fn query_lint_human_output_reports_strict_validation_errors() {
+fn lint_human_output_reports_strict_validation_errors() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1543,7 +1384,6 @@ query bad_update($slug: String) {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1676,7 +1516,7 @@ fn read_json_outputs_rows_for_named_query() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1788,8 +1628,7 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("--branch")
             .arg("feature")
             .arg("--type")
-            .arg("Person")
-            .arg("--jsonl"),
+            .arg("Person"),
     );
     let rows = stdout_string(&output)
         .lines()
@@ -1911,7 +1750,7 @@ fn read_resolves_uri_from_default_store_scope() {
     let output = output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("read")
+            .arg("query")
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("get_person")
@@ -1932,7 +1771,7 @@ fn read_csv_format_outputs_header_and_row_values() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1969,7 +1808,7 @@ fn read_uses_operator_default_output_format() {
         let mut command = cli();
         command
             .env("OMNIGRAPH_HOME", operator_home.path())
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2004,7 +1843,7 @@ fn read_jsonl_format_outputs_metadata_header_first() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2039,7 +1878,7 @@ query insert_person($name: String, $age: I32) {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2058,7 +1897,7 @@ query insert_person($name: String, $age: I32) {
 
     let verify = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2431,14 +2270,11 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
     let temp = tempdir().unwrap();
     let data = temp.path().join("batch.ndjson");
     fs::write(&data, "").unwrap();
-    let schema = temp.path().join("schema.pg");
-    fs::write(&schema, "node Person { name: String }").unwrap();
     let data = data.to_str().unwrap();
-    let schema = schema.to_str().unwrap();
     let commands = [
         vec!["mutate", "stored_write"],
         vec!["mutate", "-e", "mutation write() {}"],
-        vec!["change", "-e", "branch create review"],
+        vec!["mutate", "-e", "branch create review"],
         vec!["branch", "create", "review"],
         vec!["branch", "delete", "review", "--yes"],
         vec!["branch", "merge", "review"],
@@ -2446,8 +2282,6 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
         vec![
             "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
         ],
-        vec!["ingest", "--data", data],
-        vec!["schema", "apply", "--schema", schema],
     ];
     let cases = [
         (
@@ -2738,7 +2572,7 @@ query insert_person($name: String, $age: I32) {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2761,7 +2595,7 @@ fn read_requires_name_for_multi_query_files() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2783,7 +2617,7 @@ fn read_refuses_an_empty_source_as_no_query() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2803,7 +2637,7 @@ fn read_supports_inline_query_string() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")
@@ -2901,7 +2735,7 @@ fn change_supports_inline_query_string() {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&repo)
             .arg("--query-string")
@@ -2916,7 +2750,7 @@ fn change_supports_inline_query_string() {
 
     let verify = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")
@@ -2938,7 +2772,7 @@ fn read_rejects_query_string_combined_with_query() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("--query")
@@ -2962,7 +2796,7 @@ fn read_rejects_empty_query_string() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")

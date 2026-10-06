@@ -23,9 +23,7 @@ async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before
         let store = MemoryStore::default();
         if expired {
             let mut saved = identity_credential(&context, "https://data.example");
-            saved.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
-                .format(&Rfc3339)
-                .unwrap();
+            expire_identity(&mut saved);
             save(&store, &context, &saved);
         }
         let dir = tempfile::tempdir().unwrap();
@@ -67,7 +65,7 @@ async fn ordinary_graph_command_acquires_missing_or_expired_identity_once_before
 }
 
 #[tokio::test]
-async fn acquisition_preserves_explicit_target_priority_and_never_widens_restricted_credentials() {
+async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_credentials() {
     let context = context();
     let dir = tempfile::tempdir().unwrap();
     super::super::save_context(dir.path(), &context).unwrap();
@@ -95,24 +93,91 @@ async fn acquisition_preserves_explicit_target_priority_and_never_widens_restric
         .unwrap()
         .is_none()
     );
-    let mut restricted = credential(&context, "https://data.example");
-    restricted.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
-        .format(&Rfc3339)
-        .unwrap();
-    save(&store, &context, &restricted);
     let cli = Cli::try_parse_from(["omnigraph", "query", "q", "--graph", "knowledge"]).unwrap();
-    let failure = resolve_with_acquisition(
-        &cli,
-        dir.path(),
-        &store,
-        || Ok(false),
-        async |_| Ok(None),
-        async |_| panic!("restricted credential widened"),
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(failure.body["type"], "data_credential_expired");
+    for corruption in [
+        "retired-cache",
+        "retired-token",
+        "permissions",
+        "malformed-token",
+        "wrong-actor",
+        "wrong-expiry",
+    ] {
+        let mut cached = credential(&context, "https://data.example");
+        expire_identity(&mut cached);
+        match corruption {
+            "retired-cache" => cached.version = 1,
+            "malformed-token" => cached.token = DATA_TOKEN.into(),
+            "wrong-actor" => cached.actor = "principal:other".into(),
+            "wrong-expiry" => {
+                cached.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(60))
+                    .format(&Rfc3339)
+                    .unwrap()
+            }
+            _ => {
+                let parts: Vec<_> = cached.token.split('.').collect();
+                let mut claims: Value =
+                    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+                if corruption == "retired-token" {
+                    claims["version"] = json!(1);
+                }
+                claims["grants"] = json!([]);
+                cached.token = format!(
+                    "{}.{}.{}",
+                    parts[0],
+                    URL_SAFE_NO_PAD.encode(claims.to_string()),
+                    parts[2]
+                );
+            }
+        }
+        save(&store, &context, &cached);
+        let before = store.get(&key(&context)).unwrap();
+        let failure = resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| panic!("invalid cache consulted identity"),
+            async |_| panic!("invalid cache called issuer"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            failure.body["type"], "data_credential_invalid",
+            "{corruption}"
+        );
+        assert_eq!(store.get(&key(&context)).unwrap(), before, "{corruption}");
+
+        // A second process can replace the cache before this caller gets its
+        // cache lock. Revalidate those bytes rather than treating invalidity
+        // as permission to mint over them.
+        let mut initially_expired = credential(&context, "https://data.example");
+        expire_identity(&mut initially_expired);
+        save(&store, &context, &initially_expired);
+        let failure = resolve_with_acquisition(
+            &cli,
+            dir.path(),
+            &store,
+            || Ok(false),
+            async |_| {
+                save(&store, &context, &cached);
+                Ok(Some("alice".into()))
+            },
+            async |_| panic!("invalid replacement cache called issuer"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            failure.body["type"], "data_credential_invalid",
+            "replacement: {corruption}"
+        );
+        assert_eq!(
+            store.get(&key(&context)).unwrap(),
+            before,
+            "replacement: {corruption}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -160,45 +225,53 @@ fn context() -> Context {
 }
 
 fn credential(context: &Context, endpoint: &str) -> Credential {
-    Credential {
-        version: 1,
-        api: context.api.clone(),
-        cluster_id: context.cluster.clone(),
-        endpoint: endpoint.into(),
-        token: DATA_TOKEN.into(),
-        expires_at: (OffsetDateTime::now_utc() + time::Duration::hours(1))
-            .format(&Rfc3339)
-            .unwrap(),
-        kid: "a".repeat(64),
-        actor: "principal:alice".into(),
-        cluster_incarnation: None,
-        grants: vec![Grant {
-            graph_id: "knowledge".into(),
-            actions: vec!["read".into(), "change".into(), "invoke_query".into()],
-        }],
-    }
+    identity_credential(context, endpoint)
 }
 
 fn identity_credential(context: &Context, endpoint: &str) -> Credential {
-    let mut credential = credential(context, endpoint);
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    credential.version = 2;
-    credential.grants.clear();
-    credential.cluster_incarnation = Some("incarnation-a".into());
-    credential.expires_at = OffsetDateTime::from_unix_timestamp(now + 3600)
-        .unwrap()
-        .format(&Rfc3339)
-        .unwrap();
-    let header = json!({"typ":"JWT","alg":"ES256","kid":credential.kid});
+    let kid = "a".repeat(64);
+    let header = json!({"typ":"JWT","alg":"ES256","kid":kid});
     let claims = json!({"version":2,"iss":context.api,"aud":format!("urn:omnigraph:data:{}", context.cluster),
         "sub":"alice","account_id":"account-a","cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
         "principal_kind":"human","assurance":"verified_human","iat":now,"exp":now+3600,"jti":"test-credential"});
+    Credential {
+        version: 2,
+        api: context.api.clone(),
+        cluster_id: context.cluster.clone(),
+        endpoint: endpoint.into(),
+        token: format!(
+            "{}.{}.signature",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        ),
+        expires_at: OffsetDateTime::from_unix_timestamp(now + 3600)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap(),
+        kid,
+        actor: "principal:alice".into(),
+        cluster_incarnation: Some("incarnation-a".into()),
+    }
+}
+
+fn expire_identity(credential: &mut Credential) {
+    let expiry = OffsetDateTime::now_utc().unix_timestamp() - 1;
+    credential.expires_at = OffsetDateTime::from_unix_timestamp(expiry)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let parts: Vec<_> = credential.token.split('.').collect();
+    let mut claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    claims["iat"] = json!(expiry - 3600);
+    claims["exp"] = json!(expiry);
     credential.token = format!(
-        "{}.{}.signature",
-        URL_SAFE_NO_PAD.encode(header.to_string()),
-        URL_SAFE_NO_PAD.encode(claims.to_string())
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(claims.to_string()),
+        parts[2]
     );
-    credential
 }
 
 fn save(store: &MemoryStore, context: &Context, credential: &Credential) {
@@ -216,7 +289,7 @@ fn change_reply() -> Value {
 }
 
 #[test]
-fn token_arguments_bound_authority_and_keep_direct_compatibility() {
+fn token_arguments_bound_lifetime_and_refuse_removed_actions() {
     for (input, expected) in [
         ("60", 60),
         ("1m", 60),
@@ -237,9 +310,7 @@ fn token_arguments_bound_authority_and_keep_direct_compatibility() {
     ] {
         assert!(parse_ttl(bad).is_err());
     }
-    for bad in ["", "read,read", "read,admin", "schema_apply", "*", " read"] {
-        assert!(requested_grant(Some("knowledge"), Some(bad)).is_err());
-    }
+
     for bad in [
         "../graph",
         "graph_bad",
@@ -249,16 +320,16 @@ fn token_arguments_bound_authority_and_keep_direct_compatibility() {
         "1graph",
         "-graph",
     ] {
-        assert!(requested_grant(Some(bad), Some("read")).is_err());
+        assert!(graph_id(bad).is_err());
     }
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--managed", "--clear"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--managed"]).is_ok());
     assert!(
         Cli::try_parse_from([
             "omnigraph",
             "cluster",
             "token",
-            "--clear",
+            "--managed",
             "--actions",
             "read"
         ])
@@ -291,35 +362,27 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         IntentReply::json(200, read_reply()),
     ]);
     let mut context = context();
-    let mut response_credential = credential(&context, &data.origin);
-    response_credential.expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(3629))
-        .format(&Rfc3339)
-        .unwrap();
-    let mut response = response_credential.metadata();
-    response["token"] = json!(DATA_TOKEN);
-    response["access_token"] = json!("must-not-be-output");
-    let cp = IntentApiFixture::new(vec![IntentReply::json(
-        200,
-        json!({"data":response,"meta":{"cluster_id":context.cluster}}),
-    )]);
-    context.api = cp.origin.clone();
+    let cp = IntentApiFixture::with_origin(|origin| {
+        context.api = origin.to_owned();
+        let response_credential = credential(&context, &data.origin);
+        let mut response = response_credential.metadata();
+        response["token"] = json!(response_credential.token);
+        response["access_token"] = json!("must-not-be-output");
+        vec![IntentReply::json(
+            200,
+            json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}}),
+        )]
+    });
     let cp_store = MemoryStore::default();
     cp_store
         .put(&context.api, "unrelated-control-session")
         .unwrap();
     let data_store = MemoryStore::default();
     let api = Api::new(cp.origin.clone(), Some("control-session-secret".into())).unwrap();
-    let output = mint(
-        &data_store,
-        &context,
-        &api,
-        response_credential.grants[0].clone(),
-        3600,
-    )
-    .await
-    .unwrap();
+    let output = mint(&data_store, &context, &api, 3600).await.unwrap();
+    let token = load_credential(&data_store, &context).unwrap().token;
     let rendered = output.to_string();
-    assert!(!rendered.contains(DATA_TOKEN));
+    assert!(!rendered.contains(&token));
     assert!(!rendered.contains("must-not-be-output"));
     assert_eq!(
         cp_store.get(&context.api).unwrap().as_deref(),
@@ -332,19 +395,10 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         requests[0].headers["authorization"],
         "Bearer control-session-secret"
     );
-    assert_eq!(
-        requests[0].body,
-        json!({"grants":response_credential.grants,"ttl_seconds":3600})
-    );
+    assert_eq!(requests[0].body, json!({"version":2,"ttl_seconds":3600}));
     cp.assert_complete();
     drop(cp);
-    let client = load(
-        &data_store,
-        &context,
-        "knowledge",
-        &["read", "change", "invoke_query"],
-    )
-    .unwrap();
+    let client = load(&data_store, &context, "knowledge").unwrap();
     let result = client
         .query(
             ReadTarget::Branch("main".into()),
@@ -383,10 +437,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         ]
     );
     for request in &requests {
-        assert_eq!(
-            request.headers["authorization"],
-            format!("Bearer {DATA_TOKEN}")
-        );
+        assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
     }
     assert_eq!(requests[1].headers["omnigraph-if-graph-commit"], "head-a");
     data.assert_complete();
@@ -400,10 +451,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
         false
     );
     assert_eq!(
-        load(&data_store, &context, "knowledge", &["read"])
-            .err()
-            .unwrap()
-            .body["type"],
+        load(&data_store, &context, "knowledge").err().unwrap().body["type"],
         "data_credential_required"
     );
     assert!(cp_store.get(&context.api).unwrap().is_some());
@@ -440,9 +488,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     });
     let store = MemoryStore::default();
     let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
-    let output = mint_profile(&store, &context, &api, None, 3600)
-        .await
-        .unwrap();
+    let output = mint(&store, &context, &api, 3600).await.unwrap();
     assert_eq!(output["data"]["version"], 2);
     assert!(output["data"].get("grants").is_none());
     assert!(output["data"].get("token").is_none());
@@ -455,7 +501,7 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
     let saved: Value = serde_json::from_str(&store.get(&key(&context)).unwrap().unwrap()).unwrap();
     assert!(saved.get("grants").is_none());
     assert!(
-        load(&store, &context, "any-graph", &["schema_apply"]).is_ok(),
+        load(&store, &context, "any-graph").is_ok(),
         "Cedar, not the local cache, decides permission"
     );
     let dir = tempfile::tempdir().unwrap();
@@ -554,16 +600,26 @@ async fn identity_issuance_caches_no_permissions_and_discovers_without_control_c
         saved
     );
     data.assert_complete();
-    save(&store, &context, &credential(&context, &data.origin));
+    let mut retired = credential(&context, &data.origin);
+    retired.version = 1;
+    save(&store, &context, &retired);
     let failure = resolve(&cli, dir.path(), &store, || Ok(false))
         .err()
         .unwrap();
-    assert_eq!(failure.body["type"], "data_profile_unsupported");
+    assert_eq!(failure.body["type"], "data_credential_invalid");
 }
 
 #[tokio::test]
 async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_replacement() {
-    for field in ["version", "grants", "roles", "actor", "incarnation"] {
+    for field in [
+        "version",
+        "grants",
+        "roles",
+        "actor",
+        "incarnation",
+        "endpoint",
+        "token",
+    ] {
         let mut context = context();
         let cp = IntentApiFixture::with_origin(|origin| {
             context.api = origin.to_owned();
@@ -576,24 +632,24 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
                 "grants" => envelope["data"]["grants"] = json!([]),
                 "roles" => envelope["data"]["roles"] = json!(["admin"]),
                 "actor" => envelope["data"]["actor"] = json!("principal:other"),
+                "endpoint" => {
+                    envelope["data"]["endpoint"] = json!("https://user:password@data.example/path")
+                }
+                "token" => envelope["data"]["token"] = json!("x".repeat(MAX_TOKEN + 1)),
                 _ => envelope["meta"]["incarnation"] = json!("other"),
             }
             vec![IntentReply::json(200, envelope)]
         });
         let store = MemoryStore::default();
-        store
-            .put(&key(&context), "existing-restricted-credential")
-            .unwrap();
+        store.put(&key(&context), "existing-credential").unwrap();
         let api = Api::new(cp.origin.clone(), Some("control-session".into())).unwrap();
         assert!(
-            mint_profile(&store, &context, &api, None, 3600)
-                .await
-                .is_err(),
+            mint(&store, &context, &api, 3600).await.is_err(),
             "accepted {field}"
         );
         assert_eq!(
             store.get(&key(&context)).unwrap().as_deref(),
-            Some("existing-restricted-credential")
+            Some("existing-credential")
         );
         cp.assert_complete();
     }
@@ -604,43 +660,17 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
     let context = context();
     let store = MemoryStore::default();
     let original = credential(&context, "https://data.example");
-    let mut clock_ahead = credential(&context, "https://data.example");
-    clock_ahead.expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(86429))
-        .format(&Rfc3339)
-        .unwrap();
-    assert!(clock_ahead.validate(&context).is_ok());
-    clock_ahead.expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(86460))
-        .format(&Rfc3339)
-        .unwrap();
-    assert!(clock_ahead.validate(&context).is_err());
     save(&store, &context, &original);
-    assert_eq!(
-        load(&store, &context, "foreign", &["read"])
-            .err()
-            .unwrap()
-            .body["type"],
-        "data_scope_missing"
-    );
-    assert_eq!(
-        load(&store, &context, "knowledge", &["export"])
-            .err()
-            .unwrap()
-            .body["type"],
-        "data_scope_missing"
-    );
     let base = serde_json::to_value(&original).unwrap();
     for (field, value) in [
-        ("version", json!(2)),
+        ("version", json!(1)),
         ("api", json!("https://foreign.example")),
         ("cluster_id", json!("foreign")),
         ("endpoint", json!("https://data.example/path")),
         ("endpoint", json!("http://data.example")),
         ("endpoint", json!("https://user:secret@data.example")),
         ("token", json!("a.b")),
-        (
-            "token",
-            json!(identity_credential(&context, "https://data.example").token),
-        ),
+        ("token", json!(DATA_TOKEN)),
         ("token", json!("x".repeat(MAX_TOKEN + 1))),
         ("kid", json!("not-a-fingerprint")),
         (
@@ -669,7 +699,7 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
         corrupt[field] = value;
         store.put(&key(&context), &corrupt.to_string()).unwrap();
         assert!(
-            load(&store, &context, "knowledge", &["read"]).is_err(),
+            load(&store, &context, "knowledge").is_err(),
             "accepted {field}"
         );
     }
@@ -677,59 +707,7 @@ fn cached_authority_refuses_wrong_bindings_expiry_and_extra_fields() {
         .unwrap()
         .replacen("{", "{\"version\":1,", 1);
     store.put(&key(&context), &duplicate).unwrap();
-    assert!(load(&store, &context, "knowledge", &["read"]).is_err());
-}
-
-#[tokio::test]
-async fn invalid_issuance_never_replaces_cached_authority() {
-    for corruption in [
-        "extra-action",
-        "foreign-endpoint",
-        "oversize-token",
-        "profile-upgrade",
-        "hidden-profile-upgrade",
-    ] {
-        let mut context = context();
-        let valid = credential(&context, "https://data.example");
-        let mut response = valid.metadata();
-        response["token"] = json!(DATA_TOKEN);
-        match corruption {
-            "extra-action" => response["grants"][0]["actions"] = json!(["read", "export"]),
-            "foreign-endpoint" => {
-                response["endpoint"] = json!("https://user:password@data.example/path")
-            }
-            "profile-upgrade" => response["version"] = json!(2),
-            "hidden-profile-upgrade" => {
-                response["token"] =
-                    json!(identity_credential(&context, "https://data.example").token)
-            }
-            _ => response["token"] = json!("x".repeat(MAX_TOKEN + 1)),
-        }
-        let cp = IntentApiFixture::new(vec![IntentReply::json(
-            200,
-            json!({"data":response,"meta":{"cluster_id":context.cluster}}),
-        )]);
-        context.api = cp.origin.clone();
-        let store = MemoryStore::default();
-        store.put(&key(&context), "prior-authority").unwrap();
-        let api = Api::new(context.api.clone(), Some("control-only".into())).unwrap();
-        assert!(
-            mint(
-                &store,
-                &context,
-                &api,
-                requested_grant(Some("knowledge"), Some("read")).unwrap(),
-                3600
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            store.get(&key(&context)).unwrap().as_deref(),
-            Some("prior-authority")
-        );
-        cp.assert_complete();
-    }
+    assert!(load(&store, &context, "knowledge").is_err());
 }
 
 #[test]
@@ -788,16 +766,6 @@ fn managed_routing_preserves_selected_managed_authority_without_fallback() {
             .unwrap()
             .is_some()
     );
-    let mut narrowed = cached;
-    narrowed.grants[0].actions = vec!["read".into()];
-    save(&store, &context, &narrowed);
-    assert_eq!(
-        resolve(&query, dir.path(), &store, || Ok(false))
-            .err()
-            .unwrap()
-            .body["type"],
-        "data_scope_missing"
-    );
 }
 
 struct NoCredentialAccess;
@@ -827,9 +795,9 @@ fn managed_data_issue_633_explicit_and_unrelated_commands_skip_context() {
         }
         for args in [
             vec!["query", "q", "--server", "legacy"],
-            vec!["read", "q", "--profile", "legacy"],
+            vec!["query", "q", "--profile", "legacy"],
             vec!["mutate", "--store", "file:///scratch", "-e", "source"],
-            vec!["change", "m", "--cluster", "local"],
+            vec!["mutate", "m", "--cluster", "local"],
             vec!["query", "q", "--direct"],
             vec!["init", "--schema", "schema.pg", "file:///scratch"],
             vec![
@@ -923,6 +891,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
         IntentReply::json(200, commit.clone()),
     ]);
+    let cached = credential(&context, &server.origin);
     for command in [vec!["commit", "list"], vec!["commit", "show", "commit-a"]] {
         let cli = Cli::try_parse_from(
             ["omnigraph", "--graph", "knowledge"]
@@ -944,17 +913,6 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
                 .body["type"],
             "data_credential_required"
         );
-        let mut cached = credential(&context, &server.origin);
-        cached.grants[0].actions = vec!["change".into()];
-        save(&store, &context, &cached);
-        assert_eq!(
-            resolve(&cli, dir.path(), &store, || Ok(false))
-                .err()
-                .unwrap()
-                .body["type"],
-            "data_scope_missing"
-        );
-        cached.grants[0].actions = vec!["read".into()];
         save(&store, &context, &cached);
         let client = resolve(&cli, dir.path(), &store, || Ok(false))
             .unwrap()
@@ -986,14 +944,14 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         assert_eq!(request.path, path);
         assert_eq!(
             request.headers["authorization"],
-            format!("Bearer {DATA_TOKEN}")
+            format!("Bearer {}", cached.token)
         );
     }
     server.assert_complete();
 }
 
 #[test]
-fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
+fn managed_load_uses_identity_and_keeps_target_preflight() {
     let dir = tempfile::tempdir().unwrap();
     let context = context();
     super::super::save_context(dir.path(), &context).unwrap();
@@ -1023,30 +981,18 @@ fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
             .body["type"],
         "managed_target_ambiguous"
     );
-    for (actions, graph, from, allowed) in [
-        (vec!["read"], "knowledge", false, false),
-        (vec!["change"], "other", false, false),
-        (vec!["change"], "knowledge", false, true),
-        (vec!["branch_create"], "knowledge", true, false),
-        (vec!["change"], "knowledge", true, false),
-        (vec!["change", "branch_create"], "knowledge", true, true),
-    ] {
-        let mut cached = credential(&context, "https://data.example");
-        cached.grants[0].graph_id = graph.into();
-        cached.grants[0].actions = actions.into_iter().map(str::to_string).collect();
-        save(&store, &context, &cached);
-        let extra = if from {
-            vec!["--branch", "review", "--from", "main"]
-        } else {
-            vec![]
-        };
+    save(
+        &store,
+        &context,
+        &credential(&context, "https://data.example"),
+    );
+    for extra in [vec![], vec!["--branch", "review", "--from", "main"]] {
         let cli = Cli::try_parse_from(args.into_iter().chain(extra)).unwrap();
-        let result = resolve(&cli, dir.path(), &store, || Ok(false));
-        if allowed {
-            assert!(result.unwrap().is_some());
-        } else {
-            assert_eq!(result.err().unwrap().body["type"], "data_scope_missing");
-        }
+        assert!(
+            resolve(&cli, dir.path(), &store, || Ok(false))
+                .unwrap()
+                .is_some()
+        );
     }
     let cli = Cli::try_parse_from(args.into_iter().chain(["--as", "fake"])).unwrap();
     assert_eq!(
@@ -1081,7 +1027,7 @@ fn managed_load_requires_exact_graph_change_and_explicit_fork_authority() {
 fn managed_data_issue_633_ambiguity_and_invalid_context_precede_credentials() {
     let dir = tempfile::tempdir().unwrap();
     super::super::save_context(dir.path(), &context()).unwrap();
-    for verb in ["query", "read", "mutate", "change"] {
+    for verb in ["query", "mutate"] {
         let cli = Cli::try_parse_from(["omnigraph", verb, "q", "--graph", "knowledge"]).unwrap();
         assert_eq!(
             resolve(&cli, dir.path(), &NoCredentialAccess, || Ok(true))
@@ -1248,8 +1194,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
         std::time::Duration::from_millis(30_750),
     );
     let store = MemoryStore::default();
-    let mut cached = credential(&context, &server.origin);
-    cached.grants[0].actions = vec!["change".into(), "branch_create".into()];
+    let cached = credential(&context, &server.origin);
     save(&store, &context, &cached);
     let cli = Cli::try_parse_from([
         "omnigraph",
@@ -1296,7 +1241,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
     assert_eq!(
         requests[0].headers["authorization"],
-        format!("Bearer {DATA_TOKEN}")
+        format!("Bearer {}", cached.token)
     );
     assert_eq!(requests[0].raw_body, ndjson.as_bytes());
     assert!(!requests[0].headers.contains_key("x-actor-id"));

@@ -48,16 +48,15 @@ use api::{
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    LegacyReadOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, ReadinessOutput,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
-    graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output, snapshot_payload,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -114,6 +113,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         deployment::status,
         deployment::lookup,
         deployment::apply,
+        deployment::plan,
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
@@ -121,24 +121,16 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
-        // deprecated; the #[deprecated] attribute on the handler
-        // surfaces as `deprecated: true` on the OpenAPI operation.
-        #[allow(deprecated)] handlers::server_read,
         handlers::server_query,
         handlers::server_export,
-        #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
         handlers::server_invoke_query_if_graph_commit,
-        handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
         handlers::server_load_ndjson,
-        // deprecated; the #[deprecated] attribute on the handler surfaces as
-        // `deprecated: true` on the OpenAPI operation.
-        #[allow(deprecated)] handlers::server_ingest,
         handlers::server_branch_list,
         handlers::server_branch_create,
         handlers::server_branch_delete,
@@ -397,11 +389,6 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
-    /// Server-level Cedar policy. Used by management endpoints (`GET
-    /// /graphs`) which act on the registry resource, not on a per-graph
-    /// resource. Loaded from the cluster-scoped policy binding when
-    /// configured. Per-graph policies live on each `GraphHandle.policy`.
-    server_policy: Option<Arc<PolicyEngine>>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
@@ -768,7 +755,6 @@ impl AppState {
             },
             workload,
             bearer_tokens,
-            server_policy: None,
             data_token_trust: None,
             oidc_identity_trust: None,
             operations: operations::OperationRuntime::new(),
@@ -812,6 +798,7 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_entries(entries)?);
+        registry.initialize_server_policy(server_policy.map(Arc::new));
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
@@ -821,7 +808,6 @@ impl AppState {
             },
             workload: Arc::new(workload),
             bearer_tokens,
-            server_policy: server_policy.map(Arc::new),
             data_token_trust: None,
             oidc_identity_trust: None,
             operations: operations::OperationRuntime::new(),
@@ -924,14 +910,15 @@ impl AppState {
         {
             return true;
         }
-        if self.server_policy.is_some() {
+        let snapshot = self.routing.registry.snapshot_ref();
+        if snapshot.server_policy.is_some() {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
         // policy gate would receive unauthenticated requests. Reading
         // the cached `any_per_graph_policy` flag off the registry
         // snapshot is O(1).
-        self.routing.registry.snapshot_ref().any_per_graph_policy
+        snapshot.any_per_graph_policy
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<AuthenticatedActor> {
@@ -2402,26 +2389,7 @@ pub fn build_app(state: AppState) -> Router {
         // dedicated handler makes the zero-payload-read contract structural.
         .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
-        // /read and /change retain their deprecated route/request semantics;
-        // their handlers carry #[deprecated] so the OpenAPI operation is
-        // flagged and their responses include RFC 9745 Deprecation +
-        // RFC 8288 Link headers. Suppress the call-site warning for the
-        // route registration itself.
-        .route(
-            "/read",
-            post({
-                #[allow(deprecated)]
-                server_read
-            }),
-        )
         .route("/query", post(server_query))
-        .route(
-            "/change",
-            post({
-                #[allow(deprecated)]
-                server_change
-            }),
-        )
         .route("/mutate", post(server_mutate))
         .route(
             "/mutate/if-graph-commit",
@@ -2434,23 +2402,11 @@ pub fn build_app(state: AppState) -> Router {
             post(server_invoke_query_if_graph_commit),
         )
         .route("/schema", get(server_schema_get))
-        .route("/schema/apply", post(server_schema_apply))
         .route(
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/load/ndjson", post(server_load_ndjson))
-        // /ingest is the deprecated alias of /load; its handler carries
-        // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
-        // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
-        .route(
-            "/ingest",
-            post({
-                #[allow(deprecated)]
-                server_ingest
-            })
-            .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-        )
         .route(
             "/branches",
             get(server_branch_list).post(server_branch_create),
@@ -2488,6 +2444,7 @@ pub fn build_app(state: AppState) -> Router {
         ));
 
     let deployments = Router::new()
+        .route("/cluster/plan", post(deployment::plan))
         .route(
             "/cluster/deployments",
             get(deployment::status).post(deployment::apply),
@@ -2659,6 +2616,7 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults);
+    deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     let startup_owner = operations
         .own_startup()
@@ -2848,7 +2806,7 @@ async fn prepare_multi_graph_state(
         }
     }
 
-    // Server-level policy (loaded once, applies to management endpoints).
+    // Initial server-level policy, replaced atomically by deployment activation.
     // The placeholder graph_id `"server"` is the sentinel the Cedar
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.

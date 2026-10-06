@@ -43,6 +43,7 @@ struct AdmissionOwner {
     guard: StateLockGuard,
     canonical_root: String,
     schema_contracts: BTreeMap<String, SchemaContractDigest>,
+    serving_deployment: Option<crate::DeploymentResult>,
     purpose: ClusterAdmissionPurpose,
 }
 
@@ -67,6 +68,28 @@ impl ClusterAdmission {
                 "this owner cannot deploy",
             ));
         }
+        self.validate_current_lock().await
+    }
+
+    /// Completion uses the accepted deployment's current base, not the graph
+    /// inventory captured when a long-lived server first acquired this owner.
+    pub(crate) async fn validate_completion(&self, deployment_id: &str) -> Result<(), Diagnostic> {
+        match &self.0.purpose {
+            ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::Deployment => {}
+            ClusterAdmissionPurpose::Reconcile {
+                deployment_id: original,
+            } if original == deployment_id => {}
+            _ => {
+                return Err(crate::deployment::refusal(
+                    "cluster_admission_purpose_mismatch",
+                    "this owner cannot complete the accepted deployment",
+                ));
+            }
+        }
+        self.validate_current_lock().await
+    }
+
+    async fn validate_current_lock(&self) -> Result<(), Diagnostic> {
         let mut observations = self.0.store.observations();
         let mut diagnostics = Vec::new();
         self.0
@@ -111,6 +134,12 @@ impl ClusterAdmission {
             .schema_contracts
             .get(&graph_id)
             .expect("admitted graph"))
+    }
+
+    /// The current converged receipt captured under this admission. This is
+    /// startup input, not evidence that this process has installed its bindings.
+    pub fn serving_deployment(&self) -> Option<&crate::DeploymentResult> {
+        self.0.serving_deployment.as_ref()
     }
 
     /// Explicitly release a uniquely owned admission after the caller has
@@ -295,13 +324,21 @@ pub(crate) async fn acquire_with_store(
                 "only reconciliation of the exact outstanding deployment is admitted; serving and other writers are refused",
             ));
         }
-        Ok::<_, Diagnostic>(state
+        let serving_deployment = state.deployment_results.as_ref().and_then(|results| {
+            results.iter().rev().find(|result| {
+                result.converged
+                    && Some(result.result_revision) == state.applied_revision.result_revision
+                    && result.config_digest.is_some()
+                    && result.config_digest == state.applied_revision.config_digest
+            }).cloned()
+        });
+        Ok::<_, Diagnostic>((state
             .applied_revision
             .schema_contracts
-            .expect("validated v2 state has exact achieved contracts"))
+            .expect("validated v2 state has exact achieved contracts"), serving_deployment))
     }.await;
-    let schema_contracts = match captured {
-        Ok(contracts) => contracts,
+    let (schema_contracts, serving_deployment) = match captured {
+        Ok(captured) => captured,
         Err(error) => return Err(release_refused_preflight(store, guard.lock_id(), error).await),
     };
     Ok(Some(ClusterAdmission(Arc::new(AdmissionOwner {
@@ -309,11 +346,13 @@ pub(crate) async fn acquire_with_store(
         guard,
         canonical_root,
         schema_contracts,
+        serving_deployment,
         purpose,
     }))))
 }
 
-pub(crate) fn canonical_graph_uri(graph_uri: &str) -> Result<String, Diagnostic> {
+/// Canonical process-owner identity for a graph URI, including local aliases.
+pub fn canonical_graph_uri(graph_uri: &str) -> Result<String, Diagnostic> {
     omnigraph_storage::normalize_root_uri(graph_uri)
         .and_then(|root| omnigraph_storage::write_queue_root_identity(&root))
         .map_err(|error| {

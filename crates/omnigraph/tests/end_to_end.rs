@@ -2295,8 +2295,26 @@ async fn assert_graph_root_refuses_overlapping_bases(
         matches!(error, OmniError::ExternalBlobPolicy { .. }),
         "unexpected error: {error}"
     );
-    drop(db);
+    assert_eq!(graph_state(graph_uri.clone()).await, before);
+    let payload = external.join("content.bin");
+    std::fs::write(&payload, [1_u8, 2, 3]).unwrap();
+    let row = serde_json::json!({"type":"Document", "data": {
+        "title":"external", "content":url::Url::from_file_path(&payload).unwrap().to_string()
+    }})
+    .to_string();
+    let denied = helpers::session(
+        db.with_runtime_bindings(None, None, ExternalBlobPolicy::Deny)
+            .unwrap(),
+    );
+    assert!(db.shares_runtime_owner(&denied));
+    assert!(matches!(
+        denied.load_jsonl(&row, LoadMode::Merge).await.unwrap_err(),
+        OmniError::ExternalBlobPolicy { .. }
+    ));
     assert_eq!(graph_state(graph_uri).await, before);
+    // The old admitted view keeps its allow-list; the replacement denies new
+    // external ingestion without changing the old policy or graph ownership.
+    db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────

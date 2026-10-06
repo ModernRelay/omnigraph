@@ -48,6 +48,108 @@ pub(crate) struct StateSnapshot {
     pub(crate) state_cas: Option<String>,
 }
 
+/// Only explicit stopped-ledger conversion may remove obsolete runtime fields.
+/// The remaining ledger is decoded by the ordinary strict types and validator.
+fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diagnostic> {
+    let invalid =
+        |message: String| Diagnostic::error("invalid_state_json", CLUSTER_STATE_FILE, message);
+    let strict_error = match serde_json::from_str::<ClusterState>(text) {
+        Ok(state) => return Ok((state, false)),
+        Err(error) => error,
+    };
+    if !upgrade {
+        // Reuse the bounded converter only to recognize a qualified prior
+        // receipt shape. Ordinary reads never consume the converted state.
+        if matches!(decode_ledger(text, true), Ok((_, true))) {
+            return Err(Diagnostic::error(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "completed receipts contain obsolete runtime fields; stop serving, writers and maintenance, establish prior I/O quiescence, then run `omnigraph --cluster <cluster-root> cluster upgrade-ledger --writers-stopped`",
+            ));
+        }
+        return Err(invalid(strict_error.to_string()));
+    }
+    let mut value =
+        omnigraph::loader::parse_unique_json(text).map_err(|error| invalid(error.to_string()))?;
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
+        return Err(invalid(strict_error.to_string()));
+    }
+    if value
+        .get("outstanding")
+        .is_some_and(|pending| !pending.is_null())
+    {
+        return Err(Diagnostic::error(
+            "ledger_upgrade_pending",
+            CLUSTER_STATE_FILE,
+            "complete the outstanding deployment with its originating build before ledger conversion",
+        ));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PriorActivation {
+        process_incarnation: String,
+        result_revision: u64,
+        config_digest: String,
+    }
+    let mut converted = false;
+    let results = value
+        .get_mut("deployment_results")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| invalid("missing deployment results".into()))?;
+    let results_bytes = serde_json::to_vec(&results).map_err(|error| invalid(error.to_string()))?;
+    if results_bytes.len() > crate::deployment::MAX_RESULTS_BYTES {
+        return Err(invalid("obsolete results exceed the receipt bound".into()));
+    }
+    for result in results {
+        if serde_json::to_vec(&result)
+            .map_err(|error| invalid(error.to_string()))?
+            .len()
+            > crate::deployment::MAX_RESULT_BYTES
+        {
+            return Err(invalid("obsolete result exceeds the receipt bound".into()));
+        }
+        let fields = result
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid deployment result".into()))?;
+        let restart = fields.remove("restart_required");
+        let activation = fields.remove("activation");
+        if restart.is_none() && activation.is_none() {
+            continue;
+        }
+        let restart = restart
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| invalid("obsolete receipt requires boolean restart_required".into()))?;
+        let activation = activation
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value::<PriorActivation>)
+            .transpose()
+            .map_err(|error| invalid(error.to_string()))?;
+        let receipt: crate::DeploymentResult =
+            serde_json::from_value(result.clone()).map_err(|error| invalid(error.to_string()))?;
+        if let Some(active) = activation {
+            if !active
+                .process_incarnation
+                .parse::<ulid::Ulid>()
+                .is_ok_and(|id| id.to_string() == active.process_incarnation)
+                || active.result_revision != receipt.result_revision
+                || receipt.config_digest.as_deref() != Some(active.config_digest.as_str())
+                || !receipt.converged
+                || restart
+            {
+                return Err(invalid("inconsistent obsolete activation witness".into()));
+            }
+        } else if !restart {
+            return Err(invalid(
+                "obsolete receipt claims activation without a witness".into(),
+            ));
+        }
+        converted = true;
+    }
+    let state = serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
+    validate_state(&state)?;
+    Ok((state, converted))
+}
+
 impl ClusterStore {
     /// The default layout: storage root = the config directory itself
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
@@ -140,6 +242,68 @@ impl ClusterStore {
                 format!("{}/graphs/{graph_id}.omni", self.root)
             }
         }
+    }
+
+    /// Refuse symlink/alias substitution before accepting or resuming deletion.
+    /// The immutable intent stores this exact layout identity, never a caller's
+    /// arbitrary prefix or the target of a graph-directory symlink.
+    pub(crate) fn canonical_managed_graph_root(&self, graph: &str) -> Result<String, Diagnostic> {
+        let mut diagnostics = Vec::new();
+        crate::config::validate_id("graph", "graph", graph, &mut diagnostics);
+        if let Some(error) = diagnostics.into_iter().next() {
+            return Err(error);
+        }
+        let expected = format!(
+            "{}/graphs/{graph}.omni",
+            self.canonical_root()?.trim_start_matches("file://")
+        );
+        let actual = crate::admission::canonical_graph_uri(&self.graph_root(graph))?;
+        if actual != expected {
+            return Err(Diagnostic::error(
+                "cluster_graph_root_mismatch",
+                graph,
+                "graph root is outside the admitted cluster's canonical graph layout",
+            ));
+        }
+        Ok(expected)
+    }
+
+    pub(crate) async fn delete_managed_graph_root(
+        &self,
+        graph: &str,
+        recorded_root: &str,
+    ) -> Result<(), Diagnostic> {
+        if self.canonical_managed_graph_root(graph)? != recorded_root {
+            return Err(Diagnostic::error(
+                "cluster_graph_root_mismatch",
+                graph,
+                "graph deletion root differs from its accepted identity",
+            ));
+        }
+        self.adapter
+            .delete_prefix(recorded_root)
+            .await
+            .map_err(|error| {
+                Diagnostic::error(
+                    "deployment_outcome_unknown",
+                    graph,
+                    format!("graph root deletion remains outstanding: {error}"),
+                )
+            })?;
+        if self
+            .graph_root_exists(recorded_root)
+            .await
+            .map_err(|error| {
+                Diagnostic::error("deployment_outcome_unknown", graph, error.to_string())
+            })?
+        {
+            return Err(Diagnostic::error(
+                "deployment_outcome_unknown",
+                graph,
+                "graph root remains present after deletion",
+            ));
+        }
+        Ok(())
     }
 
     /// Display-form storage root (plain local path for `file://`, URI for
@@ -240,6 +404,46 @@ impl ClusterStore {
             }
         }
         out
+    }
+
+    /// Exact birth cleanup can leave directory skeletons on local filesystems.
+    /// Admit only a bounded tree of real directories: object-store listings
+    /// follow symlinks and hide broken ones, so their zero-object result alone
+    /// cannot prove this local exception safe. Engine preparation still checks
+    /// the target before minting creation authority. Cloud markers never qualify.
+    pub(crate) fn graph_root_is_empty_local_directory(
+        &self,
+        graph_uri: &str,
+    ) -> omnigraph_storage::Result<bool> {
+        if storage_kind_for_uri(graph_uri)? != StorageKind::Local {
+            return Ok(false);
+        }
+        let root = Path::new(graph_uri.trim_start_matches("file://"));
+        if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+            return Ok(false);
+        }
+        let mut pending = vec![root.to_path_buf()];
+        let mut directories = 1usize;
+        let mut path_bytes = root.as_os_str().len();
+        while let Some(directory) = pending.pop() {
+            if path_bytes > 64 * 1024 {
+                return Ok(false);
+            }
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                directories += 1;
+                if directories > 64 || !entry.file_type()?.is_dir() {
+                    return Ok(false);
+                }
+                let path = entry.path();
+                path_bytes = path_bytes.saturating_add(path.as_os_str().len());
+                if path_bytes > 64 * 1024 {
+                    return Ok(false);
+                }
+                pending.push(path);
+            }
+        }
+        Ok(true)
     }
 
     /// Existence probe before graph creation or read-only observation. A bare local
@@ -556,14 +760,33 @@ impl ClusterStore {
         &self,
         observations: &mut StateObservations,
     ) -> Result<StateSnapshot, Diagnostic> {
+        self.read_state_inner(observations, false)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    pub(crate) async fn read_state_for_ledger_upgrade(
+        &self,
+    ) -> Result<(StateSnapshot, bool), Diagnostic> {
+        self.read_state_inner(&mut self.observations(), true).await
+    }
+
+    async fn read_state_inner(
+        &self,
+        observations: &mut StateObservations,
+        upgrade: bool,
+    ) -> Result<(StateSnapshot, bool), Diagnostic> {
         let state_uri = self.uri(CLUSTER_STATE_FILE);
         let (text, _version) = match self.read_versioned_opt(&state_uri).await {
             Ok(Some(read)) => read,
             Ok(None) => {
-                return Ok(StateSnapshot {
-                    state: None,
-                    state_cas: None,
-                });
+                return Ok((
+                    StateSnapshot {
+                        state: None,
+                        state_cas: None,
+                    },
+                    false,
+                ));
             }
             Err(err) => {
                 return Err(Diagnostic::error(
@@ -578,26 +801,25 @@ impl ClusterStore {
         let state_cas = format!("sha256:{}", sha256_hex(text.as_bytes()));
         observations.state_cas = Some(state_cas.clone());
 
-        let mut state = serde_json::from_str::<ClusterState>(&text).map_err(|err| {
-            Diagnostic::error(
-                "invalid_state_json",
-                CLUSTER_STATE_FILE,
-                format!("could not parse state JSON: {err}"),
-            )
-        })?;
+        let (mut state, converted) = decode_ledger(&text, upgrade)?;
 
         validate_state(&state)?;
 
-        canonicalize_observation_coordinates(&mut state)?;
+        if !converted {
+            canonicalize_observation_coordinates(&mut state)?;
+        }
 
         observations.applied_config_digest = state.applied_revision.config_digest.clone();
         observations.state_revision = state.state_revision;
         observations.resource_count = state.applied_revision.resources.len();
 
-        Ok(StateSnapshot {
-            state: Some(state),
-            state_cas: Some(state_cas),
-        })
+        Ok((
+            StateSnapshot {
+                state: Some(state),
+                state_cas: Some(state_cas),
+            },
+            converted,
+        ))
     }
 
     /// CAS-guarded ledger replace. The public contract stays content-level
@@ -613,6 +835,26 @@ impl ClusterStore {
         state: &ClusterState,
         expected_cas: Option<&str>,
         observations: &mut StateObservations,
+    ) -> Result<(), Diagnostic> {
+        self.write_state_inner(state, expected_cas, observations, false)
+            .await
+    }
+
+    pub(crate) async fn write_state_for_ledger_upgrade(
+        &self,
+        state: &ClusterState,
+        expected_cas: &str,
+    ) -> Result<(), Diagnostic> {
+        self.write_state_inner(state, Some(expected_cas), &mut self.observations(), true)
+            .await
+    }
+
+    async fn write_state_inner(
+        &self,
+        state: &ClusterState,
+        expected_cas: Option<&str>,
+        observations: &mut StateObservations,
+        upgrade: bool,
     ) -> Result<(), Diagnostic> {
         validate_state(state)?;
         if state.version != 2 {
@@ -634,9 +876,7 @@ impl ClusterStore {
             )
         })?;
         if let Some((text, _)) = &current {
-            let previous: ClusterState = serde_json::from_str(text).map_err(|err| {
-                Diagnostic::error("invalid_state_json", CLUSTER_STATE_FILE, err.to_string())
-            })?;
+            let (previous, _) = decode_ledger(text, upgrade)?;
             validate_state(&previous)?;
             if previous.version == 2 && state.version != 2 {
                 return Err(Diagnostic::error(

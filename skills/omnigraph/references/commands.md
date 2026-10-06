@@ -117,7 +117,9 @@ omnigraph schema plan --schema next.pg $REPO --json
 omnigraph schema apply --schema next.pg $REPO
 ```
 
-See `references/schema.md` for the full workflow.
+Both commands require direct storage and refuse `--server`. Cluster-managed
+graphs evolve through `cluster apply`. See `references/schema.md` for the full
+workflow.
 
 ### Offline storage upgrade
 
@@ -280,7 +282,7 @@ omnigraph login --api <origin>             # managed Intent API session (OS keyc
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. Only `cluster` subcommands and `use` accept `--config`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster` and `use`.
 
 ## Addressing a Graph
 
@@ -302,8 +304,8 @@ operator default server/store competes, they refuse with
 `managed_target_ambiguous`. Global `--direct` restores the ordinary resolution
 above. Other data commands are unaffected.
 
-Cluster subcommands use `--config <dir>`; policy and stored-query control-plane
-commands use `--cluster <dir|uri>`. Maintenance against a
+`cluster` uses `--config <dir>` for source/context folders; policy
+and stored-query control-plane commands use `--cluster <dir|uri>`. Maintenance against a
 cluster-managed graph uses `--cluster <dir|file://|s3://|az://> --graph <id>`.
 Each command declares a **capability** — `any` / `served` / `direct` /
 `control` / `local` — shown in `omnigraph --help`; mis-addressing fails loudly.
@@ -361,17 +363,24 @@ is healthy; authorized `graphs list --server <name|url> --json` returns one
 omnigraph cluster validate     --config <dir>          # parse + typecheck the declaration
 omnigraph cluster plan         --config <dir> [--json] # preview (schema changes show migration steps)
 omnigraph cluster apply        --config <dir> --as <actor>   # direct (serving stopped): bootstrap or update
-omnigraph cluster apply --server <name|url> --config <dir>   # submit to the running server; activates without restart
+omnigraph cluster plan --server <name|url> --config <dir> --json  # read-only served preview
+omnigraph cluster apply --server <name|url> --config <dir> [--no-wait] [--timeout 1800] --json
+omnigraph cluster status --server <name|url> --deployment-id <ID> --wait [--timeout 1800] --json
 omnigraph cluster status       --config <dir> [--json] # read the ledger (read-only)
 omnigraph cluster observe      --config <dir> [--json] # current observations: no lock, no write
-omnigraph cluster plan --observe --config <dir>        # plan without taking the lock
 omnigraph cluster force-unlock <LOCK_ID> --config <dir>  # remove an exact lock once its owner is quiescent
-omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped  # one-time: convert a stopped 0.11 (v1) ledger
+omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped  # convert a supported stopped legacy ledger
 ```
 
-`observe` and `plan --observe` report an existing lock instead of refusing, and
-print `authority: "observed"` with the `state_cas` they read (`plan` output
-carries `authority: locked|observed|unlocked`).
+`plan` and `observe` are read-only and report `authority: "observed"` with the
+ledger `state_cas` they read. A plan is an observation; apply revalidates it.
+Served apply normally polls its original ID until convergence and activation.
+`--no-wait` returns after durable acceptance; `--timeout` bounds caller waiting
+(default 300 seconds, range 1–3600), including acceptance, and never cancels work.
+A wait timeout exits 5. Exact served status returns `deployment`, `active`, and
+`in_progress`; use `--wait` with `--deployment-id` to resume observation. These
+wait flags require `--server`. Lost responses trigger original-ID reads, never
+automatic resubmission. See [deployment receipts](cluster.md#the-loop-memorize-this).
 
 The 0.11 verbs `import`, `refresh` and `approve` are removed. A fresh direct
 `apply` creates the ledger, and a ledger written by 0.11 is converted once with
@@ -379,26 +388,26 @@ The 0.11 verbs `import`, `refresh` and `approve` are removed. A fresh direct
 its admission lock after it completes: once the owner and its I/O have settled,
 release that exact lock id with `force-unlock` before starting the server.
 
-A managed folder (see [`cluster.md`](cluster.md#managed-clusters)) uses a
-different verb set; `validate`, `observe`, and `force-unlock` (without
-`--cluster`) refuse there unless `--direct` is given:
+`cluster` commands select the managed service only with `--managed`; otherwise
+they ignore managed context (see [`cluster.md`](cluster.md#managed-clusters)):
 
 ```bash
 omnigraph use <CLUSTER_ID> --api <origin> [--config <dir>]
-omnigraph cluster create <name> --api <origin>
-omnigraph cluster push --expected-revision <rev> --message <msg>
-omnigraph cluster plan [--rev <revision>]
-omnigraph cluster apply --plan <PLAN_RUN_ID>
-omnigraph cluster status [RUN_ID | --operation <id> [--wait]]
-omnigraph cluster history [--limit N] [--since <RFC3339>]
-omnigraph cluster cancel <RUN_ID>
-omnigraph cluster token ([--ttl 1h] | --clear)   # optional; --graph <id> --actions … is the legacy restricted profile
-omnigraph cluster delete --incarnation <id> [--retention-seconds 86400]
-omnigraph cluster undo-delete --incarnation <id> --deletion-id <id>
+omnigraph cluster create --managed <name> --api <origin>
+omnigraph cluster push --managed --expected-revision <rev> --message <msg>
+omnigraph cluster plan --managed [--rev <revision>]
+omnigraph cluster apply --managed --plan <PLAN_RUN_ID>
+omnigraph cluster status --managed [RUN_ID]
+omnigraph cluster operation --managed <id> [--api <origin>] [--wait] [--timeout 1800]
+omnigraph cluster history --managed [--limit N] [--since <RFC3339>]
+omnigraph cluster cancel --managed <RUN_ID>
+omnigraph cluster token --managed ([--ttl 1h] | --clear)   # identity only; applied Cedar policy decides access
+omnigraph cluster delete --managed --incarnation <id> [--retention-seconds 86400]
+omnigraph cluster undo-delete --managed --incarnation <id> --deletion-id <id>
 ```
 
-Managed runs take `--no-wait`, `--timeout <1..3600>`, and
-`--idempotency-key` (reuse the same key after an uncertain response). Managed
+Managed plan, apply, create, delete, and undo-delete take `--no-wait`,
+`--timeout <1..3600>`, and `--idempotency-key` (reuse the same key after an uncertain response). Managed
 plan/apply/lifecycle exit codes: 0 converged, 1 failed or transport error, 2
 refused or blocked, 3 partially converged, 4 recovery required, 5 stalled or
 wait deadline, 6 cancelled.

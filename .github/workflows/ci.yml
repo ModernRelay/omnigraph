@@ -707,6 +707,7 @@ jobs:
           # These real CLI/server/proxy journeys must execute in the ordinary
           # workspace gate. A removed, filtered or re-ignored owner is not green.
           for test_name in \
+            cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
             remote_server_and_cli_end_to_end_flow \
             remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
             remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph \
@@ -714,6 +715,7 @@ jobs:
             remote_read_preserves_projection_order_in_json_and_csv \
             remote_branch_create_list_merge_flow \
             remote_merge_delivery_loss_never_replays_committed_effect \
+            remote_deployment_delivery_loss_preserves_owned_completion \
             remote_branch_delete_removes_branch \
             remote_export_round_trips_full_branch_graph \
             remote_ingest_creates_review_branch_and_keeps_it_readable \
