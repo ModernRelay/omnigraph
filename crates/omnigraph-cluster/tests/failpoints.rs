@@ -476,18 +476,31 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
 #[tokio::test]
 #[serial]
 async fn offline_preacceptance_id_never_aliases_a_later_nonce() {
-    use omnigraph_cluster::{DeploymentLookup, apply_deployment, deployment_status};
+    use omnigraph_cluster::{
+        ClusterAdmissionPurpose, DeploymentLookup, acquire_cluster_admission,
+        apply_captured_deployment, apply_deployment, capture_deployment, deployment_status,
+    };
     let _scenario = FailScenario::setup();
     let dir = offline_fixture().await;
     let root = dir.path().to_str().unwrap();
     let mut unaccepted = String::new();
     {
+        let admission = acquire_cluster_admission(root, ClusterAdmissionPurpose::Deployment)
+            .await
+            .unwrap()
+            .unwrap();
+        let bundle = capture_deployment(dir.path()).unwrap();
+        let mut effects = false;
         let _fail = omnigraph_cluster::seams::catalog::DEPLOYMENT_BEFORE_ACCEPTANCE.fire_always();
-        Box::pin(apply_deployment(
-            dir.path(),
+        Box::pin(apply_captured_deployment(
+            &bundle,
             None,
             &deployment_owner(),
+            &admission,
+            &std::collections::BTreeMap::new(),
             |id, _, _| unaccepted = id.into(),
+            |_| panic!("pre-acceptance failure cannot acknowledge acceptance"),
+            &mut effects,
         ))
         .await
         .unwrap_err();

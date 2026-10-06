@@ -83,7 +83,7 @@ pub fn managed_cli(config: &Path, origin: &str) -> Command {
         .env("OMNIGRAPH_CONTROL_API", origin)
         .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
         .current_dir(config)
-        .arg("cluster")
+        .arg("managed")
         .timeout(Duration::from_secs(15));
     command
 }

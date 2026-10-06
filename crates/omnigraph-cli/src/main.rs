@@ -194,6 +194,13 @@ async fn main() -> Result<()> {
     };
     match result {
         Err(error) => {
+            if error
+                .downcast_ref::<cluster_remote::WaitTimeout>()
+                .is_some()
+            {
+                std::io::stdout().flush()?;
+                std::process::exit(5);
+            }
             if let Some(evidence) = evidence {
                 let failure = command_outcome::Failure::classify(error, evidence);
                 match machine {
@@ -256,6 +263,22 @@ fn validate_core_root_arguments(
     let Command::Cluster { command } = &cli.command else {
         return Ok(());
     };
+    if cli.server.is_none()
+        && matches!(
+            command,
+            ClusterCommand::Apply { no_wait: true, .. }
+                | ClusterCommand::Apply {
+                    timeout: Some(_),
+                    ..
+                }
+                | ClusterCommand::Status { wait: true, .. }
+        )
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "deployment wait options require --server <SERVER>",
+        ));
+    }
     if cli.cluster.is_some()
         && command_matches
             .try_get_one::<PathBuf>("config")
@@ -286,7 +309,7 @@ fn validate_core_root_arguments(
     {
         return Err(Cli::command().error(
             clap::error::ErrorKind::MissingRequiredArgument,
-            "this Core deployment operation requires --cluster <ROOT>",
+            "this deployment operation requires --cluster <ROOT>",
         ));
     }
     Ok(())
@@ -1929,23 +1952,9 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
                 deployment_id,
-                run_id,
-                operation,
-                api,
-                wait,
-                timeout,
+                ..
             } => {
                 if let Some(root) = cli.cluster.as_deref() {
-                    if run_id.is_some()
-                        || operation.is_some()
-                        || api.is_some()
-                        || wait
-                        || timeout.is_some()
-                    {
-                        bail!(
-                            "root-addressed Core status does not accept managed run/operation flags"
-                        );
-                    }
                     let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
                     let status = core_deployment_result(
                         omnigraph_cluster::deployment_status(
@@ -1978,16 +1987,8 @@ async fn run(cli: Cli) -> Result<()> {
                     finish_cluster_force_unlock(&output, json)?;
                 }
             }
-            ClusterCommand::History { .. }
-            | ClusterCommand::Cancel { .. }
-            | ClusterCommand::Token { .. }
-            | ClusterCommand::Create { .. }
-            | ClusterCommand::Delete { .. }
-            | ClusterCommand::UndoDelete { .. }
-            | ClusterCommand::Push { .. } => {
-                unreachable!("managed dispatch refuses managed-only verbs without context")
-            }
         },
+        Command::Managed { .. } => unreachable!("managed commands dispatch before Core"),
         Command::Graphs { command } => match command {
             GraphsCommand::List { json, discovery } => {
                 let (client, discovery) = if let Some(client) = managed_data {

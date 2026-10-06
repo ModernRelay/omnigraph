@@ -784,14 +784,14 @@ pub async fn authorize_apply_plan(
             return Err(diagnostics.remove(0));
         }
     }
-    let prior = snapshot
-        .state
-        .as_ref()
-        .map(state_resource_digests)
-        .unwrap_or_default();
-    let mut changes = diff_resources(&prior, &desired.resource_digests);
-    append_policy_binding_changes(&mut changes, snapshot.state.as_ref(), &desired);
-    append_embedding_profile_changes(&mut changes, snapshot.state.as_ref(), &desired);
+    let changes = crate::diff::diff_state_resources(
+        &snapshot
+            .state
+            .as_ref()
+            .map(|state| state.applied_revision.resources.clone())
+            .unwrap_or_default(),
+        &captured.resources,
+    );
     let (authorization, _) = authorize_candidate(
         &backend, &desired, &captured, &snapshot, &changes, identity, true,
     )

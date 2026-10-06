@@ -198,6 +198,9 @@ pub struct PlanChange {
     /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+    /// Removing a declared graph deletes its managed root and retained history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -220,6 +223,10 @@ pub struct PlanOutput {
     pub authority: LedgerAuthority,
     pub config_dir: String,
     pub desired_revision: DesiredRevision,
+    /// Immutable captured input identity, when capture succeeded. This is an
+    /// observation, not a reservation or permission to execute it later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_digest: Option<String>,
     pub resource_digests: BTreeMap<String, String>,
     pub dependencies: Vec<Dependency>,
     pub state_observations: StateObservations,

@@ -93,6 +93,18 @@ canonical root. An explicit absolute `storage` must match that root; relative
 storage paths refuse. The CLI reads only local source files and needs no local
 mount or storage credentials for the server’s root.
 
+Preview the same local configuration through the server before applying:
+
+```bash
+omnigraph cluster plan --server production --config . --json
+omnigraph cluster apply --server production --config . --timeout 1800 --json
+```
+
+The served plan lists resource changes and schema migrations, including the exact
+managed root and history that a graph removal deletes. It writes nothing and keeps
+serving admission open. Its ledger CAS and input digest identify an observation;
+apply rechecks current authority and physical execution eligibility.
+
 The CLI prints the deployment ID before submission. The server keeps its PID,
 listener and writer ownership. It closes admission on affected graphs,
 finishes their admitted requests, publishes schema changes, and activates
@@ -103,8 +115,25 @@ Graph additions and removals use the same deployment; see
 
 The response separates the durable deployment result from `active`, which means
 that result's affected bindings are installed in this process. An unrelated
-blocked graph does not invalidate that activation. A successful response requires
-both convergence and activation. Each graph publishes atomically; deployment
+blocked graph does not invalidate that activation. Default apply waits for
+convergence and activation by polling the original ID. `--no-wait` instead returns
+after durable acceptance; drain and preparation may precede that acknowledgment.
+`--timeout SECONDS` bounds caller waiting, including acceptance (default 300,
+maximum 3600). Expiry exits 5 with the original ID and last observation; it does
+not cancel execution or prove failure. Resume observation with:
+
+```bash
+omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
+```
+
+The exact response contains `deployment`, `active` and `in_progress`. General
+cluster status retains its aggregate `status` object. An authenticated submitter
+can read its own durable receipt even after its deployment removes its management
+permission; general status and later deployments still require current permission.
+Lost submission responses are followed only by original-ID reads, never automatic
+resubmission. Expired receipts and unknown outcomes require investigation.
+
+Each graph publishes atomically; deployment
 across multiple graphs is not one transaction. Query-only changes create no graph
 commit and also work with multiple branches. Schema changes remain main-only
 and require a single live branch.

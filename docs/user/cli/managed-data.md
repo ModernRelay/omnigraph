@@ -18,7 +18,7 @@ needed. A valid cached graph credential for your cached sign-in avoids an
 unrelated API session check; an explicit automation token verifies its own
 principal before reusing that cache. Authentication refresh never replays a
 submitted mutation. Explicit
-`cluster token --ttl 1h` remains available for credential administration.
+`managed token --ttl 1h` remains available for credential administration.
 
 The issuer must support identity credentials and admit your principal to the
 selected cluster. The credential proves who you are and which cluster you
@@ -76,7 +76,7 @@ keychain; unattended clients needing a raw token use the issuance API directly.
 Managed `query`, `mutate`, `load`, `commit list`/`show`, and `graphs list`
 read `.omnigraph/context` only in the current directory; graph-specific
 commands require `--graph`. After
-`cluster token --config DIR`, run these commands from `DIR`; no parent
+`managed token --config DIR`, run these commands from `DIR`; no parent
 directory is searched. Ordinary data requests go directly to the cached
 endpoint without contacting the control
 API. They keep working during an API outage until the token expires or its
@@ -120,12 +120,12 @@ omnigraph query find_person --profile staging --graph knowledge --json
 
 Ordinary token settings never supply managed authority. Global `--direct`
 continues to select ordinary addressing and credentials, including when the
-context is malformed. Existing `cluster --direct` remains valid. Without
+context is malformed. Core `cluster` commands never read managed context. Without
 managed context, existing data commands retain their behavior.
 
 ## Clear a credential
 
-`cluster token --clear [--config DIR]` forgets that cluster's local data
+`managed token --clear [--config DIR]` forgets that cluster's local data
 entry, independently of the control-plane session. Do not combine `--clear`
 with `--graph` or `--ttl`. Clearing is not server revocation:
 copies remain usable until expiry or signing-key retirement. `logout --api`

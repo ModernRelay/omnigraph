@@ -39,8 +39,8 @@ pub(crate) fn pristine_bootstrap_state(state: &ClusterState) -> bool {
         && state.applied_revision.resources.is_empty()
 }
 
-/// The caller still owns authentication. A stored authority record never
-/// grants permission to invoke an effect or disclose an earlier result.
+/// The caller still owns authentication. Stored authority never grants effect
+/// permission; an authenticated initiating actor may read its exact receipt.
 #[derive(Debug, Clone)]
 pub enum DeploymentCaller {
     StorageOwner { actor: Option<String> },
@@ -131,6 +131,12 @@ impl CapturedDeployment {
     }
     pub fn config_digest(&self) -> &str {
         &self.config_digest
+    }
+    /// Immutable input identity used by the ledger and deployment receipts.
+    pub fn input_digest(&self) -> Result<String, Diagnostic> {
+        serde_json::to_vec(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| refusal("deployment_encode", error.to_string()))
     }
     pub fn graph_ids(&self) -> Vec<String> {
         self.resources
@@ -276,6 +282,7 @@ impl DeploymentStatus {
 pub enum DeploymentLookup {
     Outstanding {
         id: String,
+        input_digest: String,
         graphs: BTreeMap<String, String>,
     },
     Complete {

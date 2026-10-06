@@ -89,7 +89,7 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         "status": {"canonical_root":remote_root, "ledger_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV",
             "state_revision":1, "result_revision":0, "next_sequence":1,
             "lock_id":"server-owner", "outstanding_id":null, "lookup":null},
-        "active":false
+        "active":false, "in_progress":false
     });
     let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
     for declared_storage in [Some(remote_root.as_str()), None] {
@@ -161,6 +161,230 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
         api.assert_complete();
     }
 
+    // Submission is once-only: acceptance and later activation are distinct
+    // observations. Lost delivery permits GETs under the original identity.
+    let input_digest = omnigraph_cluster::capture_deployment_for_server(temp.path(), &remote_root)
+        .unwrap()
+        .input_digest()
+        .unwrap();
+    let accepted = serde_json::json!({
+        "deployment":{"status":"outstanding", "id":id, "input_digest":input_digest, "graphs":{"knowledge":"started"}},
+        "active":false, "in_progress":true,
+    });
+    let complete = serde_json::json!({
+        "deployment":{"status":"complete", "result":{
+            "id":id, "input_digest":input_digest, "authority":{"kind":"authenticated_identity","actor":"operator"},
+            "base":{"result_revision":0,"resource_digests":{},"schema_contracts":{},"capture_cas":"base"},
+            "result_revision":1,"config_digest":"desired","graphs":{},"recovery_executors":{},"converged":true,
+        }}, "active":true, "in_progress":false,
+    });
+    for mode in ["accepted", "poll", "lost", "timeout"] {
+        let mut replies = vec![IntentReply::json(200, status.clone())];
+        replies.push(if mode == "lost" {
+            IntentReply::json(504, serde_json::json!({"error":"proxy lost acceptance"}))
+        } else {
+            IntentReply::json(202, accepted.clone())
+        });
+        if mode == "lost" {
+            replies.push(IntentReply::json(200, serde_json::json!({"deployment":{"status":"not_recorded"},"active":false,"in_progress":true})));
+            replies.push(IntentReply::json(200, accepted.clone()));
+        }
+        if mode == "poll" {
+            let mut activating = complete.clone();
+            activating["active"] = false.into();
+            activating["in_progress"] = true.into();
+            replies.push(IntentReply::json(200, activating));
+        }
+        if mode == "timeout" {
+            replies.push(IntentReply::json(200, accepted.clone()));
+        } else if mode != "accepted" {
+            replies.push(IntentReply::json(200, complete.clone()));
+        }
+        let api = IntentApiFixture::graph(replies);
+        let mut command = cli();
+        command
+            .args([
+                "cluster",
+                "apply",
+                "--server",
+                &api.origin,
+                "--deployment-id",
+                id,
+                "--config",
+            ])
+            .arg(temp.path())
+            .arg("--json");
+        if mode == "accepted" {
+            command.args(["--no-wait", "--timeout", "10"]);
+        } else {
+            command.args(["--timeout", if mode == "timeout" { "1" } else { "10" }]);
+        }
+        let output = command.output().unwrap();
+        let result = parse_stdout_json(&output);
+        if mode == "timeout" {
+            assert_eq!(output.status.code(), Some(5), "{output:?}");
+            assert_eq!(result["outcome"], "wait_timeout");
+            assert_eq!(result["deployment_id"], id);
+            assert_eq!(result["last_observation"], accepted);
+        } else {
+            assert!(output.status.success(), "{mode}: {output:?}");
+            assert_eq!(
+                result,
+                if mode == "accepted" {
+                    accepted.clone()
+                } else {
+                    complete.clone()
+                }
+            );
+        }
+        let requests = api.workflow_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1
+        );
+        for request in requests.iter().skip(2) {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, format!("/cluster/deployments/{id}"));
+        }
+        assert_no_core_effects(temp.path());
+        api.assert_complete();
+    }
+    // A proxy can lose the input-mismatch refusal for an existing identity.
+    // Observing its older receipt must never acknowledge this different input.
+    let mut wrong_input_successes = Vec::new();
+    for no_wait in [false, true] {
+        let mut old_receipt = if no_wait {
+            accepted.clone()
+        } else {
+            complete.clone()
+        };
+        if no_wait {
+            old_receipt["deployment"]["input_digest"] = "0".repeat(64).into();
+        } else {
+            old_receipt["deployment"]["result"]["input_digest"] = "0".repeat(64).into();
+        }
+        let api = IntentApiFixture::graph(vec![
+            IntentReply::json(200, status.clone()),
+            IntentReply::json(
+                504,
+                serde_json::json!({"error":"proxy lost input-mismatch refusal"}),
+            ),
+            IntentReply::json(200, old_receipt),
+        ]);
+        let mut command = cli();
+        command
+            .args([
+                "cluster",
+                "apply",
+                "--server",
+                &api.origin,
+                "--deployment-id",
+                id,
+                "--config",
+            ])
+            .arg(temp.path())
+            .args(["--json", "--timeout", "10"]);
+        if no_wait {
+            command.arg("--no-wait");
+        }
+        let output = command.output().unwrap();
+        if output.status.success() {
+            wrong_input_successes.push(no_wait);
+        } else {
+            let error = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(error.contains("input digest"), "{output:?}");
+        }
+        let requests = api.workflow_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1
+        );
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].path, format!("/cluster/deployments/{id}"));
+        api.assert_complete();
+    }
+    assert!(
+        wrong_input_successes.is_empty(),
+        "different input was incorrectly acknowledged for no_wait={wrong_input_successes:?}"
+    );
+
+    // Exact status can wait without loading a config or general cluster status.
+    let api = IntentApiFixture::graph(vec![
+        IntentReply::json(200, accepted.clone()),
+        IntentReply::json(200, complete.clone()),
+    ]);
+    let observed = output_success(cli().args([
+        "cluster",
+        "status",
+        "--server",
+        &api.origin,
+        "--deployment-id",
+        id,
+        "--wait",
+        "--timeout",
+        "10",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&observed), complete);
+    assert!(
+        api.workflow_requests()
+            .iter()
+            .all(|request| request.method == "GET"
+                && request.path == format!("/cluster/deployments/{id}"))
+    );
+    api.assert_complete();
+
+    for terminal in [
+        "not_recorded",
+        "identity_mismatch",
+        "different_ledger",
+        "result_expired",
+        "outstanding",
+        "complete",
+    ] {
+        let response = match terminal {
+            "outstanding" => {
+                let mut response = accepted.clone();
+                response["in_progress"] = false.into();
+                response
+            }
+            "complete" => {
+                let mut response = complete.clone();
+                response["active"] = false.into();
+                response
+            }
+            "result_expired" => {
+                serde_json::json!({"deployment":{"status":terminal,"acceptance":"unknown","outcome":"unknown"},"active":false,"in_progress":false})
+            }
+            _ => {
+                serde_json::json!({"deployment":{"status":terminal},"active":false,"in_progress":false})
+            }
+        };
+        let api = IntentApiFixture::graph(vec![IntentReply::json(200, response.clone())]);
+        let output = output_failure(cli().args([
+            "cluster",
+            "status",
+            "--server",
+            &api.origin,
+            "--deployment-id",
+            id,
+            "--wait",
+            "--json",
+        ]));
+        assert_eq!(parse_stdout_json(&output), response);
+        api.assert_complete();
+    }
+
     // A different declared root still refuses before POST; the server's status
     // is binding evidence, never permission to silently retarget the bundle.
     fs::write(&config, format!("storage: {remote_root}-other\n{source}")).unwrap();
@@ -211,7 +435,7 @@ fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context()
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
                 .args([
-                    "cluster",
+                    "managed",
                     "create",
                     name,
                     "--api",
@@ -306,7 +530,7 @@ fn managed_lifecycle_pending_is_principal_bound_across_session_renewal() {
             .env("OMNIGRAPH_CONTROL_TOKEN", token)
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "cluster",
+                "managed",
                 "create",
                 "new-name",
                 "--api",
@@ -388,7 +612,7 @@ fn managed_lifecycle_definitive_first_refusal_releases_pending_intent() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "cluster",
+                "managed",
                 "create",
                 name,
                 "--api",
@@ -455,7 +679,7 @@ fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
-                .arg("cluster")
+                .arg("managed")
                 .args(args)
                 .args(["--no-wait", "--idempotency-key", "exact-intent", "--json"]),
         );
@@ -491,7 +715,7 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "cluster",
+                "managed",
                 "delete",
                 "--incarnation",
                 "inc-one",
@@ -525,9 +749,8 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
-            "status",
-            "--operation",
+            "managed",
+            "operation",
             "operation-one",
             "--api",
             &api.origin,
@@ -555,7 +778,7 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
+            "managed",
             "create",
             "new",
             "--api",
@@ -582,7 +805,7 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
+            "managed",
             "create",
             "new",
             "--api",
@@ -632,7 +855,7 @@ fn managed_lifecycle_push_sends_only_complete_referenced_files() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "cluster",
+                "managed",
                 "push",
                 "--expected-revision",
                 &"b".repeat(40),
@@ -683,7 +906,7 @@ fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http()
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "cluster",
+                "managed",
                 "push",
                 "--expected-revision",
                 &"b".repeat(40),
@@ -718,7 +941,7 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
+            "managed",
             "create",
             "locked",
             "--api",
@@ -742,16 +965,16 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
     drop(lock);
     for args in [
         vec![
-            "cluster",
+            "managed",
             "create",
             "direct",
             "--api",
             &api.origin,
             "--direct",
         ],
-        vec!["cluster", "delete", "--incarnation", "inc-one", "--direct"],
+        vec!["managed", "delete", "--incarnation", "inc-one", "--direct"],
         vec![
-            "cluster",
+            "managed",
             "undo-delete",
             "--incarnation",
             "inc-one",
@@ -760,9 +983,8 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             "--direct",
         ],
         vec![
-            "cluster",
-            "status",
-            "--operation",
+            "managed",
+            "operation",
             "op",
             "--api",
             &api.origin,
@@ -776,10 +998,7 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
-        assert_eq!(
-            parse_stdout_json(&output)["type"],
-            "managed_context_required"
-        );
+        assert_eq!(parse_stdout_json(&output)["type"], "managed_scope_conflict");
     }
     assert!(api.workflow_requests().is_empty());
     assert_no_core_effects(temp.path());
@@ -804,7 +1023,7 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
+            "managed",
             "push",
             "--expected-revision",
             &"b".repeat(40),
@@ -826,7 +1045,7 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "cluster",
+            "managed",
             "delete",
             "--incarnation",
             "inc-one",
@@ -861,7 +1080,7 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             "--json",
         ],
         vec![
-            "cluster",
+            "managed",
             "token",
             "--clear",
             "--graph",
@@ -1510,7 +1729,7 @@ fn managed_invalid_context_refuses_without_network_or_core_effects() {
         write_managed_context(temp.path(), &api.origin);
         fs::write(temp.path().join(".omnigraph/context"), context).unwrap();
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["apply", "--json"])
+            .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
@@ -1557,7 +1776,7 @@ fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
             _ => unreachable!(),
         }
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["apply", "--json"])
+            .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{variant}");
@@ -1572,31 +1791,51 @@ fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
 }
 
 #[test]
-fn managed_context_is_exact_directory_and_explicit_direct_preserves_core() {
+fn managed_namespace_is_explicit_and_core_ignores_folder_context() {
     let temp = tempdir().unwrap();
     let api = IntentApiFixture::new(vec![]);
     write_cluster_config_fixture(temp.path());
     write_managed_context(temp.path(), &api.origin);
-    let unsupported = managed_cli(temp.path(), &api.origin)
-        .args(["observe", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(unsupported.status.code(), Some(2));
-    assert_eq!(
-        parse_stdout_json(&unsupported)["type"],
-        "managed_command_unsupported"
-    );
-    assert_no_core_effects(temp.path());
-    fs::write(temp.path().join(".omnigraph/context"), "{\n").unwrap();
-    let direct = output_success(
-        managed_cli(temp.path(), &api.origin).args(["--direct", "validate", "--json"]),
-    );
-    assert_eq!(parse_stdout_json(&direct)["ok"], true);
+    for context in ["valid", "malformed"] {
+        if context == "malformed" {
+            fs::write(temp.path().join(".omnigraph/context"), "{\n").unwrap();
+        }
+        for verb in ["validate", "plan", "status"] {
+            let output = output_success(
+                cli()
+                    .current_dir(temp.path())
+                    .args(["cluster", verb, "--json"]),
+            );
+            assert_eq!(parse_stdout_json(&output)["ok"], true, "{context}: {verb}");
+        }
+        let observed = cli()
+            .current_dir(temp.path())
+            .args(["cluster", "observe", "--json"])
+            .output()
+            .unwrap();
+        assert!(!observed.status.success());
+        let observed = parse_stdout_json(&observed);
+        assert_eq!(observed["ok"], false);
+        assert!(
+            observed["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "state_missing")
+        );
+        assert_no_core_effects(temp.path());
+    }
     let child = temp.path().join("nested");
     fs::create_dir(&child).unwrap();
-    write_cluster_config_fixture(&child);
-    let implicit = output_success(managed_cli(&child, &api.origin).args(["validate", "--json"]));
-    assert_eq!(parse_stdout_json(&implicit)["ok"], true);
+    let missing = managed_cli(&child, &api.origin)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(
+        parse_stdout_json(&missing)["type"],
+        "managed_context_required"
+    );
     assert!(api.requests().is_empty());
     assert_no_core_effects(&child);
 }

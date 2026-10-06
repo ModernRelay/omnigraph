@@ -22,11 +22,11 @@ Run `omnigraph <command> --help` for the flags supported by your installed
 version. The [CLI reference](reference.md) summarizes addressing, commands,
 configuration, and output formats.
 
-For a managed cluster, first select it with `use` and cache an identity
-credential with `cluster token`. Run `graphs list` to discover graph names,
-then `query` or `mutate` from that folder with an explicit `--graph`. Applied
-Cedar policy determines your permissions. See [managed data access](managed-data.md)
-for legacy restricted credentials, expiry, offline operation, and clearing.
+For a managed cluster, select it with `use`. The CLI acquires identity credentials
+when needed. Run `graphs list` to discover graph names, then `query` or `mutate`
+from that folder with an explicit `--graph`. Applied Cedar policy determines your
+permissions. See [managed data access](managed-data.md) for expiry, offline
+operation and credential clearing.
 
 ## Create, load, and query a graph
 
@@ -105,7 +105,7 @@ line in the source applies after `--set`, so the file wins.
   run (`--store`) accepts them with no effect.
 - `changes poll --set`: sent as `set=NAME=VALUE` on the change feed read, with
   the same validation and the same absence of effect.
-- `load --set` and `ingest --set`: a direct run (`--store`) applies them to the
+- `load --set`: a direct run (`--store`) applies them to the
   staged write (`--set stage_write_concurrency=16`); a served run refuses any
   `--set` before sending, since the served load routes carry no
   `settings` field.
@@ -182,8 +182,8 @@ from the token; clients cannot override it with `--as`.
 
 ## Manage a cluster
 
-Without a managed context, cluster commands read a directory containing
-`cluster.yaml`:
+Self-hosted `cluster` commands read a directory containing `cluster.yaml`, or address
+a running server explicitly. They ignore managed folder context:
 
 ```bash
 omnigraph cluster validate --config ./company-brain
@@ -204,22 +204,22 @@ your config directory:
 ```bash
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
-omnigraph cluster plan --config ./company-brain --json > plan.json
-omnigraph cluster apply --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph cluster history --config ./company-brain --json
+omnigraph managed plan --config ./company-brain --json > plan.json
+omnigraph managed apply --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
+omnigraph managed status --config ./company-brain --json
+omnigraph managed history --config ./company-brain --json
 omnigraph logout --api https://control.example
 ```
 
 Commit and push external configuration before planning. The API plans its
 bound head, or the pushed revision selected with `--rev`. Apply uses the exact
 saved plan and your current permissions. To release an unused plan, run
-`omnigraph cluster cancel PLAN_RUN_ID --config ./company-brain`; its result
+`omnigraph managed cancel PLAN_RUN_ID --config ./company-brain`; its result
 remains in history and cannot be applied afterward.
 
-The folder's `.omnigraph/context` selects the managed API. An unavailable API
-or malformed context causes an error. To intentionally use the direct
-`cluster.yaml` path, pass `--direct`. See [Managed cluster commands](reference.md#managed-cluster-commands)
+The explicit `managed` namespace uses the folder's `.omnigraph/context` to select
+the API. Missing or malformed context and unavailable APIs refuse without
+falling back to local deployment. See [Managed cluster commands](reference.md#managed-cluster-commands)
 for credential storage, automation, bounded waits, and exit codes.
 
 ## Validate source before running it
@@ -231,8 +231,3 @@ omnigraph queries validate --cluster ./company-brain --graph knowledge
 
 `lint` checks one `.gq` source. `queries validate` checks the applied stored
 query registry for a cluster graph.
-
-## Deprecated names
-
-`read`, `change`, `check`, and `ingest` remain compatibility shims. New scripts
-should use `query`, `mutate`, `lint`, and `load`.

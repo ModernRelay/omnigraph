@@ -46,10 +46,7 @@ use config::{
     schema_address, state_resource_digests, validate_cluster_header,
 };
 pub use deployment::*;
-use diff::{
-    ResourceKind, append_embedding_profile_changes, append_policy_binding_changes,
-    compute_blast_radius, diff_resources, resource_kind,
-};
+use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
@@ -201,6 +198,7 @@ async fn plan_config_dir_impl(
             desired_revision: DesiredRevision {
                 config_digest: None,
             },
+            input_digest: None,
             resource_digests: BTreeMap::new(),
             dependencies: Vec::new(),
             state_observations: observations,
@@ -218,6 +216,7 @@ async fn plan_config_dir_impl(
             desired_revision: DesiredRevision {
                 config_digest: Some(desired.config_digest),
             },
+            input_digest: None,
             resource_digests: desired.resource_digests,
             dependencies: desired.dependencies,
             state_observations: observations,
@@ -234,7 +233,6 @@ async fn plan_config_dir_impl(
     // Plan reports pending recovery without executing it.
     warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
-    let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
     let mut prior_cas = None;
     if !has_errors(&diagnostics) {
@@ -242,7 +240,6 @@ async fn plan_config_dir_impl(
             Ok(snapshot) => {
                 prior_cas = snapshot.state_cas;
                 if let Some(state) = snapshot.state {
-                    prior_resources = state_resource_digests(&state);
                     prior_state = Some(state);
                 }
             }
@@ -250,16 +247,24 @@ async fn plan_config_dir_impl(
         }
     }
 
+    let bundle = capture_desired_deployment(&desired, captured.sources, None);
+    let input_digest = bundle
+        .as_ref()
+        .ok()
+        .and_then(|bundle| bundle.input_digest().ok());
     let mut changes = if has_errors(&diagnostics) {
         Vec::new()
+    } else if let Ok(bundle) = &bundle {
+        crate::diff::diff_state_resources(
+            &prior_state
+                .as_ref()
+                .map(|state| state.applied_revision.resources.clone())
+                .unwrap_or_default(),
+            &bundle.resources,
+        )
     } else {
-        diff_resources(&prior_resources, &desired.resource_digests)
+        Vec::new()
     };
-    if !has_errors(&diagnostics) {
-        append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
-        append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
-    }
-    let bundle = capture_desired_deployment(&desired, captured.sources, None);
     // The same v2 scope rules govern previews and execution. A refused scope
     // is wholly pre-effect; no approval artifact can authorize a removed path.
     let scope_error = prior_state.as_ref().and_then(|state| {
@@ -275,22 +280,8 @@ async fn plan_config_dir_impl(
             Err(error) => Some(error.clone()),
         }
     });
-    for change in &mut changes {
-        if let Some(error) = &scope_error {
-            change.disposition = Some(ApplyDisposition::Blocked);
-            change.reason = Some(error.code.clone());
-        } else {
-            change.disposition = Some(
-                if matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
-                    && change.operation == PlanOperation::Update
-                {
-                    ApplyDisposition::Derived
-                } else {
-                    ApplyDisposition::Applied
-                },
-            );
-            change.reason = None;
-        }
+    if let Err(error) = annotate_plan_changes(&backend, &mut changes, scope_error.as_ref()) {
+        diagnostics.push(error);
     }
     if let Some(error) = scope_error {
         diagnostics.push(error);
@@ -357,6 +348,7 @@ async fn plan_config_dir_impl(
         desired_revision: DesiredRevision {
             config_digest: Some(desired.config_digest),
         },
+        input_digest,
         resource_digests: desired.resource_digests,
         dependencies: desired.dependencies,
         state_observations: observations,

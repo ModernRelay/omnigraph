@@ -4,17 +4,14 @@ use super::*;
 mod capture;
 mod pending;
 
-pub(super) fn handles(command: &ClusterCommand) -> bool {
+pub(super) fn handles(command: &ManagedCommand) -> bool {
     matches!(
         command,
-        ClusterCommand::Create { .. }
-            | ClusterCommand::Delete { .. }
-            | ClusterCommand::UndoDelete { .. }
-            | ClusterCommand::Push { .. }
-            | ClusterCommand::Status {
-                operation: Some(_),
-                ..
-            }
+        ManagedCommand::Create { .. }
+            | ManagedCommand::Delete { .. }
+            | ManagedCommand::UndoDelete { .. }
+            | ManagedCommand::Push { .. }
+            | ManagedCommand::Operation { .. }
     )
 }
 
@@ -31,17 +28,11 @@ fn context_required(config: &Path) -> Result<Context> {
     })
 }
 
-pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Value, i32)> {
+pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Value, i32)> {
     reject_scope(cli)?;
-    if cli.direct {
-        return Err(Failure::refused(
-            "managed_context_required",
-            "managed lifecycle and upload commands cannot be used with --direct",
-        ));
-    }
     let (config, _) = config_and_json(command);
     match command {
-        ClusterCommand::Create {
+        ManagedCommand::Create {
             name, api, managed, ..
         } => {
             if name.is_empty()
@@ -71,12 +62,12 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
             )
             .await
         }
-        ClusterCommand::Delete {
+        ManagedCommand::Delete {
             incarnation,
             managed,
             ..
         }
-        | ClusterCommand::UndoDelete {
+        | ManagedCommand::UndoDelete {
             incarnation,
             managed,
             ..
@@ -84,14 +75,14 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
             identifier(incarnation)?;
             let context = context_required(config)?;
             let (kind, body, tombstone) = match command {
-                ClusterCommand::Delete {
+                ManagedCommand::Delete {
                     retention_seconds, ..
                 } => (
                     "delete",
                     json!({"incarnation":incarnation,"retention_seconds":retention_seconds}),
                     *retention_seconds > 0,
                 ),
-                ClusterCommand::UndoDelete { deletion_id, .. } => {
+                ManagedCommand::UndoDelete { deletion_id, .. } => {
                     identifier(deletion_id)?;
                     (
                         "undo",
@@ -117,8 +108,8 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
             )
             .await
         }
-        ClusterCommand::Status {
-            operation: Some(id),
+        ManagedCommand::Operation {
+            operation_id: id,
             api,
             wait,
             timeout,
@@ -173,7 +164,7 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
             identity.matches(context.as_ref(), None, Some(id))?;
             wait_operation(&api, body, &identity, &options, deadline, false).await
         }
-        ClusterCommand::Push {
+        ManagedCommand::Push {
             expected_revision,
             message,
             ..
@@ -497,7 +488,7 @@ async fn wait_operation(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             eprintln!(
-                "wait deadline reached; operation {} continues; use cluster status --operation {}",
+                "wait deadline reached; operation {} continues; use managed operation {}",
                 identity.operation_id, identity.operation_id
             );
             return Ok((body, 5));

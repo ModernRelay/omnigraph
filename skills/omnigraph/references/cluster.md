@@ -80,7 +80,7 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   keep `__cluster/lock.json`, and the next writer or server start refuses with
   `state_lock_held`. Once the previous owner has stopped and its I/O has
   settled, clear that exact id with `cluster force-unlock <LOCK_ID> --config .`.
-  While a lock is held, preview with `cluster plan --observe`.
+  While the server owns the lock, preview with `cluster plan --server <name|url>`.
 - **`storage: s3://bucket/prefix`** (optional) puts the entire cluster — state
   ledger, lock, content-addressed catalog, and the derived graph roots
   (`<storage>/graphs/<id>.omni`) — on
@@ -116,20 +116,42 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
   operator config's `operator.actor`. `cluster apply --server` refuses it,
   because the server takes the actor from the bearer token; the other cluster
   subcommands reject this flag.
-- **Apply only adds and updates**: it creates graphs with their policy
-  bindings and changes schemas and stored queries. Removing a graph, or
-  changing an existing graph's policy, embedding-provider or `external_blobs`
-  binding, is refused with `deployment_scope`; no approval command exists.
-- **Drift**: every apply compares each graph's schema with the one the ledger
-  recorded and refuses an out-of-band change with `applied_schema_drift`;
-  `cluster apply --schema-correction <file>` accepts a reviewed one.
-  To inspect without side effects, `cluster observe --config .` reports the
-  current ledger, catalog and graph observations, and `cluster plan --observe`
-  plans, without taking the lock or writing. Their output carries
-  `authority: "observed"` and the `state_cas` they read, and an existing lock
-  is reported rather than refused.
+- **Deployment scope**: apply creates graphs and updates schemas, queries,
+  policies, provider definitions/bindings, and `external_blobs` rules. Removing
+  a graph declaration deletes its exact managed root, including retained
+  history, after affected admission closes and work drains. Current permissions
+  authorize changes; proposed permissions cannot authorize themselves. Shared
+  external Blob objects are not deleted, and provider retention may keep object
+  versions. Root changes, adoption and missing-root recreation refuse.
+- **Drift**: apply refuses an out-of-band schema change with
+  `applied_schema_drift`; it never adopts it by matching schema text. To inspect
+  without effects, `cluster observe --config .` reports current ledger, catalog
+  and graph observations; `cluster plan --config .` previews desired changes.
+  Both are read-only, report `authority: "observed"` and the `state_cas` they
+  read, and take no writer lock. Apply revalidates current authority.
 - **Data is NOT cluster's job**: rows flow through `omnigraph load / mutate`
   against the served graph (`--server … --graph <id>`), with branches as usual.
+
+For a running server, preview and submit the same local bundle:
+
+```bash
+omnigraph cluster plan --server production --config . --json
+omnigraph cluster apply --server production --config . --timeout 1800 --json
+omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
+```
+
+Apply prints its deployment ID before submission and normally polls that ID
+until convergence and activation. `--no-wait` returns after durable acceptance;
+`--timeout` bounds caller waiting, including acceptance (default 300 seconds,
+range 1–3600). Expiry exits 5 without cancelling work. Resume with the exact
+`status --deployment-id ID --wait`; these wait flags require `--server`.
+A lost submission response triggers original-ID reads, never automatic replay.
+The exact response contains `deployment`, `active` and `in_progress`; `active`
+means the result's affected bindings are installed in this process. An
+unrelated blocked graph does not invalidate that activation. The authenticated
+submitter can still read its own retained receipt after losing management
+permission; aggregate status and new deployments require current permission.
+Deployment across graphs is not one transaction.
 
 ## The config contract (do not blur this)
 
@@ -139,10 +161,10 @@ omnigraph-server --cluster . --bind 127.0.0.1:8080 --unauthenticated  # serve (l
 | `~/.omnigraph/config.yaml` | per-operator: identity (`operator.actor`), named `servers:`, output defaults, personal aliases | data-plane CLI commands (tokens live in `~/.omnigraph/credentials` via `omnigraph login`) |
 
 Direct cluster commands use the operator actor default when `--as` is omitted
-(`--as` > `operator.actor`). Managed context selects a separate API route, as
-described below. A `--cluster` server
-reads it for **nothing** — boot from cluster state XOR the operator file, never
-a merge.
+(`--as` > `operator.actor`). `cluster` always selects self-hosted deployment,
+independent of managed context; `managed` selects the service API described below.
+A `--cluster` server never reads the operator file: its configuration comes from
+applied cluster state.
 Address a cluster-managed graph's data via `--server`/aliases against the
 serving instance. A direct `--store <storage>/graphs/<id>.omni` read takes no
 lock. On a ledger-v2 cluster a direct write takes the cluster lock: it is
@@ -201,8 +223,8 @@ An Intent API can own the control plane while the same CLI operates it:
 ```bash
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config .
-omnigraph cluster plan --config . --json
-omnigraph cluster apply --plan PLAN_RUN_ID --config . --json
+omnigraph managed plan --config . --json
+omnigraph managed apply --plan PLAN_RUN_ID --config . --json
 omnigraph query find_person --graph knowledge --params '{"name":"Alice"}' --json
 ```
 
@@ -218,32 +240,30 @@ ordinary routing; global `--direct` selects ordinary ambient defaults. Missing
 or malformed managed authority refuses without fallback, and competing ambient
 targets require an explicit choice.
 
-Managed creation, config upload, deletion and undo use `cluster create`, `push`,
-`delete` and `undo-delete`; durable operation records bind uncertain submissions
-to their exact identity. Reconcile the existing operation before issuing another.
+Managed creation, config upload, deletion and undo use `managed create`, `push`,
+`delete` and `undo-delete`. `managed status [RUN_ID]` reads cluster projections or
+one run; `managed operation ID [--wait]` observes a lifecycle operation. Durable
+operation records bind uncertain submissions to their exact identity. Reconcile
+the existing operation before issuing another.
 
-- **Schema/config changes**: commit, `cluster push --expected-revision <rev>
-  --message …`, `cluster plan --rev <new>`, then `cluster apply --plan <run>`.
+- **Schema/config changes**: commit, `managed push --expected-revision <rev>
+  --message …`, `managed plan --rev <new>`, then `managed apply --plan <run>`.
   The Intent API executes the apply; there is no local `--as` or approval step.
-- **Supported verbs** with a managed context: `plan`, `apply --plan`,
-  `status`, `history`, `cancel`, `token`, and the lifecycle verbs. `validate`,
-  `observe`, and config-addressed `force-unlock` refuse unless
-  `--direct` is given; `--as`, `--server`, `--profile`, `--store`, and
-  `--cluster` do not apply to managed cluster operations.
+- **Explicit namespace**: `managed` requires context, except creation and
+  explicit-origin operation lookup. `cluster` ignores context and needs no
+  `--direct` escape. Managed operations reject `--direct`, `--as`, `--server`,
+  `--profile`, `--graph`, `--store`, and `--cluster`; failures never fall back to
+  local deployment.
 - **Sessions** from `login --api` hold an access credential of at most 15
   minutes that renews silently for up to eight hours after sign-in; then log
   in again. For unattended runs, set `OMNIGRAPH_CONTROL_API` and
   `OMNIGRAPH_CONTROL_TOKEN` together; reuse the same `--idempotency-key` after
   an uncertain response.
 - **Data credentials**: graph commands acquire an identity credential on
-  their own; `cluster token [--ttl 1h]` issues one explicitly (TTL 60s–24h,
-  default 1h) and `--clear` forgets the local copy without revoking it. An
-  identity credential carries no graph or action grants: the applied Cedar
-  policy must permit its actor. `cluster token --graph <id> --actions <a,b>`
-  requests the legacy restricted profile, for older issuers only: `read`,
-  `export`, `change`, `branch_create`, `branch_delete`, `branch_merge`,
-  `invoke_query`, `graph_list` (`admin`, `config_manage` and `schema_apply`
-  refuse).
+  their own; `managed token [--ttl 1h]` issues one explicitly (TTL 60s–24h,
+  default 1h) and `--clear` forgets the local copy without revoking it. Only
+  identity credentials are supported: they carry no graph or action grants,
+  and the applied Cedar policy must permit the authenticated actor.
 - **Exit codes** for plan/apply/lifecycle runs: 0 converged, 1 failed or
   transport error, 2 refused or blocked, 3 partially converged, 4 recovery
   required, 5 stalled or wait deadline, 6 cancelled.
@@ -255,13 +275,14 @@ See the authoritative [managed command reference](https://github.com/ModernRelay
 
 | Symptom | Fix |
 |---|---|
-| Apply interrupted or outcome unknown | never retry under a new deployment id. Read the original deployment with `omnigraph --cluster <root> cluster status --deployment-id <ID> --json` (apply prints the id and root). Stop the prior owner, prove its I/O has settled, clear the held lock with `omnigraph --cluster <root> cluster force-unlock <LOCK_ID>`, then reconcile that same id: `omnigraph --cluster <root> cluster apply --deployment-id <ID> --writers-stopped` |
+| Served apply timed out or lost its response | continue original-ID observation with `cluster status --server <name\|url> --deployment-id <ID> --wait --json`; timeout does not cancel the owner. Never resubmit under a new ID |
+| Direct apply interrupted, or accepted work needs stopped recovery | never retry under a new deployment id. Read the original deployment with `omnigraph --cluster <root> cluster status --deployment-id <ID> --json` (apply prints the id and root). Stop the prior owner, prove its I/O has settled, clear the held lock with `omnigraph --cluster <root> cluster force-unlock <LOCK_ID>`, then reconcile that same id: `omnigraph --cluster <root> cluster apply --deployment-id <ID> --writers-stopped` |
 | Held lock (`state_lock_held`) | expected after any apply, direct write or server run. `cluster observe` shows state and the holder without refusing. First stop the owner and prove its I/O has settled; then use `cluster status` and clear that exact id with `cluster force-unlock <LOCK_ID> --config .` |
 | `config_path_escape` / `config_path_symlink` | move the referenced file inside the config directory and reference it by a plain relative path |
 | Missing `state.json` | new cluster: `cluster apply` creates the ledger. Bootstrap never adopts graph roots that already exist (`graph_already_exists`); for those, restore a trusted cluster-state backup |
 | Corrupt `state.json` | restore a trusted cluster-state backup or follow the diagnostic |
 | Server refuses to boot | the error names its code and remedy; common ones: `state_lock_held` (see Held lock above), `ledger_upgrade_required` (stop serving and writers, then `cluster upgrade-ledger --writers-stopped`), `cluster_deployment_outstanding` (reconcile that exact id with `cluster apply --deployment-id <ID> --writers-stopped`) |
-| `ledger_upgrade_required` (ledger written before 0.12) | stop every server, writer and maintenance job, then `omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped`; it converts the ledger only and keeps rows, branches and history |
+| `ledger_upgrade_required` (supported legacy ledger or obsolete completed-result fields) | stop every server, writer and maintenance job, then `omnigraph --cluster <root> cluster upgrade-ledger --writers-stopped`; it converts the ledger only and keeps rows, branches and history |
 
 Full reference: the omnigraph repo's `docs/user/clusters/index.md` (operator guide)
 and `docs/user/clusters/config.md` (every key, flag, and diagnostic).

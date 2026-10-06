@@ -3,18 +3,19 @@
 //! only request lifetime, graph admission and activation of serving bindings.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
 
 use axum::{
     Extension, Json,
     extract::{Path, State},
+    http::StatusCode,
 };
 use omnigraph_cluster::{
     CapturedDeployment, DeploymentCaller, DeploymentLookup, DeploymentStatus,
     GraphDeploymentResult, IdentityAuthorization,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Duration, Instant};
 use utoipa::ToSchema;
 
@@ -33,6 +34,44 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Default)]
 pub(crate) struct DeploymentRuntime {
     gate: Arc<Mutex<()>>,
+    // Process observation generation and exact current owned invocation.
+    current: SyncMutex<(u64, Option<String>)>,
+}
+
+impl DeploymentRuntime {
+    fn observation(&self, id: Option<&str>) -> (u64, bool) {
+        let current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            current.0,
+            current
+                .1
+                .as_ref()
+                .is_some_and(|current| id.is_none_or(|id| id == current)),
+        )
+    }
+
+    // The deployment gate is already held; this is a derived process observation,
+    // never durable execution permission or a second deployment queue.
+    fn own(self: &Arc<Self>, id: String) -> RunningDeployment {
+        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        current.0 = current.0.wrapping_add(1);
+        current.1 = Some(id);
+        RunningDeployment(Arc::clone(self))
+    }
+}
+
+struct RunningDeployment(Arc<DeploymentRuntime>);
+
+impl Drop for RunningDeployment {
+    fn drop(&mut self) {
+        let mut current = self
+            .0
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        current.0 = current.0.wrapping_add(1);
+        current.1 = None;
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -43,11 +82,19 @@ pub(crate) struct DeploymentRequest {
     deployment: CapturedDeployment,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanRequest {
+    #[schema(value_type = Object)]
+    deployment: CapturedDeployment,
+}
+
 #[derive(Serialize, ToSchema)]
 pub(crate) struct DeploymentResponse {
     #[schema(value_type = Object)]
     deployment: DeploymentLookup,
     active: bool,
+    in_progress: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -55,6 +102,7 @@ pub(crate) struct DeploymentStatusResponse {
     #[schema(value_type = Object)]
     status: DeploymentStatus,
     active: bool,
+    in_progress: bool,
 }
 
 fn caller(state: &AppState, actor: &AuthenticatedActor) -> Result<DeploymentCaller, ApiError> {
@@ -93,6 +141,15 @@ fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
     } else {
         ApiError::conflict(message)
     }
+}
+
+fn observation_changed() -> ApiError {
+    let mut error = ApiError::conflict(
+        "deployment ownership changed during observation; repeat this status request",
+    );
+    error.status = StatusCode::SERVICE_UNAVAILABLE;
+    error.code = None;
+    error
 }
 
 fn uncertain(message: impl Into<String>) -> ApiError {
@@ -207,7 +264,8 @@ fn active_result(
 
 #[utoipa::path(
     get, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_status",
-    responses((status = 200, body = DeploymentStatusResponse), (status = 403, body = crate::api::ErrorOutput)),
+    responses((status = 200, body = DeploymentStatusResponse), (status = 403, body = crate::api::ErrorOutput),
+        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn status(
@@ -220,15 +278,36 @@ pub(crate) async fn status(
 #[utoipa::path(
     get, path = "/cluster/deployments/{id}", tag = "cluster", operation_id = "deployment_lookup",
     params(("id" = String, Path, description = "Original deployment identity")),
-    responses((status = 200, body = DeploymentStatusResponse), (status = 403, body = crate::api::ErrorOutput)),
+    responses((status = 200, body = DeploymentResponse), (status = 403, body = crate::api::ErrorOutput),
+        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn lookup(
     State(state): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
     Path(id): Path<String>,
-) -> Result<Json<DeploymentStatusResponse>, ApiError> {
-    lookup_status(&state, &actor, Some(&id)).await.map(Json)
+) -> Result<Json<DeploymentResponse>, ApiError> {
+    let owner = admission(&state)?;
+    let identity = IdentityAuthorization::authenticated(actor.actor_id_str()).map_err(refusal)?;
+    for _ in 0..3 {
+        let (generation, _) = state.deployments.observation(Some(&id));
+        let (deployment, revision) =
+            omnigraph_cluster::deployment_receipt(owner.canonical_root(), &id, &identity)
+                .await
+                .map_err(refusal)?;
+        let (observed_generation, in_progress) = state.deployments.observation(Some(&id));
+        if generation != observed_generation {
+            // An owner starting or finishing during the read can make an old
+            // ledger snapshot appear ownerless. Retry this read, never apply.
+            continue;
+        }
+        return Ok(Json(DeploymentResponse {
+            active: active_result(&state, Some(&deployment), revision),
+            deployment,
+            in_progress,
+        }));
+    }
+    Err(observation_changed())
 }
 
 async fn lookup_status(
@@ -238,17 +317,66 @@ async fn lookup_status(
 ) -> Result<DeploymentStatusResponse, ApiError> {
     let caller = caller(state, actor)?;
     let owner = admission(state)?;
-    let status = omnigraph_cluster::deployment_status(owner.canonical_root(), id, &caller)
+    for _ in 0..3 {
+        let (generation, _) = state.deployments.observation(id);
+        let status = omnigraph_cluster::deployment_status(owner.canonical_root(), id, &caller)
+            .await
+            .map_err(refusal)?;
+        let (observed_generation, in_progress) = state.deployments.observation(id);
+        if generation != observed_generation {
+            continue;
+        }
+        let active = active_result(state, status.lookup.as_ref(), status.result_revision);
+        return Ok(DeploymentStatusResponse {
+            status,
+            active,
+            in_progress,
+        });
+    }
+    Err(observation_changed())
+}
+
+#[utoipa::path(
+    post, path = "/cluster/plan", tag = "cluster", operation_id = "deployment_plan",
+    request_body = PlanRequest,
+    responses((status = 200, body = Object), (status = 400, body = crate::api::ErrorOutput),
+        (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
+        (status = 413, body = crate::api::ErrorOutput)),
+    security(("bearer_token" = []))
+)]
+pub(crate) async fn plan(
+    State(state): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    request: Result<Json<PlanRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<omnigraph_cluster::PlanOutput>, ApiError> {
+    let caller = caller(&state, &actor)?;
+    let Json(request) = request.map_err(|error| ApiError::bad_request(error.body_text()))?;
+    let owner = admission(&state)?;
+    let _gate = state.deployments.gate.try_lock().map_err(|_| {
+        ApiError::conflict("deployment planning or apply is already running; observe submitted work by its original identity")
+    })?;
+    let preview =
+        omnigraph_cluster::prepare_deployment_preview(&request.deployment, owner, &caller)
+            .await
+            .map_err(refusal)?;
+    validate_serving_candidate(&state, owner, preview.serving)?;
+    let live = state
+        .routing
+        .registry
+        .list()
+        .into_iter()
+        .map(|view| (view.key.graph_id.to_string(), Arc::clone(&view.engine)))
+        .collect();
+    omnigraph_cluster::plan_captured_deployment(&request.deployment, owner, &caller, &live)
         .await
-        .map_err(refusal)?;
-    let active = active_result(state, status.lookup.as_ref(), status.result_revision);
-    Ok(DeploymentStatusResponse { status, active })
+        .map(Json)
+        .map_err(refusal)
 }
 
 #[utoipa::path(
     post, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_apply",
     request_body = DeploymentRequest,
-    responses((status = 200, body = DeploymentResponse), (status = 400, body = crate::api::ErrorOutput),
+    responses((status = 200, body = DeploymentResponse), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentResponse), (status = 400, body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 503, body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
@@ -258,7 +386,7 @@ pub(crate) async fn apply(
     Extension(actor): Extension<AuthenticatedActor>,
     Extension(ingress): Extension<IngressLease>,
     request: Result<Json<DeploymentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<DeploymentResponse>, ApiError> {
+) -> Result<(StatusCode, Json<DeploymentResponse>), ApiError> {
     let caller = caller(&state, &actor)?;
     let Json(request) = request.map_err(|error| ApiError::bad_request(error.body_text()))?;
     let owner = admission(&state)?.clone();
@@ -278,22 +406,34 @@ pub(crate) async fn apply(
         .clone()
         .try_lock_owned()
         .map_err(|_| {
-            ApiError::conflict("a deployment is already running; observe its original identity")
+            ApiError::conflict("deployment planning or apply is already running; observe submitted work by its original identity")
         })?;
     let reservation = state
         .workload
         .try_admit(&actor.actor_id, REQUEST_BYTES as u64)
         .map_err(ApiError::from_workload_reject)?;
     let operation_state = state.clone();
-    state
+    let running = state.deployments.own(request.deployment_id.clone());
+    let (accepted, acceptance) = oneshot::channel();
+    let response = state
         .operations
         .submit((gate, reservation, ingress), async move {
-            let result = execute(operation_state, owner, caller, request).await;
+            let _running = running;
+            let result = execute(operation_state, owner, caller, request, accepted).await;
             OwnedResult::from(result)
-        })?
-        .result()
-        .await
-        .map(Json)
+        })?;
+    let result = response.result();
+    tokio::pin!(result);
+    tokio::select! {
+        biased;
+        result = &mut result => result.map(|response| (StatusCode::OK, Json(response))),
+        accepted = acceptance => match accepted {
+            Ok(deployment) => Ok((StatusCode::ACCEPTED, Json(DeploymentResponse {
+                deployment, active: false, in_progress: true,
+            }))),
+            Err(_) => result.await.map(|response| (StatusCode::OK, Json(response))),
+        },
+    }
 }
 
 async fn execute(
@@ -301,6 +441,7 @@ async fn execute(
     owner: omnigraph_cluster::ClusterAdmission,
     caller: DeploymentCaller,
     request: DeploymentRequest,
+    accepted: oneshot::Sender<DeploymentLookup>,
 ) -> Result<DeploymentResponse, ApiError> {
     // An original identity is observation-only. Validate immutable input through
     // the shared executor before returning it, without closing graph admission.
@@ -320,6 +461,7 @@ async fn execute(
             &owner,
             &BTreeMap::new(),
             |_, _, _| {},
+            |_| {},
             &mut effects_started,
         )
         .await
@@ -327,6 +469,7 @@ async fn execute(
         return Ok(DeploymentResponse {
             active: active_result(&state, Some(&deployment), status.result_revision),
             deployment,
+            in_progress: false,
         });
     }
     // Validate and authorize before pausing healthy graphs. No client-supplied
@@ -412,6 +555,9 @@ async fn execute(
         &owner,
         &live,
         |_, _, _| {},
+        |deployment| {
+            let _ = accepted.send(deployment);
+        },
         &mut effects_started,
     )
     .await;
@@ -436,6 +582,7 @@ async fn execute(
         return Ok(DeploymentResponse {
             active: active_result(&state, Some(&applied), status.result_revision),
             deployment: applied,
+            in_progress: false,
         });
     };
     let contracts = omnigraph_cluster::applied_deployment_contracts(&owner, result.result_revision)
@@ -568,6 +715,7 @@ async fn execute(
     Ok(DeploymentResponse {
         active: active_result(&state, Some(&applied), result.result_revision),
         deployment: applied,
+        in_progress: false,
     })
 }
 

@@ -90,7 +90,10 @@ async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiE
         if matches!(parts.method, Method::GET | Method::HEAD)
             || route == "/mcp"
             || (parts.method == Method::POST
-                && matches!(route, "/query" | "/export" | "/changes/baseline"))
+                && matches!(
+                    route,
+                    "/query" | "/export" | "/changes/baseline" | "/cluster/plan"
+                ))
         {
             AdmissionClass::Read
         } else {
@@ -133,7 +136,7 @@ pub(crate) async fn admit(
     let raw = receives_body && route == "/load/ndjson";
     let limit = if !receives_body {
         0
-    } else if route == "/cluster/deployments" {
+    } else if matches!(route, "/cluster/deployments" | "/cluster/plan") {
         crate::deployment::REQUEST_BYTES
     } else if route == "/mcp" {
         crate::mcp::REQUEST_BYTES

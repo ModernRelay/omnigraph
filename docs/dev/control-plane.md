@@ -205,6 +205,23 @@ to the running owner. The bearer actor needs applied cluster `ConfigManage` and
 the graph permissions required by the shared executor. Graph-scoped data tokens
 cannot deploy. One process gate owns execution and activation after caller
 disconnect; no polling worker or second storage-writing CLI is involved.
+POST returns 202 after the outstanding ledger CAS confirms acceptance. The CLI
+then polls exact-ID GET; its wait deadline does not cancel the owned operation.
+Exact GET returns the receipt, `active`, and `in_progress` derived from the
+current process owner. A complete receipt can precede activation. A missing
+receipt during preparation is not proof of refusal, and an outstanding receipt
+without a live owner requires recovery.
+
+Exact receipt reads also permit the authenticated initiating actor recorded in
+that receipt, even after management permission is revoked. This narrow observation
+cannot disclose current inventory, next sequence or lock identity and grants no
+effect permission. Aggregate status still needs current management permission.
+
+`POST /cluster/plan` shares captured-input/current-policy validation and resource
+diffs. It plans migrations against a coherent accepted schema view without graph
+opens, a schema gate, writer admission, graph closure or ledger writes. The plan
+reports its observed base and destructive root removal; physical execution checks
+remain the post-drain executor's responsibility.
 
 The controller validates captured input, current authorization and the serving
 projection before closing admission, without opening affected graphs or acquiring

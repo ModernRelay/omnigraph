@@ -223,6 +223,18 @@ struct HandleSchemaView {
     schema_identity_domain: String,
 }
 
+impl HandleSchemaView {
+    fn contract_digest(&self) -> SchemaContractDigest {
+        use sha2::Digest;
+        SchemaContractDigest {
+            source_hash: format!("{:x}", sha2::Sha256::digest(self.source.as_bytes())),
+            schema_ir_hash: self.schema_ir_hash.clone(),
+            schema_identity_domain: self.schema_identity_domain.clone(),
+            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
+        }
+    }
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -788,15 +800,7 @@ impl Omnigraph {
     /// This does not refresh storage; callers comparing current durable
     /// authority must open or refresh under their writer-exclusion boundary.
     pub fn schema_contract_digest(&self) -> SchemaContractDigest {
-        use sha2::Digest;
-
-        let view = self.schema_view.load();
-        SchemaContractDigest {
-            source_hash: format!("{:x}", sha2::Sha256::digest(view.source.as_bytes())),
-            schema_ir_hash: view.schema_ir_hash.clone(),
-            schema_identity_domain: view.schema_identity_domain.clone(),
-            schema_identity_version: super::schema_state::SCHEMA_IDENTITY_VERSION,
-        }
+        self.schema_view.load().contract_digest()
     }
 
     /// Publish one coherent handle-local projection after the durable schema
@@ -1118,6 +1122,17 @@ impl Omnigraph {
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
         schema_apply::plan_schema(self, desired_schema_source).await
+    }
+
+    /// Describe schema evolution from one exact handle-local accepted contract.
+    /// This performs no storage I/O or gate acquisition. It is advisory: branch,
+    /// physical and current durable eligibility are checked again before apply.
+    pub fn plan_schema_at_contract(
+        &self,
+        desired_schema_source: &str,
+        expected: &SchemaContractDigest,
+    ) -> Result<SchemaMigrationPlan> {
+        schema_apply::plan_schema_at_contract(self, desired_schema_source, expected)
     }
 
     pub async fn preview_schema_apply(

@@ -154,7 +154,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                 || matches!(
                     cmd,
                     Command::Cluster {
-                        command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+                        command: ClusterCommand::Plan { .. }
+                            | ClusterCommand::Apply { .. }
+                            | ClusterCommand::Status { .. }
                     }
                 )
         }
@@ -228,7 +230,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         ScopeFlag::Profile => match capability {
             Any | Served => true,
             Direct => !matches!(cmd, Command::Init { .. }),
-            Control => !matches!(cmd, Command::Cluster { .. }),
+            Control => !matches!(cmd, Command::Cluster { .. } | Command::Managed { .. }),
             Local => false,
         },
     }
@@ -289,7 +291,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
-        Command::Cluster { .. } => Plane::Control,
+        Command::Cluster { .. } | Command::Managed { .. } => Plane::Control,
         Command::Alias { .. }
         | Command::Embed(_)
         | Command::Login { .. }
@@ -345,6 +347,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
+        Command::Managed { .. } => "managed",
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },
@@ -553,7 +556,7 @@ mod tests {
             ),
             (
                 parse(&["omnigraph", "cluster", "plan", "--config", "."]),
-                [false, false, false, false, true, false],
+                [true, false, false, false, true, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
@@ -573,6 +576,10 @@ mod tests {
                     "--writers-stopped",
                 ]),
                 [false, true, false, false, true, false],
+            ),
+            (
+                parse(&["omnigraph", "managed", "status"]),
+                [false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "version"]),
@@ -604,7 +611,6 @@ mod tests {
                 &["--writers-stopped", "--deployment-id", "unused"],
                 "--writers-stopped cannot be used with --server",
             ),
-            (&["--no-wait"], "does not accept managed run arguments"),
             (&["--graph", "knowledge"], "--graph selects a graph"),
         ];
         for (extra, expected) in cases {

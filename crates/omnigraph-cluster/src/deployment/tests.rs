@@ -182,6 +182,7 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         )
         .unwrap();
         let bundle = capture_deployment(dir.path()).unwrap();
+        let input_digest = bundle.input_digest().unwrap();
         // The serving preview reads control metadata only. Full engine
         // preparation runs after the server closes and drains affected work;
         // reopening here would queue an exclusive schema gate behind writers.
@@ -192,7 +193,37 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         fs::rename(&parked_root, &graph_root).unwrap();
         let preview = preview.expect("serving preview must not open an affected graph");
         assert_eq!(preview.affected_graphs, ["knowledge"]);
+        let before_plan = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+        let observed = plan_captured_deployment(&bundle, &admission, &owner(), &handles)
+            .await
+            .unwrap();
+        assert!(observed.ok, "{observed:?}");
+        assert_eq!(observed.authority, LedgerAuthority::Observed);
+        assert!(!observed.state_observations.lock_acquired);
+        assert_eq!(
+            observed.input_digest.as_deref(),
+            Some(sha256_hex(&serde_json::to_vec(&bundle).unwrap()).as_str())
+        );
+        assert!(
+            observed
+                .changes
+                .iter()
+                .any(|change| change.resource == "schema.knowledge"
+                    && change.migration.as_ref().is_some_and(|plan| plan.supported))
+        );
+        assert_eq!(
+            fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+            before_plan
+        );
+        assert_eq!(
+            plan_captured_deployment(&bundle, &admission, &owner(), &BTreeMap::new())
+                .await
+                .unwrap_err()
+                .code,
+            "graph_unavailable"
+        );
         let mut started = false;
+        let mut accepted = false;
         let applied = apply_captured_deployment(
             &bundle,
             None,
@@ -200,15 +231,33 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
             &admission,
             &handles,
             |_, _, _| {},
+            |lookup| {
+                let DeploymentLookup::Outstanding {
+                    id,
+                    input_digest: recorded_digest,
+                    ..
+                } = lookup
+                else {
+                    panic!("acceptance must be outstanding")
+                };
+                let state: serde_json::Value =
+                    serde_json::from_slice(&fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
+                        .unwrap();
+                assert_eq!(state["outstanding"]["id"], id);
+                assert_eq!(state["outstanding"]["input_digest"], input_digest);
+                assert_eq!(recorded_digest, input_digest);
+                accepted = true;
+            },
             &mut started,
         )
         .await
         .unwrap();
-        assert!(started);
+        assert!(started && accepted);
         let DeploymentLookup::Complete { result } = applied else {
             panic!("{applied:?}");
         };
         assert!(result.converged);
+        assert_eq!(result.input_digest, input_digest);
         assert_eq!(
             db.schema_contract_digest().source_hash,
             bundle.resources["schema.knowledge"].digest
@@ -236,6 +285,20 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
             fs::read(dir.path().join("__cluster/state.json")).unwrap(),
             before
         );
+        let mut repeated_effects = false;
+        apply_captured_deployment(
+            &bundle,
+            Some(&result.id),
+            &owner(),
+            &admission,
+            &handles,
+            |_, _, _| panic!("lookup cannot report a new invocation"),
+            |_| panic!("lookup cannot acknowledge new acceptance"),
+            &mut repeated_effects,
+        )
+        .await
+        .unwrap();
+        assert!(!repeated_effects);
     }
     // Membership captured at server boot is not current deployment authority:
     // create and delete a later graph under this same lifetime writer.
@@ -249,6 +312,7 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         &admission,
         &handles,
         |_, _, _| {},
+        |_| {},
         &mut started,
     )
     .await
@@ -267,6 +331,29 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
     });
     let bundle = capture_deployment(dir.path()).unwrap();
+    // A removed graph may be blocked without a live engine. Observing its
+    // deletion uses ledger authority; apply checks its physical identity later.
+    let planned = plan_captured_deployment(&bundle, &admission, &owner(), &handles)
+        .await
+        .unwrap();
+    assert!(planned.ok, "{planned:?}");
+    let deletion = planned
+        .changes
+        .iter()
+        .find(|change| change.resource == "graph.second")
+        .unwrap();
+    assert_eq!(deletion.operation, PlanOperation::Delete);
+    assert_eq!(
+        deletion.delete_root.as_deref(),
+        Some(
+            format!(
+                "{}/graphs/second.omni",
+                admission.canonical_root().trim_start_matches("file://")
+            )
+            .as_str()
+        )
+    );
+    assert!(dir.path().join("graphs/second.omni").exists());
     let deleted = apply_captured_deployment(
         &bundle,
         None,
@@ -274,6 +361,7 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         &admission,
         &handles,
         |_, _, _| {},
+        |_| {},
         &mut started,
     )
     .await
@@ -332,6 +420,7 @@ async fn captured_input_is_revalidated_and_preflight_keeps_original_writer() {
         &admission,
         &BTreeMap::new(),
         |_, _, _| {},
+        |_| panic!("refused input must not be accepted"),
         &mut effects,
     )
     .await
@@ -630,6 +719,90 @@ async fn authenticated_deployment_records_the_authenticated_actor() {
         panic!("{:?}", result.graphs);
     };
     assert_eq!(commit.actor_id.as_deref(), Some("principal:owner"));
+
+    // The initiator retains only exact receipt access after its own policy
+    // handoff. This cannot grant cluster status, successor execution, another
+    // actor's result, or a storage owner's merely attributed result.
+    unlock(root).await;
+    let management = dir.path().join("management.policy.yaml");
+    let source = fs::read_to_string(&management)
+        .unwrap()
+        .replace("principal:owner", "principal:successor");
+    fs::write(&management, source).unwrap();
+    let handoff = apply_deployment(dir.path(), None, &identity("principal:owner"), |_, _, _| {})
+        .await
+        .unwrap();
+    let DeploymentLookup::Complete { result: handoff } = handoff else {
+        panic!("handoff missing")
+    };
+    let actor = IdentityAuthorization::authenticated("principal:owner").unwrap();
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    for id in [&result.id, &handoff.id] {
+        assert!(matches!(
+            deployment_receipt(root, id, &actor).await.unwrap().0,
+            DeploymentLookup::Complete { .. }
+        ));
+        assert_eq!(
+            deployment_receipt(
+                root,
+                id,
+                &IdentityAuthorization::authenticated("principal:reader").unwrap()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "policy_denied"
+        );
+    }
+    assert_eq!(
+        deployment_status(root, None, &identity("principal:owner"))
+            .await
+            .unwrap_err()
+            .code,
+        "policy_denied"
+    );
+    let store = ClusterStore::for_config_dir(dir.path());
+    let (mut state, cas) = execution::read_existing(&store).await.unwrap();
+    let attributed = &state.deployment_results.as_ref().unwrap()[0];
+    assert_eq!(attributed.authority.kind, AuthorityKind::StorageOwner);
+    assert_eq!(
+        deployment_receipt(root, &attributed.id, &actor)
+            .await
+            .unwrap_err()
+            .code,
+        "policy_denied"
+    );
+    let next = deployment_status(root, None, &owner())
+        .await
+        .unwrap()
+        .next_deployment_id();
+    assert_eq!(
+        deployment_receipt(root, &next, &actor)
+            .await
+            .unwrap_err()
+            .code,
+        "policy_denied"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    state
+        .deployment_results
+        .as_mut()
+        .unwrap()
+        .retain(|entry| entry.id == handoff.id);
+    store
+        .write_state(&state, Some(&cas), &mut store.observations())
+        .await
+        .unwrap();
+    assert_eq!(
+        deployment_receipt(root, &result.id, &actor)
+            .await
+            .unwrap_err()
+            .code,
+        "policy_denied"
+    );
 }
 
 #[tokio::test]

@@ -2122,6 +2122,11 @@ async fn live_query_deployment_closes_admission_before_waiting_for_a_merge() {
     live_deployment_fixture("merge").await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn deployment_acceptance_and_polling_track_the_owned_executor_through_activation() {
+    live_deployment_fixture("acceptance").await;
+}
+
 async fn live_deployment_fixture(mode: &str) {
     use omnigraph_cluster::{CapturedDeployment, DeploymentStatus};
     use omnigraph_server::{GraphId, GraphKey, RegistryLookup, ServerConfigMode};
@@ -2141,16 +2146,60 @@ async fn live_deployment_fixture(mode: &str) {
             ))
             .unwrap()
     }
+    // Existing lifecycle assertions observe completed activation; the acceptance
+    // case below uses the raw HTTP helper to test each intermediate boundary.
+    async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
+        let token = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("")
+            .to_owned();
+        let (code, body) = support::json_response(app, request).await;
+        if code != StatusCode::ACCEPTED {
+            return (code, body);
+        }
+        assert_eq!(body["in_progress"], true, "{body}");
+        let id = body["deployment"]["id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let (code, result) = support::json_response(
+                    app,
+                    get_request(&format!("/cluster/deployments/{id}"), &token),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "{result}");
+                if result["in_progress"] == false {
+                    return (code, result);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("accepted deployment must finish under its server owner")
+    }
     async fn status(app: &Router, id: Option<&str>) -> (DeploymentStatus, bool) {
-        let path = id
-            .map(|id| format!("/cluster/deployments/{id}"))
-            .unwrap_or_else(|| "/cluster/deployments".into());
-        let (code, body) = json_response(app, get_request(&path, "operator-token")).await;
+        let (code, body) =
+            json_response(app, get_request("/cluster/deployments", "operator-token")).await;
         assert_eq!(code, StatusCode::OK, "{body}");
-        (
-            serde_json::from_value(body["status"].clone()).unwrap(),
-            body["active"].as_bool().unwrap(),
-        )
+        let mut status: DeploymentStatus = serde_json::from_value(body["status"].clone()).unwrap();
+        let mut active = body["active"].as_bool().unwrap();
+        if let Some(id) = id {
+            let (code, receipt) = json_response(
+                app,
+                get_request(&format!("/cluster/deployments/{id}"), "operator-token"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{receipt}");
+            assert!(
+                receipt.get("status").is_none(),
+                "exact receipts do not expose cluster status"
+            );
+            status.lookup = Some(serde_json::from_value(receipt["deployment"].clone()).unwrap());
+            active = receipt["active"].as_bool().unwrap();
+        }
+        (status, active)
     }
 
     let temp = tempfile::tempdir().unwrap();
@@ -2377,6 +2426,195 @@ async fn live_deployment_fixture(mode: &str) {
     .unwrap();
     fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
     let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+    if mode == "acceptance" {
+        use omnigraph_cluster::seams::catalog::{
+            DEPLOYMENT_AFTER_ACCEPTANCE, DEPLOYMENT_AFTER_RESULT, DEPLOYMENT_BEFORE_ACCEPTANCE,
+        };
+        struct ScopedHold {
+            prefix: String,
+            hold: Arc<omnigraph::seams::Hold>,
+        }
+        impl omnigraph::seams::Behavior for ScopedHold {
+            fn uninstalling(&self) {
+                self.hold.release();
+            }
+        }
+        impl omnigraph::seams::Decide for ScopedHold {
+            fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+                if std::thread::current()
+                    .name()
+                    .is_some_and(|name| name == self.prefix)
+                {
+                    omnigraph::seams::Decide::decide(self.hold.as_ref(), name)
+                } else {
+                    omnigraph::seams::Decision::Pass
+                }
+            }
+        }
+        async fn reached(hold: &omnigraph::seams::Hold) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !hold.reached() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned executor must reach its next boundary");
+        }
+        let plan_request = |token: &str| {
+            Request::post("/cluster/plan")
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"deployment": deployment})).unwrap(),
+                ))
+                .unwrap()
+        };
+        let (code, plan) = json_response(&app, plan_request("operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{plan}");
+        assert_eq!(plan["ok"], true, "{plan}");
+        assert!(
+            plan["input_digest"]
+                .as_str()
+                .is_some_and(|digest| !digest.is_empty())
+        );
+        assert!(
+            plan["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change.get("migration").is_some())
+        );
+        assert_eq!(
+            json_response(&app, plan_request("reader-token")).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        assert!(matches!(
+            state.routing().registry.get(&key),
+            RegistryLookup::Ready(_)
+        ));
+
+        let prefix = format!("deployment-{}", initial_status.ledger_id);
+        let before_acceptance = Arc::new(omnigraph::seams::Hold::default());
+        let after_acceptance = Arc::new(omnigraph::seams::Hold::default());
+        let after_result = Arc::new(omnigraph::seams::Hold::default());
+        let guards = [
+            DEPLOYMENT_BEFORE_ACCEPTANCE.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&before_acceptance),
+            })),
+            DEPLOYMENT_AFTER_ACCEPTANCE.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&after_acceptance),
+            })),
+            DEPLOYMENT_AFTER_RESULT.install(Arc::new(ScopedHold {
+                prefix: prefix.clone(),
+                hold: Arc::clone(&after_result),
+            })),
+        ];
+        let request_app = app.clone();
+        let request = submit(&id, &deployment, "operator-token");
+        let (response, mut received) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name(prefix)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let reply = support::json_response(&request_app, request).await;
+                    response.send(reply).unwrap();
+                    let _ = stopped.await;
+                });
+        });
+        reached(&before_acceptance).await;
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let path = format!("/cluster/deployments/{id}");
+        let (code, preparing) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(code, StatusCode::OK, "{preparing}");
+        assert_eq!(preparing["deployment"]["status"], "not_recorded");
+        assert_eq!(preparing["in_progress"], true);
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        before_acceptance.release();
+        reached(&after_acceptance).await;
+        let (code, accepted) = tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .expect("HTTP acceptance must not wait for graph effects or activation")
+            .unwrap();
+        assert_eq!(code, StatusCode::ACCEPTED, "{accepted}");
+        assert_eq!(accepted["deployment"]["status"], "outstanding");
+        assert_eq!(accepted["deployment"]["id"], id);
+        assert_eq!(accepted["deployment"]["input_digest"], plan["input_digest"]);
+        assert_eq!(accepted["active"], false);
+        assert_eq!(accepted["in_progress"], true);
+        let (_, running) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(running["deployment"]["status"], "outstanding");
+        assert_eq!(running["deployment"]["input_digest"], plan["input_digest"]);
+        assert_eq!(running["in_progress"], true);
+        assert!(running.get("status").is_none());
+        assert_eq!(
+            json_response(&app, submit(&id, &deployment, "operator-token"))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            json_response(&app, plan_request("operator-token")).await.0,
+            StatusCode::CONFLICT
+        );
+        after_acceptance.release();
+        reached(&after_result).await;
+        let (_, completing) = json_response(&app, get_request(&path, "operator-token")).await;
+        assert_eq!(completing["deployment"]["status"], "complete");
+        assert_eq!(completing["active"], false);
+        assert_eq!(
+            completing["in_progress"], true,
+            "durable result precedes activation"
+        );
+        after_result.release();
+        let final_receipt = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, receipt) = json_response(&app, get_request(&path, "operator-token")).await;
+                if receipt["in_progress"] == false {
+                    break receipt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(final_receipt["active"], true, "{final_receipt}");
+        assert_eq!(final_receipt["deployment"]["result"]["id"], id);
+        assert_eq!(
+            final_receipt["deployment"]["result"]["input_digest"],
+            plan["input_digest"]
+        );
+        assert!(!state.operation_runtime().snapshot().closed);
+        assert!(
+            !before_acceptance.timed_out()
+                && !after_acceptance.timed_out()
+                && !after_result.timed_out()
+        );
+        stop.send(()).unwrap();
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+        drop(guards);
+        return;
+    }
     let (code, _) = json_response(&app, submit(&id, &deployment, "reader-token")).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -2522,6 +2760,18 @@ async fn live_deployment_fixture(mode: &str) {
         !status(&app, Some(&boot_id)).await.1,
         "transitioning bindings are not active"
     );
+    let (_, preparing) = json_response(
+        &app,
+        get_request(&format!("/cluster/deployments/{id}"), "operator-token"),
+    )
+    .await;
+    assert_eq!(preparing["deployment"]["status"], "not_recorded");
+    assert_eq!(preparing["in_progress"], true);
+    assert!(
+        !observer.is_finished(),
+        "HTTP acceptance must await durable recording"
+    );
+
     let (code, _) =
         json_response(&app, get_request("/graphs/peer/snapshot", "operator-token")).await;
     assert_eq!(code, StatusCode::OK, "unaffected graph keeps serving");
@@ -2967,7 +3217,8 @@ async fn live_deployment_fixture(mode: &str) {
     assert_eq!(body["served_graph_count"], 0);
 
     // Management-policy handoff takes effect on all cloned routers. The old
-    // administrator cannot deploy or list; the newly granted one can observe.
+    // administrator cannot deploy or list; its own receipt remains observable.
+    // The newly granted administrator can observe the current cluster.
     fs::write(
         temp.path().join("cluster-policy.yaml"),
         format!(
@@ -2978,13 +3229,32 @@ async fn live_deployment_fixture(mode: &str) {
     .unwrap();
     let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
     let (next, _) = status(&app, None).await;
-    let (code, body) = json_response(
-        &app,
-        submit(&next.next_deployment_id(), &candidate, "operator-token"),
-    )
-    .await;
+    let handoff_id = next.next_deployment_id();
+    let (code, body) = json_response(&app, submit(&handoff_id, &candidate, "operator-token")).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert_eq!(body["active"], true);
+    let (code, own_receipt) = json_response(
+        &app,
+        get_request(
+            &format!("/cluster/deployments/{handoff_id}"),
+            "operator-token",
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{own_receipt}");
+    assert_eq!(own_receipt["deployment"], body["deployment"]);
+    assert_eq!(own_receipt["in_progress"], false);
+    assert!(own_receipt.get("status").is_none());
+    assert_eq!(
+        json_response(
+            &app,
+            get_request(&format!("/cluster/deployments/{boot_id}"), "operator-token")
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "storage-owner attribution is not the authenticated receipt owner"
+    );
     assert_eq!(
         json_response(&app, get_request("/cluster/deployments", "operator-token"))
             .await

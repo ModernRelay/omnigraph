@@ -258,7 +258,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             ]),
     ));
     assert_eq!(status["active"], true, "{status}");
-    assert_eq!(status["status"]["lookup"], applied["deployment"]);
+    assert_eq!(status["deployment"], applied["deployment"]);
     // Repeating the exact identity is observation, never a second schema or
     // graph creation invocation. Changed bytes under that identity refuse.
     let repeat = parse_stdout_json(&output_success(
@@ -526,16 +526,24 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             assert_eq!(missing_root.status.code(), Some(2));
             assert!(String::from_utf8_lossy(&missing_root.stderr).contains("requires --cluster"));
         }
-        for managed_flag in [
+        for unsupported_flag in [
             vec!["--no-wait"],
             vec!["--timeout", "1"],
             vec!["--idempotency-key", "key"],
         ] {
             let output = output_failure(
-                rooted(&["apply", "--deployment-id", id, "--json"]).args(managed_flag),
+                rooted(&["apply", "--deployment-id", id, "--json"]).args(&unsupported_flag),
             );
             assert_eq!(output.status.code(), Some(2));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("managed_scope_conflict"));
+            let expected = if unsupported_flag[0] == "--idempotency-key" {
+                "unexpected argument"
+            } else {
+                "deployment wait options require --server"
+            };
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
+            );
         }
         output_failure(&mut rooted(&["force-unlock", "wrong-lock", "--json"]));
         let unknown_id = format!(
@@ -1008,7 +1016,64 @@ fn live_graph_removal_deletes_owned_storage(
     );
     assert_eq!(live_snapshot(server, "retired"), deleted_before);
 
-    let deleted = live_apply(config_dir, server, "live-deployment-token");
+    // Server-only preview describes destructive removal without changing
+    // either the ledger or the graph's readable data/history.
+    let plan = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "plan", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--json"),
+    ));
+    assert_eq!(plan["ok"], true, "{plan}");
+    let removal = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "graph.retired")
+        .unwrap();
+    assert_eq!(removal["operation"], "delete");
+    assert_eq!(
+        removal["delete_root"],
+        format!(
+            "{}/graphs/retired.omni",
+            status_before["status"]["canonical_root"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("file://")
+                .trim_end_matches('/')
+        )
+    );
+    assert_eq!(
+        live_policy_status(server, "live-deployment-token"),
+        status_before
+    );
+    assert_eq!(live_snapshot(server, "retired"), deleted_before);
+
+    let accepted = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .args(["--no-wait", "--timeout", "30", "--json"]),
+    ));
+    let deployment_id = accepted["deployment"]["id"]
+        .as_str()
+        .or_else(|| accepted["deployment"]["result"]["id"].as_str())
+        .unwrap();
+    let deleted = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token").args([
+            "cluster",
+            "status",
+            "--server",
+            &server.base_url,
+            "--deployment-id",
+            deployment_id,
+            "--wait",
+            "--timeout",
+            "30",
+            "--json",
+        ]),
+    ));
+    assert_eq!(deleted["active"], true, "{deleted}");
     assert_eq!(
         deleted["deployment"]["result"]["graphs"]["retired"]["outcome"], "deleted",
         "{deleted}"

@@ -53,7 +53,7 @@ fn key(context: &Context) -> String {
 fn invalid() -> Failure {
     Failure::refused(
         "data_credential_invalid",
-        "the cached data credential is invalid; mint a new cluster token",
+        "the cached data credential is invalid; mint a new managed token",
     )
 }
 
@@ -135,7 +135,7 @@ impl Credential {
         if expires <= now {
             return Err(Failure::refused(
                 "data_credential_expired",
-                "the data credential has expired; mint a new cluster token",
+                "the data credential has expired; mint a new managed token",
             ));
         }
         Ok(())
@@ -290,7 +290,7 @@ fn load_credential(store: &impl Store, context: &Context) -> Result<Credential> 
     let raw = store.get(&key(context))?.ok_or_else(|| {
         Failure::refused(
             "data_credential_required",
-            "no data credential is cached for this cluster; run cluster token",
+            "no data credential is cached for this cluster; run managed token",
         )
     })?;
     if raw.len() > MAX_CREDENTIAL {

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-09-16
+updated: 2026-10-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -23,9 +23,10 @@ blocked_on: []
 
 ## Summary
 
-Add an HTTP client for the managed Intent API to the existing CLI. A folder's
-`.omnigraph/context` selects managed cluster operations; absence preserves
-the existing direct Core path. Managed authentication establishes identity,
+The explicit `managed` command family addresses the managed Intent API. A
+folder's `.omnigraph/context` selects the service and cluster for bound
+operations. Core `cluster` commands never inspect that context.
+Managed authentication establishes identity,
 and current permissions authorize execution of an exact saved plan. There is
 no separate managed approval workflow. Engine behavior and storage formats
 are unchanged.
@@ -44,11 +45,11 @@ rather than a local command refactor.
 ```sh
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example
-omnigraph cluster plan --config . --json
-omnigraph cluster apply --config . --plan PLAN_RUN_ID --json
-omnigraph cluster status --config . --json
-omnigraph cluster history --config . --json
-omnigraph cluster cancel RUN_ID --config . --json
+omnigraph managed plan --config . --json
+omnigraph managed apply --config . --plan PLAN_RUN_ID --json
+omnigraph managed status --config . --json
+omnigraph managed history --config . --json
+omnigraph managed cancel RUN_ID --config . --json
 omnigraph logout --api https://control.example
 ```
 
@@ -59,11 +60,11 @@ does not commit files, upload a bundle, silently replan, or ask for another
 approval. Current permissions, binding, digests, and lease are checked by the
 API and execution authority is independently checked by the executor.
 
-`--direct` explicitly selects existing Core behavior for `--config`; its
-`cluster.yaml` still owns the root. There is no root substitution. Without
-that flag, malformed context, unknown context version, unsupported managed
-commands, provider/API errors, and permission refusals fail closed. No such
-failure may invoke Core or consult graph-root credentials.
+The command family selects authority before context discovery. `cluster` uses
+Core configuration or its explicit server/root target; `managed` uses only the
+service API and rejects `--direct`. Malformed context, unknown context version,
+provider/API errors and permission refusals fail closed. No managed failure may
+invoke Core or consult graph-root credentials.
 
 `--no-wait` returns the accepted run envelope. Otherwise the CLI polls every
 two seconds for up to 300 seconds; `--timeout` selects 1–3,600 seconds. Timeout
@@ -86,7 +87,7 @@ serialized by the API. It never cancels accepted effects through lease expiry.
 The versioned, secret-free context is at most 16 KiB and lives only in the
 selected config directory; parent directory search is not performed. Context
 must be a regular file and neither it nor `.omnigraph` may be a symbolic link;
-a dangling link is a refusal, never absence selecting the Core:
+a dangling link is a refusal, never permission to select Core:
 
 ```yaml
 version: 1
@@ -132,22 +133,22 @@ fork, cloud-only correctness fix, duplicated lock, or new writer fence.
 
 Existing profiles/servers/clusters config and `login SERVER --token` /
 `logout SERVER` remain intact. The new `--api` mode is mutually exclusive
-with legacy server login. Existing direct commands without context retain
-their flags and behavior. Managed-only flags without context refuse.
-Unsupported managed commands refuse before direct execution.
+with named-server login. Core commands retain their own addressing regardless
+of folder context. Managed commands and their arguments live only under
+`managed`; former managed `cluster` spellings are not aliases.
 
-No stored graph or server API format changes. Removing the context or using
-`--direct` restores the existing direct path intentionally. Older CLI builds
-do not understand this context contract and must not be presented as safe
-managed clients; deploy a compatible CLI and API together.
+No stored graph or server API format changes. Bound managed commands refuse
+without context; its absence cannot select direct execution. Deploy a compatible
+CLI and API together.
 The server SDK and Python SDK gain no new authority or dependencies.
 
 ## Alternatives
 
 - Raw HTTP keeps the current gap in bounded waits, identity storage, and
   context isolation and makes every script reproduce the managed contract.
-- A second top-level verb family avoids dispatch integration but contradicts
-  the existing cluster command model and duplicates discoverability/docs.
+- Ambient context dispatch makes identical cluster commands select different
+  protocols and exposes mutually incompatible flags in one parser. Explicit
+  command families keep that choice visible without another mode flag.
 - Inferring managed mode from storage roots or existing server aliases risks
   forwarding the wrong credential; explicit context and origin binding win.
 - Requiring browser sign-in after every short access lifetime interrupts
@@ -203,3 +204,9 @@ separate increment; this decision authorizes control-plane operations only.
 managed-store editing and provisioning to this original increment, and links
 RFC 0061 as the owner of those additional client commands. Its authentication,
 folder context, direct routing and exact-plan execution contract is unchanged.
+
+2026-10-06: The maintainer requested explicit command namespaces. Summary,
+User behavior, Design, Compatibility and Alternatives now place service commands
+under `managed` and remove ambient interception of Core `cluster` commands.
+Managed data-command context and service protocols remain unchanged. Existing
+CLI owners cover namespace refusal and Core isolation from malformed context.

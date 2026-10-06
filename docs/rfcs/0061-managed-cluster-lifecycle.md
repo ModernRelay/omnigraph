@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - Andrew
 created: 2026-09-06
-updated: 2026-09-06
+updated: 2026-10-06
 discussion: null
 supersedes: []
 superseded_by: []
@@ -37,21 +37,21 @@ operations rather than local storage effects or unbounded polling.
 
 ## User and operational behavior
 
-`cluster create NAME --api ORIGIN --config DIR` requests an empty managed
+`managed create NAME --api ORIGIN --config DIR` requests an empty managed
 cluster and binds the config directory to the returned identity. An existing
 context is never overwritten. `--no-wait` returns the accepted operation;
 otherwise the command waits up to 300 seconds, configurable from 1–3600 using
 `--timeout`. Readiness means the API's ordinary plan/apply and serving witness
 completed; acceptance alone does not mean ready or network reachable.
 
-`cluster push --expected-revision COMMIT --message MESSAGE` captures only
+`managed push --expected-revision COMMIT --message MESSAGE` captures only
 `cluster.yaml` and referenced schema, stored-query and policy files from the
 selected folder and uploads them with a conditional managed Git revision.
-It does not apply. The caller next uses `cluster plan --rev COMMIT` and exact
-`cluster apply --plan RUN`. No Git provider credentials or bucket access are
+It does not apply. The caller next uses `managed plan --rev COMMIT` and exact
+`managed apply --plan RUN`. No Git provider credentials or bucket access are
 required by the CLI.
 
-`cluster delete --incarnation INCARNATION` requires exact targeting and current
+`managed delete --incarnation INCARNATION` requires exact targeting and current
 scoped delete permission. `--retention-seconds` accepts 0–2,592,000 and defaults
 to 86,400. With a nonzero interval, ordinary waiting stops at the confirmed
 tombstone and reports its deadline and operation ID while preserving canonical
@@ -59,12 +59,12 @@ state `running`; zero waits toward final purge. `--no-wait` and `--timeout`
 provide the same bounded alternatives as creation. There is no additional
 approval or confirmation workflow.
 
-`cluster undo-delete --incarnation INCARNATION --deletion-id OPERATION` requests
+`managed undo-delete --incarnation INCARNATION --deletion-id OPERATION` requests
 undo of that exact deletion. The service requires current delete, plan and apply
 permissions, checks the retained undo window, and restores through the normal
 plan/apply workflow. The CLI does not recreate a retired identity.
 
-`cluster status --operation OPERATION` reads a service operation. `--api ORIGIN`
+`managed operation OPERATION` reads a service operation. `--api ORIGIN`
 allows recovery before any folder context exists; otherwise the exact folder
 context selects the origin and cluster. `--wait --timeout SECONDS` explicitly
 polls to a canonical outcome. A local deadline returns exit 5 with the latest
@@ -120,9 +120,9 @@ The Lance domain map therefore has no changed substrate surface.
 
 ## Compatibility and reversibility
 
-Folder context remains version 1. Older clients retain plan/apply/status and
-direct behavior; they cannot execute the new commands. Service refusal does
-not trigger a legacy fallback. Removing this CLI surface does not cancel any
+Folder context remains version 1. These commands use the explicit `managed`
+namespace; former managed `cluster` spellings are refused. Service refusal
+never invokes Core execution. Removing this CLI surface does not cancel any
 accepted service operation. Private routing still needs its explicit connection;
 public routing and a console are outside this RFC.
 
@@ -170,3 +170,8 @@ CLI contract and compatibility.
 2026-09-06: Completed the bounded client implementation and owned local
 regressions. Managed upload is qualified on Unix; other platforms refuse it.
 The companion service owns cell qualification and cloud rollout separately.
+
+2026-10-06: The maintainer requested the explicit `managed` namespace. User
+behavior and Compatibility now use those commands and a separate `managed
+operation ID` for lifecycle observation. Service APIs, identity checks, pending
+request custody and bounded waits are unchanged.

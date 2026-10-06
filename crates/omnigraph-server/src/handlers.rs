@@ -303,6 +303,7 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/plan",
     "/cluster/deployments",
     "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",

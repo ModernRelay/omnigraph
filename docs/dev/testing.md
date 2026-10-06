@@ -137,11 +137,15 @@ scope, schema identity and candidate bounds;
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
 are not generic native settlement. Server `boot_settings` exercises authenticated
-submission, parked requests, caller disconnect, pre-effect refusal and historical
-ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
+submission, parked requests, caller disconnect, pre-effect refusal, durable
+acceptance before completion, activation-in-progress observation and exact receipt
+access after management handoff. CLI `cli_cluster` owns submit-once polling,
+lost-response observation, terminal outcomes and caller timeout without replay.
+CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
 replacement, graph addition, policy grant/revocation and management handoff.
 Extend that same journey for graph deletion, proving target storage/history
-removal, peer preservation and unchanged PID/listener. It checks
+removal, peer preservation and unchanged PID/listener, including a served deletion
+preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks
 the achieved configuration again after restart. The local journey also exercises
 counted embedding-provider replacement, external-Blob admission changes, catalog
 integrity reporting, schema-drift refusal and missing-root refusal. S3/Azure wrappers

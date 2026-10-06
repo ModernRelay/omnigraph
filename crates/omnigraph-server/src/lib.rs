@@ -113,6 +113,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         deployment::status,
         deployment::lookup,
         deployment::apply,
+        deployment::plan,
         handlers::server_health,
         handlers::server_ready,
         handlers::server_graphs_list,
@@ -2443,6 +2444,7 @@ pub fn build_app(state: AppState) -> Router {
         ));
 
     let deployments = Router::new()
+        .route("/cluster/plan", post(deployment::plan))
         .route(
             "/cluster/deployments",
             get(deployment::status).post(deployment::apply),

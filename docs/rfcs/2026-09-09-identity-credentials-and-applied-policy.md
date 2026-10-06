@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-05
+updated: 2026-10-06
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -48,7 +48,7 @@ returned by the existing graph catalog.
 Normal credential acquisition requests version 2 without graph/actions:
 
 ```text
-omnigraph cluster token --ttl 3600
+omnigraph managed token --ttl 3600
 omnigraph --graph knowledge query list_people
 omnigraph graphs list
 ```
@@ -60,7 +60,7 @@ select the new minimal endpoint with
 No JWT-shaped static token is reinterpreted to select a different command.
 
 CLI `--actions` is removed. Unsupported caches refuse without automatic
-replacement; `cluster token` explicitly requests a current identity credential.
+replacement; `managed token` explicitly requests a current identity credential.
 Permission denial never switches credentials or storage addressing.
 
 `GET /graphs/discovery` returns only
@@ -176,7 +176,7 @@ documented trust boundary, never an automatic fallback from identity denial.
 ## Compatibility and reversibility
 
 Version-1 tokens, cache entries and public claim/grant types are unsupported;
-CLI `--actions` is removed. A new explicit `cluster token` request replaces an
+CLI `--actions` is removed. A new explicit `managed token` request replaces an
 old cache. Existing static/unauthenticated modes and direct APIs retain their
 behavior. Authorized entry points remain additive.
 The public exhaustive policy enums gain `ConfigManage`/`Cluster` variants;
@@ -242,6 +242,10 @@ No alternative authority model is left open. Live activation and qualification
 of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
+
+- 2026-10-06: Credential-administration examples now use `managed token` under
+  the explicit service namespace from [RFC 0052](0052-managed-control-plane-cli.md).
+  Credential format, acquisition and authorization are unchanged.
 
 - 2026-10-05: The maintainer requested removal of compatibility interfaces.
   This replaces Summary's retained version-1 profile, User behavior's

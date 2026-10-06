@@ -201,6 +201,48 @@ pub async fn deployment_status(
     })
 }
 
+/// Read one durable invocation without disclosing the current cluster status.
+/// Current management permission or the exact authenticated initiating actor
+/// authorizes this receipt only. Missing/expired ownership evidence grants no
+/// fallback permission, and storage-owner attribution is never authentication.
+pub async fn deployment_receipt(
+    root: &str,
+    id: &str,
+    identity: &IdentityAuthorization,
+) -> Result<(DeploymentLookup, u64), Diagnostic> {
+    let store = ClusterStore::for_storage_root(root)?;
+    let (state, _) = read_existing(&store).await?;
+    require_v2(&state)?;
+    let authority = state
+        .outstanding
+        .as_ref()
+        .filter(|pending| pending.id == id)
+        .map(|pending| &pending.authorization.authority)
+        .or_else(|| {
+            state
+                .deployment_results
+                .as_ref()?
+                .iter()
+                .find(|result| result.id == id)
+                .map(|result| &result.authority)
+        });
+    if !authority.is_some_and(|authority| {
+        authority.kind == AuthorityKind::AuthenticatedIdentity
+            && authority.actor.as_deref() == Some(identity.actor())
+    }) {
+        policies(
+            &store,
+            &state,
+            &DeploymentCaller::AuthenticatedIdentity(identity.clone()),
+        )
+        .await?;
+    }
+    Ok((
+        lookup(&state, id)?,
+        state.applied_revision.result_revision.unwrap(),
+    ))
+}
+
 fn lookup(state: &ClusterState, requested: &str) -> Result<DeploymentLookup, Diagnostic> {
     let id = DeploymentId::parse(requested)?;
     if Some(id.ledger.as_str()) != state.ledger_id.as_deref() {
@@ -210,6 +252,7 @@ fn lookup(state: &ClusterState, requested: &str) -> Result<DeploymentLookup, Dia
         if pending.id == requested {
             return Ok(DeploymentLookup::Outstanding {
                 id: requested.to_owned(),
+                input_digest: pending.input_digest.clone(),
                 graphs: pending
                     .graphs
                     .iter()
@@ -453,10 +496,7 @@ async fn bootstrap_ledger(
         // unmanaged roots refuse, including after a lost cluster ledger.
         let state = empty_ledger();
         let id = format!("{}:1:{}", state.ledger_id.as_ref().unwrap(), Ulid::new());
-        let input_digest = sha256_hex(
-            &serde_json::to_vec(bundle)
-                .map_err(|error| refusal("deployment_encode", error.to_string()))?,
-        );
+        let input_digest = bundle.input_digest()?;
         Box::pin(prepare_deployment(
             store,
             bundle,
@@ -1198,9 +1238,7 @@ fn verify_recorded_input(
     id: &str,
     bundle: &CapturedDeployment,
 ) -> Result<(), Diagnostic> {
-    let digest = sha256_hex(
-        &serde_json::to_vec(bundle).map_err(|e| refusal("deployment_encode", e.to_string()))?,
-    );
+    let digest = bundle.input_digest()?;
     let recorded = state
         .outstanding
         .as_ref()
@@ -1236,6 +1274,22 @@ pub async fn prepare_deployment_preview(
     admission: &ClusterAdmission,
     caller: &DeploymentCaller,
 ) -> Result<DeploymentPreview, Diagnostic> {
+    let (store, state, cas, affected_graphs) =
+        capture_deployment_preview(bundle, admission, caller).await?;
+    let serving = serve::preview_snapshot_with_store(&store, bundle, &affected_graphs, state, cas)
+        .await
+        .map_err(|mut diagnostics| diagnostics.remove(0))?;
+    Ok(DeploymentPreview {
+        affected_graphs,
+        serving,
+    })
+}
+
+async fn capture_deployment_preview(
+    bundle: &CapturedDeployment,
+    admission: &ClusterAdmission,
+    caller: &DeploymentCaller,
+) -> Result<(ClusterStore, ClusterState, String, Vec<String>), Diagnostic> {
     if bundle.canonical_root() != admission.canonical_root() {
         return Err(refusal(
             "cluster_admission_root_mismatch",
@@ -1262,13 +1316,187 @@ pub async fn prepare_deployment_preview(
     for graph in &affected_graphs {
         authorize_graph_change(&state, bundle, caller, &policy, graph)?;
     }
-    let serving = serve::preview_snapshot_with_store(&store, bundle, &affected_graphs, state, cas)
+    Ok((store, state, cas, affected_graphs))
+}
+
+/// Observe a captured deployment through the serving owner's existing handles.
+/// No graph is opened, no admission is closed, and no execution intent or
+/// sequence is reserved. Apply repeats physical eligibility after drainage.
+pub async fn plan_captured_deployment(
+    bundle: &CapturedDeployment,
+    admission: &ClusterAdmission,
+    caller: &DeploymentCaller,
+    live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
+) -> Result<PlanOutput, Diagnostic> {
+    let (store, state, cas, affected) =
+        capture_deployment_preview(bundle, admission, caller).await?;
+    // Verify the same control payloads and candidate bindings used by preview.
+    // This projection reads no graph datasets or source paths on the client.
+    serve::preview_snapshot_with_store(&store, bundle, &affected, state.clone(), cas.clone())
         .await
         .map_err(|mut diagnostics| diagnostics.remove(0))?;
-    Ok(DeploymentPreview {
-        affected_graphs,
-        serving,
+    let mut changes =
+        crate::diff::diff_state_resources(&state.applied_revision.resources, &bundle.resources);
+    let mut diagnostics = Vec::new();
+    for graph in &affected {
+        if !state
+            .applied_revision
+            .resources
+            .contains_key(&graph_address(graph))
+        {
+            continue;
+        }
+        let Some(db) = live_graphs.get(graph) else {
+            if !bundle.resources.contains_key(&graph_address(graph)) {
+                // Deletion can remove a blocked or missing graph. Its ledger
+                // identity is enough to describe the change; apply verifies
+                // the physical root after draining affected work.
+                continue;
+            }
+            return Err(refusal(
+                "graph_unavailable",
+                format!("graph {graph} has no ready serving handle for an observed plan"),
+            ));
+        };
+        admission::admitted_graph_id(
+            &bundle.canonical_root,
+            state.applied_revision.schema_contracts.as_ref().unwrap(),
+            db.uri(),
+        )?;
+        let expected = &state.applied_revision.schema_contracts.as_ref().unwrap()[graph];
+        if &db.schema_contract_digest() != expected {
+            return Err(refusal(
+                "applied_schema_drift",
+                format!("graph {graph} differs from its achieved contract"),
+            ));
+        }
+        let address = schema_address(graph);
+        if let Some(change) = changes
+            .iter_mut()
+            .find(|change| change.resource == address && change.operation == PlanOperation::Update)
+        {
+            let migration = db
+                .plan_schema_at_contract(source_for(bundle, &address)?, expected)
+                .map_err(|error| refusal("schema_preview_unavailable", error.to_string()))?;
+            if !migration.supported {
+                diagnostics.push(refusal(
+                    "schema_preflight_failed",
+                    "observed schema migration is unsupported",
+                ));
+            }
+            if db
+                .branch_list()
+                .await
+                .map_err(|error| refusal("schema_preview_unavailable", error.to_string()))?
+                .iter()
+                .any(|branch| branch != "main")
+            {
+                diagnostics.push(refusal(
+                    "schema_preflight_failed",
+                    format!("graph {graph} schema apply requires only main"),
+                ));
+            }
+            change.migration = Some(migration);
+        }
+    }
+    annotate_plan_changes(&store, &mut changes, diagnostics.first())?;
+    let mut dependencies = BTreeSet::new();
+    for (address, resource) in &bundle.resources {
+        match resource_kind(address) {
+            ResourceKind::Schema(graph) => {
+                dependencies.insert(Dependency {
+                    from: address.clone(),
+                    to: graph_address(&graph),
+                });
+            }
+            ResourceKind::Query { graph, .. } => {
+                dependencies.insert(Dependency {
+                    from: address.clone(),
+                    to: graph_address(&graph),
+                });
+                dependencies.insert(Dependency {
+                    from: address.clone(),
+                    to: schema_address(&graph),
+                });
+            }
+            ResourceKind::Policy(_) => {
+                for target in resource
+                    .applies_to
+                    .iter()
+                    .flatten()
+                    .filter(|target| target.starts_with("graph."))
+                {
+                    dependencies.insert(Dependency {
+                        from: address.clone(),
+                        to: target.clone(),
+                    });
+                }
+            }
+            ResourceKind::Graph(_) => {
+                if let Some(provider) = &resource.embedding_provider {
+                    dependencies.insert(Dependency {
+                        from: address.clone(),
+                        to: provider.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let dependencies: Vec<_> = dependencies.into_iter().collect();
+    let mut observations = store.observations();
+    observations.state_found = true;
+    observations.state_revision = state.state_revision;
+    observations.state_cas = Some(cas);
+    observations.applied_config_digest = state.applied_revision.config_digest;
+    observations.resource_count = state.applied_revision.resources.len();
+    // The lifetime admission is already held. A plan does not acquire it.
+    observations.locked = true;
+    observations.lock_id = Some(admission.lock_id().to_owned());
+    Ok(PlanOutput {
+        ok: !has_errors(&diagnostics),
+        authority: LedgerAuthority::Observed,
+        config_dir: bundle.canonical_root.clone(),
+        desired_revision: DesiredRevision {
+            config_digest: Some(bundle.config_digest.clone()),
+        },
+        input_digest: Some(bundle.input_digest()?),
+        resource_digests: bundle
+            .resources
+            .iter()
+            .map(|(address, resource)| (address.clone(), resource.digest.clone()))
+            .collect(),
+        blast_radius: compute_blast_radius(&changes, &dependencies),
+        dependencies,
+        state_observations: observations,
+        changes,
+        diagnostics,
     })
+}
+
+pub(crate) fn annotate_plan_changes(
+    store: &ClusterStore,
+    changes: &mut [PlanChange],
+    error: Option<&Diagnostic>,
+) -> Result<(), Diagnostic> {
+    for change in changes {
+        change.disposition = Some(if error.is_some() {
+            ApplyDisposition::Blocked
+        } else if matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
+            && change.operation == PlanOperation::Update
+        {
+            ApplyDisposition::Derived
+        } else {
+            ApplyDisposition::Applied
+        });
+        change.reason = error.map(|error| error.code.clone());
+        if let ResourceKind::Graph(graph) = resource_kind(&change.resource)
+            && change.operation == PlanOperation::Delete
+        {
+            change.delete_root = Some(store.canonical_managed_graph_root(&graph)?);
+        }
+    }
+    Ok(())
 }
 
 /// Authorize from applied control metadata before any graph gate or open.
@@ -1332,6 +1560,7 @@ pub async fn apply_deployment(
         &admission,
         &BTreeMap::new(),
         report_id,
+        |_| {},
         &mut effects_started,
     )
     .await;
@@ -1352,6 +1581,9 @@ pub async fn apply_deployment(
 /// Every affected live handle must be drained with healthy native operations
 /// before invocation. Root admission excludes participating writers; it does
 /// not fence excluded/raw writers or prove remote I/O settlement after failure.
+/// `on_accepted` receives the confirmed outstanding receipt after its ledger
+/// CAS, before graph effects. Lookup and pre-acceptance refusal never call it.
+#[allow(clippy::too_many_arguments)] // Distinct identity-report and durable-acceptance boundaries.
 pub async fn apply_captured_deployment(
     bundle: &CapturedDeployment,
     requested_id: Option<&str>,
@@ -1359,6 +1591,7 @@ pub async fn apply_captured_deployment(
     admission: &ClusterAdmission,
     live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
     report_id: impl FnOnce(&str, &str, &str),
+    on_accepted: impl FnOnce(DeploymentLookup),
     effects_started: &mut bool,
 ) -> Result<DeploymentLookup, Diagnostic> {
     execute_captured_deployment(
@@ -1368,11 +1601,13 @@ pub async fn apply_captured_deployment(
         admission,
         live_graphs,
         report_id,
+        on_accepted,
         effects_started,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Shared executor for direct and served acceptance observers.
 async fn execute_captured_deployment(
     bundle: &CapturedDeployment,
     requested_id: Option<&str>,
@@ -1380,6 +1615,7 @@ async fn execute_captured_deployment(
     admission: &ClusterAdmission,
     live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
     report_id: impl FnOnce(&str, &str, &str),
+    on_accepted: impl FnOnce(DeploymentLookup),
     effects_started: &mut bool,
 ) -> Result<DeploymentLookup, Diagnostic> {
     let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
@@ -1392,10 +1628,7 @@ async fn execute_captured_deployment(
         ));
     }
     admission.validate_deployment().await?;
-    let input_digest = sha256_hex(
-        &serde_json::to_vec(&bundle)
-            .map_err(|error| refusal("deployment_encode", error.to_string()))?,
-    );
+    let input_digest = bundle.input_digest()?;
     // Existing identities are lookup-only, including while their owner holds
     // the lock. Input equality is required before exposing the original result.
     let (before, before_cas) = read_existing(&store).await?;
@@ -1476,6 +1709,7 @@ async fn execute_captured_deployment(
     }
     seams::fail(&DEPLOYMENT_BEFORE_ACCEPTANCE)?;
     cas = replace(&store, &mut state, &cas).await?;
+    on_accepted(lookup(&state, &id)?);
     seams::fail(&DEPLOYMENT_AFTER_ACCEPTANCE)?;
     install_catalog_payloads(&store, &state, bundle).await?;
     for (graph, entry) in state.outstanding.as_ref().unwrap().graphs.clone() {
@@ -1692,10 +1926,7 @@ pub(crate) async fn preflight_deployment_at(
     let cas = snapshot
         .state_cas
         .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"")));
-    let input_digest = sha256_hex(
-        &serde_json::to_vec(bundle)
-            .map_err(|error| refusal("deployment_encode", error.to_string()))?,
-    );
+    let input_digest = bundle.input_digest()?;
     let prepared = prepare_deployment(
         &store,
         bundle,

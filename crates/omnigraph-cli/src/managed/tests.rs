@@ -68,7 +68,7 @@ fn legacy_login_and_managed_login_are_exclusive() {
         assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
     }
     for value in ["0", "3601"] {
-        assert!(Cli::try_parse_from(["omnigraph", "cluster", "plan", "--timeout", value]).is_err());
+        assert!(Cli::try_parse_from(["omnigraph", "managed", "plan", "--timeout", value]).is_err());
     }
 }
 
@@ -97,14 +97,14 @@ fn contexts_are_exact_and_cannot_hide_unknown_authority() {
 }
 
 #[tokio::test]
-async fn explicit_direct_is_the_only_context_override() {
+async fn managed_namespace_is_explicit_and_core_ignores_context() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
     std::fs::write(dir.path().join(".omnigraph/context"), "malformed").unwrap();
     let config = dir.path().to_str().unwrap();
     let managed = Cli::try_parse_from([
         "omnigraph",
-        "cluster",
+        "managed",
         "status",
         "--config",
         config,
@@ -112,26 +112,46 @@ async fn explicit_direct_is_the_only_context_override() {
     ])
     .unwrap();
     assert_eq!(dispatch(&managed).await.unwrap().exit, 2);
+    for verb in ["validate", "plan", "apply", "status", "observe"] {
+        let core = Cli::try_parse_from(["omnigraph", "cluster", verb, "--config", config]).unwrap();
+        assert!(dispatch(&core).await.is_none(), "{verb}");
+    }
     let direct = Cli::try_parse_from([
         "omnigraph",
-        "cluster",
+        "managed",
         "status",
         "--config",
         config,
         "--direct",
     ])
     .unwrap();
-    assert!(dispatch(&direct).await.is_none());
-    let forbidden = Cli::try_parse_from([
-        "omnigraph",
-        "cluster",
-        "apply",
-        "--config",
-        config,
-        "--direct",
-        "--plan",
-        "plan-id",
-    ])
-    .unwrap();
-    assert_eq!(dispatch(&forbidden).await.unwrap().exit, 2);
+    assert_eq!(dispatch(&direct).await.unwrap().exit, 2);
+    for args in [
+        vec![
+            "cluster",
+            "create",
+            "demo",
+            "--api",
+            "https://control.example",
+        ],
+        vec!["cluster", "apply", "--plan", "saved-plan"],
+        vec!["cluster", "plan", "--rev", "revision"],
+        vec!["cluster", "status", "run-id"],
+        vec!["cluster", "status", "--operation", "operation-id"],
+        vec!["managed", "apply"],
+        vec![
+            "managed",
+            "apply",
+            "--plan",
+            "saved-plan",
+            "--deployment-id",
+            "id",
+        ],
+        vec!["managed", "status", "--deployment-id", "id"],
+        vec!["managed", "status", "--operation", "id"],
+        vec!["managed", "observe"],
+    ] {
+        assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
+    }
+    assert!(Cli::try_parse_from(["omnigraph", "managed", "operation", "op-id"]).is_ok());
 }

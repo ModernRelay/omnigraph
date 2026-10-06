@@ -562,8 +562,9 @@ independently of configuration discovery or current input files.
 | `omnigraph --cluster ROOT cluster status [--deployment-id ID]` | Bounded authorized lookup; return incarnation, next sequence, outstanding full ID and lock identity without graph opens or effects. |
 | `omnigraph cluster plan --config DIR` | Observe without a writer lock; derive migration steps from the same captured preparation with the intended actor. |
 | `omnigraph cluster apply --config DIR [--deployment-id ID]` | Bootstrap or execute under direct exclusive admission; allocate and emit the original ID unless supplied. |
-| `omnigraph cluster apply --server URL --config DIR [--deployment-id ID]` | Submit captured input to the running owner; keep the PID/listener and activate coherent schema/query/policy/provider/Blob bindings and graph additions. |
-| `omnigraph cluster status --server URL [--deployment-id ID]` | Authorized ledger lookup plus an observation of whether that result is active in this process. |
+| `omnigraph cluster plan --server URL --config DIR` | Observe changes and schema migrations against captured applied state without closing serving admission or taking a schema gate. |
+| `omnigraph cluster apply --server URL --config DIR [--deployment-id ID] [--no-wait] [--timeout SECONDS]` | Submit once to the running owner; wait for durable acceptance, then observe that ID until convergence and activation unless `--no-wait` is set. |
+| `omnigraph cluster status --server URL [--deployment-id ID [--wait [--timeout SECONDS]]]` | Observe cluster status or an exact deployment receipt; optional waiting polls the original ID without executing it. |
 | `omnigraph --cluster ROOT cluster apply --deployment-id ID --writers-stopped` | Reconcile that original deployment only; never submit, use new files or replay schema effects. A terminal result is lookup-only. |
 | `omnigraph --cluster ROOT cluster force-unlock LOCK_ID` | Exact-ID release under the operator-exclusion/quiescence procedure; outstanding evidence remains intact. |
 
@@ -574,8 +575,10 @@ fence and does not replace lock admission or Azure's wrapper. Conversion and
 reconciliation require it; read-only status does not. Routine apply does not need
 manual status-and-copy, and may not allocate a new ID when resolving a previous
 unknown result. Missing/expired original lookup never creates a replacement.
-Managed remote runs keep their existing API; these flags do not manufacture a
-remotely authenticated identity. Status needs no lock and cannot authorize a writer.
+Hosted service workflows use the explicit `managed` command family and retain
+their separate control-plane API. Folder context never redirects `cluster`
+commands to that API. These flags do not manufacture a remotely authenticated
+identity. Status needs no lock and cannot authorize a writer.
 
 Conversion preserves graph data, native identities, branches/history, applied
 resource digests, policy/provider bindings and existing audit/approval facts.
@@ -652,14 +655,24 @@ root-disjointness and server-safe projection checks. A terminal partial result
 publishes only achieved graph state; serving must install achieved management
 policy too, so a policy handoff cannot strand the corrective deployment.
 
-Plan always observes without writer admission. It captures source bytes and
-the ledger once, and derives migration steps from shared effect-free preparation
-for that input and actor. Missing retained graphs, schema drift, unsupported
-migrations and branch restrictions are errors, not successful plans with a warning. Apply repeats
-those checks under writer admission; a plan is not a reservation or permission
-to replay a deployment.
+Plan always observes without acquiring writer admission. Direct planning uses
+shared effect-free preparation. Served planning captures source bytes, the ledger
+and current runtime contracts, checks current authorization and deployment scope,
+and derives schema migration steps from one accepted schema view. It never opens
+a second engine or takes the exclusive schema gate. Relevant unavailable graphs,
+schema drift, unsupported migrations and branch restrictions refuse. Physical
+rewrite, creation and deletion eligibility remain the executor's post-drain checks.
+Both plans include the observed ledger CAS, input digest, resource changes and
+explicit managed-root deletion including history. They write no ledger or plan
+resource and consume no deployment sequence. Apply checks its fresh accepted
+base; an observed plan is neither a reservation nor permission to replay work.
 
 ## Online deployment
+
+`POST /cluster/plan` accepts a bounded captured bundle and returns the observed
+plan under current management and graph permissions. It uses the ordinary read
+lane and resource limits, validates the serving projection, and never closes graph
+admission or creates a deployment record.
 
 `POST /cluster/deployments` accepts a client-known `deployment_id` and one
 bounded `CapturedDeployment`. The CLI discovers the v0.12 contract, reads
@@ -669,6 +682,38 @@ storage selects that root; an explicit absolute root must match without client
 storage lookup. The server independently revalidates canonical ownership. The CLI
 does not write the ledger. `GET /cluster/deployments/{id}` observes the original
 outcome; disconnection never authorizes a new ID or replay.
+
+POST returns `202` only after the outstanding ledger CAS confirms acceptance,
+with `{deployment, active, in_progress}`. A pre-effect refusal still returns its
+error; an existing original ID is lookup-only. Returning acceptance releases the
+HTTP observer, while the existing owned executor retains completion and activation.
+No job queue, background poller or second durable operation record is introduced.
+
+The CLI waits by default. `--no-wait` returns after confirmed acceptance, which
+can itself require waiting for drain and preparation. `--timeout` bounds the
+entire caller wait (default 300 seconds, maximum 3600), including acceptance; it
+never cancels work. Each GET is separately bounded, and transient observation
+failures may retry only GET within the same total budget. POST is sent at most
+once. A lost POST response may be resolved through the original ID. Apply also
+checks the immutable input digest on every outstanding or completed receipt;
+an old ID can never confirm a different submitted bundle. Timeout
+returns exit 5 and structured original-ID/last-observation output; it does not
+assert deployment failure. `status --deployment-id ID --wait` resumes observation.
+
+Exact GET returns only `{deployment, active, in_progress}`. `in_progress` derives
+from the current process owner of that exact ID, not another durable state machine.
+`NotRecorded` with a live owner means preparation; `Complete` without activation
+can still be in progress. Without that owner, an outstanding record requires
+recovery and an inactive complete result is terminal for this observation.
+Expired receipts, identity mismatch and different-ledger results terminate waiting
+without replay. A process-local observation is not proof of native-I/O quiescence.
+
+Current management permission grants ordinary status access. A still-authenticated
+initiator may additionally read its own exact durable receipt after a deployment
+revokes its management permission, identified by recorded authenticated authority.
+This grants neither current cluster inventory/sequence/lock observations nor any
+write permission. A foreign, missing or expired receipt cannot establish that
+exception; authentication and current permission remain required there.
 
 The server resolves a trusted bearer actor, refuses graph-scoped data tokens,
 checks applied `ConfigManage`, and delegates exact graph authorization and input
@@ -1225,6 +1270,12 @@ Before enabling an affected increment, its owners must implement and qualify:
    cluster roots to v14 before rollout, under the storage-upgrade owner.
 
 ## Decision log
+
+- 2026-10-06: The maintainer approved served observational planning, durable
+  acceptance followed by bounded CLI observation, and explicit `managed` command
+  routing. Online deployment and CLI sections now define exact receipt reads for
+  initiating actors, process-owned progress, caller wait outcomes, and the shared
+  observed-plan limits. No new durable job authority is added.
 
 - 2026-10-06: Review corrections amend the serving-transition and Online
   deployment sections: close and drain before full engine preparation, retain

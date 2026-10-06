@@ -196,6 +196,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/plan",
     "/cluster/deployments",
     "/cluster/deployments/{id}",
     "/graphs/{graph_id}/snapshot",
@@ -2213,6 +2214,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/plan",
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
@@ -2251,6 +2253,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
                 | "/readyz"
                 | "/graphs"
                 | "/graphs/discovery"
+                | "/cluster/plan"
                 | "/cluster/deployments"
                 | "/cluster/deployments/{id}"
                 | "/.well-known/oauth-protected-resource"
@@ -2322,6 +2325,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/plan",
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
@@ -2453,9 +2457,8 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
                 .collect();
             let oauth = path == "/.well-known/oauth-protected-resource";
-            let protected = path == "/graphs"
-                || path.starts_with("/graphs/")
-                || path.starts_with("/cluster/deployments");
+            let protected =
+                path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
             if protected {
                 assert_eq!(contract_parameters.len(), 1, "{method} {path}");
                 let parameter = contract_parameters[0];

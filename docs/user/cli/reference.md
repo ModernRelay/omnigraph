@@ -61,7 +61,8 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
-| `cluster validate/plan/apply/...` | Operate declarative state; [deployment/recovery flags](../clusters/index.md) | config, Core server, explicit root, or managed context |
+| `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
+| `managed create/push/plan/apply/...` | Operate a managed service cluster | managed API and folder context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
@@ -81,8 +82,8 @@ multiple declarations the positional name selects one. A stored server query is
 its registry name alone. Parameters come inline, `--params '{"name":"Ada"}'`,
 or from a file, `--params-file params.json`. `--set NAME=VALUE`, repeatable,
 gives a [session setting](index.md#session-settings) a value for the run of
-`query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, `load`
-and `ingest`. The source may instead be one branch statement, `mutate -e
+`query`, `mutate`, `branch merge`, `commit changes`, `changes poll`, and `load`.
+The source may instead be one branch statement, `mutate -e
 'branch create b0'` or `query -e 'branch list'` (writes through `mutate`, the
 listing through `query`; no `--branch`, `--snapshot`, `--if-commit`, name, or
 params; see [Work with branches](index.md#work-with-branches)), or one
@@ -101,8 +102,7 @@ envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](..
 head. The id and rows share one pinned snapshot; use that id for a later
 conditional mutation.
 
-Successful `mutate --json`, `load --json`, and compatibility
-`ingest --json` responses include `commit`, the exact commit published by
+Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt. It contains `graph_commit_id`, optional `graph_branch`,
 `graph_manifest_version`, optional parent and merged-parent ids, optional
 `actor_id`, and `created_at` in Unix microseconds. A successful mutation
@@ -252,20 +252,20 @@ cluster: CLUSTER_ID
 api: https://control.example
 ```
 
-The context contains no secret. Cluster commands read it only from the selected
+The context contains no secret. Managed commands read it only from the selected
 `--config` directory, which defaults to `.`. Parent directories are not searched.
 Unknown fields, versions, malformed files, symbolic links, and files over
 16 KiB are refused. API addresses must be origins without credentials, path,
 query, or fragment. HTTPS is required except for exact localhost,
 127.0.0.1, and `[::1]` API hosts used for local integration.
 
-| Command with managed context | Behavior |
+| Managed command | Behavior |
 |---|---|
-| `cluster plan [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
-| `cluster apply --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
-| `cluster status [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
-| `cluster history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
-| `cluster cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+| `managed plan [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
+| `managed apply --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
+| `managed status [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
+| `managed history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
+| `managed cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
 
 See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
 
@@ -276,12 +276,12 @@ submission. Reuse that key with the same body
 to recover from an uncertain response; changing the body under a key is
 refused by the API. Retry cancellation or abandonment using the same run id.
 Plan and apply do not upload local files or infer a revision from uncommitted
-changes; `cluster push` explicitly prepares managed source. A saved plan retains the service's change lease
+changes; `managed push` explicitly prepares managed source. A saved plan retains the service's change lease
 until it is applied, abandoned, or expires under the API's rules.
 
 Plan and apply normally poll every two seconds for up to 300 seconds.
 `--timeout` accepts 1–3600 seconds. Reaching the deadline stops only the local
-wait; inspect `cluster status RUN_ID` to continue following the run.
+wait; inspect `managed status RUN_ID` to continue following the run.
 `--no-wait` prints the accepted run and exits 0. Every HTTP request has a
 10-second deadline and an 8 MiB response limit; redirects are refused.
 `--json` prints one API envelope to stdout with its provenance and
@@ -310,19 +310,19 @@ its API origin together:
 ```bash
 export OMNIGRAPH_CONTROL_API=https://control.example
 # Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
-omnigraph cluster apply --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
+omnigraph managed apply --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
 ```
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
 separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
 
-Without a context, existing direct cluster commands behave as before.
-`--direct` explicitly selects that path, ignoring even a malformed context;
-`cluster.yaml` still owns the storage root. Managed-only arguments with
-`--direct` or without a context refuse. Other cluster verbs, including
-`observe` and `force-unlock`, refuse when a managed context is present. API
-failures never trigger direct execution.
+Self-hosted `cluster` commands always ignore managed context. The `managed` family
+requires its own context, except creation and explicit-origin operation lookup;
+`--direct` is rejected. Managed API failures never trigger local deployment.
+Use `managed operation OPERATION_ID [--wait]` for service lifecycle observation;
+`managed status [RUN_ID]` reads cluster projections or a managed run. Self-hosted
+`cluster status --deployment-id ID` addresses a separate deployment receipt.
 
 ## Managed data access
 

@@ -322,9 +322,9 @@ fn token_arguments_bound_lifetime_and_refuse_removed_actions() {
     ] {
         assert!(graph_id(bad).is_err());
     }
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--clear"]).is_ok());
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token"]).is_ok());
-    assert!(Cli::try_parse_from(["omnigraph", "cluster", "token", "--actions", "read"]).is_err());
+    assert!(Cli::try_parse_from(["omnigraph", "managed", "token", "--clear"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "managed", "token"]).is_ok());
+    assert!(Cli::try_parse_from(["omnigraph", "managed", "token", "--actions", "read"]).is_err());
     assert!(
         Cli::try_parse_from(["omnigraph", "cluster", "status", "--direct"])
             .unwrap()

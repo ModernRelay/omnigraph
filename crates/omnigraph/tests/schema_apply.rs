@@ -92,6 +92,17 @@ async fn plan_schema_reports_supported_additive_change() {
 
     let preview = db.preview_schema_apply(&desired).await.unwrap();
     assert_eq!(preview.catalog.node_types.len(), 2);
+
+    let contract = db.schema_contract_digest();
+    // The served observational planner uses the accepted in-memory contract;
+    // it must neither reopen this root nor wait on a schema gate.
+    let parked = dir.path().with_extension("parked");
+    std::fs::rename(dir.path(), &parked).unwrap();
+    let observed = db.plan_schema_at_contract(&desired, &contract).unwrap();
+    std::fs::rename(&parked, dir.path()).unwrap();
+    assert_eq!(observed, plan);
+    db.apply_schema(&desired).await.unwrap();
+    assert!(db.plan_schema_at_contract(&desired, &contract).is_err());
 }
 
 #[tokio::test]

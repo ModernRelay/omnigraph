@@ -20,9 +20,9 @@ served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
 repair, cleanup, schema plan/apply, lint).\n  \
 control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
-Core deployment/recovery; policy & queries via --cluster).\n  \
+self-hosted deployment/recovery; policy & queries via --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
-MANAGED FOLDERS: cluster commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
+MANAGED FOLDERS: managed commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
@@ -71,14 +71,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
-    /// Address a cluster. Core apply/status/force-unlock/upgrade-ledger accept
+    /// Address a cluster. Cluster apply/status/force-unlock/upgrade-ledger accept
     /// a literal file://, s3:// or az:// storage root independently of local
     /// bundle files. Root-addressed apply reconciles an exact --deployment-id.
     /// Maintenance also accepts a cluster directory or a `clusters:` name from
     /// ~/.omnigraph/config.yaml; pair it with --graph to select the graph.
     /// Azure writes still require the cluster-root external admission wrapper
     /// and remain a qualification preview. Exclusive with a positional URI,
-    /// --store or --server; Core root commands also reject explicit --config.
+    /// --store or --server; root-addressed cluster commands also reject explicit --config.
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
@@ -365,10 +365,15 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Manage cluster configuration or the folder's selected managed cluster.
+    /// Deploy and inspect a self-hosted cluster through its server or storage root.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
+    },
+    /// Manage the selected folder's cluster through its managed service API.
+    Managed {
+        #[command(subcommand)]
+        command: ManagedCommand,
     },
 
     /// Policy administration and diagnostics against a cluster's applied bundles
@@ -516,13 +521,110 @@ pub(crate) enum BlobCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
+    Validate {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Produce a read-only plan against applied state, locally or through --server.
+    Plan {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a captured bundle. --server submits and waits for live activation;
+    /// direct storage apply requires stopped serving. With --cluster ROOT and
+    /// --deployment-id, reconcile the original deployment without source files.
+    Apply {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+        /// Original durable deployment identity; never allocates a retry.
+        #[arg(long)]
+        deployment_id: Option<String>,
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, requires = "deployment_id")]
+        writers_stopped: bool,
+        /// With --server, return after durable acceptance without waiting for completion.
+        #[arg(long)]
+        no_wait: bool,
+        /// With --server, bound the local wait (default 300s, maximum 3600s).
+        /// Expiry does not cancel accepted work.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+    },
+    /// Read deployment status without scanning graphs. --deployment-id selects
+    /// an exact durable receipt through --server or --cluster ROOT.
+    Status {
+        #[arg(long)]
+        deployment_id: Option<String>,
+        /// With --server, wait for this deployment's outcome.
+        #[arg(long, requires = "deployment_id")]
+        wait: bool,
+        /// Bound the local wait (default 300s, maximum 3600s); never cancels work.
+        #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect declared graphs and catalog payloads without acquiring writer
+    /// admission. Reports observed state with the exact ledger CAS it read.
+    Observe {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an exact persisted lock after stopping the owner and establishing
+    /// graph/control I/O quiescence, with admissions and other unlocks excluded.
+    ForceUnlock {
+        /// Exact lock id from cluster status or a state_lock_held diagnostic.
+        lock_id: String,
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Convert the stopped cluster ledger without resetting graphs or history.
+    UpgradeLedger {
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, required = true)]
+        writers_stopped: bool,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ManagedCommand {
     /// Create an empty managed cluster and bind an unbound folder to its identity.
     Create {
         name: String,
         #[arg(long)]
         api: String,
+        /// Unbound configuration folder to bind after creation.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -534,8 +636,10 @@ pub(crate) enum ClusterCommand {
         expected_revision: String,
         #[arg(long)]
         message: String,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
@@ -545,8 +649,10 @@ pub(crate) enum ClusterCommand {
         incarnation: String,
         #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u32).range(0..=2592000))]
         retention_seconds: u32,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -558,8 +664,10 @@ pub(crate) enum ClusterCommand {
         incarnation: String,
         #[arg(long)]
         deletion_id: String,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -567,8 +675,10 @@ pub(crate) enum ClusterCommand {
     },
     /// Cache an identity credential for this cluster, or forget it locally.
     Token {
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         /// Credential lifetime, 60 seconds to 24 hours (default 1h).
@@ -578,74 +688,59 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
-    Validate {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
+    /// Plan an exact pushed revision through the managed service.
     Plan {
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        /// Managed: select a pushed revision; omission uses the bound head.
-        #[arg(long = "rev", alias = "revision")]
+        /// Select a pushed revision; omission uses the bound head.
+        #[arg(long = "rev")]
         revision: Option<String>,
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Apply a captured bundle through the v2 deployment ledger. --server
-    /// updates the running server without restarting; direct storage apply
-    /// requires stopped serving. With --cluster ROOT and --deployment-id,
-    /// reconcile the original deployment without local source files.
+    /// Apply an exact saved plan run through the managed service.
     Apply {
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        /// Managed: apply this exact saved plan run. Required in managed mode.
+        /// Exact saved plan run to apply.
         #[arg(long)]
-        plan: Option<String>,
-        /// Original durable Core deployment identity; never allocates a retry.
-        #[arg(long, conflicts_with = "plan")]
-        deployment_id: Option<String>,
-        /// Attest prior writers and accepted graph/control I/O are quiescent.
-        #[arg(long, requires = "deployment_id")]
-        writers_stopped: bool,
+        plan: String,
         #[command(flatten)]
         managed: ManagedRunArgs,
     },
-    /// Read the cluster ledger without scanning live graphs; --cluster ROOT
-    /// supports source-independent lookup of an exact --deployment-id.
+    /// Read managed cluster projections or inspect an exact run.
     Status {
-        /// Managed: inspect a run instead of the cluster projections.
-        #[arg(conflicts_with = "operation")]
+        /// Inspect this run instead of the cluster projections.
         run_id: Option<String>,
-        /// Look up the exact durable Core deployment without opening graphs.
-        #[arg(long, conflicts_with_all = ["run_id", "operation", "api", "wait", "timeout"])]
-        deployment_id: Option<String>,
-        /// Managed: inspect a service lifecycle operation instead of a run.
+        /// Configuration folder containing the managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
-        operation: Option<String>,
-        /// Managed operation recovery before a folder context exists.
-        #[arg(long, requires = "operation")]
+        json: bool,
+    },
+    /// Inspect or wait for a managed service lifecycle operation.
+    Operation {
+        /// Exact service lifecycle operation.
+        operation_id: String,
+        /// API origin for recovery before a folder context exists.
+        #[arg(long)]
         api: Option<String>,
-        /// Poll a lifecycle operation to its canonical outcome.
-        #[arg(long, requires = "operation")]
+        /// Poll until the operation reaches its canonical outcome.
+        #[arg(long)]
         wait: bool,
-        /// Managed operation wait deadline (default 300, maximum 3600 seconds).
+        /// Local wait deadline in seconds (default 300, maximum 3600).
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: Option<u64>,
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
@@ -654,8 +749,10 @@ pub(crate) enum ClusterCommand {
     },
     /// Read managed run history with its provenance and outcomes.
     History {
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
@@ -667,38 +764,10 @@ pub(crate) enum ClusterCommand {
     /// Cancel a pending managed run, or abandon an unused saved plan.
     Cancel {
         run_id: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect declared graphs and catalog payloads without acquiring writer
-    /// admission. Reports observed state with the exact ledger CAS it read.
-    Observe {
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove an exact persisted lock after stopping the owner and establishing
-    /// graph/control I/O quiescence, with admissions and other unlocks excluded.
-    ForceUnlock {
-        /// Exact lock id from cluster status or a state_lock_held diagnostic.
-        lock_id: String,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Convert the stopped cluster ledger without resetting graphs or history.
-    UpgradeLedger {
-        /// Attest prior writers and accepted graph/control I/O are quiescent.
-        #[arg(long, required = true)]
-        writers_stopped: bool,
         #[arg(long)]
         json: bool,
     },
