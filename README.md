@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>Lakehouse graph database for context assembly &amp; multi-agent coordination</strong><br>
-  <sub>Multimodal retrieval · Git-style branching · object-storage native</sub>
+  <strong>Object-storage native graph database with branching and typed ontology.</strong><br>
+  <sub>Unified retrieval engine (vector/bm25/graph) · Git-style workflows · Open data format (Lance)</sub>
 </p>
 
 <p align="center">
@@ -259,18 +259,6 @@ Notes:
 - CI runs the same excluded command with `--locked` and the failpoint features
 - Full CI and some local test flows require `protobuf-compiler`
 - S3 integration tests expect an S3-compatible endpoint such as RustFS
-
-## Workspace Crates
-
-- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
-- `crates/omnigraph-storage`: shared local/S3/Azure control-object storage implementation and concrete backend handle
-- `crates/omnigraph-azure-admission`: narrow Azure Blob lease wrapper for the single-writer reference deployment
-- `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
-- `crates/omnigraph-policy`: Cedar policy compilation and enforcement
-- `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI
-- `crates/omnigraph-cluster`: cluster config validation, planning, and apply (the control plane)
-- `crates/omnigraph-server`: Axum HTTP server, cluster-first, runs N graphs under `/graphs/{id}/…`
-- `crates/omnigraph-cli`: CLI for graph lifecycle, query/mutate, branch/commit/merge, schema/lint, snapshot/export, cluster control, policy/queries, profiles, and maintenance
 
 ## Contributing
 
