@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-10
-updated: 2026-10-02
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,14 @@ blocked_on: []
 ---
 
 # RFC 0004: Cluster graph and schema apply
+
+> **Server runtime disposition:**
+> [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
+> replaced part of this RFC. Historical: the cluster recovery sidecar and sweep
+> (D2, D3), approval artifacts and `cluster approve` (D4), graph delete as a
+> deployment effect (D6), and `cluster import` / `cluster refresh` (D7).
+> Current: `cluster apply` as the entry point for graph create and
+> cluster-driven schema update.
 
 **Implementation deviations:** (1) D3 row 8 retires the stale delete sidecar and lets the still-approved delete re-propose and retry, instead of a pending-block — prefix removal is idempotent, so the retry is the repair. (2) The approver/actor flag is the CLI's existing global `--as`, not a dedicated `--actor`/`--by`. (3) Consumed approval artifacts are rewritten with `consumed_at` rather than moved into state — the file and the ledger record both survive independently (axiom 11).
 **Builds on:** cluster Stages 1–3B (shipped: validate/plan/status/refresh/import/force-unlock, config-only `cluster apply` with content-addressed catalog publish, catalog payload verification, failpoint-proven crash/CAS recovery for the apply protocol). Current normative context: [cluster control plane](../dev/control-plane.md).

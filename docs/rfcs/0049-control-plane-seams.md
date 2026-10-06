@@ -16,6 +16,15 @@ blocked_on: []
 
 # RFC 0049: Control-plane seams: observe, readiness witness, bounded shutdown
 
+> **Server runtime disposition:**
+> [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
+> removed `cluster refresh`, `cluster import`, and approval execution, refuses
+> `state.lock: false`, and added online activation. The current observe/apply
+> sections replace the former refresh analogy, unlocked label and approval
+> clause; the Summary reflects online activation. Historical: "the server never
+> reloads" below. Current: observe-only authority, the readiness witness and
+> inventory, and bounded shutdown.
+
 ## Summary
 
 Three small, independently shippable contracts let an external control plane
@@ -41,9 +50,9 @@ recovery protocol. The v0.12 availability amendment replaces the readiness and
 inventory response shapes with coordinated in-tree consumer changes and no
 legacy aliases. The wider
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-decision owns the initial loading listener and startup ownership. Deploying,
-startup retry remains separate; online activation is owned by that decision. Observe-only authority and the absolute
-shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
+decision owns the initial loading listener, startup ownership and online
+activation. Startup retry remains separate. Observe-only authority and the
+absolute shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
 its real use arrives with coherent restore points, where the ledger and the graphs come back
 together, and it will be designed once, against those.
 

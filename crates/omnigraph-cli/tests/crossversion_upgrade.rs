@@ -1610,7 +1610,7 @@ fn journey_fixture(directory: &Path) -> [PathBuf; 3] {
             std::fs::read_to_string(fixture("search.jsonl"))
                 .unwrap()
                 .trim_end(),
-            r#"{"edge":"Cites","id":"citation-1","from":"ml-intro","to":"dl-basics","data":{"note":"preserved edge"}}"#,
+            r#"{"edge":"Cites","from":"ml-intro","to":"dl-basics","data":{"note":"preserved edge"}}"#,
         ),
     )
     .unwrap();
@@ -1799,9 +1799,9 @@ fn genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history() {
     storage_upgrade_preserves_history(&old, 8, V8_HANDLER, Some(born_with));
 }
 
-/// Stamp 9 as the released 0.11.0's default `upgrade` (6 to 7 to 8 to 9, main
-/// alone) leaves a branched 0.10.0 graph: the commits before the system-column
-/// respelling pin `id`/`src`/`dst` tables under the one `__id` root contract.
+/// Stamp 9 that the released 0.11.0's default `upgrade` (6 to 7 to 8 to 9) writes from 0.10.0:
+/// the route needs a graph with only main, so 0.10.0 merges and deletes `review` first, and main's
+/// pre-respelling commits pin `id`/`src`/`dst` tables under the one `__id` root contract.
 #[test]
 fn genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history() {
     let (Some(old), Some(born_with)) = (v011_bin(), v6_bin_for_storage_upgrade()) else {
@@ -1814,9 +1814,9 @@ fn genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history() {
     storage_upgrade_preserves_history(&old, 9, V9_HANDLER, Some(born_with));
 }
 
-/// The 0.10.x CLI that wrote a journey graph before the released 0.11.0 took
-/// it over, and the `--to-format` that 0.11.0 `upgrade` was given (`None`: its
-/// default target).
+/// The 0.10.x CLI that wrote a journey graph before the released 0.11.0 took it over, and the
+/// `--to-format` 0.11.0 `upgrade` was given (`None`: its default, 9). A route ending at v9 needs a
+/// graph with only main, so the journey merges and deletes `review` before it.
 struct BornWith<'a> {
     binary: &'a Path,
     to_format: Option<u32>,
@@ -1982,11 +1982,20 @@ fn storage_upgrade_preserves_history(
         branch(binary, &["create", "temp"]);
         mutate(binary, "retitle", "temp", r#"{"title":"organism temp"}"#);
     };
+    let merge_and_delete_review = |binary: &Path| {
+        branch(binary, &["merge", "review", "--into", "main"]);
+        branch(binary, &["delete", "review"]);
+    };
     branch(first, &["create", "review"]);
     mutate(first, "retitle", "main", r#"{"title":"organism main"}"#);
     mutate(first, "remove", "review", "{}");
+    let main_alone = born_with.is_some() && source_format == 9;
     let written_before_conversion = born_with.as_ref().map(|born| {
-        fork_temp(born.binary);
+        if main_alone {
+            merge_and_delete_review(born.binary);
+        } else {
+            fork_temp(born.binary);
+        }
         let explicit = born.to_format.map(|format| format.to_string());
         let mut args = vec!["upgrade", uri, "--json"];
         if let Some(explicit) = &explicit {
@@ -2021,8 +2030,9 @@ fn storage_upgrade_preserves_history(
         assert!(ids.len() >= 2, "{ids:?}");
         ids
     });
-    branch(old, &["merge", "review", "--into", "main"]);
-    branch(old, &["delete", "review"]);
+    if !main_alone {
+        merge_and_delete_review(old);
+    }
     branch(old, &["create", "review"]);
     mutate(
         old,
@@ -2030,7 +2040,8 @@ fn storage_upgrade_preserves_history(
         "review",
         r#"{"title":"organism recreated"}"#,
     );
-    if born_with.is_none() {
+    let child_forks_at_the_temp_commit = born_with.is_none() || main_alone;
+    if child_forks_at_the_temp_commit {
         fork_temp(old);
     }
     branch(old, &["create", "child", "--from", "temp"]);
@@ -2072,7 +2083,8 @@ fn storage_upgrade_preserves_history(
             .count(),
         1,
         "`child` inherits the one commit of the deleted `temp`; neither binary selects a commit \
-         of a deleted branch by id, so it is read through `child`: {}",
+         of a deleted branch by id, so `check_history` reads it through `child` where `child` \
+         forks at it: {}",
         histories[2]
     );
     assert!(
@@ -2084,8 +2096,8 @@ fn storage_upgrade_preserves_history(
         for id in ids {
             assert!(
                 historical_rows.contains_key(id),
-                "commit {id}, written before the predecessor's conversion, must be read before \
-                 and after the upgrade: {:?}",
+                "commit {id}, listed on main right after the predecessor's conversion, must be \
+                 read before and after the upgrade: {:?}",
                 historical_rows.keys().collect::<Vec<_>>()
             );
         }
@@ -2271,7 +2283,9 @@ fn storage_upgrade_preserves_history(
                 for commit in histories[index].as_array().unwrap() {
                     let written_on = commit["graph_branch"].as_str().unwrap_or("main");
                     let selector = match (written_on, branch) {
-                        ("temp", "child") => ReadTarget::branch("child"),
+                        ("temp", "child") if child_forks_at_the_temp_commit => {
+                            ReadTarget::branch("child")
+                        }
                         (written_on, branch) if written_on == branch => {
                             ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
                                 commit["graph_commit_id"].as_str().unwrap(),
@@ -2408,13 +2422,16 @@ fn storage_upgrade_preserves_history(
             }
             pins
         });
-    for policy in [["--keep", "4"], ["--older-than", "7d"]] {
-        output_success(
-            cli()
-                .args(["cleanup", uri])
-                .args(policy)
-                .args(["--confirm", "--json"]),
-        );
+    let kept = support::parse_stdout_json(&output_success(cli().args([
+        "cleanup",
+        uri,
+        "--keep",
+        "4",
+        "--confirm",
+        "--json",
+    ])));
+    for dataset in kept["datasets"].as_array().unwrap() {
+        assert!(dataset["error"].is_null(), "`cleanup --keep 4`: {kept}");
     }
     assert_eq!(
         journey_rows(None, uri, query_path, "--branch", "main", "docs"),
@@ -2498,9 +2515,9 @@ fn storage_upgrade_preserves_history(
     }
 }
 
-/// Stamp 9 after the released 0.11.0 ran `optimize` and `cleanup --keep 1`:
-/// retained `__manifest` versions then pin table versions that are gone, so
-/// the first `cleanup` after the upgrade has to be `--keep 1`.
+/// Stamp 9 after the released 0.11.0 ran `optimize` and `cleanup --keep 1`: pre-upgrade versions
+/// of main's and review's `__manifest` pin table versions that are gone, and `cleanup` keeps every
+/// one of them, so a policy that retains them refuses those tables.
 #[test]
 fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     const LIVE_BRANCHES: [&str; 2] = ["main", "review"];
@@ -2660,40 +2677,82 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         "branch", "merge", "review", "--into", "main", "--uri", uri, "--json",
     ]));
     let heads = head_exports();
-    let objects = graph_files(&graph);
-    let refused = cli()
-        .args(["cleanup", uri, "--older-than", "7d", "--confirm", "--json"])
-        .output()
-        .unwrap();
-    let reported = format!(
-        "{}{}",
-        String::from_utf8_lossy(&refused.stdout),
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(
-        reported.contains("is absent from the listing"),
-        "`cleanup --older-than` must refuse while pre-upgrade `__manifest` versions are \
-         retained: {reported}"
-    );
-    let left = graph_files(&graph);
-    for object in objects.keys() {
-        assert!(
-            left.contains_key(object),
-            "a refused cleanup must delete nothing, {} is gone",
-            object.display()
-        );
-    }
-    assert_eq!(head_exports(), heads);
-    for policy in [["--keep", "1"], ["--older-than", "7d"]] {
+    let refuses = |policy: &[&str], when: &str| {
         let report = support::parse_stdout_json(&output_success(
             cli()
                 .args(["cleanup", uri])
                 .args(policy)
                 .args(["--confirm", "--json"]),
         ));
-        for dataset in report["datasets"].as_array().unwrap() {
-            assert!(dataset["error"].is_null(), "{policy:?}: {report}");
-        }
-        assert_eq!(head_exports(), heads, "{policy:?}");
+        let refused: Vec<&serde_json::Value> = report["datasets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|dataset| !dataset["error"].is_null())
+            .collect();
+        assert!(
+            refused.iter().any(|dataset| {
+                dataset["error"].as_str().unwrap().split("; ").any(|reason| {
+                    reason.contains("linear version ")
+                        && reason.ends_with(
+                            ", pinned by a retained `__manifest` version, is absent from the listing",
+                        )
+                })
+            }),
+            "`cleanup {}` must refuse a table on a pre-upgrade linear pin ({when}): {report}",
+            policy.join(" ")
+        );
+        assert_eq!(head_exports(), heads, "{} ({when})", policy.join(" "));
+    };
+    refuses(
+        &["--older-than", "7d"],
+        "after the upgrade, a write and a merge",
+    );
+    let manifest_versions: Vec<PathBuf> = graph_files(&graph)
+        .into_keys()
+        .filter(|path| {
+            path.starts_with("__manifest")
+                && path
+                    .components()
+                    .any(|part| part.as_os_str() == "_versions")
+        })
+        .collect();
+    let kept = support::parse_stdout_json(&output_success(cli().args([
+        "cleanup",
+        uri,
+        "--keep",
+        "1",
+        "--confirm",
+        "--json",
+    ])));
+    let datasets = kept["datasets"].as_array().unwrap();
+    for dataset in datasets {
+        assert!(dataset["error"].is_null(), "`cleanup --keep 1`: {kept}");
     }
+    let left = graph_files(&graph);
+    for path in &manifest_versions {
+        assert!(
+            left.contains_key(path),
+            "`cleanup --keep 1` must keep every version of main's and review's `__manifest`, {} is gone",
+            path.display()
+        );
+    }
+    assert_eq!(head_exports(), heads, "--keep 1");
+    refuses(&["--older-than", "7d"], "after `cleanup --keep 1`");
+    refuses(&["--keep", "100"], "with every commit inside the policy");
+    let aged = support::parse_stdout_json(&output_success(cli().args([
+        "cleanup",
+        uri,
+        "--older-than",
+        "0s",
+        "--confirm",
+        "--json",
+    ])));
+    for dataset in aged["datasets"].as_array().unwrap() {
+        assert!(
+            dataset["error"].is_null(),
+            "`cleanup --older-than 0s`: {aged}"
+        );
+    }
+    assert_eq!(head_exports(), heads, "--older-than 0s");
 }

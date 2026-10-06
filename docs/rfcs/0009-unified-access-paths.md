@@ -15,6 +15,14 @@ blocked_on: []
 ---
 
 # RFC 0009: Unified embedded and remote access paths
+
+> **RFC 0011 disposition:** [RFC 0011](0011-cli-addressing-and-config.md) owns
+> addressing and the capability set. Historical: the Phase 3 sentence on
+> `RemoteClient` addressing inputs, Phase 4's `Storage | Server | Both`
+> declaration, and the Open question 3 answer on `graphs list`. Current: the
+> parity matrix, `omnigraph-api-types`, `GraphClient` with its embedded and
+> remote implementations, and the Phase 5 route alignment.
+
 **Audience:** engine/CLI/server maintainers
 **Builds on:** [RFC 0007](0007-operator-config.md)
 (landed — `--server` targeting and operator aliases are remote-addressing
