@@ -208,7 +208,7 @@ Cedar/default-deny semantics.
 ### Managed CLI data access
 
 The companion issuance API supplies a data endpoint and signed credential.
-`omnigraph managed token --config DIR --ttl 1h` requests a version-2 identity
+`omnigraph cluster token --managed --config DIR --ttl 1h` requests a version-2 identity
 credential. TTL defaults to 3,600 seconds and must be 60–86,400 seconds.
 Issuance adds no policy permissions. `--clear` instead
 forgets the selected cluster's local data credential. Token command output is
@@ -282,7 +282,7 @@ authentication work. No deny-list exception is requested.
 
 Existing deployments without trust are unchanged. New credentials do not work
 on old servers; they cannot degrade into static credentials. Version-1 restricted tokens, their public data types, and CLI `--actions` are
-removed. Old caches refuse without replacement; `managed token` explicitly
+removed. Old caches refuse without replacement; `cluster token --managed` explicitly
 obtains a current credential. Removing the trust flag disables signed credentials deliberately. The trust supplier must
 not leave a token-only deployment in unauthenticated mode after rollback.
 No graph storage, ledger, manifest, policy-file, or managed-marker format
@@ -423,6 +423,7 @@ engine and storage behavior was preserved. The
 later CLI diagnostic-redaction fix is covered by its focused regression and
 does not change the successfully qualified data path.
 
-2026-10-06: Credential-administration examples now use `managed token` under
-the explicit service namespace from [RFC 0052](0052-managed-control-plane-cli.md).
+2026-10-06: Managed CLI data access and Compatibility replace the token command
+spelling with `cluster token --managed`, using the explicit service mode from
+[RFC 0052](0052-managed-control-plane-cli.md).
 Credential format, acquisition and authorization are unchanged.

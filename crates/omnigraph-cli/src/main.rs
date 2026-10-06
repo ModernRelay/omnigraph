@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
             None
         };
         let cli = Cli::from_arg_matches(&matches)?;
-        if let Err(error) = validate_core_root_arguments(&cli, command_matches) {
+        if let Err(error) = validate_cluster_arguments(&cli, command_matches) {
             error.exit();
         }
         (cli, machine)
@@ -256,22 +256,105 @@ async fn main() -> Result<()> {
 
 /// Cross-level argument relations must be checked after Clap propagates global
 /// values: subcommand validation cannot see `--cluster` given before `cluster`.
-fn validate_core_root_arguments(
+fn validate_cluster_arguments(
     cli: &Cli,
     command_matches: &clap::ArgMatches,
 ) -> std::result::Result<(), clap::Error> {
-    let Command::Cluster { command } = &cli.command else {
+    let Command::Cluster { managed, command } = &cli.command else {
         return Ok(());
     };
+    let conflict =
+        |message| Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+    if *managed {
+        match command {
+            ClusterCommand::Validate { .. }
+            | ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::UpgradeLedger { .. } => {
+                return Err(conflict("this command cannot be used with --managed"));
+            }
+            ClusterCommand::Apply {
+                deployment_id,
+                writers_stopped,
+                plan,
+                ..
+            } => {
+                if deployment_id.is_some() || *writers_stopped {
+                    return Err(conflict(
+                        "--deployment-id and --writers-stopped cannot be used with --managed",
+                    ));
+                }
+                if plan.is_none() {
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "cluster apply --managed requires --plan <PLAN_ID>",
+                    ));
+                }
+            }
+            ClusterCommand::Status {
+                deployment_id,
+                wait,
+                timeout,
+                ..
+            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+                return Err(conflict(
+                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                ));
+            }
+            _ => {}
+        }
+        // The managed dispatcher rejects competing target selectors before
+        // reading context, preserving its structured scope diagnostics.
+        return Ok(());
+    }
+    match command {
+        ClusterCommand::Create { .. }
+        | ClusterCommand::Push { .. }
+        | ClusterCommand::Delete { .. }
+        | ClusterCommand::UndoDelete { .. }
+        | ClusterCommand::Token { .. }
+        | ClusterCommand::Operation { .. }
+        | ClusterCommand::History { .. }
+        | ClusterCommand::Cancel { .. } => {
+            return Err(conflict("this command requires --managed"));
+        }
+        ClusterCommand::Plan { revision, run, .. }
+            if revision.is_some()
+                || run.no_wait
+                || run.timeout.is_some()
+                || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict(
+                "plan options --rev, --no-wait, --timeout and --idempotency-key require --managed",
+            ));
+        }
+        ClusterCommand::Apply { plan, run, .. }
+            if plan.is_some() || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict("--plan and --idempotency-key require --managed"));
+        }
+        ClusterCommand::Status {
+            run_id: Some(_), ..
+        } => {
+            return Err(conflict(
+                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+            ));
+        }
+        _ => {}
+    }
     if cli.server.is_none()
         && matches!(
             command,
-            ClusterCommand::Apply { no_wait: true, .. }
-                | ClusterCommand::Apply {
+            ClusterCommand::Apply {
+                run: ClusterRunArgs { no_wait: true, .. },
+                ..
+            } | ClusterCommand::Apply {
+                run: ClusterRunArgs {
                     timeout: Some(_),
                     ..
-                }
-                | ClusterCommand::Status { wait: true, .. }
+                },
+                ..
+            } | ClusterCommand::Status { wait: true, .. }
         )
     {
         return Err(Cli::command().error(
@@ -1987,8 +2070,17 @@ async fn run(cli: Cli) -> Result<()> {
                     finish_cluster_force_unlock(&output, json)?;
                 }
             }
+            ClusterCommand::Create { .. }
+            | ClusterCommand::Push { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Operation { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => {
+                unreachable!("managed cluster commands dispatch first")
+            }
         },
-        Command::Managed { .. } => unreachable!("managed commands dispatch before Core"),
         Command::Graphs { command } => match command {
             GraphsCommand::List { json, discovery } => {
                 let (client, discovery) = if let Some(client) = managed_data {

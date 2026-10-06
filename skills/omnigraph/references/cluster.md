@@ -161,8 +161,9 @@ Deployment across graphs is not one transaction.
 | `~/.omnigraph/config.yaml` | per-operator: identity (`operator.actor`), named `servers:`, output defaults, personal aliases | data-plane CLI commands (tokens live in `~/.omnigraph/credentials` via `omnigraph login`) |
 
 Direct cluster commands use the operator actor default when `--as` is omitted
-(`--as` > `operator.actor`). `cluster` always selects self-hosted deployment,
-independent of managed context; `managed` selects the service API described below.
+(`--as` > `operator.actor`). `cluster` selects self-hosted deployment unless
+`--managed` explicitly selects the service API described below. Folder context
+never selects the mode.
 A `--cluster` server never reads the operator file: its configuration comes from
 applied cluster state.
 Address a cluster-managed graph's data via `--server`/aliases against the
@@ -223,8 +224,8 @@ An Intent API can own the control plane while the same CLI operates it:
 ```bash
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config .
-omnigraph managed plan --config . --json
-omnigraph managed apply --plan PLAN_RUN_ID --config . --json
+omnigraph cluster plan --managed --config . --json
+omnigraph cluster apply --managed --plan PLAN_RUN_ID --config . --json
 omnigraph query find_person --graph knowledge --params '{"name":"Alice"}' --json
 ```
 
@@ -240,27 +241,29 @@ ordinary routing; global `--direct` selects ordinary ambient defaults. Missing
 or malformed managed authority refuses without fallback, and competing ambient
 targets require an explicit choice.
 
-Managed creation, config upload, deletion and undo use `managed create`, `push`,
-`delete` and `undo-delete`. `managed status [RUN_ID]` reads cluster projections or
-one run; `managed operation ID [--wait]` observes a lifecycle operation. Durable
+Managed creation, config upload, deletion and undo use `cluster create`, `push`,
+`delete` and `undo-delete`, each with `--managed`.
+`cluster status --managed [RUN_ID]` reads cluster projections or one run;
+`cluster operation --managed ID [--wait]` observes a lifecycle operation. Durable
 operation records bind uncertain submissions to their exact identity. Reconcile
 the existing operation before issuing another.
 
-- **Schema/config changes**: commit, `managed push --expected-revision <rev>
-  --message …`, `managed plan --rev <new>`, then `managed apply --plan <run>`.
+- **Schema/config changes**: commit, `cluster push --managed --expected-revision <rev>
+  --message …`, `cluster plan --managed --rev <new>`, then `cluster apply --managed --plan <run>`.
   The Intent API executes the apply; there is no local `--as` or approval step.
-- **Explicit namespace**: `managed` requires context, except creation and
-  explicit-origin operation lookup. `cluster` ignores context and needs no
+- **Explicit mode**: `--managed` requires context, except creation and
+  explicit-origin operation lookup. Without it, `cluster` ignores context and needs no
   `--direct` escape. Managed operations reject `--direct`, `--as`, `--server`,
   `--profile`, `--graph`, `--store`, and `--cluster`; failures never fall back to
-  local deployment.
+  local deployment. Service-only verbs require `--managed`; `validate`,
+  `observe`, `force-unlock`, and `upgrade-ledger` reject it.
 - **Sessions** from `login --api` hold an access credential of at most 15
   minutes that renews silently for up to eight hours after sign-in; then log
   in again. For unattended runs, set `OMNIGRAPH_CONTROL_API` and
   `OMNIGRAPH_CONTROL_TOKEN` together; reuse the same `--idempotency-key` after
   an uncertain response.
 - **Data credentials**: graph commands acquire an identity credential on
-  their own; `managed token [--ttl 1h]` issues one explicitly (TTL 60s–24h,
+  their own; `cluster token --managed [--ttl 1h]` issues one explicitly (TTL 60s–24h,
   default 1h) and `--clear` forgets the local copy without revoking it. Only
   identity credentials are supported: they carry no graph or action grants,
   and the applied Cedar policy must permit the authenticated actor.

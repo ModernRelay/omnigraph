@@ -387,7 +387,11 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
     let Some(server) = cli.server.as_deref() else {
         return Ok(false);
     };
-    let Command::Cluster { command } = &cli.command else {
+    let Command::Cluster {
+        managed: false,
+        command,
+    } = &cli.command
+    else {
         return Ok(false);
     };
     if !matches!(
@@ -416,17 +420,22 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
     }
     let remote = RemoteCluster::new(server)?;
     match command {
-        ClusterCommand::Plan { config, json } => remote.plan(config, *json).await?,
+        ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json).await?,
         ClusterCommand::Apply {
             config,
             deployment_id,
             json,
-            no_wait,
-            timeout,
+            run,
             ..
         } => {
             remote
-                .apply(config, deployment_id.as_deref(), *json, *no_wait, *timeout)
+                .apply(
+                    config,
+                    deployment_id.as_deref(),
+                    *json,
+                    run.no_wait,
+                    run.timeout,
+                )
                 .await?
         }
         ClusterCommand::Status {

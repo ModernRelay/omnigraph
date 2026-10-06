@@ -23,6 +23,11 @@ roots are derived as `graphs/<graph_id>.omni` beneath that root.
 
 ## Managed CLI sessions
 
+Cluster control selects the service only with explicit `--managed`; folder
+context supplies identity after selection and never redirects direct/server
+deployment. The CLI rejects conflicting targets and wrong-mode flags before
+context, credentials, HTTP, or storage access. Data-command context is separate.
+
 The CLI's managed HTTP adapter obtains current access before each new request,
 including status polls. A rotating credential pair lives only in the OS
 keychain, independently of configuration directories and graph credentials.

@@ -20,9 +20,9 @@ served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
 repair, cleanup, schema plan/apply, lint).\n  \
 control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
-self-hosted deployment/recovery; policy & queries via --cluster).\n  \
+self-hosted deployment/recovery; --managed for the managed service; policy & queries via --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
-MANAGED FOLDERS: managed commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
+MANAGED FOLDERS: cluster --managed uses .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
@@ -365,15 +365,14 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Deploy and inspect a self-hosted cluster through its server or storage root.
+    /// Deploy and inspect a cluster; --managed selects its managed service API.
     Cluster {
+        /// Use the managed service and the selected folder's .omnigraph/context.
+        /// Never inferred from context; incompatible with other target selectors.
+        #[arg(long, global = true)]
+        managed: bool,
         #[command(subcommand)]
         command: ClusterCommand,
-    },
-    /// Manage the selected folder's cluster through its managed service API.
-    Managed {
-        #[command(subcommand)]
-        command: ManagedCommand,
     },
 
     /// Policy administration and diagnostics against a cluster's applied bundles
@@ -530,18 +529,25 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Produce a read-only plan against applied state, locally or through --server.
+    /// Preview local configuration against storage or --server; with --managed,
+    /// plan a pushed revision (--rev, or the bound head).
     Plan {
-        /// Directory containing cluster.yaml.
+        /// Directory containing cluster.yaml or the managed folder context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
+        /// With --managed, select an exact pushed revision.
+        #[arg(long = "rev")]
+        revision: Option<String>,
+        #[command(flatten)]
+        run: ClusterRunArgs,
     },
     /// Apply a captured bundle. --server submits and waits for live activation;
     /// direct storage apply requires stopped serving. With --cluster ROOT and
     /// --deployment-id, reconcile the original deployment without source files.
+    /// With --managed, apply an exact saved --plan instead.
     Apply {
         /// Directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
@@ -555,17 +561,18 @@ pub(crate) enum ClusterCommand {
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,
-        /// With --server, return after durable acceptance without waiting for completion.
+        /// With --managed, the exact saved plan run to apply (required).
         #[arg(long)]
-        no_wait: bool,
-        /// With --server, bound the local wait (default 300s, maximum 3600s).
-        /// Expiry does not cancel accepted work.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout: Option<u64>,
+        plan: Option<String>,
+        #[command(flatten)]
+        run: ClusterRunArgs,
     },
     /// Read deployment status without scanning graphs. --deployment-id selects
     /// an exact durable receipt through --server or --cluster ROOT.
+    /// With --managed, read cluster projections or a positional RUN_ID.
     Status {
+        /// With --managed, inspect this exact run instead of cluster projections.
+        run_id: Option<String>,
         #[arg(long)]
         deployment_id: Option<String>,
         /// With --server, wait for this deployment's outcome.
@@ -612,11 +619,7 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ManagedCommand {
-    /// Create an empty managed cluster and bind an unbound folder to its identity.
+    /// With --managed, create an empty cluster and bind an unbound folder to its identity.
     Create {
         name: String,
         #[arg(long)]
@@ -628,9 +631,9 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Upload only referenced configuration files to the managed repository.
+    /// With --managed, upload only referenced configuration files to the managed repository.
     Push {
         #[arg(long)]
         expected_revision: String,
@@ -643,7 +646,7 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Delete this exact managed incarnation; nonzero retention waits to tombstone.
+    /// With --managed, delete this exact incarnation; nonzero retention waits to tombstone.
     Delete {
         #[arg(long)]
         incarnation: String,
@@ -656,9 +659,9 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Undo an exact retained deletion through the ordinary managed bootstrap.
+    /// With --managed, undo an exact retained deletion through the ordinary managed bootstrap.
     UndoDelete {
         #[arg(long)]
         incarnation: String,
@@ -671,9 +674,9 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Cache an identity credential for this cluster, or forget it locally.
+    /// With --managed, cache an identity credential for this cluster, or forget it locally.
     Token {
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -688,46 +691,7 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// Plan an exact pushed revision through the managed service.
-    Plan {
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Select a pushed revision; omission uses the bound head.
-        #[arg(long = "rev")]
-        revision: Option<String>,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Apply an exact saved plan run through the managed service.
-    Apply {
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Exact saved plan run to apply.
-        #[arg(long)]
-        plan: String,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Read managed cluster projections or inspect an exact run.
-    Status {
-        /// Inspect this run instead of the cluster projections.
-        run_id: Option<String>,
-        /// Configuration folder containing the managed context.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect or wait for a managed service lifecycle operation.
+    /// With --managed, inspect or wait for a service lifecycle operation.
     Operation {
         /// Exact service lifecycle operation.
         operation_id: String,
@@ -747,7 +711,7 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Read managed run history with its provenance and outcomes.
+    /// With --managed, read run history with its provenance and outcomes.
     History {
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -761,7 +725,7 @@ pub(crate) enum ManagedCommand {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Cancel a pending managed run, or abandon an unused saved plan.
+    /// With --managed, cancel a pending run, or abandon an unused saved plan.
     Cancel {
         run_id: String,
         /// Configuration folder containing the managed context.
@@ -774,14 +738,15 @@ pub(crate) enum ManagedCommand {
 }
 
 #[derive(Debug, Default, Args)]
-pub(crate) struct ManagedRunArgs {
-    /// Return the accepted managed run without waiting for its outcome.
+pub(crate) struct ClusterRunArgs {
+    /// For served apply or managed operations, return after acceptance without waiting for completion.
     #[arg(long)]
     pub(crate) no_wait: bool,
-    /// Managed wait deadline in seconds (default 300, maximum 3600).
+    /// For served apply or managed operations, bound the local wait in seconds (default 300, maximum 3600).
+    /// Expiry does not cancel accepted work.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub(crate) timeout: Option<u64>,
-    /// Reuse this key to safely replay the same managed request.
+    /// With --managed, reuse this key to safely replay the same request.
     #[arg(long)]
     pub(crate) idempotency_key: Option<String>,
 }

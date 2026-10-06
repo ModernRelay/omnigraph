@@ -3,6 +3,8 @@
 These commands use your managed service identity and permissions. They do not
 open graph storage or require cloud credentials. The service must support
 cluster creation and lifecycle operations; an older service returns a refusal.
+Every command below requires explicit `--managed`; folder context alone never
+selects the service for a cluster command.
 
 ## Create an empty cluster
 
@@ -11,7 +13,7 @@ Log in to your control API, then use an unbound configuration directory:
 ```sh
 omnigraph login --api https://control.example
 mkdir customer-demo
-omnigraph managed create customer-demo --api https://control.example \
+omnigraph cluster create --managed customer-demo --api https://control.example \
   --config customer-demo --no-wait --json
 ```
 
@@ -28,8 +30,8 @@ sets a local 1–3600-second deadline; the default is 300. A timeout does not
 cancel creation. Follow the saved operation explicitly:
 
 ```sh
-omnigraph managed operation OPERATION_ID --config customer-demo --json
-omnigraph managed operation OPERATION_ID --api https://control.example \
+omnigraph cluster operation --managed OPERATION_ID --config customer-demo --json
+omnigraph cluster operation --managed OPERATION_ID --api https://control.example \
   --wait --timeout 600 --json
 ```
 
@@ -56,14 +58,14 @@ Create `customer-demo/catalog.pg` with your graph schema, then read the current
 managed revision before submitting the edit:
 
 ```sh
-omnigraph managed status --config customer-demo --json
+omnigraph cluster status --managed --config customer-demo --json
 # Use data.requested.revision from that response.
-omnigraph managed push --config customer-demo --expected-revision COMMIT \
+omnigraph cluster push --managed --config customer-demo --expected-revision COMMIT \
   --message "Add the knowledge graph" --json
 # Use data.revision returned by push.
-omnigraph managed plan --config customer-demo --rev NEW_COMMIT --json
+omnigraph cluster plan --managed --config customer-demo --rev NEW_COMMIT --json
 # Use data.run_id from the converged plan.
-omnigraph managed apply --config customer-demo --plan PLAN_RUN_ID --json
+omnigraph cluster apply --managed --config customer-demo --plan PLAN_RUN_ID --json
 ```
 
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
@@ -86,7 +88,7 @@ permission and never executes a plan; `apply` requires its separate permission.
 Use the exact incarnation from your cluster's response:
 
 ```sh
-omnigraph managed delete --config customer-demo --incarnation INCARNATION \
+omnigraph cluster delete --managed --config customer-demo --incarnation INCARNATION \
   --idempotency-key customer-demo-delete --json
 ```
 
@@ -105,7 +107,7 @@ Before the deadline and irreversible retirement, request undo of the exact
 deletion operation:
 
 ```sh
-omnigraph managed undo-delete --config customer-demo --incarnation INCARNATION \
+omnigraph cluster undo-delete --managed --config customer-demo --incarnation INCARNATION \
   --deletion-id DELETE_OPERATION_ID --json
 ```
 

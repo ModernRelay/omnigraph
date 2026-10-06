@@ -1,5 +1,4 @@
-//! Cluster command surface: validate/plan/apply/status/sync/force-unlock.
-//! Moved verbatim from tests/cli.rs in the modularization.
+//! Direct, served, and explicitly selected managed cluster command workflows.
 
 use serde_json::Value;
 use std::fs;
@@ -518,8 +517,9 @@ fn managed_lifecycle_uncertain_create_reuses_durable_key_and_preserves_context()
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
                 .args([
-                    "managed",
+                    "cluster",
                     "create",
+                    "--managed",
                     name,
                     "--api",
                     &api.origin,
@@ -613,8 +613,9 @@ fn managed_lifecycle_pending_is_principal_bound_across_session_renewal() {
             .env("OMNIGRAPH_CONTROL_TOKEN", token)
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "managed",
+                "cluster",
                 "create",
+                "--managed",
                 "new-name",
                 "--api",
                 &api.origin,
@@ -695,8 +696,9 @@ fn managed_lifecycle_definitive_first_refusal_releases_pending_intent() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "managed",
+                "cluster",
                 "create",
+                "--managed",
                 name,
                 "--api",
                 &api.origin,
@@ -762,8 +764,9 @@ fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
                 .current_dir(temp.path())
                 .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
                 .env("OMNIGRAPH_CONTROL_API", &api.origin)
-                .arg("managed")
+                .arg("cluster")
                 .args(args)
+                .arg("--managed")
                 .args(["--no-wait", "--idempotency-key", "exact-intent", "--json"]),
         );
         assert_eq!(parse_stdout_json(&output)["data"]["kind"], kind);
@@ -798,8 +801,9 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "managed",
+                "cluster",
                 "delete",
+                "--managed",
                 "--incarnation",
                 "inc-one",
                 "--timeout",
@@ -832,8 +836,9 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "operation",
+            "--managed",
             "operation-one",
             "--api",
             &api.origin,
@@ -861,8 +866,9 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "create",
+            "--managed",
             "new",
             "--api",
             &api.origin,
@@ -888,8 +894,9 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "create",
+            "--managed",
             "new",
             "--api",
             &api.origin,
@@ -938,8 +945,9 @@ fn managed_lifecycle_push_sends_only_complete_referenced_files() {
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "managed",
+                "cluster",
                 "push",
+                "--managed",
                 "--expected-revision",
                 &"b".repeat(40),
                 "--message",
@@ -989,8 +997,9 @@ fn managed_lifecycle_push_refuses_unsafe_paths_and_oversized_files_before_http()
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
             .env("OMNIGRAPH_CONTROL_API", &api.origin)
             .args([
-                "managed",
+                "cluster",
                 "push",
+                "--managed",
                 "--expected-revision",
                 &"b".repeat(40),
                 "--message",
@@ -1024,8 +1033,9 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "create",
+            "--managed",
             "locked",
             "--api",
             &api.origin,
@@ -1048,17 +1058,26 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
     drop(lock);
     for args in [
         vec![
-            "managed",
+            "cluster",
             "create",
+            "--managed",
             "direct",
             "--api",
             &api.origin,
             "--direct",
         ],
-        vec!["managed", "delete", "--incarnation", "inc-one", "--direct"],
         vec![
-            "managed",
+            "cluster",
+            "delete",
+            "--managed",
+            "--incarnation",
+            "inc-one",
+            "--direct",
+        ],
+        vec![
+            "cluster",
             "undo-delete",
+            "--managed",
             "--incarnation",
             "inc-one",
             "--deletion-id",
@@ -1066,8 +1085,9 @@ fn managed_lifecycle_local_lock_and_direct_flags_refuse_without_submission() {
             "--direct",
         ],
         vec![
-            "managed",
+            "cluster",
             "operation",
+            "--managed",
             "op",
             "--api",
             &api.origin,
@@ -1106,8 +1126,9 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "push",
+            "--managed",
             "--expected-revision",
             &"b".repeat(40),
             "--message",
@@ -1128,8 +1149,9 @@ fn managed_lifecycle_capture_and_retry_records_refuse_symlinks_without_reading_t
         .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
         .env("OMNIGRAPH_CONTROL_API", &api.origin)
         .args([
-            "managed",
+            "cluster",
             "delete",
+            "--managed",
             "--incarnation",
             "inc-one",
             "--no-wait",
@@ -1163,8 +1185,9 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             "--json",
         ],
         vec![
-            "managed",
+            "cluster",
             "token",
+            "--managed",
             "--clear",
             "--graph",
             "knowledge",
@@ -1822,10 +1845,10 @@ fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
         if timeout {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("inspect `managed status run-one`"),
+                stderr.contains("inspect `cluster status --managed run-one`"),
                 "{stderr}"
             );
-            assert!(!stderr.contains("cluster status"), "{stderr}");
+            assert!(!stderr.contains("inspect `managed status"), "{stderr}");
         }
         let requests = api.requests();
         assert_eq!(requests.len(), if timeout { 1 } else { 2 });
@@ -1967,7 +1990,7 @@ fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
 }
 
 #[test]
-fn managed_namespace_is_explicit_and_core_ignores_folder_context() {
+fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
     let temp = tempdir().unwrap();
     let api = IntentApiFixture::new(vec![]);
     write_managed_context(temp.path(), &api.origin);
@@ -2023,6 +2046,120 @@ fn managed_namespace_is_explicit_and_core_ignores_folder_context() {
         assert!(
             api.requests().is_empty(),
             "Core apply consulted the managed service"
+        );
+    }
+    // Neither a selected folder nor an invalid context may change the meaning
+    // of a command. Reject the spelling/flag conflict before reading context,
+    // opening storage, or submitting anything to either HTTP API.
+    let rejected_root = temp.path().join("rejected");
+    fs::create_dir(&rejected_root).unwrap();
+    write_cluster_config_fixture(&rejected_root);
+    write_managed_context(&rejected_root, &api.origin);
+    let rejected_context = rejected_root.join(".omnigraph/context");
+    fs::write(&rejected_context, "{\n").unwrap();
+    let mut rejected_arguments = vec![
+        vec!["managed", "status"], // Removed spelling has no compatibility alias.
+        vec!["cluster", "create", "new", "--api", &api.origin],
+        vec![
+            "cluster",
+            "push",
+            "--expected-revision",
+            "old",
+            "--message",
+            "new",
+        ],
+        vec!["cluster", "delete", "--incarnation", "inc-one"],
+        vec![
+            "cluster",
+            "undo-delete",
+            "--incarnation",
+            "inc-one",
+            "--deletion-id",
+            "op",
+        ],
+        vec!["cluster", "token"],
+        vec!["cluster", "operation", "op"],
+        vec!["cluster", "history"],
+        vec!["cluster", "cancel", "run"],
+        vec!["cluster", "plan", "--rev", "revision"],
+        vec!["cluster", "plan", "--no-wait"],
+        vec!["cluster", "plan", "--timeout", "10"],
+        vec!["cluster", "plan", "--idempotency-key", "key"],
+        vec!["cluster", "apply", "--plan", "plan"],
+        vec!["cluster", "apply", "--idempotency-key", "key"],
+        vec!["cluster", "status", "run"],
+        vec!["cluster", "apply", "--managed"], // A managed apply requires a plan.
+        vec![
+            "cluster",
+            "apply",
+            "--managed",
+            "--plan",
+            "plan",
+            "--deployment-id",
+            "id",
+        ],
+        vec![
+            "cluster",
+            "apply",
+            "--managed",
+            "--plan",
+            "plan",
+            "--writers-stopped",
+        ],
+        vec!["cluster", "status", "--managed", "--deployment-id", "id"],
+        vec!["cluster", "status", "--managed", "run", "--wait"],
+        vec!["cluster", "status", "--managed", "run", "--timeout", "10"],
+        vec!["cluster", "validate", "--managed"],
+        vec!["cluster", "observe", "--managed"],
+        vec!["cluster", "force-unlock", "lock", "--managed"],
+        vec![
+            "cluster",
+            "upgrade-ledger",
+            "--writers-stopped",
+            "--managed",
+        ],
+    ];
+    for selector in [
+        vec!["--server", api.origin.as_str()],
+        vec!["--cluster", "file:///must-not-open"],
+        vec!["--store", "file:///must-not-open"],
+        vec!["--profile", "must-not-load"],
+        vec!["--graph", "knowledge"],
+        vec!["--as", "forged"],
+        vec!["--direct"],
+    ] {
+        let mut arguments = vec!["cluster", "apply", "--managed", "--plan", "plan"];
+        arguments.extend(selector);
+        rejected_arguments.push(arguments);
+    }
+    for arguments in rejected_arguments {
+        let output = cli()
+            .current_dir(&rejected_root)
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args(&arguments)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        let diagnostics = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !diagnostics.contains("context_invalid")
+                && !diagnostics.contains("managed_context_required"),
+            "argument refusal must precede context access: {arguments:?}: {diagnostics}"
+        );
+        assert!(api.requests().is_empty(), "{arguments:?}");
+        assert_no_core_effects(&rejected_root);
+        assert_eq!(fs::read(&rejected_context).unwrap(), b"{\n");
+        assert!(!rejected_root.join(".omnigraph/lifecycle.lock").exists());
+        assert!(
+            !rejected_root
+                .join(".omnigraph/pending-lifecycle.json")
+                .exists()
         );
     }
     let child = temp.path().join("nested");

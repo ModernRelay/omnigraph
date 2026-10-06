@@ -149,8 +149,9 @@ planning to prove preview does not wait for the graph gate. In-source
 turnover, exercising bounded re-observation for aggregate and exact status.
 CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
 retries, malformed-receipt refusal, terminal outcomes and caller timeout without
-replay. Its managed fixtures cover status/history scope and filters, while
-direct apply must ignore both valid and malformed managed folder context.
+replay. Its managed fixtures cover status/history scope and filters, explicit
+`--managed` selection, and wrong-mode refusals before context or external access.
+Direct apply must ignore both valid and malformed managed folder context.
 CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
 replacement, graph addition, policy grant/revocation and management handoff;
 the original submitter retains only its exact receipt access after restart.

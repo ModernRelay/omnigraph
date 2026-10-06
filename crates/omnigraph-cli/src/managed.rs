@@ -1,7 +1,7 @@
 //! Managed control routing (RFC 0052) and offline data credentials (RFC 0053).
-//! Context selects authority, never caches a ledger; errors never fall back to Core.
+//! Explicit --managed selects this routing; context supplies its bound authority.
 
-use crate::cli::{Cli, Command, ManagedCommand, ManagedRunArgs};
+use crate::cli::{Cli, ClusterCommand, ClusterRunArgs, Command};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -438,7 +438,7 @@ async fn wait_run(
     api: &Api,
     context: &Context,
     mut body: Value,
-    options: &ManagedRunArgs,
+    options: &ClusterRunArgs,
     deadline: Instant,
 ) -> Result<(Value, i32)> {
     run_matches(&body, &context.cluster, None)?;
@@ -460,7 +460,9 @@ async fn wait_run(
         let next = Instant::now() + POLL_INTERVAL;
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
-            eprintln!("wait deadline reached; run {id} continues; inspect `managed status {id}`");
+            eprintln!(
+                "wait deadline reached; run {id} continues; inspect `cluster status --managed {id}`"
+            );
             return Ok((body, 5));
         }
         tokio::time::sleep_until(next).await;
@@ -492,19 +494,20 @@ fn idempotency_key(value: Option<&str>) -> Result<String> {
     Ok(key)
 }
 
-fn config_and_json(command: &ManagedCommand) -> (&Path, bool) {
+fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
     match command {
-        ManagedCommand::Plan { config, json, .. }
-        | ManagedCommand::Apply { config, json, .. }
-        | ManagedCommand::Status { config, json, .. }
-        | ManagedCommand::Operation { config, json, .. }
-        | ManagedCommand::History { config, json, .. }
-        | ManagedCommand::Cancel { config, json, .. }
-        | ManagedCommand::Token { config, json, .. }
-        | ManagedCommand::Create { config, json, .. }
-        | ManagedCommand::Delete { config, json, .. }
-        | ManagedCommand::UndoDelete { config, json, .. }
-        | ManagedCommand::Push { config, json, .. } => (config, *json),
+        ClusterCommand::Plan { config, json, .. }
+        | ClusterCommand::Apply { config, json, .. }
+        | ClusterCommand::Status { config, json, .. }
+        | ClusterCommand::Operation { config, json, .. }
+        | ClusterCommand::History { config, json, .. }
+        | ClusterCommand::Cancel { config, json, .. }
+        | ClusterCommand::Token { config, json, .. }
+        | ClusterCommand::Create { config, json, .. }
+        | ClusterCommand::Delete { config, json, .. }
+        | ClusterCommand::UndoDelete { config, json, .. }
+        | ClusterCommand::Push { config, json, .. } => (config, *json),
+        _ => unreachable!("local-only commands cannot select --managed"),
     }
 }
 
@@ -518,7 +521,7 @@ fn reject_scope(cli: &Cli) -> Result<()> {
     {
         return Err(Failure::refused(
             "managed_scope_conflict",
-            "managed commands use folder context and authenticated identity; --as, --server, --graph, --profile, --store, and --cluster do not apply",
+            "cluster --managed uses folder context and authenticated identity; --as, --server, --graph, --profile, --store, and --cluster do not apply",
         ));
     }
     Ok(())
@@ -527,21 +530,20 @@ fn reject_scope(cli: &Cli) -> Result<()> {
 async fn cluster_command(
     cli: &Cli,
     context: &Context,
-    command: &ManagedCommand,
+    command: &ClusterCommand,
 ) -> Result<(Value, i32)> {
-    if let ManagedCommand::Token { ttl, clear, .. } = command {
+    if let ClusterCommand::Token { ttl, clear, .. } = command {
         return data::token(cli, context, *ttl, *clear)
             .await
             .map(|body| (body, 0));
     }
-    reject_scope(cli)?;
     let api = Api::authenticated(context.api.clone())?;
     let base = format!("/v1/clusters/{}", context.cluster);
     match command {
-        ManagedCommand::Plan { managed, .. } | ManagedCommand::Apply { managed, .. } => {
-            let deadline = Instant::now() + Duration::from_secs(managed.timeout.unwrap_or(300));
+        ClusterCommand::Plan { run, .. } | ClusterCommand::Apply { run, .. } => {
+            let deadline = Instant::now() + Duration::from_secs(run.timeout.unwrap_or(300));
             let body = match command {
-                ManagedCommand::Plan { revision, .. } => {
+                ClusterCommand::Plan { revision, .. } => {
                     if revision.as_ref().is_some_and(|r| {
                         r.is_empty() || r.len() > 1024 || r.chars().any(char::is_control)
                     }) {
@@ -555,25 +557,28 @@ async fn cluster_command(
                         None => json!({"kind":"plan"}),
                     }
                 }
-                ManagedCommand::Apply { plan, .. } => {
+                ClusterCommand::Apply { plan, .. } => {
+                    let plan = plan.as_deref().ok_or_else(|| {
+                        Failure::refused("plan_required", "cluster apply --managed requires --plan")
+                    })?;
                     identifier(plan)?;
                     json!({"kind":"apply","plan_run":plan})
                 }
                 _ => unreachable!(),
             };
-            let key = idempotency_key(managed.idempotency_key.as_deref())?;
+            let key = idempotency_key(run.idempotency_key.as_deref())?;
             let path = format!("{base}/runs");
             let submission = api.request(Method::POST, &path, Some(&body), Some(&key));
-            let response = if managed.no_wait {
+            let response = if run.no_wait {
                 submission.await?
             } else {
                 tokio::time::timeout_at(deadline, submission).await.map_err(|_| {
                     Failure::new("wait_timeout", "the local wait deadline was reached during submission; the run may exist, so replay the same idempotency key", 5)
                 })??
             };
-            wait_run(&api, context, response, managed, deadline).await
+            wait_run(&api, context, response, run, deadline).await
         }
-        ManagedCommand::Status { run_id, .. } => {
+        ClusterCommand::Status { run_id, .. } => {
             let body = if let Some(id) = run_id {
                 identifier(id)?;
                 let body = api
@@ -590,7 +595,7 @@ async fn cluster_command(
             };
             Ok((body, 0))
         }
-        ManagedCommand::History { limit, since, .. } => {
+        ClusterCommand::History { limit, since, .. } => {
             let mut url = Url::parse(&format!("{}{base}/history", context.api))
                 .map_err(|_| Failure::protocol())?;
             url.query_pairs_mut()
@@ -608,7 +613,7 @@ async fn cluster_command(
             cluster_matches(&body, &context.cluster)?;
             Ok((body, 0))
         }
-        ManagedCommand::Cancel { run_id, .. } => {
+        ClusterCommand::Cancel { run_id, .. } => {
             identifier(run_id)?;
             let before = api
                 .request(Method::GET, &format!("/v1/runs/{run_id}"), None, None)
@@ -698,20 +703,30 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             .await;
             Some(Output::from_result(result, *json, 0))
         }
-        Command::Managed { command } => {
+        Command::Cluster {
+            managed: true,
+            command,
+        } => {
             let (config, json) = config_and_json(command);
             if cli.direct {
                 return Some(Output::from_result(
                     Err(Failure::refused(
                         "managed_scope_conflict",
-                        "managed commands cannot be used with --direct; use cluster for self-hosted deployment",
+                        "--managed and --direct cannot be used together",
                     )),
                     json,
                     2,
                 ));
             }
+            let scope = match command {
+                ClusterCommand::Token { ttl, clear, .. } => data::token_scope(cli, *ttl, *clear),
+                _ => reject_scope(cli),
+            };
+            if let Err(err) = scope {
+                return Some(Output::from_result(Err(err), json, 2));
+            }
             if lifecycle::handles(command) {
-                return Some(match lifecycle::dispatch(cli, command).await {
+                return Some(match lifecycle::dispatch(command).await {
                     Ok((body, exit)) => Output::from_result(Ok(body), json, exit),
                     Err(err) => Output::from_result(Err(err), json, 1),
                 });
@@ -720,7 +735,7 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
                 let context = read_context(config)?.ok_or_else(|| {
                     Failure::refused(
                         "managed_context_required",
-                        "managed commands require the selected folder's .omnigraph/context",
+                        "cluster --managed requires the selected folder's .omnigraph/context",
                     )
                 })?;
                 cluster_command(cli, &context, command).await

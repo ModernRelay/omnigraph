@@ -23,9 +23,9 @@ blocked_on: []
 
 ## Summary
 
-The explicit `managed` command family addresses the managed Intent API. A
-folder's `.omnigraph/context` selects the service and cluster for bound
-operations. Core `cluster` commands never inspect that context.
+The explicit `cluster <command> --managed` mode addresses the managed Intent
+API. A folder's `.omnigraph/context` selects the service and cluster only after
+that mode is chosen. Without `--managed`, cluster commands never inspect it.
 Managed authentication establishes identity,
 and current permissions authorize execution of an exact saved plan. There is
 no separate managed approval workflow. Engine behavior and storage formats
@@ -45,11 +45,11 @@ rather than a local command refactor.
 ```sh
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example
-omnigraph managed plan --config . --json
-omnigraph managed apply --config . --plan PLAN_RUN_ID --json
-omnigraph managed status --config . --json
-omnigraph managed history --config . --json
-omnigraph managed cancel RUN_ID --config . --json
+omnigraph cluster plan --managed --config . --json
+omnigraph cluster apply --managed --config . --plan PLAN_RUN_ID --json
+omnigraph cluster status --managed --config . --json
+omnigraph cluster history --managed --config . --json
+omnigraph cluster cancel --managed RUN_ID --config . --json
 omnigraph logout --api https://control.example
 ```
 
@@ -60,11 +60,22 @@ does not commit files, upload a bundle, silently replan, or ask for another
 approval. Current permissions, binding, digests, and lease are checked by the
 API and execution authority is independently checked by the executor.
 
-The command family selects authority before context discovery. `cluster` uses
-Core configuration or its explicit server/root target; `managed` uses only the
-service API and rejects `--direct`. Malformed context, unknown context version,
-provider/API errors and permission refusals fail closed. No managed failure may
+The mode flag selects authority before context discovery. `cluster` without
+`--managed` uses self-hosted configuration or its explicit server/root target;
+with `--managed` it uses only the service API. Managed mode rejects `--direct`,
+`--server`, `--cluster`, `--store`, `--profile`, `--graph`, and `--as` before
+context, credentials, HTTP, or storage access. Malformed context, unknown context
+version, provider/API errors and permission refusals fail closed. No managed failure may
 invoke Core or consult graph-root credentials.
+
+Service-only `create`, `push`, `delete`, `undo-delete`, `token`, `operation`,
+`history`, and `cancel` require `--managed`. Local `validate`, `observe`,
+`force-unlock`, and `upgrade-ledger` reject it. Shared `plan`, `apply`, and
+`status` validate arguments against the selected mode before dispatch. Managed
+plan uses `--rev`, apply requires `--plan`, and status accepts an optional
+positional run ID. Self-hosted deployment uses local configuration or exact
+`--deployment-id`; served status alone permits deployment `--wait`. No argument
+or folder context infers a mode. The flag may precede or follow the subcommand.
 
 `--no-wait` returns the accepted run envelope. Otherwise the CLI polls every
 two seconds for up to 300 seconds; `--timeout` selects 1–3,600 seconds. Timeout
@@ -133,9 +144,10 @@ fork, cloud-only correctness fix, duplicated lock, or new writer fence.
 
 Existing profiles/servers/clusters config and `login SERVER --token` /
 `logout SERVER` remain intact. The new `--api` mode is mutually exclusive
-with named-server login. Core commands retain their own addressing regardless
-of folder context. Managed commands and their arguments live only under
-`managed`; former managed `cluster` spellings are not aliases.
+with named-server login. Self-hosted commands retain their own addressing
+regardless of folder context. Managed control requires `cluster <command> --managed`;
+the top-level `managed` command is removed, with no alias. Omitting the mode
+flag cannot select service execution.
 
 No stored graph or server API format changes. Bound managed commands refuse
 without context; its absence cannot select direct execution. Deploy a compatible
@@ -147,8 +159,10 @@ The server SDK and Python SDK gain no new authority or dependencies.
 - Raw HTTP keeps the current gap in bounded waits, identity storage, and
   context isolation and makes every script reproduce the managed contract.
 - Ambient context dispatch makes identical cluster commands select different
-  protocols and exposes mutually incompatible flags in one parser. Explicit
-  command families keep that choice visible without another mode flag.
+  protocols. Explicit `--managed` keeps the choice visible and mode validation
+  refuses arguments belonging to another protocol before any access.
+- Separate top-level command families repeat cluster concepts and workflows.
+  One `cluster` noun with an explicit mode retains the authority boundary.
 - Inferring managed mode from storage roots or existing server aliases risks
   forwarding the wrong credential; explicit context and origin binding win.
 - Requiring browser sign-in after every short access lifetime interrupts
@@ -205,8 +219,10 @@ managed-store editing and provisioning to this original increment, and links
 RFC 0061 as the owner of those additional client commands. Its authentication,
 folder context, direct routing and exact-plan execution contract is unchanged.
 
-2026-10-06: The maintainer requested explicit command namespaces. Summary,
-User behavior, Design, Compatibility and Alternatives now place service commands
-under `managed` and remove ambient interception of Core `cluster` commands.
+2026-10-06: The maintainer chose `cluster <command> --managed`. Summary and
+User behavior replace command-family routing with explicit mode selection,
+early conflicts and shared-command argument rules. Compatibility removes the
+top-level `managed` command without an alias. Alternatives replaces separate
+command families with one cluster noun while rejecting ambient interception.
 Managed data-command context and service protocols remain unchanged. Existing
-CLI owners cover namespace refusal and Core isolation from malformed context.
+CLI owners cover mode refusal and self-hosted isolation from malformed context.

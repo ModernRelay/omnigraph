@@ -575,10 +575,12 @@ fence and does not replace lock admission or Azure's wrapper. Conversion and
 reconciliation require it; read-only status does not. Routine apply does not need
 manual status-and-copy, and may not allocate a new ID when resolving a previous
 unknown result. Missing/expired original lookup never creates a replacement.
-Hosted service workflows use the explicit `managed` command family and retain
-their separate control-plane API. Folder context never redirects `cluster`
-commands to that API. These flags do not manufacture a remotely authenticated
-identity. Status needs no lock and cannot authorize a writer.
+Hosted service workflows use `cluster <command> --managed` and retain their
+separate control-plane API. The flag is mutually exclusive with server or direct
+storage selectors; folder context never selects it. Shared commands validate
+mode-specific flags before context or external access, and the removed top-level
+`managed` command has no alias. These flags do not manufacture a remotely
+authenticated identity. Status needs no lock and cannot authorize a writer.
 
 Conversion preserves graph data, native identities, branches/history, applied
 resource digests, policy/provider bindings and existing audit/approval facts.
@@ -1272,8 +1274,10 @@ Before enabling an affected increment, its owners must implement and qualify:
 ## Decision log
 
 - 2026-10-06: The maintainer approved served observational planning, durable
-  acceptance followed by bounded CLI observation, and explicit `managed` command
-  routing. Online deployment and CLI sections now define exact receipt reads for
+  acceptance followed by bounded CLI observation, and explicit `cluster <command>
+  --managed` mode selection. The CLI section replaces command-family routing with
+  explicit mode and pre-access argument validation. Online deployment and CLI
+  sections now define exact receipt reads for
   initiating actors, process-owned progress, caller wait outcomes, and the shared
   observed-plan limits. No new durable job authority is added.
 

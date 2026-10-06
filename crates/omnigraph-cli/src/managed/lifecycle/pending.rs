@@ -127,7 +127,7 @@ pub(super) fn prepare(
             if bound_create {
                 return Err(Failure::refused(
                     "context_already_bound",
-                    "managed create requires an unbound folder; its existing context was preserved",
+                    "cluster create --managed requires an unbound folder; its existing context was preserved",
                 ));
             }
             let pending = Pending {

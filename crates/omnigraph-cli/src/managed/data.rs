@@ -53,7 +53,7 @@ fn key(context: &Context) -> String {
 fn invalid() -> Failure {
     Failure::refused(
         "data_credential_invalid",
-        "the cached data credential is invalid; mint a new managed token",
+        "the cached data credential is invalid; run cluster token --managed",
     )
 }
 
@@ -135,7 +135,7 @@ impl Credential {
         if expires <= now {
             return Err(Failure::refused(
                 "data_credential_expired",
-                "the data credential has expired; mint a new managed token",
+                "the data credential has expired; run cluster token --managed",
             ));
         }
         Ok(())
@@ -260,27 +260,32 @@ fn clear(store: &impl Store, context: &Context) -> Result<Value> {
     )
 }
 
-pub(super) async fn token(
-    cli: &Cli,
-    context: &Context,
-    ttl: Option<u64>,
-    clear: bool,
-) -> Result<Value> {
+pub(super) fn token_scope(cli: &Cli, ttl: Option<u64>, clear: bool) -> Result<()> {
     scope(cli)?;
-    if clear {
-        if cli.graph.is_some() || ttl.is_some() {
-            return Err(Failure::refused(
-                "token_clear_conflict",
-                "--clear forgets the whole cached cluster credential and cannot select a graph or TTL",
-            ));
-        }
-        return self::clear(&auth::DATA_STORE, context);
+    if clear && (cli.graph.is_some() || ttl.is_some()) {
+        return Err(Failure::refused(
+            "token_clear_conflict",
+            "--clear forgets the whole cached cluster credential and cannot select a graph or TTL",
+        ));
     }
     if cli.graph.is_some() {
         return Err(Failure::refused(
             "token_profile_conflict",
             "identity credentials do not select a graph; use --graph on the graph operation",
         ));
+    }
+    Ok(())
+}
+
+pub(super) async fn token(
+    cli: &Cli,
+    context: &Context,
+    ttl: Option<u64>,
+    clear: bool,
+) -> Result<Value> {
+    token_scope(cli, ttl, clear)?;
+    if clear {
+        return self::clear(&auth::DATA_STORE, context);
     }
     let api = Api::authenticated(context.api.clone())?;
     mint(&auth::DATA_STORE, context, &api, ttl.unwrap_or(3600)).await
@@ -290,7 +295,7 @@ fn load_credential(store: &impl Store, context: &Context) -> Result<Credential> 
     let raw = store.get(&key(context))?.ok_or_else(|| {
         Failure::refused(
             "data_credential_required",
-            "no data credential is cached for this cluster; run managed token",
+            "no data credential is cached for this cluster; run cluster token --managed",
         )
     })?;
     if raw.len() > MAX_CREDENTIAL {

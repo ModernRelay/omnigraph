@@ -282,7 +282,7 @@ omnigraph login --api <origin>             # managed Intent API session (OS keyc
 omnigraph logout --api <origin>            # revoke that session and remove its keychain entry
 ```
 
-The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster`, `managed`, and `use`.
+The operator config and `~/.omnigraph/credentials` are **auto-discovered — there is no flag to point at them.** `$OMNIGRAPH_HOME` relocates the `~/.omnigraph` directory, and an absent file is an empty layer. `--config` selects source/context folders for `cluster` and `use`.
 
 ## Addressing a Graph
 
@@ -304,7 +304,7 @@ operator default server/store competes, they refuse with
 `managed_target_ambiguous`. Global `--direct` restores the ordinary resolution
 above. Other data commands are unaffected.
 
-`cluster` and `managed` use `--config <dir>` for source/context folders; policy
+`cluster` uses `--config <dir>` for source/context folders; policy
 and stored-query control-plane commands use `--cluster <dir|uri>`. Maintenance against a
 cluster-managed graph uses `--cluster <dir|file://|s3://|az://> --graph <id>`.
 Each command declares a **capability** — `any` / `served` / `direct` /
@@ -388,22 +388,22 @@ The 0.11 verbs `import`, `refresh` and `approve` are removed. A fresh direct
 its admission lock after it completes: once the owner and its I/O have settled,
 release that exact lock id with `force-unlock` before starting the server.
 
-Self-hosted `cluster` commands always ignore managed context. The managed
-service has its own namespace (see [`cluster.md`](cluster.md#managed-clusters)):
+`cluster` commands select the managed service only with `--managed`; otherwise
+they ignore managed context (see [`cluster.md`](cluster.md#managed-clusters)):
 
 ```bash
 omnigraph use <CLUSTER_ID> --api <origin> [--config <dir>]
-omnigraph managed create <name> --api <origin>
-omnigraph managed push --expected-revision <rev> --message <msg>
-omnigraph managed plan [--rev <revision>]
-omnigraph managed apply --plan <PLAN_RUN_ID>
-omnigraph managed status [RUN_ID]
-omnigraph managed operation <id> [--api <origin>] [--wait] [--timeout 1800]
-omnigraph managed history [--limit N] [--since <RFC3339>]
-omnigraph managed cancel <RUN_ID>
-omnigraph managed token ([--ttl 1h] | --clear)   # identity only; applied Cedar policy decides access
-omnigraph managed delete --incarnation <id> [--retention-seconds 86400]
-omnigraph managed undo-delete --incarnation <id> --deletion-id <id>
+omnigraph cluster create --managed <name> --api <origin>
+omnigraph cluster push --managed --expected-revision <rev> --message <msg>
+omnigraph cluster plan --managed [--rev <revision>]
+omnigraph cluster apply --managed --plan <PLAN_RUN_ID>
+omnigraph cluster status --managed [RUN_ID]
+omnigraph cluster operation --managed <id> [--api <origin>] [--wait] [--timeout 1800]
+omnigraph cluster history --managed [--limit N] [--since <RFC3339>]
+omnigraph cluster cancel --managed <RUN_ID>
+omnigraph cluster token --managed ([--ttl 1h] | --clear)   # identity only; applied Cedar policy decides access
+omnigraph cluster delete --managed --incarnation <id> [--retention-seconds 86400]
+omnigraph cluster undo-delete --managed --incarnation <id> --deletion-id <id>
 ```
 
 Managed plan, apply, create, delete, and undo-delete take `--no-wait`,

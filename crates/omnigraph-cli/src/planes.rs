@@ -156,7 +156,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     Command::Cluster {
                         command: ClusterCommand::Plan { .. }
                             | ClusterCommand::Apply { .. }
-                            | ClusterCommand::Status { .. }
+                            | ClusterCommand::Status { .. },
+                        managed: false,
                     }
                 )
         }
@@ -206,7 +207,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: ClusterCommand::Plan { .. }
                         | ClusterCommand::Apply { .. }
                         | ClusterCommand::UpgradeLedger { .. },
-                    ..
+                    managed: false,
                 }
             ),
             Direct => matches!(
@@ -230,7 +231,7 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         ScopeFlag::Profile => match capability {
             Any | Served => true,
             Direct => !matches!(cmd, Command::Init { .. }),
-            Control => !matches!(cmd, Command::Cluster { .. } | Command::Managed { .. }),
+            Control => !matches!(cmd, Command::Cluster { .. }),
             Local => false,
         },
     }
@@ -291,7 +292,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
-        Command::Cluster { .. } | Command::Managed { .. } => Plane::Control,
+        Command::Cluster { .. } => Plane::Control,
         Command::Alias { .. }
         | Command::Embed(_)
         | Command::Login { .. }
@@ -347,7 +348,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
-        Command::Managed { .. } => "managed",
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },
@@ -377,7 +377,7 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             | Command::Policy { .. }
             | Command::Queries { .. }
             | Command::Cluster { command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
-                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. } }
+                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. }, managed: false }
     )
 }
 
@@ -578,7 +578,22 @@ mod tests {
                 [false, true, false, false, true, false],
             ),
             (
-                parse(&["omnigraph", "managed", "status"]),
+                parse(&["omnigraph", "cluster", "status", "--managed"]),
+                [false, false, false, false, false, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "plan", "--managed"]),
+                [false, false, false, false, false, false],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "apply",
+                    "--managed",
+                    "--plan",
+                    "plan",
+                ]),
                 [false, false, false, false, false, false],
             ),
             (

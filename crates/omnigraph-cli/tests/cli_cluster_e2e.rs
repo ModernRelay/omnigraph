@@ -546,7 +546,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             );
             assert_eq!(output.status.code(), Some(2));
             let expected = if unsupported_flag[0] == "--idempotency-key" {
-                "unexpected argument"
+                "--plan and --idempotency-key require --managed"
             } else {
                 "deployment wait options require --server"
             };

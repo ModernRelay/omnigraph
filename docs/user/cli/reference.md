@@ -62,7 +62,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list/validate` | Inspect or validate a cluster query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
-| `managed create/push/plan/apply/...` | Operate a managed service cluster | managed API and folder context |
+| `cluster <command> --managed` | Operate a managed service cluster | managed API and folder context |
 | `policy validate/test/explain` | Validate or evaluate applied policy | cluster |
 | `embed` | Generate, clean, or refresh seed embeddings | local tooling |
 | `login`, `logout` | Manage a named server credential or a managed API session | local or managed API |
@@ -229,6 +229,10 @@ invocation.
 
 ## Managed cluster commands
 
+Add `--managed` to select the managed service explicitly. Without it, `cluster`
+uses self-hosted configuration or an explicit server/root and ignores managed
+folder context. The flag can appear before or after the subcommand.
+
 `omnigraph login --api ORIGIN` reuses valid cached access or prints a WorkOS
 AuthKit verification URL and user code. The OS keychain holds provider-bound
 access and rotating refresh credentials; old opaque sessions are not reused.
@@ -261,11 +265,11 @@ query, or fragment. HTTPS is required except for exact localhost,
 
 | Managed command | Behavior |
 |---|---|
-| `managed plan [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
-| `managed apply --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
-| `managed status [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
-| `managed history [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
-| `managed cancel RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+| `cluster plan --managed [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
+| `cluster apply --managed --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
+| `cluster status --managed [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
+| `cluster history --managed [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
+| `cluster cancel --managed RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
 
 See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
 
@@ -276,12 +280,12 @@ submission. Reuse that key with the same body
 to recover from an uncertain response; changing the body under a key is
 refused by the API. Retry cancellation or abandonment using the same run id.
 Plan and apply do not upload local files or infer a revision from uncommitted
-changes; `managed push` explicitly prepares managed source. A saved plan retains the service's change lease
+changes; `cluster push --managed` explicitly prepares managed source. A saved plan retains the service's change lease
 until it is applied, abandoned, or expires under the API's rules.
 
 Plan and apply normally poll every two seconds for up to 300 seconds.
 `--timeout` accepts 1–3600 seconds. Reaching the deadline stops only the local
-wait; inspect `managed status RUN_ID` to continue following the run.
+wait; inspect `cluster status --managed RUN_ID` to continue following the run.
 `--no-wait` prints the accepted run and exits 0. Every HTTP request has a
 10-second deadline and an 8 MiB response limit; redirects are refused.
 `--json` prints one API envelope to stdout with its provenance and
@@ -310,18 +314,22 @@ its API origin together:
 ```bash
 export OMNIGRAPH_CONTROL_API=https://control.example
 # Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
-omnigraph managed apply --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
+omnigraph cluster apply --managed --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
 ```
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
 separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
 
-Self-hosted `cluster` commands always ignore managed context. The `managed` family
-requires its own context, except creation and explicit-origin operation lookup;
-`--direct` is rejected. Managed API failures never trigger local deployment.
-Use `managed operation OPERATION_ID [--wait]` for service lifecycle observation;
-`managed status [RUN_ID]` reads cluster projections or a managed run. Self-hosted
+`--managed` requires its own context, except creation and explicit-origin
+operation lookup; `--direct` is rejected. Managed API failures never trigger
+local deployment. Service-only `create`, `push`, `delete`, `undo-delete`, `token`,
+`operation`, `history`, and `cancel` require `--managed`. Local `validate`,
+`observe`, `force-unlock`, and `upgrade-ledger` reject it. Managed `plan` takes
+`--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
+be combined with them.
+Use `cluster operation --managed OPERATION_ID [--wait]` for service lifecycle observation;
+`cluster status --managed [RUN_ID]` reads cluster projections or a managed run. Self-hosted
 `cluster status --deployment-id ID` addresses a separate deployment receipt.
 
 ## Managed data access

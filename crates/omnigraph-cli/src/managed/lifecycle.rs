@@ -4,14 +4,14 @@ use super::*;
 mod capture;
 mod pending;
 
-pub(super) fn handles(command: &ManagedCommand) -> bool {
+pub(super) fn handles(command: &ClusterCommand) -> bool {
     matches!(
         command,
-        ManagedCommand::Create { .. }
-            | ManagedCommand::Delete { .. }
-            | ManagedCommand::UndoDelete { .. }
-            | ManagedCommand::Push { .. }
-            | ManagedCommand::Operation { .. }
+        ClusterCommand::Create { .. }
+            | ClusterCommand::Delete { .. }
+            | ClusterCommand::UndoDelete { .. }
+            | ClusterCommand::Push { .. }
+            | ClusterCommand::Operation { .. }
     )
 }
 
@@ -28,13 +28,10 @@ fn context_required(config: &Path) -> Result<Context> {
     })
 }
 
-pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Value, i32)> {
-    reject_scope(cli)?;
+pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
-        ManagedCommand::Create {
-            name, api, managed, ..
-        } => {
+        ClusterCommand::Create { name, api, run, .. } => {
             if name.is_empty()
                 || name.len() > 64
                 || name.trim() != name
@@ -56,33 +53,29 @@ pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Val
                     kind: "create",
                     context: read_context(config)?,
                     incarnation: None,
-                    managed,
+                    run,
                     tombstone: false,
                 },
             )
             .await
         }
-        ManagedCommand::Delete {
-            incarnation,
-            managed,
-            ..
+        ClusterCommand::Delete {
+            incarnation, run, ..
         }
-        | ManagedCommand::UndoDelete {
-            incarnation,
-            managed,
-            ..
+        | ClusterCommand::UndoDelete {
+            incarnation, run, ..
         } => {
             identifier(incarnation)?;
             let context = context_required(config)?;
             let (kind, body, tombstone) = match command {
-                ManagedCommand::Delete {
+                ClusterCommand::Delete {
                     retention_seconds, ..
                 } => (
                     "delete",
                     json!({"incarnation":incarnation,"retention_seconds":retention_seconds}),
                     *retention_seconds > 0,
                 ),
-                ManagedCommand::UndoDelete { deletion_id, .. } => {
+                ClusterCommand::UndoDelete { deletion_id, .. } => {
                     identifier(deletion_id)?;
                     (
                         "undo",
@@ -102,13 +95,13 @@ pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Val
                     kind,
                     context: Some(context),
                     incarnation: Some(incarnation),
-                    managed,
+                    run,
                     tombstone,
                 },
             )
             .await
         }
-        ManagedCommand::Operation {
+        ClusterCommand::Operation {
             operation_id: id,
             api,
             wait,
@@ -137,7 +130,7 @@ pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Val
                 }
             };
             let api = client(&origin)?;
-            let options = ManagedRunArgs {
+            let options = ClusterRunArgs {
                 no_wait: !wait,
                 timeout: *timeout,
                 idempotency_key: None,
@@ -164,7 +157,7 @@ pub(super) async fn dispatch(cli: &Cli, command: &ManagedCommand) -> Result<(Val
             identity.matches(context.as_ref(), None, Some(id))?;
             wait_operation(&api, body, &identity, &options, deadline, false).await
         }
-        ManagedCommand::Push {
+        ClusterCommand::Push {
             expected_revision,
             message,
             ..
@@ -274,7 +267,7 @@ struct Submission<'a> {
     kind: &'a str,
     context: Option<Context>,
     incarnation: Option<&'a str>,
-    managed: &'a ManagedRunArgs,
+    run: &'a ClusterRunArgs,
     tombstone: bool,
 }
 
@@ -369,7 +362,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
             "the pending create uses another API origin",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(intent.managed.timeout.unwrap_or(300));
+    let deadline = Instant::now() + Duration::from_secs(intent.run.timeout.unwrap_or(300));
     // The service scopes idempotency to the principal. The same captured bearer
     // performs this read and the submission, including after a session renewal.
     let principal = principal(api, deadline).await?;
@@ -379,7 +372,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         &intent.path,
         &intent.body,
         &principal,
-        intent.managed.idempotency_key.as_deref(),
+        intent.run.idempotency_key.as_deref(),
         intent.kind == "create" && intent.context.is_some(),
     )?;
     let response = tokio::time::timeout_at(
@@ -444,7 +437,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         api,
         response,
         &identity,
-        intent.managed,
+        intent.run,
         deadline,
         intent.tombstone,
     )
@@ -455,7 +448,7 @@ async fn wait_operation(
     api: &Api,
     mut body: Value,
     identity: &Identity,
-    options: &ManagedRunArgs,
+    options: &ClusterRunArgs,
     deadline: Instant,
     tombstone: bool,
 ) -> Result<(Value, i32)> {
@@ -488,7 +481,7 @@ async fn wait_operation(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             eprintln!(
-                "wait deadline reached; operation {} continues; use managed operation {}",
+                "wait deadline reached; operation {} continues; use cluster operation --managed {}",
                 identity.operation_id, identity.operation_id
             );
             return Ok((body, 5));
