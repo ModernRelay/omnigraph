@@ -598,8 +598,10 @@ or corrupt authoritative payloads must be restored; candidate sources cannot
 substitute for current permissions.
 
 Removing a graph declaration is destructive. Plan reports the delete effect;
-apply authorizes it through the currently applied `ConfigManage` policy and
-existing exclusive root admission. The intent binds the canonical derived graph
+apply requires existing exclusive root admission. Authenticated callers need
+currently applied `ConfigManage` permission plus graph `Read` and `SchemaApply`.
+Storage-owner callers also need an actor with those graph permissions when a
+graph policy is installed. The intent binds the canonical derived graph
 root and its applied schema contract before effects. A present root must match
 that contract; an already-absent root can complete deletion. The same outstanding
 ledger record persists `Started` before the first removal, then records
