@@ -1,7 +1,6 @@
 //! Configuration-owned authorization for callers that already authenticated
 //! an identity. The applied ledger owns policy; candidate files never do.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use omnigraph_policy::{PolicyAction, PolicyEngine, PolicyRequest};
@@ -220,17 +219,6 @@ impl AppliedPolicies {
         backend: &ClusterStore,
         state: &ClusterState,
     ) -> Result<Self, Diagnostic> {
-        Self::load_optional_with_sources(backend, state, &BTreeMap::new()).await
-    }
-
-    /// Repair authority is restricted to a storage owner. Replacement source
-    /// must hash to the currently applied policy; candidate policy cannot grant
-    /// authority to repair itself. This method does not write catalog bytes.
-    pub(crate) async fn load_optional_with_sources(
-        backend: &ClusterStore,
-        state: &ClusterState,
-        repair_sources: &BTreeMap<String, String>,
-    ) -> Result<Self, Diagnostic> {
         if state.applied_revision.resources.len() > MAX_AUTHORIZATION_RESOURCES {
             return Err(refusal(
                 "policy_bounds_exceeded",
@@ -261,13 +249,7 @@ impl AppliedPolicies {
                     address,
                     MAX_POLICY_BYTES.min(MAX_POLICY_TOTAL_BYTES.saturating_sub(total_bytes)),
                 )
-                .await
-                .or_else(|error| match repair_sources.get(&entry.digest) {
-                    Some(source) if sha256_hex(source.as_bytes()) == entry.digest => {
-                        Ok(source.clone())
-                    }
-                    _ => Err(error),
-                })?;
+                .await?;
             total_bytes = total_bytes.saturating_add(source.len());
             if source.len() > MAX_POLICY_BYTES || total_bytes > MAX_POLICY_TOTAL_BYTES {
                 return Err(refusal(
@@ -390,12 +372,13 @@ fn check(
 pub(crate) async fn authorize_candidate(
     backend: &ClusterStore,
     desired: &DesiredCluster,
-    state: Option<&ClusterState>,
-    observations: &StateObservations,
+    captured: &CapturedDeployment,
+    snapshot: &store::StateSnapshot,
     changes: &[PlanChange],
     identity: &IdentityAuthorization,
     applying: bool,
 ) -> Result<(PlanAuthorization, Option<AppliedPolicies>), Diagnostic> {
+    let state = snapshot.state.as_ref();
     if !desired.state_lock {
         return Err(refusal(
             "authorization_requires_lock",
@@ -423,13 +406,7 @@ pub(crate) async fn authorize_candidate(
                 "initial configuration differs from the explicitly authorized initialization",
             ));
         }
-        if state.is_some_and(|state| {
-            state.state_revision > 1
-                || !state.applied_revision.resources.is_empty()
-                || !state.approval_records.is_empty()
-                || !state.recovery_records.is_empty()
-                || state.applied_revision.config_digest.as_deref() != Some(&desired.config_digest)
-        }) {
+        if state.is_some_and(|state| !pristine_bootstrap_state(state)) {
             return Err(refusal(
                 "bootstrap_already_initialized",
                 "bootstrap",
@@ -439,7 +416,7 @@ pub(crate) async fn authorize_candidate(
         // The explicit capability authorizes installation, not candidate-policy
         // self-authorization. Validate that it actually installs an initial
         // management policy for the authenticated creator.
-        validate_initial_policy(desired, &identity.actor)?;
+        validate_initial_policy(desired, captured, &identity.actor)?;
         None
     } else {
         let state = state.ok_or_else(|| {
@@ -554,6 +531,22 @@ pub(crate) async fn authorize_candidate(
             })
             .collect::<BTreeSet<_>>();
         for graph in affected_graphs {
+            if !captured.resources.contains_key(&graph_address(&graph))
+                && !backend
+                    .graph_root_exists(&backend.graph_root(&graph))
+                    .await
+                    .map_err(|error| {
+                        refusal(
+                            "graph_unavailable",
+                            graph_address(&graph),
+                            error.to_string(),
+                        )
+                    })?
+            {
+                // The applied identity still authorizes removing an already
+                // absent graph; it must never be recreated to inspect recovery.
+                continue;
+            }
             Omnigraph::ensure_no_pending_recovery(&backend.graph_root(&graph))
                 .await
                 .map_err(|error| {
@@ -570,9 +563,9 @@ pub(crate) async fn authorize_candidate(
         version: 1,
         actor: identity.actor.clone(),
         canonical_root: backend.canonical_root()?,
-        state_revision: observations.state_revision,
-        state_cas: observations.state_cas.clone(),
-        applied_config_digest: observations.applied_config_digest.clone(),
+        state_revision: state.map_or(0, |state| state.state_revision),
+        state_cas: snapshot.state_cas.clone(),
+        applied_config_digest: state.and_then(|state| state.applied_revision.config_digest.clone()),
         desired_config_digest: desired.config_digest.clone(),
         policy_digests: policies
             .as_ref()
@@ -585,7 +578,11 @@ pub(crate) async fn authorize_candidate(
     Ok((evidence, policies))
 }
 
-fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), Diagnostic> {
+fn validate_initial_policy(
+    desired: &DesiredCluster,
+    captured: &CapturedDeployment,
+    actor: &str,
+) -> Result<(), Diagnostic> {
     let (address, _) = desired
         .policy_bindings
         .iter()
@@ -597,29 +594,20 @@ fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), 
                 "initialization must explicitly declare a cluster management policy",
             )
         })?;
-    let resource = desired
-        .resources
-        .iter()
-        .find(|resource| &resource.address == address)
-        .ok_or_else(|| {
-            refusal(
-                "bootstrap_policy_required",
-                address,
-                "initial policy source missing",
-            )
-        })?;
-    let file = fs::File::open(resource.path.as_ref().ok_or_else(|| {
+    let resource = captured.resources.get(address).ok_or_else(|| {
         refusal(
             "bootstrap_policy_required",
             address,
             "initial policy source missing",
         )
-    })?)
-    .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
-    let mut source = String::new();
-    file.take(MAX_POLICY_BYTES as u64 + 1)
-        .read_to_string(&mut source)
-        .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
+    })?;
+    let source = captured.sources.get(&resource.digest).ok_or_else(|| {
+        refusal(
+            "bootstrap_policy_required",
+            address,
+            "initial policy source missing",
+        )
+    })?;
     if source.len() > MAX_POLICY_BYTES || sha256_hex(source.as_bytes()) != resource.digest {
         return Err(refusal(
             "resource_content_changed",
@@ -627,7 +615,7 @@ fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), 
             "initial policy source differs from its authorized digest",
         ));
     }
-    let policy = PolicyEngine::load_cluster_from_source(&source)
+    let policy = PolicyEngine::load_cluster_from_source(source)
         .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
     check(
         &policy,
@@ -762,7 +750,8 @@ pub async fn authorize_apply_plan(
     identity: &IdentityAuthorization,
     expected: &PlanAuthorization,
 ) -> Result<PlanAuthorization, Diagnostic> {
-    let outcome = load_desired(config_dir.as_ref());
+    let sources = config::capture_desired(config_dir.as_ref());
+    let outcome = sources.outcome;
     if let Some(diagnostic) = outcome
         .diagnostics
         .into_iter()
@@ -780,14 +769,7 @@ pub async fn authorize_apply_plan(
     let backend = store_for(&desired.config_dir, desired.storage_root.as_deref())?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let captured = crate::capture_deployment(config_dir.as_ref(), &BTreeMap::new())?;
-    if captured.config_digest() != desired.config_digest {
-        return Err(refusal(
-            "resource_content_changed",
-            "configuration",
-            "candidate changed during authorization capture",
-        ));
-    }
+    let captured = capture_desired_deployment(&desired, sources.sources, None)?;
     if let Some(state) = &snapshot.state {
         if state.version != 2 {
             return Err(refusal(
@@ -811,13 +793,7 @@ pub async fn authorize_apply_plan(
     append_policy_binding_changes(&mut changes, snapshot.state.as_ref(), &desired);
     append_embedding_profile_changes(&mut changes, snapshot.state.as_ref(), &desired);
     let (authorization, _) = authorize_candidate(
-        &backend,
-        &desired,
-        snapshot.state.as_ref(),
-        &observations,
-        &changes,
-        identity,
-        true,
+        &backend, &desired, &captured, &snapshot, &changes, identity, true,
     )
     .await?;
     compare_authorization(expected, &authorization)?;

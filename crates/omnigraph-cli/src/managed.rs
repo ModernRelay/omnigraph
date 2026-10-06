@@ -551,14 +551,8 @@ async fn cluster_command(
     context: &Context,
     command: &ClusterCommand,
 ) -> Result<(Value, i32)> {
-    if let ClusterCommand::Token {
-        actions,
-        ttl,
-        clear,
-        ..
-    } = command
-    {
-        return data::token(cli, context, actions.as_deref(), *ttl, *clear)
+    if let ClusterCommand::Token { ttl, clear, .. } = command {
+        return data::token(cli, context, *ttl, *clear)
             .await
             .map(|body| (body, 0));
     }
@@ -570,18 +564,6 @@ async fn cluster_command(
             ..
         } | ClusterCommand::Apply {
             writers_stopped: true,
-            ..
-        } | ClusterCommand::Apply {
-            schema_correction: Some(_),
-            ..
-        } | ClusterCommand::Apply {
-            lifecycle: Some(_),
-            ..
-        } | ClusterCommand::Plan {
-            lifecycle: Some(_),
-            ..
-        } | ClusterCommand::Plan {
-            schema_correction: Some(_),
             ..
         } | ClusterCommand::Status {
             deployment_id: Some(_),
@@ -595,12 +577,6 @@ async fn cluster_command(
     }
     // Reject unsupported verbs and invalid requests before accessing credentials.
     match command {
-        ClusterCommand::Plan { observe: true, .. } => {
-            return Err(Failure::refused(
-                "managed_command_unsupported",
-                "managed plan does not accept --observe",
-            ));
-        }
         ClusterCommand::Apply { plan: None, .. } => {
             return Err(Failure::refused(
                 "plan_required",

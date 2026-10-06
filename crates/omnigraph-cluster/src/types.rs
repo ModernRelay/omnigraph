@@ -193,24 +193,11 @@ pub struct PlanChange {
     /// whose applied ledger metadata needs to converge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_change: Option<PlanMetadataChange>,
-    /// Explicit lifecycle work remains visible even when source digests match.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lifecycle: Option<PlanLifecycleAction>,
     /// For schema updates: the engine's migration plan against the live
     /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
     /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanLifecycleAction {
-    RemoveRetainingStorage,
-    Adopt,
-    Recreate,
-    RepairCatalog,
-    CorrectSchemaContract,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -229,7 +216,7 @@ pub struct BlastRadius {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanOutput {
     pub ok: bool,
-    /// Whether this plan held the cluster lock or only observed the ledger.
+    /// Plans are observations and never reserve writer authority.
     pub authority: LedgerAuthority,
     pub config_dir: String,
     pub desired_revision: DesiredRevision,
@@ -272,13 +259,6 @@ pub enum LedgerAuthority {
     /// The command took no lock and wrote nothing. Its findings are a
     /// point-in-time observation; `state_cas` names the ledger it read.
     Observed,
-}
-
-/// Options for [`crate::plan_config_dir_with_options`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PlanOptions {
-    /// Plan without the cluster lock and label the output `observed`.
-    pub observe: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

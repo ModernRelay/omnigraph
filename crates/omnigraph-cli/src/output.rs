@@ -228,21 +228,6 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
                 ""
             };
             println!("  {:?} {}{bindings}", change.operation, change.resource);
-            if let Some(action) = change.lifecycle {
-                use omnigraph_cluster::PlanLifecycleAction;
-                let description = match action {
-                    PlanLifecycleAction::RemoveRetainingStorage => {
-                        "remove from cluster; retain storage"
-                    }
-                    PlanLifecycleAction::Adopt => "adopt the confirmed existing graph",
-                    PlanLifecycleAction::Recreate => "create an empty graph with a new identity",
-                    PlanLifecycleAction::RepairCatalog => "restore the verified catalog payload",
-                    PlanLifecycleAction::CorrectSchemaContract => {
-                        "accept the confirmed observed schema contract"
-                    }
-                };
-                println!("      {description}");
-            }
             if let Some(migration) = &change.migration {
                 if !migration.supported {
                     println!("      migration UNSUPPORTED:");
@@ -490,40 +475,6 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
         }
     }
     if let Some(diagnostic) = payload.embedding_generation {
-        println!("{}", diagnostic.message());
-    }
-}
-
-pub(crate) fn print_ingest_human(output: &IngestOutput) {
-    println!(
-        "ingested {} entities from {} into branch {} from {} with {} ({})",
-        output.total_entities,
-        output.uri,
-        output.branch,
-        output.base_branch.as_deref().unwrap_or("main"),
-        output.mode.as_str(),
-        if output.branch_created {
-            "branch created"
-        } else {
-            "branch exists"
-        }
-    );
-    for declaration in &output.nodes {
-        println!(
-            "node type '{}': {} entities loaded",
-            declaration.name, declaration.entities_loaded
-        );
-    }
-    for declaration in &output.edges {
-        println!(
-            "edge type '{}': {} entities loaded",
-            declaration.name, declaration.entities_loaded
-        );
-    }
-    if let Some(actor_id) = &output.actor_id {
-        println!("actor_id: {}", actor_id);
-    }
-    if let Some(diagnostic) = output.embedding_generation {
         println!("{}", diagnostic.message());
     }
 }

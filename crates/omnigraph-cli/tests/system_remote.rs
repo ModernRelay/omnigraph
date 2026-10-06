@@ -105,7 +105,7 @@ query insert_person($name: String, $age: I32) {
 
     let local_read = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&served_root)
             .arg("--query")
@@ -117,7 +117,7 @@ query insert_person($name: String, $age: I32) {
     ));
     let read_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -141,7 +141,7 @@ query insert_person($name: String, $age: I32) {
     // is `--unauthenticated`, so the actor is the server default).
     let change_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -158,11 +158,11 @@ query insert_person($name: String, $age: I32) {
 
     let query_source = fs::read_to_string(fixture("test.gq")).unwrap();
     let http_read = client
-        .post(format!("{}/graphs/{GRAPH_ID}/read", server.base_url))
+        .post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
         .json(&json!({
             "branch": "main",
-            "query_source": query_source,
-            "query_name": "get_person",
+            "query": query_source,
+            "name": "get_person",
             "params": { "name": "Mina" }
         }))
         .send()
@@ -174,13 +174,13 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(http_read["row_count"], 1);
     assert_eq!(http_read["rows"][0]["p.name"], "Mina");
     assert!(
-        http_read.get("graph_commit_id").is_none(),
-        "deprecated /read must preserve its byte-stable legacy envelope"
+        http_read["graph_commit_id"].is_string(),
+        "query returns the graph position pinned with its rows"
     );
 
     let local_verify = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&served_root)
             .arg("--query")
@@ -198,7 +198,7 @@ query insert_person($name: String, $age: I32) {
     // queries.
     let inline_remote_read = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -214,7 +214,7 @@ query insert_person($name: String, $age: I32) {
 
     let inline_remote_change = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -296,12 +296,17 @@ fn assert_cluster_schema_apply_refused(server: &TestServer, schema: &std::path::
             .arg("--json"),
     );
     let refusal = parse_stdout_json(&output);
-    assert_eq!(refusal["code"], "conflict", "{refusal}");
+    assert_eq!(
+        refusal["command_outcome"]["execution"], "not_started",
+        "{refusal}"
+    );
+    assert_eq!(refusal["command_outcome"]["effects"], "none", "{refusal}");
+    assert!(refusal.get("http_status").is_none(), "{refusal}");
     assert!(
         refusal["error"]
             .as_str()
             .unwrap()
-            .contains("server-side schema apply is disabled for cluster-backed serving"),
+            .contains("`schema apply` is a direct (storage-native) command"),
         "{refusal}"
     );
     assert_eq!(
@@ -400,7 +405,7 @@ query ordered_person($name: String) {
 
     let json_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -422,7 +427,7 @@ query ordered_person($name: String) {
 
     let csv = stdout_string(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -498,7 +503,7 @@ query insert_person($name: String, $age: I32) {
 
     let changed = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -533,7 +538,7 @@ query insert_person($name: String, $age: I32) {
 
     let verify = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -801,7 +806,7 @@ query add_friend($from: String, $to: String) {
 
     output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -817,7 +822,7 @@ query add_friend($from: String, $to: String) {
     );
     output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -840,8 +845,7 @@ query add_friend($from: String, $to: String) {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--branch")
-            .arg("feature")
-            .arg("--jsonl"),
+            .arg("feature"),
     ));
     let export_path = temp.path().join("system-remote-exported.jsonl");
     fs::write(&export_path, &exported).unwrap();
@@ -890,7 +894,7 @@ query add_friend($from: String, $to: String) {
 
     let eve = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
@@ -919,7 +923,9 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let ingest_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("ingest")
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -928,6 +934,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg(&ingest_data)
             .arg("--branch")
             .arg("feature-ingest")
+            .arg("--from")
+            .arg("main")
             .arg("--json"),
     ));
     assert_eq!(ingest_payload["branch"], "feature-ingest");
@@ -955,7 +963,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let zoe = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -974,7 +982,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
 }
 
 /// The unified `load` works against remote graphs through the server's
-/// `/ingest` endpoint: without `--from` a missing branch is a hard error
+/// `load` behavior: without `--from` a missing branch is a hard error
 /// (no implicit fork), with `--from` it forks like ingest did.
 #[test]
 fn remote_load_round_trips_and_requires_from_for_new_branches() {
@@ -1078,7 +1086,9 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
 
     let ingest_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("ingest")
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1101,7 +1111,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
 
     let bob = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1120,7 +1130,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
 
     let zoe = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1180,7 +1190,7 @@ query insert_person($name: String, $age: I32) {
     let denied_main_change = output_failure(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1222,7 +1232,7 @@ query insert_person($name: String, $age: I32) {
     let changed = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1316,7 +1326,7 @@ query insert_person($name: String, $age: I32) {
     let verify = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")

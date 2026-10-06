@@ -48,16 +48,15 @@ use api::{
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
     GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    LegacyReadOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, ReadinessOutput,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery,
-    graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output, snapshot_payload,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -121,24 +120,16 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
-        // deprecated; the #[deprecated] attribute on the handler
-        // surfaces as `deprecated: true` on the OpenAPI operation.
-        #[allow(deprecated)] handlers::server_read,
         handlers::server_query,
         handlers::server_export,
-        #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
         handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
         handlers::server_invoke_query_if_graph_commit,
-        handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
         handlers::server_load_ndjson,
-        // deprecated; the #[deprecated] attribute on the handler surfaces as
-        // `deprecated: true` on the OpenAPI operation.
-        #[allow(deprecated)] handlers::server_ingest,
         handlers::server_branch_list,
         handlers::server_branch_create,
         handlers::server_branch_delete,
@@ -2397,26 +2388,7 @@ pub fn build_app(state: AppState) -> Router {
         // dedicated handler makes the zero-payload-read contract structural.
         .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
-        // /read and /change retain their deprecated route/request semantics;
-        // their handlers carry #[deprecated] so the OpenAPI operation is
-        // flagged and their responses include RFC 9745 Deprecation +
-        // RFC 8288 Link headers. Suppress the call-site warning for the
-        // route registration itself.
-        .route(
-            "/read",
-            post({
-                #[allow(deprecated)]
-                server_read
-            }),
-        )
         .route("/query", post(server_query))
-        .route(
-            "/change",
-            post({
-                #[allow(deprecated)]
-                server_change
-            }),
-        )
         .route("/mutate", post(server_mutate))
         .route(
             "/mutate/if-graph-commit",
@@ -2429,23 +2401,11 @@ pub fn build_app(state: AppState) -> Router {
             post(server_invoke_query_if_graph_commit),
         )
         .route("/schema", get(server_schema_get))
-        .route("/schema/apply", post(server_schema_apply))
         .route(
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route("/load/ndjson", post(server_load_ndjson))
-        // /ingest is the deprecated alias of /load; its handler carries
-        // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
-        // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
-        .route(
-            "/ingest",
-            post({
-                #[allow(deprecated)]
-                server_ingest
-            })
-            .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-        )
         .route(
             "/branches",
             get(server_branch_list).post(server_branch_create),
@@ -2654,6 +2614,7 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults);
+    deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     let startup_owner = operations
         .own_startup()

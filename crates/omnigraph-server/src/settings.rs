@@ -1099,15 +1099,9 @@ graphs:
         )
         .unwrap();
         let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
-        let apply = omnigraph_cluster::apply_deployment(
-            dir.path(),
-            None,
-            &caller,
-            &Default::default(),
-            |_, _, _| {},
-        )
-        .await
-        .unwrap();
+        let apply = omnigraph_cluster::apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap();
         assert!(
             matches!(apply, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
             "{apply:?}"

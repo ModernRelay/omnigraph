@@ -1139,6 +1139,18 @@ impl Omnigraph {
         desired_schema_source: &str,
         actor: Option<&str>,
     ) -> Result<PreparedSchemaApply> {
+        self.prepare_schema_apply_with_plan_as(desired_schema_source, actor)
+            .await
+            .map(|(intent, _)| intent)
+    }
+
+    /// Return the migration preview and exact intent from the same accepted
+    /// schema capture. The plan is descriptive; execution revalidates the intent.
+    pub async fn prepare_schema_apply_with_plan_as(
+        &self,
+        desired_schema_source: &str,
+        actor: Option<&str>,
+    ) -> Result<(PreparedSchemaApply, SchemaMigrationPlan)> {
         schema_apply::prepare_schema_apply(self, desired_schema_source, actor).await
     }
 

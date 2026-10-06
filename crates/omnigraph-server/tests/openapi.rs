@@ -200,20 +200,16 @@ const EXPECTED_PATHS: &[&str] = &[
     "/cluster/deployments/{id}",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
-    "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
     "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/queries",
     "/graphs/{graph_id}/queries/{name}",
     "/graphs/{graph_id}/queries/{name}/if-graph-commit",
     "/graphs/{graph_id}/schema",
-    "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
     "/graphs/{graph_id}/load/ndjson",
-    "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
@@ -229,6 +225,9 @@ fn openapi_contains_all_expected_paths() {
     let doc = openapi_json();
     let paths = doc["paths"].as_object().expect("paths must be an object");
     let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for retired in ["read", "change", "ingest", "schema/apply"] {
+        assert!(!path_keys.contains(format!("/graphs/{{graph_id}}/{retired}").as_str()));
+    }
 
     for expected in EXPECTED_PATHS {
         assert!(
@@ -542,12 +541,6 @@ fn openapi_healthz_is_get() {
 }
 
 #[test]
-fn openapi_read_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/read"]["post"].is_object());
-}
-
-#[test]
 fn openapi_blob_supports_get_and_explicit_head() {
     let doc = openapi_json();
     let path = &doc["paths"]["/graphs/{graph_id}/blob"];
@@ -731,12 +724,6 @@ fn export_documents_pre_header_failures() {
 }
 
 #[test]
-fn openapi_change_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/change"]["post"].is_object());
-}
-
-#[test]
 fn openapi_mutate_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/mutate"]["post"].is_object());
@@ -773,32 +760,6 @@ fn openapi_conditional_mutation_routes_are_post() {
     }
 }
 
-// Deprecation flagging — `/read` and `/change` are kept indefinitely for
-// back-compat but are flagged so OpenAPI codegens (typescript-fetch,
-// openapi-generator, oapi-codegen, etc.) emit @deprecated on the generated
-// SDK methods. The canonical successors `/query` and `/mutate` are not
-// flagged. See `deprecation_headers` in `omnigraph-server/src/lib.rs` for
-// the matching runtime signal (RFC 9745 + RFC 8288 headers).
-#[test]
-fn openapi_read_is_deprecated() {
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/read"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/read must be flagged deprecated in OpenAPI; use /query instead"
-    );
-}
-
-#[test]
-fn openapi_change_is_deprecated() {
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/change"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/change must be flagged deprecated in OpenAPI; use /mutate instead"
-    );
-}
-
 #[test]
 fn openapi_query_is_not_deprecated() {
     let doc = openapi_json();
@@ -823,12 +784,6 @@ fn openapi_mutate_is_not_deprecated() {
         !deprecated,
         "/mutate is the canonical mutation endpoint and must not be deprecated"
     );
-}
-
-#[test]
-fn openapi_ingest_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/ingest"]["post"].is_object());
 }
 
 #[test]
@@ -881,17 +836,6 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     assert_eq!(declaration_props.len(), 2);
     assert!(declaration_props.contains_key("name"));
     assert!(declaration_props.contains_key("entities_loaded"));
-}
-
-#[test]
-fn openapi_ingest_is_deprecated() {
-    // RFC-009 Phase 5: /ingest is now the deprecated alias of /load.
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/ingest"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/ingest must be flagged deprecated now that /load is canonical"
-    );
 }
 
 #[test]
@@ -1006,15 +950,12 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "MergeConflictKindOutput",
     "MergeConflictOutput",
     "ReadOutput",
-    "ReadRequest",
     "ReadSetConflictOutput",
     "ReadTargetOutput",
     "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
     "PublishedDatasetVersionConflictOutput",
-    "SchemaApplyOutput",
-    "SchemaApplyRequest",
     "SnapshotDatasetOutput",
     "SnapshotOutput",
 ];
@@ -1040,6 +981,10 @@ fn openapi_omits_retired_vocabulary_components() {
     let doc = openapi_json();
     let schemas = doc["components"]["schemas"].as_object().unwrap();
     for retired in [
+        "ReadRequest",
+        "LegacyReadOutput",
+        "SchemaApplyRequest",
+        "SchemaApplyOutput",
         "IngestTableOutput",
         "ChangeEntityKind",
         "ManifestConflictOutput",
@@ -1068,31 +1013,6 @@ fn health_output_schema_has_expected_fields() {
 }
 
 #[test]
-fn read_request_schema_has_expected_fields() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["ReadRequest"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_source"));
-    assert!(props.contains_key("query_name"));
-    assert!(props.contains_key("params"));
-    assert!(props.contains_key("branch"));
-    assert!(props.contains_key("snapshot"));
-}
-
-#[test]
-fn read_request_query_source_is_required() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["ReadRequest"];
-    let required: Vec<&str> = schema["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(required.contains(&"query_source"));
-}
-
-#[test]
 fn read_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ReadOutput"];
@@ -1105,9 +1025,6 @@ fn read_output_schema_has_expected_fields() {
 
 #[test]
 fn change_request_schema_has_expected_fields() {
-    // Canonical field names on the wire are now `query` and `name`. The
-    // schema descriptions document `query_source` and `query_name` as
-    // legacy deserialization aliases for backward compatibility.
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ChangeRequest"];
     let props = schema["properties"].as_object().unwrap();
@@ -1115,13 +1032,8 @@ fn change_request_schema_has_expected_fields() {
     assert!(props.contains_key("name"));
     assert!(props.contains_key("params"));
     assert!(props.contains_key("branch"));
-    let query_desc = schema["properties"]["query"]["description"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        query_desc.contains("query_source"),
-        "expected `query` description to mention the legacy `query_source` alias, got: {query_desc}"
-    );
+    assert!(!props.contains_key("query_source"));
+    assert!(!props.contains_key("query_name"));
 }
 
 #[test]
@@ -1413,7 +1325,6 @@ fn error_output_schema_has_expected_fields() {
     );
     for path in [
         "/graphs/{graph_id}/query",
-        "/graphs/{graph_id}/read",
         "/graphs/{graph_id}/queries/{name}",
     ] {
         let response = &doc["paths"][path]["post"]["responses"]["409"];
@@ -1535,15 +1446,6 @@ fn commit_output_schema_has_expected_fields() {
 }
 
 #[test]
-fn schema_apply_output_uses_graph_manifest_version() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["SchemaApplyOutput"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("graph_manifest_version"));
-    assert!(!props.contains_key("manifest_version"));
-}
-
-#[test]
 fn snapshot_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["SnapshotOutput"];
@@ -1655,14 +1557,12 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
     assert_eq!(output_ref, "#/components/schemas/ExternalBlobSourceOutput");
 
     for path in [
-        "/graphs/{graph_id}/change",
         "/graphs/{graph_id}/mutate",
         "/graphs/{graph_id}/mutate/if-graph-commit",
         "/graphs/{graph_id}/queries/{name}",
         "/graphs/{graph_id}/queries/{name}/if-graph-commit",
         "/graphs/{graph_id}/load",
         "/graphs/{graph_id}/load/ndjson",
-        "/graphs/{graph_id}/ingest",
         "/graphs/{graph_id}/branches/merge",
     ] {
         assert_eq!(
@@ -1743,18 +1643,14 @@ fn openapi_defines_bearer_token_security_scheme() {
 fn protected_endpoints_reference_bearer_token_security() {
     let doc = openapi_json();
     let protected_paths = [
-        ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/blob", "get"),
         ("/graphs/{graph_id}/blob", "head"),
-        ("/graphs/{graph_id}/change", "post"),
-        ("/graphs/{graph_id}/schema/apply", "post"),
         ("/graphs/{graph_id}/queries", "get"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
@@ -1880,38 +1776,14 @@ fn openapi_operations_have_tags() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn read_endpoint_200_references_legacy_read_output_schema() {
+fn mutate_endpoint_200_references_change_output_schema() {
     let doc = openapi_json();
-    let content = &doc["paths"]["/graphs/{graph_id}/read"]["post"]["responses"]["200"]["content"];
-    let schema = &content["application/json"]["schema"];
-    let ref_path = schema["$ref"].as_str().unwrap();
-    assert!(
-        ref_path.contains("LegacyReadOutput"),
-        "POST /read 200 should reference LegacyReadOutput, got {ref_path}"
-    );
-}
-
-#[test]
-fn legacy_read_output_schema_cannot_carry_graph_commit_id() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["LegacyReadOutput"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_name"));
-    assert!(props.contains_key("target"));
-    assert!(props.contains_key("row_count"));
-    assert!(props.contains_key("rows"));
-    assert!(!props.contains_key("graph_commit_id"));
-}
-
-#[test]
-fn change_endpoint_200_references_change_output_schema() {
-    let doc = openapi_json();
-    let content = &doc["paths"]["/graphs/{graph_id}/change"]["post"]["responses"]["200"]["content"];
+    let content = &doc["paths"]["/graphs/{graph_id}/mutate"]["post"]["responses"]["200"]["content"];
     let schema = &content["application/json"]["schema"];
     let ref_path = schema["$ref"].as_str().unwrap();
     assert!(
         ref_path.contains("ChangeOutput"),
-        "POST /change 200 should reference ChangeOutput, got {ref_path}"
+        "POST /mutate 200 should reference ChangeOutput, got {ref_path}"
     );
 }
 
@@ -1931,10 +1803,10 @@ fn healthz_200_references_health_output_schema() {
 fn error_responses_reference_error_output_schema() {
     let doc = openapi_json();
     let paths_with_errors = [
-        ("/graphs/{graph_id}/read", "post", "400"),
-        ("/graphs/{graph_id}/read", "post", "401"),
-        ("/graphs/{graph_id}/change", "post", "400"),
-        ("/graphs/{graph_id}/change", "post", "409"),
+        ("/graphs/{graph_id}/query", "post", "400"),
+        ("/graphs/{graph_id}/query", "post", "401"),
+        ("/graphs/{graph_id}/mutate", "post", "400"),
+        ("/graphs/{graph_id}/mutate", "post", "409"),
         ("/graphs/{graph_id}/branches", "post", "409"),
     ];
 
@@ -1953,14 +1825,12 @@ fn error_responses_reference_error_output_schema() {
 fn recovery_barrier_write_endpoints_document_recovery_required() {
     let doc = openapi_json();
     for (path, method) in [
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
         ("/graphs/{graph_id}/branches/merge", "post"),
@@ -1982,14 +1852,12 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
 fn bounded_keyed_write_endpoints_document_resource_limit() {
     let doc = openapi_json();
     for (path, method) in [
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches/merge", "post"),
     ] {
         let response = &doc["paths"][path][method]["responses"]["413"];
@@ -2013,10 +1881,9 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
 fn post_endpoints_have_request_body() {
     let doc = openapi_json();
     let post_paths = [
-        ("/graphs/{graph_id}/read", "ReadRequest"),
-        ("/graphs/{graph_id}/change", "ChangeRequest"),
-        ("/graphs/{graph_id}/schema/apply", "SchemaApplyRequest"),
-        ("/graphs/{graph_id}/ingest", "IngestRequest"),
+        ("/graphs/{graph_id}/query", "QueryRequest"),
+        ("/graphs/{graph_id}/mutate", "ChangeRequest"),
+        ("/graphs/{graph_id}/load", "IngestRequest"),
         ("/graphs/{graph_id}/export", "ExportRequest"),
         ("/graphs/{graph_id}/branches", "BranchCreateRequest"),
         ("/graphs/{graph_id}/branches/merge", "BranchMergeRequest"),
@@ -2149,10 +2016,8 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     // RFC-011 cluster-only: the served spec always nests protected
     // routes under `/graphs/{graph_id}/...`.
     let protected_paths = [
-        ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/blob", "get"),
         ("/graphs/{graph_id}/blob", "head"),
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/commits", "get"),
@@ -2234,16 +2099,12 @@ fn openapi_spec_is_up_to_date() {
 const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
-    "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/queries/{name}/if-graph-commit",
-    "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
     "/graphs/{graph_id}/load/ndjson",
-    "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
@@ -2318,14 +2179,10 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
     let flat_protected = [
         "/snapshot",
         "/blob",
-        "/read",
         "/export",
-        "/change",
         "/schema",
-        "/schema/apply",
         "/load",
         "/load/ndjson",
-        "/ingest",
         "/branches",
         "/branches/{branch}",
         "/branches/merge",
@@ -2544,20 +2401,16 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     let flat_protected = [
         "/snapshot",
         "/blob",
-        "/read",
         "/query",
         "/export",
-        "/change",
         "/mutate",
         "/mutate/if-graph-commit",
         "/queries",
         "/queries/{name}",
         "/queries/{name}/if-graph-commit",
         "/schema",
-        "/schema/apply",
         "/load",
         "/load/ndjson",
-        "/ingest",
         "/branches",
         "/branches/{branch}",
         "/branches/merge",

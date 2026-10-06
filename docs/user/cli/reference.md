@@ -330,7 +330,7 @@ After login and cluster selection, use `graphs list` to discover graphs, then
 `query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
 Missing or expired identity credentials are acquired before the operation;
 applied Cedar policy decides permissions. See [managed data access](managed-data.md)
-for offline behavior, identity binding, explicit restricted credentials,
+for offline behavior, identity binding,
 discovery and credential clearing.
 
 ## Confirmation rules
@@ -339,12 +339,3 @@ discovery and credential clearing.
 against non-local storage also require interactive confirmation or `--yes`; in
 non-interactive and JSON modes they fail closed. The same non-local consent
 rule applies to overwrite loads and branch deletion, verb or statement.
-
-## Compatibility aliases
-
-| Old name | Canonical name |
-|---|---|
-| `read` | `query` |
-| `change` | `mutate` |
-| `check` and `query lint` | `lint` |
-| `ingest` | `load` |

@@ -6,11 +6,11 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
-    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
-    DiagnosticSeverity, ForceUnlockOutput, PlanOptions, PlanOutput, StateSyncOutput, StatusOutput,
+    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
     ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
     validate_config_dir,
 };
@@ -34,7 +34,6 @@ use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -149,7 +148,6 @@ async fn main() -> Result<()> {
         .display_location_section(false)
         .install()?;
     let (cli, machine) = {
-        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -158,7 +156,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches_from(raw_args);
+            .get_matches();
         let mut command_matches = &matches;
         while let Some((_, child)) = command_matches.subcommand() {
             command_matches = child;
@@ -258,23 +256,6 @@ fn validate_core_root_arguments(
     let Command::Cluster { command } = &cli.command else {
         return Ok(());
     };
-    if cli.cluster.is_some()
-        && matches!(
-            command,
-            ClusterCommand::Apply {
-                schema_correction: Some(_),
-                ..
-            } | ClusterCommand::Apply {
-                lifecycle: Some(_),
-                ..
-            }
-        )
-    {
-        return Err(Cli::command().error(
-            clap::error::ErrorKind::ArgumentConflict,
-            "--schema-correction and --lifecycle require config-addressed apply; root reconciliation uses only the original captured input",
-        ));
-    }
     if cli.cluster.is_some()
         && command_matches
             .try_get_one::<PathBuf>("config")
@@ -611,44 +592,6 @@ async fn run(cli: Cli) -> Result<()> {
                 print_json(&payload)?;
             } else {
                 print_load_human(&payload);
-            }
-        }
-        Command::Ingest {
-            uri,
-            data,
-            branch,
-            from,
-            mode,
-            settings,
-            json,
-        } => {
-            let settings = client::parse_set_flags(&settings)?;
-            // stderr so `--json` consumers reading stdout are unaffected.
-            eprintln!(
-                "warning: `omnigraph ingest` is a deprecated loader command; \
-                 use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
-                 (ingest retains its permissive parser and defaults: --from main --mode merge; output uses current canonical vocabulary)"
-            );
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
-            let branch = resolve_branch(branch, None, "main");
-            let from = resolve_branch(from, None, "main");
-            echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
-            let payload = client
-                .ingest(&branch, &from, &data.to_string_lossy(), mode, &settings)
-                .await?;
-            if json {
-                print_json(&payload)?;
-            } else {
-                print_ingest_human(&payload);
             }
         }
         Command::Branch { command } => match command {
@@ -1127,9 +1070,8 @@ async fn run(cli: Cli) -> Result<()> {
                 // RFC-011 Decision 10: a graph managed by a cluster evolves via
                 // `cluster apply` (deployment ledger), not a direct
                 // `schema apply` against its storage root — that would bypass the
-                // ledger. Mirrors `init`'s refusal. Only the embedded path can
-                // address a storage root; a served apply (`--server`) is the
-                // server's concern.
+                // ledger. Mirrors `init`'s refusal. This command addresses
+                // standalone storage only.
                 if !client.is_remote() {
                     if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
                         .await
@@ -1152,9 +1094,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let schema_source = fs::read_to_string(&schema)?;
                 // The embedded (direct-store) arm carries no stored-query
                 // registry — the registry is cluster-owned (RFC-011), so a
-                // direct apply has nothing to validate against. The served arm
-                // runs the server's own catalog check. So the validator is a
-                // no-op here on both arms.
+                // standalone apply has nothing to validate against.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
                     .apply_schema(&schema_source, |_catalog| Ok(()))
@@ -1252,7 +1192,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Export {
             uri,
             branch,
-            jsonl,
             type_names,
         } => {
             let client = client::GraphClient::resolve(
@@ -1265,9 +1204,6 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             let branch = resolve_branch(branch, None, "main");
-            if jsonl {
-                eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
-            }
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
@@ -1754,12 +1690,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Repair {
-            uri,
-            confirm,
-            force,
-            json,
-        } => {
+        Command::Repair { uri, json } => {
             let uri = resolve_maintenance_uri(
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -1772,30 +1703,15 @@ async fn run(cli: Cli) -> Result<()> {
             echo_write_target(cli.quiet, "repair", &uri, false);
             crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
-            let stats = db
-                .repair(omnigraph::db::RepairOptions { confirm, force })
-                .await?;
+            let stats = db.repair(omnigraph::db::RepairOptions::default()).await?;
             let refused_count = stats
                 .datasets
                 .iter()
                 .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
                 .count();
-            let blocked_count = stats
-                .datasets
-                .iter()
-                .filter(|s| {
-                    matches!(s.action, omnigraph::db::RepairAction::Refused)
-                        && matches!(
-                            s.classification,
-                            omnigraph::db::RepairClassification::BlockedPromotion
-                        )
-                })
-                .count();
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
-                    "confirm": confirm,
-                    "force": force,
                     "graph_manifest_version": stats.graph_manifest_version,
                     "datasets": stats.datasets.iter().map(|s| serde_json::json!({
                         "type_key": s.type_key,
@@ -1809,13 +1725,7 @@ async fn run(cli: Cli) -> Result<()> {
                 });
                 print_json(&value)?;
             } else {
-                let mode = if confirm { "confirm" } else { "preview" };
-                println!(
-                    "repair {} — {} mode, {} datasets",
-                    uri,
-                    mode,
-                    stats.datasets.len()
-                );
+                println!("repair {} — {} datasets", uri, stats.datasets.len());
                 for s in &stats.datasets {
                     let drift = if s.published_dataset_version == s.lance_head_version {
                         format!("{}", s.published_dataset_version)
@@ -1842,34 +1752,11 @@ async fn run(cli: Cli) -> Result<()> {
                         err
                     );
                 }
-                if !confirm {
-                    println!("rerun with --confirm to publish verified maintenance drift");
-                }
             }
-            let drift_refused = refused_count - blocked_count;
-            if blocked_count > 0 && drift_refused == 0 {
+            if refused_count > 0 {
                 bail!(
-                    "repair reports {} blocked promotion(s), one per table and branch; nothing resolves a \
-                     blocked pin yet and --force --confirm refuses the same way; reads, mutations \
-                     and loads on those tables continue",
-                    blocked_count
-                );
-            }
-            if drift_refused > 0 {
-                let blocked_note = if blocked_count > 0 {
-                    format!(
-                        "; {} more blocked promotion(s), which --force does not resolve",
-                        blocked_count
-                    )
-                } else {
-                    String::new()
-                };
-                bail!(
-                    "repair refused {} suspicious or unverifiable dataset(s); review the preview \
-                     output and rerun with --force --confirm only if publishing that drift is \
-                     intentional{}",
-                    drift_refused,
-                    blocked_note
+                    "repair could not diagnose {} dataset(s); inspect the reported errors",
+                    refused_count
                 );
             }
         }
@@ -1974,20 +1861,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
             }
-            ClusterCommand::Plan {
-                config,
-                json,
-                observe,
-                lifecycle,
-                schema_correction,
-                ..
-            } => {
-                let options =
-                    read_deployment_options(lifecycle.as_deref(), schema_correction.as_deref())?;
-                let output = omnigraph_cluster::plan_config_dir_with_deployment_options(
+            ClusterCommand::Plan { config, json, .. } => {
+                let output = omnigraph_cluster::plan_config_dir_as(
                     config,
-                    PlanOptions { observe },
-                    &options,
                     resolve_cluster_actor(cli.as_actor.as_deref())?,
                 )
                 .await;
@@ -2001,8 +1877,6 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
                 deployment_id,
-                schema_correction,
-                lifecycle,
                 writers_stopped,
                 ..
             } => {
@@ -2020,15 +1894,8 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     finish_core_deployment(result, json)?;
                 } else {
-                    let options = read_deployment_options(
-                        lifecycle.as_deref(),
-                        schema_correction.as_deref(),
-                    )?;
-                    let result = omnigraph_cluster::apply_deployment_with_options(
-                        &config,
-                        deployment_id.as_deref(),
-                        &caller,
-                        &options,
+                    let result = omnigraph_cluster::apply_deployment(
+                        &config, deployment_id.as_deref(), &caller,
                         |id, root, lock| {
                             let root = omnigraph::storage::redacted_storage_uri(root);
                             eprintln!(

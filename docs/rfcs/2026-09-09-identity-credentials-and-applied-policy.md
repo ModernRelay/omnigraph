@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-09-16
+updated: 2026-10-05
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -18,8 +18,7 @@ blocked_on: []
 
 ## Summary
 
-Add an identity-only version 2 signed credential alongside the restricted
-version 1 profile in [RFC 0053](0053-offline-data-token-verification.md).
+Use the identity-only version 2 signed credential described in [RFC 0053](0053-offline-data-token-verification.md).
 The credential authenticates a principal for one cluster; the cluster's
 applied policy configuration defines graph and schema permissions.
 Authenticated users can discover every graph's existence without obtaining
@@ -27,10 +26,8 @@ permission to read its data or schema.
 
 Add an identity-authorized cluster planning/apply API that checks the same
 policy engine against the current applied configuration before effects.
-Existing direct storage-holder APIs and version 1 restrictions remain intact.
-Version 2 is the normal credential profile. Version 1 remains an explicit
-compatibility interface for existing restricted clients; its presence does
-not require a new deployment to operate both profiles.
+Existing direct storage-holder APIs remain intact. Native signed credentials
+use version 2 only; version-1 credentials and restricted issuance are refused.
 
 ## Motivation
 
@@ -62,10 +59,9 @@ select the new minimal endpoint with
 `omnigraph graphs list --discovery --server <server>`.
 No JWT-shaped static token is reinterpreted to select a different command.
 
-Explicit legacy `--actions` requests retain version 1 restrictions. Existing
-cached restricted credentials never become identity-only credentials through
-renewal, permission denial, or omission of a field. Unsupported profiles
-refuse without switching credentials or storage addressing.
+CLI `--actions` is removed. Unsupported caches refuse without automatic
+replacement; `cluster token` explicitly requests a current identity credential.
+Permission denial never switches credentials or storage addressing.
 
 `GET /graphs/discovery` returns only
 `{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}`
@@ -73,7 +69,6 @@ for a valid version 2 identity. It uses the effective inventory, including
 unavailable graphs. No policy group or `graph_list` permit is required. Graph
 data, schema, query bodies, roots, diagnostics and topology are absent.
 The existing `/graphs` response and authorization retain their contract.
-Version 1 credentials cannot use discovery to evade their existing filters.
 Display names currently equal graph IDs. Inventory availability presumes a
 running server; an invalid cluster policy can still fail existing boot
 validation rather than silently disabling that validation.
@@ -92,9 +87,9 @@ account, cluster/incarnation, assurance and temporal checks of version 1.
 Its claims contain `version: 2`, `iss`, `aud`, `sub`, `account_id`,
 `cluster_id`, `cluster_incarnation`, `principal_kind`, `assurance`, `iat`,
 `exp`, and `jti`. It contains no `grants`, roles or policy membership.
-Unknown or duplicate fields refuse; removing `grants` from a version 1
-credential does not change its profile. The verifier privately represents
-the profiles distinctly and preserves public version 1 construction APIs.
+Unknown or duplicate fields and unsupported versions refuse; removing `grants`
+from a version-1 credential cannot make it valid. Only the strict
+`IdentityTokenClaims` type represents native signed credentials.
 
 The token remains bounded to 8,192 bytes, lifetime 60–86,400 seconds, default
 3,600 seconds, no expiry leeway and at most 30 seconds future issue time.
@@ -102,11 +97,9 @@ Public trust and canonical-root binding retain RFC 0053's bounds. Verification
 and policy evaluation have no synchronous issuer dependency. `principal:<sub>`
 remains the immutable authenticated actor; caller overrides cannot replace it.
 
-Credential acquisition explicitly requests `version: 2`; an omitted version
-retains the version 1 request contract. Version 2 responses explicitly report
+Credential acquisition explicitly requests `version: 2`. Version 2 responses explicitly report
 their version, identity, endpoint and expiry metadata without a grant list.
-The client checks the response profile and keeps separate versioned cache
-metadata. The issuer must check current identity and exact cluster admission;
+The client checks the response version and keeps versioned cache metadata. The issuer must check current identity and exact cluster admission;
 it must not exchange a restricted credential for a broader one. Issuer policy
 enrollment and lifecycle remain outside this library's trust boundary.
 
@@ -182,9 +175,10 @@ documented trust boundary, never an automatic fallback from identity denial.
 
 ## Compatibility and reversibility
 
-Version 1 tokens retain their ceilings, filtered catalog and schema exclusion.
-Existing static/unauthenticated modes, direct APIs and public version 1 data
-types retain their behavior. New authorized entry points are additive.
+Version-1 tokens, cache entries and public claim/grant types are unsupported;
+CLI `--actions` is removed. A new explicit `cluster token` request replaces an
+old cache. Existing static/unauthenticated modes and direct APIs retain their
+behavior. Authorized entry points remain additive.
 The public exhaustive policy enums gain `ConfigManage`/`Cluster` variants;
 embedders with exhaustive matches must add the corresponding arms. Policy
 configuration using `config_manage` requires a supporting binary; old binaries
@@ -210,16 +204,16 @@ Teach each caller to evaluate policy: duplicates semantics and permits drift.
 Extend the server token/auth-policy and catalog suites, CLI token/cache and
 dispatch suites, policy tests, and cluster plan/apply tests. Required cases:
 
-- Version 1 remains restricted and unchanged; malformed cross-profile claims
-  and invalid signature/time/root/identity fail.
+- Version-1 credentials and caches refuse without graph effects or automatic
+  replacement; invalid signature/time/root/identity and permission claims fail.
 - An authenticated unenrolled principal sees every graph ID/name, including
   an unavailable graph, and cannot read data/schema or private catalog fields.
 - Allowed and denied schema/config effects follow the applied policy; a
   candidate self-grant, wrong actor or stale base fails before effects.
 - A policy activation changes permissions for the same identity credential.
 - Bootstrap cannot be repeated on an initialized or policy-free cluster.
-- Old CLI restriction flags, cache entries and automation exchanges cannot
-  silently gain authority; explicit addressing stays compatible.
+- Removed CLI restriction flags fail parsing; explicit addressing retains
+  its independent authority and never falls back from managed refusal.
 - OpenAPI accurately describes the additive discovery response.
 
 The implementation changes authentication and authorization around existing
@@ -238,13 +232,9 @@ execution boundary then activates with compatible server/client versions.
 Retained graphs, configuration and accepted operations require their existing
 storage and ownership qualification regardless of the authentication cutover.
 
-The published version 1 verifier, data types and explicit restricted CLI
-requests remain compatible. Issuers that continue serving restricted clients
-retain their exact ceilings; unsupported requests refuse without widening them.
-An issuer may stop producing version 1 credentials once it has accounted for
-its clients. Retiring their verification trust also requires waiting at least
-86,430 seconds after the last issuance. This bounds old credential validity;
-it is not a requirement to build a legacy issuance path in new deployments.
+Upgrade callers to version-2 issuance and explicitly replace old caches.
+There is no dual-profile rollout or automatic conversion of restricted tokens.
+Existing signed identities and current policy remain the authority boundary.
 
 ## Unresolved questions
 
@@ -253,6 +243,15 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
+- 2026-10-05: The maintainer requested removal of compatibility interfaces.
+  This replaces Summary's retained version-1 profile, User behavior's
+  `--actions`/restricted-cache and filtered-discovery sentences, Credential
+  profiles' dual parser/public type and omitted-version contracts,
+  Compatibility's version-1 preservation, Evidence's legacy-success cases,
+  Rollout's retained verifier/issuer clauses, and Provider-native access's
+  restricted-token compatibility promises. Version 2 and applied policy stay
+  authoritative; unsupported tokens/caches refuse and explicit issuance is
+  required to replace a cache. Focused implementation gates remain required.
 - 2026-09-09: Proposed the separate identity profile, authenticated minimal
   discovery, and authorization against applied policy, retaining legacy
   restrictions and direct storage-holder behavior.
@@ -274,14 +273,11 @@ serialized refresh with a pending-before-send marker and atomic credential
 replacement, and no automatic retry after an uncertain exchange. Old managed
 sessions require new login. The API and CLI switch together; no broker
 compatibility path or gradual authentication migration is required.
-Direct/static configuration remains supported. Published restricted
-data-token verification is a separate compatibility contract and does not
-retain the retired login broker.
+Direct/static configuration remains supported.
 
 Normal native data commands acquire a self-only identity credential before
 execution. A permission refusal never triggers login or mutation replay.
-Native restricted credentials retain their existing verifier semantics; a
-restricted cache is never silently promoted to a less restricted profile.
+Unsupported caches and tokens refuse without automatic replacement.
 
 An additional generic server profile accepts externally signed human OAuth
 resource tokens. `--oidc-identity-trust FILE` loads public JSON containing a

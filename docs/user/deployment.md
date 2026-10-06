@@ -57,8 +57,10 @@ returns one `graphs` list, including blocked entries, with each graph's `state`
 Blocked entries include a sanitized `failure`: `invalid_configuration`,
 `invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
 `invalid_stored_queries`. Details remain in server logs.
-`apply_correction_or_restart` means apply an explicit graph correction or correct the
-storage problem and restart; `wait_for_restart` describes shutdown.
+`apply_correction_or_restart` means fix a query, policy or provider configuration
+through deployment, or restore damaged graph storage from a verified backup and
+restart. It does not authorize adopting a different graph identity.
+`wait_for_restart` describes shutdown.
 `wait_for_startup` means the graph's one startup attempt has not completed
 admission. It promises no retry time and does not trigger another open.
 `wait_for_transition` means that graph's admissions are closed while its owner
@@ -68,6 +70,14 @@ continue serving and transitioning. Server-owned deployments activate schema and
 stored-query changes through this transition; a proved pre-effect refusal restores
 the unchanged views. See [live deployment](clusters/index.md#deploy-without-restarting).
 Ready entries use `none`. There is no separate `quarantined` list or automatic startup retry.
+
+`GET /cluster/deployments/{id}` separates the durable achieved result from its
+current `active` status. Active means this process has installed that exact
+deployment and all its graph bindings are ready. Loading, blocked graphs,
+partial convergence and shutdown keep it false. A normal restart verifies its
+own bindings before reporting the retained current deployment active; successful
+apply alone is not activation. Activation does not rewrite the durable receipt.
+
 Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
 read `main` or list the management inventory; other callers cannot use this response to discover
 them. Unknown graphs return 404. A 503 does not authorize replaying a write.
@@ -135,7 +145,7 @@ configure both byte limits when setting an instance's input budget.
 Body timeouts above 86400 seconds also warn and use the 30-second default.
 Ingress reserves the route's maximum before reading, then reduces the reservation
 to the actual body size. Body collection limits remain 1 MiB for ordinary JSON
-requests, 32 MiB for bulk load/ingest and 64 KiB for MCP. Cluster deployment POSTs
+requests, 32 MiB for bulk load and 64 KiB for MCP. Cluster deployment POSTs
 allow 16 MiB plus 1 KiB for the request envelope; the captured bundle itself is
 limited to 16 MiB. MCP uses the read-body
 lane after authentication. Registered bulk routes alone

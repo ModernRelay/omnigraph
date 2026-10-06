@@ -15,10 +15,10 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
+URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show.\n  \
 served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
-repair, cleanup, schema plan, lint).\n  \
+repair, cleanup, schema plan/apply, lint).\n  \
 control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
 Core deployment/recovery; policy & queries via --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
@@ -28,7 +28,7 @@ Explicit target selectors retain ordinary addressing; competing ambient targets 
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Explicitly use legacy addressing and credentials, ignoring folder context.
+    /// Use ordinary addressing and operator credentials, ignoring folder context.
     #[arg(long, global = true)]
     pub(crate) direct: bool,
 
@@ -49,8 +49,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed queries, mutations, loads, commit reads,
-    /// and legacy restricted token issuance with `--actions`.
+    /// `--store`). Required for managed queries, mutations, loads, and commit reads.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -104,8 +103,7 @@ pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
     /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
     ///
-    /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
-    #[command(visible_alias = "read")]
+    /// Run a read query.
     Query {
         /// Query name. With no `--query`/`-e`, the stored query to invoke from
         /// the catalog (served — addressed via --server/--profile). With
@@ -144,8 +142,7 @@ pub(crate) enum Command {
     },
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
-    /// Canonical mutation endpoint, paired with `query`; `change` is a visible alias that warns.
-    #[command(visible_alias = "change")]
+    /// Run a mutation.
     Mutate {
         /// Query name. With no `--query`/`-e`, the stored mutation to invoke
         /// from the catalog (served — addressed via --server/--profile). With
@@ -227,27 +224,6 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Deprecated permissive loader (defaults: --mode merge, --from main; canonical current output)
-    #[command(hide = true)]
-    Ingest {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        data: PathBuf,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long, default_value = "merge")]
-        mode: CliLoadMode,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
-        /// stores only: no served load route carries a `settings` field.
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
     /// Branch operations
     Branch {
         #[command(subcommand)]
@@ -268,8 +244,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
-        #[arg(long, hide = true)]
-        jsonl: bool,
         #[arg(long = "type")]
         type_names: Vec<String>,
     },
@@ -348,18 +322,10 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Classify and explicitly repair graph-manifest/Lance-HEAD drift
+    /// Diagnose foreign Lance HEAD movement without adopting it.
     Repair {
         /// Graph URI
         uri: Option<String>,
-        /// Publish verified maintenance drift. Without this flag, repair only
-        /// previews what it would do.
-        #[arg(long)]
-        confirm: bool,
-        /// Also publish suspicious or unverifiable drift. Requires
-        /// `--confirm`; use only after operator review.
-        #[arg(long, requires = "confirm")]
-        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -382,15 +348,6 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
-    ///
-    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
-    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
-    /// deprecated `omnigraph query lint` / `omnigraph query check` /
-    /// `omnigraph check` invocations — each is kept as an argv-level
-    /// shim that prints a one-line stderr warning and rewrites to
-    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
-    /// clap's `visible_alias` because that would advertise two
-    /// equivalent canonical names, which agents emit interchangeably.
     Lint {
         /// Graph URI
         uri: Option<String>,
@@ -614,9 +571,6 @@ pub(crate) enum ClusterCommand {
         config: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Legacy restricted profile: exact comma-separated actions; requires --graph.
-        #[arg(long, conflicts_with = "clear")]
-        actions: Option<String>,
         /// Credential lifetime, 60 seconds to 24 hours (default 1h).
         #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
         ttl: Option<u64>,
@@ -641,16 +595,6 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        /// Plan without taking the cluster lock: read the ledger once, report
-        /// any lock instead of refusing, and label the output `observed`.
-        #[arg(long)]
-        observe: bool,
-        /// Core: exact lifecycle confirmations and repair options as JSON (at most 16 MiB).
-        #[arg(long)]
-        lifecycle: Option<PathBuf>,
-        /// Core: exact observed schema contracts to correct.
-        #[arg(long, conflicts_with = "lifecycle")]
-        schema_correction: Option<PathBuf>,
         /// Managed: select a pushed revision; omission uses the bound head.
         #[arg(long = "rev", alias = "revision")]
         revision: Option<String>,
@@ -674,13 +618,6 @@ pub(crate) enum ClusterCommand {
         /// Original durable Core deployment identity; never allocates a retry.
         #[arg(long, conflicts_with = "plan")]
         deployment_id: Option<String>,
-        /// Core config apply only: JSON map from graph id to the exact observed
-        /// SchemaContractDigest being corrected (at most 16 MiB).
-        #[arg(long, conflicts_with_all = ["plan", "lifecycle"])]
-        schema_correction: Option<PathBuf>,
-        /// Core: exact graph deletion/adoption/recreation confirmations and catalog repair options.
-        #[arg(long, conflicts_with = "plan")]
-        lifecycle: Option<PathBuf>,
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,
@@ -862,7 +799,8 @@ pub(crate) enum SchemaCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Apply a supported schema migration.
+    /// Apply a supported schema migration to a standalone graph.
+    /// Deploy served schemas with `cluster apply --server URL --config DIR`.
     ///
     /// A drop removes the property or type from the current graph-manifest
     /// version and reclaims nothing at apply: older commits still read the

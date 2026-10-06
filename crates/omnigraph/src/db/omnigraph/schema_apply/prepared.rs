@@ -277,13 +277,14 @@ pub(in crate::db::omnigraph) async fn prepare_schema_apply(
     db: &Omnigraph,
     source: &str,
     actor: Option<&str>,
-) -> Result<PreparedSchemaApply> {
+) -> Result<(PreparedSchemaApply, SchemaMigrationPlan)> {
     authorize(db, actor)?;
     let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
     let captured = capture(db, source, None)
         .await
         .map_err(OmniError::before_effect)?;
-    captured.issue(db, source, actor)
+    let intent = captured.issue(db, source, actor)?;
+    Ok((intent, captured.planned.plan))
 }
 
 pub(in crate::db::omnigraph) async fn reconcile_schema_apply(

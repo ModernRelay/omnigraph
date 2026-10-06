@@ -208,7 +208,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 
     let read_before = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -223,7 +223,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 
     let change_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -239,7 +239,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 
     let read_after = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -257,7 +257,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     // engine identically, including param binding and `branch=main` defaults.
     let inline_change = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("-e")
@@ -272,7 +272,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 
     let inline_read = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query-string")
@@ -304,7 +304,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
 
     let change_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -321,7 +321,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
 
     let feature_read = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -349,7 +349,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
 
     let main_read = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -386,23 +386,17 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let ingest_output = output_success(
         cli()
-            .arg("ingest")
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
             .arg("feature-ingest")
+            .arg("--from")
+            .arg("main")
             .arg(graph.path())
             .arg("--json"),
-    );
-    // The deprecation warning goes to stderr so --json stdout stays clean.
-    let ingest_stderr = String::from_utf8_lossy(&ingest_output.stderr);
-    assert!(
-        ingest_stderr.contains("deprecated loader command"),
-        "ingest must describe its deprecated parser/default status on stderr: {ingest_stderr}"
-    );
-    assert!(
-        !ingest_stderr.contains("will be removed"),
-        "ingest must not promise removal: {ingest_stderr}"
     );
     let ingest_payload = parse_stdout_json(&ingest_output);
     assert_eq!(ingest_payload["branch"], "feature-ingest");
@@ -418,15 +412,19 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let human_ingest = output_success(
         cli()
-            .arg("ingest")
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
             .arg("feature-ingest-human")
+            .arg("--from")
+            .arg("main")
             .arg(graph.path()),
     );
     let human_stdout = stdout_string(&human_ingest);
-    assert!(human_stdout.contains("node type 'Person': 2 entities loaded"));
+    assert!(human_stdout.contains("2 entities across 1 node types and 0 edge types"));
     assert!(!human_stdout.contains("node:Person"));
     assert!(!human_stdout.contains("rows_loaded"));
 
@@ -442,7 +440,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let zoe = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -459,7 +457,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 
     let bob = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -598,8 +596,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
             .arg("export")
             .arg(graph.path())
             .arg("--branch")
-            .arg("feature")
-            .arg("--jsonl"),
+            .arg("feature"),
     ));
     let export_path = graph.write_jsonl("system-local-exported.jsonl", &exported);
     let imported_graph = graph.path().parent().unwrap().join("imported-export.omni");
@@ -640,7 +637,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
 
     let eve = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
@@ -655,7 +652,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
 
     let friends = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
@@ -721,7 +718,7 @@ fn cli_object_store_end_to_end_init_load_read_flow(graph_uri: &str) {
     let read = parse_stdout_json(&output_success(
         cli()
             .current_dir(query_root)
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph_uri)
             .arg("--query")
@@ -786,7 +783,7 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
 
     let output = output_failure(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -799,7 +796,7 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
 
     let friends_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -857,7 +854,7 @@ query get_person($name: String) {
     let payload = parse_stdout_json(&output_success(
         cli()
             .current_dir(&cwd_dir)
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -969,7 +966,7 @@ query get_task($slug: String) {
 
     let filtered = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -994,7 +991,7 @@ query get_task($slug: String) {
 
     let insert_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1010,7 +1007,7 @@ query get_task($slug: String) {
 
     let update_payload = parse_stdout_json(&output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1024,7 +1021,7 @@ query get_task($slug: String) {
 
     let gamma = parse_stdout_json(&output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1112,7 +1109,7 @@ query vector_search($q: String) {
             // auto-embedded `$q` lands in the same vector space.
             .env("OMNIGRAPH_EMBED_PROVIDER", "gemini")
             .env("OMNIGRAPH_EMBED_MODEL", "gemini-embedding-2-preview")
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1226,7 +1223,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
 
     // Case 1: no token → the server refuses before any policy check.
     let no_token = cli()
-        .arg("change")
+        .arg("mutate")
         .arg("--server")
         .arg(&server.base_url)
         .arg("--graph")
@@ -1246,7 +1243,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     // Case 2: bruno token against protected main → denied by the server.
     let denied = cli()
         .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
-        .arg("change")
+        .arg("mutate")
         .arg("--server")
         .arg(&server.base_url)
         .arg("--graph")
@@ -1271,7 +1268,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     let allowed = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
-            .arg("change")
+            .arg("mutate")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1293,7 +1290,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     let verify = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1324,7 +1321,7 @@ fn local_cli_direct_store_write_is_unpoliced_regardless_of_actor() {
         cli()
             .arg("--as")
             .arg("act-bruno")
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -1451,7 +1448,9 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
 
     let denied = cli()
         .env("OMNIGRAPH_BEARER_TOKEN", "bruno-tok")
-        .arg("ingest")
+        .arg("load")
+        .arg("--mode")
+        .arg("merge")
         .arg("--server")
         .arg(&server.base_url)
         .arg("--graph")
@@ -1460,6 +1459,8 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         .arg(&data)
         .arg("--branch")
         .arg("policy-ingest-feature")
+        .arg("--from")
+        .arg("main")
         .arg("--json")
         .output()
         .unwrap();
@@ -1475,7 +1476,9 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
     let allowed = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "ragnor-tok")
-            .arg("ingest")
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")
@@ -1484,6 +1487,8 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
             .arg(&data)
             .arg("--branch")
             .arg("policy-ingest-feature")
+            .arg("--from")
+            .arg("main")
             .arg("--json"),
     ));
     assert_eq!(allowed["branch"], "policy-ingest-feature");
@@ -1708,7 +1713,7 @@ fn local_cli_actor_from_config_used_when_no_flag() {
     let allowed = parse_stdout_json(&output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -1736,7 +1741,7 @@ fn local_cli_actor_flag_overrides_config_actor() {
             .env("OMNIGRAPH_HOME", home.path())
             .arg("--as")
             .arg("act-bruno")
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(graph.path())
             .arg("--query")
@@ -2058,11 +2063,11 @@ fn skip_system_e2e(test_name: &str) -> bool {
 
 /// The whole control-plane story in one test: declare two graphs → converge
 /// (apply creates them) → serve → direct schema/query evolution → serve the new
-/// shape → exact acknowledged drift correction → unconfirmed deletion refuses.
+/// shape → delete one graph and its storage → refuse foreign schema drift.
 /// The live same-PID journey is owned by cli_cluster_e2e.
 #[test]
-fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
-    if skip_system_e2e("local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete") {
+fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
+    if skip_system_e2e("local_cluster_full_lifecycle_declare_serve_evolve_delete") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -2154,15 +2159,44 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
     }
 
     unlock_cluster_fixture(dir);
+    // Removing a declaration deletes its entire owned root. Reboot from the
+    // achieved catalog: the removed graph stays absent and its peer keeps data.
+    fs::write(dir.join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n").unwrap();
+    let deleted = cluster_cli(dir, &["apply"]);
+    assert_eq!(
+        deleted["result"]["graphs"]["engineering"]["outcome"], "deleted",
+        "{deleted}"
+    );
+    assert!(!dir.join("graphs/engineering.omni").exists());
+    {
+        let server = spawn_server_with_cluster(dir);
+        let (status, body) = invoke_query(
+            &client,
+            &server.base_url,
+            "engineering",
+            "find_service",
+            serde_json::json!({"name":"billing"}),
+        );
+        assert_eq!(status, 404, "{body}");
+        let (status, body) = invoke_query(
+            &client,
+            &server.base_url,
+            "knowledge",
+            "find_person",
+            serde_json::json!({"name":"Ada"}),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["rows"][0]["p.name"], "Ada", "{body}");
+    }
+    unlock_cluster_fixture(dir);
     // A raw storage holder deliberately changes the accepted contract. Desired
-    // text alone must not adopt that drift; acknowledgement binds its identity.
+    // text alone must not adopt that drift.
     let rogue_pg = "node Person { name: String @key bio: String? rogue: String? }\n";
-    let observed = tokio::runtime::Runtime::new().unwrap().block_on(async {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = Omnigraph::open(dir.join("graphs/knowledge.omni").to_string_lossy().as_ref())
             .await
             .unwrap();
         db.apply_schema(rogue_pg).await.unwrap();
-        db.schema_contract_digest()
     });
     // Apply validates only affected graphs. Change this graph's query payload
     // so its exact achieved contract must be checked before catalog publication.
@@ -2174,60 +2208,29 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_refuse_delete() {
     assert_eq!(refused["ok"], false, "{refused}");
     assert_eq!(refused["diagnostics"][0]["code"], "applied_schema_drift");
     assert_eq!(fs::read(dir.join("__cluster/state.json")).unwrap(), before);
-    let correction = dir.join("correction.json");
-    fs::write(
-        &correction,
-        serde_json::to_vec(&serde_json::json!({"knowledge":observed})).unwrap(),
-    )
-    .unwrap();
-    let heal = cluster_cli(
-        dir,
-        &["apply", "--schema-correction", correction.to_str().unwrap()],
-    );
-    assert_eq!(heal["result"]["converged"], true, "{heal}");
     let schema_show = cli()
         .arg("schema")
         .arg("show")
         .arg(dir.join("graphs/knowledge.omni"))
         .output()
         .unwrap();
-    assert!(
-        schema_show.status.success(),
-        "schema show failed: {}",
-        String::from_utf8_lossy(&schema_show.stderr)
-    );
-    let shown = String::from_utf8_lossy(&schema_show.stdout);
+    assert!(!schema_show.status.success());
+    assert!(String::from_utf8_lossy(&schema_show.stderr).contains("applied_schema_drift"));
+    let shown = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Omnigraph::open_read_only(dir.join("graphs/knowledge.omni").to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .schema_source()
+            .to_owned()
+    });
     assert!(
         shown.contains("Person"),
         "schema show produced no schema: {shown}"
     );
     assert!(
-        !shown.contains("rogue"),
-        "drift must be dropped back to the declared schema: {shown}"
+        shown.contains("rogue"),
+        "refusing drift must not silently rewrite the graph: {shown}"
     );
-
-    // Removal requires an exact lifecycle confirmation. Refusal preserves the
-    // whole achieved projection and both graph roots.
-    fs::write(dir.join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n").unwrap();
-    let before = fs::read(dir.join("__cluster/state.json")).unwrap();
-    let blocked = cluster_cli(dir, &["apply"]);
-    assert_eq!(blocked["ok"], false, "{blocked}");
-    assert_eq!(
-        blocked["diagnostics"][0]["code"], "graph_delete_confirmation_required",
-        "{blocked}"
-    );
-    assert_eq!(fs::read(dir.join("__cluster/state.json")).unwrap(), before);
-    assert!(dir.join("graphs/engineering.omni").exists());
-    let server = spawn_server_with_cluster(dir);
-    let (status, body) = invoke_query(
-        &client,
-        &server.base_url,
-        "engineering",
-        "find_service",
-        serde_json::json!({"name":"billing"}),
-    );
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rows"][0]["s.name"], "billing");
 }
 
 /// Applied policy bundles gate serving per their bindings: the cluster-bound
@@ -2415,7 +2418,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
             command.env(name, value);
         }
         command
-            .arg("read")
+            .arg("query")
             .arg("--server")
             .arg(&server.base_url)
             .arg("--graph")

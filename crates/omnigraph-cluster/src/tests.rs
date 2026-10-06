@@ -72,14 +72,14 @@ pub(crate) fn identity_fixture() -> tempfile::TempDir {
 
 async fn apply_identity_fixture(dir: &Path) -> DeploymentResult {
     let caller = DeploymentCaller::storage_owner(None);
-    let applied = apply_deployment(dir, None, &caller, &BTreeMap::new(), |_, _, _| {})
+    let applied = apply_deployment(dir, None, &caller, |_, _, _| {})
         .await
         .unwrap();
     assert!(
         matches!(applied, DeploymentLookup::Complete { ref result } if result.converged),
         "{applied:?}"
     );
-    let captured = capture_deployment(dir, &BTreeMap::new()).unwrap();
+    let captured = capture_deployment(dir).unwrap();
     if let Some(lock_id) = deployment_status(captured.canonical_root(), None, &caller)
         .await
         .unwrap()
@@ -1246,7 +1246,7 @@ async fn missing_state_plans_creates() {
     assert!(out.ok, "{:?}", out.diagnostics);
     assert!(!out.state_observations.state_found);
     assert!(!out.state_observations.locked);
-    assert!(out.state_observations.lock_acquired);
+    assert!(!out.state_observations.lock_acquired);
     assert!(
         out.changes
             .iter()
@@ -1606,18 +1606,14 @@ graphs:
 }
 
 #[tokio::test]
-async fn plan_succeeds_after_force_unlock() {
+async fn plan_succeeds_with_or_without_an_existing_lock() {
     let dir = fixture();
     write_lock_file(dir.path(), "held-lock", "plan");
 
     let locked = plan_config_dir(dir.path()).await;
-    assert!(!locked.ok);
-    assert!(
-        locked
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "state_lock_held")
-    );
+    assert!(locked.ok, "{:?}", locked.diagnostics);
+    assert!(locked.state_observations.locked);
+    assert!(!locked.state_observations.lock_acquired);
 
     let unlocked = force_unlock_config_dir(dir.path(), "held-lock").await;
     assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
@@ -1627,7 +1623,7 @@ async fn plan_succeeds_after_force_unlock() {
 }
 
 #[tokio::test]
-async fn plan_reports_state_cas_revision_and_removes_lock() {
+async fn plan_reports_state_cas_revision_without_creating_a_lock() {
     let dir = fixture();
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
     fs::create_dir_all(&state_dir).unwrap();
@@ -1646,16 +1642,13 @@ async fn plan_reports_state_cas_revision_and_removes_lock() {
     );
     assert!(!out.state_observations.locked);
     assert!(out.state_observations.lock_id.is_none());
-    assert!(out.state_observations.lock_acquired);
-    assert!(out.state_observations.acquired_lock_id.is_some());
-    assert!(
-        !dir.path().join(CLUSTER_LOCK_FILE).exists(),
-        "plan must release lock before returning"
-    );
+    assert!(!out.state_observations.lock_acquired);
+    assert!(out.state_observations.acquired_lock_id.is_none());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 }
 
 #[tokio::test]
-async fn existing_lock_makes_plan_fail() {
+async fn existing_lock_is_observed_by_plan() {
     let dir = fixture();
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
     fs::create_dir_all(&state_dir).unwrap();
@@ -1672,7 +1665,7 @@ async fn existing_lock_makes_plan_fail() {
     .unwrap();
 
     let out = plan_config_dir(dir.path()).await;
-    assert!(!out.ok);
+    assert!(out.ok, "{:?}", out.diagnostics);
     assert!(out.state_observations.locked);
     assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
     assert!(!out.state_observations.lock_acquired);
@@ -1681,15 +1674,8 @@ async fn existing_lock_makes_plan_fail() {
         out.state_observations.lock_operation.as_deref(),
         Some("plan")
     );
-    assert!(
-        out.diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "state_lock_held")
-    );
-    assert!(out.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "state_lock_held"
-            && diagnostic.message.contains("force-unlock held-lock")
-    }));
+    assert!(!out.diagnostics.iter().any(|d| d.code == "state_lock_held"));
+    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
 }
 
 #[tokio::test]
@@ -1721,7 +1707,7 @@ graphs:
     assert!(
         out.diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "state_lock_disabled")
+            .any(|diagnostic| diagnostic.code == "deployment_requires_lock")
     );
     assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 }
@@ -1861,7 +1847,6 @@ async fn durable_store_verifies_immutable_bundle_bytes_and_encoded_bound() {
     let store = ClusterStore::for_config_dir(dir.path());
     let source_digest = sha256_hex(SCHEMA.as_bytes());
     let mut bundle = deployment::DeploymentBundle {
-        options: DeploymentOptions::default(),
         version: 2,
         canonical_root: store.canonical_root().unwrap(),
         config_digest: sha256_hex(b"configuration"),
@@ -1945,6 +1930,110 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
     apply_identity_fixture(dir.path()).await;
     let legacy_path = dir.path().join(CLUSTER_STATE_FILE);
     let mut legacy = read_state_json(dir.path());
+    // Earlier v2 builds persisted runtime claims in terminal receipts. Only
+    // explicit stopped conversion may discard those claims; exact outcomes,
+    // ledger identity, sequence, achieved resources and graph history survive.
+    let root = dir.path().to_str().unwrap();
+    let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
+    let graph_before = identity_manifest_version(dir.path()).await;
+    for activated in [false, true] {
+        let current = read_state_json(dir.path());
+        let mut previous = current.clone();
+        let receipts = previous["deployment_results"].as_array_mut().unwrap();
+        assert!(!receipts.is_empty());
+        for receipt in receipts {
+            receipt["restart_required"] = json!(!activated);
+            if activated {
+                receipt["activation"] = json!({
+                    "process_incarnation": "01K00000000000000000000001",
+                    "result_revision": receipt["result_revision"],
+                    "config_digest": receipt["config_digest"],
+                });
+            }
+        }
+        let previous_bytes = serde_json::to_vec(&previous).unwrap();
+        fs::write(&legacy_path, &previous_bytes).unwrap();
+        assert_eq!(
+            deployment_status(root, None, &caller)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_state_json"
+        );
+        assert_eq!(
+            upgrade_deployment_ledger(root, false, &caller)
+                .await
+                .unwrap_err()
+                .code,
+            "writers_stopped_required"
+        );
+        for invalid in ["unknown", "runtime_type", "activation", "pending"] {
+            let mut corrupt = previous.clone();
+            match invalid {
+                "unknown" => corrupt["deployment_results"][0]["unknown_field"] = json!(true),
+                "runtime_type" => {
+                    corrupt["deployment_results"][0]["restart_required"] = json!("false")
+                }
+                "activation" => {
+                    corrupt["deployment_results"][0]["restart_required"] = json!(false);
+                    corrupt["deployment_results"][0]["activation"] = json!({
+                        "process_incarnation": "01K00000000000000000000001",
+                        "result_revision": u64::MAX,
+                        "config_digest": corrupt["deployment_results"][0]["config_digest"],
+                    });
+                }
+                "pending" => corrupt["outstanding"] = json!({"id": "originating-build-required"}),
+                _ => unreachable!(),
+            }
+            let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
+            fs::write(&legacy_path, &corrupt_bytes).unwrap();
+            let refused = upgrade_deployment_ledger(root, true, &caller)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                refused.code,
+                if invalid == "pending" {
+                    "ledger_upgrade_pending"
+                } else {
+                    "invalid_state_json"
+                }
+            );
+            assert_eq!(fs::read(&legacy_path).unwrap(), corrupt_bytes);
+            assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+        }
+        for member in ["version", "input_digest", "restart_required"] {
+            let prefix = format!("\"{member}\":");
+            let duplicate = String::from_utf8(previous_bytes.clone()).unwrap().replacen(
+                &prefix,
+                &format!("{prefix}null,{prefix}"),
+                1,
+            );
+            fs::write(&legacy_path, &duplicate).unwrap();
+            assert_eq!(
+                upgrade_deployment_ledger(root, true, &caller)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_state_json"
+            );
+            assert_eq!(fs::read_to_string(&legacy_path).unwrap(), duplicate);
+            assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+        }
+        fs::write(&legacy_path, &previous_bytes).unwrap();
+        let converted = upgrade_deployment_ledger(root, true, &caller)
+            .await
+            .unwrap();
+        let mut expected = current;
+        expected["state_revision"] = json!(expected["state_revision"].as_u64().unwrap() + 1);
+        assert_eq!(read_state_json(dir.path()), expected);
+        assert!(converted.lock_id.is_none());
+        assert_eq!(identity_manifest_version(dir.path()).await, graph_before);
+        let converted_bytes = fs::read(&legacy_path).unwrap();
+        upgrade_deployment_ledger(root, true, &caller)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&legacy_path).unwrap(), converted_bytes);
+    }
     legacy["version"] = json!(1);
     for key in [
         "ledger_id",
@@ -2108,24 +2197,18 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
     let query = QUERY.replace("$p.name, $p.age", "$p.name, $p.age, $p.email");
     fs::write(dir.path().join("people.gq"), &query).unwrap();
     let mut exposed = None;
-    let outcome = apply_deployment(
-        dir.path(),
-        None,
-        &caller,
-        &Default::default(),
-        |id, canonical_root, lock_id| {
-            assert!(read_state_json(dir.path()).get("outstanding").is_none());
-            assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
-            exposed = Some((
-                id.to_string(),
-                canonical_root.to_string(),
-                lock_id.to_string(),
-            ));
-            // Capture preceded ID exposure; effects must use those exact bytes.
-            fs::write(dir.path().join("people.pg"), "invalid schema").unwrap();
-            fs::write(dir.path().join("people.gq"), "invalid query").unwrap();
-        },
-    )
+    let outcome = apply_deployment(dir.path(), None, &caller, |id, canonical_root, lock_id| {
+        assert!(read_state_json(dir.path()).get("outstanding").is_none());
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+        exposed = Some((
+            id.to_string(),
+            canonical_root.to_string(),
+            lock_id.to_string(),
+        ));
+        // Capture preceded ID exposure; effects must use those exact bytes.
+        fs::write(dir.path().join("people.pg"), "invalid schema").unwrap();
+        fs::write(dir.path().join("people.gq"), "invalid query").unwrap();
+    })
     .await
     .unwrap();
     let DeploymentLookup::Complete { result } = outcome else {
@@ -2133,7 +2216,7 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
     };
     let (id, canonical_root, lock_id) = exposed.unwrap();
     assert_eq!(result.id, id);
-    assert!(result.converged && result.restart_required);
+    assert!(result.converged);
     assert_eq!(result.result_revision, 2);
     assert_eq!(result.authority.actor.as_deref(), Some("principal:owner"));
     assert_eq!(result.authority.kind, AuthorityKind::AuthenticatedIdentity);
@@ -2181,26 +2264,18 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
     fs::write(dir.path().join("people.pg"), &schema).unwrap();
     fs::write(dir.path().join("people.gq"), &query).unwrap();
     assert!(matches!(
-        apply_deployment(
-            dir.path(),
-            Some(&id),
-            &caller,
-            &Default::default(),
-            |_, _, _| panic!("lookup cannot invoke")
-        )
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "lookup cannot invoke"
+        ))
         .await
         .unwrap(),
         DeploymentLookup::Complete { .. }
     ));
     fs::write(dir.path().join("people.gq"), format!("{query}\n")).unwrap();
     assert_eq!(
-        apply_deployment(
-            dir.path(),
-            Some(&id),
-            &caller,
-            &Default::default(),
-            |_, _, _| panic!("mismatch cannot invoke")
-        )
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "mismatch cannot invoke"
+        ))
         .await
         .unwrap_err()
         .code,
@@ -2261,7 +2336,7 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
         .unwrap();
     let before_refused_plan = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
     expand_identity_schema(dir.path());
-    let refused = apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+    let refused = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
         .await
         .unwrap_err();
     assert_eq!(refused.code, "schema_preflight_failed");
@@ -2289,7 +2364,7 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
     )
     .unwrap();
     let DeploymentLookup::Complete { result } =
-        apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+        apply_deployment(dir.path(), None, &caller, |_, _, _| {})
             .await
             .unwrap()
     else {
@@ -2390,7 +2465,7 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
         .unwrap();
 
     fs::write(&config_path, config).unwrap(); // Re-add the stored query only.
-    let error = apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
         .await
         .unwrap_err();
     assert_eq!(error.code, "applied_schema_drift");
@@ -2412,15 +2487,11 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
 
     // Changing desired bytes does not implicitly acknowledge a new lifetime.
     fs::write(dir.path().join("people.pg"), format!("{SCHEMA}\n")).unwrap();
-    let error = apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
         .await
         .unwrap_err();
     assert_eq!(error.code, "applied_schema_drift");
-    assert!(
-        error
-            .message
-            .contains(&replaced_contract.schema_identity_domain)
-    );
+    assert!(error.message.contains("knowledge"), "{error:?}");
     assert!(
         deployment_status(root, None, &caller)
             .await
@@ -2435,114 +2506,6 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
     assert_eq!(
         identity_manifest_version(dir.path()).await,
         replacement_version
-    );
-
-    // An explicit correction also works without changing source bytes, but
-    // acknowledges exactly the observed contract and still authorizes schema.
-    fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
-    for corrections in [
-        BTreeMap::from([("knowledge".to_owned(), achieved_contract.clone())]),
-        BTreeMap::from([("unknown".to_owned(), replaced_contract.clone())]),
-    ] {
-        let error = apply_deployment(dir.path(), None, &caller, &corrections, |_, _, _| {})
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error.code.as_str(),
-            "applied_schema_drift" | "deployment_input_invalid"
-        ));
-        assert!(
-            deployment_status(root, None, &caller)
-                .await
-                .unwrap()
-                .lock_id
-                .is_none()
-        );
-        assert_eq!(
-            fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-            ledger_before
-        );
-    }
-    let corrections = BTreeMap::from([("knowledge".to_owned(), replaced_contract.clone())]);
-    let denied = DeploymentCaller::storage_owner(Some("principal:reader".into()));
-    let error = apply_deployment(dir.path(), None, &denied, &corrections, |_, _, _| {})
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, "schema_preflight_failed");
-    assert!(
-        deployment_status(root, None, &caller)
-            .await
-            .unwrap()
-            .lock_id
-            .is_none()
-    );
-    assert_eq!(
-        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-        ledger_before
-    );
-    let DeploymentLookup::Complete { result } =
-        apply_deployment(dir.path(), None, &caller, &corrections, |_, _, _| {})
-            .await
-            .unwrap()
-    else {
-        panic!("expected exact authorized correction");
-    };
-    assert!(result.converged);
-    assert!(matches!(
-        &result.graphs["knowledge"],
-        GraphDeploymentResult::Schema { result: omnigraph::db::SchemaApplySettlement::NoOp { contract, .. } }
-            if contract == &replaced_contract
-    ));
-    assert_eq!(
-        identity_manifest_version(dir.path()).await,
-        replacement_version
-    );
-    assert_eq!(
-        read_state_json(dir.path())["applied_revision"]["schema_contracts"]["knowledge"],
-        serde_json::to_value(&replaced_contract).unwrap()
-    );
-    assert!(matches!(
-        apply_deployment(
-            dir.path(),
-            Some(&result.id),
-            &caller,
-            &corrections,
-            |_, _, _| panic!("lookup only")
-        )
-        .await
-        .unwrap(),
-        DeploymentLookup::Complete { .. }
-    ));
-    assert_eq!(
-        apply_deployment(
-            dir.path(),
-            Some(&result.id),
-            &caller,
-            &Default::default(),
-            |_, _, _| panic!("input mismatch")
-        )
-        .await
-        .unwrap_err()
-        .code,
-        "deployment_input_mismatch"
-    );
-    let status = deployment_status(root, None, &caller).await.unwrap();
-    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(
-        apply_deployment(dir.path(), None, &caller, &corrections, |_, _, _| {})
-            .await
-            .unwrap_err()
-            .code,
-        "schema_correction_unneeded"
-    );
-    assert!(
-        deployment_status(root, None, &caller)
-            .await
-            .unwrap()
-            .lock_id
-            .is_none()
     );
 }
 #[tokio::test]
@@ -2563,15 +2526,13 @@ async fn offline_deployment_ids_survive_result_eviction_without_aliasing_or_repl
     for sequence in upgraded.next_sequence..=upgraded.next_sequence + deployment::MAX_RESULTS as u64
     {
         let id = format!("{}:{sequence}:{}", upgraded.ledger_id, Ulid::new());
-        let DeploymentLookup::Complete { result } = apply_deployment(
-            dir.path(),
-            Some(&id),
-            &caller,
-            &Default::default(),
-            |reported, _, _| assert_eq!(reported, id),
-        )
-        .await
-        .unwrap() else {
+        let DeploymentLookup::Complete { result } =
+            apply_deployment(dir.path(), Some(&id), &caller, |reported, _, _| {
+                assert_eq!(reported, id)
+            })
+            .await
+            .unwrap()
+        else {
             panic!("expected no-op deployment receipt");
         };
         assert_eq!(result.id, id);
@@ -2586,13 +2547,9 @@ async fn offline_deployment_ids_survive_result_eviction_without_aliasing_or_repl
             Some(DeploymentLookup::IdentityMismatch)
         ));
         assert!(matches!(
-            apply_deployment(
-                dir.path(),
-                Some(&alias),
-                &caller,
-                &Default::default(),
-                |_, _, _| panic!("alias cannot execute")
-            )
+            apply_deployment(dir.path(), Some(&alias), &caller, |_, _, _| panic!(
+                "alias cannot execute"
+            ))
             .await
             .unwrap(),
             DeploymentLookup::IdentityMismatch
@@ -2639,13 +2596,9 @@ async fn offline_deployment_ids_survive_result_eviction_without_aliasing_or_repl
             }) if acceptance == "unknown" && outcome == "unknown"
         ));
         assert!(matches!(
-            apply_deployment(
-                dir.path(),
-                Some(id),
-                &caller,
-                &Default::default(),
-                |_, _, _| panic!("expired ID cannot execute")
-            )
+            apply_deployment(dir.path(), Some(id), &caller, |_, _, _| panic!(
+                "expired ID cannot execute"
+            ))
             .await
             .unwrap(),
             DeploymentLookup::ResultExpired { .. }
@@ -2660,13 +2613,9 @@ async fn offline_deployment_ids_survive_result_eviction_without_aliasing_or_repl
         Some(DeploymentLookup::NotRecorded)
     ));
     assert_eq!(
-        apply_deployment(
-            dir.path(),
-            Some(&future_id),
-            &caller,
-            &Default::default(),
-            |_, _, _| panic!("future sequence cannot execute")
-        )
+        apply_deployment(dir.path(), Some(&future_id), &caller, |_, _, _| panic!(
+            "future sequence cannot execute"
+        ))
         .await
         .unwrap_err()
         .code,
@@ -2747,7 +2696,7 @@ async fn offline_deployment_reserves_created_query_projection_before_schema_effe
         captured.outcome.diagnostics
     );
 
-    let error = apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
         .await
         .unwrap_err();
     assert_eq!(error.code, "deployment_bounds", "{error:?}");
@@ -2847,7 +2796,6 @@ fn offline_deployment_reserves_partial_projection_resource_count() {
                     GraphDeployment {
                         intent: None,
                         create: None,
-                        adopt: None,
                         delete: None,
                         observed_manifest_version: 1,
                         state: GraphDeploymentState::NotStarted,
@@ -2870,7 +2818,6 @@ fn offline_deployment_reserves_partial_projection_resource_count() {
         }
         assert!(desired.len() <= deployment::MAX_RESOURCES);
         let bundle = DeploymentBundle {
-            options: DeploymentOptions::default(),
             version: 2,
             canonical_root: "file:///capacity-only".into(),
             config_digest: "e".repeat(64),
@@ -2952,7 +2899,6 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         // change. Null cancels that same term in both sides of this comparison.
         intent: None,
         create: None,
-        adopt: None,
         delete: None,
         observed_manifest_version: u64::MAX,
         state: GraphDeploymentState::NotStarted,
@@ -3294,13 +3240,7 @@ async fn plan_embeds_migration_preview_for_schema_update() {
     )
     .unwrap();
 
-    let out = plan_config_dir_with_deployment_options(
-        dir.path(),
-        PlanOptions::default(),
-        &DeploymentOptions::default(),
-        Some("principal:owner".into()),
-    )
-    .await;
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
     assert!(out.ok, "{:?}", out.diagnostics);
     let schema_change = out
         .changes
@@ -3322,15 +3262,9 @@ async fn plan_embeds_migration_preview_for_schema_update() {
     db.branch_create("feature").await.unwrap();
     let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
     let version = identity_manifest_version(dir.path()).await;
-    let plan = plan_config_dir_with_deployment_options(
-        dir.path(),
-        PlanOptions::default(),
-        &DeploymentOptions::default(),
-        Some("principal:owner".into()),
-    )
-    .await;
+    let plan = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
     assert!(!plan.ok, "{plan:?}");
-    let error = apply_deployment(dir.path(), None, &caller, &BTreeMap::new(), |_, _, _| {})
+    let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
         .await
         .unwrap_err();
     assert!(
@@ -4243,7 +4177,7 @@ graphs:
 }
 
 #[tokio::test]
-async fn plan_observe_takes_no_lock_and_reports_observed_authority() {
+async fn plan_takes_no_lock_and_reports_observed_authority() {
     let dir = fixture();
     let state_dir = dir.path().join(CLUSTER_STATE_DIR);
     fs::create_dir_all(&state_dir).unwrap();
@@ -4259,7 +4193,7 @@ async fn plan_observe_takes_no_lock_and_reports_observed_authority() {
     )
     .unwrap();
 
-    let out = plan_config_dir_with_options(dir.path(), PlanOptions { observe: true }).await;
+    let out = plan_config_dir(dir.path()).await;
     assert!(out.ok, "{:?}", out.diagnostics);
     assert_eq!(out.authority, LedgerAuthority::Observed);
     assert_eq!(out.state_observations.state_revision, 7);
@@ -4283,11 +4217,11 @@ async fn plan_observe_takes_no_lock_and_reports_observed_authority() {
             .unwrap()
             .contains("01OTHER")
     );
-    // The locked path still labels itself.
+    // A plan without an existing owner also remains observational.
     fs::remove_file(dir.path().join(CLUSTER_LOCK_FILE)).unwrap();
     let locked = plan_config_dir(dir.path()).await;
-    assert_eq!(locked.authority, LedgerAuthority::Locked);
-    assert!(locked.state_observations.lock_acquired);
+    assert_eq!(locked.authority, LedgerAuthority::Observed);
+    assert!(!locked.state_observations.lock_acquired);
 }
 
 #[tokio::test]
@@ -4587,7 +4521,6 @@ graphs:
         dir.path(),
         None,
         &DeploymentCaller::storage_owner(None),
-        &BTreeMap::new(),
         |_, _, _| {},
     )
     .await
@@ -4739,31 +4672,35 @@ async fn serving_snapshot_reads_applied_empty_cluster() {
 // ---- query discovery (Terraform-style declaration) ----
 
 #[tokio::test]
-async fn plan_requires_exact_removal_confirmation_and_accepts_policy_rebinding() {
-    let dir = fixture();
-    apply_identity_fixture(dir.path()).await;
+async fn plan_observes_graph_removal_and_policy_rebinding() {
+    let dir = identity_fixture();
     let path = dir.path().join(CLUSTER_CONFIG_FILE);
-    let original = fs::read_to_string(&path).unwrap();
+    let original = fs::read_to_string(&path)
+        .unwrap()
+        .replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n");
+    fs::write(&path, &original).unwrap();
+    apply_identity_fixture(dir.path()).await;
     let ledger = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
     for source in [
         "version: 1\ngraphs: {}\n".to_owned(),
-        original.replace("applies_to: [knowledge]", "applies_to: [cluster]"),
+        original.replace("applies_to: [knowledge]", "applies_to: [second]"),
     ] {
         fs::write(&path, &source).unwrap();
-        let plan = plan_config_dir(dir.path()).await;
-        let removing = !source.contains("knowledge");
-        assert_eq!(plan.ok, !removing, "{plan:?}");
-        if removing {
-            assert!(
-                plan.diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "graph_delete_confirmation_required"),
-                "{plan:?}"
-            );
+        let plan = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+        assert!(plan.ok, "{plan:?}");
+        if !source.contains("knowledge") {
             assert!(
                 plan.changes
                     .iter()
-                    .all(|change| change.disposition == Some(ApplyDisposition::Blocked))
+                    .any(|change| change.resource == "graph.knowledge"
+                        && change.operation == PlanOperation::Delete)
+            );
+            assert!(dir.path().join("graphs/knowledge.omni").exists());
+        } else {
+            assert!(
+                plan.changes
+                    .iter()
+                    .any(|change| change.resource == "policy.base" && change.binding_change)
             );
         }
         let wire = serde_json::to_value(&plan).unwrap();

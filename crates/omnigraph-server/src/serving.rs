@@ -17,8 +17,6 @@ use tokio::time::Instant;
 use crate::ApiError;
 use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
-#[cfg(test)]
-use crate::queries::QueryRegistry;
 use crate::registry::{BlockedGraph, GraphHandle, GraphRegistry};
 
 /// A non-reusable epoch within one registered graph's lifetime.
@@ -341,29 +339,14 @@ impl GraphTransition {
         })
     }
 
-    /// Publish complete query/schema bindings only after the deployment
-    /// controller has recorded their durable achieved state. All replacement
-    /// engines and policies stay identical; additions are already durable graphs.
-    #[cfg(test)]
-    pub(crate) fn activate(
-        self,
-        bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
-        additions: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
-    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
-        let replacements = self
-            .registry
-            .validate_activation(&self.record, bindings, additions)?;
-        self.operations
-            .while_open(|| self.registry.activate(&self.record, replacements))
-    }
-
     /// Publish graph lifecycle and authorization changes in one registry snapshot.
     pub(crate) fn activate_deployment(
         self,
         handles: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
-        removals: std::collections::HashSet<GraphKey>,
         unavailable: Vec<Arc<BlockedGraph>>,
+        deleted: Vec<(GraphKey, SchemaContractDigest)>,
         server_policy: Option<Arc<crate::PolicyEngine>>,
+        deployment: Option<crate::deployment::ActiveDeployment>,
     ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
         let views = self
             .registry
@@ -372,9 +355,10 @@ impl GraphTransition {
             self.registry.activate_deployment(
                 &self.record,
                 views,
-                removals,
                 unavailable,
+                deleted,
                 server_policy,
+                deployment,
             )
         })
     }

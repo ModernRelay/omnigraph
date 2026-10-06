@@ -15,52 +15,6 @@ use omnigraph_compiler::settings::SettingId;
 use super::*;
 use crate::operator;
 
-pub(crate) fn read_schema_corrections(
-    path: Option<&std::path::Path>,
-) -> Result<std::collections::BTreeMap<String, omnigraph::db::SchemaContractDigest>> {
-    use std::io::Read;
-
-    let Some(path) = path else {
-        return Ok(Default::default());
-    };
-    let limit = omnigraph_cluster::MAX_BUNDLE_BYTES;
-    let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        bail!("schema correction file exceeds the {limit}-byte deployment input limit");
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| color_eyre::eyre::eyre!("invalid schema correction JSON: {error}"))
-}
-
-pub(crate) fn read_deployment_options(
-    lifecycle: Option<&std::path::Path>,
-    correction: Option<&std::path::Path>,
-) -> Result<omnigraph_cluster::DeploymentOptions> {
-    use std::io::Read;
-    if let Some(path) = lifecycle {
-        if correction.is_some() {
-            bail!("--lifecycle and --schema-correction cannot be combined");
-        }
-        let limit = omnigraph_cluster::MAX_BUNDLE_BYTES;
-        let mut bytes = Vec::new();
-        fs::File::open(path)?
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            bail!("lifecycle file exceeds the {limit}-byte deployment input limit");
-        }
-        return serde_json::from_slice(&bytes)
-            .map_err(|error| color_eyre::eyre::eyre!("invalid lifecycle JSON: {error}"));
-    }
-    Ok(omnigraph_cluster::DeploymentOptions {
-        schema_corrections: read_schema_corrections(correction)?,
-        ..Default::default()
-    })
-}
-
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;
@@ -1321,69 +1275,6 @@ pub(crate) async fn execute_queries_list(
         }
     }
     Ok(())
-}
-
-pub(crate) fn legacy_change_request_body(
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-) -> Value {
-    let mut body = serde_json::json!({
-        "query_source": query_source,
-        "branch": branch,
-    });
-    if let Some(name) = query_name {
-        body["query_name"] = Value::String(name.to_string());
-    }
-    if let Some(params) = params_json {
-        body["params"] = params.clone();
-    }
-    body
-}
-
-pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
-    if args.len() >= 3 {
-        let sub = args[1].to_str();
-        let sub2 = args[2].to_str();
-        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
-            let suffix = sub2.unwrap();
-            eprintln!(
-                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
-            );
-            // Drop the leading `query` token AND normalize `check` -> `lint`.
-            // `check` is no longer a clap visible_alias (MR-981 §6), so the
-            // rewritten argv must reach the canonical `lint` subcommand
-            // directly. Result for `omnigraph query check --query foo.gq`:
-            //   `omnigraph lint --query foo.gq`.
-            let mut out = Vec::with_capacity(args.len() - 1);
-            out.push(args[0].clone());
-            out.push(OsString::from("lint"));
-            out.extend(args[3..].iter().cloned());
-            return out;
-        }
-    }
-    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
-        match sub {
-            "read" => {
-                eprintln!("warning: `omnigraph read` is deprecated; use `omnigraph query` instead")
-            }
-            "change" => eprintln!(
-                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
-            ),
-            "check" => {
-                eprintln!("warning: `omnigraph check` is deprecated; use `omnigraph lint` instead");
-                // Rewrite the top-level subcommand to `lint`; pass through the rest.
-                let mut out = Vec::with_capacity(args.len());
-                out.push(args[0].clone());
-                out.push(OsString::from("lint"));
-                out.extend(args[2..].iter().cloned());
-                return out;
-            }
-            _ => {}
-        }
-    }
-    args
 }
 
 #[cfg(test)]

@@ -333,8 +333,8 @@ these cutovers:
   `knowledge_next` with the desired schema, query, provider, and policy
   bindings. Validate, plan, and submit `cluster apply --server` so the running
   owner creates and activates its derived root. Load through that server, verify
-  the new ID, and move clients to it. Remove the old declaration only with an
-  exact lifecycle confirmation; removal retains its storage for recovery.
+  the new ID, back up what you need, and move clients. Removing the old declaration
+  and applying deletes its managed storage and all retained history.
 - **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
   new `storage` root, and keep the original cluster untouched. Validate, plan,
   and apply the new bundle; load the export into its derived graph root; then

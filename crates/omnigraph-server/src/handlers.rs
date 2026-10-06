@@ -41,8 +41,8 @@ mod dispatch;
 use dispatch::{
     Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
     read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_settings_at_deprecated_route, refuse_statement_envelope, refuse_wrong_door,
-    run_branch_statement, session_with_prefix, show_at_write_door,
+    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, session_with_prefix,
+    show_at_write_door,
 };
 
 /// Liveness probe.
@@ -180,17 +180,11 @@ pub(crate) async fn server_graphs_list(
         },
     )?;
 
-    let may_list = |id: &str| {
-        actor
-            .as_ref()
-            .is_none_or(|actor| actor.0.permits_graph_listing(id))
-    };
     let stopping = state.draining.load(std::sync::atomic::Ordering::SeqCst)
         || state.operations.snapshot().closed;
     let mut graphs: Vec<GraphInfo> = snapshot
         .graphs
         .values()
-        .filter(|entry| may_list(entry.key().graph_id.as_str()))
         .map(|entry| {
             let failure = match &entry {
                 GraphEntry::Loading(_) | GraphEntry::Ready(_) | GraphEntry::Transitioning(_) => {
@@ -483,11 +477,6 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if let Some(actor) = request.extensions_mut().get_mut::<AuthenticatedActor>() {
-        if !actor.select_graph(&graph_id) {
-            return Err(ApiError::forbidden("credential does not permit this graph"));
-        }
-    }
     let key = GraphKey::cluster(graph_id.clone());
     let handle = resolve_registered_graph(
         &state,
@@ -505,8 +494,7 @@ pub(crate) async fn resolve_graph_handle(
     ingress::admit(&state, request, next).await
 }
 
-/// HTTP and MCP share identity and unavailable-graph disclosure. Callers must
-/// first bind the credential to this graph with `select_graph`.
+/// HTTP and MCP share identity and unavailable-graph disclosure.
 pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,
@@ -611,7 +599,7 @@ pub(crate) enum Authz {
 /// and reserving `Err` for operational failures (401 missing bearer, 500
 /// policy-evaluation error). Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
-///     graph's Cedar rules govern read/change/branch_*/schema_apply.
+///     graph's Cedar rules govern read/change/branch_*.
 ///   * Management handler — captures the current registry snapshot policy so
 ///     server-level Cedar rules govern management access coherently with its
 ///     graph inventory.
@@ -628,11 +616,6 @@ pub(crate) fn authorize(
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
     if let Some(actor) = actor {
-        if !actor.permits_action(request.action) {
-            return Ok(Authz::Denied(
-                "credential does not permit this action".to_string(),
-            ));
-        }
         if actor.source == AuthSource::SignedData && policy.is_none() {
             return Ok(Authz::Denied(
                 "signed data credentials require an applied Cedar policy permit".to_string(),
@@ -663,12 +646,11 @@ pub(crate) fn authorize(
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
         // cluster must be bootstrapped with an explicit cluster-scoped
-        // policy bundle. This deployment class keeps that binding fixed.
+        // policy bundle.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
                 "server-scoped actions require an applied cluster policy permit; \
-                 declare the cluster policy when bootstrapping. Existing policy bindings \
-                 cannot be changed by this deployment class. The management surface \
+                 declare the cluster policy when bootstrapping. The management surface \
                  is closed by default, including with --unauthenticated."
                     .to_string(),
             ));
@@ -677,8 +659,7 @@ pub(crate) fn authorize(
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
                  applied policy bundle). Only `read` actions are permitted. Other \
-                 actions require an applied graph policy; changing existing policy \
-                 bindings is outside the supported deployment class."
+                 actions require an applied graph policy."
                     .to_string(),
             ));
         }
@@ -779,81 +760,6 @@ pub(crate) async fn server_snapshot(
     Ok(Json(output))
 }
 
-/// Header values that flag a response as coming from a deprecated route
-/// (RFC 9745 / RFC 8288) and point at the canonical successor.
-pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName, HeaderValue); 2] {
-    [
-        (
-            HeaderName::from_static("deprecation"),
-            HeaderValue::from_static("true"),
-        ),
-        (
-            HeaderName::from_static("link"),
-            HeaderValue::from_static(successor_link),
-        ),
-    ]
-}
-
-#[utoipa::path(
-    post,
-    path = "/read",
-    tag = "queries",
-    operation_id = "read",
-    request_body = ReadRequest,
-    responses(
-        (status = 200, description = "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = LegacyReadOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely with a byte-stable envelope"
-)]
-/// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
-///
-/// Execute a GQ read query. The route is kept indefinitely with a byte-stable
-/// envelope; cell spelling follows the JSON writer. A `settings` field, and
-/// a `set` or `reset` prefix in the source, are refused: the route runs under
-/// the process defaults alone. New integrations
-/// should target `POST /query`, which has clean field names (`query` /
-/// `name`) and a 400-on-mutation guard. Responses from this route include
-/// `Deprecation: true` and `Link: <query>; rel="successor-version"`
-/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
-/// signal.
-pub(crate) async fn server_read(
-    State(state): State<AppState>,
-    Extension(handle): Extension<GraphRequest>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ReadRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
-    if request.settings.is_some() {
-        return Err(ApiError::bad_request(
-            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
-        ));
-    }
-    let session = state.session(&handle, None)?;
-    let output = run_query(
-        handle,
-        session,
-        actor.as_ref().map(|Extension(actor)| actor),
-        Door::Read,
-        &request.query_source,
-        request.query_name.as_deref(),
-        request.params.as_ref(),
-        request.branch,
-        request.snapshot,
-    )
-    .await?
-    .into_read_output()?;
-    Ok((
-        deprecation_headers("<query>; rel=\"successor-version\""),
-        Json(output.into()),
-    ))
-}
-
 #[utoipa::path(
     post,
     path = "/query",
@@ -862,22 +768,20 @@ pub(crate) async fn server_read(
     request_body = QueryRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
-        (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, or its deprecated alias POST /change, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Execute an inline read query (friendlier-named alternative to `POST /read`).
+/// Execute an inline read query.
 ///
 /// Designed for ad-hoc exploration and AI-agent tool-use: short field
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
-/// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
-/// write queries. It shares `POST /read` target semantics (branch xor
-/// snapshot) and the same Cedar action (Read), while its canonical response
-/// additionally carries the pinned graph-commit token.
+/// -- use `POST /mutate` for writes. Select a branch or snapshot and obtain
+/// the pinned graph-commit token with the response. Cedar authorizes Read.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
@@ -1318,9 +1222,9 @@ fn reject_graph_commit_expected_head(
 }
 
 /// Shared backend for `/mutate` (canonical), `/mutate/if-graph-commit`,
-/// `/change` (deprecated alias), and the stored-mutation arm of
+/// and the stored-mutation arm of
 /// `/queries/{name}`. Returns the bare `ChangeOutput`; each route handler
-/// wraps it (the alias also attaches Deprecation headers).
+/// wraps it.
 ///
 /// Order: parse and classify first; a branch statement then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise
@@ -1342,7 +1246,6 @@ pub(crate) async fn run_mutate(
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let file = classify(query)?;
-    refuse_settings_at_deprecated_route(door, &file.settings)?;
     refuse_process_settings(&file.settings)?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
@@ -1425,19 +1328,14 @@ pub(crate) async fn run_mutate(
     .await
 }
 
-/// Shared backend for `/query` (canonical), `/read` (deprecated alias), and
-/// the stored-read arm of `/queries/{name}`.
+/// Shared backend for `/query` and the stored-read arm of `/queries/{name}`.
 ///
 /// Order: parse and classify first; `branch list` then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise runs
 /// the handler body of `GET /branches` (a scope-free `read` check); `show`
 /// passes the same refusals and the same scope-free `read` check before it
-/// reads the session's effective settings. At the deprecated `Read` door a
-/// `set` or `reset` prefix is refused by
-/// [`refuse_settings_at_deprecated_route`] before any of that, as the
-/// `settings` field of `/read` is. A
-/// declared query resolves and authorizes its read target, is refused at
-/// every door but `Read` when it contains mutations, and runs.
+/// reads the session's effective settings. A declared query resolves and
+/// authorizes its read target, refuses mutations, and runs.
 ///
 /// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
 /// reads use the bounded server observer lane, so there is no `state.workload` consumer.
@@ -1453,7 +1351,6 @@ pub(crate) async fn run_query(
     snapshot: Option<String>,
 ) -> std::result::Result<ReadDispatch, ApiError> {
     let file = classify(query)?;
-    refuse_settings_at_deprecated_route(door, &file.settings)?;
     refuse_process_settings(&file.settings)?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
@@ -1473,11 +1370,6 @@ pub(crate) async fn run_query(
             };
         }
         FileBody::Show(id) => {
-            if matches!(door, Door::Read | Door::Change) {
-                return Err(ApiError::bad_request(
-                    crate::api::branch_statement_refusals::DEPRECATED_ROUTE,
-                ));
-            }
             refuse_statement_envelope(
                 branch.is_some() || snapshot.is_some(),
                 name.is_some() || params_json.is_some(),
@@ -1496,7 +1388,7 @@ pub(crate) async fn run_query(
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if door != Door::Read && !query_decl.mutations.is_empty() {
+    if !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
@@ -1580,74 +1472,6 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<blob_transport
 
 #[utoipa::path(
     post,
-    path = "/change",
-    tag = "mutations",
-    operation_id = "change",
-    request_body = ChangeRequest,
-    responses(
-        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(
-    note = "use POST /mutate instead; /change retains its request and execution semantics"
-)]
-/// **Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.
-///
-/// Apply a GQ mutation to a branch. The deprecated route retains its request
-/// and execution semantics, while its response uses the current canonical
-/// vocabulary; a `settings` field is refused, since the route runs under the
-/// process defaults alone. New integrations should target `POST /mutate`.
-/// Responses include `Deprecation: true` and
-/// `Link: <mutate>; rel="successor-version"` headers per RFC 9745 / RFC 8288
-/// so SDKs and proxies can surface the signal.
-pub(crate) async fn server_change(
-    State(state): State<AppState>,
-    Extension(handle): Extension<GraphRequest>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    headers: axum::http::HeaderMap,
-    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
-    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
-    if request.settings.is_some() {
-        return Err(ApiError::bad_request(
-            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
-        ));
-    }
-    let session = state.session(&handle, None)?;
-    let output = run_mutate(
-        state,
-        handle,
-        ingress,
-        session,
-        actor.as_ref().map(|Extension(actor)| actor),
-        Door::Change,
-        &request.query,
-        request.name.as_deref(),
-        request.params.as_ref(),
-        request.branch,
-        None,
-    )
-    .await?;
-    Ok((
-        deprecation_headers("<mutate>; rel=\"successor-version\""),
-        Json(output),
-    ))
-}
-
-#[utoipa::path(
-    post,
     path = "/mutate",
     tag = "mutations",
     operation_id = "mutate",
@@ -1677,8 +1501,7 @@ pub(crate) async fn server_change(
 /// Conditional callers use `POST /mutate/if-graph-commit`, which requires and
 /// validates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.
 ///
-/// Pairs with `POST /query` (read-only). The legacy `POST /change` route
-/// has identical semantics and is kept as a deprecated alias.
+/// Pairs with `POST /query` (read-only).
 ///
 /// The GQ statements `branch create`, `branch delete`, and `branch merge`
 /// (grammar: `BranchStmt` in `omnigraph-compiler`) are also served
@@ -2101,107 +1924,6 @@ pub(crate) async fn server_schema_get(
     }))
 }
 
-#[utoipa::path(
-    post,
-    path = "/schema/apply",
-    tag = "mutations",
-    operation_id = "applySchema",
-    request_body = SchemaApplyRequest,
-    responses(
-        (status = 200, description = "Schema apply results", body = SchemaApplyOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Use `omnigraph cluster apply --server <SERVER> --config <CONFIG>` for live schema deployment", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a schema migration.
-///
-/// Cluster-backed servers reject this route with `409 Conflict`; operators
-/// submit schema changes with `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.
-///
-/// Diffs `schema_source` against the current schema and applies the resulting
-/// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
-/// a drop removes data from the branch head; older commits keep reading it
-/// until `omnigraph cleanup` stops retaining them. Returns the list of steps
-/// applied; if `applied` is false the diff was unsupported and no changes
-/// were made.
-pub(crate) async fn server_schema_apply(
-    State(state): State<AppState>,
-    Extension(handle): Extension<GraphRequest>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<SchemaApplyRequest>,
-) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
-    let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
-        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
-    authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::SchemaApply,
-            branch: None,
-            target_branch: Some("main".to_string()),
-        },
-    )?;
-    // Disable HTTP schema apply on cluster-backed serving AFTER the Cedar gate,
-    // so an unauthorized actor gets a 403 (not a 409 that would disclose the
-    // server is cluster-backed): 401 → 403 → 409, never leak topology before
-    // authorization. An authorized actor gets the actionable 409 signpost.
-    if state.routing().config_path.is_some() {
-        return Err(ApiError::conflict(
-            "server-side schema apply is disabled for cluster-backed serving; \
-             update the cluster config and run \
-             `omnigraph cluster apply --server <SERVER> --config <CONFIG>`.",
-        ));
-    }
-    let est_bytes = request.schema_source.len() as u64;
-    let admission = state
-        .workload
-        .try_admit(&actor_arc, est_bytes)
-        .map_err(ApiError::from_workload_reject)?;
-    let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, handle.clone(), async move {
-        let result = {
-            let db = &handle.engine;
-            let registry = handle.queries.as_deref();
-            let label = handle.key.graph_id.as_str().to_string();
-            // Engine-layer policy enforcement (MR-722): pass the resolved
-            // actor through so apply_schema_as can call enforce() with the
-            // authoritative identity. With a policy installed in AppState,
-            // engine-side enforcement re-checks the same decision the
-            // HTTP-layer authorize_request just made above. PR #3 collapses
-            // the redundancy.
-            db.apply_schema_as_with_catalog_check(
-                &request.schema_source,
-                actor_id.as_deref(),
-                |catalog| {
-                    if let Some(registry) = registry {
-                        validate_registry_against_catalog(registry, catalog, &label)?;
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(ApiError::from_omni)?
-        };
-        // Physical indexes are derived state. Schema apply records intent only;
-        // explicit `ensure_indices` / `optimize` maintenance owns convergence on
-        // every surface, including a long-lived server. Keeping the handler free
-        // of detached physical writes also makes a successful response describe
-        // the complete effect envelope of this request.
-        Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
-    })
-    .await
-}
-
 /// Authorize one load target without touching request data.
 async fn authorize_load_scope(
     handle: &GraphHandle,
@@ -2249,10 +1971,10 @@ async fn authorize_load_scope(
     )
 }
 
-/// Shared body for JSON `POST /load` and `POST /ingest` (deprecated):
+/// JSON `POST /load`:
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
-async fn run_ingest(
+async fn run_json_load(
     state: AppState,
     handle: GraphRequest,
     ingress: IngressLease,
@@ -2326,9 +2048,6 @@ async fn run_ingest(
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
 /// or when the load produces conflicting writes.
-///
-/// The legacy `POST /ingest` route has identical semantics and is kept as a
-/// deprecated alias.
 pub(crate) async fn server_load(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -2337,7 +2056,7 @@ pub(crate) async fn server_load(
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     Ok(Json(
-        run_ingest(
+        run_json_load(
             state,
             handle,
             ingress,
@@ -2501,54 +2220,6 @@ pub(crate) async fn server_load_ndjson(
         )))
     })
     .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/ingest",
-    tag = "mutations",
-    operation_id = "ingest",
-    request_body = IngestRequest,
-    responses(
-        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)", body = IngestOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(note = "use POST /load instead; /ingest retains its parser and branch defaults")]
-/// **Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.
-///
-/// Bulk-load NDJSON data into a branch. The deprecated route retains its
-/// parser and branch defaults, but its response uses the current canonical
-/// vocabulary. New integrations should target `POST /load`. Responses
-/// include `Deprecation: true` and `Link: <load>; rel="successor-version"`
-/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
-pub(crate) async fn server_ingest(
-    State(state): State<AppState>,
-    Extension(handle): Extension<GraphRequest>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<IngestRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
-    let output = run_ingest(
-        state,
-        handle,
-        ingress,
-        actor.as_ref().map(|Extension(actor)| actor),
-        request,
-    )
-    .await?;
-    Ok((
-        deprecation_headers("<load>; rel=\"successor-version\""),
-        Json(output),
-    ))
 }
 
 #[utoipa::path(

@@ -291,6 +291,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "preview_schema_apply"),
     ("db/omnigraph.rs", "prepare_schema_apply_as"),
+    ("db/omnigraph.rs", "prepare_schema_apply_with_plan_as"),
     ("db/omnigraph.rs", "prepare_schema_settlement_as"),
     ("db/omnigraph.rs", "reconcile_schema_apply_as"),
     ("db/omnigraph.rs", "snapshot_of"),

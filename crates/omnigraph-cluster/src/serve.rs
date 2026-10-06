@@ -230,7 +230,7 @@ pub async fn read_deployment_serving_snapshot(
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let backend =
         ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
-    read_snapshot_impl(&backend, false, None, Some(affected)).await
+    read_snapshot_impl(&backend, false, None, Some(affected), None).await
 }
 
 /// Test support: read a local cluster's serving snapshot through the
@@ -426,7 +426,7 @@ fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
 pub(crate) async fn read_snapshot_with_store(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, false, None, None).await
+    read_snapshot_impl(backend, false, None, None, None).await
 }
 
 /// Decode and validate legacy applied facts only for stopped-writer conversion.
@@ -434,7 +434,7 @@ pub(crate) async fn read_snapshot_with_store(
 pub(crate) async fn read_snapshot_for_ledger_upgrade(
     backend: &ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, true, None, None).await
+    read_snapshot_impl(backend, true, None, None, None).await
 }
 
 /// Use the ordinary serving projector with already validated frozen candidate
@@ -443,8 +443,17 @@ pub(crate) async fn preview_snapshot_with_store(
     backend: &ClusterStore,
     candidate: &crate::CapturedDeployment,
     affected: &[String],
+    state: ClusterState,
+    state_cas: String,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
-    read_snapshot_impl(backend, false, Some(candidate), Some(affected)).await
+    read_snapshot_impl(
+        backend,
+        false,
+        Some(candidate),
+        Some(affected),
+        Some((state, state_cas)),
+    )
+    .await
 }
 
 async fn serving_payload(
@@ -471,6 +480,7 @@ async fn read_snapshot_impl(
     legacy_conversion: bool,
     candidate: Option<&crate::CapturedDeployment>,
     affected: Option<&[String]>,
+    captured: Option<(ClusterState, String)>,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let selected = |graph: &str| affected.is_none_or(|graphs| graphs.iter().any(|id| id == graph));
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -514,21 +524,26 @@ async fn read_snapshot_impl(
     }
 
     let mut observations = backend.observations();
-    let state = match backend.read_state(&mut observations).await {
-        Ok(snapshot) => match snapshot.state {
-            Some(state) => Some(state),
-            None => {
-                diagnostics.push(Diagnostic::error(
-                    "cluster_state_missing",
-                    CLUSTER_STATE_FILE,
-                    "no cluster state ledger; run `cluster apply` first",
-                ));
+    let state = if let Some((state, cas)) = captured {
+        observations.state_cas = Some(cas);
+        Some(state)
+    } else {
+        match backend.read_state(&mut observations).await {
+            Ok(snapshot) => match snapshot.state {
+                Some(state) => Some(state),
+                None => {
+                    diagnostics.push(Diagnostic::error(
+                        "cluster_state_missing",
+                        CLUSTER_STATE_FILE,
+                        "no cluster state ledger; run `cluster apply` first",
+                    ));
+                    None
+                }
+            },
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
                 None
             }
-        },
-        Err(diagnostic) => {
-            diagnostics.push(diagnostic);
-            None
         }
     };
     let Some(mut state) = state else {

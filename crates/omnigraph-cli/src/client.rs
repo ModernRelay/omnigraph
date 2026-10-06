@@ -5,7 +5,7 @@
 //! into two arms here.
 //!
 //! Phase 3a put the factory + the uniform read verbs in place. Phase 3b
-//! adds the data-plane writes (`load`/`ingest`/`mutate`/`branch_*`/
+//! adds the data-plane writes (`load`/`mutate`/`branch_*`/
 //! `apply_schema`) and `query`. The wrinkle 3a deferred: writes open the
 //! local engine WITH policy (`open_local_db_with_policy`) and carry a
 //! resolved actor, while reads/`query` open WITHOUT policy. So the
@@ -35,10 +35,9 @@ use omnigraph_api_types::{
     BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
     ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
     CommitListOutput, CommitOutput, EntityKindOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphDiscoveryResponse, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output, change_baseline_output,
-    change_feed_output, change_scope, commit_changes_output, commit_output, ingest_receipt_output,
+    GraphDiscoveryResponse, GraphListResponse, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
+    change_baseline_output, change_feed_output, change_scope, commit_changes_output, commit_output,
     read_output, schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
@@ -56,10 +55,9 @@ use crate::cli::CliLoadMode;
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, branch_statement_change_request,
-    branch_statement_query_request, is_remote_uri, legacy_change_request_body,
-    precondition_failed_cli, query_params_from_json, remote_json, remote_json_bounded,
-    remote_response_json_bounded, remote_url, resolve_cli_actor, resolve_cli_graph,
-    resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
+    remote_json, remote_json_bounded, remote_response_json_bounded, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -168,10 +166,10 @@ fn blob_transport_error(error: color_eyre::Report) -> color_eyre::Report {
     }
 }
 
-/// Why a served `load`/`ingest` refuses a `--set`: neither route's request
+/// Why a served `load` refuses a `--set`: neither load route's request
 /// type carries a `settings` field, so a value could only be dropped.
-const SETTINGS_AT_SERVED_LOAD: &str = "load and ingest take --set only on an embedded store; \
-                                       the served load and ingest routes carry no settings field";
+const SETTINGS_AT_SERVED_LOAD: &str = "load takes --set only on an embedded store; \
+                                       the served load routes carry no settings field";
 
 /// The `--set name=value` flags of one invocation, each checked against the
 /// settings definition (the Session settings RFC). Scope is the transport's: the embedded
@@ -247,7 +245,7 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
-    /// An already validated managed credential never enters legacy scope or token resolution.
+    /// A validated managed credential does not resolve operator profiles or tokens.
     pub(crate) fn managed(endpoint: &str, graph: &str, token: String) -> Result<Self> {
         Self::managed_url(
             endpoint,
@@ -991,68 +989,7 @@ impl GraphClient {
         }
     }
 
-    /// `ingest` — the deprecated loader-compatible path. Unlike canonical
-    /// `load`, it retains the historical permissive parser and `/ingest`
-    /// endpoint. The embedded arm echoes `actor_id: None` in the output
-    /// exactly as the legacy arm did (the actor is still attributed on the
-    /// commit via `load_file_as_with_receipt`).
-    pub(crate) async fn ingest(
-        &self,
-        branch: &str,
-        from: &str,
-        data: &str,
-        mode: CliLoadMode,
-        settings: &[(SettingId, SettingValue)],
-    ) -> Result<IngestOutput> {
-        match self {
-            GraphClient::Remote {
-                http,
-                base_url,
-                token,
-                ..
-            } => {
-                if !settings.is_empty() {
-                    bail!("{}", SETTINGS_AT_SERVED_LOAD);
-                }
-                let data = std::fs::read_to_string(data)?;
-                remote_json(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["ingest"], &[])?,
-                    Some(serde_json::to_value(IngestRequest {
-                        branch: Some(branch.to_string()),
-                        from: Some(from.to_string()),
-                        mode: Some(mode.into()),
-                        data,
-                    })?),
-                    token.as_deref(),
-                )
-                .await
-            }
-            GraphClient::Embedded { uri, actor } => {
-                let session = Self::open_write_session(uri, settings).await?;
-                let receipt = session
-                    .load_file_as_with_receipt(
-                        branch,
-                        Some(from),
-                        data,
-                        mode.into(),
-                        actor.as_deref(),
-                    )
-                    .await?;
-                Ok(ingest_receipt_output(
-                    uri,
-                    &receipt,
-                    &session.catalog(),
-                    mode.into(),
-                    None,
-                ))
-            }
-        }
-    }
-
-    /// `mutate` — run a change query against `branch`. Folds
-    /// `execute_change` / `execute_change_remote` + the legacy request body.
+    /// Run a mutation against `branch`.
     ///
     /// `expected_head` is the `--if-commit` compare-and-swap precondition:
     /// the write runs only if the branch head commit still equals it. A
@@ -1060,9 +997,7 @@ impl GraphClient {
     /// The command boundary reserves exit 4 for verified remote refusals
     /// without earlier whole-command effects.
     ///
-    /// A `--set` value travels in the `settings` field of `POST /mutate`
-    /// (the deprecated `/change` route refuses the field), so the legacy
-    /// body is sent only when there is neither a precondition nor a setting.
+    /// A `--set` value travels in the `settings` field of `POST /mutate`.
     pub(crate) async fn mutate(
         &self,
         branch: &str,
@@ -1079,28 +1014,19 @@ impl GraphClient {
                 token,
                 response_limit,
             } => {
-                let (url, body) = if expected_head.is_some() || !settings.is_empty() {
-                    let route: &[&str] = if expected_head.is_some() {
-                        &["mutate", "if-graph-commit"]
-                    } else {
-                        &["mutate"]
-                    };
-                    (
-                        remote_url(base_url, route, &[])?,
-                        serde_json::to_value(ChangeRequest {
-                            query: query_source.to_string(),
-                            name: query_name.map(ToOwned::to_owned),
-                            params: params_json.cloned(),
-                            branch: Some(branch.to_string()),
-                            settings: Self::remote_settings(settings)?,
-                        })?,
-                    )
+                let route: &[&str] = if expected_head.is_some() {
+                    &["mutate", "if-graph-commit"]
                 } else {
-                    (
-                        remote_url(base_url, &["change"], &[])?,
-                        legacy_change_request_body(query_source, query_name, branch, params_json),
-                    )
+                    &["mutate"]
                 };
+                let url = remote_url(base_url, route, &[])?;
+                let body = serde_json::to_value(ChangeRequest {
+                    query: query_source.to_string(),
+                    name: query_name.map(ToOwned::to_owned),
+                    params: params_json.cloned(),
+                    branch: Some(branch.to_string()),
+                    settings: Self::remote_settings(settings)?,
+                })?;
                 remote_json_bounded(
                     http,
                     Method::POST,
@@ -1582,12 +1508,8 @@ impl GraphClient {
         Ok(output)
     }
 
-    /// `apply_schema` — apply `schema_source`. The embedded arm runs the
-    /// caller's catalog validator (stored-query registry check) inside the
-    /// engine's `apply_schema_as_with_catalog_check`; the remote arm runs
-    /// the server's own check and IGNORES `validate`. The `impl FnOnce`
-    /// validator is exactly why this is an enum, not a trait (non-object-
-    /// safe).
+    /// Apply a standalone graph's schema with the caller's catalog validator.
+    /// Served schemas are deployed through the cluster configuration.
     pub(crate) async fn apply_schema<F>(
         &self,
         schema_source: &str,
@@ -1597,25 +1519,10 @@ impl GraphClient {
         F: FnOnce(&Catalog) -> omnigraph::error::Result<()>,
     {
         match self {
-            GraphClient::Remote {
-                http,
-                base_url,
-                token,
-                ..
-            } => {
-                // The server's `server_schema_apply` runs its own catalog
-                // check, so `validate` does not apply here.
-                remote_json::<SchemaApplyOutput>(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["schema", "apply"], &[])?,
-                    Some(serde_json::to_value(SchemaApplyRequest {
-                        schema_source: schema_source.to_string(),
-                    })?),
-                    token.as_deref(),
-                )
-                .await
-            }
+            GraphClient::Remote { .. } => bail!(
+                "schema apply requires a standalone storage URI; deploy a served schema with \
+                 `cluster apply --server <SERVER> --config <CONFIG>`"
+            ),
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_write(uri).await?;
                 let result = db
@@ -2037,7 +1944,7 @@ mod tests {
                 let error = remote_json::<Value>(
                     &http,
                     Method::POST,
-                    format!("{}/graphs/knowledge/change", server.origin),
+                    format!("{}/graphs/knowledge/mutate", server.origin),
                     Some(json!({"query":"mutation m() {}"})),
                     Some("secret-bearer"),
                 )
@@ -2272,7 +2179,7 @@ mod tests {
             let error = remote_json::<Value>(
                 &http,
                 Method::POST,
-                format!("{}/graphs/knowledge/change", server.origin),
+                format!("{}/graphs/knowledge/mutate", server.origin),
                 Some(json!({})),
                 Some("data-bearer"),
             )
@@ -2480,7 +2387,7 @@ mod tests {
                             if form == "conditional" {
                                 "/graphs/knowledge/mutate/if-graph-commit"
                             } else {
-                                "/graphs/knowledge/change"
+                                "/graphs/knowledge/mutate"
                             },
                         ),
                     };
@@ -2734,8 +2641,9 @@ mod tests {
         let server = IntentApiFixture::graph(vec![
             IntentReply::json(200, read),
             IntentReply::json(200, change.clone()),
-            IntentReply::json(200, change),
+            IntentReply::json(200, change.clone()),
             IntentReply::json(200, merged),
+            IntentReply::json(200, change),
         ]);
         let client =
             GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
@@ -2772,14 +2680,24 @@ mod tests {
             .await
             .unwrap();
 
+        client
+            .mutate("main", "mutation m() {}", Some("m"), None, None, &[])
+            .await
+            .unwrap();
         let requests = server.workflow_requests();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[4].path, "/graphs/knowledge/mutate");
+        assert_eq!(requests[4].body["query"], "mutation m() {}");
+        assert_eq!(requests[4].body["name"], "m");
+        assert!(requests[4].body.get("query_source").is_none());
+        assert!(requests[4].body.get("query_name").is_none());
+        assert!(requests[4].body.get("settings").is_none());
         let field = json!({"merge_lineage": "off", "ann_nprobes": 1});
         assert_eq!(requests[0].path, "/graphs/knowledge/query");
         assert_eq!(requests[0].body["settings"], field);
         assert_eq!(
             requests[1].path, "/graphs/knowledge/mutate",
-            "a setting selects the canonical route over the legacy /change"
+            "mutations use the canonical route"
         );
         assert_eq!(requests[1].body["settings"], field);
         assert!(

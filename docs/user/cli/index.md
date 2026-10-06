@@ -107,7 +107,7 @@ line in the source applies after `--set`, so the file wins.
   the same validation and the same absence of effect.
 - `load --set` and `ingest --set`: a direct run (`--store`) applies them to the
   staged write (`--set stage_write_concurrency=16`); a served run refuses any
-  `--set` before sending, since the served load and ingest routes carry no
+  `--set` before sending, since the served load routes carry no
   `settings` field.
 
 ```bash
@@ -192,10 +192,11 @@ omnigraph cluster apply --config ./company-brain --as act-alice
 ```
 
 They manage graph definitions, schemas, stored queries, policies, embedding
-providers and external Blob rules. Use `--lifecycle FILE` on plan and apply for
-explicit removal, adoption, recreation, catalog repair or schema-contract
-correction. Use the same actor and lifecycle file for both commands. See
-[Operating a cluster](../clusters/index.md).
+providers and external Blob rules. Plan is always an observation and never takes
+the writer lock. Removing a graph declaration deletes its managed storage and
+history. Apply refuses unmanaged existing roots, missing graphs that remain
+declared, and schema drift; it has no lifecycle or repair override. See
+[deployment boundaries](../clusters/index.md#deployment-boundaries).
 
 For a managed cluster, log in to its Intent API and select the cluster for
 your config directory:

@@ -31,8 +31,8 @@ Missing or unapplied state, or a nonempty cluster whose graphs all fail, refuses
 startup. Authentication, policy and data-token root checks still apply.
 
 Use `cluster apply --server URL --config DIR` for schema, query, policy,
-provider and Blob-rule changes without restart. Explicit graph lifecycle changes
-use the same deployment. Direct apply requires stopped serving and a subsequent
+provider and Blob-rule changes without restart. Graph additions and removals
+use the same deployment; removal deletes the graph's managed storage and history. Direct apply requires stopped serving and a subsequent
 start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
@@ -106,22 +106,15 @@ defines the machine-written file.
 
 Signed credentials use the actor `principal:<immutable-principal-id>`. A caller
 cannot change its actor through request headers or JSON. The server accepts
-two explicit profiles:
-
-- **Identity credentials (version 2)** bind the principal to the cluster and
-  contain no permissions. Applied Cedar policy decides graph operations;
-  missing policy or an unknown policy actor denies protected access.
-- **Legacy restricted credentials (version 1)** additionally limit access to
-  their exact graph/action grants. Both the grant and applied policy must
-  allow the request. These credentials cannot grant `schema_apply`,
-  `config_manage`, or `admin`.
+version-2 identity credentials, which bind the principal to the cluster and
+contain no permissions. Applied Cedar policy decides graph operations;
+missing policy or an unknown policy actor denies protected access.
 
 Every valid identity credential can call `GET /graphs/discovery` for applied
 graph IDs and names (currently identical), including blocked graphs. It
 requires no policy membership and returns no locations, availability, schema,
-queries or data. Static/restricted credentials cannot use it. `GET /graphs`
-requires `graph_list` permission and, for restricted credentials, a signed
-`graph_list` grant. Discovery grants no graph access or reachability.
+queries or data. Static credentials cannot use it. `GET /graphs`
+requires `graph_list` permission. Discovery grants no graph access or reachability.
 
 See [managed data access](../cli/managed-data.md) for issuance and CLI discovery.
 
@@ -234,12 +227,7 @@ Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
 
-`/read`, `/change`, and `/ingest` are deprecated compatibility routes. New
-clients should use `/query`, `/mutate`, and `/load`.
-
-`POST /graphs/{id}/schema/apply` remains in the wire surface for compatibility,
-but a cluster-only server rejects it with `409`. Change a managed graph's
-schema through `cluster apply --server URL --config DIR`; see
+Change a managed graph's schema through `cluster apply --server URL --config DIR`; see
 [cluster deployments](../clusters/index.md#deploy-without-restarting).
 
 ## Run an inline query
@@ -260,9 +248,6 @@ Use `branch` or `snapshot` to select a read view; they are mutually exclusive.
 When the read snapshot has an effective graph head, the canonical `/query`
 response includes its `graph_commit_id`, pinned with the returned rows. Inline
 writes go to `/mutate` and may select a target `branch`.
-
-The deprecated `/read` compatibility response does not include
-`graph_commit_id`; clients that need a read position must use `/query`.
 
 ## Invoke a stored query
 
@@ -293,7 +278,7 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
 ```
 
 Stored mutations use `POST /graphs/{id}/queries/{name}/if-graph-commit` with
-that header. Ordinary `/mutate`, deprecated `/change`, and `/queries/{name}`
+that header. Ordinary `/mutate` and `/queries/{name}`
 reject it rather than ignore the condition. Never fall back to an unconditional
 route after a conditional request fails.
 

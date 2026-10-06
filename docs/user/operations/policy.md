@@ -133,8 +133,7 @@ For HTTP requests, the server maps the bearer token to an actor. Headers,
 query parameters, and request bodies cannot override that identity.
 Signed credentials use `principal:<immutable-principal-id>`; groups and
 permissions come from applied policy. An identity credential contains no
-graph/action grants. Legacy restricted credentials retain an additional
-ceiling; they cannot override a policy denial.
+graph/action grants. Version-1 restricted credentials are not accepted.
 
 For direct CLI writes, actor resolution is:
 

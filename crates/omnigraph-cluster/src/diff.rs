@@ -19,7 +19,6 @@ pub(crate) fn diff_resources(
                 reason: None,
                 binding_change: false,
                 metadata_change: None,
-                lifecycle: None,
                 migration: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
@@ -31,7 +30,6 @@ pub(crate) fn diff_resources(
                 reason: None,
                 binding_change: false,
                 metadata_change: None,
-                lifecycle: None,
                 migration: None,
             }),
             Some(_) => {}
@@ -48,7 +46,6 @@ pub(crate) fn diff_resources(
                 reason: None,
                 binding_change: false,
                 metadata_change: None,
-                lifecycle: None,
                 migration: None,
             });
         }
@@ -89,7 +86,6 @@ pub(crate) fn append_policy_binding_changes(
             reason: None,
             binding_change: true,
             metadata_change: Some(PlanMetadataChange::PolicyBindings),
-            lifecycle: None,
             migration: None,
         });
     }
@@ -130,7 +126,6 @@ pub(crate) fn append_embedding_profile_changes(
             reason: None,
             binding_change: false,
             metadata_change: Some(PlanMetadataChange::EmbeddingProfile),
-            lifecycle: None,
             migration: None,
         });
     }

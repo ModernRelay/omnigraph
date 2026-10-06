@@ -207,7 +207,13 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     ..
                 }
             ),
-            Direct => matches!(cmd, Command::RebuildFullTextIndexes { .. }),
+            Direct => matches!(
+                cmd,
+                Command::RebuildFullTextIndexes { .. }
+                    | Command::Schema {
+                        command: SchemaCommand::Apply { .. }
+                    }
+            ),
             Served | Local => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
@@ -248,14 +254,13 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 
 /// The plane a subcommand belongs to. Exhaustive — a new `Command` variant
 /// will not compile until classified. Descends into the nested enums where
-/// the plane differs per subcommand (`schema plan` is storage while `schema
-/// show`/`apply` are data; `queries`/`policy` read cluster applied state).
+/// the plane differs per subcommand (`schema plan`/`apply` are storage while
+/// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query { .. }
         | Command::Mutate { .. }
         | Command::Load { .. }
-        | Command::Ingest { .. }
         | Command::Branch { .. }
         | Command::Snapshot { .. }
         | Command::Export { .. }
@@ -264,10 +269,13 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
-            command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
+            command: SchemaCommand::Show { .. },
         } => Plane::Data,
         Command::Schema {
-            command: SchemaCommand::Plan { .. } | SchemaCommand::UpgradeSystemColumns { .. },
+            command:
+                SchemaCommand::Plan { .. }
+                | SchemaCommand::Apply { .. }
+                | SchemaCommand::UpgradeSystemColumns { .. },
         } => Plane::Storage,
         // `queries` and `policy` tooling now source their inputs from a
         // cluster's applied state (`--cluster`), so they live on the control
@@ -304,7 +312,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
-        Command::Ingest { .. } => "ingest",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -436,6 +443,11 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
             Command::Init { .. } => " Pass a storage URI.",
+            Command::Schema {
+                command: SchemaCommand::Apply { .. },
+            } => {
+                " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
+            }
             Command::Optimize { .. }
             | Command::RebuildFullTextIndexes { .. }
             | Command::Repair { .. }
@@ -507,6 +519,10 @@ mod tests {
             (
                 parse(&["omnigraph", "changes", "baseline", "--out", "b.jsonl"]),
                 [true, false, true, true, false, true],
+            ),
+            (
+                parse(&["omnigraph", "schema", "apply", "--schema", "s.pg", "g.omni"]),
+                [false, false, false, true, true, true],
             ),
             (
                 parse(&["omnigraph", "optimize", "g.omni"]),

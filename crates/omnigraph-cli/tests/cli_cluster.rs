@@ -91,12 +91,6 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             "lock_id":"server-owner", "outstanding_id":null, "lookup":null},
         "active":false
     });
-    let lifecycle = temp.path().join("lifecycle.json");
-    fs::write(
-        &lifecycle,
-        r#"{"repair_catalog":["query.knowledge.find_person"]}"#,
-    )
-    .unwrap();
     let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
     for declared_storage in [Some(remote_root.as_str()), None] {
         let captured_config = match declared_storage {
@@ -126,8 +120,6 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
                     "--config",
                 ])
                 .arg(temp.path())
-                .arg("--lifecycle")
-                .arg(&lifecycle)
                 .arg("--json"),
         );
         assert_eq!(
@@ -152,10 +144,7 @@ fn core_live_apply_captures_server_file_root_without_local_storage_access() {
             );
         }
         assert_eq!(requests[1].body["deployment_id"], id);
-        assert_eq!(
-            requests[1].body["deployment"]["options"]["repair_catalog"],
-            serde_json::json!(["query.knowledge.find_person"])
-        );
+        assert!(requests[1].body["deployment"].get("options").is_none());
         assert_eq!(
             requests[1].body["deployment"]["canonical_root"],
             remote_root
@@ -871,7 +860,6 @@ fn managed_data_process_refuses_missing_graph_and_actor_override_before_keychain
             "forged",
             "--json",
         ],
-        vec!["cluster", "token", "--actions", "read", "--json"],
         vec![
             "cluster",
             "token",
@@ -2041,12 +2029,12 @@ fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
 }
 
 #[test]
-fn cluster_plan_locked_state_exits_nonzero() {
+fn cluster_plan_observes_an_existing_lock() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     write_cluster_lock(temp.path(), "held-lock", "plan");
 
-    let output = output_failure(
+    let output = output_success(
         cli()
             .arg("cluster")
             .arg("plan")
@@ -2055,7 +2043,7 @@ fn cluster_plan_locked_state_exits_nonzero() {
             .arg("--json"),
     );
     let json = parse_stdout_json(&output);
-    assert_eq!(json["ok"], false);
+    assert_eq!(json["ok"], true);
     assert_eq!(json["state_observations"]["locked"], true);
     assert_eq!(json["state_observations"]["lock_acquired"], false);
     assert_eq!(json["state_observations"]["lock_id"], "held-lock");
@@ -2066,18 +2054,8 @@ fn cluster_plan_locked_state_exits_nonzero() {
         "1970-01-01T00:00:00Z"
     );
     assert!(json["state_observations"]["lock_age_seconds"].is_number());
-    assert!(
-        json["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_lock_held"
-                && diagnostic["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("force-unlock held-lock")),
-        "locked state should produce a useful diagnostic: {json}"
-    );
+    assert_eq!(json["authority"], "observed");
+    assert!(temp.path().join("__cluster/lock.json").exists());
 }
 
 #[test]
@@ -2130,12 +2108,12 @@ fn cluster_force_unlock_wrong_id_exits_nonzero() {
 }
 
 #[test]
-fn cluster_locked_plan_then_force_unlock_then_plan_succeeds() {
+fn cluster_plan_succeeds_before_and_after_force_unlock() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     write_cluster_lock(temp.path(), "held-lock", "plan");
 
-    let locked = parse_stdout_json(&output_failure(
+    let locked = parse_stdout_json(&output_success(
         cli()
             .arg("cluster")
             .arg("plan")
@@ -2143,7 +2121,7 @@ fn cluster_locked_plan_then_force_unlock_then_plan_succeeds() {
             .arg(temp.path())
             .arg("--json"),
     ));
-    assert_eq!(locked["ok"], false);
+    assert_eq!(locked["ok"], true);
     assert_eq!(locked["state_observations"]["lock_id"], "held-lock");
 
     let unlocked = parse_stdout_json(&output_success(

@@ -76,11 +76,8 @@ impl RemoteCluster {
         &self,
         config: &Path,
         requested_id: Option<&str>,
-        correction: Option<&Path>,
-        lifecycle: Option<&Path>,
         json_output: bool,
     ) -> Result<()> {
-        let options = crate::read_deployment_options(lifecycle, correction)?;
         let status: StatusResponse = self
             .request(Method::GET, &["cluster", "deployments"], None)
             .await?;
@@ -88,11 +85,7 @@ impl RemoteCluster {
         // captured bytes to the authenticated server's root without opening
         // that storage root or resolving it on the client.
         let deployment = crate::core_deployment_result(
-            omnigraph_cluster::capture_deployment_for_server_with_options(
-                config,
-                &options,
-                &status.status.canonical_root,
-            ),
+            omnigraph_cluster::capture_deployment_for_server(config, &status.status.canonical_root),
             json_output,
         )?;
         if status.status.canonical_root != deployment.canonical_root() {
@@ -215,19 +208,11 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
         ClusterCommand::Apply {
             config,
             deployment_id,
-            schema_correction,
-            lifecycle,
             json,
             ..
         } => {
             remote
-                .apply(
-                    config,
-                    deployment_id.as_deref(),
-                    schema_correction.as_deref(),
-                    lifecycle.as_deref(),
-                    *json,
-                )
+                .apply(config, deployment_id.as_deref(), *json)
                 .await?;
         }
         ClusterCommand::Status { deployment_id, .. } => {

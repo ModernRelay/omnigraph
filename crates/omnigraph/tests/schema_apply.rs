@@ -806,10 +806,16 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     let predecessor = db.list_commits(None).await.unwrap()[0].clone();
     let files_before = schema_storage_bytes(dir.path());
     let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
-    let prepared = db
-        .prepare_schema_apply_as(&desired, Some("deployer"))
+    let (prepared, migration) = db
+        .prepare_schema_apply_with_plan_as(&desired, Some("deployer"))
         .await
         .unwrap();
+    assert!(migration.supported);
+    assert!(migration.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty { type_name, property_name, .. }
+            if type_name == "Person" && property_name == "nickname"
+    )));
     assert!(!prepared.is_noop());
     assert_eq!(prepared.actor(), Some("deployer"));
     assert_eq!(
@@ -844,6 +850,7 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
         .unwrap();
     let commit = result.commit.as_ref().unwrap();
     assert!(result.applied);
+    assert_eq!(result.steps, migration.steps);
     assert_eq!(
         intent_nonce(&commit.graph_commit_id).unwrap(),
         commit_id,

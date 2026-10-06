@@ -78,13 +78,8 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
         !root_help
             .lines()
             .any(|line| line.trim_start().starts_with("ingest")),
-        "the compatibility command must remain hidden from root help:\n{root_help}"
+        "removed commands must be absent from root help:\n{root_help}"
     );
-
-    let ingest_help = stdout_string(&output_success(cli().arg("ingest").arg("--help")));
-    assert!(ingest_help.contains("Deprecated permissive loader"));
-    assert!(ingest_help.contains("--from"));
-    assert!(ingest_help.contains("--mode"));
 
     let export_help = stdout_string(&output_success(cli().arg("export").arg("--help")));
     assert!(export_help.contains("--type"));
@@ -191,24 +186,32 @@ fn schema_plan_json_reports_supported_additive_change() {
 
 #[test]
 fn schema_plan_with_server_flag_errors_wrong_plane() {
-    // RFC-010 Slice 1: `schema plan` is storage-plane while `schema show/apply`
-    // are data-plane — the guard rejects --server on plan with the per-subcommand
-    // label (proving command_plane/command_label descend into the nested enum).
-    let output = output_failure(
-        cli()
-            .arg("schema")
-            .arg("plan")
-            .arg("--schema")
-            .arg(fixture("test.pg"))
-            .arg("--server")
-            .arg("prod"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`schema plan` is a direct (storage-native) command")
-            && stderr.contains("Pass a storage URI."),
-        "schema plan wrong-capability message not found; got: {stderr}"
-    );
+    let server = support::managed_http::IntentApiFixture::graph(Vec::new());
+    for command in ["plan", "apply"] {
+        let output = output_failure(
+            cli()
+                .args(["schema", command, "--schema"])
+                .arg(fixture("test.pg"))
+                .args(["--server", &server.origin]),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "`schema {command}` is a direct (storage-native) command"
+            )),
+            "schema {command} wrong-capability message not found; got: {stderr}"
+        );
+        if command == "apply" {
+            assert!(stderr.contains("cluster apply --server"), "{stderr}");
+        } else {
+            assert!(stderr.contains("Pass a storage URI."), "{stderr}");
+        }
+        assert!(
+            server.requests().is_empty(),
+            "refuse before discovery or dispatch"
+        );
+    }
+    server.assert_complete();
 }
 
 #[test]
@@ -250,6 +253,18 @@ fn schema_apply_json_applies_supported_migration() {
     let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
     init_graph(&graph);
+    load_fixture(&graph);
+    let read = |source: &str| {
+        parse_stdout_json(&output_success(
+            cli()
+                .args(["query", "people", "-e", source, "--json", "--store"])
+                .arg(&graph),
+        ))
+    };
+    let before = read(
+        "query people() { match { $p: Person } return { $p.name, $p.age } order { $p.name } }",
+    );
+    assert!(before["row_count"].as_u64().unwrap() > 0);
 
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -271,6 +286,21 @@ fn schema_apply_json_applies_supported_migration() {
     assert_eq!(payload["supported"], true);
     assert_eq!(payload["applied"], true);
     assert_eq!(payload["step_count"], 1);
+
+    // This preserves the old HTTP mirror's AddProperty row-preservation
+    // assertion at the supported standalone CLI boundary.
+    let after = read(
+        "query people() { match { $p: Person } return { $p.name, $p.age, $p.nickname is null as nickname_is_null } order { $p.name } }",
+    );
+    assert_eq!(after["row_count"], before["row_count"]);
+    let mut rows = after["rows"].as_array().unwrap().clone();
+    for row in &mut rows {
+        assert_eq!(
+            row.as_object_mut().unwrap().remove("nickname_is_null"),
+            Some(Value::Bool(true))
+        );
+    }
+    assert_eq!(Value::Array(rows), before["rows"]);
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()

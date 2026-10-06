@@ -2,7 +2,7 @@
 //! Input and graph outcomes belong to the cluster ledger; this controller owns
 //! only request lifetime, graph admission and activation of serving bindings.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
@@ -10,8 +10,8 @@ use axum::{
     extract::{Path, State},
 };
 use omnigraph_cluster::{
-    CapturedDeployment, DeploymentActivation, DeploymentCaller, DeploymentLookup, DeploymentStatus,
-    IdentityAuthorization,
+    CapturedDeployment, DeploymentCaller, DeploymentLookup, DeploymentStatus,
+    GraphDeploymentResult, IdentityAuthorization,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -58,11 +58,6 @@ pub(crate) struct DeploymentStatusResponse {
 }
 
 fn caller(state: &AppState, actor: &AuthenticatedActor) -> Result<DeploymentCaller, ApiError> {
-    if actor.data_claims().is_some() {
-        return Err(ApiError::forbidden(
-            "graph-scoped credentials cannot deploy cluster configuration",
-        ));
-    }
     crate::handlers::authorize_request(
         Some(actor),
         state
@@ -106,6 +101,47 @@ fn uncertain(message: impl Into<String>) -> ApiError {
     ApiError::internal(message)
 }
 
+/// Installed together with graph bindings; durable completion stays in the
+/// cluster ledger, while activation belongs only to this process incarnation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveDeployment {
+    canonical_root: String,
+    process_incarnation: String,
+    id: String,
+    input_digest: String,
+    result_revision: u64,
+    config_digest: String,
+}
+
+impl ActiveDeployment {
+    pub(crate) fn new(
+        owner: &omnigraph_cluster::ClusterAdmission,
+        result: &omnigraph_cluster::DeploymentResult,
+    ) -> Option<Self> {
+        result.converged.then_some(())?;
+        Some(Self {
+            canonical_root: owner.canonical_root().to_owned(),
+            process_incarnation: owner.lock_id().to_owned(),
+            id: result.id.clone(),
+            input_digest: result.input_digest.clone(),
+            result_revision: result.result_revision,
+            config_digest: result.config_digest.clone()?,
+        })
+    }
+}
+
+/// Seed only the admission's exact boot input. Loading/blocked entries cannot
+/// report it active; every installed view must first pass startup verification.
+pub(crate) fn initialize_boot_activation(state: &AppState) {
+    let activation = state.cluster_admission.as_ref().and_then(|owner| {
+        owner
+            .serving_deployment()
+            .filter(|result| result.config_digest == state.witness.booted_serving_digest)
+            .and_then(|result| ActiveDeployment::new(owner, result))
+    });
+    state.routing.registry.initialize_deployment(activation);
+}
+
 fn active_result(
     state: &AppState,
     lookup: Option<&DeploymentLookup>,
@@ -114,22 +150,24 @@ fn active_result(
     let Some(owner) = state.cluster_admission.as_ref() else {
         return false;
     };
-    if state.operations.snapshot().closed {
+    let Some(DeploymentLookup::Complete { result }) = lookup else {
+        return false;
+    };
+    if result.result_revision != current_revision {
         return false;
     }
-    matches!(lookup, Some(DeploymentLookup::Complete { result })
-    if result.result_revision == current_revision
-        && result.activation.as_ref().is_some_and(|active|
-            active.process_incarnation == owner.lock_id()
-            && active.result_revision == current_revision)
-        && result.graphs.iter().all(|(id, outcome)| GraphId::try_from(id.as_str()).is_ok_and(|id| {
-            let current = state.routing.registry.get(&GraphKey::cluster(id));
-            if matches!(outcome, omnigraph_cluster::GraphDeploymentResult::Deleted { .. }) {
-                matches!(current, RegistryLookup::Gone)
-            } else {
-                matches!(current, RegistryLookup::Ready(_))
-            }
-        })))
+    state
+        .operations
+        .while_open(|| {
+            let snapshot = state.routing.registry.snapshot_ref();
+            let expected = ActiveDeployment::new(owner, result);
+            Ok::<_, ApiError>(expected.is_some()
+            && snapshot.deployment == expected
+            && snapshot.graphs.values().all(|entry| {
+                matches!(entry, crate::GraphEntry::Ready(view) if view.contract_is_current())
+            }))
+        })
+        .unwrap_or(false)
 }
 
 #[utoipa::path(
@@ -258,25 +296,12 @@ async fn execute(
     }
     // Validate and authorize before pausing healthy graphs. No client-supplied
     // path is opened for writes; the server's root admission is authoritative.
-    let affected =
-        omnigraph_cluster::deployment_affected_graphs(&request.deployment, &owner, &caller)
+    let preview =
+        omnigraph_cluster::prepare_deployment_preview(&request.deployment, &owner, &caller)
             .await
             .map_err(refusal)?;
-    for id in request.deployment.options().recreate_graphs.keys() {
-        let key = GraphKey::cluster(
-            GraphId::try_from(id.as_str())
-                .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        );
-        if matches!(
-            state.routing.registry.get(&key),
-            RegistryLookup::Ready(_) | RegistryLookup::Transitioning(_)
-        ) {
-            return Err(ApiError::conflict(format!(
-                "graph {id} retains a runtime owner; restart after correcting the missing root before recreation"
-            )));
-        }
-    }
-    let retained = validate_serving_candidate(&state, &request.deployment, &owner, &caller).await?;
+    let affected = preview.affected_graphs;
+    validate_serving_candidate(&state, &owner, preview.serving)?;
     let mut keys = Vec::new();
     for id in &affected {
         let key = GraphKey::cluster(
@@ -335,7 +360,6 @@ async fn execute(
             .into_iter()
             .map(|(key, engine)| (key.graph_id.to_string(), engine)),
     );
-    live.extend(retained);
     let mut effects_started = false;
     let applied = omnigraph_cluster::apply_captured_deployment(
         &request.deployment,
@@ -400,11 +424,6 @@ async fn execute(
         prepare_management_policy(server_policy).map_err(|error| uncertain(error.message))?;
     let mut handles = Vec::new();
     let mut unavailable = Vec::new();
-    let mut removals: HashSet<_> = keys
-        .iter()
-        .filter(|key| !contracts.contains_key(key.graph_id.as_str()))
-        .cloned()
-        .collect();
     for graph in graphs {
         let id = graph.graph_id.clone();
         let contract = contracts
@@ -414,7 +433,6 @@ async fn execute(
         let key = GraphKey::cluster(
             GraphId::try_from(id.as_str()).map_err(|error| uncertain(error.to_string()))?,
         );
-        removals.remove(&key);
         let uri = omnigraph::storage::normalize_root_uri(&graph.uri)
             .map_err(|error| uncertain(format!("achieved graph URI is invalid: {error}")))?;
         let prepared = match crate::prepare_single_graph(graph, Some(contract.clone())) {
@@ -479,59 +497,44 @@ async fn execute(
             }
         }
     }
-    let fully_ready = unavailable.is_empty();
+    let activation = if unavailable.is_empty() {
+        ActiveDeployment::new(&owner, result)
+    } else {
+        None
+    };
+    let deleted = result
+        .graphs
+        .iter()
+        .filter_map(|(id, result)| match result {
+            GraphDeploymentResult::Deleted { contract } => Some((id, contract.clone())),
+            _ => None,
+        })
+        .map(|(id, contract)| {
+            Ok((
+                GraphKey::cluster(
+                    GraphId::try_from(id.as_str()).map_err(|error| uncertain(error.to_string()))?,
+                ),
+                contract,
+            ))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     transition
-        .activate_deployment(handles, removals, unavailable, server_policy)
+        .activate_deployment(handles, unavailable, deleted, server_policy, activation)
         .map_err(|error| uncertain(format!("deployment applied; activation refused: {error}")))?;
-    if result.config_digest.is_none() || !fully_ready {
-        // Serving follows the exact achieved schema/query/runtime projection.
-        // Partial convergence never acknowledges the desired revision active.
-        return Ok(DeploymentResponse {
-            deployment: applied,
-            active: false,
-        });
-    }
-    let activated = omnigraph_cluster::record_deployment_activation(
-        owner.canonical_root(),
-        &request.deployment_id,
-        &owner,
-        DeploymentActivation {
-            process_incarnation: owner.lock_id().to_owned(),
-            result_revision: result.result_revision,
-            config_digest: result
-                .config_digest
-                .clone()
-                .ok_or_else(|| uncertain("applied deployment did not converge"))?,
-        },
-        &contracts,
-    )
-    .await
-    .map_err(|error| {
-        uncertain(format!(
-            "deployment activated; activation record is uncertain: {}",
-            error.message
-        ))
-    })?;
-    let deployment = DeploymentLookup::Complete { result: activated };
     Ok(DeploymentResponse {
-        active: active_result(&state, Some(&deployment), result.result_revision),
-        deployment,
+        active: active_result(&state, Some(&applied), result.result_revision),
+        deployment: applied,
     })
 }
 
 /// Resolve runtime-only settings using the same serving projection and graph
 /// preparation as startup, before accepting any deployment or graph effect.
 /// Unaffected bindings remain installed and are not reconfigured by this apply.
-async fn validate_serving_candidate(
+fn validate_serving_candidate(
     state: &AppState,
-    deployment: &CapturedDeployment,
     owner: &omnigraph_cluster::ClusterAdmission,
-    caller: &DeploymentCaller,
-) -> Result<BTreeMap<String, Arc<omnigraph::db::Omnigraph>>, ApiError> {
-    let snapshot =
-        omnigraph_cluster::preview_deployment_serving_snapshot(deployment, owner, caller)
-            .await
-            .map_err(refusal)?;
+    snapshot: omnigraph_cluster::ServingSnapshot,
+) -> Result<(), ApiError> {
     let settings = crate::settings::settings_from_snapshot(
         std::path::Path::new(owner.canonical_root()),
         None,
@@ -550,49 +553,15 @@ async fn validate_serving_candidate(
         ..
     } = settings.mode;
     prepare_management_policy(server_policy)?;
-    state
-        .routing
-        .registry
-        .validate_owner_capacity(
-            &graphs
-                .iter()
-                .map(|graph| graph.uri.clone())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| ApiError::conflict(error.to_string()))?;
-    let mut retained = BTreeMap::new();
     for graph in graphs {
-        let id = graph.graph_id.clone();
         let prepared = crate::prepare_single_graph(graph, None).map_err(|error| {
             ApiError::conflict(format!("deployment serving preparation failed: {error}"))
         })?;
-        let retired = state
-            .routing
-            .registry
-            .retained_engine(&prepared.pending.uri)
-            .map_err(|error| ApiError::conflict(error.to_string()))?;
-        if let Some(engine) = &retired {
-            let confirmation = deployment.options().adopt_graphs.get(&id).ok_or_else(|| {
-                ApiError::conflict(format!("graph {id} retains a deleted runtime owner; exact adoption or restart is required"))
-            })?;
-            let snapshot = engine
-                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-                .await
-                .map_err(|error| ApiError::from_omni(error.before_effect()))?;
-            if engine.schema_contract_digest() != confirmation.contract
-                || snapshot.graph_manifest_version() != confirmation.graph_manifest_version
-            {
-                return Err(ApiError::conflict(format!(
-                    "graph {id} retained owner does not match the adoption confirmation"
-                )));
-            }
-            retained.insert(id, Arc::clone(engine));
-        }
         let engine = match state.routing.registry.get(&prepared.pending.key) {
             RegistryLookup::Ready(view) | RegistryLookup::Transitioning(view) => {
                 Some(Arc::clone(&view.engine))
             }
-            _ => retired,
+            _ => None,
         };
         if let Some(engine) = engine {
             let policy = prepared
@@ -612,7 +581,7 @@ async fn validate_serving_candidate(
             drop(engine);
         }
     }
-    Ok(retained)
+    Ok(())
 }
 
 fn prepare_management_policy(

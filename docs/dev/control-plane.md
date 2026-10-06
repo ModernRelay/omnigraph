@@ -1,6 +1,6 @@
 # Cluster control plane
 
-The cluster control plane turns a local declarative bundle into a durable applied revision that servers can consume without the source checkout. It owns graph lifecycle, accepted schemas, stored queries, Cedar bundles, embedding-provider bindings, and external-Blob ingress policy. It does not own graph rows.
+The cluster control plane turns a local declarative bundle into a durable applied revision that servers can consume without the source checkout. It owns graph lifecycle, accepted schemas, stored queries, Cedar bundles, embedding-provider bindings, and external-Blob ingress policy. It does not execute row queries or mutations.
 
 ## Authority model
 
@@ -49,7 +49,7 @@ All stored control objects use the shared storage adapter. Filesystem replacemen
 
 The engine has no ordinary graph recovery sidecar: schema, table pins and
 lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
-graph-birth authority in one outstanding record. Legacy control evidence is
+graph-birth and graph-deletion authority in one outstanding record. Legacy control evidence is
 preserved for explicit conversion checks, never executed by a fallback sweep.
 
 ## Deployment ledger
@@ -61,20 +61,26 @@ resets graphs nor migrates their storage format. Unknown versions and
 `state.lock: false` refuse. There is no offline/online mode field and no legacy
 apply, import, refresh or approval executor.
 
+The same explicit `cluster upgrade-ledger --writers-stopped` path removes
+obsolete runtime fields from completed v2 receipts after validating their prior
+shape and consistency. It preserves ledger identity, deployment sequence, exact
+outcomes and applied resources with one conditional replacement. Normal decoding
+stays strict; outstanding work must finish under its originating build.
+
 Apply manages graphs, schemas, queries, policies and provider/Blob bindings.
 Runtime changes are validated before effects and activated with the achieved
-revision. Roots, trust and storage format stay fixed. Exact lifecycle input
-permits graph removal with retained storage, adoption, missing-root recreation
-and targeted catalog repair. Normal engine open requires v14; server HTTP
-requires v0.12.
+revision. Retained roots, trust and storage format stay fixed. Removing a graph
+from desired configuration deletes its exact managed root, including all branches,
+retained history and managed Blob bytes. It does not follow external Blob
+references or delete peer roots. Adoption, missing-root recreation and catalog
+repair refuse. Normal engine open requires v14; server HTTP requires v0.12.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
 advanced by successful schema outcomes. Serving and preparation of every affected graph compare
 this identity even after receipt eviction, rejecting a recreated graph with
-identical schema text. Unaffected graph opens are skipped. Explicit correction supplies the exact observed contract
-through `--schema-correction FILE`; it becomes immutable deployment input and
-requires schema-apply authority even when the source is unchanged.
+identical schema text. Unaffected graph opens are skipped. Ordinary apply never
+adopts foreign schema identity as an implicit correction.
 
 Config capture reads each source once, preserving exact bytes by digest.
 Immutable bundles and prepared engine intents are bounded before acceptance,
@@ -89,12 +95,27 @@ The original ID is `<ledger_ULID>:<sequence>:<nonce_ULID>`; the nonce exists
 before exposure and full ID plus input digest identifies resubmission. Acceptance
 CAS consumes the exact next sequence. One outstanding deployment records each
 graph as `NotStarted`, `Started` or `Settled`; the confirmed `Started` CAS
-precedes schema or graph-creation invocation. Recovery never replays it. It records
-`NotStarted` as not attempted, or persists an engine-issued settlement intent
-before reconciling `Started`. Strict numeric publication at the prepared base
+precedes schema, graph-creation or graph-deletion invocation. Schema and birth
+recovery never replay the original invocation. They record `NotStarted` as not
+attempted, or persist an engine-issued settlement intent before reconciling
+`Started`. Strict numeric publication at the prepared base
 plus one permits a neutral lineage fence or a qualified occupied-version proof
 to establish nonpublication. Missing evidence remains unknown. Such proof
 does not authorize adopting a foreign schema into the applied projection.
+
+Deletion is recorded in that same outstanding record with its exact canonical
+root and applied schema contract. `Started` is durable before any file removal.
+Every deletion caller, including a direct storage owner, must satisfy an
+installed graph policy's `read` and `schema_apply` gates before effects or recovery.
+Accepted deletion cannot settle as refused or not attempted. An error leaves
+it outstanding; reconciliation resumes only that root under exclusive admission,
+including after its manifest is gone. Fresh deletion accepts an already-absent
+root; a present root must match the applied contract. Recovery refuses a readable
+foreign contract, while a partial root remains bound to its original intent.
+Completion requires verified root absence before a `Deleted` outcome removes
+the graph's applied resources and contract. A lost completion acknowledgement is
+reconciled by original ID. No deletion queue, side record or retained-owner pool
+is introduced, and matching source text never authorizes a replacement root.
 
 A graph-birth token binds canonical root, exact source/IR contract and genesis
 identity. Reconciliation accepts only that birth, not matching text. Under
@@ -167,7 +188,7 @@ I/O settlement. Azure writers also acquire the external admission lease through
 --cluster <config-directory | file://root | s3://root | az://root>
 ```
 
-A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions use deployment.
+A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions and destructive removals use deployment.
 
 Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. No attempt timeout, startup retry, reopen or native-settlement proof is introduced.
 
@@ -180,7 +201,10 @@ disconnect; no polling worker or second storage-writing CLI is involved.
 The controller projects captured input through the existing serving validator,
 resolves required provider secrets and validates new graph bindings before any
 deployment effect. It reserves one batch transition, atomically closes affected graph
-admission and drains request descendants. Existing engine handles remain owned.
+admission and drains request descendants, including held response bytes. Existing
+engine handles remain owned through execution. A removal cannot delete storage
+before this boundary; a pre-effect refusal can resume the unchanged predecessor
+under a fresh epoch only when the existing abort proof permits it.
 It executes under the server's lifetime admission, loads the achieved bindings,
 and atomically installs exact contracts, query registries, immutable engine
 runtime bindings, management policy and graph inventory. Rebound engine views
@@ -188,12 +212,22 @@ share the coordinator, write queues, schema and Lance sessions without reopening
 storage. Unchanged siblings continue serving. Pre-effect refusals restore predecessor
 views with new epochs. Uncertain effects use existing process containment.
 
-After installation, the ledger records the result revision/config digest and
-server admission incarnation. `GET /cluster/deployments/{id}` reports active
-only for the current achieved revision, matching process and ready affected
-views. Old-ID submission validates immutable input and returns the original
-record before graph closure; it cannot reinstall an old view. Boot digests
-remain boot facts. Explicit OIDC public-admission refresh is separate below.
+Activation identity is installed in the same immutable registry snapshot as
+serving bindings: canonical root, process incarnation, original ID/input digest,
+achieved revision and config digest. The durable achieved receipt stays unchanged;
+there is no second ledger write after activation. `GET /cluster/deployments/{id}`
+reports active only for that exact current identity while every graph is ready
+under its installed schema contract and process admission remains open. Row
+commits do not invalidate unchanged deployment bindings. Partial convergence,
+blocked/loading/transitioning entries and shutdown report inactive.
+
+A normal configured boot captures the latest matching converged receipt under
+root admission and establishes fresh runtime evidence only as its verified graph
+opens complete. Generic embedding constructors do not attest deployment bindings.
+Missing or expired receipt identity is not inferred from schema text or boot
+revision alone. Old-ID submission validates immutable input and returns the
+original record before graph closure; it cannot reinstall an old view. Boot
+digests remain boot facts. Explicit OIDC public-admission refresh is separate below.
 
 Protected graph and registry HTTP calls require the v0.12 contract header after
 authentication and before graph resolution. CLI discovery and response validation
@@ -208,17 +242,10 @@ uses immutable public trust loaded before graph open. The Core's opt-in
 root-bound serving snapshot supplies the canonical storage root from the same
 resolution as the applied revision; the server checks that root against trust
 without reading a managed identity marker. The verifier resolves
-`principal:<sub>` and retains a private, verified credential profile:
-
-- Version 1 keeps its existing per-graph action ceilings. Graph selection
-  checks the ceiling before registry lookup; the common authorization gate
-  checks actions before Cedar.
-- Version 2 authenticates a cluster-bound identity and rejects permission
-  fields. The same common gate requires applied Cedar policy for protected
-  operations, with no token-derived graph/action ceiling.
-
-Cedar must explicitly permit either signed profile even when no static
-credentials exist. Static credential authority remains unchanged. Issuer
+`principal:<sub>` and retains a private, verified version-2 identity. Permission
+fields and unsupported token versions are refused. The common authorization
+gate requires applied Cedar policy for protected operations, with no token-derived
+graph/action ceiling. Static credential authority remains unchanged. Issuer
 reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
@@ -228,22 +255,18 @@ IDs and display names for the loading, ready and blocked graph inventory capture
 at boot. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
 `GET /graphs` uses the same registry with a `graph_list` gate and returns one
-list containing runtime availability, sanitized failure and action. Version 1
-filtering remains an additional restriction. Neither inventory synthesizes graph
+list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
 entries from the boot witness. Discovery still discloses no availability.
 
-HTTP and MCP graph resolution apply credential graph scope before lookup and
-atomically capture a serving view with its graph-epoch lease. A loading, blocked or
+HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
 transitioning graph yields 503 only after graph `read` authorization on `main` or
 management `graph_list` authorization; otherwise it remains undisclosed as 404.
 An invalid graph policy or configuration cannot authorize the graph-read fallback.
 Availability booleans describe the runtime, not a policy grant; route
 authorization still applies to ready graphs.
 
-The CLI's versioned keychain cache records the issuance profile and verifies
-its endpoint and identity bindings before replacement. A legacy issuance
-request cannot return an identity profile, and restricted caches are never
-silently upgraded. The provider-native client acquires missing/expired identity
+The CLI's versioned keychain cache verifies endpoint and identity bindings before
+replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation and selects discovery in a managed folder.
 Explicit server addressing keeps the
 existing catalog unless `graphs list --discovery` is requested; the CLI never
@@ -319,14 +342,13 @@ The embedding entry point is `AppState::prepare_same_view`. It binds the actual
 process runtime; callers cannot substitute a new runtime to bypass stopping.
 It grants no schema/query replacement or deployment authority. The internal
 batch capability used by `deployment.rs` validates exact achieved schema/query
-bindings and explicit graph lifecycle under the same shutdown/attempt fence.
-Logical deletion retains the engine owner by canonical storage identity;
-readoption reuses that owner and validates its exact confirmation. At most 2,048
-active plus retained roots are admitted per process. Retained owners are never
-evicted without settlement; restart clears them. Recreating a graph with a
-retained owner is a pre-effect refusal. Blocked startup entries with no engine
-can receive a newly created graph. There is no public arbitrary-view replacement
-endpoint.
+bindings, graph additions and completed graph deletions under the same
+shutdown/attempt fence. Inventory removal requires an exact durable `Deleted`
+result for a graph closed by this transition; it is installed atomically with
+surviving bindings and management policy. There is no retired-owner cache,
+readoption path, root-recreation shortcut or public arbitrary-view replacement
+endpoint. Interrupted deletion keeps affected admissions closed; it never
+restores a partially deleted predecessor.
 
 These registrations account for server lifetimes, not universal storage-I/O
 settlement. A joined future or zero operation counter cannot authorize runtime
@@ -364,13 +386,12 @@ The binary's `--data-token-trust FILE` selects this managed path.
 
 `ResolvedActor` is a public identity projection, not proof of authentication.
 Middleware and protected handlers retain `AuthenticatedActor`, whose private
-state carries verified claims and graph selection. `DataTokenTrust::verify_at`
+state carries verified claims. `DataTokenTrust::verify_at`
 returns the identity projection for existing callers;
 `verify_authenticated_at` returns the opaque authenticated result used by the
 server. Public actor construction cannot grant signed-token permissions.
-`DataTokenClaims` and `DataGrant` keep their version-1 shapes;
-`IdentityTokenClaims` is a separate strict type. Read-only claim accessors on
-`AuthenticatedActor` expose only the matching verified profile.
+`IdentityTokenClaims` is the strict signed identity type; its read-only accessor
+on `AuthenticatedActor` exposes only verified claims.
 
 Policy embedders must handle `PolicyAction::ConfigManage`,
 `PolicyResourceKind::Cluster`, and `PolicyEngineKind::Cluster`. These public

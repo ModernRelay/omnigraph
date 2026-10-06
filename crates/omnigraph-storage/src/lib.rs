@@ -1127,7 +1127,8 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// when nothing exists there (idempotent). Local: `remove_dir_all`
     /// (directories are a local-FS concept; list+delete would leave empty
     /// directory skeletons that local existence probes report as present);
-    /// object stores: list + delete (NOT atomic — callers must tolerate
+    /// object stores: stream descendants + delete the exact root marker
+    /// (NOT atomic — callers must tolerate
     /// partial prefixes on crash, which the cluster delete protocol does by
     /// retry).
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()>;
@@ -2176,22 +2177,25 @@ impl StorageAdapter for ObjectStorageAdapter {
         }
         let prefix = self.object_path(prefix_uri.trim_end_matches('/'))?;
         let mut entries = self.store.list(Some(&prefix));
-        let mut locations = Vec::new();
+        // Consume the backend's paginated stream without retaining the full
+        // graph inventory. The caller keeps writers excluded throughout purge.
         while let Some(meta) = entries
             .try_next()
             .await
             .map_err(|err| storage_backend_error("delete_prefix", prefix_uri, err))?
         {
-            locations.push(meta.location);
-        }
-        for location in locations {
-            match self.store.delete(&location).await {
+            match self.store.delete(&meta.location).await {
                 Ok(()) => {}
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(err) => return Err(storage_backend_error("delete_prefix", prefix_uri, err)),
             }
         }
-        Ok(())
+        // ObjectStore::list is segment-scoped and excludes an exact prefix
+        // object on some backends. Such a marker belongs to this root too.
+        match self.store.delete(&prefix).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(storage_backend_error("delete_prefix", prefix_uri, err)),
+        }
     }
 }
 
@@ -3881,6 +3885,9 @@ mod tests {
         adapter.delete(&claim).await.unwrap();
         assert!(!adapter.exists(&claim).await.unwrap());
 
+        let sibling = format!("{root}/contract-peer/keep.json");
+        adapter.write_text(&sibling, "peer").await.unwrap();
+
         // delete_prefix: recursive + idempotent; nothing under the prefix
         // (including local directory skeletons) survives.
         adapter
@@ -3889,8 +3896,13 @@ mod tests {
             .unwrap();
         assert!(!adapter.exists(&a).await.unwrap());
         assert!(!adapter.exists(&format!("{root}/contract")).await.unwrap());
+        assert_eq!(adapter.read_text(&sibling).await.unwrap(), "peer");
         adapter
             .delete_prefix(&format!("{root}/contract"))
+            .await
+            .unwrap();
+        adapter
+            .delete_prefix(&format!("{root}/contract-peer"))
             .await
             .unwrap();
     }
@@ -3908,6 +3920,27 @@ mod tests {
         // strong-CAS path (ETag tokens + PutMode::Update) without a bucket.
         let adapter = ObjectStorageAdapter::in_memory();
         contract_suite(&adapter, "mem-root").await;
+        // Object stores permit an exact root marker alongside descendants.
+        // A purge must remove both, without matching a sibling name.
+        adapter
+            .write_text("mem-root/graph", "marker")
+            .await
+            .unwrap();
+        adapter
+            .write_text("mem-root/graph/nested/data", "data")
+            .await
+            .unwrap();
+        adapter
+            .write_text("mem-root/graph-peer/data", "peer")
+            .await
+            .unwrap();
+        adapter.delete_prefix("mem-root/graph").await.unwrap();
+        assert!(!adapter.exists("mem-root/graph").await.unwrap());
+        assert_eq!(
+            adapter.read_text("mem-root/graph-peer/data").await.unwrap(),
+            "peer"
+        );
+        adapter.delete_prefix("mem-root/graph").await.unwrap();
     }
 
     #[tokio::test]

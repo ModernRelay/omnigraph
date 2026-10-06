@@ -118,8 +118,9 @@ between graph roots.
 ## Cluster failures
 
 - Run `cluster validate` before `plan` or `apply`.
-- Graph removal, adoption and missing-root recreation require exact confirmations
-  through `--lifecycle FILE`; see [lifecycle and repair](../clusters/index.md#explicit-lifecycle-and-repair).
+- Apply refuses existing unmanaged roots and missing managed graphs that remain
+  declared. Restore authoritative data to keep a missing graph, or remove its
+  declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
 - A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
   of other admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
@@ -171,8 +172,7 @@ condition is per table.
 - Queries, mutations, loads, merges, index builds, schema apply, optimize
   and cleanup are unaffected: none of them resolves the linear HEAD.
 - `repair` prints the last linear version, the HEAD and the count of foreign
-  versions, takes no action and exits 0. `--confirm` and `--force --confirm`
-  never adopt the foreign commit.
+  versions, takes no action and exits 0. The removed confirmation flags are rejected; repair never adopts the foreign commit.
 - `cleanup` never deletes a foreign version or its files; the table's result
   row lists them under `foreign_versions`.
 
