@@ -15,6 +15,7 @@
   <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
   <a href="docs/user/cli/reference.md">CLI</a>
+  <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
 <p align="center">
@@ -24,9 +25,11 @@
 
 <hr>
 
-Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. A shared durable state allows agents and UI to become thin stateless consumers.
+Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of a durable state.
 
-**Multi-Modal retrieval**: agent retrieve high precision/recall context by combining vector/fts search, graph traversal and filtering <br>
+## Key Capabilties
+
+**Multi-Modal retrieval**: agents retrieve high precision/recall context by combining vector/fts search, graph traversal and filtering <br>
 **Branching**: agents propose reviewable changes rather than writing directly. <br>
 **Typed ontology**: agents have a shared enforceable model of the domain.<br>
 **Object-storage**: scales at the lowest cost.
@@ -47,13 +50,12 @@ to ask questions, share feedback, and follow development.
 | **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
 
 
-## Key capabilities
+## All features
 
 | Capability | What it gives you |
 |---|---|
-| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies; `cluster apply` converges it and `omnigraph-server` brings every graph online at `/graphs/{id}/…`. |
-| **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
-| **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
+| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies|
+| **Multimodal query engine** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
 | **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
 | **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
