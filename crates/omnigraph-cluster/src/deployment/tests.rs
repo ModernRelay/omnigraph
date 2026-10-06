@@ -309,6 +309,145 @@ fn identity(actor: &str) -> DeploymentCaller {
 }
 
 #[tokio::test]
+async fn configuration_metadata_does_not_require_unrelated_graph_read() {
+    let dir = crate::tests::identity_fixture();
+    let root = dir.path().to_str().unwrap();
+    add_second_graph(dir.path());
+    let config_path = dir.path().join(CLUSTER_CONFIG_FILE);
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("applies_to: [knowledge, second]", "applies_to: [knowledge]");
+    fs::write(config_path, config).unwrap();
+    let first = bootstrap(dir.path()).await;
+    unlock(root).await;
+    let before = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let mut versions = BTreeMap::new();
+    for graph in ["knowledge", "second"] {
+        let db = Omnigraph::open_read_only(
+            dir.path()
+                .join(format!("graphs/{graph}.omni"))
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        versions.insert(
+            graph,
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .graph_manifest_version(),
+        );
+    }
+    // Status and exact receipt lookup disclose control metadata, not rows.
+    let status = deployment_status(root, Some(&first.id), &identity("principal:owner"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        status.lookup,
+        Some(DeploymentLookup::Complete { .. })
+    ));
+    assert!(status.lock_id.is_none());
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    let error = deployment_status(root, None, &identity("principal:reader"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "policy_denied");
+    // Removing the inventory-wide Read requirement does not grant data access.
+    let store = ClusterStore::for_storage_root(root).unwrap();
+    let state: ClusterState = serde_json::from_slice(&before).unwrap();
+    let policies = crate::authorization::AppliedPolicies::load(&store, &state)
+        .await
+        .unwrap();
+    let error = policies
+        .check_graph(
+            "principal:owner",
+            "second",
+            omnigraph_policy::PolicyAction::Read,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "graph_policy_required");
+    // A schema effect on the unbound sibling still refuses before publication,
+    // even though this caller may configure the cluster and change knowledge.
+    fs::write(
+        dir.path().join("people.pg"),
+        crate::tests::SCHEMA.replace("age: I32?", "age: I32?\n  email: String?"),
+    )
+    .unwrap();
+    let error = apply_deployment(
+        dir.path(),
+        None,
+        &identity("principal:owner"),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "graph_policy_required");
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        before
+    );
+    assert!(
+        deployment_status(root, None, &owner())
+            .await
+            .unwrap()
+            .lock_id
+            .is_none()
+    );
+    fs::write(dir.path().join("people.pg"), crate::tests::SCHEMA).unwrap();
+    let result = apply_deployment(
+        dir.path(),
+        None,
+        &identity("principal:collaborator"),
+        &BTreeMap::new(),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    let DeploymentLookup::Complete { result } = result else {
+        panic!("{result:?}");
+    };
+    assert!(result.converged);
+    assert!(result.graphs.is_empty());
+    let after_noop = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let repeated = apply_deployment(
+        dir.path(),
+        Some(&result.id),
+        &identity("principal:collaborator"),
+        &BTreeMap::new(),
+        |_, _, _| panic!("Recorded invocation must not execute again"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(repeated, DeploymentLookup::Complete { .. }));
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        after_noop
+    );
+    for (graph, version) in versions {
+        let db = Omnigraph::open_read_only(
+            dir.path()
+                .join(format!("graphs/{graph}.omni"))
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .graph_manifest_version(),
+            version,
+        );
+    }
+}
+
+#[tokio::test]
 async fn authenticated_deployment_checks_current_policy_before_every_effect() {
     let dir = crate::tests::identity_fixture();
     let root = dir.path().to_str().unwrap();

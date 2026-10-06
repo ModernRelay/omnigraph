@@ -29,7 +29,6 @@ async fn policies(
     store: &ClusterStore,
     state: &ClusterState,
     caller: &DeploymentCaller,
-    manage: bool,
 ) -> Result<AppliedPolicies, Diagnostic> {
     caller.authority()?;
     let policies = match caller {
@@ -38,14 +37,10 @@ async fn policies(
         }
         DeploymentCaller::AuthenticatedIdentity(identity) => {
             let policies = AppliedPolicies::load(store, state).await?;
-            if manage {
-                policies.check_cluster(identity.actor())?;
-            }
-            for address in state.applied_revision.resources.keys() {
-                if let ResourceKind::Graph(graph) = resource_kind(address) {
-                    policies.check_graph(identity.actor(), &graph, PolicyAction::Read)?;
-                }
-            }
+            // ConfigManage covers ledger and receipt metadata, not graph data.
+            // Schema effects still enforce graph SchemaApply during preflight
+            // and recovery; ordinary graph reads retain their own policy gate.
+            policies.check_cluster(identity.actor())?;
             policies
         }
     };
@@ -125,7 +120,7 @@ async fn deployment_policies(
             return AppliedPolicies::load_optional(store, state).await;
         }
     }
-    policies(store, state, caller, true).await
+    policies(store, state, caller).await
 }
 
 // Before first convergence there is no applied management policy. Only the
@@ -160,7 +155,7 @@ async fn lookup_policies(
             return AppliedPolicies::load_optional(store, state).await;
         }
     }
-    policies(store, state, caller, true).await
+    policies(store, state, caller).await
 }
 
 fn graph_ids(state: &ClusterState) -> Vec<String> {
@@ -322,7 +317,7 @@ pub async fn upgrade_deployment_ledger(
     }
     // Refuse unauthorized conversion before acquiring durable admission; a
     // denied caller must not strand a lock. Recheck current policy under it.
-    policies(&store, &before, caller, true).await?;
+    policies(&store, &before, caller).await?;
     let mut observations = store.observations();
     let mut guard = store
         .acquire_lock("upgrade_ledger", &mut observations)
@@ -339,7 +334,7 @@ pub async fn upgrade_deployment_ledger(
                 "ledger changed during conversion; inspect original root",
             ));
         }
-        policies(&store, &state, caller, true).await?;
+        policies(&store, &state, caller).await?;
         authorization::refuse_pending_recovery(&store).await?;
         serve::read_snapshot_for_ledger_upgrade(&store)
             .await
@@ -1224,7 +1219,7 @@ pub async fn deployment_affected_graphs(
     let store = ClusterStore::for_storage_root(admission.canonical_root())?;
     let (state, _) = read_existing(&store).await?;
     require_v2(&state)?;
-    policies(&store, &state, caller, true).await?;
+    policies(&store, &state, caller).await?;
     if state.outstanding.is_some() {
         return Err(refusal(
             "cluster_deployment_outstanding",

@@ -114,7 +114,10 @@ nonce is unknown. Applied result revision is distinct from server activation.
 
 `DeploymentCaller` preserves the storage-owner trust boundary and an optional
 actor label. Authenticated identity callers recheck current cluster
-`ConfigManage`, graph `Read`, and `SchemaApply` for schema effects/recovery.
+`ConfigManage` for ledger/receipt metadata and graph `SchemaApply` for schema
+effects/recovery. Unrelated graph `Read` is not required to inspect deployment
+metadata or converge an unchanged declaration; graph-data reads retain their
+separate installed-policy checks.
 Original authority stays immutable; recovery records the current executor while
 preserving the authored engine receipt. The accepted
 [server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md)

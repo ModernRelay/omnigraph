@@ -41,8 +41,10 @@ of the deployment ledger version. The [configuration reference](config.md)
 covers storage roots, embedding providers, external Blob policy and limits.
 
 For server-owned deployment, the applied policy must grant the operator
-`config_manage` at cluster scope, `read` on disclosed graphs, and `schema_apply`
-on graphs whose schema changes. New graphs need suitable declared policies too.
+`config_manage` at cluster scope and `schema_apply` on graphs whose schema
+changes. Deployment status, receipts, and unchanged declarations do not require
+`read` on unrelated graphs. Reading graph data still requires that graph's
+applied read permission. New graphs need suitable declared policies too.
 The server derives the actor from its bearer token; `--as` is for direct access.
 
 ## Bootstrap a cluster
