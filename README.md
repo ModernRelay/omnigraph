@@ -32,9 +32,20 @@ Omnigraph is engineered for the new workload introduced by long-horizon agents: 
 **Object-storage**: scales at the lowest cost.
 
 
-
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
+
+
+## What you can build
+
+| Use case | What it's for |
+|---|---|
+| **Company brain** | Org knowledge unified into one graph every agent can query |
+| **Agentic memory** | Durable, versioned memory: a branch per agent or per task, merged on review |
+| **Context graph** | Decision traces and codified tribal knowledge for retrieval |
+| **Dev graph** | Issues & dependency model that coding agents read and write |
+| **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
+
 
 ## Key capabilities
 
@@ -46,16 +57,6 @@ to ask questions, share feedback, and follow development.
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
 | **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
 | **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
-
-## What you can build
-
-| Use case | What it's for |
-|---|---|
-| **Company brain** | Org knowledge unified into one graph every agent can query |
-| **Agentic memory** | Durable, versioned memory: a branch per agent or per task, merged on review |
-| **Context graph** | Decision traces and codified tribal knowledge for retrieval |
-| **Dev graph** | Issues & dependency model that coding agents read and write |
-| **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
 
 ## Install
 
