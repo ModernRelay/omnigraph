@@ -26,7 +26,7 @@
 
 Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. 
 
-**Multi-Modal retrieval**: because assembling context for agents requires fusing vector/fts search, graph traversal and filtering <br>
+**Multi-Modal retrieval**: agent retrieve high precision/recall context by combining vector/fts search, graph traversal and filtering <br>
 **Branching**: agents propose reviewable changes rather than writing directly. <br>
 **Typed ontology**: agents have a shared enforceable model of the domain.<br>
 **Object-storage**: scales at the lowest cost.
