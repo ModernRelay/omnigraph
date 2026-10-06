@@ -125,7 +125,11 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge.
+timeout without replaying a committed merge. Its deployment matrix holds a real
+admitted request through drain, disconnects or times out the caller before
+durable acceptance, and loses replies after acceptance. Exact-ID observation
+must finish with one ledger result, one schema publication and the same server
+PID; neither apply nor recovery polling may resubmit.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
@@ -139,10 +143,17 @@ availability. The same owners cover coherent schema/query batch activation; thes
 are not generic native settlement. Server `boot_settings` exercises authenticated
 submission, parked requests, caller disconnect, pre-effect refusal, durable
 acceptance before completion, activation-in-progress observation and exact receipt
-access after management handoff. CLI `cli_cluster` owns submit-once polling,
-lost-response observation, terminal outcomes and caller timeout without replay.
+access after management handoff. It also holds a merge across served schema
+planning to prove preview does not wait for the graph gate. In-source
+`deployment` tests suspend observer read futures across owner start, finish and complete
+turnover, exercising bounded re-observation for aggregate and exact status.
+CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
+retries, malformed-receipt refusal, terminal outcomes and caller timeout without
+replay. Its managed fixtures cover status/history scope and filters, while
+direct apply must ignore both valid and malformed managed folder context.
 CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement, graph addition, policy grant/revocation and management handoff.
+replacement, graph addition, policy grant/revocation and management handoff;
+the original submitter retains only its exact receipt access after restart.
 Extend that same journey for graph deletion, proving target storage/history
 removal, peer preservation and unchanged PID/listener, including a served deletion
 preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks

@@ -460,7 +460,7 @@ async fn wait_run(
         let next = Instant::now() + POLL_INTERVAL;
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
-            eprintln!("wait deadline reached; run {id} continues; inspect `cluster status {id}`");
+            eprintln!("wait deadline reached; run {id} continues; inspect `managed status {id}`");
             return Ok((body, 5));
         }
         tokio::time::sleep_until(next).await;

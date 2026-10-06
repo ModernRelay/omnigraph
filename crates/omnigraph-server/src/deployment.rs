@@ -3,6 +3,7 @@
 //! only request lifetime, graph admission and activation of serving bindings.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::{Arc, Mutex as SyncMutex, PoisonError};
 
 use axum::{
@@ -48,6 +49,27 @@ impl DeploymentRuntime {
                 .as_ref()
                 .is_some_and(|current| id.is_none_or(|id| id == current)),
         )
+    }
+
+    async fn observe<T, F>(
+        &self,
+        id: Option<&str>,
+        mut read: impl FnMut() -> F,
+    ) -> Result<(T, bool), ApiError>
+    where
+        F: Future<Output = Result<T, ApiError>>,
+    {
+        for _ in 0..3 {
+            let (generation, _) = self.observation(id);
+            let observed = read().await?;
+            let (observed_generation, in_progress) = self.observation(id);
+            if generation == observed_generation {
+                return Ok((observed, in_progress));
+            }
+            // An owner starting or finishing during the read can make an old
+            // ledger snapshot appear ownerless. Retry this read, never apply.
+        }
+        Err(observation_changed())
     }
 
     // The deployment gate is already held; this is a derived process observation,
@@ -289,25 +311,19 @@ pub(crate) async fn lookup(
 ) -> Result<Json<DeploymentResponse>, ApiError> {
     let owner = admission(&state)?;
     let identity = IdentityAuthorization::authenticated(actor.actor_id_str()).map_err(refusal)?;
-    for _ in 0..3 {
-        let (generation, _) = state.deployments.observation(Some(&id));
-        let (deployment, revision) =
+    let ((deployment, revision), in_progress) = state
+        .deployments
+        .observe(Some(&id), || async {
             omnigraph_cluster::deployment_receipt(owner.canonical_root(), &id, &identity)
                 .await
-                .map_err(refusal)?;
-        let (observed_generation, in_progress) = state.deployments.observation(Some(&id));
-        if generation != observed_generation {
-            // An owner starting or finishing during the read can make an old
-            // ledger snapshot appear ownerless. Retry this read, never apply.
-            continue;
-        }
-        return Ok(Json(DeploymentResponse {
-            active: active_result(&state, Some(&deployment), revision),
-            deployment,
-            in_progress,
-        }));
-    }
-    Err(observation_changed())
+                .map_err(refusal)
+        })
+        .await?;
+    Ok(Json(DeploymentResponse {
+        active: active_result(&state, Some(&deployment), revision),
+        deployment,
+        in_progress,
+    }))
 }
 
 async fn lookup_status(
@@ -317,23 +333,20 @@ async fn lookup_status(
 ) -> Result<DeploymentStatusResponse, ApiError> {
     let caller = caller(state, actor)?;
     let owner = admission(state)?;
-    for _ in 0..3 {
-        let (generation, _) = state.deployments.observation(id);
-        let status = omnigraph_cluster::deployment_status(owner.canonical_root(), id, &caller)
-            .await
-            .map_err(refusal)?;
-        let (observed_generation, in_progress) = state.deployments.observation(id);
-        if generation != observed_generation {
-            continue;
-        }
-        let active = active_result(state, status.lookup.as_ref(), status.result_revision);
-        return Ok(DeploymentStatusResponse {
-            status,
-            active,
-            in_progress,
-        });
-    }
-    Err(observation_changed())
+    let (status, in_progress) = state
+        .deployments
+        .observe(id, || async {
+            omnigraph_cluster::deployment_status(owner.canonical_root(), id, &caller)
+                .await
+                .map_err(refusal)
+        })
+        .await?;
+    let active = active_result(state, status.lookup.as_ref(), status.result_revision);
+    Ok(DeploymentStatusResponse {
+        status,
+        active,
+        in_progress,
+    })
 }
 
 #[utoipa::path(
@@ -802,5 +815,128 @@ fn abort_before_effects(
         Err(error) => uncertain(format!(
             "pre-effect refusal could not restore coherent serving: {error}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    // The same observer serves aggregate status and exact receipts. Suspend its
+    // read after capturing old ledger data, then cross real owner boundaries.
+    #[tokio::test]
+    async fn deployment_observation_rechecks_owner_start_finish_and_complete_turnover() {
+        for change in ["start", "finish", "start_and_finish"] {
+            for exact in [false, true] {
+                let runtime = Arc::new(DeploymentRuntime::default());
+                let _gate = runtime.gate.clone().try_lock_owned().unwrap();
+                let mut owner = (change == "finish").then(|| runtime.own("original".into()));
+                let (reading, read_started) = oneshot::channel();
+                let (release, released) = oneshot::channel();
+                let mut pause = Some((reading, released));
+                let mut reads = 0;
+                let stale = if change == "finish" {
+                    "outstanding"
+                } else {
+                    "not_recorded"
+                };
+                let fresh = if change == "start" {
+                    "outstanding"
+                } else {
+                    "complete"
+                };
+                let observe = runtime.observe(exact.then_some("original"), || {
+                    reads += 1;
+                    let pause = pause.take();
+                    let captured = if pause.is_some() { stale } else { fresh };
+                    async move {
+                        if let Some((reading, released)) = pause {
+                            reading.send(()).unwrap();
+                            released.await.unwrap();
+                        }
+                        Ok(captured)
+                    }
+                });
+                let transition = async {
+                    read_started.await.unwrap();
+                    match change {
+                        "start" => owner = Some(runtime.own("original".into())),
+                        "finish" => drop(owner.take()),
+                        "start_and_finish" => drop(runtime.own("original".into())),
+                        _ => unreachable!(),
+                    }
+                    release.send(()).unwrap();
+                };
+                let (observed, ()) = tokio::join!(observe, transition);
+                let (observed, in_progress) = observed.unwrap();
+                assert_eq!(reads, 2, "{change}, exact={exact}");
+                assert_eq!(observed, fresh, "a stale ledger read must never escape");
+                assert_eq!(in_progress, change == "start");
+                if change == "start" {
+                    for (scope, expected) in [
+                        (None, true),
+                        (Some("original"), true),
+                        (Some("other"), false),
+                    ] {
+                        let (receipt, in_progress) = runtime
+                            .observe(scope, || std::future::ready(Ok("retained receipt")))
+                            .await
+                            .unwrap();
+                        assert_eq!(receipt, "retained receipt");
+                        assert_eq!(in_progress, expected, "scope={scope:?}");
+                    }
+                }
+                drop(owner);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_observation_refuses_after_three_owner_changes_without_terminal_receipt() {
+        for id in [None, Some("original")] {
+            let runtime = Arc::new(DeploymentRuntime::default());
+            let _gate = runtime.gate.clone().try_lock_owned().unwrap();
+            let mut reads = 0;
+            let result = runtime
+                .observe(id, || {
+                    reads += 1;
+                    drop(runtime.own("original".into()));
+                    std::future::ready(Ok("stale terminal receipt"))
+                })
+                .await;
+            let error = result.expect_err("churn must not produce a terminal observation");
+            assert_eq!(reads, 3, "no fourth storage read is permitted");
+            assert!(
+                !error.completion_uncertain,
+                "a refused read cannot poison write admission"
+            );
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("repeat this status request")
+            );
+            assert!(body.get("deployment").is_none());
+            assert!(body.get("active").is_none());
+            assert!(body.get("in_progress").is_none());
+
+            let mut reads = 0;
+            let stable = runtime
+                .observe(id, || {
+                    reads += 1;
+                    std::future::ready(Ok("fresh receipt"))
+                })
+                .await
+                .unwrap();
+            assert_eq!(stable, ("fresh receipt", false));
+            assert_eq!(reads, 1, "a later stable observation remains usable");
+        }
     }
 }

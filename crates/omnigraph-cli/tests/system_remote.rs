@@ -648,7 +648,7 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
                 );
             }
 
-            let captured = proxy.forwarded_merges();
+            let captured = proxy.forwarded_responses();
             assert_eq!(
                 captured.len(),
                 1,
@@ -719,6 +719,280 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
                         "branches/merge"
                     }
                 )
+            );
+        }
+    }
+}
+
+#[test]
+fn remote_deployment_delivery_loss_preserves_owned_completion() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpStream};
+    use std::time::{Duration, Instant};
+    use support::managed_http::{DeploymentDeliveryFault, IntentApiFixture};
+
+    const TOKEN: &str = "deployment-wire-token";
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    for (file, actions) in [
+        ("operator", "config_manage"),
+        ("graph", "schema_apply, read, change, invoke_query"),
+    ] {
+        fs::write(cluster.path().join(format!("{file}.policy.yaml")), format!(
+            "version: 1\ngroups:\n  operators: [act-cluster-test]\nrules:\n  - id: operator\n    allow:\n      actors: {{ group: operators }}\n      actions: [{actions}]\n"
+        )).unwrap();
+    }
+    let config_path = cluster.path().join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, format!("{config}policies:\n  operator:\n    file: ./operator.policy.yaml\n    applies_to: [cluster]\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [{GRAPH_ID}]\n")).unwrap();
+    apply_cluster_fixture(cluster.path());
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-cluster-test":"deployment-wire-token"}"#,
+        )],
+    );
+    let pid = server.id();
+    let client = graph_http_client();
+    let get = |path: &str| {
+        client
+            .get(format!("{}{path}", server.base_url))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+
+    for (index, (fault, before_acceptance, times_out)) in [
+        (DeploymentDeliveryFault::PassThrough, true, true),
+        (
+            DeploymentDeliveryFault::DisconnectBeforeAcceptance,
+            true,
+            false,
+        ),
+        (DeploymentDeliveryFault::WaitAfterAcceptance, false, true),
+        (
+            DeploymentDeliveryFault::DisconnectAfterAcceptance,
+            false,
+            false,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before: omnigraph_cluster::DeploymentStatus =
+            serde_json::from_value(get("/cluster/deployments")["status"].clone()).unwrap();
+        let id = before.next_deployment_id();
+        let receipt_path = format!("/cluster/deployments/{id}");
+        let commits_path = format!("/graphs/{GRAPH_ID}/commits?branch=main");
+        let before_commits = get(&commits_path);
+        let schema_path = cluster.path().join("graph.pg");
+        let property = format!("wire_{index}");
+        let schema = fs::read_to_string(&schema_path).unwrap().replace(
+            "node Person {",
+            &format!("node Person {{\n    {property}: String?"),
+        );
+        fs::write(&schema_path, &schema).unwrap();
+
+        // A real admitted request holds the graph during drain. Hyper sends
+        // 100 Continue only when admission starts polling this incomplete body;
+        // no sleep or production test hook decides when deployment may proceed.
+        let held = before_acceptance.then(|| {
+            let url = url::Url::parse(&server.base_url).unwrap();
+            let mut socket = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap())).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            write!(socket, "POST /graphs/{GRAPH_ID}/query HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", &url[url::Position::BeforeHost..url::Position::AfterPort], omnigraph_api_types::HTTP_API_CONTRACT_HEADER, omnigraph_api_types::HTTP_API_CONTRACT).unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "HTTP/1.1 100 Continue\r\n", "{fault:?}: {line}");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "\r\n");
+            socket
+        });
+        let proxy = IntentApiFixture::graph_deployment_proxy(&server.base_url, fault);
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+            .args(["cluster", "apply", "--config"])
+            .arg(cluster.path())
+            .args([
+                "--server",
+                &proxy.origin,
+                "--deployment-id",
+                &id,
+                "--timeout",
+                if times_out { "3" } else { "15" },
+                "--json",
+            ])
+            .timeout(Duration::from_secs(20));
+        let output = std::thread::scope(|scope| {
+            let caller = scope.spawn(move || command.output().unwrap());
+            if before_acceptance {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let observation = get(&receipt_path);
+                    if observation["in_progress"] == true {
+                        assert_eq!(
+                            observation["deployment"]["status"], "not_recorded",
+                            "{fault:?}: {observation}"
+                        );
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{fault:?}: server must own submission; {}",
+                        server.stderr()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let during = get("/cluster/deployments");
+                assert_eq!(during["status"]["next_sequence"], before.next_sequence);
+                assert_eq!(during["status"]["state_revision"], before.state_revision);
+                assert_eq!(during["status"]["outstanding_id"], serde_json::Value::Null);
+                if !times_out {
+                    // The proxy has now severed the upstream POST. Require the
+                    // actual CLI to start observing before releasing the graph.
+                    while !proxy
+                        .requests()
+                        .iter()
+                        .any(|request| request.method == "GET" && request.path == receipt_path)
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "CLI must observe its disconnected submission"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert_eq!(get(&receipt_path)["deployment"]["status"], "not_recorded");
+                }
+            }
+            if times_out {
+                if !before_acceptance {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while proxy.forwarded_responses().is_empty() {
+                        assert!(
+                            !caller.is_finished(),
+                            "caller must still wait when durable acceptance is confirmed"
+                        );
+                        assert!(
+                            Instant::now() < deadline,
+                            "upstream must acknowledge before caller timeout"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    assert!(!caller.is_finished(), "acceptance must precede timeout");
+                }
+                let output = caller.join().unwrap();
+                assert_eq!(output.status.code(), Some(5), "{fault:?}: {output:?}");
+                let timeout = parse_stdout_json(&output);
+                assert_eq!(timeout["outcome"], "wait_timeout");
+                assert_eq!(timeout["deployment_id"], id);
+                if before_acceptance {
+                    assert_eq!(get(&receipt_path)["deployment"]["status"], "not_recorded");
+                }
+                if let Some(held) = held {
+                    held.shutdown(Shutdown::Both).unwrap();
+                }
+                output
+            } else {
+                if let Some(held) = held {
+                    held.shutdown(Shutdown::Both).unwrap();
+                }
+                let output = caller.join().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{fault:?}: {output:?}; {}",
+                    server.stderr()
+                );
+                output
+            }
+        });
+        let receipt = if times_out {
+            parse_stdout_json(&output_success(
+                cli()
+                    .env("OMNIGRAPH_BEARER_TOKEN", TOKEN)
+                    .args([
+                        "cluster",
+                        "status",
+                        "--server",
+                        &proxy.origin,
+                        "--deployment-id",
+                        &id,
+                        "--wait",
+                        "--timeout",
+                        "15",
+                        "--json",
+                    ])
+                    .timeout(Duration::from_secs(20)),
+            ))
+        } else {
+            parse_stdout_json(&output)
+        };
+        assert_eq!(receipt["active"], true, "{fault:?}: {receipt}");
+        assert_eq!(receipt["deployment"]["result"]["id"], id);
+        // Activation can be observed before the owner's final drop. Wait for
+        // settlement without mistaking that harmless window for a second run.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let settled = get(&receipt_path);
+            assert_eq!(settled["deployment"], receipt["deployment"]);
+            assert_eq!(settled["active"], true);
+            if settled["in_progress"] == false {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner must finish: {settled}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = get("/cluster/deployments");
+        assert_eq!(after["status"]["next_sequence"], before.next_sequence + 1);
+        assert_eq!(
+            after["status"]["result_revision"],
+            before.result_revision + 1
+        );
+        assert_eq!(after["status"]["outstanding_id"], serde_json::Value::Null);
+        assert_eq!(server.id(), pid);
+        assert_eq!(
+            get(&format!("/graphs/{GRAPH_ID}/schema"))["schema_source"],
+            schema
+        );
+        assert_eq!(
+            get(&commits_path)["commits"].as_array().unwrap().len(),
+            before_commits["commits"].as_array().unwrap().len() + 1
+        );
+        let response = client.post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
+            .timeout(Duration::from_secs(3))
+            .bearer_auth(TOKEN).json(&json!({"query": format!("query inspect() {{ match {{ $p: Person {{ name: \"Alice\" }} }} return {{ $p.name, $p.{property} }} }}")}))
+            .send().unwrap();
+        let status = response.status();
+        let rows = response.json::<serde_json::Value>().unwrap();
+        assert!(status.is_success(), "{fault:?}: {rows}");
+        assert_eq!(rows["row_count"], 1);
+        assert_eq!(rows["rows"][0]["p.name"], "Alice");
+        assert_eq!(
+            rows["rows"][0][format!("p.{property}")],
+            serde_json::Value::Null
+        );
+        proxy.assert_complete();
+        for request in proxy.workflow_requests() {
+            assert!(
+                request.method == "POST" && request.path == "/cluster/deployments"
+                    || request.method == "GET"
+                        && (request.path == "/cluster/deployments" || request.path == receipt_path),
+                "unexpected request: {request:?}"
+            );
+        }
+        if !before_acceptance {
+            assert_eq!(
+                proxy.forwarded_responses().len(),
+                1,
+                "fault must follow real durable acceptance"
             );
         }
     }

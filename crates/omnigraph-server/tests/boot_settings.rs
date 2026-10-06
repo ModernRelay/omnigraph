@@ -2351,6 +2351,87 @@ async fn live_deployment_fixture(mode: &str) {
         })
         .await
         .unwrap();
+        // A schema plan observes the accepted contract while this merge owns
+        // the shared schema gate. It must not queue an exclusive graph open.
+        let schema_path = temp.path().join("people.pg");
+        let original_source = fs::read_to_string(&schema_path).unwrap();
+        fs::write(
+            &schema_path,
+            "node Person { name: String @key bio: String? }\n",
+        )
+        .unwrap();
+        let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let owners_before_plan = state.operation_runtime().snapshot();
+        let plan_request = Request::post("/cluster/plan")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer operator-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "deployment": candidate,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let (code, plan) =
+            tokio::time::timeout(Duration::from_secs(5), json_response(&app, plan_request))
+                .await
+                .expect("schema planning must finish while the merge remains held");
+        assert_eq!(code, StatusCode::OK, "{plan}");
+        assert_eq!(plan["input_digest"], candidate.input_digest().unwrap());
+        assert_eq!(
+            plan["ok"], false,
+            "the live feature branch still prevents schema apply"
+        );
+        assert!(
+            plan["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "schema_preflight_failed"
+                        && diagnostic["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("requires only main")
+                }),
+            "{plan}"
+        );
+        assert!(
+            plan["changes"].as_array().unwrap().iter().any(|change| {
+                change["resource"] == "schema.knowledge" && change["migration"].is_object()
+            }),
+            "{plan}"
+        );
+        assert!(
+            !merger.is_finished(),
+            "planning must not release the parked writer"
+        );
+        assert!(!hold.timed_out());
+        assert_eq!(state.operation_runtime().snapshot(), owners_before_plan);
+        assert_eq!(
+            fs::read(temp.path().join("__cluster/state.json")).unwrap(),
+            before
+        );
+        assert_eq!(original_engine.schema_contract_digest(), original_contract);
+        let RegistryLookup::Ready(after_plan) = state.routing().registry.get(&key) else {
+            panic!("planning must leave graph admission ready");
+        };
+        assert!(
+            Arc::ptr_eq(&original, &after_plan),
+            "planning must preserve the installed binding"
+        );
+        let (code, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            json_response(
+                &app,
+                get_request("/graphs/knowledge/snapshot", "operator-token"),
+            ),
+        )
+        .await
+        .expect("graph reads stay admitted during planning and the held merge");
+        assert_eq!(code, StatusCode::OK);
+        fs::write(&schema_path, original_source).unwrap();
         fs::write(temp.path().join("people.gq"), "// query-only deployment\nquery find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
         let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
         let deploy_app = app.clone();

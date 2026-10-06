@@ -131,7 +131,9 @@ cluster status retains its aggregate `status` object. An authenticated submitter
 can read its own durable receipt even after its deployment removes its management
 permission; general status and later deployments still require current permission.
 Lost submission responses are followed only by original-ID reads, never automatic
-resubmission. Expired receipts and unknown outcomes require investigation.
+resubmission. While waiting, observation retries transient HTTP 429/503 responses
+and interrupted response bodies within the same budget; malformed receipts fail immediately.
+Expired receipts and unknown outcomes require investigation.
 
 Each graph publishes atomically; deployment
 across multiple graphs is not one transaction. Query-only changes create no graph

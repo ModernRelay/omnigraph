@@ -1,0 +1,1 @@
+- Served deployment observation retries truncated HTTP response bodies within the caller's wait budget, without resubmitting the deployment. Malformed receipts still fail immediately. Managed wait timeouts now point to `managed status` for recovery.

@@ -342,7 +342,13 @@ fn is_wait_timeout(error: &color_eyre::Report, deadline: Instant) -> bool {
 fn retry_observation(error: &color_eyre::Report) -> bool {
     error.is::<tokio::time::error::Elapsed>()
         || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-            error.is_timeout() || error.is_connect() || error.is_body() || error.is_request()
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_body()
+                // Response::chunk classifies a truncated transport body as
+                // decoding; parsed JSON/protocol failures are separate errors.
+                || error.is_decode()
+                || error.is_request()
         })
         || error.downcast_ref::<RemoteErrorCli>().is_some_and(|error| {
             matches!(

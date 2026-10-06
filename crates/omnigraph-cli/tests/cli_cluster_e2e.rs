@@ -312,20 +312,30 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
 
     // Reboot from the durable projection: no source apply is allowed to hide
     // an activation-only change that was never actually persisted.
-    let boot_deployment = live_policy_handoff_before_restart(temp.path(), &server);
+    let boot_receipt = live_policy_handoff_before_restart(temp.path(), &server);
+    let boot_deployment = boot_receipt["result"]["id"].as_str().unwrap();
     server.stop();
     unlock();
     let server = spawn_server_with_cluster_env(temp.path(), &server_env);
-    let boot_status = parse_stdout_json(&output_success(live_policy_cli("next-token").args([
-        "cluster",
-        "status",
-        "--server",
-        &server.base_url,
-        "--deployment-id",
-        &boot_deployment,
-        "--json",
-    ])));
+    // The initiating actor still observes its exact receipt after its
+    // management grant is revoked and the original server process is gone.
+    let boot_status = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token").args([
+            "cluster",
+            "status",
+            "--server",
+            &server.base_url,
+            "--deployment-id",
+            boot_deployment,
+            "--wait",
+            "--timeout",
+            "20",
+            "--json",
+        ]),
+    ));
     assert_eq!(boot_status["active"], true, "{boot_status}");
+    assert_eq!(boot_status["deployment"], boot_receipt);
+    assert!(boot_status.get("status").is_none());
     live_policy_state_survives_restart(temp.path(), &server);
     assert_live_graph_absent(&server, "retired");
     assert_eq!(live_snapshot(&server, "tools"), retained);
@@ -1261,7 +1271,10 @@ fn live_policy_grants_revocations_and_management_handoff(
     assert_eq!(server.base_url, original_url);
 }
 
-fn live_policy_handoff_before_restart(config_dir: &std::path::Path, server: &TestServer) -> String {
+fn live_policy_handoff_before_restart(
+    config_dir: &std::path::Path,
+    server: &TestServer,
+) -> serde_json::Value {
     let management_path = config_dir.join("live.policy.yaml");
     let current = fs::read_to_string(&management_path).unwrap();
     let handoff = current.replace("[act-live]", "[act-next]");
@@ -1271,6 +1284,24 @@ fn live_policy_handoff_before_restart(config_dir: &std::path::Path, server: &Tes
     );
     fs::write(management_path, handoff).unwrap();
     let result = live_apply(config_dir, server, "live-deployment-token");
+    let receipt = parse_stdout_json(&output_success(
+        live_policy_cli("live-deployment-token").args([
+            "cluster",
+            "status",
+            "--server",
+            &server.base_url,
+            "--deployment-id",
+            result["deployment"]["result"]["id"].as_str().unwrap(),
+            "--wait",
+            "--timeout",
+            "20",
+            "--json",
+        ]),
+    ));
+    assert_eq!(receipt["active"], true, "{receipt}");
+    assert_eq!(receipt["deployment"], result["deployment"]);
+    assert!(receipt.get("status").is_none());
+    let current = live_policy_status(server, "next-token");
     live_policy_expect_forbidden(live_policy_cli("live-deployment-token").args([
         "cluster",
         "status",
@@ -1278,11 +1309,14 @@ fn live_policy_handoff_before_restart(config_dir: &std::path::Path, server: &Tes
         &server.base_url,
         "--json",
     ]));
-    live_policy_status(server, "next-token");
-    result["deployment"]["result"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned()
+    live_policy_expect_forbidden(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--json"),
+    );
+    assert_eq!(live_policy_status(server, "next-token"), current);
+    result["deployment"].clone()
 }
 
 fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &TestServer) {
@@ -1297,7 +1331,14 @@ fn live_policy_state_survives_restart(config_dir: &std::path::Path, server: &Tes
         &server.base_url,
         "--json",
     ]));
-    live_policy_status(server, "next-token");
+    let current = live_policy_status(server, "next-token");
+    live_policy_expect_forbidden(
+        live_policy_cli("live-deployment-token")
+            .args(["cluster", "apply", "--server", &server.base_url, "--config"])
+            .arg(config_dir)
+            .arg("--json"),
+    );
+    assert_eq!(live_policy_status(server, "next-token"), current);
     let management_path = config_dir.join("live.policy.yaml");
     let handoff = fs::read_to_string(&management_path).unwrap();
     let restored = handoff.replace("[act-next]", "[act-live]");
