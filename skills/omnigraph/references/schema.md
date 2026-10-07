@@ -100,7 +100,7 @@ This validates the schema **and** the queries against it. No running repo requir
 
 ## Evolution (schema plan/apply)
 
-### Plan before apply — always
+### Plan before apply
 
 ```bash
 omnigraph schema plan --schema next.pg s3://bucket/repo --json
@@ -117,10 +117,9 @@ a code is present, match it rather than the free-form message text.
 the current schema; older commits still read the dropped data until
 `omnigraph cleanup` stops retaining them, and only then is it gone for good. No
 flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
-with a retention that excludes the commits before the drop. A cluster-only
-server rejects
-`POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
-`cluster plan` and `cluster apply`.
+with a retention that excludes the commits before the drop. A served graph
+evolves through `cluster plan --server …` and `cluster apply --server …`;
+there is no graph schema-apply HTTP endpoint.
 
 ### Apply is main-only
 
@@ -148,7 +147,7 @@ unsupported. Pattern:
 3. Backfill via a `mutate` or `load --mode merge`
 4. Keep it optional: tightening `T?` -> `T` is currently refused by the planner
    (a property-type change, OG-MF-106). Enforce presence at write time by
-   convention until required-tightening ships as a migration step.
+   convention, or rebuild with the stricter schema when required.
 
 ### Enum widening is a supported apply
 
@@ -170,9 +169,12 @@ endpoints are refused as unsupported. In-place migrations are additions of
 nullable properties and types, `@index` additions, enum widening, renames, and
 drops; tightening a constraint means a rebuild.
 
-### `schema apply` blocks writes while running
+### Availability during apply
 
-No concurrent mutations during an apply. Plan for a short read-only window.
+Standalone schema apply serializes with writes. Served cluster apply closes
+affected graph admission and drains admitted work before changing its schema;
+new requests to that graph can receive `503 graph_unavailable` during the
+transition. Unrelated ready graphs keep serving.
 
 ## Supported Types
 
@@ -209,7 +211,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 
 ## Interfaces
 
-Supported but rarely used. Declare shared property contracts and node types implement them:
+Declare a shared property contract and have node types implement it:
 
 ```pg
 interface Searchable {
@@ -222,8 +224,6 @@ node Doc implements Searchable {
     body: String
 }
 ```
-
-Most schemas are fine without interfaces. Reach for them only when 3+ node types need to share a property contract.
 
 ## Design Principles (brief)
 
@@ -240,7 +240,7 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
+omnigraph cluster plan --server <name|url> --config . --json
 omnigraph cluster apply --server <name|url> --config .
 # the running server publishes and activates the new shape; no restart
 ```
@@ -251,7 +251,7 @@ root itself: stop the server and transfer its cluster lock first (see
 
 Differences from direct `schema apply` (on a non-cluster store): out-of-band
 schema changes on the live graph are *drift* — the next `cluster apply`
-refuses with `applied_schema_drift`, and `--schema-correction` accepts a
-reviewed observed schema.
+refuses with `applied_schema_drift`. There is no correction/adoption flag that
+bypasses this check; investigate the mismatched graph authority.
 Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

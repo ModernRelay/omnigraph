@@ -1,155 +1,68 @@
-# Aliases & Agent Automation
+# Read Aliases
 
-## Contents
-- What an alias is
-- Operator alias schema
-- Args binding & JSON-first parsing
-- Default to structured output
-- Alias naming convention
-- Secrets don't belong in aliases
-- Example alias set
-- Invocation patterns
-
-How to wire Omnigraph operations for agents and scripts.
-
-## What an alias is
-
-An **operator alias** decouples a stable **operation name** from its implementation, so an agent calling `omnigraph alias signal …` keeps working as the query evolves. Aliases live in `~/.omnigraph/config.yaml` and are personal *bindings* to a **stored query on a named server** — they carry no query content; the stored query in the cluster catalog is the team's contract.
-
-```yaml
-# ~/.omnigraph/config.yaml
-aliases:
-  triage:
-    server: intel-dev      # an entry under servers:
-    graph: spike           # optional (multi-graph servers)
-    query: weekly_triage   # the STORED query's name — never a file
-    args: [since]          # positional args → params, in order
-    params: { limit: 20 }  # fixed defaults; positionals/--params win
-    format: table
-```
-
-```bash
-omnigraph alias triage 2026-06-01
-# → POST <intel-dev>/graphs/spike/queries/weekly_triage with the keyed credential
-```
-
-> **Alias vs stored query.** The alias is *yours* (a personal name + defaults); the **stored query** it points at is the *team's* — declared in `cluster.yaml`, type-checked and served by the cluster (`GET /graphs/<id>/queries`, `POST /graphs/<id>/queries/<name>`, gated by `invoke_query`). See [`stored-queries.md`](stored-queries.md).
-## Operator Alias Schema
-
-```yaml
-aliases:
-  <alias-name>:
-    server: <server-name>     # an entry under servers: in ~/.omnigraph/config.yaml
-    graph: <graph-id>         # optional: for multi-graph servers
-    query: <stored-query>     # the stored query's NAME (never a file path)
-    args: [<name1>, <name2>]  # positional CLI args → named params, in order
-    params: { <k>: <v> }      # fixed default params; positionals / --params win
-    format: table|kv|csv|jsonl|json   # optional: output format
-```
-
-Dispatch with `omnigraph alias <name> [args]`. Operator aliases are read-only:
-the alias asserts a read, so the server refuses a bound stored mutation with
-`400`. Invoke stored mutations with
-`omnigraph mutate <name> --server <server> --graph <id>`. Aliases live in their
-own namespace, so one can never shadow or be shadowed by a built-in verb.
-
-### `args` bind to query parameters
-
-If `args: [slug, name, age]`, then:
-
-```bash
-omnigraph alias foo sig-bar "Some Name" 29
-```
-
-...maps to `{"slug":"sig-bar","name":"Some Name","age":29}`.
-
-### Args are JSON-first
-
-Each arg is parsed as JSON first, then falls back to string:
-- `29` → integer
-- `'"29"'` → string (shell-quote the JSON quotes; a bare `"29"` reaches the CLI as `29`)
-- `true` → boolean
-- `Alice` → string (JSON parse fails, falls back)
-- `{"x":1}` → object
-
-Explicit `--params '{...}'` wins on key conflict.
-
-## Default to Structured Output
-
-For scripts and agents, prefer `jsonl` or `json`; `table` is for humans. Set a default in `~/.omnigraph/config.yaml`:
-
-```yaml
-defaults:
-  output: jsonl
-```
-
-Or per-alias (`format: jsonl`), or per-call (`--format jsonl`).
-
-### When to use which
-
-- **`jsonl`** — line-oriented NDJSON, with metadata first; ideal for agents
-- **`json`** — pretty-printed `ReadOutput` envelope (metadata, columns, and rows)
-- **`kv`** — `key: value` per line; good for single-row lookups
-- **`csv`** — for spreadsheets or line-count-heavy analysis
-- **`table`** — default human view; don't use in automation
-
-`--format arrow` is accepted by the parser in 0.12.0 but always fails with "has
-no text rendering"; never set it as an alias or `defaults.output` format.
-
-Query row spelling follows [`queries.md`](queries.md#system-fields-and-result-values):
-null fields are omitted, bare node projections are objects, and DateTime
-strings are UTC without a trailing `Z`. Use `json` when the consumer needs
-the complete column list or the snapshot's `graph_commit_id` for a later
-conditional mutation; the JSONL metadata line does not carry those fields.
-
-## Alias Naming Convention
-
-Short, hyphenated, matches the conceptual operation:
-
-- `signal`, `pattern`, `element` — single lookup (typical pair with `format: kv`)
-- `signals`, `patterns`, `elements` — list
-- `signal-patterns`, `pattern-signals` — traversals
-
-## Secrets Don't Belong in Aliases
-
-Credentials never live in an alias or any config file. For remote servers, `omnigraph login <server>` stores the bearer token in `~/.omnigraph/credentials` (`0600`); for S3-backed storage, AWS creds go in `.env.omni`. Aliases should only contain query names and parameter bindings — never tokens, passwords, or API keys.
-
-## Example Alias Set
+An operator alias binds a personal name and default parameters to a served
+stored query. The team's query stays in the applied cluster registry; aliases
+contain no `.gq` source and cannot invoke mutations.
 
 ```yaml
 # ~/.omnigraph/config.yaml
 servers:
-  intel-dev: { url: https://graph.example.com }
+  production: { url: https://graph.example.com }
 aliases:
-  # Lookups (kv format for single-row readability)
-  signal:   { server: intel-dev, graph: spike, query: get_signal,  args: [slug], format: kv }
-  pattern:  { server: intel-dev, graph: spike, query: get_pattern, args: [slug], format: kv }
-  # Lists
-  signals:  { server: intel-dev, graph: spike, query: recent_signals }
-  # Traversals
-  pattern-signals: { server: intel-dev, graph: spike, query: pattern_signals, args: [slug] }
+  person:
+    server: production
+    graph: knowledge
+    query: get_person
+    args: [slug]
+    format: json
+  recent-people:
+    server: production
+    graph: knowledge
+    query: recent_people
+    params: { since: "2026-10-01T00:00:00Z" }
+    format: json
 ```
-
-Each `query:` names a stored query the cluster serves — declare them in `cluster.yaml` and `cluster apply` first (see [`stored-queries.md`](stored-queries.md)).
-
-## Invocation Patterns
 
 ```bash
-# Invoke a read alias
-omnigraph alias signal sig-kimi-k25
-
-# Invoke a served stored mutation directly (aliases are read-only)
-omnigraph mutate add_signal --server intel-dev --graph spike \
-  --params '{"slug":"sig-new","name":"Name","brief":"Brief","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
-
-# Override output format
-omnigraph alias signals --format jsonl
-
-# Explicit --params (wins over positional args on key conflict)
-omnigraph alias signal --params '{"slug":"sig-override"}'
+omnigraph alias person ada
+omnigraph alias person --params '{"slug":"grace"}'
+omnigraph alias recent-people --format jsonl
 ```
 
-The `alias` subcommand carries `--params`/`--params-file` and
-`--format`/`--json`; the server, graph, and stored-query name come from the
-binding. For a different server/graph or a branch read, call `query`/`mutate`
-directly.
+The server, graph and query name come from the binding. To choose a different
+scope or branch, call `query` directly. The `alias` command accepts
+`--params`/`--params-file` and `--format`/`--json`; it has its own namespace and
+cannot shadow built-in commands. Credentials belong in `omnigraph login`
+storage, never alias configuration.
+
+## Parameters
+
+`args` maps positional values to parameter names in order. Each argument is
+parsed as JSON first, then as a String:
+
+| Shell argument | Bound value |
+|---|---|
+| `29` | Integer |
+| `'"29"'` | String `29` |
+| `true` | Boolean |
+| `Ada` | String |
+| `'{"x":1}'` | Object |
+
+Explicit `--params` wins over positional arguments, which win over configured
+`params`. Parameter types must match the stored query.
+
+## Results and policy
+
+Use JSON when a consumer needs columns or the read's `graph_commit_id`; JSONL
+omits those metadata fields. Null property values are omitted from rows and
+DateTime output is UTC without a trailing `Z`. See [result values](queries.md#system-fields-and-result-values).
+
+Alias invocation requires the stored-query `invoke_query` and `read` grants.
+A stored mutation bound as an alias is refused. Invoke it explicitly instead:
+
+```bash
+omnigraph mutate update_person --server production --graph knowledge \
+  --params '{"slug":"ada","name":"Ada"}' --json
+```
+
+See [stored queries](stored-queries.md) for registry declaration and live updates.

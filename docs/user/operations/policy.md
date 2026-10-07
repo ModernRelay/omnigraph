@@ -2,8 +2,9 @@
 
 OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
-Policies are declared in `cluster.yaml` and installed during cluster bootstrap
-or graph creation. Servers load them at startup or when activating a new graph.
+Declare policies in `cluster.yaml`. Apply them at bootstrap or update them on
+running graphs with `cluster apply --server URL --config DIR`. The server
+activates the new permissions after affected requests drain.
 
 ## Actions
 
@@ -14,7 +15,7 @@ Graph-scoped actions:
 | `read` | Queries, snapshots, branches, and commits |
 | `export` | Snapshot export |
 | `change` | Mutations and loads |
-| `schema_apply` | Schema changes |
+| `schema_apply` | Schema changes and graph deletion (also requires `read`) |
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |

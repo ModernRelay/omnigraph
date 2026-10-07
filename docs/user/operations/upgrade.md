@@ -1,11 +1,21 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage format v14 and never migrates a graph. A
-standalone graph at v8 or v9 (release 0.11.x) or at v13 is converted in place
-by the offline [storage upgrade](#storage-upgrade). A graph at any other
-format, and every cluster-managed graph below v14, is refused and takes the
-[export/import rebuild](#rebuild) with the binary that wrote the graph.
-Check the [release notes](../../releases/) for storage and index compatibility.
+OmniGraph 0.13 opens storage format v14. Normal open never migrates a graph.
+Upgrade the CLI, server and integrations together; the HTTP contract is exactly
+0.13. Keep old executables and a verified whole-root backup until cutover passes.
+
+| Starting point | Route to 0.13 |
+|---|---|
+| 0.12 / format v14 | No graph-format conversion. Convert the cluster ledger only if it reports `ledger_upgrade_required`; see [ledger conversion](../clusters/index.md#direct-deployments-and-conversion). |
+| Standalone v8/v9 (0.11.x) or v13 | Offline [storage upgrade](#storage-upgrade), preserving branches and retained history. |
+| Standalone v6 (0.9/0.10) | First use 0.11's `upgrade --to-format 8`, then the 0.13 storage upgrade. Run each binary's `--check` first; keep all readers and writers stopped across both steps. |
+| Cluster-managed graph below v14 | Export with its old binary and [rebuild](#rebuild) at a new root. |
+| Other unsupported format | Use the refusal's version guidance and [export binary table](#choose-the-export-binary); rebuild rather than bypassing the format check. |
+
+An export/rebuild preserves the exported entities, not old commit IDs, snapshots
+or shared branch history. In-place storage upgrade preserves retained history.
+See [what a rebuild preserves](#what-an-exportimport-rebuild-preserves) before
+choosing a route. Old full-text indexes may also need an [index rebuild](#full-text-index-upgrade).
 
 ## Storage upgrade
 
@@ -111,23 +121,16 @@ refused: a cluster-managed graph is exported with the build that wrote it and
 
 ## v0.9 to v0.10
 
-Released v0.9.0 uses Lance 9; v0.10.0 uses Lance 11. Both use graph storage
-format v6, so existing entities, branches, and retained history do not need an
-export/import migration. Development builds using Lance 10 follow the same
-full-text upgrade procedure below.
-
-The CLI/API vocabulary changes are not rolling-compatible. Update the CLI,
-server, and client integrations together, with application traffic stopped.
-Even without full-text indexes, do not run an old and new fleet against the
-same graph. Keep the old executables and a verified whole-root backup until the
-upgrade is proven. See the [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
+This earlier transition changed Lance's full-text analyzer while retaining
+storage format v6. For its historical release details, see
+[v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility).
+For an upgrade to 0.13, use the route table above; v6 is not a current open format.
 
 ## Full-text index upgrade
 
-The v0.9-to-v0.10 Lance 11 transition keeps graph storage format v6, entities,
-branches, and history. It changes the English stemmer used by full-text search.
-Old indexes cannot safely be searched by the new analyzer, so OmniGraph explicitly refuses
-full-text queries until the selected indexes have been rebuilt.
+After converting a supported graph, full-text queries can still refuse indexes
+created with the older Lance 9/10 analyzer. Rebuild the selected indexes before
+searching them; a graph-format upgrade alone does not certify their analyzer.
 
 1. Stop application readers and writers. Using the old CLI, inventory the live
    branches and record which need full-text search, including `main`:
@@ -196,17 +199,9 @@ Keep the pre-upgrade cluster deployment bundle, configuration, and state backup
 alongside the graph-root backups. A rollback restores that consistent set with
 the old executables; it does not point an old server at upgraded index files.
 
-If v0.10 applied an `external_blobs` policy and the cluster state itself is not
-being restored, v0.9 cannot read that new optional state field. While every
-writer is stopped, remove `external_blobs` from each graph's configuration,
-review `cluster plan`, and use the v0.10 `cluster apply` to converge the removal
-before starting v0.9. Editing only the YAML is insufficient; do not hand-edit
-the state ledger. This state-shape step does **not** replace restoring the
-pre-upgrade graph backup after full-text rebuilding.
-
-A downgrade also removes v0.10's default-deny external-URI enforcement: v0.9
-writers admitted arbitrary supported sources, including `file://`. Do not roll
-back to v0.9 if that ingress boundary is required.
+Do not downgrade by editing configuration fields or internal ledger objects.
+Restore the coherent pre-upgrade backup with its matching binaries and security
+configuration. Keep external Blob sources available throughout verification.
 
 ## What an export/import rebuild preserves
 

@@ -54,8 +54,10 @@ graphs:
     embedding_provider: default
 ```
 
-Inline API keys are rejected. `${ENV_VAR}` references are resolved when the
-server starts, not when the cluster configuration is planned or applied.
+Inline API keys are rejected. The server resolves `${ENV_VAR}` references at
+startup and while preparing a live configuration deployment. Set secrets in
+the server environment before applying provider changes; local validation does
+not load those credentials. Updating a provider does not re-embed stored rows.
 
 ## Schema annotation
 

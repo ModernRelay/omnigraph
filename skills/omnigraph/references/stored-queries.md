@@ -1,6 +1,9 @@
 # Stored-Query Registries
 
-A **stored query** is a `.gq` query that the *server* loads, type-checks at startup, and exposes by name — without ever accepting ad-hoc query source from the client. It's how you publish a vetted, typed query surface to remote callers and MCP tools.
+A stored query is a named `.gq` declaration published through cluster apply.
+The server type-checks it at startup or live activation and exposes invocation
+by name, with typed parameters and policy gates. The invocation request contains
+parameters, not query source.
 
 It is distinct from CLI `aliases:` (see [`aliases.md`](aliases.md)): an alias
 is local client ergonomics; a stored query is a server-published,

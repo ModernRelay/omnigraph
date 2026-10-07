@@ -1,0 +1,1 @@
+- Agent skills and deployment guides now describe the current 0.13 workflows, exact receipts and live configuration updates. Obsolete commands, historical workarounds and duplicated migration instructions have been removed.
