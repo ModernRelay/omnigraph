@@ -27,6 +27,13 @@
 Omnigraph is the operational state and coordination layer for fleets of agents.\
 Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero.png">
+    <img alt="One dark terminal window: four agents write to the same Omnigraph company graph at once, each in its own pane and on its own branch; three merge into main, and main refuses the fourth, a decision that contradicts one already merged; beside them, the graph grows as each write lands and marks the refused one" src="assets/readme/hero.webp">
+  </picture>
+</p>
+
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
 
