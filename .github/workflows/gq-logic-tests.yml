@@ -197,6 +197,14 @@ jobs:
           RUSTFLAGS: ""
         run: cargo test -p omnigraph-seams --locked --timings --test failpoint_names_guard
 
+      # This parity test reads a corpus case, so it must run when a
+      # cases-only diff skips `Test Workspace`.
+      - name: Test benchmark fixture parity with the GQT corpus
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-bench --locked --timings --lib branch_merge::tests::generated_dataset_matches_the_legacy_fixture_and_reversible_history -- --exact --nocapture
+
       # The workspace .cargo/config.toml enables the seeded Tokio runtime
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST

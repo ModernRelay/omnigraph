@@ -51,8 +51,12 @@ all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 `crates/omnigraph-seams/tests/failpoint_names_guard.rs`, which counts a case's
 `at:` name as arming a seam: `Test Workspace` runs it on engine input and
 `GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
-case arming a seam turns the guard red where the PR can see it. No crate
-reads a deployment file. `scripts/check-change-classes.py` keeps the
+case arming a seam turns the guard red where the PR can see it. The fixture
+parity test in `crates/omnigraph-bench/src/branch_merge.rs` also reads
+`generated_branch_merge_dataset.gqt` from the corpus. `GQT (ordinary)` runs
+that exact test on `run_gqt`, including cases-only changes, while
+`Test Workspace` covers it on engine input. No crate reads a deployment
+file. `scripts/check-change-classes.py` keeps the
 literal-spelling half of this true: it replays the classifier over fixture
 diffs and fails when a string literal in a Rust or TOML file under `crates/`
 or `tools/` spells a class path (root-relative or `../`-relative) without the
@@ -147,7 +151,8 @@ the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
 the same flagless shape; the guard is a source walk whose crate declares no
 workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
 `toml`), so
-it adds no second engine build.
+it adds no second engine build. The same ordinary job runs the benchmark
+fixture parity test against the generated branch-merge corpus case.
 The dispatch owner also checks external-store admission and persistence.
 Automatic corpus runs supply no `--store`, so schema-less query files are
 refused there; schema-and-seed datasets with zero steps are admitted.
