@@ -1266,18 +1266,101 @@ fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
     counter(probes, "ContainsJoinExec", name)
 }
 
-/// 64 MiB of passage text under a 48 MiB pool: the unfiltered Passage scan
-/// refuses, the filtered one holds a batch at a time and the two citing rows.
-/// Rust, not `.gqt`: rows cannot show the pool's cap or the refusing owner.
+/// 64 MiB of payload under a 16 MiB pool: an unordered `limit 1` and a top-k
+/// read of the wide column answer. The limit stops the streamed scan of the
+/// narrow columns after a few batches, the top-k sorts them, and each fetches
+/// its one kept row's payload by row address. The pool is released. GQT cannot set the
+/// pool or read the operators' counters. The scale twin is
+/// `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
 #[tokio::test]
 #[serial]
-async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
+async fn a_wide_column_read_under_a_limit_follows_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = graph_fixture(&dir, 4_096, 16 * 1024).await;
+    let limit = 16 * MIB;
+
+    let any = r#"query any_payload() {
+        match { $p: Person }
+        return { $p.payload }
+        limit 1
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, any, "any_payload", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(result.num_rows(), 1);
+    let emitted: usize = probes
+        .execution_metrics()
+        .iter()
+        .filter(|metric| metric.operator == "ScanExec")
+        .map(|metric| metric.output_rows)
+        .sum();
+    assert!(
+        emitted < 4_097,
+        "the limit must stop the scan before it reads the type: {emitted} rows"
+    );
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
+    assert_released(&probes);
+
+    let top = r#"query greatest() {
+        match { $p: Person }
+        return { $p.name, $p.payload }
+        order { $p.name desc }
+        limit 1
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, top, "greatest", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "leaf04095"
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .len(),
+        16 * 1024
+    );
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
+    assert_released(&probes);
+}
+
+/// 64 MiB of passage text under a 48 MiB pool: the Passage scan streams a
+/// batch at a time with or without needles, so the plain filtered product
+/// and the contains join both answer; only the join's marked scan sieves,
+/// and only a marked scan records the runtime-filter counters.
+/// Rust, not `.gqt`: rows cannot show the pool's cap or the scan's counters.
+#[tokio::test]
+#[serial]
+async fn a_passage_table_the_pool_cannot_hold_streams_with_and_without_needles() {
     let dir = tempfile::tempdir().unwrap();
     let v2 = citation_fixture(&dir, 16_384, 4_096).await;
     let limit = 48 * MIB;
+    let cited = [
+        ("mN-0001".to_string(), "p000007".to_string()),
+        ("mN-0003".to_string(), "p000011".to_string()),
+    ];
 
     let probes = QueryMemoryProbes::default();
-    let error = with_query_memory_probes(
+    let result = with_query_memory_probes(
         probes.clone(),
         with_query_memory_limit(
             limit,
@@ -1285,15 +1368,12 @@ async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
         ),
     )
     .await
-    .unwrap_err();
-    assert_memory_refusal(error, limit);
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(cited_pairs(&result.concat_batches().unwrap()), cited);
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
     assert!(
-        probes
-            .refusals()
-            .iter()
-            .any(|owner| owner == "v2 scan attempt"),
-        "the unfiltered Passage scan must refuse its own collection: {:?}",
-        probes.refusals()
+        scan_counter(&probes, "runtime_filter_rows_read").is_empty(),
+        "an unmarked scan records no runtime-filter counters"
     );
     assert_released(&probes);
 
@@ -1304,13 +1384,7 @@ async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
     )
     .await
     .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
-    assert_eq!(
-        cited_pairs(&result.concat_batches().unwrap()),
-        [
-            ("mN-0001".to_string(), "p000007".to_string()),
-            ("mN-0003".to_string(), "p000011".to_string()),
-        ]
-    );
+    assert_eq!(cited_pairs(&result.concat_batches().unwrap()), cited);
     assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
     assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [16_384]);
     assert_eq!(

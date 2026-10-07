@@ -23,8 +23,8 @@ use crate::error::PlanError;
 use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Estimate, Hop, HydratedBinding, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
+    Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 use crate::source::SideId;
 
@@ -244,6 +244,10 @@ pub enum NodeMirror {
         input: NodeId,
         side: SideId,
     },
+    HydrateColumns {
+        input: NodeId,
+        bindings: Vec<HydratedBinding>,
+    },
     RowCompare {
         input: NodeId,
     },
@@ -389,6 +393,10 @@ impl From<&PhysicalNode> for NodeMirror {
             PhysicalNode::HydrateByAddress { input, side } => Self::HydrateByAddress {
                 input: *input,
                 side: *side,
+            },
+            PhysicalNode::HydrateColumns { input, bindings } => Self::HydrateColumns {
+                input: *input,
+                bindings: bindings.clone(),
             },
             PhysicalNode::RowCompare { input } => Self::RowCompare { input: *input },
             PhysicalNode::ClassifyThreeWay { input } => Self::ClassifyThreeWay { input: *input },
@@ -575,6 +583,9 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 fallback,
             },
             NodeMirror::HydrateByAddress { input, side } => Self::HydrateByAddress { input, side },
+            NodeMirror::HydrateColumns { input, bindings } => {
+                Self::HydrateColumns { input, bindings }
+            }
             NodeMirror::RowCompare { input } => Self::RowCompare { input },
             NodeMirror::ClassifyThreeWay { input } => Self::ClassifyThreeWay { input },
             NodeMirror::Limit { input, rows } => Self::Limit { input, rows },

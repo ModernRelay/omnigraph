@@ -243,6 +243,7 @@ hash join $e
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
+hydrate $d: columns [body]
 pass projection_pushdown
 not pass aggregate_pushdown
 ```
@@ -258,8 +259,11 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
 the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
 none. Dropping a type key or swapping key order fails these assertions.
-`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Projection/read lists are sets; identity keys and selection members
+`hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
+exactly those columns of `$d` by row address above the root limit (pass
+`late_materialization`); the `scan` lines keep reading the logical plan, whose
+projection still lists them. `pass <name>` states that a named optimizer pass
+fired, `not pass <name>` that it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in

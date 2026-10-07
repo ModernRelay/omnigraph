@@ -16,6 +16,7 @@ use crate::logical::{
     tiebreak_text,
 };
 use crate::mirror::EdgeSelectionMirror;
+use crate::operation::TableRef;
 use crate::source::SideId;
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -381,6 +382,29 @@ impl Properties {
     }
 }
 
+/// The prefix of the column a query's return projection carries for a
+/// `HydrateColumns` above it: `^n` holds binding `n`'s row address. No GQ
+/// alias or `binding.property` name starts with it.
+pub const ROW_ADDRESS_PREFIX: &str = "^";
+
+/// One binding whose return columns a `HydrateColumns` fetches: its pinned
+/// table and the columns, each with the return position it fills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedBinding {
+    pub binding: String,
+    pub table: TableRef,
+    pub columns: Vec<HydratedColumn>,
+}
+
+/// One deferred return item: `binding.property` under `output`, the return
+/// column at `position`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedColumn {
+    pub position: usize,
+    pub output: String,
+    pub property: String,
+}
+
 /// The operator catalog. The change-feed and merge nodes (`Scan`,
 /// `SortMergeJoin`, `HydrateByAddress`, `RowCompare`, `ClassifyThreeWay`,
 /// `Page`) each have one push operator in the engine's `engine/push/`; the
@@ -432,6 +456,15 @@ pub enum PhysicalNode {
     HydrateByAddress {
         input: NodeId,
         side: SideId,
+    },
+    /// Pass 6 on a query: the return columns only the output reads, fetched
+    /// for the rows that reached it by each binding's row address (the
+    /// `ROW_ADDRESS_PREFIX` column the projection below carries) from the
+    /// binding's pinned table, in bounded chunks, and placed at their return
+    /// positions between the input's other columns.
+    HydrateColumns {
+        input: NodeId,
+        bindings: Vec<HydratedBinding>,
     },
     RowCompare {
         input: NodeId,
@@ -537,6 +570,7 @@ impl PhysicalNode {
             Self::MetadataCount { .. } => "MetadataCount",
             Self::HashJoin { .. } => "HashJoin",
             Self::HydrateByAddress { .. } => "HydrateByAddress",
+            Self::HydrateColumns { .. } => "HydrateColumns",
             Self::SortMergeJoin { .. } => "SortMergeJoin",
             Self::RowCompare { .. } => "RowCompare",
             Self::ClassifyThreeWay { .. } => "ClassifyThreeWay",
@@ -557,6 +591,7 @@ impl PhysicalNode {
     pub fn inputs(&self) -> Vec<NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -582,6 +617,7 @@ impl PhysicalNode {
     fn inputs_mut(&mut self) -> Vec<&mut NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -872,6 +908,21 @@ impl PhysicalPlan {
                 "node": "HydrateByAddress",
                 "side": side,
             }),
+            PhysicalNode::HydrateColumns { bindings, .. } => json!({
+                "node": "HydrateColumns",
+                "bindings": bindings
+                    .iter()
+                    .map(|binding| json!({
+                        "binding": binding.binding,
+                        "table": binding.table.type_key,
+                        "columns": binding
+                            .columns
+                            .iter()
+                            .map(|column| column.property.as_str())
+                            .collect::<Vec<&str>>(),
+                    }))
+                    .collect::<Vec<Value>>(),
+            }),
             PhysicalNode::HashJoin {
                 binding, fallback, ..
             } => json!({
@@ -1147,6 +1198,7 @@ impl PhysicalPlan {
             }
             PhysicalNode::RowCompare { input }
             | PhysicalNode::ClassifyThreeWay { input }
+            | PhysicalNode::HydrateColumns { input, .. }
             | PhysicalNode::Page { input, .. }
             | PhysicalNode::Limit { input, .. }
             | PhysicalNode::Filter { input, .. }

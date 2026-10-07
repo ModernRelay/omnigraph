@@ -457,6 +457,11 @@ impl WorkMemory {
         })
     }
 
+    /// The query pool's size, which the plan's assumed memory limit set.
+    pub(in crate::engine) fn pool_bytes(&self) -> u64 {
+        self.resources.limit
+    }
+
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
     pub(in crate::engine) fn batch_bytes(&self) -> usize {
         (self.resources.limit / 32).clamp(1, 1024 * 1024) as usize

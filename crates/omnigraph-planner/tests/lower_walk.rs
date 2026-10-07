@@ -3,9 +3,9 @@
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
-    ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
-    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields,
+    ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, HydratedBinding, Lower, NodeId,
+    PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind,
+    RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -83,6 +83,15 @@ impl Lower for Trace {
         input: String,
     ) -> Result<String, PlanError> {
         self.call("hydrate_by_address", id, &[&input])
+    }
+
+    fn hydrate_columns(
+        &mut self,
+        id: NodeId,
+        _: &[HydratedBinding],
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("hydrate_columns", id, &[&input])
     }
 
     fn row_compare(&mut self, id: NodeId, input: String) -> Result<String, PlanError> {
@@ -227,7 +236,11 @@ fn every_input_is_lowered_before_its_consumer_and_finish_runs_last() {
         input: filter,
         rows: 3,
     });
-    plan.set_root(limit);
+    let hydrate = plan.add(PhysicalNode::HydrateColumns {
+        input: limit,
+        bindings: Vec::new(),
+    });
+    plan.set_root(hydrate);
 
     let mut trace = Trace::default();
     plan.lower(&mut trace).expect("the plan lowers");
@@ -240,7 +253,8 @@ fn every_input_is_lowered_before_its_consumer_and_finish_runs_last() {
             "cross_join#2(outer_reference#0(),outer_reference#1())",
             "filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))",
             "limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1())))",
-            "finish#4(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))))",
+            "hydrate_columns#5(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))))",
+            "finish#5(hydrate_columns#5(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1())))))",
         ]
     );
 }

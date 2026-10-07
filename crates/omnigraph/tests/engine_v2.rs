@@ -282,8 +282,10 @@ async fn tiny_pool_refuses_a_large_fan_out_expand_with_the_typed_resource_error(
 }
 
 /// 100 hubs sharing 1,000 leaves: 100,000 pairs, about 240 B of accounting
-/// each when retained as `ExpandedPairs` (24 MB, refused by a 16 MiB pool
+/// each when retained as `ExpandedPairs` (24 MB, refused by a 20 MiB pool
 /// before the single hop streamed); per input batch, every output slice fits.
+/// The pool leaves headroom over the hop's own neighbour map for the source
+/// scan's read-ahead batches, which stream beside it.
 #[tokio::test]
 #[serial]
 async fn expand_streams_a_single_hop_under_a_pool_the_pairs_would_not_fit() {
@@ -323,14 +325,14 @@ async fn expand_streams_a_single_hop_under_a_pool_the_pairs_would_not_fit() {
     let answered = with_query_memory_probes(
         probes.clone(),
         with_query_memory_limit(
-            16 * 1024 * 1024,
+            20 * 1024 * 1024,
             query_main(&v2, HOP_QUERIES, "one_hop", &params(&[])),
         ),
     )
     .await
     .unwrap_or_else(|error| {
         panic!(
-            "a streamed single hop fits a 16 MiB pool: {error}; refusals={:?}",
+            "a streamed single hop fits a 20 MiB pool: {error}; refusals={:?}",
             probes.refusals()
         )
     });

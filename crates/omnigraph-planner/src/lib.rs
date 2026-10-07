@@ -40,9 +40,9 @@ pub mod source;
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, CSR_BUILD_FACTOR, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
-    cost_effective_hops, direction_probe_factor, estimate_rows, executed_hops, scan_row_estimate,
-    should_switch_to_csr,
+    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
+    choose_expand_mode, cost_effective_hops, direction_probe_factor, estimate_rows, executed_hops,
+    hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
@@ -57,9 +57,9 @@ pub use lower::{
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use physical::{
-    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OverfetchRung, PhysicalNode,
-    PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope, RankedAccess,
-    ScanInput, StatisticSource,
+    Assumptions, DatasetPin, Estimate, GatePolicy, Hop, HydratedBinding, HydratedColumn, NodeId,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, PrefilterMode, Properties,
+    ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;

@@ -871,6 +871,38 @@ async fn a_fusion_replays() {
     assert_eq!(result.len(), 3);
 }
 
+/// A top-k whose output alone reads `text` replays with its `HydrateColumns`
+/// node: the bound plan carries the hydrated binding and its table, and the
+/// replay takes the same rows' text by address from the pinned snapshot.
+#[tokio::test]
+async fn a_hydrating_top_k_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let source = r#"query two_texts() {
+        match { $d: Doc }
+        return { $d.slug, $d.text }
+        order { $d.slug desc }
+        limit 2
+    }"#;
+    let Replayed { result, plan, rows } =
+        replayed(&db, source, "two_texts", &ParamMap::new()).await;
+    assert_eq!(
+        result,
+        [
+            serde_json::json!({"d.slug": "d09", "d.text": "needle 9"}),
+            serde_json::json!({"d.slug": "d08", "d.text": "needle 8"}),
+        ]
+    );
+    assert_eq!(
+        plan.plan.node(plan.plan.root()).map(|node| node.name()),
+        Some("HydrateColumns")
+    );
+    assert!(
+        rows.iter().any(|row| row["operator"] == "HydrateExec"),
+        "{rows:#?}"
+    );
+}
+
 #[tokio::test]
 async fn the_skip_shapes_and_the_aggregate_replay() {
     let dir = tempfile::tempdir().unwrap();

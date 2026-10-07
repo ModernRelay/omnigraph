@@ -1,6 +1,7 @@
-//! The pipelined path of a marked plain table read: bounded Lance batches, filter
-//! or none, each sieved by the `RuntimeFilter` the parent left, prefixed,
-//! conformed and sent as it is read, so the scan never holds the table.
+//! The pipelined path of every unranked table read: bounded Lance batches,
+//! each sieved by the `RuntimeFilter` a marking parent left (a contains join),
+//! prefixed, conformed and sent as it is read, so the scan never holds the
+//! table and a consumer that stops early (a `limit`) stops the read.
 
 use std::sync::Arc;
 
@@ -20,20 +21,25 @@ use crate::engine::search::SearchMode;
 
 /// The pool owner of one streamed batch's hold, from its sieve to its send.
 const SCAN_BATCH: &str = "v2 scan batch";
+/// The pool owner of the Lance batch being sieved.
+const SCAN_INPUT: &str = "v2 scan input";
+
+/// Whether a table read under `mode` streams: it ranks nothing.
+pub(super) fn streams(mode: &SearchMode) -> bool {
+    mode.bm25.is_none() && mode.nearest.is_none()
+}
 
 impl ScanExec {
-    /// Whether the scan sends each sieved Lance batch as it is read: a marked
-    /// table read under no search mode (a ranked scan is never marked).
+    /// Whether the scan sends each Lance batch as it is read: every table read
+    /// under no search mode. A ranked scan stays a breaker: its overfetch
+    /// ladder reruns it whole.
     pub(super) fn pipelines(&self) -> bool {
-        self.runtime_filter.is_some()
-            && matches!(
-                &self.source,
-                ScanSource::Table { mode, .. } if mode.bm25.is_none() && mode.nearest.is_none()
-            )
+        matches!(&self.source, ScanSource::Table { mode, .. } if streams(mode))
     }
 
-    /// The marked table read as a pipeline over `stream_batches`, under the
-    /// filter the parent left in the slot (`None` when it left none).
+    /// The table read as a pipeline over `stream_batches`, under the filter a
+    /// marking parent left in the slot (`None` when it left none or the scan
+    /// is unmarked); only a marked scan counts what its filter read.
     pub(super) fn execute_pipelined(
         &self,
         mode: SearchMode,
@@ -52,7 +58,10 @@ impl ScanExec {
         let mut work = WorkMemory::new(ctx, "ScanExec")?;
         work.set_metrics(self.metrics.clone());
         work.metric("input_rows", 0);
-        scan_counters(&work, filter.is_some());
+        let marked = self.runtime_filter.is_some();
+        if marked {
+            scan_counters(&work, filter.is_some());
+        }
         let stream = producer_stream(
             schema,
             Arc::new(work),
@@ -70,7 +79,16 @@ impl ScanExec {
                 )
                 .await
                 .map_err(external)?;
-                stream_batches(read, filter.as_ref(), &binding, &declared, &memory, &sender).await
+                stream_batches(
+                    read,
+                    filter.as_ref(),
+                    marked,
+                    &binding,
+                    &declared,
+                    &memory,
+                    &sender,
+                )
+                .await
             },
         );
         Ok(polled(&self.metrics, stream))
@@ -80,9 +98,11 @@ impl ScanExec {
 /// The batches of `read` under `declared`, each sieved by `filter` under its
 /// own `SCAN_BATCH` charge (a mixed selection's copy admitted before it is
 /// built) and sent; an emptied batch is skipped, and the Lance batch let go.
+/// `marked` scans record the runtime-filter counters, unfiltered reads too.
 async fn stream_batches(
     read: NodeRead<'_>,
     filter: Option<&RuntimeFilter>,
+    marked: bool,
     binding: &str,
     declared: &SchemaRef,
     memory: &WorkMemory,
@@ -97,7 +117,7 @@ async fn stream_batches(
         .await
         .map_err(external)?;
     let (_plan, mut stream) = memory.stream(plan)?;
-    let in_flight = memory.child("runtime filter input")?;
+    let in_flight = memory.child(SCAN_INPUT)?;
     let mut inert = false;
     while let Some(batch) = stream.next().await {
         let batch = batch?;
@@ -106,7 +126,9 @@ async fn stream_batches(
         let kept = match filter {
             Some(filter) => filter.keep(&batch, &work, SCAN_BATCH, &mut inert)?,
             None => {
-                count_unsieved(&work, &batch);
+                if marked {
+                    count_unsieved(&work, &batch);
+                }
                 batch.clone()
             }
         };

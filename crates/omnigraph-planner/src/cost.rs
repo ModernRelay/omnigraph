@@ -96,6 +96,20 @@ pub const HASH_JOIN_RATIO: u64 = 8;
 /// side may take at most one part in this many of the memory pool.
 pub const HASH_JOIN_POOL_DIVISOR: u64 = 4;
 
+/// A query's return-only columns are fetched by row address for the rows a
+/// root `limit` keeps once the binding's table holds more than this many
+/// rows per kept row: a take reads each kept row's pages apart, where the
+/// scan would read the column for every row it passes.
+pub const HYDRATE_ROW_RATIO: u64 = 4;
+
+/// The bytes one `HydrateColumns` chunk may retain under a query pool of
+/// `pool` bytes: an eighth, so the chunk, the rows it is re-attached to and
+/// the batches queued beside them fit the pool together. The planner
+/// declares it as the node's `retained_limit`; the operator enforces it.
+pub fn hydrate_chunk_bytes(pool: u64) -> u64 {
+    (pool / 8).max(1)
+}
+
 /// The access path of a dependent scan. `HashJoin` needs both: the table
 /// holds at most `HASH_JOIN_RATIO` rows per frontier row, and the build
 /// side's estimated bytes are known and at most `build_bytes_budget`.

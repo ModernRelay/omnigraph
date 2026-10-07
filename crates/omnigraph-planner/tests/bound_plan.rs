@@ -442,3 +442,26 @@ fn a_filtered_cross_join_has_its_own_tag_and_a_plain_one_the_old_shape() {
     assert!(matches!(old, OldReader::CrossJoin { .. }));
     assert_eq!(round_trip(&plain), plain);
 }
+
+/// A top-k whose return-only column is fetched by row address reads back
+/// with its `HydrateColumns` node and the scan's address column.
+#[test]
+fn a_hydrating_plan_reads_back_with_its_bindings() {
+    let mut query = query(prop("d", "slug"));
+    query.return_exprs.push(IRProjection {
+        expr: prop("d", "text"),
+        alias: None,
+    });
+    query.limit = Some(2);
+    let plan = plan_query(&query, &source(), &fixture_bounds::BOUNDS).expect("the query plans");
+    assert!(matches!(
+        plan.node(plan.root()),
+        Some(PhysicalNode::HydrateColumns { bindings, .. })
+            if bindings.len() == 1 && bindings[0].columns[0].property == "text"
+    ));
+    let bound = BoundPlan {
+        plan,
+        values: Default::default(),
+    };
+    assert_eq!(round_trip(&bound), bound);
+}

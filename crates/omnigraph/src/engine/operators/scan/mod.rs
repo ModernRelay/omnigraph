@@ -1,6 +1,7 @@
 //! `ScanExec`: a binding's scan under its `SearchMode`, columns prefixed, its
-//! `ScanReport` recorded for the search retry ladders; a breaker, except the
-//! marked plain table read (`pipelined`).
+//! `ScanReport` recorded for the search retry ladders. Every unranked table
+//! read streams (`pipelined`); a ranked scan is a breaker, since its ladder
+//! reruns it whole.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -55,17 +56,9 @@ pub(crate) struct ScanExec {
 
 impl ScanExec {
     /// This scan under the runtime filter its parent fills, when the plan
-    /// marked one; a marked table read that ranks nothing then streams.
+    /// marked one.
     pub(crate) fn with_runtime_filter(mut self, filter: Option<Arc<RuntimeFilterSlot>>) -> Self {
         self.runtime_filter = filter;
-        if let ScanSource::Table { .. } = &self.source {
-            let schema = self.schema();
-            self.properties = if self.pipelines() {
-                streaming_properties(schema)
-            } else {
-                breaker_properties(schema)
-            };
-        }
         self
     }
 
@@ -98,7 +91,11 @@ impl ScanExec {
                     mode,
                     projection.as_ref(),
                 )?;
-                breaker_properties(schema)
+                if pipelined::streams(mode) {
+                    streaming_properties(schema)
+                } else {
+                    breaker_properties(schema)
+                }
             }
         };
         Ok(Self {
@@ -215,8 +212,9 @@ impl ExecutionPlan for ScanExec {
             }
             ScanSource::Table { mode, report } => (mode.as_ref().clone(), Arc::clone(report)),
         };
-        if let Some(slot) = self.runtime_filter.as_ref().filter(|_| self.pipelines()) {
-            return self.execute_pipelined(mode, slot.take(), ctx);
+        if self.pipelines() {
+            let filter = self.runtime_filter.as_ref().and_then(|slot| slot.take());
+            return self.execute_pipelined(mode, filter, ctx);
         }
         let schema: SchemaRef = self.schema();
         let type_name = self.type_name.clone();
