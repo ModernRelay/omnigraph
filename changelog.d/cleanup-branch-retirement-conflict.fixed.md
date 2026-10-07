@@ -1,1 +1,1 @@
-- Cleanup now reports a retryable conflict when a branch captured in its inventory is deleted before collection can read it. The refused attempt deletes nothing; rerunning cleanup uses the current branch inventory.
+- Cleanup now reports a retryable conflict when a branch captured in its inventory is deleted before collection can read it. The refused attempt sweeps no graph data; rerunning cleanup uses the current branch inventory.
