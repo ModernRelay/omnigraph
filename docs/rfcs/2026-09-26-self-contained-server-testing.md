@@ -50,7 +50,7 @@ stopped. A shutdown can observe a returned error while accepted storage work is 
 pending. Testing either condition only through the engine misses the server's
 admission, authorization, body ownership and shutdown behavior.
 
-The current [GQT admission code](../../crates/omnigraph-gqt/src/runner_config.rs)
+The current [GQT admission code](../../crates/omnigraph-gqt-core/src/runner_config.rs)
 still parses a declared `target` field, recognizes both server names there
 and admits only the ordinary engine route on local filesystem storage without
 seams or concurrent blocks and engine-DST on in-memory storage when built with

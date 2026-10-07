@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
-mod seams;
+pub(crate) mod seams;
 mod settings;
 
 #[cfg(tokio_unstable)]
@@ -338,6 +338,8 @@ struct Input {
     effective_settings: settings::EffectiveSettings,
     #[serde(default)]
     engine: Engine,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     bless: bool,
     /// `--measure`: the DST worker records every store request per step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -616,6 +618,7 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
         Selection {
             target: None,
             storage: None,
+            store: None,
             seed: None,
             fast_tier: true,
             measure: None,
@@ -637,6 +640,7 @@ pub fn run_selected(
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
+    store: Option<&str>,
 ) -> CaseOutcome {
     run_with_selection(
         path,
@@ -645,6 +649,7 @@ pub fn run_selected(
         Selection {
             target,
             storage,
+            store,
             seed,
             fast_tier: false,
             measure,
@@ -656,6 +661,7 @@ pub fn run_selected(
 struct Selection<'a> {
     target: Option<&'a str>,
     storage: Option<&'a str>,
+    store: Option<&'a str>,
     seed: Option<u64>,
     fast_tier: bool,
     measure: Option<MeasureOptions>,
@@ -1286,7 +1292,15 @@ fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), Strin
         .keep()
         .map_err(|e| format!("report_failed: retain summary: {e}"))?;
     println!("GQT report: {}", path.display());
-    println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        println!("GQT replay unavailable: external store contents are not frozen");
+    } else {
+        println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    }
     Ok(())
 }
 
@@ -1444,8 +1458,19 @@ fn run_invocation(
     if selected_envs.is_empty() {
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
+    case.admit_store(selection.store)?;
+    if selection.measure.is_some()
+        && !selected_envs.iter().any(|env| {
+            matches!(
+                env.execution,
+                Execution::Dst { .. } | Execution::ServerDst { .. }
+            )
+        })
+    {
+        return Err("invalid_case: --measure requires a selected DST environment".into());
+    }
     for env in &selected_envs {
-        env.admit(case.needs_dst())?;
+        env.admit_store(case.needs_dst(), selection.store)?;
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -1514,6 +1539,7 @@ fn run_invocation(
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
+                    store: selection.store.map(str::to_owned),
                     bless,
                     measure: selection.measure.is_some(),
                     model: selection
@@ -1577,6 +1603,24 @@ fn run_invocation(
     }
 }
 
+fn store_environment_variable(store: &str, key: &str) -> bool {
+    if store.starts_with("s3://") {
+        return key.starts_with("AWS_");
+    }
+    store.starts_with("az://")
+        && (key.starts_with("AZURE_")
+            || matches!(
+                key,
+                "AZURITE_BLOB_STORAGE_URL"
+                    | "IDENTITY_ENDPOINT"
+                    | "IDENTITY_HEADER"
+                    | "MSI_ENDPOINT"
+                    | "AWS_ALLOW_HTTP"
+                    | "OBJECT_STORE_CLIENT_MAX_RETRIES"
+                    | "OBJECT_STORE_CLIENT_RETRY_TIMEOUT"
+            ))
+}
+
 fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<WorkerReport, String> {
     input.effective_settings.verify_expected(input.seed)?;
     let started = Instant::now();
@@ -1596,6 +1640,12 @@ fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<Worke
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     input.effective_settings.configure(&mut cmd);
+    if let Some(store) = &input.store {
+        cmd.envs(std::env::vars_os().filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| store_environment_variable(store, key))
+        }));
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("worker_failed: spawn: {e}"))?;
@@ -1708,7 +1758,10 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(case.needs_dst())?;
+    case.admit_store(input.store.as_deref())?;
+    input
+        .environment
+        .admit_store(case.needs_dst(), input.store.as_deref())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1729,7 +1782,13 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                 .map_err(|e| format!("worker_failed: runtime: {e}"))?;
             runtime.block_on(capture(
                 input_digest,
-                crate::execute_case_on_engine(&case, &input.case_path, input.bless, input.engine),
+                crate::execute_case_on_engine(
+                    &case,
+                    &input.case_path,
+                    input.bless,
+                    input.engine,
+                    input.store.as_deref(),
+                ),
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
@@ -1975,6 +2034,13 @@ fn replay_attempts(
 ) -> Result<(), String> {
     refuse_ambient()?;
     crate::engine_from_env()?;
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        return Err("invalid_case: external-store invocations cannot replay; the report does not freeze store contents".into());
+    }
     for attempt in &summary.attempts {
         attempt
             .input
@@ -2108,6 +2174,62 @@ mod action_tests {
     use super::seams::admitted_effect;
     use crate::runner_config::SeamAction;
 
+    #[test]
+    fn external_worker_environment_is_scoped_to_its_backend() {
+        for (uri, accepted) in [
+            ("file:///tmp/graph", vec![]),
+            (
+                "s3://bucket/graph",
+                vec![
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_ALLOW_HTTP",
+                    "AWS_S3_FORCE_PATH_STYLE",
+                ],
+            ),
+            (
+                "az://container/graph",
+                vec![
+                    "AZURE_STORAGE_ACCOUNT_NAME",
+                    "AZURE_STORAGE_ACCOUNT_KEY",
+                    "AZURE_STORAGE_USE_EMULATOR",
+                    "AZURITE_BLOB_STORAGE_URL",
+                    "IDENTITY_ENDPOINT",
+                    "IDENTITY_HEADER",
+                    "MSI_ENDPOINT",
+                    "AWS_ALLOW_HTTP",
+                    "OBJECT_STORE_CLIENT_MAX_RETRIES",
+                    "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
+                ],
+            ),
+        ] {
+            for key in &accepted {
+                assert!(super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+            for key in [
+                "FAILPOINTS",
+                "RAYON_NUM_THREADS",
+                "LANCE_CPU_THREADS",
+                "OMNIGRAPH_ENGINE",
+                "DST_ENTROPY_SEED",
+                "HOME",
+                "PATH",
+                "GQT_WORKER_INPUT",
+            ] {
+                assert!(!super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+        }
+        assert!(!super::store_environment_variable(
+            "s3://bucket/graph",
+            "AZURE_STORAGE_ACCOUNT_KEY"
+        ));
+        assert!(!super::store_environment_variable(
+            "az://container/graph",
+            "AWS_SECRET_ACCESS_KEY"
+        ));
+    }
     #[test]
     fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
         for effects in [

@@ -16,12 +16,6 @@
 
 use tempfile::TempDir;
 
-#[path = "support/http_bench.rs"]
-mod http_bench;
-#[path = "support/http_perf_layout.rs"]
-mod http_perf_layout;
-#[path = "support/http_soak.rs"]
-mod http_soak;
 mod support;
 use support::*;
 

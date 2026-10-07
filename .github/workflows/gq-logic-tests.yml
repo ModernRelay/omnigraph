@@ -183,6 +183,12 @@ jobs:
           RUSTFLAGS: ""
         run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
 
+      - name: Test ordinary GQT core execution
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-gqt-core --locked --timings --lib -- --nocapture
+
       # A case's `at:` name arms a seam in the seam guard, so a cases-only
       # diff can change its verdict while `Test Workspace` is skipped.
       - name: Run the seam guard the case corpus arms
@@ -195,11 +201,11 @@ jobs:
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst'
-        run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
+        run: cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked --timings -- --nocapture
 
       - name: Clippy GQT with DST
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst-clippy'
-        run: cargo clippy -p omnigraph-gqt --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
+        run: cargo clippy -p omnigraph-gqt -p omnigraph-gqt-core --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
 
       - name: Retain GQT invocation reports
         if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy'

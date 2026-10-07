@@ -148,6 +148,10 @@ the same flagless shape; the guard is a source walk whose crate declares no
 workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
 `toml`), so
 it adds no second engine build.
+The dispatch owner also checks external-store admission and persistence.
+Automatic corpus runs supply no `--store`, so schema-less query files are
+refused there; schema-and-seed datasets with zero steps are admitted.
+`--measure` refuses a selection with no DST environment.
 `GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
 `--- expect same as v1` comparison runs inside it, so no job selects an
 engine. `GQT (dst-clippy)` checks all package targets with Clippy. All
@@ -417,8 +421,8 @@ cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 From `crates/omnigraph-gqt`, also run the complete configured package:
 
 ```bash
-cargo test -p omnigraph-gqt --locked
-cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
+cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked
+cargo clippy -p omnigraph-gqt -p omnigraph-gqt-core --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
 For repository metadata and workflow changes, first
