@@ -131,7 +131,6 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
         edge_count,
         src_node_count,
         dst_node_count,
-        same_type: src_node_count == dst_node_count,
         max_frontier_cap: 1 << 20,
         max_hops_cap: 6,
     };
@@ -197,7 +196,6 @@ fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },
@@ -281,7 +279,6 @@ fn access_path_sizes_only_projected_columns() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },

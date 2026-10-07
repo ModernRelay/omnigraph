@@ -1035,7 +1035,7 @@ pub(super) fn resolve_csr<'g>(
 
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
-/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
+/// Only legacy Named can switch to CSR.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
@@ -1083,7 +1083,7 @@ where
         ExpandExecution::Budgeted(_) => None,
     };
     let budgeted = step.budgeted();
-    let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
+    let max = step.max_hops;
 
     let mut active = match start_indexed {
         Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1467,8 +1467,9 @@ pub(super) fn bulk_anti_join_mask(
 /// state across the swap instead of restarting.
 ///
 /// Id spaces differ per source: Indexed owns a per-traversal interner (both
-/// endpoint types in ONE dense space — see the cross-type single-hop guard in
-/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// endpoint types in ONE dense space, which is sound because
+/// `validate_expand_structure` refuses a cross-type expand a second hop), Csr
+/// borrows the graph index's per-type dictionaries.
 /// A swap therefore translates all live state through the id strings once.
 pub(super) enum ActiveExpandSource<'g> {
     Indexed(Box<IndexedExpandSource>),

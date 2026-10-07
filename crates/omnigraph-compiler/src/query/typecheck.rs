@@ -11,6 +11,7 @@ use crate::types::{Direction, PropType, ScalarType, check_date_literal, check_da
 
 use super::ast::*;
 use super::codes::*;
+use super::diagnostic::QueryDiagnostic;
 
 /// A variable in the query's single namespace, tagged by what it binds.
 ///
@@ -1566,10 +1567,33 @@ fn resolve_traversal(
             ),
         ));
     }
-    if edges.named().is_none() && traversal.max_hops != Some(1) && src_type != dst_type {
-        return Err(CompilerError::typed(
-            T5,
-            "recursive edge selection requires the same node type at both endpoints".to_string(),
+    // A hop ends on the destination type, and the next hop must start on the
+    // source type, so a path across distinct endpoint types never reaches a
+    // second hop; a bound that allows one is refused, not silently capped.
+    if let Some(max_hops) = traversal.max_hops
+        && max_hops > 1
+        && src_type != dst_type
+    {
+        let (EdgeSelector::Named(name), Some(member)) = (&traversal.selector, edges.named()) else {
+            return Err(CompilerError::typed(
+                T5,
+                "recursive edge selection requires the same node type at both endpoints"
+                    .to_string(),
+            ));
+        };
+        let edge = lookup_traversal_edge(catalog, &member.edge_type)?;
+        return Err(CompilerError::query(
+            QueryDiagnostic::typecheck(
+                T5,
+                format!(
+                    "multi-hop traversal `{name}{{{},{max_hops}}}` requires the same node type at both endpoints, but `{}: {} -> {}` connects different types, so no path continues past one hop",
+                    traversal.min_hops, edge.name, edge.from_type, edge.to_type
+                ),
+            )
+            .with_fix(format!(
+                "follow one hop without a bound: `${} {name} ${}`",
+                traversal.src, traversal.dst
+            )),
         ));
     }
     Ok(ResolvedTraversal {

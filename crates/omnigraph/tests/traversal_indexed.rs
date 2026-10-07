@@ -263,15 +263,17 @@ async fn indexed_finds_unindexed_appended_edge() {
 }
 
 // Regression: a node `id` is unique only WITHIN a type, so a `Person` and a
-// `Company` can share an id string. A variable-length traversal over a
-// cross-type edge (`worksAt`, Person -> Company) must structurally stop after
-// one hop — a Company is not a `worksAt` source — so `worksAt{1,2}` returns
-// exactly the one-hop companies. Before the structural hop-cap, the indexed
-// path's single string interner de-interned the hop-1 Company id back to the
-// colliding Person id and ran a hop-2 `worksAt src IN (...)` scan that matched
-// that same-string Person's edges, emitting a spurious second-hop company the
-// CSR path never produces. `both_modes` (csr == indexed == auto) plus the
-// golden assert catch both the divergence and an over-emitting shared bug.
+// `Company` can share an id string. A path over a cross-type edge (`worksAt`,
+// Person -> Company) stops after one hop — a Company is not a `worksAt`
+// source — so `worksAt{1,2}` is refused at type check (T5) instead of running.
+// Before that refusal the engine capped such a range at one hop, and before
+// the cap the indexed path's single string interner de-interned the hop-1
+// Company id back to the colliding Person id and ran a hop-2
+// `worksAt src IN (...)` scan that matched that same-string Person's edges,
+// emitting a spurious second-hop company the CSR path never produces. The
+// one-hop form still runs over the colliding ids: `both_modes`
+// (csr == indexed == auto) plus the golden assert catch both a divergence and
+// an over-emitting shared bug.
 #[tokio::test]
 async fn cross_type_id_collision_does_not_bleed_into_second_hop() {
     const SCHEMA: &str = r#"
@@ -291,6 +293,14 @@ edge WorksAt: Person -> Company
 query reach($name: String) {
     match {
         $p: Person { name: $name }
+        $p worksAt $c
+    }
+    return { $c.name }
+}
+
+query reach_two($name: String) {
+    match {
+        $p: Person { name: $name }
         $p worksAt{1,2} $c
     }
     return { $c.name }
@@ -305,8 +315,18 @@ query reach($name: String) {
     assert_eq!(
         got,
         vec!["shared"],
-        "cross-type worksAt{{1,2}} must return only the one-hop company; a hop-2 \
+        "cross-type worksAt must return only the one-hop company; another \
          result means the id-string collision bled across types"
+    );
+    let error = query_main(&db, QUERY, "reach_two", &params(&[("$name", "alice")]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "T5: multi-hop traversal `worksAt{1,2}` requires the same node type at both endpoints"
+        ),
+        "{error}"
     );
 }
 

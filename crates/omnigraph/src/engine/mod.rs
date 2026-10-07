@@ -362,7 +362,7 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
                         edges,
                         omnigraph_compiler::traversal::EdgeSelection::Alternation(_)
                     ),
-                    edges.named().is_none() && src_type != dst_type,
+                    src_type != dst_type,
                     *min_hops,
                     *max_hops,
                     edge_binding.is_some(),

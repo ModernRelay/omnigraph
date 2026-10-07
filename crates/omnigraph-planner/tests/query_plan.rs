@@ -182,7 +182,6 @@ fn knows_statistics(rows: u64) -> ExpandStatistics {
         edge_count: rows * 10,
         src_node_count: rows,
         dst_node_count: rows,
-        same_type: true,
         max_frontier_cap: 1024,
         max_hops_cap: 6,
     }
