@@ -687,7 +687,8 @@ fn parity_load_embedding_diagnostics() {
         "\n",
         r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
     )).unwrap();
-    for verb in ["load", "ingest"] {
+    {
+        let verb = "load";
         for structured in [true, false] {
             let mut args = vec![
                 verb,
@@ -719,7 +720,7 @@ fn parity_load_embedding_diagnostics() {
                     assert!(human.contains("omnigraph embed"), "{verb} {arm}: {human}");
                 }
             }
-            if verb == "load" && structured {
+            if structured {
                 assert_write_parity("load embedding diagnostics", &local, &remote);
             }
         }
@@ -748,7 +749,8 @@ fn parity_load_embedding_diagnostics() {
         r#"{"type":"Person","data":{"name":"Plain","age":1}}"#,
     )
     .unwrap();
-    for verb in ["load", "ingest"] {
+    {
+        let verb = "load";
         let (local, remote) = p.run(&[
             verb,
             "--branch",
@@ -1169,9 +1171,6 @@ fn parity_errors_share_exit_codes() {
 //
 // - `graphs list`: server-only today; becomes Both-capability when the
 //   embedded arm enumerates the cluster catalog (RFC-009 open Q3, answered).
-// - `ingest`: deprecated permissive loader; its remote arm rides the
-//   deprecated JSON /ingest route. Canonical `load` is strict graph-batch on
-//   both arms; the remote arm sends raw NDJSON to `/load/ndjson`.
 // - `init`, `optimize`, `repair`, `cleanup`, `cluster *`: storage-plane by
 //   design (must work with the server down); Phase 4 declares this.
 #[allow(dead_code)]

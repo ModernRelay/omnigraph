@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-09-03
-updated: 2026-10-04
+updated: 2026-10-05
 discussion: null
 supersedes: []
 superseded_by: []
@@ -19,11 +19,11 @@ blocked_on: []
 > **Server runtime disposition:**
 > [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
 > removed `cluster refresh`, `cluster import`, and approval execution, refuses
-> `state.lock: false`, and added online activation. Historical: observe defined
-> as `refresh` without the lock, the `unlocked` label, the approval clause of
-> the observe-only reads, "the server never reloads", and the Summary sentence
-> that online activation remains unimplemented. Current: observe-only authority,
-> the readiness witness and inventory, and bounded shutdown.
+> `state.lock: false`, and added online activation. The current observe/apply
+> sections replace the former refresh analogy, unlocked label and approval
+> clause; the Summary reflects online activation. Historical: "the server never
+> reloads" below. Current: observe-only authority, the readiness witness and
+> inventory, and bounded shutdown.
 
 ## Summary
 
@@ -31,7 +31,7 @@ Three small, independently shippable contracts let an external control plane
 drive a cluster without a second implementation of anything the cluster
 crate already does, and without bypassing it:
 
-1. **Observe-only reads.** `cluster plan --observe` and a new
+1. **Observe-only reads.** `cluster plan` and
    `cluster observe` read the ledger and the live graphs without taking the
    cluster lock and without writing anything, and label their output
    `authority: observed` together with the exact `state_cas` they read.
@@ -50,9 +50,9 @@ recovery protocol. The v0.12 availability amendment replaces the readiness and
 inventory response shapes with coordinated in-tree consumer changes and no
 legacy aliases. The wider
 [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md)
-decision owns the initial loading listener and startup ownership. Deploying,
-startup retry and online activation remain unimplemented. Observe-only authority and the absolute
-shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
+decision owns the initial loading listener, startup ownership and online
+activation. Startup retry remains separate. Observe-only authority and the
+absolute shutdown deadline remain unchanged. Restoring a ledger is deliberately not here:
 its real use arrives with coherent restore points, where the ledger and the graphs come back
 together, and it will be designed once, against those.
 
@@ -61,15 +61,10 @@ together, and it will be designed once, against those.
 An operator that manages many clusters needs two things from the engine it
 does not have today.
 
-**A drift signal without a lock.** `plan` and `refresh` take
-`__cluster/lock.json` (create-if-absent, deleted on release). A service that
-observes hundreds of clusters would create and delete lock files on roots it
-does not own, would be refused whenever an apply holds the lock, and would
-have no way to say that what it returned was an observation rather than a
-locked read. `refresh` additionally writes the ledger and runs the recovery
-sweep, so it can only run while nothing else moves the cluster. The
-`state.lock: false` bypass exists but is a configuration setting with a
-warning, not a per-command intent.
+**A drift signal without a lock.** A preview should work while the server owns
+the cluster. Writer admission supplies effect authority; taking it merely to
+observe would block deployments or create unnecessary ownership handoffs.
+Planning therefore always reports observations and reserves nothing.
 
 **An honest replica.** `/healthz` reports the process is alive. Nothing
 reports which applied revision a replica actually booted from, which graphs it
@@ -88,27 +83,25 @@ preempt those contracts.
 ### Observe-only reads
 
 ```bash
-omnigraph cluster plan --observe --config ./company-brain
+omnigraph cluster plan --config ./company-brain
 omnigraph cluster observe --config ./company-brain
 ```
 
-`plan --observe` is `plan` without the lock: it reads the ledger once, diffs
-the desired bundle against it, and reports. `cluster observe` is `refresh`
-without the lock, the sweep, or the write: it verifies catalog payloads and
-observes every declared graph through the read-only open, and reports the
-resource statuses and observations `refresh` would have recorded.
+`plan` reads the ledger once, diffs the captured desired bundle and runs shared
+effect-free preparation. `cluster observe` verifies catalog payloads and observes
+every declared graph through read-only opens. Both report without writer
+admission or ledger writes.
 
-Both outputs carry `authority: "observed"`. The existing paths carry
-`"locked"`, or `"unlocked"` when the bundle sets `state.lock: false`, so a
-read never claims a lock it did not hold. Every output carries the
-`state_cas` and `state_revision` of the ledger it read.
+Both outputs carry `authority: "observed"` and the `state_cas` and
+`state_revision` of the ledger they read. There is no locked plan mode or
+`--observe` flag.
 An existing lock is reported in `state_observations` (`locked`, `lock_id`,
 `lock_operation`, `lock_age_seconds`) and does not refuse the command. Pending
 recovery sidecars are reported as the `cluster_recovery_pending` warning that
 read-only commands already emit; nothing is swept.
 
 An observed result is never authority for an effect: `apply` still re-plans
-under the lock, and an approval still binds to the digests `apply` sees.
+under writer admission against its immutable input.
 
 ### Readiness witness
 
@@ -133,7 +126,7 @@ counts distinguish actual startup outcomes. `GET /graphs` returns one `graphs`
 list including those outcomes under the same gate, with `state` (`loading`,
 `ready`, `blocked`, `transitioning`, `stopping`), `read_available`, `write_available`, optional sanitized
 `failure`, and `action` (`none`, `wait_for_startup`, `wait_for_transition`,
-`restart_after_correction`, `wait_for_restart`). Closed transitions count as
+`apply_correction_or_restart`, `wait_for_restart`). Closed transitions count as
 blocked; pending initial admission counts as loading.
 These booleans describe runtime availability, not permission. Raw failures stay
 in server logs. The separate `quarantined` response field is removed.
@@ -190,17 +183,13 @@ crash. Nothing is deleted or repaired at the deadline.
 
 ## Design
 
-**Observe.** `plan_config_dir_with_options(dir, PlanOptions { observe })`
-and `observe_config_dir(dir)` in `omnigraph-cluster`. The observe path calls
-`ClusterStore::observe_lock` (a read of `lock.json`) where the locked path
-calls `acquire_lock`, runs `warn_pending_recovery_sidecars` where `refresh`
-runs `sweep_recovery_sidecars`, mutates only its in-memory copy of the
-ledger, and returns before `write_state`. `PlanOutput` and `StateSyncOutput`
-gain `authority: LedgerAuthority` (`locked` | `unlocked` | `observed`);
-`StateSyncOperation` gains `observe`. The graph observation pass already
-opens graphs read-only and never runs the recovery sweep, so no engine change
-is needed. `refresh` refuses with `state_revision_overflow` instead of
-saturating at `u64::MAX`.
+**Observe.** `plan_config_dir(dir)` and `observe_config_dir(dir)` in
+`omnigraph-cluster` call `ClusterStore::observe_lock` to report existing
+ownership. Plan captures source bytes and the ledger once and uses shared
+deployment preparation for validation and migration steps. It never acquires
+admission or writes state. Apply prepares again under the current owner.
+`PlanOutput` and `StateSyncOutput` report observed authority. The graph
+observation pass opens graphs read-only and does not run recovery.
 
 **Witness.** `ServingSnapshot` supplies applied revision/digest/CAS boot facts
 and graph startup inputs, including graph-specific admission refusals. The

@@ -319,14 +319,11 @@ impl GraphTools {
     fn graph(
         &self,
         name: &str,
-        mut actor: AuthenticatedActor,
+        actor: AuthenticatedActor,
         graph: &McpGraphRequest,
     ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
         let id = GraphId::try_from(name.to_string())
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        if !actor.select_graph(&id) {
-            return Err(ApiError::forbidden("credential does not permit this graph"));
-        }
         let handle =
             handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
         if graph.set(handle.clone()).is_err() {

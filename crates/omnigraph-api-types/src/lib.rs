@@ -66,13 +66,6 @@ pub mod branch_statement_refusals {
     pub const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
     /// An expected head beside a statement.
     pub const COMMIT_PRECONDITION: &str = "a branch statement takes no commit precondition";
-    /// Any branch statement sent to a deprecated route.
-    pub const DEPRECATED_ROUTE: &str =
-        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
-    /// An `explain` statement sent to a deprecated route.
-    pub const EXPLAIN_DEPRECATED_ROUTE: &str =
-        "the explain statement is not served on deprecated routes; use POST /query";
-
     /// Fill the `{statement}` placeholder of the two door refusals.
     pub fn with_statement(template: &str, statement: &str) -> String {
         template.replace("{statement}", statement)
@@ -87,10 +80,6 @@ pub mod query_file_refusals {
     /// step, refused at every HTTP route and CLI verb since nothing follows
     /// the prefix in the same request.
     pub const ONLY_SETTINGS: &str = "a file of only settings lines carries no statement";
-    /// Either carrier — the `settings` field or a `set`/`reset` prefix in the
-    /// source — at either deprecated route, which serve their legacy bodies
-    /// under the process defaults alone.
-    pub const SETTINGS_AT_DEPRECATED_ROUTE: &str = "the deprecated /read and /change routes take no settings, neither a settings field nor a set or reset prefix; use POST /query or POST /mutate";
 }
 
 /// The `settings` field of a request: one optional value per `request`-scope
@@ -469,32 +458,6 @@ pub struct ReadOutput {
     /// come from one pinned version, so no separate id fetch is needed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_commit_id: Option<String>,
-}
-
-/// Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell
-/// spelling follows the JSON writer. The canonical [`ReadOutput`] may grow
-/// additive fields; this legacy envelope deliberately cannot carry them.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LegacyReadOutput {
-    pub query_name: String,
-    pub target: ReadTargetOutput,
-    pub row_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<String>,
-    #[schema(value_type = Value)]
-    pub rows: Box<RawValue>,
-}
-
-impl From<ReadOutput> for LegacyReadOutput {
-    fn from(value: ReadOutput) -> Self {
-        Self {
-            query_name: value.query_name,
-            target: value.target,
-            row_count: value.row_count,
-            columns: value.columns,
-            rows: value.rows,
-        }
-    }
 }
 
 /// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
@@ -896,43 +859,17 @@ pub struct ChangeErrorOutput {
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadRequest {
-    /// GQ query source. May declare one or more named queries; pick one with
-    /// `query_name` if there is more than one.
-    #[schema(
-        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
-    )]
-    pub query_source: String,
-    /// Name of the query to run when `query_source` declares multiple. Optional
-    /// when only one query is declared.
-    pub query_name: Option<String>,
-    /// JSON object whose keys match the query's declared parameters.
-    pub params: Option<Value>,
-    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
-    pub branch: Option<String>,
-    /// Snapshot id to read from. Mutually exclusive with `branch`.
-    pub snapshot: Option<String>,
-    /// Refused when present: the deprecated route runs under the process
-    /// defaults. Typed as raw JSON so the refusal names the field instead of
-    /// a deserialization error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Value>,
-}
-
 /// Inline read-query request for `POST /query`.
 ///
-/// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
-/// AI-agent integration. Mutations are rejected with 400 — use `POST
-/// /mutate` (or its deprecated alias `POST /change`) for write queries.
+/// Mutations are rejected with 400 — use `POST /mutate` for write queries.
 /// Field names are deliberately short (`query`, `name`) to match the GQ
 /// keyword and the CLI `-e` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
-    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
-    /// deprecated alias `POST /change`) instead. May instead be the branch
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch
     /// statement `branch list`, sent with no `name`, `params`, `branch`, or
     /// `snapshot`; or one `explain` statement (`explain query …`), which
     /// answers the v2 plan instead of
@@ -1091,22 +1028,18 @@ impl BlobStatOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
     /// May declare multiple named mutations; pick one with `name`. May instead
     /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
     /// sent with no `name`, `params`, or `branch`.
-    ///
-    /// Accepts the legacy field name `query_source` as a deserialization alias.
     #[schema(
         example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
     )]
-    #[serde(alias = "query_source")]
     pub query: String,
     /// Name of the mutation to run when `query` declares multiple.
-    ///
-    /// Accepts the legacy field name `query_name` as a deserialization alias.
-    #[serde(default, alias = "query_name")]
+    #[serde(default)]
     pub name: Option<String>,
     /// JSON object whose keys match the mutation's declared parameters.
     #[serde(default)]
@@ -1267,16 +1200,6 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             nullable: param.nullable,
         },
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct SchemaApplyRequest {
-    /// Project schema in `.pg` source form. The diff against the current
-    /// schema produces the migration steps that will be applied.
-    #[schema(
-        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
-    )]
-    pub schema_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2206,7 +2129,7 @@ pub enum GraphAvailabilityAction {
     None,
     WaitForStartup,
     WaitForTransition,
-    RestartAfterCorrection,
+    ApplyCorrectionOrRestart,
     WaitForRestart,
 }
 
