@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-26
-updated: 2026-10-03
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -39,7 +39,7 @@ Ordinary server tests supply real socket and process evidence;
 `omnigraph-bench` supplies real performance measurements. The engine remains
 independently testable. This proposal defines testing architecture and
 qualification, not new production recovery or deployment guarantees. Server
-qualification targets the v0.12 release/wire contract with coordinated CLI,
+qualification targets the v0.13 release/wire contract with coordinated CLI,
 server and cluster tools. Independent historical serving, durable data-operation
 idempotency and broader runtime binding changes are outside this scope.
 
@@ -258,7 +258,7 @@ product capability remains a prerequisite; the adapter cannot supply it.
 Static input and capability validation happens before fixture effects. The
 runner then guards partial acquisitions while creating the minimal cluster
 configuration, graphs and local credentials required to boot. Executable and
-wire admission require the identified v0.12 contract; unsupported or unidentified
+wire admission require the identified v0.13 contract; unsupported or unidentified
 contracts refuse before request admission. Before initial scenario dispatch,
 readiness compares `/readyz`'s
 `booted_serving_digest` and `state_revision` with the applied revision the
@@ -379,13 +379,13 @@ then, and T4.progress's handle reopen carries scope E + D.
 The local server combination requires no connection profile and cannot attach
 to an ambient service. Existing external-backend profile proposals and
 qualification work remain separate. This RFC introduces no remote testing mode.
-The server decision owns the v0.12 wire contract: CLI, server and cluster tools
+The server decision owns the v0.13 wire contract: CLI, server and cluster tools
 upgrade together; unsupported or unidentified contracts refuse before admission.
 No mixed-version execution, fallback or legacy error alias is qualified here.
 The exact contract discriminator and CLI discovery/response checks are owned by
 [the accepted HTTP admission decision](2026-09-30-v012-http-admission.md); qualifying
 that transport does not provide this runner's missing server controls. `/healthz` reports package `version` and separate storage
-`internal_schema_version`; neither proves the required wire behavior. v0.12 names
+`internal_schema_version`; neither proves the required wire behavior. v0.13 names
 the release/wire line, not a manifest stamp. Normal serving requires format 13;
 explicit storage conversion remains separately owned. The executed-type witness
 remains a Local HTTP prerequisite, not an inferred response shape.
@@ -449,7 +449,7 @@ outside that guarantee. An in-memory client cannot stand in for CLI behavior.
 
 The evidence record binds exact case/workload bytes, route, each step's API, build and backend,
 epoch identities, actual protocol, results, publication identities, pending
-work, the identified v0.12 server contract and deployment revision where
+work, the identified v0.13 server contract and deployment revision where
 applicable, and separate primary and cleanup outcomes. Epoch is inapplicable
 for the engine routes. Independent oracles need a deliberate bad-result test:
 wrong receipt, early permit release or missing history must turn the corresponding assertion red. Sensitivity
@@ -475,7 +475,7 @@ guarantees belong to
 including [operation ownership](2026-09-29-server-runtime-and-online-deployment.md#operation-ownership)
 and [serving views](2026-09-29-server-runtime-and-online-deployment.md#serving-views).
 That RFC owns delivery gates; this proposal owns their scenario and evidence
-requirements. The active scope is v0.12 outcomes, owned work, bounded resources,
+requirements. The active scope is v0.13 outcomes, owned work, bounded resources,
 status and drained online schema/query deployment. T8.history/T8.retention are
 reserved deferred identifiers, not delivery promises. A follow-up must be accepted
 before independent historical serving or its benchmarks become requirements.
@@ -514,10 +514,10 @@ totals alone cannot prove atomic publication.
 
 | Assertion ID | Scope | Required control and assertion | Independent oracle and sensitivity failure | Required evidence / prerequisite |
 |---|---|---|---|---|
-| T1.receipt | H + D + E | Hold changing merge A after publication, or no-op A after its outcome is established, before response construction; publish B; release A. Cover no-op, fast-forward and three-way through `POST /mutate` with a `branch merge` statement; the `/branches/merge` route stays with the server route suites. | For a changing merge, expect A's own outcome, parents, actor and manifest version; substituting B's receipt fails. For no-op, an independent held outcome observation and protected history bound to A prove that A published nothing; the wire result is `already_up_to_date` with `commit: null`. Fabricating a receipt for that no-op fails. | Identified v0.12 contract, harness operation identity, established outcome, reached hold, protected history and wire response; publication identity only where a publication exists. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes). No additional no-op wire identity is required. |
-| T2.delivery | H + E | Suppress/truncate an already successful response; separately proxy 504 and caller timeout. | CLI request census proves one submission; accepted graph state proves effects despite delivery loss. Deliberate automatic resubmission must fail. | Actual CLI/server/proxy processes, identified v0.12 CLI/server contract, wire attempts and final content; no inferred idempotency. Prerequisite: a transport control (response truncation, proxy 504, caller timeout) spelled in a later RFC 0045 amendment; until then the row's evidence stays with the CLI Rust owner. |
-| T2.compound | H + E | Permit merge but deny optional source deletion under the v0.12 contract. | Independently verify the merged target and retained source. Require exit 0, the merge's own receipt, `branch_deleted: false` and `branch_delete_error_details` as `ErrorOutput`; no legacy error alias or automatic merge replay. Missing structured failure or a lost receipt fails. | Per-action authorization/outcomes and publication evidence. Prerequisite: a case-declared policy and receipt-field expect (format additions owned by RFC 0045); until then the existing CLI/server Rust owners retain these assertions. |
-| T3.retry | H + E | Exercise v0.12 typed pre-admission 429 with caller-backoff `Retry-After`, generic 409/503, [`RecoveryRequired`](../dev/writes.md#failure-outcomes), malformed success, precondition failure and earlier compound effects. Present unsupported or unidentified request contracts and an incompatible response after dispatch. | Whole-command exits/actions follow [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes), checked against request/effect census. Unknown effects, a generic status or a retry header alone never permit replay. Unsupported/unidentified request contracts refuse before admission with no effects or fallback; response incompatibility after dispatch reports unknown effects. Structured output preserves admission backoff without requiring a scheduled server retry. | Exit/output, headers, identified contract and admission/effect census. The explicit contract discriminator and proposed exits/classifications are product prerequisites; current health version fields and v0.11 behavior are not their qualification. Prerequisite: refusal/malformed-response fixtures and Server concurrent controls (separate RFC amending RFC 0045) for held pre-admission 429. |
+| T1.receipt | H + D + E | Hold changing merge A after publication, or no-op A after its outcome is established, before response construction; publish B; release A. Cover no-op, fast-forward and three-way through `POST /mutate` with a `branch merge` statement; the `/branches/merge` route stays with the server route suites. | For a changing merge, expect A's own outcome, parents, actor and manifest version; substituting B's receipt fails. For no-op, an independent held outcome observation and protected history bound to A prove that A published nothing; the wire result is `already_up_to_date` with `commit: null`. Fabricating a receipt for that no-op fails. | Identified v0.13 contract, harness operation identity, established outcome, reached hold, protected history and wire response; publication identity only where a publication exists. Prerequisite: Server concurrent controls (separate RFC amending RFC 0045); [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes). No additional no-op wire identity is required. |
+| T2.delivery | H + E | Suppress/truncate an already successful response; separately proxy 504 and caller timeout. | CLI request census proves one submission; accepted graph state proves effects despite delivery loss. Deliberate automatic resubmission must fail. | Actual CLI/server/proxy processes, identified v0.13 CLI/server contract, wire attempts and final content; no inferred idempotency. Prerequisite: a transport control (response truncation, proxy 504, caller timeout) spelled in a later RFC 0045 amendment; until then the row's evidence stays with the CLI Rust owner. |
+| T2.compound | H + E | Permit merge but deny optional source deletion under the v0.13 contract. | Independently verify the merged target and retained source. Require exit 0, the merge's own receipt, `branch_deleted: false` and `branch_delete_error_details` as `ErrorOutput`; no legacy error alias or automatic merge replay. Missing structured failure or a lost receipt fails. | Per-action authorization/outcomes and publication evidence. Prerequisite: a case-declared policy and receipt-field expect (format additions owned by RFC 0045); until then the existing CLI/server Rust owners retain these assertions. |
+| T3.retry | H + E | Exercise v0.13 typed pre-admission 429 with caller-backoff `Retry-After`, generic 409/503, [`RecoveryRequired`](../dev/writes.md#failure-outcomes), malformed success, precondition failure and earlier compound effects. Present unsupported or unidentified request contracts and an incompatible response after dispatch. | Whole-command exits/actions follow [exact outcomes](2026-09-29-server-runtime-and-online-deployment.md#exact-outcomes), checked against request/effect census. Unknown effects, a generic status or a retry header alone never permit replay. Unsupported/unidentified request contracts refuse before admission with no effects or fallback; response incompatibility after dispatch reports unknown effects. Structured output preserves admission backoff without requiring a scheduled server retry. | Exit/output, headers, identified contract and admission/effect census. The explicit contract discriminator and proposed exits/classifications are product prerequisites; current health version fields and v0.11 behavior are not their qualification. Prerequisite: refusal/malformed-response fixtures and Server concurrent controls (separate RFC amending RFC 0045) for held pre-admission 429. |
 | T4.visibility | E + D | Fault mutation, multi-table load, schema apply, merge and optimize around detached effects and graph publication, including acknowledgment loss and named branches where supported. | Exact authored rows/types, table pins, accepted contract and lineage; unpublished artifacts stay unreachable. A visible participant prefix, mixed pin/contract view or duplicate publication fails. | Reached phase, raw outcome and exact accepted-state evidence. Existing `schema_apply`, `failpoints` and `detached_commit_matrix` owners retain E; D remains separately qualified. One-graph atomicity, no cross-graph transaction. |
 | T4.progress | E + D | Remove supported transient capture/publication faults; issue a traversal and follow-up write on the same live engine, then repeat handle reopen twice. Include schema apply before publication and after an acknowledgment loss. | The accepted contract and pins agree without file installation or a sentinel. Proven outcomes permit supported progress without duplicate publication; uncertain work retains authority and refuses reuse. Reopen-only success cannot prove same-engine progress. | Engine/process identity, exact publication outcome and schema/table evidence. Existing `schema_apply`, `failpoints` and `detached_commit_matrix` owners retain E; native settlement and D remain separately gated. |
 | T4.foreign | E + H | Introduce a foreign linear version above the registration's `omnigraph.last_linear_version`. | Reads/writes use published pins; `repair` reports `foreign_drift` without adoption; cleanup preserves foreign manifests/files. Substituting foreign rows fails. | Before/after accepted-pin and foreign-artifact census under current detached-only semantics. Prerequisite: a fixture that constructs a foreign linear version (later RFC 0045 amendment; schema and JSONL seed cannot); until then its Rust owner `crates/omnigraph/tests/maintenance.rs` keeps it. |
@@ -682,3 +682,9 @@ the maintainer who confirms or reverses it and the event that forces that call.
 - 2026-10-02: Qualification restores T11.status's exact inventory, 503/404 and liveness/readiness assertions and adds T11.embed for the promised ingestion diagnostic. T8.live now exercises candidate expiry before timer delivery; T9.identity requires partial convergence across A/B with unaffected C, distinguishing known refusal from process-contained uncertainty. B1 restores independent target extent, projected columns and row width alongside the schema/history sweep; small payloads and feed evidence cannot qualify merge memory.
 
 - 2026-10-03: Extend T8.live to graph creation, server-bound remote capture without client storage access, runtime provider preflight and pre-effect abort with retained request ownership. Retired import/refresh commands are refusal cases; Azure emulator evidence does not replace live-provider qualification.
+
+- 2026-10-07: Replaced the body's v0.12 release/wire qualification sentences,
+  rollout labels and evidence cells with the single current v0.13 contract.
+  The [HTTP admission decision](2026-09-30-v012-http-admission.md) owns the
+  discriminator change and refusal rules; historical decision-log entries retain
+  their original release scope. No storage-format change follows from the wire bump.

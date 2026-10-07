@@ -1902,27 +1902,34 @@ mod tests {
 
     #[tokio::test]
     async fn graph_http_discovery_refuses_before_data_dispatch() {
-        use omnigraph_api_types::HTTP_API_CONTRACT_HEADER as HEADER;
+        use omnigraph_api_types::{
+            HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER,
+        };
 
         let target = IntentApiFixture::new(vec![]);
         for managed in [false, true] {
             for (status, headers) in [
                 (200, vec![]),
                 (200, vec![(HEADER.into(), "0.11".into())]),
-                (200, vec![(HEADER.into(), "0.12, 0.12".into())]),
+                (200, vec![(HEADER.into(), "0.12".into())]),
+                (200, vec![(HEADER.into(), "0.14".into())]),
+                (
+                    200,
+                    vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
+                ),
                 (
                     200,
                     vec![
-                        (HEADER.into(), "0.12".into()),
-                        (HEADER.into(), "0.12".into()),
+                        (HEADER.into(), CONTRACT.into()),
+                        (HEADER.into(), CONTRACT.into()),
                     ],
                 ),
-                (401, vec![(HEADER.into(), "0.12".into())]),
-                (503, vec![(HEADER.into(), "0.12".into())]),
+                (401, vec![(HEADER.into(), CONTRACT.into())]),
+                (503, vec![(HEADER.into(), CONTRACT.into())]),
                 (
                     302,
                     vec![
-                        (HEADER.into(), "0.12".into()),
+                        (HEADER.into(), CONTRACT.into()),
                         ("Location".into(), target.origin.clone()),
                     ],
                 ),
@@ -2008,7 +2015,7 @@ mod tests {
             assert_eq!(pair[1].headers["authorization"], "Bearer data-bearer");
             assert_eq!(
                 pair[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
-                "0.12"
+                omnigraph_api_types::HTTP_API_CONTRACT
             );
         }
         server.assert_complete();

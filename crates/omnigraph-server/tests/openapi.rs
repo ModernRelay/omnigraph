@@ -1533,7 +1533,7 @@ fn error_code_schema_has_expected_variants() {
             "graph_unavailable",
             "internal",
         ]),
-        "ErrorCode must match the closed v0.12 HTTP contract, including its \
+        "ErrorCode must match the closed HTTP contract, including its \
          explicit API admission and graph availability refusals",
     );
 }

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -61,8 +61,8 @@ Whole-command retry classification remains A3; server-owned writes remain B.
 
 ## Compatibility and invariants
 
-This is the coordinated v0.12 contract admitted by
-[v0.12 HTTP admission](2026-09-30-v012-http-admission.md). HTTP integrations must
+These receipts belong to the single current contract admitted by
+[HTTP contract admission](2026-09-30-v012-http-admission.md). HTTP integrations must
 consume the required merge receipt and structured deletion error. Embedded Rust
 callers adapt to `MergeResult`; no old-return-type wrapper or wire alias remains.
 No migration, graph reset or additional publication is required.
@@ -112,3 +112,5 @@ executed gates before marking implementation complete.
 
 - 2026-09-30: Qualified canonical branch names at the dedicated CLI boundary
   while hardening the reviewed stack.
+
+- 2026-10-07: Replaced the Compatibility sentence tying receipts to v0.12 with the current HTTP admission decision; receipt semantics are unchanged.

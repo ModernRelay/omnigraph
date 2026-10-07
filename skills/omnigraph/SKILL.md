@@ -2,10 +2,10 @@
 name: omnigraph
 description: Operate OmniGraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, OmniGraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
-compatibility: Covers OmniGraph CLI and server 0.12.0. Upgrade the CLI, server and HTTP integrations together; only storage format 14 is served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
+compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; only storage format 14 is served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.12.0"
+  version: "0.13.0"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -14,8 +14,9 @@ metadata:
 This skill captures the operational rules for working with a locally or remotely deployed Omnigraph. Follow them when authoring schema, writing queries, loading data, evolving schema, or automating graph operations.
 
 Check `omnigraph version` and the command's `--help` before using these
-instructions. This skill targets the [v0.12.0 release](https://github.com/ModernRelay/omnigraph/releases/tag/v0.12.0),
-which reports `internal-schema 14 (serves v14 to v14)` and serves storage
+instructions. This skill tracks the current CLI/server contract, including
+`Omnigraph-Http-Api: 0.13`; the released 0.12 contract is unsupported. The engine
+reports `internal-schema 14 (serves v14 to v14)` and serves storage
 format 14 only. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
 standalone v8 or v9 graph (written by 0.11.x) or a v13 graph is converted in
