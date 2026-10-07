@@ -9,7 +9,7 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobCell, BlobContent, EntityKind};
-use omnigraph_server::api::{IngestRequest, ReadRequest};
+use omnigraph_server::api::{IngestRequest, QueryRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
@@ -96,9 +96,9 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     assert_eq!(snapshot_status, StatusCode::OK);
     assert!(snapshot_body["datasets"].is_array());
 
-    let read = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -108,7 +108,7 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/read"))
+            .uri(g("/query"))
             .method(Method::POST)
             .header("authorization", "Bearer object-store-token")
             .header("content-type", "application/json")

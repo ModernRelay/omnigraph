@@ -2,13 +2,13 @@
 //!
 //! The handoff calls this out as the empirical proof of MR-686's central
 //! design promise: per-actor admission control isolates noisy actors so a
-//! heavy `/ingest` user does not starve light `/change` traffic. The
+//! heavy `/load` user does not starve light `/mutate` traffic. The
 //! per-`(table, branch)` queue pins the same-key serialization story; this
 //! bench pins actor isolation under load.
 //!
 //! Setup:
-//! - One "heavy" actor flooding `/ingest` with multi-row NDJSON bodies.
-//! - N "light" actors each running short bursts of `/change` inserts.
+//! - One "heavy" actor flooding `/load` with multi-row NDJSON bodies.
+//! - N "light" actors each running short bursts of `/mutate` inserts.
 //! - Each actor authenticates with its own bearer token so the
 //!   `WorkloadController` accounts them as distinct identities.
 //!
@@ -48,20 +48,20 @@ const HEAVY_ACTOR: &str = "act-heavy";
 #[derive(Parser, Debug)]
 #[command(about = "Actor-isolation HTTP bench for MR-686 WorkloadController")]
 struct Args {
-    /// Number of light actors driving /change traffic concurrently with the
-    /// heavy /ingest flood. Each gets its own bearer token.
+    /// Number of light actors driving /mutate traffic concurrently with the
+    /// heavy /load flood. Each gets its own bearer token.
     #[arg(long, default_value_t = 4)]
     light_actors: usize,
-    /// Number of /change ops per light actor.
+    /// Number of /mutate ops per light actor.
     #[arg(long, default_value_t = 50)]
     light_ops_per_actor: usize,
-    /// Number of /ingest batches the heavy actor sends.
+    /// Number of /load batches the heavy actor sends.
     #[arg(long, default_value_t = 200)]
     heavy_batches: usize,
-    /// NDJSON rows per heavy /ingest batch.
+    /// NDJSON rows per heavy /load batch.
     #[arg(long, default_value_t = 200)]
     heavy_rows_per_batch: usize,
-    /// Concurrent in-flight /ingest tasks the heavy actor maintains. With
+    /// Concurrent in-flight /load tasks the heavy actor maintains. With
     /// `inflight_cap` smaller than this, the heavy actor exercises its own
     /// admission cap (and the bench reports `heavy_too_many_requests > 0`),
     /// proving the gate fires without affecting light actors. Default 4
@@ -133,7 +133,7 @@ async fn send_heavy_batch(app: Router, batch_idx: usize, rows: usize) -> StatusC
     let req = Request::builder()
         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
-        .uri("/graphs/default/ingest")
+        .uri("/graphs/default/load")
         .header("authorization", format!("Bearer {HEAVY_TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(body))
@@ -144,7 +144,7 @@ async fn send_heavy_batch(app: Router, batch_idx: usize, rows: usize) -> StatusC
     }
 }
 
-/// Drive `batches` /ingest calls from the heavy actor with up to
+/// Drive `batches` /load calls from the heavy actor with up to
 /// `concurrency` in flight at a time. With `concurrency > inflight_cap`,
 /// the heavy actor's own admission permits are exhausted at peak, and
 /// some batches return 429. Returns (ok, 429, other) counts.
@@ -214,7 +214,7 @@ async fn drive_light_actor(
         let req = Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
-            .uri("/graphs/default/change")
+            .uri("/graphs/default/mutate")
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(body))
@@ -374,7 +374,7 @@ async fn main() {
         light_p99_ms: pct(0.99),
         light_p999_ms: pct(0.999),
         light_max_ms: max_ms,
-        notes: "MR-686 actor-isolation bench. Heavy /ingest + light /change concurrent.",
+        notes: "MR-686 actor-isolation bench. Heavy /load + light /mutate concurrent.",
     };
 
     let json = serde_json::to_string_pretty(&results).unwrap();

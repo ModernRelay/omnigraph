@@ -83,7 +83,7 @@ pub fn managed_cli(config: &Path, origin: &str) -> Command {
         .env("OMNIGRAPH_CONTROL_API", origin)
         .env("OMNIGRAPH_TOKEN", "data-token-must-not-be-used")
         .current_dir(config)
-        .arg("cluster")
+        .args(["cluster", "--managed"])
         .timeout(Duration::from_secs(15));
     command
 }
@@ -105,7 +105,7 @@ fn server_process() -> StdCommand {
     }
 }
 
-fn built_server_binary() -> Option<PathBuf> {
+pub fn built_server_binary() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let candidate = workspace_root
         .join("target")
@@ -245,6 +245,35 @@ impl TestServer {
         read_stderr(&self.stderr_log)
     }
 
+    /// Settle an otherwise idle process through the real shutdown path before
+    /// a cross-version test releases its retained writer lock.
+    #[cfg(unix)]
+    pub fn stop_gracefully(mut self) -> String {
+        // The owned child has not been reaped, so its pid cannot be reused.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) },
+            0,
+            "signal test server"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for test server") {
+                assert!(
+                    status.success(),
+                    "server shutdown: {status}\n{}",
+                    self.stderr()
+                );
+                return self.stderr();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server failed to settle\n{}",
+                self.stderr()
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Everything the server wrote to stderr so far; the diagnostic of a
     /// request that died mid-stream lives here, not in the client's error.
     pub fn stderr(&self) -> String {
@@ -288,10 +317,14 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
         }
     });
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
     let mut base_url = None;
     let mut early_exit = None;
-    for _ in 0..300 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         if base_url.is_none()
             && let Ok(address) = listen_addr_rx.try_recv()
         {
@@ -326,8 +359,8 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
     // visible for both a stalled process and an early startup failure.
     if early_exit.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
     }
+    let _ = child.wait();
     let stderr = read_stderr(&stderr_log);
     match early_exit {
         Some(status) => {
@@ -388,16 +421,30 @@ pub fn spawn_server_with_cluster_env(cluster_dir: &Path, envs: &[(&str, &str)]) 
 /// The same cluster startup owner, with an explicit attested executable and
 /// a cleared environment for controlled cross-binary diagnostics.
 pub fn spawn_server_with_cluster_binary(cluster_dir: &Path, binary: &Path) -> TestServer {
+    spawn_server_with_cluster_binary_env(
+        cluster_dir,
+        binary,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    )
+}
+
+pub fn spawn_server_with_cluster_binary_env(
+    cluster_dir: &Path,
+    binary: &Path,
+    envs: &[(&str, &str)],
+) -> TestServer {
     let mut command = StdCommand::new(binary);
     command.env_clear();
     command.env("LANCE_MEM_POOL_SIZE", HTTP_DIAGNOSTIC_LANCE_POOL_BYTES);
     command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
     command.env("LANG", "C");
     command.env("LC_ALL", "C");
-    command.env(
-        "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-        r#"{"act-parity":"parity-tok"}"#,
-    );
+    for (name, value) in envs {
+        command.env(name, value);
+    }
     command.arg("--cluster").arg(cluster_dir);
     spawn_server_process(command)
 }

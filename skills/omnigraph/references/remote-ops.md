@@ -76,7 +76,7 @@ exits `4`; HTTP returns `412` with `precondition_failure: {expected, actual?}`.
 Re-read and decide again. Fetching a head id after the read does not close the
 race.
 
-Over HTTP, beside the `Omnigraph-Http-Api: 0.12` header every graph request
+Over HTTP, beside the `Omnigraph-Http-Api: 0.13` header every graph request
 needs, send the raw id in the `Omnigraph-If-Graph-Commit` header to
 `POST /graphs/{id}/mutate/if-graph-commit` or
 `POST /graphs/{id}/queries/{name}/if-graph-commit`. The plain routes reject that

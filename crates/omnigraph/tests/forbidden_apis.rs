@@ -291,6 +291,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "plan_schema"),
     ("db/omnigraph.rs", "preview_schema_apply"),
     ("db/omnigraph.rs", "prepare_schema_apply_as"),
+    ("db/omnigraph.rs", "prepare_schema_apply_with_plan_as"),
     ("db/omnigraph.rs", "prepare_schema_settlement_as"),
     ("db/omnigraph.rs", "reconcile_schema_apply_as"),
     ("db/omnigraph.rs", "snapshot_of"),
@@ -872,7 +873,9 @@ durable_calls! {
     ("omnigraph-core/storage.rs", ".rename_text(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("omnigraph-core/storage.rs", ".delete(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
     ("omnigraph-core/storage.rs", ".delete_prefix(", 1, WriteProtocol::Composed("engine storage compatibility forwarding")),
-    ("omnigraph-storage/lib.rs", ".delete(", 3, WriteProtocol::Composed("storage adapter primitive, including Azure rename source retirement")),
+    // Prefix deletion also removes the exact root marker after descendants;
+    // callers supply deletion authority and keep writers excluded throughout.
+    ("omnigraph-storage/lib.rs", ".delete(", 4, WriteProtocol::Composed("ordinary object deletion, Azure rename source retirement, prefix descendants and exact root marker removal")),
     // One `.put(` beyond upstream's Azure set: the binary `write_bytes`
     // primitive (graph-index artifact), same atomic-visibility PUT contract
     // as `write_text`.

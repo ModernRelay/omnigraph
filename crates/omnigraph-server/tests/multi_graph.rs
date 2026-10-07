@@ -8,7 +8,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
-use omnigraph_server::api::{ErrorOutput, ExportRequest, ReadRequest};
+use omnigraph_server::api::{ErrorOutput, ExportRequest, QueryRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::Value;
 use serial_test::serial;
@@ -281,7 +281,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
     }
 
     // Cell i: BranchDelete × Change, on a different branch. Delete one
-    // branch while a /change runs on main. Both should succeed.
+    // branch while a /mutate runs on main. Both should succeed.
     {
         let cell = "i:branch_delete×change:distinct-branch";
         let h = matrix::Harness::new().await;
@@ -827,9 +827,9 @@ graphs:
     .unwrap();
     let app = build_app(state);
 
-    let read = ReadRequest {
-        query_source: EMBED_QUERY.to_string(),
-        query_name: Some("vector_search_string".to_string()),
+    let read = QueryRequest {
+        query: EMBED_QUERY.to_string(),
+        name: Some("vector_search_string".to_string()),
         params: Some(serde_json::json!({ "q": "alpha" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -839,7 +839,7 @@ graphs:
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri("/graphs/knowledge/read")
+            .uri("/graphs/knowledge/query")
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))

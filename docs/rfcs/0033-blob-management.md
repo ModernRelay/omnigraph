@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-10-04
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -346,7 +346,7 @@ boundaries, just like `cleanup`: Phase 1 adds
 no durable reader lease or cross-process live-reader registry. Callers that
 require an opened reader to finish must quiesce it before deleting that branch,
 running version GC, or performing an offline operation that removes a ref/path.
-The v0.12 [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md)
+The [server runtime decision](2026-09-29-server-runtime-and-online-deployment.md)
 drains affected reads during deployment. Independent historical availability
 and its stronger reader-retention protocol require a separate proposal; neither
 changes the quiescence rule above. Ordinary detached writes need no compensation.
@@ -1842,3 +1842,5 @@ publisher architecture.
   contract; §11's uncertainty row retains publication/control uncertainty without
   the removed schema-installation phase. Blob behavior and serving-view
   requirements are unchanged.
+
+- 2026-10-07: Replaced the v0.12 qualifier on §3.3's server-runtime link with the current decision; the Blob quiescence rule is unchanged.

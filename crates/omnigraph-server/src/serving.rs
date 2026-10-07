@@ -17,8 +17,7 @@ use tokio::time::Instant;
 use crate::ApiError;
 use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
-use crate::queries::QueryRegistry;
-use crate::registry::{GraphHandle, GraphRegistry};
+use crate::registry::{BlockedGraph, GraphHandle, GraphRegistry};
 
 /// A non-reusable epoch within one registered graph's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +36,7 @@ impl ServingEpoch {
     }
 }
 
-/// Immutable bindings for one epoch. Changed bindings retain the same engine;
+/// Immutable bindings for one epoch. Changed bindings retain the engine owner;
 /// a view is not an engine snapshot or a native settlement proof.
 pub struct ServingView {
     handle: Arc<GraphHandle>,
@@ -256,6 +255,8 @@ impl From<ApiError> for ServingTransitionError {
 /// Arc identity fences stale tickets without a second persistent identity.
 pub(crate) struct TransitionRecord {
     pub(crate) predecessors: Vec<Arc<ServingView>>,
+    pub(crate) unavailable: Vec<Arc<BlockedGraph>>,
+    pub(crate) recovering: std::collections::HashSet<GraphKey>,
     pub(crate) deadline: Instant,
 }
 
@@ -299,7 +300,8 @@ impl Drop for PreparedTransition {
 
 /// Closed predecessors. Dropping this ticket retires its scheduling record;
 /// the registry retains closed views and their resources until process shutdown.
-/// Successful validated activation opens fresh epochs under the original deadline.
+/// Standalone transitions keep their deadline. A drained deployment transfers
+/// completion to its owned executor under the process shutdown boundary.
 pub struct GraphTransition {
     registry: Arc<GraphRegistry>,
     record: Arc<TransitionRecord>,
@@ -324,12 +326,9 @@ impl GraphTransition {
     ) -> Result<HashMap<GraphKey, Arc<Omnigraph>>, ServingTransitionError> {
         self.operations.while_open(|| {
             self.registry.check_drained(&self.record)?;
-            if self
-                .record
-                .predecessors
-                .iter()
-                .any(|view| !view.contract_is_current())
-            {
+            if self.record.predecessors.iter().any(|view| {
+                !self.record.recovering.contains(&view.key) && !view.contract_is_current()
+            }) {
                 return Err(ServingTransitionError::SchemaChanged);
             }
             Ok(self
@@ -341,19 +340,35 @@ impl GraphTransition {
         })
     }
 
-    /// Publish complete query/schema bindings only after the deployment
-    /// controller has recorded their durable achieved state. All replacement
-    /// engines and policies stay identical; additions are already durable graphs.
-    pub(crate) fn activate(
-        self,
-        bindings: HashMap<GraphKey, (SchemaContractDigest, QueryRegistry)>,
-        additions: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
-    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
-        let replacements = self
-            .registry
-            .validate_activation(&self.record, bindings, additions)?;
+    /// Transfer a drained deployment to its completion owner before entering
+    /// the shared executor. Pre-effect refusals still restore unchanged views.
+    pub(crate) fn retain_deployment_completion(&self) -> Result<(), ServingTransitionError> {
         self.operations
-            .while_open(|| self.registry.activate(&self.record, replacements))
+            .while_open(|| self.registry.retain_deployment_completion(&self.record))
+    }
+
+    /// Publish graph lifecycle and authorization changes in one registry snapshot.
+    pub(crate) fn activate_deployment(
+        self,
+        handles: Vec<(Arc<GraphHandle>, SchemaContractDigest)>,
+        unavailable: Vec<Arc<BlockedGraph>>,
+        deleted: Vec<(GraphKey, SchemaContractDigest)>,
+        server_policy: Option<Arc<crate::PolicyEngine>>,
+        deployment: Option<crate::deployment::ActiveDeployment>,
+    ) -> Result<HashMap<GraphKey, ServingEpoch>, ServingTransitionError> {
+        let views = self
+            .registry
+            .validate_deployment_activation(&self.record, handles)?;
+        self.operations.while_open(|| {
+            self.registry.activate_deployment(
+                &self.record,
+                views,
+                unavailable,
+                deleted,
+                server_policy,
+                deployment,
+            )
+        })
     }
 
     /// The controller attests no deployment effect began. Reopen only these

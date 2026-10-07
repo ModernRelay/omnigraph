@@ -93,6 +93,17 @@ async fn plan_schema_reports_supported_additive_change() {
 
     let preview = db.preview_schema_apply(&desired).await.unwrap();
     assert_eq!(preview.catalog.node_types.len(), 2);
+
+    let contract = db.schema_contract_digest();
+    // The served observational planner uses the accepted in-memory contract;
+    // it must neither reopen this root nor wait on a schema gate.
+    let parked = dir.path().with_extension("parked");
+    std::fs::rename(dir.path(), &parked).unwrap();
+    let observed = db.plan_schema_at_contract(&desired, &contract).unwrap();
+    std::fs::rename(&parked, dir.path()).unwrap();
+    assert_eq!(observed, plan);
+    db.apply_schema(&desired).await.unwrap();
+    assert!(db.plan_schema_at_contract(&desired, &contract).is_err());
 }
 
 #[tokio::test]
@@ -807,10 +818,16 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     let predecessor = db.list_commits(None).await.unwrap()[0].clone();
     let files_before = schema_storage_bytes(dir.path());
     let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
-    let prepared = db
-        .prepare_schema_apply_as(&desired, Some("deployer"))
+    let (prepared, migration) = db
+        .prepare_schema_apply_with_plan_as(&desired, Some("deployer"))
         .await
         .unwrap();
+    assert!(migration.supported);
+    assert!(migration.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty { type_name, property_name, .. }
+            if type_name == "Person" && property_name == "nickname"
+    )));
     assert!(!prepared.is_noop());
     assert_eq!(prepared.actor(), Some("deployer"));
     assert_eq!(
@@ -845,6 +862,7 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
         .unwrap();
     let commit = result.commit.as_ref().unwrap();
     assert!(result.applied);
+    assert_eq!(result.steps, migration.steps);
     assert_eq!(
         intent_nonce(&commit.graph_commit_id).unwrap(),
         commit_id,

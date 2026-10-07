@@ -115,7 +115,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.12
+Omnigraph-Http-Api: 0.13
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),
@@ -165,8 +165,7 @@ and retry.
 
 The HTTP load request body is also capped at 32 MiB. That cap counts the
 encoded request, so one request carries about 24 MiB of decoded `base64:`
-data. Every HTTP request other than a load (`/load`, `/load/ndjson`,
-`/ingest`) is bounded by the default 1 MiB request body limit, so a `base64:`
+data. Every HTTP request other than a load (`/load` and `/load/ndjson`) is bounded by the default 1 MiB request body limit, so a `base64:`
 literal in an HTTP mutation hits that limit first.
 
 Values larger than these limits stay readable. The CLI and the HTTP server

@@ -85,6 +85,25 @@ pub(super) async fn plan_schema(
         .map_err(|err| OmniError::manifest(err.to_string()))
 }
 
+pub(super) fn plan_schema_at_contract(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    expected: &SchemaContractDigest,
+) -> Result<SchemaMigrationPlan> {
+    let view = db.schema_view.load();
+    if &view.contract_digest() != expected {
+        return Err(OmniError::manifest_conflict(
+            "handle schema differs from the observed deployment contract",
+        ));
+    }
+    let accepted_ir = view.catalog.bound_schema_ir().ok_or_else(|| {
+        OmniError::manifest_internal("accepted catalog carries no bound SchemaIR")
+    })?;
+    let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
+    plan_schema_migration(accepted_ir, &desired_ir)
+        .map_err(|error| OmniError::manifest(error.to_string()))
+}
+
 /// The accepted IR a plan is made against: the contract of the live view the
 /// handle resolves now (probe, refresh when the manifest moved), not the
 /// handle's warm ArcSwap catalog.

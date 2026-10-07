@@ -125,20 +125,44 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge.
+timeout without replaying a committed merge. Its deployment matrix holds a real
+admitted request through drain, disconnects or times out the caller before
+durable acceptance, and loses replies after acceptance. Exact-ID observation
+must finish with one ledger result, one schema publication and the same server
+PID; neither apply nor recovery polling may resubmit.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
-own capture/close ordering, deadlines, schema identity and candidate bounds;
+own capture/close ordering, drain-only deployment deadlines, affected activation
+scope, schema identity and candidate bounds;
 `operations`, `ingress` and `mcp` own detached execution and output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
 are not generic native settlement. Server `boot_settings` exercises authenticated
-submission, parked requests, caller disconnect, pre-effect refusal and historical
-ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement and graph addition while an unaffected peer keeps serving.
+submission, parked requests, caller disconnect, pre-effect refusal, durable
+acceptance before completion, activation-in-progress observation and exact receipt
+access after management handoff. It also holds a merge across served schema
+planning to prove preview does not wait for the graph gate. In-source
+`deployment` tests suspend observer read futures across owner start, finish and complete
+turnover, exercising bounded re-observation for aggregate and exact status.
+CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
+retries, malformed-receipt refusal, terminal outcomes and caller timeout without
+replay. Its managed fixtures cover status/history scope and filters, explicit
+`--managed` selection, and wrong-mode refusals before context or external access.
+Direct apply must ignore both valid and malformed managed folder context.
+CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
+replacement, graph addition, policy grant/revocation and management handoff;
+the original submitter retains only its exact receipt access after restart.
+Extend that same journey for graph deletion, proving target storage/history
+removal, peer preservation and unchanged PID/listener, including a served deletion
+preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks
+the achieved configuration again after restart. The local journey also exercises
+counted embedding-provider replacement, external-Blob admission changes, catalog
+integrity reporting, schema-drift refusal and missing-root refusal. S3/Azure wrappers
+share the transport-independent phases; local success does not qualify their
+storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
@@ -146,7 +170,10 @@ Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
 exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
 exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
-interruption windows, killed-process recovery and corrective successors;
+interruption windows, killed-process recovery and corrective successors, including
+deletion before start, during partial removal, after root absence and before
+terminal ledger acknowledgement, same-lifetime older manifest survivors,
+replacement refusal and corrective creation in empty local settlement residue;
 `tests/identity_recovery.rs` owns current-actor authorization and adoption of a
 persisted settlement without replacing its author. CLI
 `tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
@@ -252,6 +279,41 @@ reads. The catalog tests own row uniqueness, projection and validation;
 [support matrix](versioning.md#storage-upgrade-support-matrix).
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
+
+### Manual 0.12 cluster upgrade qualification
+
+`genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment` is an ignored,
+Unix-only release qualification test. It creates genuine 0.12 receipts, stops
+the old server, converts the ledger, checks data/history/schema identity and
+historical reads, then applies live schema and policy changes. Storage stays at
+format 14. Ordinary CI keeps current-version live-deployment coverage; it does
+not download 0.12 or run this journey.
+
+Run explicitly from the repository root when qualifying that upgrade path,
+using a native build with Cargo's default `target/` directory.
+Both predecessor variables are required; missing binaries fail. The installer
+verifies the official archive checksum. Copy the freshly built candidate server
+so another build cannot replace it during qualification:
+
+```bash
+set -euo pipefail
+qualification_dir=$(mktemp -d)
+REPO_SLUG=ModernRelay/omnigraph VERSION=v0.12.0 INSTALL_DIR="$qualification_dir/v012" bash scripts/install.sh
+qualification_features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo build --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster --features "$qualification_features"
+cp target/debug/omnigraph-server "$qualification_dir/omnigraph-server"
+env RUST_MIN_STACK=16777216 \
+  OMNIGRAPH_V012_BIN="$qualification_dir/v012/omnigraph" \
+  OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
+  "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
+  cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
+    --features "$qualification_features" --test crossversion_upgrade \
+    genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment \
+    -- --exact --ignored --test-threads=1 --nocapture
+```
+
+Qualification requires `1 passed; 0 failed; 0 ignored`; an empty or ignored run
+is not evidence. Keep its output with the release qualification record.
 
 ## Commands
 
