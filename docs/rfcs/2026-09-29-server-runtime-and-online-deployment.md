@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-07
+updated: 2026-10-08
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -681,7 +681,9 @@ is emulated, and Azure requires its separate admission qualification.
 `bootstrap_serving(config_dir, caller)` captures and validates the ordinary
 bounded configuration and existing bootstrap authorization. It refuses graphs,
 schemas, queries, providers, Blob bindings, existing ledgers, graph residue and
-unknown control state. It acquires one private bootstrap admission and retains
+unknown native control state. Freshness covers native-owned authority and graph
+namespaces; unrelated opaque application metadata is neither adopted nor used
+as execution authority. It acquires one private bootstrap admission and retains
 it across the initial ledger and the existing policy deployment protocol.
 That capability never escapes to callers or permits a second deployment. No
 graph engine opens. Every state transition increments the native revision and
