@@ -78,6 +78,32 @@ through `cluster.yaml`; a root URI boots directly from applied resources. Editin
 local files alone never changes serving behavior. See
 [HTTP server](../operations/server.md) for authentication and routes.
 
+### First boot from a bootstrap receipt
+
+Administrators using the `omnigraph-cluster` library can prepare a fresh S3
+cluster with `bootstrap_serving`, containing only its initial cluster management
+policy. After that initializer has stopped, supply its exact receipt at first boot:
+
+```bash
+OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
+  omnigraph-server --cluster s3://company-data/company-brain \
+  --bootstrap-handoff /run/omnigraph/bootstrap-receipt.json
+```
+
+The receipt must be a regular file containing strict JSON, at most 16 KiB.
+It must match the selected root and its completed empty bootstrap. The server
+claims ownership once before listening; replay, mismatched state and uncertain
+claims refuse. Any failure after the claim retains ownership, including invalid
+trust or server settings. Investigate that exact attempt; do not retry by
+removing the lock or omitting the flag.
+
+The receipt supplies no user permissions. Configure static tokens or identity
+trust normally; the applied policy controls who can create the first graph
+through `cluster apply --server`. Protect the receipt and boot configuration as
+administrator inputs. This path supports only first boot of a fresh S3 cluster;
+it is not a restart, recovery or writer-fencing mechanism. Local and Azure roots
+are unsupported, and other writers must remain excluded.
+
 ## Deploy without restarting
 
 Edit and validate the bundle, then submit it to the running owner:

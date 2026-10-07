@@ -15,7 +15,8 @@ use handlers::*;
 use settings::*;
 pub use settings::{
     ServerRuntimeState, classify_server_runtime_state, load_server_settings,
-    load_server_settings_with_data_token_trust, load_server_settings_with_identity_trust,
+    load_server_settings_with_bootstrap_handoff, load_server_settings_with_data_token_trust,
+    load_server_settings_with_identity_trust,
 };
 pub mod auth;
 pub mod data_tokens;
@@ -217,11 +218,11 @@ pub struct ServerConfig {
     pub cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
 }
 
-/// Applied server settings paired with already validated offline token trust.
+/// Applied server settings bound to a root and optional validated identity trust.
 ///
-/// Constructed only by [`load_server_settings_with_data_token_trust`]. The
-/// settings are exposed read-only so their graphs cannot be replaced after the
-/// canonical serving root has been checked against the trust document.
+/// Constructed by the identity-trust and bootstrap-handoff settings loaders. The
+/// settings are exposed read-only so their graphs cannot be replaced after
+/// ownership or identity trust has been bound to the canonical serving root.
 #[derive(Debug, Clone)]
 pub struct ManagedServerConfig {
     config: ServerConfig,
@@ -2488,8 +2489,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     serve_config(config, None, None).await
 }
 
-/// Serve settings whose offline data-token trust was validated against their
-/// applied snapshot's canonical root before any graph engine open.
+/// Serve root-bound settings whose enabled identity trust was validated against
+/// the applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
     serve_config(config.config, config.trust, config.oidc_trust).await
 }
