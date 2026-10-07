@@ -221,7 +221,7 @@ pub struct ExpectedLogicalContentV1 {
 }
 
 /// A normalized declaration and its complete, version-bearing audit digest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedFixtureReferenceV1 {
     pub definition: FixtureReferenceV1,

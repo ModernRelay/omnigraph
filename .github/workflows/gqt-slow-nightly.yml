@@ -47,6 +47,30 @@ jobs:
       - name: Run the slow cases
         run: cargo run -p omnigraph-gqt --locked --bin omnigraph-gqt -- crates/omnigraph-gqt/cases_slow
 
+      - name: Validate full benchmark datasets
+        run: |
+          cargo run -p omnigraph-gqt --locked --bin omnigraph-gqt -- \
+            benchmarks/fixtures/branch_merge_d50.gqt \
+            benchmarks/fixtures/equal_current_narrow_one_batch.gqt \
+            benchmarks/fixtures/equal_current_wide_four_batches.gqt \
+            benchmarks/fixtures/equal_current_wide_one_batch.gqt \
+            benchmarks/fixtures/hot_table_idle_base.gqt \
+            benchmarks/fixtures/hot_table_idle_branches_4.gqt \
+            benchmarks/fixtures/hot_table_idle_branches_4_aged.gqt \
+            benchmarks/fixtures/hot_table_idle_tables_4.gqt \
+            benchmarks/fixtures/identity_lifecycle.gqt \
+            benchmarks/fixtures/nearest_ranks_updated_embedding.gqt \
+            benchmarks/fixtures/nearest_skips_deleted_rows_and_fills_limit.gqt \
+            benchmarks/fixtures/parallel_tables.gqt \
+            benchmarks/fixtures/repeated_deletion_recreation_branches.gqt \
+            benchmarks/fixtures/repeated_deletion_recreation_rows.gqt \
+            benchmarks/fixtures/threshold_crossings_after.gqt \
+            benchmarks/fixtures/threshold_crossings_at.gqt \
+            benchmarks/fixtures/threshold_crossings_before.gqt \
+            benchmarks/fixtures/threshold_crossings_production_control.gqt \
+            benchmarks/fixtures/tiny_graph.gqt \
+            benchmarks/fixtures/very_long_history_32.gqt
+
       - name: Retain GQT invocation reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

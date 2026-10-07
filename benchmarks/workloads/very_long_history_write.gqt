@@ -1,0 +1,32 @@
+# issue: none
+# notes: Fixed-live-data history checkpoint; selected write is separate from verification.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":1,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":1,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String

@@ -758,7 +758,7 @@ fn stage_failure(
     ValidationOutcome::failure(diagnostics)
 }
 
-fn load_source_descriptor(
+pub(crate) fn load_source_descriptor(
     path: &Path,
 ) -> Result<(RegisteredFixtureSourceV1, String), Vec<Diagnostic>> {
     let source = read_source_descriptor(path).map_err(|diagnostic| vec![diagnostic])?;
