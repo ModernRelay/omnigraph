@@ -45,6 +45,18 @@ pub(crate) struct StateLockFile {
 }
 
 impl StateLockFile {
+    fn new(operation: &str) -> Self {
+        Self {
+            version: LOCK_VERSION,
+            lock_id: Ulid::new().to_string(),
+            operation: operation.to_owned(),
+            created_at: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
+            pid: process::id(),
+        }
+    }
+
     pub(crate) fn parse(text: &str) -> Result<Self, StateLockError> {
         let lock: Self = serde_json::from_str(text).map_err(StateLockError::LockParse)?;
         if lock.version != LOCK_VERSION {
@@ -80,7 +92,8 @@ pub(crate) enum StateLockAcquire {
 /// Exclusive persisted cluster-state lock.
 ///
 /// Private fields and the absence of `Clone` make ownership non-forgeable.
-/// The only constructor performs the backend's atomic create-if-absent.
+/// Constructors perform atomic create-if-absent or the bounded initial
+/// bootstrap owner's exact-version conditional transfer.
 #[derive(Debug)]
 pub(crate) struct StateLockGuard {
     adapter: Arc<dyn StorageAdapter>,
@@ -160,15 +173,7 @@ pub(crate) async fn acquire_state_lock(
 ) -> Result<StateLockAcquire, StateLockError> {
     let _validated_cluster_root = cluster_root_from_lock_uri(lock_uri)?;
     let adapter = storage.adapter();
-    let lock = StateLockFile {
-        version: LOCK_VERSION,
-        lock_id: Ulid::new().to_string(),
-        operation: operation.to_string(),
-        created_at: OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-        pid: process::id(),
-    };
+    let lock = StateLockFile::new(operation);
     let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
     if adapter.write_text_if_absent(lock_uri, &payload).await? {
         return Ok(StateLockAcquire::Acquired(StateLockGuard {
@@ -180,6 +185,115 @@ pub(crate) async fn acquire_state_lock(
         }));
     }
     Ok(StateLockAcquire::Held)
+}
+
+const BOOTSTRAP_OPERATION: &str = "bootstrap_serving";
+
+/// No release path exists in initial bootstrap, including a lost write
+/// acknowledgement before a guard could be constructed.
+pub(crate) async fn acquire_bootstrap_lock(
+    adapter: Arc<dyn StorageAdapter>,
+    kind: StorageKind,
+    uri: &str,
+) -> Result<(StateLockGuard, String), StateLockError> {
+    require_conditional_bootstrap(kind, uri)?;
+    let lock = StateLockFile::new(BOOTSTRAP_OPERATION);
+    let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
+    if !adapter.write_text_if_absent(uri, &payload).await? {
+        return Err(StateLockError::InvalidBinding(
+            "bootstrap lock is already held".into(),
+        ));
+    }
+    let guard = StateLockGuard {
+        adapter: adapter.clone(),
+        uri: uri.into(),
+        kind,
+        lock,
+        release_on_drop: false,
+    };
+    let (observed, version) = read_bootstrap_lock(&adapter, uri).await?;
+    if observed.lock_id != guard.lock_id() {
+        return Err(StateLockError::InvalidBinding(
+            "bootstrap owner changed".into(),
+        ));
+    }
+    Ok((guard, version))
+}
+
+fn require_conditional_bootstrap(kind: StorageKind, uri: &str) -> Result<(), StateLockError> {
+    cluster_root_from_lock_uri(uri)?;
+    if kind != StorageKind::S3 {
+        return Err(StateLockError::InvalidBinding(
+            "bootstrap handoff requires S3 conditional updates".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_bootstrap_lock(
+    adapter: &Arc<dyn StorageAdapter>,
+    uri: &str,
+) -> Result<(StateLockFile, String), StateLockError> {
+    let (text, version) = adapter
+        .read_text_versioned_if_exists_bounded(uri, 64 * 1024)
+        .await?
+        .ok_or_else(|| StateLockError::InvalidBinding("bootstrap lock is absent".into()))?;
+    let lock = StateLockFile::parse(&text)?;
+    if lock.operation != BOOTSTRAP_OPERATION
+        || version.is_empty()
+        || version.len() > 1024
+        || version.chars().any(char::is_control)
+    {
+        return Err(StateLockError::InvalidBinding(
+            "not a retained bootstrap lock and version".into(),
+        ));
+    }
+    Ok((lock, version))
+}
+
+pub(crate) async fn verify_bootstrap_lock(
+    adapter: &Arc<dyn StorageAdapter>,
+    uri: &str,
+    lock_id: &str,
+    expected_version: &str,
+) -> Result<(), StateLockError> {
+    let (lock, version) = read_bootstrap_lock(adapter, uri).await?;
+    if lock.lock_id != lock_id || version != expected_version {
+        return Err(StateLockError::InvalidBinding(
+            "bootstrap lock identity or version changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn claim_bootstrap_lock(
+    adapter: Arc<dyn StorageAdapter>,
+    kind: StorageKind,
+    uri: &str,
+    lock_id: &str,
+    expected_version: &str,
+) -> Result<StateLockGuard, StateLockError> {
+    require_conditional_bootstrap(kind, uri)?;
+    verify_bootstrap_lock(&adapter, uri, lock_id, expected_version).await?;
+    let lock = StateLockFile::new("serve");
+    let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
+    // Never refresh the token or adopt a winner after an uncertain response.
+    if adapter
+        .write_text_if_match(uri, &payload, expected_version)
+        .await?
+        .is_none()
+    {
+        return Err(StateLockError::InvalidBinding(
+            "bootstrap lock claim lost its exact-version CAS".into(),
+        ));
+    }
+    Ok(StateLockGuard {
+        adapter,
+        uri: uri.into(),
+        kind,
+        lock,
+        release_on_drop: false,
+    })
 }
 
 fn cluster_root_from_lock_uri(lock_uri: &str) -> Result<String, StateLockError> {
