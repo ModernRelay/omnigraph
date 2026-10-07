@@ -125,20 +125,44 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge.
+timeout without replaying a committed merge. Its deployment matrix holds a real
+admitted request through drain, disconnects or times out the caller before
+durable acceptance, and loses replies after acceptance. Exact-ID observation
+must finish with one ledger result, one schema publication and the same server
+PID; neither apply nor recovery polling may resubmit.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
-own capture/close ordering, deadlines, schema identity and candidate bounds;
+own capture/close ordering, drain-only deployment deadlines, affected activation
+scope, schema identity and candidate bounds;
 `operations`, `ingress` and `mcp` own detached execution and output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
 are not generic native settlement. Server `boot_settings` exercises authenticated
-submission, parked requests, caller disconnect, pre-effect refusal and historical
-ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement and graph addition while an unaffected peer keeps serving.
+submission, parked requests, caller disconnect, pre-effect refusal, durable
+acceptance before completion, activation-in-progress observation and exact receipt
+access after management handoff. It also holds a merge across served schema
+planning to prove preview does not wait for the graph gate. In-source
+`deployment` tests suspend observer read futures across owner start, finish and complete
+turnover, exercising bounded re-observation for aggregate and exact status.
+CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
+retries, malformed-receipt refusal, terminal outcomes and caller timeout without
+replay. Its managed fixtures cover status/history scope and filters, explicit
+`--managed` selection, and wrong-mode refusals before context or external access.
+Direct apply must ignore both valid and malformed managed folder context.
+CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
+replacement, graph addition, policy grant/revocation and management handoff;
+the original submitter retains only its exact receipt access after restart.
+Extend that same journey for graph deletion, proving target storage/history
+removal, peer preservation and unchanged PID/listener, including a served deletion
+preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks
+the achieved configuration again after restart. The local journey also exercises
+counted embedding-provider replacement, external-Blob admission changes, catalog
+integrity reporting, schema-drift refusal and missing-root refusal. S3/Azure wrappers
+share the transport-independent phases; local success does not qualify their
+storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
@@ -146,7 +170,10 @@ Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
 exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
 exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
-interruption windows, killed-process recovery and corrective successors;
+interruption windows, killed-process recovery and corrective successors, including
+deletion before start, during partial removal, after root absence and before
+terminal ledger acknowledgement, same-lifetime older manifest survivors,
+replacement refusal and corrective creation in empty local settlement residue;
 `tests/identity_recovery.rs` owns current-actor authorization and adoption of a
 persisted settlement without replacing its author. CLI
 `tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and

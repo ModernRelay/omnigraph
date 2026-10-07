@@ -555,7 +555,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
     });
     for (verb, route, source_field) in [
         ("query", "/graphs/g/query", "query"),
-        ("mutate", "/graphs/g/change", "query_source"),
+        ("mutate", "/graphs/g/mutate", "query"),
     ] {
         let server = IntentApiFixture::graph(vec![IntentReply::json(400, refusal.clone())]);
         let output = output_failure(
@@ -842,53 +842,6 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
              {unreachable}); got: {stderr}"
         );
     }
-}
-
-#[test]
-fn query_check_alias_matches_lint_output() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let lint_output = output_success(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let check_output = output_success(
-        cli()
-            .arg("query")
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
 }
 
 // Legacy `omnigraph.yaml` `aliases:` invoked via the `--alias` flag were

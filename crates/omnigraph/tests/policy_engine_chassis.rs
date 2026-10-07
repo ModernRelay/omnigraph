@@ -222,6 +222,68 @@ async fn apply_schema_as_allows_when_policy_permits_actor() {
 }
 
 #[tokio::test]
+async fn runtime_binding_views_share_engine_authority_and_keep_policy_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, _) = init_with_policy(&dir).await;
+    let replacement_source = POLICY_YAML.replace("act-allowed", "act-replacement");
+    let policy = Arc::new(
+        PolicyEngine::load_graph_from_source(&replacement_source, dir.path().to_str().unwrap())
+            .unwrap(),
+    );
+    let replacement = original
+        .with_runtime_bindings(
+            Some(policy as Arc<dyn PolicyChecker>),
+            None,
+            omnigraph::ExternalBlobPolicy::Deny,
+        )
+        .unwrap();
+    assert!(original.shares_runtime_owner(&replacement));
+    let before = original.list_commits(None).await.unwrap();
+    let desired = additive_schema();
+    assert_denied(
+        replacement
+            .prepare_schema_apply_as(&desired, Some("act-allowed"))
+            .await,
+        "replacement revokes original actor",
+    );
+    original
+        .prepare_schema_apply_as(&desired, Some("act-allowed"))
+        .await
+        .unwrap();
+    assert_eq!(original.list_commits(None).await.unwrap(), before);
+    replacement
+        .apply_schema_as(&desired, Some("act-replacement"))
+        .await
+        .unwrap();
+    assert_eq!(
+        original.schema_contract_digest(),
+        replacement.schema_contract_digest()
+    );
+    assert_eq!(
+        original.list_commits(None).await.unwrap(),
+        replacement.list_commits(None).await.unwrap()
+    );
+    let reopened = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!original.shares_runtime_owner(&reopened));
+    let unprotected = replacement
+        .with_runtime_bindings(None, None, omnigraph::ExternalBlobPolicy::Deny)
+        .unwrap();
+    assert!(replacement.shares_runtime_owner(&unprotected));
+    unprotected
+        .prepare_schema_apply_as(&desired, None)
+        .await
+        .unwrap();
+    assert_denied(
+        replacement
+            .prepare_schema_apply_as(&desired, Some("act-allowed"))
+            .await,
+        "removing policy from a new view leaves predecessor immutable",
+    );
+}
+
+#[tokio::test]
 async fn apply_schema_without_actor_when_policy_is_installed_denies() {
     // MR-722 footgun guard: if a PolicyChecker is installed AND the
     // call site forgets to pass an actor, enforce() fails hard. Silent

@@ -159,8 +159,8 @@ regeneration instruction, including plans without traversal nodes.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It
 takes the same `--branch`/`--snapshot` target and `--params` as the query
-itself and needs the same `read` policy decision. `mutate` and the deprecated
-routes refuse it, and so is a mutation declaration under `explain`.
+itself and needs the same `read` policy decision. `mutate` refuses it, as does a
+mutation declaration under `explain`.
 
 Every read executes on engine v2, the one value of the session setting
 `engine`, so explain describes the route the query runs. See

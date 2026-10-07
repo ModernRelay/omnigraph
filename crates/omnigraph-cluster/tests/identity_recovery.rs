@@ -12,7 +12,7 @@ use omnigraph::seams::catalog;
 use omnigraph_cluster::seams::{FailScenario, catalog as cluster_seams};
 use omnigraph_cluster::{
     AuthorityKind, DeploymentCaller, DeploymentLookup, GraphDeploymentResult,
-    IdentityAuthorization, PlanOptions, apply_deployment, authorize_apply_plan, deployment_status,
+    IdentityAuthorization, apply_deployment, authorize_apply_plan, deployment_status,
     force_unlock_storage_root, plan_config_dir_authorized, reconcile_deployment,
     upgrade_deployment_ledger,
 };
@@ -62,7 +62,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     .unwrap();
     fs::write(
         dir.path().join("cluster.policy.yaml"),
-        "version: 1\ngroups:\n  owners: [principal:operator]\nrules:\n  - id: config\n    allow: { actors: { group: owners }, actions: [config_manage] }\n",
+        "version: 1\ngroups:\n  owners: [principal:operator, principal:schema]\nrules:\n  - id: config\n    allow: { actors: { group: owners }, actions: [config_manage] }\n",
     )
     .unwrap();
     fs::write(
@@ -78,12 +78,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     )
     .unwrap();
     let caller = IdentityAuthorization::authenticated("principal:schema").unwrap();
-    let planned = Box::pin(plan_config_dir_authorized(
-        dir.path(),
-        PlanOptions { observe: true },
-        &caller,
-    ))
-    .await;
+    let planned = Box::pin(plan_config_dir_authorized(dir.path(), &caller)).await;
     assert!(planned.plan.ok, "{:?}", planned.plan.diagnostics);
     let expected = planned.authorization.unwrap();
 
@@ -112,12 +107,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         !graph.join("__recovery").exists(),
         "an interrupted mutation leaves no recovery record (RFC 0067)"
     );
-    let unblocked = Box::pin(plan_config_dir_authorized(
-        dir.path(),
-        PlanOptions { observe: true },
-        &caller,
-    ))
-    .await;
+    let unblocked = Box::pin(plan_config_dir_authorized(dir.path(), &caller)).await;
     assert!(
         unblocked.plan.ok,
         "an interrupted mutation must not block planning: {:?}",
@@ -129,12 +119,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     let ledger = dir.path().join("__cluster/state.json");
     let before_ledger = fs::read(&ledger).unwrap();
 
-    let preview = Box::pin(plan_config_dir_authorized(
-        dir.path(),
-        PlanOptions { observe: true },
-        &caller,
-    ))
-    .await;
+    let preview = Box::pin(plan_config_dir_authorized(dir.path(), &caller)).await;
     assert!(
         !preview.plan.ok,
         "pending data recovery must block a new plan"
@@ -149,7 +134,6 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         dir.path(),
         None,
         &DeploymentCaller::AuthenticatedIdentity(caller.clone()),
-        &BTreeMap::new(),
         |_, _, _| {},
     )
     .await;
@@ -171,12 +155,12 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
     // cannot interpret one, and only the build that wrote it may resolve it.
     let owner = DeploymentCaller::storage_owner(Some("principal:schema".into()));
     assert!(
-        apply_deployment(dir.path(), None, &owner, &BTreeMap::new(), |_, _, _| {})
+        apply_deployment(dir.path(), None, &owner, |_, _, _| {})
             .await
             .is_err()
     );
     fs::remove_file(graph.join("__recovery/01LEGACYSIDECAR.json")).unwrap();
-    let resolved = apply_deployment(dir.path(), None, &owner, &BTreeMap::new(), |_, _, _| {})
+    let resolved = apply_deployment(dir.path(), None, &owner, |_, _, _| {})
         .await
         .unwrap();
     assert!(
@@ -282,7 +266,6 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
             dir.path(),
             None,
             &original,
-            &Default::default(),
             |issued, _, _| id = issued.to_string(),
         ))
         .await
@@ -486,7 +469,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
 
 async fn bootstrap(dir: &Path) {
     let owner = DeploymentCaller::storage_owner(None);
-    let result = apply_deployment(dir, None, &owner, &BTreeMap::new(), |_, _, _| {})
+    let result = apply_deployment(dir, None, &owner, |_, _, _| {})
         .await
         .unwrap();
     assert!(

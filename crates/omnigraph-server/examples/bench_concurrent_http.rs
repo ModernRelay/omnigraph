@@ -1,6 +1,6 @@
 //! Server-level concurrent HTTP benchmark for MR-686 (PR 0 baseline).
 //!
-//! Drives concurrent `/change` requests against an in-process Omnigraph HTTP
+//! Drives concurrent `/mutate` requests against an in-process Omnigraph HTTP
 //! server. Originally written to measure the global `Arc<RwLock<Omnigraph>>`
 //! lock penalty as an MR-686 baseline; that lock has since been removed
 //! (engine write APIs are `&self`, the server holds a lockless
@@ -136,7 +136,7 @@ async fn drive_actor(
         let req = Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
-            .uri("/graphs/default/change")
+            .uri("/graphs/default/mutate")
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap();
@@ -250,7 +250,7 @@ async fn main() {
         p99_ms: pct(0.99),
         p999_ms: pct(0.999),
         max_ms,
-        notes: "MR-686 PR 0 baseline. Drives /change via Tower oneshot.",
+        notes: "MR-686 PR 0 baseline. Drives /mutate via Tower oneshot.",
     };
 
     let json = serde_json::to_string_pretty(&results).unwrap();

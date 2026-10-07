@@ -82,7 +82,6 @@ Successful HTTP and CLI JSON load results include `embedding_generation`:
 `"unsupported"` means the load touched a node type with an `@embed` property;
 `null` means it did not. This describes the load capability, including when
 every vector was supplied. Human CLI output prints the corresponding guidance.
-The same diagnostic applies to the deprecated `ingest` command and endpoint.
 
 ## Offline file pipeline
 

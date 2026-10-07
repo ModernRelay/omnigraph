@@ -444,7 +444,7 @@ and a cancelled worker stops at its next cooperative `memory.check()`.
 operator and the hash-join build loop run without a check, so a cancelled
 worker inside one of them finishes that stretch first. An aborted blocking job
 that is still queued holds its lease until the blocking pool dequeues it. The
-`/query` and `/read` routes have no route timeout. No benchmark or timing test
+The `/query` route has no route timeout. No benchmark or timing test
 measures the latency this wait adds to a query that errors or stops early.
 
 Custom operators
