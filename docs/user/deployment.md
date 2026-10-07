@@ -8,7 +8,7 @@ and exposes its ready applied graphs under `/graphs/{id}/…`; use
 Start with [Operating a cluster](clusters/index.md) to create and apply the
 deployment bundle.
 
-Servers use the v0.12 HTTP contract and open graph storage format v14. The
+Servers use the v0.13 HTTP contract and open graph storage format v14. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. See [cluster deployments](clusters/index.md).
 

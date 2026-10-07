@@ -280,6 +280,41 @@ reads. The catalog tests own row uniqueness, projection and validation;
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
 
+### Manual 0.12 cluster upgrade qualification
+
+`genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment` is an ignored,
+Unix-only release qualification test. It creates genuine 0.12 receipts, stops
+the old server, converts the ledger, checks data/history/schema identity and
+historical reads, then applies live schema and policy changes. Storage stays at
+format 14. Ordinary CI keeps current-version live-deployment coverage; it does
+not download 0.12 or run this journey.
+
+Run explicitly from the repository root when qualifying that upgrade path,
+using a native build with Cargo's default `target/` directory.
+Both predecessor variables are required; missing binaries fail. The installer
+verifies the official archive checksum. Copy the freshly built candidate server
+so another build cannot replace it during qualification:
+
+```bash
+set -euo pipefail
+qualification_dir=$(mktemp -d)
+REPO_SLUG=ModernRelay/omnigraph VERSION=v0.12.0 INSTALL_DIR="$qualification_dir/v012" bash scripts/install.sh
+qualification_features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo build --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster --features "$qualification_features"
+cp target/debug/omnigraph-server "$qualification_dir/omnigraph-server"
+env RUST_MIN_STACK=16777216 \
+  OMNIGRAPH_V012_BIN="$qualification_dir/v012/omnigraph" \
+  OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
+  "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
+  cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
+    --features "$qualification_features" --test crossversion_upgrade \
+    genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment \
+    -- --exact --ignored --test-threads=1 --nocapture
+```
+
+Qualification requires `1 passed; 0 failed; 0 ignored`; an empty or ignored run
+is not evidence. Keep its output with the release qualification record.
+
 ## Commands
 
 Focused iteration:

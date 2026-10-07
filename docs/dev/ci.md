@@ -136,6 +136,10 @@ then the current tree's test targets, whose dev-dependency features (lance-io
 defaults and `test-util`) differ, so only dependency artifacts with matching
 features are reused.
 
+The released 0.12 cluster-ledger journey is separate
+[manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
+Current-version live schema and policy deployment remains required by `Test Workspace`.
+
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs

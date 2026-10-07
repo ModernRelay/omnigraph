@@ -115,7 +115,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.12
+Omnigraph-Http-Api: 0.13
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),

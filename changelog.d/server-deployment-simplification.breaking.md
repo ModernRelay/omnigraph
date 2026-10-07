@@ -1,5 +1,5 @@
-- Cluster plan now always observes without taking the writer lock, and migration
-  previews use the same captured preparation as apply. The removed `--observe`,
+- Cluster plan now observes without taking the writer lock; apply rechecks
+  authority and execution eligibility before effects. The removed `--observe`,
   `--lifecycle` and `--schema-correction` flags are rejected. Apply supports graph
   creation, physical graph deletion and configuration changes. Removing a graph
   declaration and applying deletes its managed storage and retained history;

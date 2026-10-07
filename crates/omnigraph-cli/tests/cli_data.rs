@@ -2084,53 +2084,65 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
 }
 
-/// An older server cannot establish the v0.12 HTTP contract. Discovery must
+/// An older server cannot establish the current HTTP contract. Discovery must
 /// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
 
     use support::managed_http::{IntentApiFixture, IntentReply};
-    let server = IntentApiFixture::new(vec![IntentReply::json(
-        404,
-        serde_json::json!({"error":"not found"}),
-    )]);
+    for (status, headers) in [
+        (404, vec![]),
+        (
+            200,
+            vec![(
+                omnigraph_api_types::HTTP_API_CONTRACT_HEADER.into(),
+                "0.12".into(),
+            )],
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply {
+            status,
+            headers,
+            body: br#"{"error":"untrusted body"}"#.to_vec(),
+        }]);
 
-    let output = cli()
-        .arg("mutate")
-        .arg("--server")
-        .arg(&server.origin)
-        .arg("--graph")
-        .arg("legacy")
-        .arg("-e")
-        .arg(SET_AGE)
-        .arg("--params")
-        .arg(r#"{"name":"Alice","age":52}"#)
-        .arg("--if-commit")
-        .arg("01HOLDHEAD")
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(!output.status.success(), "an old server must fail closed");
-    let error = parse_stdout_json(&output);
-    assert_eq!(error["code"], "api_contract_mismatch");
-    assert_eq!(error["http_status"], 404);
-    assert_eq!(error["request_dispatched"], false);
-    assert_eq!(
-        error["command_outcome"],
-        serde_json::json!({
-            "execution":"not_started", "effects":"none", "action":"refresh"
-        })
-    );
-    let requests = server.requests();
-    assert_eq!(
-        requests.len(),
-        1,
-        "the CLI must not send any data request to an older server"
-    );
-    assert_eq!(requests[0].method, "HEAD");
-    assert_eq!(requests[0].path, "/healthz");
-    server.assert_complete();
+        let output = cli()
+            .arg("mutate")
+            .arg("--server")
+            .arg(&server.origin)
+            .arg("--graph")
+            .arg("legacy")
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":52}"#)
+            .arg("--if-commit")
+            .arg("01HOLDHEAD")
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "an old server must fail closed");
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["code"], "api_contract_mismatch");
+        assert_eq!(error["http_status"], status);
+        assert_eq!(error["request_dispatched"], false);
+        assert_eq!(
+            error["command_outcome"],
+            serde_json::json!({
+                "execution":"not_started", "effects":"none", "action":"refresh"
+            })
+        );
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the CLI must not send any data request to an older server"
+        );
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        server.assert_complete();
+    }
 }
 
 #[test]
@@ -2430,18 +2442,23 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
 
 #[test]
 fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
-    use omnigraph_api_types::HTTP_API_CONTRACT_HEADER as HEADER;
+    use omnigraph_api_types::{HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER};
     use support::managed_http::{IntentApiFixture, IntentReply};
 
     for (status, headers) in [
         (200, vec![]),
         (403, vec![(HEADER.into(), "0.11".into())]),
-        (503, vec![(HEADER.into(), "0.12, 0.12".into())]),
+        (200, vec![(HEADER.into(), "0.12".into())]),
+        (200, vec![(HEADER.into(), "0.14".into())]),
+        (
+            503,
+            vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
+        ),
         (
             200,
             vec![
-                (HEADER.into(), "0.12".into()),
-                (HEADER.into(), "0.12".into()),
+                (HEADER.into(), CONTRACT.into()),
+                (HEADER.into(), CONTRACT.into()),
             ],
         ),
     ] {
@@ -2453,7 +2470,7 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
         ] {
             let server = IntentApiFixture::new(vec![
                 IntentReply {
-                    status: 200, headers: vec![(HEADER.into(), "0.12".into())], body: vec![],
+                    status: 200, headers: vec![(HEADER.into(), CONTRACT.into())], body: vec![],
                 },
                 IntentReply {
                     status, headers: headers.clone(),
@@ -2502,7 +2519,7 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             );
             assert_eq!(requests[0].method, "HEAD");
             assert_eq!(requests[0].path, "/healthz");
-            assert_eq!(requests[1].headers[HEADER], "0.12");
+            assert_eq!(requests[1].headers[HEADER], CONTRACT);
             server.assert_complete();
         }
     }
