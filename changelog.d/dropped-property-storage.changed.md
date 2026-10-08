@@ -1,5 +1,5 @@
-- Dropping a property no longer rewrites its table. In v0.12 schema apply
-  rewrote the table without the dropped values, so `omnigraph cleanup` alone
+- Dropping a property no longer rewrites its table. Through v0.13.0 schema
+  apply rewrote the table without the dropped values, so `omnigraph cleanup` alone
   erased them; now they stay in the table's data files until
   `omnigraph optimize` rewrites every fragment that holds them, whatever its
   size. To erase them, run optimize, delete every branch created from a commit
