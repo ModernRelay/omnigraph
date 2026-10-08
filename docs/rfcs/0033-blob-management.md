@@ -576,8 +576,10 @@ merge-insert writes with default `WriteParams`, which refuse an external URI
 outside the dataset's own bases, so the reference cannot be re-sent as one.
 Under a denying policy the write fails with `StoredExternalBlobDenied` naming
 the sibling. A row holding two external cells under a denying policy therefore
-cannot have one of them replaced or cleared alone; a `.gq` `update` that
-assigns both is the V1 escape. Keeping a sibling's reference needs a Lance
+cannot have one of them replaced or cleared alone. The V1 escape is a `merge`
+load of the whole row, which replaces a node or an edge from its input without
+reading its stored cells; for a node, a `.gq` `update` that assigns both cells
+also works, while an edge has no `.gq` `update` (T16). Keeping a sibling's reference needs a Lance
 merge-insert that accepts the external mode and outside-base admission of
 `WriteParams`, plus a surface guard; that belongs to the descriptor-preserving
 item of Phase 4, not to Phase 3.
@@ -598,11 +600,21 @@ included, to the existing keyed-write byte ceilings in Arrow memory. One shared
 accounting function applies both. A single budget cannot keep the inclusive
 promise: a one-row batch holding a 33,554,432-byte value and an `id` measures
 33,555,112 bytes in Arrow memory (arrow 58.3), so the old combined ceiling
-refused every exact-limit value, from `blob put`, an embedded `.gq` parameter or
-a carried cell alike. A load stays bounded earlier by its text: a 32 MiB value
-is about 42.7 MiB of `base64:` text, above the load's 32 MiB line and parse
-ceilings, which size the JSON it holds. The bound per operation is the sum of
-the two budgets.
+refused every exact-limit value, from `blob put`, an embedded `.gq` parameter, a
+carried cell or a load alike. The bound per operation is the sum of the two
+budgets.
+
+The boundaries in front of the batch keep their own units. The compatibility
+loader (`load`) parses a stream with no line limit and forecasts each keyed row
+before decoding it (`account_keyed_json_row`), charging a `base64:` value by its
+decoded length; that forecast is the pre-Arrow owner of the same budgets and
+splits the same way, so it admits an exact-limit value. The strict NDJSON loader
+(`load_graph_batch`) bounds each encoded line at 32 MiB, and a 32 MiB value is
+44,739,244 bytes of `base64:` text, so that loader keeps a smaller effective
+payload, about 24 MiB. HTTP bodies stay bounded in encoded bytes: §5.2 for PUT,
+and each load route by its own limit. The inclusive guarantee therefore covers
+`blob put`, embedded `.gq` parameters, carried cells and the compatibility
+loader.
 
 The target cell's old payload is not read or charged before replacement. A
 predicate `.gq` update is not replayed after a pre-effect `ReadSetChanged`,
@@ -1363,14 +1375,17 @@ The implementation extends existing owners before creating new fixtures, per
   and accepted state unchanged.
 - `writes.rs` also owns the payload/framing split (§4.3): an exact 32 MiB PUT is
   accepted and one more byte is refused by the payload limit, not by a framing
-  ceiling; a 32 MiB value carried by an update and one inserted through an
-  embedded `.gq` parameter are accepted where the combined ceiling refused
-  them; and a framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
+  ceiling; a 32 MiB value carried by an update, one inserted through an
+  embedded `.gq` parameter and one loaded by the compatibility loader are
+  accepted where the combined ceiling refused them, while the strict NDJSON
+  loader still refuses that value's encoded line at its line limit; and a
+  framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
   too: an external sibling becomes managed under an admitting policy (visible
   through `stat`), fails with `StoredExternalBlobDenied` naming the sibling under
   a denying one, and on a row with two external cells under a denying policy a
-  PUT or clear of either is refused while a `.gq` update assigning both
-  succeeds.
+  PUT or clear of either is refused, for a node and for an edge, while a
+  `merge` load of the whole row succeeds for both and a `.gq` update assigning
+  both cells succeeds for the node.
 - Phase 3 extends the existing Mutation rendezvous owner: a competing write
   forces fresh If-Match evaluation and a re-carry of the siblings from the fresh
   base within the bounded attempt count, a post-publication write cannot alter
@@ -1607,8 +1622,9 @@ correctness gate.
   check of §5.1 is the runtime's, for every route.
 - **3-pre — accounting:** one shared function charges managed Blob payloads by
   logical length to the payload budget and every other batch byte by Arrow
-  memory to the keyed-write ceilings (§4.3), for every keyed writer; plus the
-  two §12.3 surface guards. This lands first because it changes load and
+  memory to the keyed-write ceilings (§4.3), for every keyed writer and for the
+  compatibility loader's pre-decode forecast; plus the two §12.3 surface
+  guards. This lands first because it changes load and
   mutation limits on its own, and the inclusive PUT bound depends on it.
 - **3A — engine:** add `Session::put_blob_at_as` and `clear_blob_at_as` through
   the shared Mutation staging/publication tail: a kind-agnostic exact-ID adapter
@@ -1865,17 +1881,19 @@ publisher architecture.
   - Payload bytes and batch framing get separate budgets for every keyed writer
     (§4.3). A one-row batch holding a 33,554,432-byte value measures 33,555,112
     bytes in Arrow memory, so the combined 32 MiB ceiling refused every
-    exact-limit value from a PUT, an embedded `.gq` parameter or a carried
-    cell; the inclusive promise is kept by counting payloads by logical
-    length. A load's own line and parse ceilings, sized on its `base64:`
-    text, still bound a loaded value below 32 MiB.
+    exact-limit value from a PUT, an embedded `.gq` parameter, a carried
+    cell or a load; the inclusive promise is kept by counting payloads by
+    logical length. The compatibility loader's pre-decode forecast splits the
+    same way; the strict NDJSON loader keeps its 32 MiB encoded-line limit and
+    HTTP bodies their encoded limits, so those paths admit less.
   - Untouched sibling Blob cells are carried by value under the `.gq` update
     rule, including an external sibling becoming managed, or
     `StoredExternalBlobDenied` under a denying policy (§4.3). Lance 11 offers no
     single-cell Blob write, its stored descriptors are bound to their data file,
     and its merge-insert writes with default `WriteParams`; a row with two
-    external cells under a denying policy is changed only by an update that
-    assigns both. Keeping a sibling's reference stays in Phase 4, behind a
+    external cells under a denying policy is changed by a `merge` load of the
+    whole row, for a node or an edge, or for a node by an update that assigns
+    both. Keeping a sibling's reference stays in Phase 4, behind a
     guard that goes red when merge-insert stores an outside-base reference.
   - The write methods are `Session` methods; edges are written by the same
     exact-ID adapter while `.gq` keeps refusing an edge `update`.
