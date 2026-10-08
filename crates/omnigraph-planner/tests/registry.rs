@@ -333,6 +333,7 @@ fn doc_source() -> MemorySource {
             schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
             key: Vec::new(),
             object_columns: vec!["id".to_string()],
+            object_fields: vec![Field::new("@id", DataType::Utf8, false)].into(),
             row_count: None,
         },
     )
@@ -348,8 +349,17 @@ fn documents_query() -> Operation {
             filters: Vec::new(),
         }],
         return_exprs: vec![IRProjection {
-            expr: IRExpr::Variable("d".to_string()),
+            expr: IRExpr::Variable(
+                "d".to_string(),
+                omnigraph_compiler::ExprType::Node {
+                    type_name: "Doc".into(),
+                },
+            ),
             alias: None,
+            column: "d".into(),
+            ty: omnigraph_compiler::ExprType::Node {
+                type_name: "Doc".into(),
+            },
         }],
         order_by: Vec::new(),
         limit: None,

@@ -49,6 +49,8 @@ pub struct NodeTypeSpec {
     pub schema: SchemaRef,
     pub key: Vec<String>,
     pub object_columns: Vec<String>,
+    /// The projected node members, with logical names such as `@id`.
+    pub object_fields: arrow_schema::Fields,
     /// The table's manifest-resident row count (`entity_count`); `None` when
     /// the table is absent from the pinned snapshot.
     pub row_count: Option<u64>,

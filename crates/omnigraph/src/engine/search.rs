@@ -235,6 +235,64 @@ pub(super) struct RrfMode {
     pub(super) limit: usize,
 }
 
+#[derive(Debug, PartialEq)]
+enum NearestQuery {
+    Vector(Vec<f32>),
+    Text(String),
+}
+
+/// Evaluate the stored query type before conversion to the vector API's F32 values.
+fn resolve_nearest_query(expr: &IRExpr, params: &ParamMap) -> Result<NearestQuery> {
+    use datafusion::scalar::ScalarValue;
+    use omnigraph_compiler::types::ExprType;
+
+    let array = super::constant::evaluate_constant_array(expr, params)?;
+    let value = ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)?;
+    let values = match (expr.ty(), value) {
+        (
+            ExprType::Value {
+                scalar: ScalarType::String,
+                list: false,
+                ..
+            },
+            ScalarValue::Utf8(Some(text)),
+        ) => return Ok(NearestQuery::Text(text)),
+        (
+            ExprType::Value {
+                scalar: ScalarType::Vector(_),
+                list: false,
+                ..
+            },
+            ScalarValue::FixedSizeList(values),
+        ) if !values.is_null(0) => values.value(0),
+        (
+            ExprType::Value {
+                scalar, list: true, ..
+            },
+            ScalarValue::List(values),
+        ) if scalar.is_numeric() && !values.is_null(0) => values.value(0),
+        _ => {
+            return Err(OmniError::manifest(
+                "nearest query must resolve to a non-null String or numeric vector",
+            ));
+        }
+    };
+    let values =
+        arrow_cast::cast(&values, &DataType::Float32).map_err(OmniError::arrow_internal)?;
+    let values = values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal("nearest vector conversion did not yield F32")
+        })?;
+    if values.null_count() != 0 || values.values().iter().any(|value| !value.is_finite()) {
+        return Err(OmniError::manifest(
+            "nearest vector elements must be non-null finite F32 values",
+        ));
+    }
+    Ok(NearestQuery::Vector(values.values().to_vec()))
+}
+
 /// Resolve a nearest query vector, embedding string inputs with the property's
 /// recorded model. Explicit vectors do not require an embedding client.
 pub(super) async fn resolve_nearest_query_vec(
@@ -245,10 +303,9 @@ pub(super) async fn resolve_nearest_query_vec(
     params: &ParamMap,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<Vec<f32>> {
-    let lit = resolve_literal_or_param(expr, params)?;
-    match lit {
-        Literal::List(_) => literal_to_f32_vec(&lit),
-        Literal::String(text) => {
+    match resolve_nearest_query(expr, params)? {
+        NearestQuery::Vector(values) => Ok(values),
+        NearestQuery::Text(text) => {
             let (expected_dim, recorded_model) =
                 nearest_property_dim_and_model(catalog, type_name, property)?;
             let client = embedding.resolve().await?;
@@ -265,44 +322,19 @@ pub(super) async fn resolve_nearest_query_vec(
             }
             client.embed_query_text(&text, expected_dim).await
         }
-        _ => Err(OmniError::manifest(
-            "nearest query must be a string or list of floats".to_string(),
-        )),
     }
 }
 
-pub(super) fn resolve_literal_or_param(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
-    Ok(match expr {
-        IRExpr::Literal(lit) => lit.clone(),
-        IRExpr::Param(name) => params
-            .get(name)
-            .cloned()
-            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?,
-        _ => {
-            return Err(OmniError::manifest(
-                "nearest query must be a literal or parameter".to_string(),
-            ));
-        }
-    })
-}
-
-/// Resolve a literal vector expression to a Vec<f32>.
-pub(super) fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
-    match lit {
-        Literal::List(items) => items
-            .iter()
-            .map(|item| match item {
-                Literal::Float(f) => Ok(*f as f32),
-                Literal::Integer(n) => Ok(*n as f32),
-                _ => Err(OmniError::manifest(
-                    "vector elements must be numeric".to_string(),
-                )),
-            })
-            .collect(),
-        _ => Err(OmniError::manifest(
-            "nearest query must be a list of floats".to_string(),
-        )),
-    }
+/// The rank constant defaults only when the optional expression is absent.
+pub(super) fn resolve_rrf_k(expr: Option<&IRExpr>, params: &ParamMap) -> Result<u32> {
+    let Some(expr) = expr else {
+        return Ok(60);
+    };
+    let value = resolve_to_int(expr, params)?;
+    u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| OmniError::manifest("rrf k must be greater than 0 and fit U32"))
 }
 
 /// Resolve the nearest() target property's vector dimension and the embedding
@@ -337,63 +369,6 @@ pub(super) fn nearest_property_dim_and_model(
         .get(property)
         .and_then(|embed| embed.model.clone());
     Ok((dim, recorded_model))
-}
-
-/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse a
-/// time-bearing `Date` string, a `DateTime` string finer than a millisecond, and a
-/// literal of another kind on a `Date` or `DateTime` parameter.
-pub(crate) fn check_param_date_literals(
-    params: &ParamMap,
-    declared: &[omnigraph_compiler::query::ast::Param],
-) -> Result<()> {
-    fn check(name: &str, lit: &Literal) -> Result<()> {
-        match lit {
-            Literal::Date(value) => omnigraph_compiler::check_date_literal(value)
-                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
-            Literal::DateTime(value) => omnigraph_compiler::check_datetime_literal(value)
-                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
-            Literal::List(items) => items.iter().try_for_each(|item| check(name, item)),
-            _ => Ok(()),
-        }
-    }
-    params.iter().try_for_each(|(name, lit)| check(name, lit))?;
-    for param in declared {
-        let Some(lit) = params.get(&param.name) else {
-            continue;
-        };
-        let scalar = param
-            .type_name
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let is_scalar = |lit: &Literal| match lit {
-            Literal::Date(_) => scalar == "Date",
-            Literal::DateTime(_) => scalar == "DateTime",
-            Literal::Null => param.nullable,
-            _ => false,
-        };
-        let well_typed = match param.type_name.as_str() {
-            "Date" | "DateTime" => is_scalar(lit),
-            "[Date]" => match lit {
-                Literal::List(items) => items.iter().all(is_scalar),
-                other => is_scalar(other),
-            },
-            "[DateTime]" => match lit {
-                Literal::List(items) => items
-                    .iter()
-                    .all(|item| matches!(item, Literal::DateTime(_))),
-                Literal::Null => param.nullable,
-                _ => false,
-            },
-            _ => true,
-        };
-        if !well_typed {
-            return Err(OmniError::manifest(format!(
-                "param '{}': expected {}, got {lit:?}",
-                param.name, param.type_name
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
@@ -718,7 +693,19 @@ pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
         call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
             Some(call)
         }
-        _ => None,
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::Cast { .. }
+        | IRExpr::IsNull { .. } => None,
     }
 }
 
@@ -732,7 +719,7 @@ pub(super) fn is_search_filter(filter: &IRExpr) -> bool {
 pub(crate) fn is_positive_search_filter(filter: &IRExpr) -> bool {
     matches!(
         filter.comparison_parts(),
-        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true))))
+        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)))
             if matches!(call, IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. })
     )
 }
@@ -747,17 +734,16 @@ pub(crate) fn search_filter_query(
     let Some(call) = search_call(filter) else {
         return Ok(None);
     };
-    is_positive_search_filter(filter)
-        .then(|| build_fts_query(call, params))
-        .flatten()
-        .map(Some)
-        .ok_or_else(|| {
-            OmniError::manifest(format!(
-                "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
-                 match_text() only as a bare call or compared to true, over a property and a \
-                 string query"
-            ))
-        })
+    if is_positive_search_filter(filter)
+        && let Some(query) = build_fts_query(call, params)?
+    {
+        return Ok(Some(query));
+    }
+    Err(OmniError::manifest(format!(
+        "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
+         match_text() only as a bare call or compared to true, over a property and a \
+         string query"
+    )))
 }
 
 /// The columns the plan's scan projection names for one bound variable
@@ -1144,6 +1130,198 @@ mod ann_probe_budget_tests {
             LadderStep::RescanUncapped {
                 summary_missing: false
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_search_value_tests {
+    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k, search_filter_query};
+    use crate::engine::scan::{
+        build_fts_query, resolve_to_int, resolve_to_string, scan_output_schema,
+    };
+    use crate::engine::search::SearchMode;
+    use lance_index::scalar::inverted::query::FtsQuery;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::ir::{IRExpr, ParamMap};
+    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
+
+    fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(kind, nullable))
+    }
+
+    fn widened_integer(value: i64) -> IRExpr {
+        IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Integer(value),
+                scalar(ScalarType::I32, false),
+            )),
+            ty: scalar(ScalarType::I64, false),
+        }
+    }
+
+    fn fuzzy(max_edits: Option<IRExpr>) -> IRExpr {
+        IRExpr::Fuzzy {
+            field: Box::new(IRExpr::PropAccess {
+                variable: "d".into(),
+                property: "text".into(),
+                ty: scalar(ScalarType::String, false),
+            }),
+            query: Box::new(IRExpr::Literal(
+                Literal::String("needle".into()),
+                scalar(ScalarType::String, false),
+            )),
+            max_edits: max_edits.map(Box::new),
+            ty: scalar(ScalarType::Bool, false),
+        }
+    }
+
+    #[test]
+    fn cast_search_options_execute_nondefault_values() {
+        let params = ParamMap::new();
+        let k = widened_integer(5);
+        k.check_types().unwrap();
+        assert_eq!(resolve_rrf_k(Some(&k), &params).unwrap(), 5);
+        assert_eq!(resolve_rrf_k(None, &params).unwrap(), 60);
+        for (max_edits, expected) in [(Some(widened_integer(1)), 1), (None, 2)] {
+            let call = fuzzy(max_edits);
+            call.check_types().unwrap();
+            let FtsQuery::Match(query) = build_fts_query(&call, &params).unwrap().unwrap().query
+            else {
+                panic!("expected fuzzy match query");
+            };
+            assert_eq!(query.fuzziness, Some(expected));
+        }
+    }
+
+    #[test]
+    fn search_option_payloads_execute_in_their_stored_type() {
+        let integer = IRExpr::Param("edits".into(), scalar(ScalarType::I32, false));
+        let params = ParamMap::from([("edits".into(), Literal::Float(1.0))]);
+        assert_eq!(resolve_to_int(&integer, &params).unwrap(), 1);
+        let float = IRExpr::Literal(Literal::Integer(1), scalar(ScalarType::F32, false));
+        assert!(resolve_to_int(&float, &ParamMap::new()).is_err());
+        let date = IRExpr::Literal(
+            Literal::String("2026-10-05".into()),
+            scalar(ScalarType::Date, false),
+        );
+        assert!(resolve_to_string(&date, &ParamMap::new()).is_err());
+        let wide = IRExpr::Param("wide".into(), scalar(ScalarType::U64, false));
+        let params = ParamMap::from([("wide".into(), Literal::Float(2_f64.powi(63)))]);
+        assert_eq!(resolve_to_int(&wide, &params).unwrap(), 1_i128 << 63);
+        assert!(resolve_rrf_k(Some(&wide), &params).is_err());
+    }
+
+    #[test]
+    fn supplied_invalid_search_options_refuse_before_empty_scan_execution() {
+        let catalog =
+            build_catalog(&parse_schema("node Doc { text: String @index }").unwrap()).unwrap();
+        let params = ParamMap::new();
+        for option in [
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::I64, true)),
+            IRExpr::Literal(Literal::Integer(-1), scalar(ScalarType::I64, false)),
+            IRExpr::Literal(
+                Literal::Integer(i64::from(u32::MAX) + 1),
+                scalar(ScalarType::I64, false),
+            ),
+            IRExpr::Param("missing".into(), scalar(ScalarType::I64, false)),
+        ] {
+            assert!(resolve_rrf_k(Some(&option), &params).is_err());
+            let call = fuzzy(Some(option));
+            call.check_types().unwrap();
+            let filter = IRExpr::comparison(
+                call,
+                CompOp::Eq,
+                IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool, false)),
+            );
+            assert!(search_filter_query(&filter, &params).is_err());
+            assert!(
+                scan_output_schema(
+                    "Doc",
+                    "d",
+                    &[filter],
+                    &params,
+                    &catalog,
+                    &SearchMode::default(),
+                    None
+                )
+                .is_err()
+            );
+        }
+        let zero = IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64, false));
+        assert!(resolve_rrf_k(Some(&zero), &params).is_err());
+        assert!(
+            build_fts_query(&fuzzy(Some(zero)), &params)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn nearest_vector_conversion_preserves_the_recorded_list_domain() {
+        let value = (1_i64 << 62) + (1_i64 << 38) + 1;
+        let expected = 2_f32.powi(62);
+        assert!(value as f32 > expected);
+        let literal = Literal::List(vec![Literal::Integer(value)]);
+        let float = IRExpr::Literal(
+            literal.clone(),
+            ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+        );
+        let integer = IRExpr::Literal(
+            literal,
+            ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+        );
+        assert_eq!(
+            resolve_nearest_query(&float, &ParamMap::new()).unwrap(),
+            NearestQuery::Vector(vec![expected])
+        );
+        assert_eq!(
+            resolve_nearest_query(&integer, &ParamMap::new()).unwrap(),
+            NearestQuery::Vector(vec![value as f32])
+        );
+        let vector = IRExpr::Param("vector".into(), scalar(ScalarType::Vector(2), false));
+        let params = ParamMap::from([(
+            "vector".into(),
+            Literal::List(vec![Literal::Float(0.1), Literal::Integer(1)]),
+        )]);
+        assert_eq!(
+            resolve_nearest_query(&vector, &params).unwrap(),
+            NearestQuery::Vector(vec![0.1_f32, 1.0])
+        );
+    }
+
+    #[test]
+    fn nearest_refuses_nulls_nonfinite_elements_and_payload_kind_shortcuts() {
+        let params = ParamMap::new();
+        for query in [
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::String, true)),
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::Vector(2), true)),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Null]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F32, false)),
+            ),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Float(f64::MAX)]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+            ),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Integer(1)]),
+                scalar(ScalarType::String, false),
+            ),
+            IRExpr::Literal(
+                Literal::String("needle".into()),
+                scalar(ScalarType::Vector(2), false),
+            ),
+        ] {
+            assert!(resolve_nearest_query(&query, &params).is_err(), "{query:?}");
+        }
+        let text = IRExpr::Param("text".into(), scalar(ScalarType::String, false));
+        let params = ParamMap::from([("text".into(), Literal::String("needle".into()))]);
+        assert_eq!(
+            resolve_nearest_query(&text, &params).unwrap(),
+            NearestQuery::Text("needle".into())
         );
     }
 }

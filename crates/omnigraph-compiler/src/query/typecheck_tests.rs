@@ -3,6 +3,79 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::schema::parser::parse_schema;
 
+/// Null positions are expressible through the public AST even though the GQ
+/// grammar has no null literal token.
+#[test]
+fn list_literal_type_unifies_all_non_null_elements() {
+    for items in [
+        vec![Literal::Integer(1), Literal::Float(2.5)],
+        vec![Literal::Float(2.5), Literal::Integer(1)],
+        vec![Literal::Null, Literal::Integer(1), Literal::Float(2.5)],
+        vec![Literal::Integer(1), Literal::Null, Literal::Float(2.5)],
+        vec![Literal::Integer(1), Literal::Float(2.5), Literal::Null],
+    ] {
+        assert_eq!(
+            literal_type(&Literal::List(items)).unwrap(),
+            PropType::list_of(ScalarType::F64, false)
+        );
+    }
+    for items in [
+        vec![],
+        vec![Literal::Null],
+        vec![Literal::Null, Literal::Null],
+    ] {
+        assert_eq!(
+            literal_type(&Literal::List(items)).unwrap(),
+            PropType::list_of(ScalarType::String, false)
+        );
+    }
+    for items in [
+        vec![Literal::Integer(1), Literal::String("x".into())],
+        vec![Literal::String("x".into()), Literal::Integer(1)],
+        vec![Literal::List(vec![])],
+        vec![Literal::Integer(1), Literal::List(vec![])],
+    ] {
+        assert!(literal_type(&Literal::List(items)).is_err());
+    }
+}
+
+#[test]
+fn public_ast_nulls_retain_the_checked_leaf_type_after_lowering() {
+    let catalog = setup();
+    let parsed = parse_query("query q() { match { $p: Person } return { 1 as value } }").unwrap();
+    for (expr, expected) in [
+        (
+            Expr::Literal(Literal::List(vec![
+                Literal::Null,
+                Literal::Integer(1),
+                Literal::Float(2.5),
+            ])),
+            PropType::list_of(ScalarType::F64, false),
+        ),
+        (
+            Expr::Literal(Literal::List(vec![Literal::Null])),
+            PropType::list_of(ScalarType::String, false),
+        ),
+        (
+            Expr::Binary {
+                left: Box::new(Expr::Literal(Literal::Null)),
+                op: BinaryOp::Compare(CompOp::Eq),
+                right: Box::new(Expr::Literal(Literal::Null)),
+            },
+            PropType::scalar(ScalarType::Bool, true),
+        ),
+    ] {
+        let mut query = parsed.single_decl().clone();
+        query.return_clause[0].expr = expr;
+        let checked = typecheck_query(&catalog, &query).unwrap();
+        let lowered = crate::lower_query(&catalog, &query, &checked).unwrap();
+        let projection = &lowered.return_exprs[0];
+        let expected = ExprType::from_prop(&expected);
+        assert_eq!(projection.ty, expected);
+        assert_eq!(projection.expr.leaf_type(), Some(&expected));
+    }
+}
+
 /// Node type name of a binding, panicking if it is an edge binding — the two
 /// namespaces can share a type name (see `setup_same_named_node_and_edge`).
 /// Indexing `ctx.bindings` covers the unbound case with its own panic.
