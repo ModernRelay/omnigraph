@@ -368,6 +368,8 @@ filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
 pass projection_pushdown
 not pass aggregate_pushdown
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -384,6 +386,44 @@ none. Dropping a type key or swapping key order fails these assertions.
 `pass <name>` states that a named optimizer pass fired, `not pass <name>` that
 it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
+`aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the named output's aggregate function, input type, accumulator,
+overflow rule and result type. Accumulators are `count`, `exact_integer`,
+`float64` and `extremum`; overflow rules are `round_to_nearest` and `error`.
+Types use shape syntax, node type names or `exact_integer`. A type's `?`
+declares nullability here; a shape line's `?` describes observed null cells.
+An unfiltered count-only query can use `MetadataCount`, which has no aggregate
+specification and does not satisfy an `aggregate` line.
+`block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the same facts on an AntiJoin's aggregate leaf, named by its GQ text,
+even beneath a comparison cast. Bare row count has no aggregate spec.
+
+`result columns [total: F64?, person: Person]` checks the complete declared
+result in return order, including names, types and nullability. It follows
+Sort and Limit to the result node; a MetadataCount also declares columns.
+
+`type $p.age: I64?` requires at least one non-cast expression with that GQ
+text, and every matching expression must carry the stated type. Types are
+stored compiler declarations, including nullability. `cast $p.age: I64? ->
+F64?` requires an explicit conversion over that expression with exactly those
+source and target types; `no cast $p.age` refuses any conversion over it.
+The checks search every typed tree in the physical plan, including pushed
+filters, sort keys, ranked scans, join predicates, aggregate arguments and
+both block comparison operands.
+Cast text is transparent, so a `type` line selects the underlying expression.
+The internal `exact_integer` and `[exact_integer]` comparison types, optionally
+nullable, are accepted here but cannot be returned as public result columns.
+
+Every successful rows step compares the plan root's declared schema with the
+compiler's independent inference and with the executed result. The inference
+check compares declared nullability; the execution check rejects observed
+nulls in non-null columns and compares node objects by their complete Struct
+type. The runner also serializes and deserializes the executed bound plan,
+validates its typed expression trees and aggregate signatures/specs, compares
+its explain documents, and directly compares stored schemas, return types,
+named node-object declarations and complete block predicates/specs. These checks require no plan section
+and execute no additional query.
+
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in
 negative assertions. Assert destination projection on the dependent scan;

@@ -17,6 +17,8 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::types::{ExprType, ScalarType};
 use omnigraph_planner::ContainsJoinFields;
 
 use self::needle_rows::ContainsColumns;
@@ -25,7 +27,7 @@ use super::memory::WorkMemory;
 use super::pair_buffer::{PairBuffer, collect_left};
 use super::producer::producer_stream;
 use super::{Filled, RuntimeFilterSlot, external, joined_schema, polled, streaming_properties};
-use crate::error::Result;
+use crate::error::{OmniError, Result};
 
 /// The distinct needles the join's fill left for the right scan's filter.
 const NEEDLES_METRIC: &str = "runtime_filter_needles";
@@ -59,6 +61,20 @@ impl ContainsJoinExec {
         params: Arc<ParamMap>,
         runtime_filter: Arc<RuntimeFilterSlot>,
     ) -> Result<Self> {
+        let operand = |expr: &IRExpr, pair: (&str, &str)| {
+            matches!(expr, IRExpr::PropAccess {
+                variable, property,
+                ty: ExprType::Value { scalar: ScalarType::String, list: false, .. },
+            } if (variable.as_str(), property.as_str()) == pair)
+        };
+        let valid = matches!(fields.conjunct,
+            IRExpr::Binary { left, op: BinaryOp::Compare(CompOp::StringContains), right, ty: _ }
+            if operand(left, fields.haystack) && operand(right, fields.needle));
+        if !valid {
+            return Err(OmniError::manifest_internal(
+                "contains join conjunct disagrees with its matcher columns",
+            ));
+        }
         let schema = joined_schema(&left.schema(), &right.schema())?;
         let column = |(binding, property): (&str, &str)| format!("{binding}.{property}");
         let columns = ContainsColumns::checked(
@@ -88,6 +104,7 @@ impl ContainsJoinExec {
         ContainsJoinFields {
             haystack: (&self.haystack.0, &self.haystack.1),
             needle: (&self.needle.0, &self.needle.1),
+            conjunct: &self.filters[0],
             residual: self.residual(),
         }
     }
@@ -234,6 +251,29 @@ mod tests {
             ContainsJoinFields {
                 haystack: ("p", "text"),
                 needle: ("m", "number"),
+                conjunct: &IRExpr::comparison(
+                    IRExpr::PropAccess {
+                        variable: "p".into(),
+                        property: "text".into(),
+                        ty: omnigraph_compiler::types::ExprType::from_prop(
+                            &omnigraph_compiler::types::PropType::scalar(
+                                omnigraph_compiler::types::ScalarType::String,
+                                false,
+                            ),
+                        ),
+                    },
+                    omnigraph_compiler::query::ast::CompOp::StringContains,
+                    IRExpr::PropAccess {
+                        variable: "m".into(),
+                        property: "number".into(),
+                        ty: omnigraph_compiler::types::ExprType::from_prop(
+                            &omnigraph_compiler::types::PropType::scalar(
+                                omnigraph_compiler::types::ScalarType::String,
+                                false,
+                            ),
+                        ),
+                    },
+                ),
                 residual: &[],
             },
             Arc::new(ParamMap::new()),

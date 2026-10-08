@@ -1,0 +1,90 @@
+# issue: none
+# notes: Null parameters retain their declarations; casts preserve nullable numeric and list results.
+# notes: Empty sets use the needle domain. GQ has no source null literal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Sample {
+    key: String @key
+    n: I64?
+    ns: [I64]?
+}
+
+--- seed
+{"type":"Sample","data":{"key":"a","n":1,"ns":[1]}}
+{"type":"Sample","data":{"key":"b"}}
+
+--- query
+set engine = v2;
+query declared_numeric_null($bound: F64?) {
+    match { $x: Sample }
+    return { $x.key, $x.n = $bound as eq_null }
+}
+--- params
+{"bound":null}
+--- expect unordered
+{"x.key":"a"}
+{"x.key":"b"}
+--- expect shape
+x.key: String
+eq_null: Bool?
+--- expect plan
+cast $x.n: I64? -> F64?
+type $bound: F64?
+
+--- query
+set engine = v2;
+query omitted_boolean_null($flag: Bool?) {
+    match { $x: Sample }
+    return { $x.key, $flag and true as both, not $flag as negated, $flag and false as neither }
+}
+--- expect unordered
+{"x.key":"a","neither":false}
+{"x.key":"b","neither":false}
+--- expect shape
+x.key: String
+both: Bool?
+negated: Bool?
+neither: Bool?
+
+--- query
+set engine = v2;
+query declared_membership_null($needle: I64?, $values: [F64]?) {
+    match { $x: Sample }
+    return { $x.key, $needle in $x.ns as null_member, $x.n in $values as null_set }
+}
+--- params
+{"needle":null,"values":null}
+--- expect unordered
+{"x.key":"a"}
+{"x.key":"b"}
+--- expect shape
+x.key: String
+null_member: Bool?
+null_set: Bool?
+--- expect plan
+cast $x.n: I64? -> F64?
+type $values: [F64]?
+type $needle: I64?
+
+--- query
+set engine = v2;
+query contextual_empty_list() {
+    match { $x: Sample }
+    return { $x.key, $x.n in [] as member, not ($x.n in []) as nonmember }
+}
+--- expect unordered
+{"x.key":"a","member":false,"nonmember":true}
+{"x.key":"b"}
+--- expect shape
+x.key: String
+member: Bool?
+nonmember: Bool?
+--- expect plan
+type []: [I64]
+no cast $x.n

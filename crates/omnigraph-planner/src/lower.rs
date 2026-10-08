@@ -7,9 +7,9 @@
 use std::collections::HashSet;
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::ast::CompOp;
 use omnigraph_compiler::traversal::EdgeSelection;
 
+use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{ColumnRef, KeyJoinKind, ScanSpec};
@@ -18,6 +18,13 @@ use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess,
 #[cfg(doc)]
 use crate::physical::RankKind;
 use crate::source::SideId;
+
+/// Aggregate expressions and their aligned planner-selected implementations.
+#[derive(Debug, Clone, Copy)]
+pub struct AggregateFields<'p> {
+    pub return_exprs: &'p [IRProjection],
+    pub aggregates: &'p [Option<AggregateSpec>],
+}
 
 /// The configuration of a [`PhysicalNode::RankFuse`] beside its two inputs.
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +74,7 @@ pub struct HashJoinFields<'p> {
 pub struct ContainsJoinFields<'p> {
     pub haystack: (&'p str, &'p str),
     pub needle: (&'p str, &'p str),
+    pub conjunct: &'p IRExpr,
     pub residual: &'p [IRExpr],
 }
 
@@ -74,15 +82,7 @@ impl ContainsJoinFields<'_> {
     /// The `$h.x contains $n.y` conjunct `haystack` and `needle` stand for,
     /// as the `Filter` over the `CrossJoin` wrote it.
     pub fn conjunct(&self) -> IRExpr {
-        let access = |(variable, property): (&str, &str)| IRExpr::PropAccess {
-            variable: variable.to_string(),
-            property: property.to_string(),
-        };
-        IRExpr::comparison(
-            access(self.haystack),
-            CompOp::StringContains,
-            access(self.needle),
-        )
+        self.conjunct.clone()
     }
 }
 
@@ -221,7 +221,7 @@ pub trait Lower {
     fn aggregate(
         &mut self,
         id: NodeId,
-        return_exprs: &[IRProjection],
+        fields: AggregateFields<'_>,
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -406,6 +406,7 @@ impl PhysicalPlan {
                 right,
                 haystack,
                 needle,
+                conjunct,
                 residual,
             } => {
                 let left = self.lower_node(*left, l)?;
@@ -413,6 +414,7 @@ impl PhysicalPlan {
                 let fields = ContainsJoinFields {
                     haystack: (&haystack.0, &haystack.1),
                     needle: (&needle.0, &needle.1),
+                    conjunct,
                     residual,
                 };
                 l.contains_join(id, fields, left, right)
@@ -488,6 +490,7 @@ impl PhysicalPlan {
             PhysicalNode::Projection {
                 input,
                 return_exprs,
+                ..
             } => {
                 let input = self.lower_node(*input, l)?;
                 l.projection(id, return_exprs, input)
@@ -495,9 +498,18 @@ impl PhysicalPlan {
             PhysicalNode::Aggregate {
                 input,
                 return_exprs,
+                aggregates,
+                ..
             } => {
                 let input = self.lower_node(*input, l)?;
-                l.aggregate(id, return_exprs, input)
+                l.aggregate(
+                    id,
+                    AggregateFields {
+                        return_exprs,
+                        aggregates,
+                    },
+                    input,
+                )
             }
             PhysicalNode::Sort {
                 input,

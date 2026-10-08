@@ -97,8 +97,8 @@ the `rrf_plan` mode and the prefilter gate's admission thresholds; and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
 retained through rewrites so historical replay can enforce the target rule. Query
-plans omit `pipelines` and node `properties.schema`: their executable schema
-is derived when lowering. Every query scan records its pinned `version`, or
+plans omit `pipelines` and node `properties.schema`: complete pipeline schemas
+are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
 `null` when that type has no dataset in the requested snapshot.
 Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
@@ -147,9 +147,44 @@ on the `ExpandExec` of an `Expand`, the mode the traversal ended on. Explain its
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 4. Saved physical
-plans use a `bound_plan_version: 1` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 6` envelope whose `body` contains `plan` and
 `values`. Older unversioned plans and unsupported versions are refused with a
 regeneration instruction, including plans without traversal nodes.
+
+An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
+group keys. Each aggregate records its result `column`, `func`, declared `input`
+and `result` types, `accumulator`, and `overflow` conversion. A type's `?` marks
+declared nullability. Integer `sum` uses `exact_integer` and `round_to_nearest`;
+floating-point `sum` and `avg` use `float64`.
+
+Aggregate, Projection and MetadataCount also print `columns`, an ordered list
+such as `["total: F64?", "person: Person"]`. Names match executed result columns;
+`?` records declared nullability, so `count` is `I64?` even when execution
+returns no nulls. A node type names its complete projected object, excluding
+Blob and Vector properties. Saved version 1 through 5 plans must be regenerated
+for the current typed expression declarations.
+
+Expression-bearing plan fields have additive `typed_*` counterparts. Each
+expression tree records `op`, the existing GQ text in `gq`, its stored `type`,
+and ordered child trees in `args`. For example, `typed_exprs`, `typed_filters`,
+`typed_filter`, `typed_keys`, `typed_left`, `typed_right`, `typed_residual` and
+`typed_k` cover results, filters, sorts, block operands, join residuals and
+rank constants. Ranked scans also expose `typed_query` and `typed_score`;
+ContainsJoin exposes its retained `typed_conjunct`. A scan's `typed_filter`
+contains its GQ conjunct trees; storage-only restrictions have no GQ tree.
+An AntiJoin exposes its complete left block tree in `typed_left` and bound in
+`typed_right`. Its `aggregate` records the aggregate leaf's `gq`, `func`, input
+and result types, accumulator and overflow rule; bare row count has `null`.
+Comparison casts wrap the finalized aggregate result. Integer block sum
+therefore accumulates exactly, rounds once to F64, and then compares in the
+stored domain. Row count is I64 non-null; column aggregates remain nullable.
+
+A `cast` tree stores the converted type and one child carrying the source
+type. Its `gq` text is identical to that child's, so existing text keys remain
+stable. Types come from compiler declarations, including `?` nullability;
+explain does not infer them. Mixed signed and U64 comparisons can use internal
+`exact_integer` values (Decimal128), including list elements. This internal
+type never appears as a public result column.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It
 takes the same `--branch`/`--snapshot` target and `--params` as the query

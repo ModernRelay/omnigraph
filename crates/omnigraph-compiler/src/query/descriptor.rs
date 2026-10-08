@@ -8,7 +8,7 @@ use crate::error::{CompilerError, Result};
 
 use super::ast::{Mutation, QueryDecl};
 use super::typecheck::{
-    BoundVariable, CheckedQuery, MutationTarget, TypeContext, infer_query_result_schema,
+    BoundVariable, CheckedQuery, MutationTarget, TypeContext, projection_field, projection_name,
     typecheck_query_decl,
 };
 
@@ -94,10 +94,15 @@ fn describe_checked_query_operation(
     let result = match checked {
         CheckedQuery::Read(ctx) => {
             collect_checked_reads(ctx, &mut reads);
-            infer_query_result_schema(catalog, query, ctx)?
-                .fields()
+            let ir = crate::lower_query(catalog, query, ctx)?;
+            ir.return_exprs
                 .iter()
-                .map(result_field_descriptor)
+                .zip(&query.return_clause)
+                .map(|(projection, ast)| {
+                    let name = projection_name(&ast.expr, ast.alias.as_deref());
+                    let field = projection_field(catalog, &name, &projection.ty)?;
+                    result_field_descriptor(&field)
+                })
                 .collect::<Result<Vec<_>>>()?
         }
         CheckedQuery::Mutation(ctx) => {
@@ -186,7 +191,7 @@ fn node_fact(type_name: &str) -> QueryGraphFact {
     }
 }
 
-fn result_field_descriptor(field: &arrow_schema::FieldRef) -> Result<QueryResultFieldDescriptor> {
+fn result_field_descriptor(field: &arrow_schema::Field) -> Result<QueryResultFieldDescriptor> {
     let (kind, item_kind, vector_dim) = result_value_shape(field.data_type())?;
     Ok(QueryResultFieldDescriptor {
         name: field.name().clone(),

@@ -22,6 +22,7 @@
 //! Query traversal schemas in this crate remain conservative input schemas;
 //! the engine derives their complete runtime output schemas from the catalog.
 
+pub mod aggregate;
 pub mod bound;
 pub mod cost;
 pub mod error;
@@ -32,17 +33,22 @@ pub mod lower;
 pub mod mirror;
 pub mod operation;
 pub mod optimizer;
+pub mod output;
 pub mod physical;
 pub mod registry;
 pub mod route;
 pub mod source;
+mod typed;
 
+pub use aggregate::{
+    Accumulator, AggregateSpec, Overflow, plan_aggregate, plan_block_aggregate,
+    validate_aggregate_specs,
+};
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, CSR_BUILD_FACTOR, ExpandCostInputs, ExpandMode, ExpandPolicy,
     HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
-    cost_effective_hops, direction_probe_factor, estimate_rows, executed_hops, scan_row_estimate,
-    should_switch_to_csr,
+    direction_probe_factor, estimate_rows, executed_hops, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
@@ -52,10 +58,12 @@ pub use logical::{
     Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
 };
 pub use lower::{
-    ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    AggregateFields, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields,
+    SortMergeJoinFields,
 };
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
+pub use output::{NodeObjectType, validate_output_schemas};
 pub use physical::{
     Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OverfetchRung, PhysicalNode,
     PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope, RankedAccess,

@@ -23,7 +23,7 @@ use omnigraph_planner::{
 
 use super::ResolvedParams;
 use super::scan::ir_expr_to_df_expr;
-use super::search::check_param_date_literals;
+use super::{fill_declared_params, validate_params};
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
@@ -274,6 +274,12 @@ impl PlanSource for QuerySource<'_> {
                 .node_object_fields()
                 .map(|field| field.name().clone())
                 .collect(),
+            object_fields: node_type
+                .node_object_members()
+                .map(|(member, field)| {
+                    arrow_schema::Field::new(member, field.data_type().clone(), field.is_nullable())
+                })
+                .collect(),
             row_count,
         })
     }
@@ -313,7 +319,6 @@ impl PlanSource for QuerySource<'_> {
             edge_count,
             src_node_count: node_count(src_type)?,
             dst_node_count: node_count(dst_type)?,
-            same_type: edge_def.from_type == edge_def.to_type,
             max_frontier_cap: self.expand_caps.max_frontier,
             max_hops_cap: self.expand_caps.max_hops,
         })
@@ -348,23 +353,8 @@ fn no_plan(reason: impl std::fmt::Display) -> OmniError {
 /// `now()` bound to the clock; an omitted required one is the error the query
 /// answers.
 fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
-    check_param_date_literals(params, &ir.params)?;
-    let mut resolved_params = None;
-    for param in &ir.params {
-        if !params.contains_key(&param.name) {
-            if param.nullable {
-                resolved_params
-                    .get_or_insert_with(|| params.clone())
-                    .insert(param.name.clone(), Literal::Null);
-            } else {
-                return Err(OmniError::manifest(format!(
-                    "parameter '{}' not provided",
-                    param.name
-                )));
-            }
-        }
-    }
-    let mut resolved = resolved_params.unwrap_or_else(|| params.clone());
+    let mut resolved = params.clone();
+    fill_declared_params(&mut resolved, &ir.params)?;
     let now_name = omnigraph_compiler::query::ast::NOW_PARAM_NAME;
     if resolved.contains_key(now_name) {
         return Err(OmniError::manifest(format!(
@@ -376,6 +366,7 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
     resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    validate_params(&resolved, &ir.params)?;
     Ok(ResolvedParams(Arc::new(resolved)))
 }
 
