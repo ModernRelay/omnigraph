@@ -230,7 +230,9 @@ cause and rerun cleanup to converge. The run derives each branch's history
 and pins from one captured version, then validates that the live inventory,
 versions, incarnations and tags still match after all table inventories.
 A changed observation refuses the whole plan before deletion; rerun with the
-same policy. Retirement archives exact branch identity and ancestry inside
+same policy. This includes a branch deleted after cleanup listed it: cleanup
+returns a retryable conflict, and a new run captures the current branches.
+Retirement archives exact branch identity and ancestry inside
 its native tree, then removes the active ref. Creation does not scan retired
 histories. Cleanup removes unneeded retired trees and their archives, while
 preserving trees needed by live descendants, merge bases or tags.

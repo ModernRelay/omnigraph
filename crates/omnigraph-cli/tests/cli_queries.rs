@@ -596,7 +596,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
         assert_eq!(requests[1].body[source_field], SOURCE);
         assert_eq!(
             requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
-            "0.12"
+            omnigraph_api_types::HTTP_API_CONTRACT
         );
         server.assert_complete();
     }

@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::case::CaseV1;
+use crate::legacy::case::CaseV1;
 use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{EffectiveEnvironmentValue, RepObservation};
@@ -32,43 +32,7 @@ pub const MAX_WORKER_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKER_EXECUTABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// Attested build facts reported by an honest worker from its own process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerBuildV1 {
-    pub source_commit: String,
-    /// `None` is an explicit failed build-time probe and is never admissible
-    /// for a measured worker. Keeping the absence typed lets the parent fail
-    /// closed instead of accepting a fabricated clean/dirty value.
-    pub source_tree_dirty: Option<bool>,
-    pub cargo_profile: String,
-    /// Cargo's profile-level observation, not proof against direct target
-    /// rustc arguments.
-    pub cargo_opt_level: String,
-    pub debug_assertions: bool,
-    /// Effective Lance memory-pool setting inherited by the measured worker.
-    /// This is retained until the complete typed engine-environment registry
-    /// below replaces the one-setting representation.
-    pub effective_lance_mem_pool_size: Box<EffectiveEnvironmentValue>,
-    pub target_triple: String,
-    pub rustc_version: String,
-    pub declared_release_lto: String,
-    pub declared_release_codegen_units: Option<u32>,
-    pub declared_release_strip: Option<bool>,
-    pub cargo_encoded_rustflags_present: Option<bool>,
-    pub release_profile_environment_overrides_supported: Option<bool>,
-    /// False until a controlled build wrapper supplies the final target rustc
-    /// command line in a digest-bound external receipt.
-    pub effective_codegen_options_proved: bool,
-    /// Canonical Cargo feature names reported by the linked
-    /// `omnigraph-engine` artifact itself, not inferred from this CLI crate.
-    pub engine_feature_flags: Vec<String>,
-    /// Canonical non-Cargo engine techniques enabled for this execution.
-    /// Runner-v1 has no such controls and therefore admits only an empty set.
-    pub enabled_techniques: Vec<String>,
-    pub executable_sha256: String,
-}
-
+pub use crate::gqt_protocol::WorkerBuildV1;
 /// Complete, immutable input for one worker process.
 ///
 /// The worker revalidates `case` and compares the derived identities with the
@@ -424,11 +388,11 @@ mod tests {
     use std::io::{BufReader, Cursor, Write};
 
     use crate::counting::LogicalCallCounts;
+    use crate::legacy::case::validate_case;
     use crate::runner::{
         ControlCallObservation, LogicalStoreCallObservation, VerificationObservation,
         test_general_merge_route, test_general_merge_stored_phases,
     };
-    use crate::validate_case;
 
     use super::*;
 

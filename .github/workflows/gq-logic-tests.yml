@@ -175,13 +175,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
+      # Every cargo invocation of this job selects the same three packages,
+      # so the engine graph resolves one feature set and builds once; a
+      # narrower selection rebuilds every crate whose features differ (the
+      # cache rule in docs/dev/ci.md). The seam guard's crate declares no
+      # workspace crate, so it adds no engine build.
       - name: Test unavailable DST runtime refusal
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
         # The flagless build shape this test exists for: an env RUSTFLAGS,
         # empty included, replaces the workspace `[build] rustflags`.
         env:
           RUSTFLAGS: ""
-        run: cargo test -p omnigraph-gqt --locked --timings --lib --test runner_dispatch -- --nocapture
+        run: cargo test -p omnigraph-gqt -p omnigraph-gqt-core -p omnigraph-bench --locked --timings --test runner_dispatch -- --nocapture
+
+      # The benchmark units include the fixture parity test, which reads a
+      # corpus case, so it must run when a cases-only diff skips `Test Workspace`.
+      - name: Test GQT, GQT core and benchmark units
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'ordinary'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-gqt -p omnigraph-gqt-core -p omnigraph-bench --locked --timings --lib
 
       # A case's `at:` name arms a seam in the seam guard, so a cases-only
       # diff can change its verdict while `Test Workspace` is skipped.
@@ -195,11 +208,11 @@ jobs:
       # from any directory; these steps run from the repo root.
       - name: Run complete GQ logic tests with DST
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst'
-        run: cargo test -p omnigraph-gqt --locked --timings -- --nocapture
+        run: cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked --timings -- --nocapture
 
       - name: Clippy GQT with DST
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst-clippy'
-        run: cargo clippy -p omnigraph-gqt --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
+        run: cargo clippy -p omnigraph-gqt -p omnigraph-gqt-core --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
 
       - name: Retain GQT invocation reports
         if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy'

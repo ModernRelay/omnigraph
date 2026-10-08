@@ -1,0 +1,46 @@
+# issue: none
+# notes: Final recreation after bounded prior cycles; exact live rows/registry after reopen.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query recreate_row() { insert Item { key: "temporary", value: 99 } }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+{"key":"temporary","value":99}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+{"key":"temporary","value":99}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String

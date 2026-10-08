@@ -632,11 +632,12 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
     let cases = [
         Vec::new(),
         vec![HeaderValue::from_static("0.11")],
-        vec![HeaderValue::from_static("0.13")],
-        vec![HeaderValue::from_static("0.12, 0.12")],
+        vec![HeaderValue::from_static("0.12")],
+        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
         vec![
-            HeaderValue::from_static("0.12"),
-            HeaderValue::from_static("0.12"),
+            HeaderValue::from_static(HTTP_API_CONTRACT),
+            HeaderValue::from_static(HTTP_API_CONTRACT),
         ],
         vec![HeaderValue::from_static("")],
         vec![HeaderValue::from_bytes(&[0xff]).unwrap()],
@@ -740,7 +741,7 @@ async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
         .clone()
         .oneshot(
             Request::post(g("/mutate"))
-                .header("Omnigraph-Http-Api", HTTP_API_CONTRACT)
+                .header("Omnigraph-Http-Api", "0.13")
                 .header("authorization", "Bearer demo-token")
                 .header("content-type", "application/json")
                 .body(Body::from(payload))

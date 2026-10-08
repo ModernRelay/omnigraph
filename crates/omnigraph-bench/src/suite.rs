@@ -161,6 +161,9 @@ pub fn validate_suite(suite: SuiteV1) -> ValidationOutcome<SuiteV1> {
 /// `<catalog>/cases`. Canonical paths, human case ids, and full point ids must
 /// each be unique.
 pub fn load_suite(path: &Path) -> ValidationOutcome<ResolvedSuite> {
+    if path.is_dir() {
+        return load_suite_directory(path);
+    }
     let (suite_path, cases_root) = match resolve_catalog_paths(path) {
         Ok(paths) => paths,
         Err(diagnostic) => return ValidationOutcome::failure(vec![diagnostic]),
@@ -266,18 +269,18 @@ fn resolve_catalog_paths(path: &Path) -> Result<(PathBuf, PathBuf), Diagnostic> 
     };
     let declared_suites_root = declared_suite_path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if declared_suites_root
-        .file_name()
-        .is_none_or(|name| name != "suites")
-    {
-        return Err(Diagnostic::error(
-            "suite_catalog_layout_error",
-            path.display().to_string(),
-            "suite file must be directly inside a benchmark catalog's 'suites' directory",
-        ));
-    }
+        .and_then(|parent| {
+            parent
+                .ancestors()
+                .find(|p| p.file_name().is_some_and(|name| name == "suites"))
+        })
+        .ok_or_else(|| {
+            Diagnostic::error(
+                "suite_catalog_layout_error",
+                path.display().to_string(),
+                "suite file must be below a catalog suites directory",
+            )
+        })?;
     let declared_catalog_root = declared_suites_root
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -310,7 +313,7 @@ fn resolve_catalog_paths(path: &Path) -> Result<(PathBuf, PathBuf), Diagnostic> 
             format!("could not resolve suite path: {error}"),
         )
     })?;
-    if suite_path.parent() != Some(suites_root.as_path()) {
+    if !suite_path.starts_with(&suites_root) {
         return Err(Diagnostic::error(
             "suite_outside_catalog",
             path.display().to_string(),
@@ -345,26 +348,96 @@ fn reject_duplicate_identity(
     let mut points: BTreeMap<&str, usize> = BTreeMap::new();
     for (loaded_index, run) in runs.iter().enumerate() {
         let source_index = source_indices[loaded_index];
-        if let Some(first) = ids.insert(&run.case.definition.id, source_index) {
+        if let Some(first) = ids.insert(run.case.id(), source_index) {
             diagnostics.push(Diagnostic::error(
                 "duplicate_case_id",
                 format!("runs[{source_index}].case"),
                 format!(
                     "case id '{}' is already used by runs[{first}]",
-                    run.case.definition.id
+                    run.case.id()
                 ),
             ));
         }
-        if let Some(first) = points.insert(&run.case.point_id, source_index) {
+        if let Some(first) = points.insert(run.case.planned_identity(), source_index) {
             diagnostics.push(Diagnostic::error(
                 "duplicate_point_id",
                 format!("runs[{source_index}].case"),
                 format!(
                     "point id '{}' is already used by runs[{first}]",
-                    run.case.point_id
+                    run.case.planned_identity()
                 ),
             ));
         }
+    }
+}
+
+fn load_suite_directory(path: &Path) -> ValidationOutcome<ResolvedSuite> {
+    let result = (|| -> Result<ResolvedSuite, Vec<Diagnostic>> {
+        let failure = |e: String| {
+            vec![Diagnostic::error(
+                "suite_directory_error",
+                path.display().to_string(),
+                e,
+            )]
+        };
+        let mut files = Vec::new();
+        for (index, entry) in fs::read_dir(path)
+            .map_err(|e| failure(e.to_string()))?
+            .enumerate()
+        {
+            if index >= MAX_SUITE_RUNS {
+                return Err(failure("directory entry budget exceeded".into()));
+            }
+            let entry = entry.map_err(|e| failure(e.to_string()))?;
+            if entry.path().extension().is_some_and(|e| e == "yaml") {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        let mut runs = Vec::new();
+        let mut total = 0u64;
+        for file in files {
+            let suite = load_suite(&file).into_result()?;
+            for run in suite.runs {
+                total = total
+                    .checked_add(run.repetitions as u64)
+                    .ok_or_else(|| failure("repetition total overflow".into()))?;
+                if runs.len() >= MAX_SUITE_RUNS || total > MAX_TOTAL_REPETITIONS {
+                    return Err(failure(
+                        "suite directory acquisition budget exceeded".into(),
+                    ));
+                }
+                runs.push(run);
+            }
+        }
+        if runs.is_empty() {
+            return Err(failure("directory contains no suite runs".into()));
+        }
+        let mut diagnostics = Vec::new();
+        let indices = (0..runs.len()).collect::<Vec<_>>();
+        reject_duplicate_identity(&runs, &indices, &mut diagnostics);
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        Ok(ResolvedSuite {
+            definition: SuiteV1 {
+                version: 1,
+                name: "directory".into(),
+                runs: runs
+                    .iter()
+                    .map(|r| SuiteRunV1 {
+                        case: r.case_path.clone(),
+                        repetitions: r.repetitions,
+                    })
+                    .collect(),
+            },
+            suite_path: path.to_path_buf(),
+            runs,
+        })
+    })();
+    match result {
+        Ok(s) => ValidationOutcome::success(s),
+        Err(d) => ValidationOutcome::failure(d),
     }
 }
 
@@ -413,7 +486,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         let five = load_suite(&suite_path).into_result().unwrap();
         fs::write(&suite_path, suite("../cases/base.yaml", 20)).unwrap();
         let twenty = load_suite(&suite_path).into_result().unwrap();
-        assert_eq!(five.runs[0].case.point_id, twenty.runs[0].case.point_id);
+        assert_eq!(five.runs[0].case.point_id(), twenty.runs[0].case.point_id());
         assert_eq!(five.runs[0].repetitions, 5);
         assert_eq!(twenty.runs[0].repetitions, 20);
     }

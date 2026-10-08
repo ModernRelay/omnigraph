@@ -258,6 +258,9 @@ fn rfc023_external_writer_process() {
                     let rows = db.cleanup(keep_one()).await.unwrap();
                     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
                 }
+                "collector_retired" => {
+                    db.branch_delete("collector-existing").await.unwrap();
+                }
                 "collector_mixed" => {
                     db.load("main", &payload, mode).await.unwrap();
                     db.branch_merge("main", "collector-existing").await.unwrap();
@@ -8448,52 +8451,65 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
     }
 }
 
-/// Revalidation refuses a cut whose later branch imports a publication that
-/// the earlier branch capture could not observe.
+/// Revalidation refuses a cut whose later branch imports an unseen publication
+/// or disappears after listing. In either case cleanup must report a retryable
+/// conflict before deleting anything, and a fresh attempt must converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn collector_refuses_mixed_branch_captures_before_deleting() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("collector-existing").await.unwrap();
-    let person_uri = node_table_uri(&db, "Person").await;
-    let expected_rows = count_rows(&db, "node:Person").await + 1;
-    let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
-    let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
-    let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
-    let reached = hold.clone();
-    tokio::task::spawn_blocking(move || reached.wait_until_reached())
+    for action in ["collector_mixed", "collector_retired"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.branch_create("collector-existing").await.unwrap();
+        let person_uri = node_table_uri(&db, "Person").await;
+        let before = detached_versions(&person_uri).await;
+        let expected_rows =
+            count_rows(&db, "node:Person").await + usize::from(action == "collector_mixed");
+        let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
+        let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
+        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let reached = hold.clone();
+        tokio::task::spawn_blocking(move || reached.wait_until_reached())
+            .await
+            .unwrap();
+        let uri = db.uri().to_string();
+        let child = tokio::task::spawn_blocking(move || {
+            run_rfc023_external_writer_action(
+                uri,
+                LoadMode::Append,
+                r#"{"type":"Person","data":{"name":"collector-main","age":40}}"#.to_string(),
+                action,
+            )
+        })
         .await
         .unwrap();
-    let uri = db.uri().to_string();
-    let child = tokio::task::spawn_blocking(move || {
-        run_rfc023_external_writer_action(
-            uri,
-            LoadMode::Append,
-            r#"{"type":"Person","data":{"name":"collector-main","age":40}}"#.to_string(),
-            "collector_mixed",
-        )
-    })
-    .await
-    .unwrap();
-    hold.release();
-    let result = cleanup.await.unwrap();
-    drop(guard);
-    child.unwrap();
-    assert!(
-        !hold.timed_out(),
-        "the child finished before releasing cleanup"
-    );
-    let error = result.expect_err("a mixed capture must fail before sweeping");
-    assert!(error.to_string().contains("collector branch"), "{error}");
-    let reader = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
-    let pin = pinned_version(&reader, "main", "node:Person").await;
-    assert!(detached_versions(&person_uri).await.contains(&pin));
-    assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
-    let retry = reader.cleanup(keep_one()).await.unwrap();
-    assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
-    assert!(detached_versions(&person_uri).await.contains(&pin));
+        hold.release();
+        let result = cleanup.await.unwrap();
+        drop(guard);
+        child.unwrap();
+        assert!(
+            !hold.timed_out(),
+            "the child finished before releasing cleanup"
+        );
+        let error = result.expect_err("a mixed capture must fail before sweeping");
+        assert!(
+            matches!(error, OmniError::Manifest(ref details) if details.kind == ManifestErrorKind::Conflict),
+            "{action}: {error:?}"
+        );
+        assert!(error.to_string().contains("collector branch"), "{error}");
+        assert!(
+            before.is_subset(&detached_versions(&person_uri).await),
+            "{action}: a refused capture must not delete any table version"
+        );
+        let reader = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
+        let pin = pinned_version(&reader, "main", "node:Person").await;
+        assert!(detached_versions(&person_uri).await.contains(&pin));
+        assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
+        let retry = reader.cleanup(keep_one()).await.unwrap();
+        assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
+        assert!(detached_versions(&person_uri).await.contains(&pin));
+    }
 }
 
 /// Detached-only collector, fixture 7: a pass interrupted inside its sweep
