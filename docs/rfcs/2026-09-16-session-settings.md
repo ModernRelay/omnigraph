@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-16
-updated: 2026-10-05
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -805,8 +805,8 @@ known gap changes.
 **Wire.** Within the Summary's boundary, the wire change is one optional
 field, `settings`, on three request types, honored at four routes, and one
 optional repeatable query parameter, `set`, on the two `GET` change routes;
-absent means the process defaults. CLI and server require the v0.12 HTTP
-contract; older-server fallback is unsupported. Query and mutation request
+absent means the process defaults. CLI and server require the current [HTTP
+contract](2026-09-30-v012-http-admission.md); older-server fallback is unsupported. Query and mutation request
 bodies refuse unknown fields. The typed field means the OpenAPI golden
 (`crates/omnigraph-server/tests/openapi.rs`) shows each `request`
 setting's type and values, and a future `request` setting is a visible
@@ -1185,3 +1185,7 @@ routed) follows step 2.
   removed; `load` retains its embedded settings behavior. `schema apply` is
   direct-only and served schema changes use cluster deployment. The earlier
   decision-log entries record the original rollout.
+
+- 2026-10-07: Replaced Compatibility and reversibility's sentence requiring
+  the v0.12 HTTP contract with the current admission decision, which now requires
+  exactly `0.13`. Settings do not negotiate an independent wire version.

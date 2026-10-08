@@ -1,0 +1,31 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query count_bare() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":20}
+--- expect shape
+n: I64
+
+--- query
+query count_bare() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":20}
+--- expect shape
+n: I64
+
+--- restart
+
+--- query
+query count_bare() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":20}
+--- expect shape
+n: I64

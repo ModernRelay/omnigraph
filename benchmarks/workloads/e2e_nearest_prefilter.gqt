@@ -1,0 +1,45 @@
+# issue: none
+# notes: Full filtered nearest query over 64 docs; exact distance order survives reopening. One operation on a fresh handle is timed; checks and restart are outside the timer.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[1.0,0.0,0.0,0.0]}
+
+--- expect ordered
+{"d.slug":"hit001"}
+{"d.slug":"hit002"}
+{"d.slug":"hit003"}
+--- expect shape
+d.slug: String
+
+--- restart
+
+--- query
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[1.0,0.0,0.0,0.0]}
+
+--- expect ordered
+{"d.slug":"hit001"}
+{"d.slug":"hit002"}
+{"d.slug":"hit003"}
+--- expect shape
+d.slug: String
+

@@ -1,7 +1,13 @@
 # Migration and Retired Vocabulary
 
-The rest of this skill targets OmniGraph 0.12.0. Read this page before replacing
+The rest of this skill targets the current CLI and HTTP contract. The versioned
+procedures below use their named predecessor binaries. Read this page before replacing
 an older binary, rebuilding a graph, or translating earlier API examples.
+
+Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.13`, including
+the current routes, shapes and credentials. A `0.12` peer is refused before data
+dispatch or graph access; changing an old integration's header alone is not an
+upgrade. See [server policy](server-policy.md).
 
 ## Upgrade v0.10 to v0.11
 

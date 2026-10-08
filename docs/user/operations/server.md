@@ -39,12 +39,14 @@ the directory's config can change where boot looks for applied state.
 
 ## HTTP contract
 
-Upgrade the v0.12 CLI, server and HTTP integrations together. Every protected
-request requires exactly one `Omnigraph-Http-Api: 0.12`: graph, registry and
+Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
+request requires exactly one `Omnigraph-Http-Api: 0.13`: graph, registry and
 cluster-deployment calls, including `/graphs/discovery`, JSON, streams and Blob GET/HEAD. Missing,
 duplicate, combined or unsupported values return `400 api_contract_mismatch`
 after authentication but before graph lookup, body decoding or execution. This
 HTTP identifier is separate from package/storage versions and grants no permission.
+The previous `0.12` value is refused; update integrations to the current routes,
+request/response shapes and credentials before changing their header.
 
 Ordinary responses, including errors and streams, carry the same header. Check
 it before decoding or emitting the body. A missing/incompatible response header
@@ -234,7 +236,7 @@ Change a managed graph's schema through `cluster apply --server URL --config DIR
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/query \
-  -H 'Omnigraph-Http-Api: 0.12' \
+  -H 'Omnigraph-Http-Api: 0.13' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
@@ -253,7 +255,7 @@ writes go to `/mutate` and may select a target `branch`.
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
-  -H 'Omnigraph-Http-Api: 0.12' \
+  -H 'Omnigraph-Http-Api: 0.13' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{"params":{"name":"Ada"}}'
@@ -270,7 +272,7 @@ acting on:
 
 ```bash
 curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
-  -H 'Omnigraph-Http-Api: 0.12' \
+  -H 'Omnigraph-Http-Api: 0.13' \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \

@@ -819,6 +819,28 @@ impl TableTagInventory {
     }
 }
 
+// Listing precedes cleanup's control-gate acquisition; a listed branch can
+// retire while cleanup waits for its gate. The report-only path holds no gates.
+// A missing inventory member invalidates the whole capture, just like a changed
+// identity or head. Only the matching typed branch miss proves this conflict:
+// missing manifests, malformed refs and other storage failures keep their cause.
+async fn open_inventory_branch(db: &Omnigraph, branch: Option<&str>) -> Result<CollectorBranch> {
+    ManifestCoordinator::collector_branch_under_control_gates(
+        db.root_uri(),
+        branch,
+        &db.control_session(),
+    )
+    .await
+    .map_err(|error| match error {
+        OmniError::BranchNotFound { branch: missing } if branch == Some(missing.as_str()) => {
+            OmniError::manifest_conflict(format!(
+                "collector branch '{missing}' disappeared during capture; retry cleanup"
+            ))
+        }
+        other => other,
+    })
+}
+
 /// Plan one run over `branches` (every live graph branch), deleting nothing.
 pub(crate) async fn plan_collection(
     db: &Omnigraph,
@@ -834,12 +856,7 @@ pub(crate) async fn plan_collection(
     let mut roots = PinRoots::new();
     let mut tables = TableLocations::new();
     let mut table_tags = HashMap::new();
-    let main = ManifestCoordinator::collector_branch_under_control_gates(
-        db.root_uri(),
-        None,
-        &db.control_session(),
-    )
-    .await?;
+    let main = open_inventory_branch(db, None).await?;
     let tags = ManifestTagInventory::capture(main.dataset()).await?;
     let registry = main.clone();
     let mut main = Some(main);
@@ -848,14 +865,7 @@ pub(crate) async fn plan_collection(
             None => main.take().ok_or_else(|| {
                 OmniError::manifest_internal("collector captured main more than once")
             })?,
-            Some(_) => {
-                ManifestCoordinator::collector_branch_under_control_gates(
-                    db.root_uri(),
-                    branch.as_deref(),
-                    &db.control_session(),
-                )
-                .await?
-            }
+            Some(_) => open_inventory_branch(db, branch.as_deref()).await?,
         };
         report.cost.manifest_snapshots += 1;
         report
@@ -1013,12 +1023,7 @@ pub(crate) async fn plan_collection(
         ));
     }
     for view in &views {
-        let current = ManifestCoordinator::collector_branch_under_control_gates(
-            db.root_uri(),
-            view.branch.as_deref(),
-            &db.control_session(),
-        )
-        .await?;
+        let current = open_inventory_branch(db, view.branch.as_deref()).await?;
         report.cost.manifest_rechecks += 1;
         if current.head_version() != view.manifest_version
             || incarnation_key(current.identifier())? != view.identifier

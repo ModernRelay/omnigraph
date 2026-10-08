@@ -843,28 +843,28 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
-          cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
 
       - name: Run required storage upgrade engine tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-lance.log"
-          cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log lance "$test_log"
 
       - name: Run required storage upgrade protocol tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-protocol.log"
-          cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
   v5_v10_format_fence:
@@ -1229,8 +1229,9 @@ jobs:
     needs: classify_changes
     if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
-    # Cold failpoint and default-feature Lance graphs compile sequentially on
-    # the first cache miss; keep the timeout above the RustFS shard envelope.
+    # One Lance graph, the one `Test Workspace` builds, compiles on the first
+    # cache miss (every cargo call below selects it; docs/dev/ci.md, cache
+    # rule); keep the timeout above the RustFS shard envelope.
     timeout-minutes: 90
     permissions:
       contents: read
@@ -1342,6 +1343,12 @@ jobs:
           test_log="$RUNNER_TEMP/azurite-azure.log"
           : >"$test_log"
 
+          # Every cargo call selects the same packages, the `Test Workspace`
+          # set, so the Lance stack resolves one feature set and compiles
+          # once; a per-owner `-p` resolved six graphs, four with the Lance
+          # stack, 89 minutes on main (docs/dev/ci.md, cache rule). An owner
+          # names only its target: `--lib`, or `--test <file>`.
+          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
           require_cell() {
             grep -Eq "test (tests::)?${1} \.\.\. ok" "$test_log" \
               || { echo "::error::required Azure cell '${1}' did not execute normally"; exit 1; }
@@ -1349,13 +1356,13 @@ jobs:
           run_cell() {
             local name="$1"
             shift
-            cargo test --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee -a "$test_log"
+            cargo test --locked "${selection[@]}" "$@" "$name" -- --exact --nocapture 2>&1 | tee -a "$test_log"
             require_cell "${name#tests::}"
           }
 
-          run_cell tests::contract_suite_azure_when_configured -p omnigraph-storage
-          run_cell tests::configured_azurite_enforces_one_lease_owner_and_explicit_break -p omnigraph-azure-admission
-          cargo test --locked -p omnigraph-azure-admission --test supervisor \
+          run_cell tests::contract_suite_azure_when_configured --lib
+          run_cell tests::configured_azurite_enforces_one_lease_owner_and_explicit_break --lib
+          cargo test --locked "${selection[@]}" --test supervisor \
             -- --nocapture 2>&1 | tee -a "$test_log"
           for test_name in \
             held_admission_never_launches_child_then_runs_once_after_release \
@@ -1365,14 +1372,17 @@ jobs:
           do
             require_cell "$test_name"
           done
-          run_cell azure_write_detached_pin_survives_next_write -p omnigraph-engine --features failpoints --test failpoints
-          run_cell azure_optimize_detached_pin_survives_next_write -p omnigraph-engine --features failpoints --test failpoints
-          run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract -p omnigraph-engine --features failpoints --test failpoints
-          run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete -p omnigraph-cluster --test s3_cluster
-          run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read -p omnigraph-server --test s3
-          run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query -p omnigraph-server --test s3
-          run_cell local_cli_azure_end_to_end_init_load_read_flow -p omnigraph-cli --test system_local
-          run_cell cluster_e2e_azure_live_apply_without_restart -p omnigraph-cli --test cli_cluster_e2e
+          # `failpoints` is a test target of the engine and of the cluster
+          # crate; the cluster binary runs zero tests for an engine owner's
+          # name and require_cell reads the engine's `ok` line.
+          run_cell azure_write_detached_pin_survives_next_write --test failpoints
+          run_cell azure_optimize_detached_pin_survives_next_write --test failpoints
+          run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract --test failpoints
+          run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete --test s3_cluster
+          run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read --test s3
+          run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test s3
+          run_cell local_cli_azure_end_to_end_init_load_read_flow --test system_local
+          run_cell cluster_e2e_azure_live_apply_without_restart --test cli_cluster_e2e
 
           if grep -Eiq 'skipping .*azure|skipping .*azurite' "$test_log"; then
             echo "::error::a configured Azure test emitted its unconfigured skip"

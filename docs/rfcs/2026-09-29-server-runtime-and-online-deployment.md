@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-06
+updated: 2026-10-07
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -35,8 +35,8 @@ The engine publishes graph contents and their accepted schema together; the
 existing cluster ledger owns deployment input and applied results. No new
 transaction manager, content-recovery log or job queue is added.
 
-This decision targets **v0.12 only**. Deploy the CLI, server and cluster tools as
-one qualified v0.12 build. There is one wire contract, without older-client
+This decision targets **v0.13 only**. Deploy the CLI, server and cluster tools as
+one qualified v0.13 build. There is one wire contract, without older-client
 adapters, legacy response aliases or a mixed-version support matrix. Version
 refusal and data-preserving migration remain required.
 
@@ -677,7 +677,7 @@ lane and resource limits, validates the serving projection, and never closes gra
 admission or creates a deployment record.
 
 `POST /cluster/deployments` accepts a client-known `deployment_id` and one
-bounded `CapturedDeployment`. The CLI discovers the v0.12 contract, reads
+bounded `CapturedDeployment`. The CLI discovers the v0.13 contract, reads
 `GET /cluster/deployments`, captures local source bytes bound to that authenticated
 canonical root, allocates the next identity and prints it before POST. Omitted
 storage selects that root; an explicit absolute root must match without client
@@ -939,18 +939,18 @@ engine. Tests must prove the boundary whose behavior is promised.
 
 ## Compatibility
 
-**One v0.12 release-line contract.** CLI, server and cluster tools are upgraded
+**One v0.13 release-line contract.** CLI, server and cluster tools are upgraded
 together to a qualified build. Earlier/later release lines, missing required
 contract evidence and incompatible protocol shapes are refused, without warning-
 and-continue, alternate response aliases or automatic downgrade. The accepted
-[v0.12 HTTP admission](2026-09-30-v012-http-admission.md) decision owns A1's exact
+[HTTP contract admission](2026-09-30-v012-http-admission.md) decision owns A1's exact
 header, public discovery, pre-effect refusal and CLI response validation. Package
 version alone does not establish that contract or prove another increment
 implemented. A response incompatibility after dispatch reports unknown effects,
 not a proven no-effect refusal. No general surface-hash or mixed-version
 negotiation framework is required.
 
-v0.12 is a software release, not internal manifest stamp 12. The current binary
+v0.13 is a software release, not internal manifest stamp 13. The current binary
 serves storage v14 only; normal open never migrates. Supported standalone roots
 have explicit offline routes under the
 [current storage contract](../dev/versioning.md#current-storage-contract).
@@ -973,7 +973,7 @@ CLI submits over HTTP and requires no competing storage-writer lease. Direct
 apply retains its stopped-writer wrapper procedure. Never bypass, share or break
 the lease or write the ledger directly.
 
-The v0.12 OpenAPI, CLI contract, user guidance and tests ship together. Document
+The v0.13 OpenAPI, CLI contract, user guidance and tests ship together. Document
 intentional breaks: structured deletion errors replace the string alias; one
 inventory includes unavailable graphs without a `quarantined` alias;
 `served_graph_count` includes those entries, with separate ready/loading/blocked counts.
@@ -1004,7 +1004,7 @@ server controls. Keep T/B identifiers stable, with these acceptance obligations:
 
 | IDs | Required evidence |
 |---|---|
-| T1–T3 | Own-publication receipts; lost delivery never replays; v0.12 admission/refusal and whole-command outcomes, including compound deletion failure. |
+| T1–T3 | Own-publication receipts; lost delivery never replays; v0.13 admission/refusal and whole-command outcomes, including compound deletion failure. |
 | T4 | Atomic contract/table publication, exact pins and same-handle schema/cache progress across faults; legacy evidence refuses unchanged. |
 | T5–T7 | Disconnect, outstanding accepted I/O, shutdown and actual process restart preserve ownership and settlement through reached boundaries. |
 | T8.live | Same engine/PID/listener and coherent schema/query activation; deletion waits for parked requests and held response bytes, then physically removes only its target and atomically removes its inventory entry. Cover shutdown races, unaffected graph progress, submission-only CLI and writer exclusion. Native-tail/provider claims require their own evidence. T8.history/retention are deferred outside scope. |
@@ -1229,7 +1229,7 @@ existing-cluster graph-format conversion remain separate gates.
 
 | Increment | Deliverable | Shipping gate |
 |---|---|---|
-| A | A1 v0.12 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
+| A | A1 v0.13 HTTP admission; A2 own-publication merge receipts; A3 CLI outcomes | A1 follows [its accepted decision](2026-09-30-v012-http-admission.md); A2 is qualified under [Exact merge receipts](2026-09-30-exact-merge-receipts.md), including T1/T2; A3's initial typed-429 and qualified-HTTP-412 contract is qualified under [Owned server operations](2026-09-30-owned-server-operations.md) |
 | B | Owned writes, read/stream accounting, drain and shared shutdown | [Owned server operations](2026-09-30-owned-server-operations.md) qualifies the task/body foundation. [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md) is accepted and partially implements query-child ownership and named aggregate write limits. Native settlement, completion reserves and runtime reuse remain unqualified under its T6/T10 gates. |
 | C | Remaining initialization/native-control completion, owned maintenance and bounded transient startup retry | Atomic schema publication is landed; T4/T6/T7/T11 retain same-process progress and protected reclamation |
 | D | Aggregate budgets and feed progress; embedding diagnostics implemented | T10–T11 and workload qualification, including the remaining T11.embed evidence above |
@@ -1243,7 +1243,7 @@ prior-owner/control-I/O quiescence remain independent obligations.
 E0 does not wait for E1's retained-engine activation proof and does not claim it.
 Existing-cluster rollout also requires qualified offline v14 conversion.
 E1 does not wait for deferred
-historical serving or data idempotency. Implement slices against the v0.12 contract
+historical serving or data idempotency. Implement slices against the v0.13 contract
 and update their actual status, OpenAPI and user/developer documentation together.
 Acceptance or merge supplies no product qualification beyond the recorded evidence.
 
@@ -1530,3 +1530,9 @@ Before enabling an affected increment, its owners must implement and qualify:
   under Owned server operations. Rollout and open gates now distinguish completed
   local ownership/outcome evidence from native-I/O settlement, completion reserves
   and engine-work bounds that still gate reusable drain and online activation.
+
+- 2026-10-07: Replaced the body's v0.12 release/wire qualification sentences,
+  rollout labels and evidence cells with the single current v0.13 contract.
+  The [HTTP admission decision](2026-09-30-v012-http-admission.md) owns the
+  discriminator change and refusal rules; historical decision-log entries retain
+  their original release scope. No storage-format change follows from the wire bump.

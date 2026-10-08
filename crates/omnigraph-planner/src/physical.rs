@@ -66,7 +66,7 @@ pub struct GatePolicy {
 
 /// Prefilter admission ratio: the gate's selective plan runs when
 /// |eligible| / corpus is at or below this. It is the conservative crossover
-/// of the `rrf-gate` bench (`benches/scenarios.rs`) across both corpora.
+/// of the historical `rrf-gate` corpora retained under `benchmarks/deferred/`.
 pub const DEFAULT_GATE_RATIO: f64 = 0.10;
 
 /// Absolute ceiling on the eligible-id in-list: the in-list probe cost
