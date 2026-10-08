@@ -3894,14 +3894,26 @@ impl TableStore {
     /// Lance itself plans for a fragment that compacts alone (deletion
     /// materialization), and its `Rewrite` group replaces the fragment in
     /// place. A fragment a Lance task already rewrites, or one
-    /// `options.excluded_fragment_ids` names, gets no task of its own; the
-    /// added tasks are outside Lance's per-run source budgets. The selection
-    /// reads only the manifest, so a table holding no dropped column costs
-    /// nothing beyond Lance's own planning.
+    /// `options.excluded_fragment_ids` names, gets no task of its own.
+    /// Lance applies its per-run source budgets (`max_source_fragments`,
+    /// `max_source_rows`, `max_source_bytes`) to its own tasks only, so
+    /// options that set one are refused rather than let the added tasks run
+    /// outside it. The selection reads only the manifest, so a table holding
+    /// no dropped column costs nothing beyond Lance's own planning.
     pub(crate) async fn plan_table_compaction(
         ds: &Dataset,
         options: &CompactionOptions,
     ) -> Result<CompactionPlan> {
+        if options.max_source_fragments.is_some()
+            || options.max_source_rows.is_some()
+            || options.max_source_bytes.is_some()
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} sets a per-run source budget, which Lance applies only to \
+                 its own tasks; the dropped-column tasks would run outside it",
+                ds.uri()
+            )));
+        }
         let mut plan = plan_compaction(ds, options)
             .await
             .map_err(OmniError::storage)?;

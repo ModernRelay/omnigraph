@@ -2668,6 +2668,45 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
     assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
 }
 
+/// Lance applies a per-run source budget only to the tasks its own planner
+/// returns, so the dropped-column tasks the graph planner appends would run
+/// outside it: options that set any budget are refused before planning.
+#[tokio::test]
+async fn table_compaction_planning_refuses_source_budgets() {
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
+    assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+
+    let budgets = [
+        CompactionOptions {
+            max_source_fragments: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_rows: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_bytes: Some(1),
+            ..CompactionOptions::default()
+        },
+    ];
+    for options in budgets {
+        match TableStore::plan_table_compaction(&ds, &options).await {
+            Err(OmniError::Manifest(manifest))
+                if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+            other => panic!("a source budget must be refused, got {other:?}"),
+        }
+    }
+}
+
 /// The schema-evolution planner reads only the manifest: renames and drops
 /// plan one Project, additions one Merge, both a Project then a Merge, an
 /// unchanged schema nothing; every change that would need a rewrite refuses.
