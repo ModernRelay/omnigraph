@@ -1538,6 +1538,7 @@ async fn empty_numbers_pair_with_the_shared_passage_batch() {
 /// The scan's sieve and the join's needle rows share the fill's one automaton,
 /// so a 14.5 MiB pool that fits one build of the 102 numbers' automaton pairs
 /// through it while the scan, every batch kept and its channel full, holds it.
+/// The 2 MB of passages are several of the scan's byte-sized batches.
 #[tokio::test]
 #[serial]
 async fn the_scan_and_the_join_share_one_matcher() {
@@ -1555,7 +1556,7 @@ async fn the_scan_and_the_join_share_one_matcher() {
         long.iter()
             .map(|(mid, number)| (mid.as_str(), number.as_str())),
     );
-    let v2 = citation_graph(&dir, &matters, 2_048, 16).await;
+    let v2 = citation_graph(&dir, &matters, 2_048, 1_024).await;
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
         probes.clone(),
@@ -1645,7 +1646,8 @@ fn cited_by(conjunct: &str, extra: &str) -> String {
 /// Rows of `(key, text)`: matter ids with numbers, or passage ids with texts.
 type KeyedTexts = Vec<(String, Option<String>)>;
 
-/// 1,200 passages over more than one Lance batch and numbers that nest
+/// 20,000 passages, whose sieved rows still fill more than one scan batch of
+/// the session's 8,192 rows, and numbers that nest
 /// (`16`, `016`, `1016`, `x1016`), repeat, equal a whole text, hold `é` or
 /// `日本`, are empty or null; texts are sometimes empty or null.
 fn generated_citations() -> (KeyedTexts, KeyedTexts) {
@@ -1667,7 +1669,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
         matters.push((mid.to_string(), Some(number.to_string())));
     }
     matters.push(("m-null".to_string(), None));
-    let passages = (0..1_200)
+    let passages = (0..20_000)
         .map(|i: usize| {
             let text = match i {
                 600 => Some("whole text of one passage".to_string()),
@@ -1692,7 +1694,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
                     ))
                 }
             };
-            (format!("p{i:04}"), text)
+            (format!("p{i:05}"), text)
         })
         .collect();
     (matters, passages)
@@ -1700,7 +1702,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
 
 /// The contains join equals its `or` form (the filtered cross join) and
 /// `str::contains` over every pair, with and without the empty number. Rust,
-/// not `.gqt`: generated inputs at Lance-batch scale.
+/// not `.gqt`: generated inputs at scan-batch scale.
 #[tokio::test]
 #[serial]
 async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_several_batches() {

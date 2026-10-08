@@ -299,6 +299,21 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// The rows of the `Limit` directly over the projection over scan `id`:
+    /// the scan sends its first batch once it has that many rows instead of
+    /// gathering a full batch. Batch size never changes which rows reach the
+    /// limit, only how many are read before it stops.
+    fn limit_over_scan(&self, id: NodeId) -> Option<usize> {
+        let projection = self.plan.parent_of(id)?;
+        let Some(PhysicalNode::Projection { .. }) = self.plan.node(projection) else {
+            return None;
+        };
+        match self.plan.node(self.plan.parent_of(projection)?)? {
+            PhysicalNode::Limit { rows, .. } => Some(*rows),
+            _ => None,
+        }
+    }
+
     /// The bindings a `HydrateColumns` over node `id` (through the `Sort`s
     /// and the `Limit` above it) fetches: the projection skips their columns
     /// and carries each binding's row address instead.
@@ -473,6 +488,9 @@ impl Lower for Walk<'_, '_> {
             }
         };
         let mut scan = self.lowering.scan(source, spec)?;
+        if let Some(rows) = self.lowering.limit_over_scan(id) {
+            scan = scan.with_gather_rows(rows);
+        }
         if let Some(filter) = runtime {
             scan = scan.with_runtime_filter(Some(Arc::clone(&filter)));
             self.runtime_filters.insert(id, filter);

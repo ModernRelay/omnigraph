@@ -50,6 +50,9 @@ pub(crate) struct ScanExec {
     snapshot: Snapshot,
     catalog: Arc<Catalog>,
     runtime_filter: Option<Arc<RuntimeFilterSlot>>,
+    /// The rows after which a streamed read sends what it gathered, below the
+    /// session's batch rows when a `Limit` sits over the scan's projection.
+    gather_rows: Option<usize>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -59,6 +62,12 @@ impl ScanExec {
     /// marked one.
     pub(crate) fn with_runtime_filter(mut self, filter: Option<Arc<RuntimeFilterSlot>>) -> Self {
         self.runtime_filter = filter;
+        self
+    }
+
+    /// This scan sending its gathered rows once it holds `rows` of them.
+    pub(crate) fn with_gather_rows(mut self, rows: usize) -> Self {
+        self.gather_rows = Some(rows.max(1));
         self
     }
 
@@ -108,6 +117,7 @@ impl ScanExec {
             snapshot,
             catalog,
             runtime_filter: None,
+            gather_rows: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
