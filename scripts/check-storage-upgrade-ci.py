@@ -71,27 +71,37 @@ ENGINE_CASES = (
     "interrupted::unreadable_legacy_object_asks_for_a_rerun",
 )
 SCOPES = {
+    # Every scope selects the `Test Workspace` packages with the canonical
+    # failpoint features, one graph for the whole job and the same one `Test
+    # Workspace` builds; a scope with its own selection resolved a third
+    # graph (docs/dev/ci.md, cache rule).
     "crossversion": (
-        'cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
         "crates/omnigraph-cli/tests/crossversion_upgrade.rs",
         "",
     ),
     "engine": (
-        "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1',
         "crates/omnigraph/src/db/upgrade/tests.rs",
         "db::upgrade::tests::",
     ),
     "lance": (
-        "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1',
         "crates/omnigraph/tests/lance_version_columns.rs",
         "",
     ),
     "protocol": (
-        "cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1",
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1',
         "crates/omnigraph/tests/forbidden_apis.rs",
         "",
     ),
 }
+OLD_SCOPE_COMMANDS = (
+    'cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
+    "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
+    "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",
+    "cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1",
+)
 PREDECESSOR_TOKENS = (
     "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
     f"STAMP_13_SOURCE_COMMIT: {STAMP_13_SOURCE_COMMIT}",
@@ -237,9 +247,12 @@ def validate_log(log: str, expected: set[str]) -> list[str]:
     summaries = re.findall(
         r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out;", log, re.MULTILINE
     )
-    if len(summaries) != 1:
-        failures.append("required test run must have exactly one successful summary")
-    elif summaries[0] != (str(len(passed)), "0", "0", "0") or not passed:
+    # A workspace selection runs one binary per member; the owner's binary
+    # executes the scope and every other binary filters to nothing.
+    executed = [summary for summary in summaries if summary != ("0", "0", "0", "0")]
+    if len(executed) != 1:
+        failures.append("required test run must have exactly one successful summary that executed tests")
+    elif executed[0] != (str(len(passed)), "0", "0", "0") or not passed:
         failures.append("required test run must execute positive coverage with no failures or ignored cases")
     return failures
 
@@ -262,10 +275,16 @@ class GuardTests(unittest.TestCase):
 
     def test_old_package_feature_selection_fails(self):
         changed = self.workflow.replace(
-            "cargo test --workspace --locked --test crossversion_upgrade",
+            "cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade",
             "cargo test --locked -p omnigraph-cli --test crossversion_upgrade",
         )
+        self.assertNotEqual(changed, self.workflow)
         self.assertTrue(validate(changed, self.policy))
+        for (command, _, _), old in zip(SCOPES.values(), OLD_SCOPE_COMMANDS):
+            with self.subTest(old=old):
+                changed = self.workflow.replace(command, old)
+                self.assertNotEqual(changed, self.workflow)
+                self.assertTrue(validate(changed, self.policy))
 
     def test_conditional_job_and_steps_fail(self):
         for line in ("    if: false\n", "    needs: classify_changes\n", "    continue-on-error: true\n"):
@@ -371,8 +390,11 @@ class GuardTests(unittest.TestCase):
         good = "test alpha ... ok\ntest beta ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"
         expected = {"alpha", "beta"}
         self.assertEqual(validate_log(good, expected), [])
+        filtered = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0s\n"
+        self.assertEqual(validate_log(filtered + good + filtered, expected), [])
         for log in (
             "", good.replace("test beta ... ok\n", ""),
+            good + filtered.replace("0 ignored", "1 ignored"),
             good.replace("test beta ... ok", "test beta ... ignored"),
             good.replace("2 passed", "0 passed"),
             good.replace("0 ignored", "1 ignored"),
