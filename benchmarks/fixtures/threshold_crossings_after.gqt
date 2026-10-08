@@ -1,0 +1,50 @@
+# issue: none
+# notes: Configured history-release shape after at budget 2048 bytes; row assertions do not claim a release counter.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key age: I32 }
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+{"type":"Person","data":{"name":"bob","age":0}}
+
+--- mutate
+set history_release_bytes = 2048;
+--- expect ok
+
+--- mutate
+branch create "b" from main
+--- expect ok
+
+--- loop $i 1 5
+--- mutate branch: b
+query bump($n: I32) { update Person set { age: $n } where name = "alice" }
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+
+--- query branch: b
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":4}
+{"name":"bob","age":0}
+--- expect shape
+name: String
+age: I32
+
+--- query branch: main
+query current_rows() { match { $r: Person } return { $r.name as name, $r.age as age } }
+--- expect unordered
+{"name":"alice","age":0}
+{"name":"bob","age":0}
+--- expect shape
+name: String
+age: I32

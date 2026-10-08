@@ -6,12 +6,12 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crate::branch_merge::BranchMergePlan;
+use crate::legacy::case::{ValidatedCase, validate_case};
 use crate::runner::{MeasurementSignals, RunnerError, RunnerResult, execute_rep_signaled};
 use crate::worker_protocol::{
     ChildFrameV1, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerRequestV1, WorkerStageV1,
     digest_worker_executable, read_frame, validate_protocol_version, write_frame,
 };
-use crate::{ValidatedCase, validate_case};
 
 /// Run exactly one repetition over the private stdin/stdout worker protocol.
 ///
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn worker_refuses_identity_mismatch_before_opening_a_store() {
-        let case: crate::CaseV1 = serde_yaml::from_str(
+        let case: crate::legacy::case::CaseV1 = serde_yaml::from_str(
             r#"
 version: 1
 id: worker-identity-test

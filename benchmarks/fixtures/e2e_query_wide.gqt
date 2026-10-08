@@ -1,0 +1,40 @@
+# issue: none
+# notes: Bounded query-shape representative: 32 people. Names start at p000500; generated vectors use the existing GQT seed recipe. Scale, vectors and publication batches differ from the former Rust workload; this has a new timing identity.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+    team: String
+    bio: String
+    embedding: Vector(32)
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 32
+    commits: 1
+    batch_rows: 32
+    start: 500
+    columns:
+      name: {kind: key, prefix: p, width: 6}
+      age: {kind: modulo, modulus: 100}
+      team: {kind: key, prefix: g, width: 0, modulo: 10}
+      bio: {kind: repeat, text: "synthetic person biography ", count: 40}
+      embedding: {kind: vector, dimensions: 32}
+
+--- query
+query fixture_people() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":32}
+--- expect shape
+n: I64
