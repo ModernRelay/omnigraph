@@ -13,6 +13,7 @@ use url::Url;
 
 mod auth;
 pub(crate) mod data;
+mod deployment;
 mod lifecycle;
 
 /// Managed transports must not render an endpoint's reflected credential.
@@ -85,6 +86,15 @@ impl Output {
                 "{}: {detail}",
                 self.body["type"].as_str().unwrap_or("error")
             );
+            for field in [
+                "accepted_deployment",
+                "requested_deployment_id",
+                "submission",
+            ] {
+                if let Some(value) = self.body.get(field) {
+                    eprintln!("{field}: {value}");
+                }
+            }
         } else {
             println!("{}", serde_json::to_string_pretty(&self.body)?);
         }
@@ -135,7 +145,7 @@ fn identifier(value: &str) -> Result<()> {
     {
         return Err(Failure::refused(
             "identifier_invalid",
-            "cluster and run ids contain 1–256 ASCII letters, digits, hyphens, or underscores",
+            "cluster and operation ids contain 1–256 ASCII letters, digits, hyphens, or underscores",
         ));
     }
     Ok(())
@@ -240,6 +250,7 @@ impl Api {
     fn new(origin: String, token: Option<String>) -> Result<Self> {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(REQUEST_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -309,7 +320,7 @@ impl Api {
         let transport = || {
             Failure::new(
                 "transport_failed",
-                "Intent API request failed or exceeded its 10-second deadline; a submitted run may still exist, so reuse its idempotency key or inspect status",
+                "managed API request failed or exceeded its 10-second deadline; a submitted operation may still exist; retain the original request and inspect its exact ID",
                 1,
             )
         };
@@ -344,9 +355,7 @@ impl Api {
             bytes.extend_from_slice(&chunk);
         }
         let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
-        if self.cached_session
-            && let Some(token) = &token
-        {
+        if let Some(token) = &token {
             auth::scrub_value(&mut body, token);
         }
         if status.is_success() {
@@ -392,94 +401,6 @@ fn cluster_matches(body: &Value, cluster: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn run_matches(body: &Value, cluster: &str, run: Option<&str>) -> Result<()> {
-    cluster_matches(body, cluster)?;
-    let id = body
-        .pointer("/data/run_id")
-        .and_then(Value::as_str)
-        .ok_or_else(Failure::protocol)?;
-    identifier(id)?;
-    if body.pointer("/data/cluster_id").and_then(Value::as_str) != Some(cluster)
-        || run.is_some_and(|r| r != id)
-    {
-        return Err(Failure::refused(
-            "context_mismatch",
-            "the run does not match the selected cluster or run id",
-        ));
-    }
-    Ok(())
-}
-
-fn outcome_exit(state: &str) -> Result<Option<i32>> {
-    Ok(match state {
-        "converged" => Some(0),
-        "failed" => Some(1),
-        "refused" | "blocked" => Some(2),
-        "partially_converged" => Some(3),
-        "recovery_required" => Some(4),
-        "stalled" => Some(5),
-        "cancelled" => Some(6),
-        "proposed" | "offered" | "running" => None,
-        _ => return Err(Failure::protocol()),
-    })
-}
-
-fn run_exit(body: &Value) -> Result<Option<i32>> {
-    outcome_exit(
-        body.pointer("/data/state")
-            .and_then(Value::as_str)
-            .ok_or_else(Failure::protocol)?,
-    )
-}
-
-async fn wait_run(
-    api: &Api,
-    context: &Context,
-    mut body: Value,
-    options: &ClusterRunArgs,
-    deadline: Instant,
-) -> Result<(Value, i32)> {
-    run_matches(&body, &context.cluster, None)?;
-    if options.no_wait {
-        return Ok((body, 0));
-    }
-    let id = body["data"]["run_id"]
-        .as_str()
-        .ok_or_else(Failure::protocol)?
-        .to_string();
-    loop {
-        if let Some(exit) = run_exit(&body)? {
-            return Ok((body, exit));
-        }
-        eprintln!(
-            "run {id}: {}",
-            body["data"]["state"].as_str().unwrap_or("pending")
-        );
-        let next = Instant::now() + POLL_INTERVAL;
-        if next >= deadline {
-            tokio::time::sleep_until(deadline).await;
-            eprintln!(
-                "wait deadline reached; run {id} continues; inspect `cluster status --managed {id}`"
-            );
-            return Ok((body, 5));
-        }
-        tokio::time::sleep_until(next).await;
-        body = match tokio::time::timeout_at(
-            deadline,
-            api.request(Method::GET, &format!("/v1/runs/{id}"), None, None),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                eprintln!("wait deadline reached; run {id} continues");
-                return Ok((body, 5));
-            }
-        };
-        run_matches(&body, &context.cluster, Some(&id))?;
-    }
 }
 
 fn idempotency_key(value: Option<&str>) -> Result<String> {
@@ -538,107 +459,7 @@ async fn cluster_command(
             .map(|body| (body, 0));
     }
     let api = Api::authenticated(context.api.clone())?;
-    let base = format!("/v1/clusters/{}", context.cluster);
-    match command {
-        ClusterCommand::Plan { run, .. } | ClusterCommand::Apply { run, .. } => {
-            let deadline = Instant::now() + Duration::from_secs(run.timeout.unwrap_or(300));
-            let body = match command {
-                ClusterCommand::Plan { revision, .. } => {
-                    if revision.as_ref().is_some_and(|r| {
-                        r.is_empty() || r.len() > 1024 || r.chars().any(char::is_control)
-                    }) {
-                        return Err(Failure::refused(
-                            "revision_invalid",
-                            "revision must be a nonempty reference of at most 1024 bytes",
-                        ));
-                    }
-                    match revision {
-                        Some(revision) => json!({"kind":"plan","revision":revision}),
-                        None => json!({"kind":"plan"}),
-                    }
-                }
-                ClusterCommand::Apply { plan, .. } => {
-                    let plan = plan.as_deref().ok_or_else(|| {
-                        Failure::refused("plan_required", "cluster apply --managed requires --plan")
-                    })?;
-                    identifier(plan)?;
-                    json!({"kind":"apply","plan_run":plan})
-                }
-                _ => unreachable!(),
-            };
-            let key = idempotency_key(run.idempotency_key.as_deref())?;
-            let path = format!("{base}/runs");
-            let submission = api.request(Method::POST, &path, Some(&body), Some(&key));
-            let response = if run.no_wait {
-                submission.await?
-            } else {
-                tokio::time::timeout_at(deadline, submission).await.map_err(|_| {
-                    Failure::new("wait_timeout", "the local wait deadline was reached during submission; the run may exist, so replay the same idempotency key", 5)
-                })??
-            };
-            wait_run(&api, context, response, run, deadline).await
-        }
-        ClusterCommand::Status { run_id, .. } => {
-            let body = if let Some(id) = run_id {
-                identifier(id)?;
-                let body = api
-                    .request(Method::GET, &format!("/v1/runs/{id}"), None, None)
-                    .await?;
-                run_matches(&body, &context.cluster, Some(id))?;
-                body
-            } else {
-                let body = api
-                    .request(Method::GET, &format!("{base}/status"), None, None)
-                    .await?;
-                cluster_matches(&body, &context.cluster)?;
-                body
-            };
-            Ok((body, 0))
-        }
-        ClusterCommand::History { limit, since, .. } => {
-            let mut url = Url::parse(&format!("{}{base}/history", context.api))
-                .map_err(|_| Failure::protocol())?;
-            url.query_pairs_mut()
-                .append_pair("limit", &limit.to_string());
-            if let Some(since) = since {
-                time::OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339)
-                    .map_err(|_| {
-                        Failure::refused("since_invalid", "--since requires an RFC 3339 timestamp")
-                    })?;
-                url.query_pairs_mut().append_pair("since", since);
-            }
-            let body = api
-                .request(Method::GET, &url[url::Position::BeforePath..], None, None)
-                .await?;
-            cluster_matches(&body, &context.cluster)?;
-            Ok((body, 0))
-        }
-        ClusterCommand::Cancel { run_id, .. } => {
-            identifier(run_id)?;
-            let before = api
-                .request(Method::GET, &format!("/v1/runs/{run_id}"), None, None)
-                .await?;
-            run_matches(&before, &context.cluster, Some(run_id))?;
-            let verb = if before["data"]["kind"] == "plan" && before["data"]["state"] == "converged"
-            {
-                "abandon"
-            } else {
-                "cancel"
-            };
-            let body = api
-                .request(
-                    Method::POST,
-                    &format!("/v1/runs/{run_id}:{verb}"),
-                    None,
-                    None,
-                )
-                .await?;
-            run_matches(&body, &context.cluster, Some(run_id))?;
-            let exit = run_exit(&body)?.ok_or_else(Failure::protocol)?;
-            Ok((body, exit))
-        }
-        _ => unreachable!("lifecycle and token commands dispatch separately"),
-    }
+    deployment::dispatch(&api, context, command).await
 }
 
 /// Only explicit managed commands and managed authentication enter this dispatcher.

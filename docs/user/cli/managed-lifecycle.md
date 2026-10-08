@@ -21,7 +21,7 @@ The service reserves a fresh cluster and operation. The CLI writes its managed
 context only after checking the returned identity. An existing context is never
 overwritten. Keep the response's `data.canonical_root`, `data.incarnation` and
 `data.operation_id` for the following steps. Without `--no-wait`, creation
-waits for the normal plan/apply bootstrap and serving readiness. The JSON keeps
+waits for the service's initial bootstrap and serving readiness. The JSON keeps
 `data.state` (the operation outcome) separate from
 `data.lifecycle.phase` (provisioning progress).
 
@@ -59,13 +59,13 @@ managed revision before submitting the edit:
 
 ```sh
 omnigraph cluster status --managed --config customer-demo --json
-# Use data.requested.revision from that response.
+# Use data.source.revision from that response.
 omnigraph cluster push --managed --config customer-demo --expected-revision COMMIT \
   --message "Add the knowledge graph" --json
 # Use data.revision returned by push.
 omnigraph cluster plan --managed --config customer-demo --rev NEW_COMMIT --json
-# Use data.run_id from the converged plan.
-omnigraph cluster apply --managed --config customer-demo --plan PLAN_RUN_ID --json
+# Use data.preview_id from the ready preview.
+omnigraph cluster apply --managed --config customer-demo --plan PREVIEW_ID --json
 ```
 
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
@@ -79,9 +79,11 @@ descriptor-relative file traversal; other platforms refuse before submission.
 
 The expected revision is a full 40-character lowercase Git commit ID. A stale
 head is refused; read the current revision and reconcile your edit before
-retrying. The storage root cannot change. A saved plan holds the change lease;
-apply or abandon that plan before another upload. `push` requires plan
-permission and never executes a plan; `apply` requires its separate permission.
+retrying. The storage root cannot change. `push` requires `source_write` and
+changes only the managed repository. Source-head observation requires
+`source_read`; it grants no native management permission. The applied cluster
+policy decides whether the caller may plan and deploy configuration. A preview
+does not hold a change lease or prevent another source edit.
 
 ## Delete and undo
 
@@ -140,6 +142,9 @@ pending record while acceptance is uncertain.
 
 JSON output is one response on stdout; progress and idempotency information use
 stderr. A local deadline exits 5 and retains the latest operation response.
-Other outcomes use the [managed exit codes](reference.md#managed-cluster-commands).
+Lifecycle outcomes keep their own mapping: ready or purged exits 0, failed 1,
+refused or blocked 2, partially converged 3, recovery required 4, stalled or a
+local deadline 5, and cancelled 6. A retained tombstone is an observation goal
+for deletion with a nonzero undo interval, not completed physical cleanup.
 All lifecycle commands refuse `--direct` and conflicting actor or storage
 selectors. Authentication and data credentials remain separate.

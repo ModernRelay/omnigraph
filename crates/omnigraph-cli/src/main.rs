@@ -287,18 +287,13 @@ fn validate_cluster_arguments(
                 if plan.is_none() {
                     return Err(Cli::command().error(
                         clap::error::ErrorKind::MissingRequiredArgument,
-                        "cluster apply --managed requires --plan <PLAN_ID>",
+                        "cluster apply --managed requires --plan <PREVIEW_ID>",
                     ));
                 }
             }
-            ClusterCommand::Status {
-                deployment_id,
-                wait,
-                timeout,
-                ..
-            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+            ClusterCommand::Status { deployment_id, .. } if deployment_id.is_some() => {
                 return Err(conflict(
-                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                    "--managed status accepts a positional DEPLOYMENT_ID; --deployment-id selects a server or storage deployment",
                 ));
             }
             _ => {}
@@ -337,7 +332,7 @@ fn validate_cluster_arguments(
             run_id: Some(_), ..
         } => {
             return Err(conflict(
-                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+                "a positional delivery ID requires --managed; use --deployment-id for a server or storage deployment",
             ));
         }
         _ => {}

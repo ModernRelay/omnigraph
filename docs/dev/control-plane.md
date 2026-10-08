@@ -39,6 +39,14 @@ The protocol and cache compatibility boundaries are specified in
 [the identity and applied-policy RFC](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients); user behavior and limits
 are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
 
+Ordinary managed deployment uses immutable `/plans` previews and scoped
+`/deployments` delivery, separate from cloud lifecycle operations. The adapter
+freezes a resolved source head before preview and sends a preview ID exactly
+once for delivery. Polling observes the original product/native IDs and never
+resubmits a write. Native execution, runtime activation and result archival
+remain distinct facts; a saved result alone cannot prove an active runtime.
+Cancellation targets only the initiating caller's unattempted queued delivery.
+
 ## Durable layout
 
 | Path | Role |

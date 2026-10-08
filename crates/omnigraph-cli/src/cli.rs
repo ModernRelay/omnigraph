@@ -561,7 +561,7 @@ pub(crate) enum ClusterCommand {
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,
-        /// With --managed, the exact saved plan run to apply (required).
+        /// With --managed, the exact prepared preview to apply (required).
         #[arg(long)]
         plan: Option<String>,
         #[command(flatten)]
@@ -569,14 +569,15 @@ pub(crate) enum ClusterCommand {
     },
     /// Read deployment status without scanning graphs. --deployment-id selects
     /// an exact durable receipt through --server or --cluster ROOT.
-    /// With --managed, read cluster projections or a positional RUN_ID.
+    /// With --managed, read cluster projections or a positional delivery ID.
     Status {
-        /// With --managed, inspect this exact run instead of cluster projections.
+        /// With --managed, observe this exact deployment delivery.
+        #[arg(value_name = "DEPLOYMENT_ID", group = "status_deployment")]
         run_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, group = "status_deployment")]
         deployment_id: Option<String>,
-        /// With --server, wait for this deployment's outcome.
-        #[arg(long, requires = "deployment_id")]
+        /// With --server or --managed, wait for this exact deployment's outcome.
+        #[arg(long, requires = "status_deployment")]
         wait: bool,
         /// Bound the local wait (default 300s, maximum 3600s); never cancels work.
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -711,7 +712,7 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, read run history with its provenance and outcomes.
+    /// With --managed, read deployment delivery history with its provenance.
     History {
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -719,14 +720,15 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        /// Include runs since this RFC 3339 timestamp.
+        /// Include deliveries created at or after this RFC 3339 timestamp.
         #[arg(long)]
         since: Option<String>,
     },
-    /// With --managed, cancel a pending run, or abandon an unused saved plan.
+    /// With --managed, cancel your queued delivery before its first dispatch attempt.
     Cancel {
+        #[arg(value_name = "DEPLOYMENT_ID")]
         run_id: String,
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -739,7 +741,7 @@ pub(crate) enum ClusterCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ClusterRunArgs {
-    /// For served apply or managed operations, return after acceptance without waiting for completion.
+    /// Return without waiting for completion. Managed apply acknowledges durable delivery reservation only.
     #[arg(long)]
     pub(crate) no_wait: bool,
     /// For served apply or managed operations, bound the local wait in seconds (default 300, maximum 3600).

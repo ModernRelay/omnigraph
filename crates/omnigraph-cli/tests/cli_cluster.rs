@@ -10,19 +10,22 @@ mod support;
 use support::managed_http::{IntentApiFixture, IntentReply, IntentRequest};
 use support::*;
 
-fn managed_envelope(kind: &str, state: &str) -> serde_json::Value {
-    let outcome = if ["proposed", "offered", "running"].contains(&state) {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!(state)
-    };
-    serde_json::json!({
-        "data": {"cluster_id":"managed-test", "run_id":"run-one", "kind":kind,
-            "state":state, "outcome":outcome, "proposer":"authenticated-actor",
-            "plan":{"plan_digest":"exact-plan", "bundle_digest":"exact-bytes"}},
-        "meta":{"cluster_id":"managed-test", "incarnation":"inc-one",
-            "provenance":"service_db", "assurance":"verified_workload", "stale":false}
-    })
+const MANAGED_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn managed_preview(state: &str) -> Value {
+    serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+fn managed_delivery(delivery: &str) -> Value {
+    serde_json::json!({"data":{"deployment_id":"delivery-one","native_deployment_id":"ledger:1:nonce","preview_id":"saved-plan","delivery":delivery,"archive":"pending","native_result_status":null,"attempted_at":null,"observation":{"state":"not_observed"}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+fn managed_complete(converged: bool, active: bool, archive: &str) -> Value {
+    let mut body = managed_delivery("dispatched");
+    body["data"]["archive"] = serde_json::json!(archive);
+    body["data"]["native_result_status"] = serde_json::json!("complete");
+    body["data"]["observation"] = serde_json::json!({"state":"observed","historical":false,"native":{"deployment":{"status":"complete","result":{"id":"ledger:1:nonce","converged":converged,"graphs":{}}},"active":active,"in_progress":false}});
+    body
 }
 
 fn assert_control_request(
@@ -1646,21 +1649,18 @@ fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
 #[test]
 fn managed_use_verifies_access_before_writing_context() {
     let temp = tempdir().unwrap();
-    let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},
-        "meta":{"cluster_id":"managed-test","assurance":"verified_workload"}});
-    let status = serde_json::json!({
-        "data":{"requested":{"revision":"revision-one"},"effective":{"revision":"revision-one"}},
-        "meta":{"cluster_id":"managed-test","provenance":"service_db"}
-    });
-    let run = managed_envelope("apply", "failed");
-    let history = serde_json::json!({
-        "data":{"runs":[run.clone()]},
-        "meta":{"cluster_id":"managed-test","provenance":"service_db"}
-    });
+    let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},"meta":{"cluster_id":"managed-test","assurance":"verified_workload"}});
+    let status = serde_json::json!({"data":{"source":{"revision":MANAGED_REVISION},"requested":null,"observed":{"state":"observation_blocked"}},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
+    let delivery = managed_complete(false, false, "archived");
+    let history = serde_json::json!({"data":{"deployments":[delivery["data"].clone()]},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
     let mut reads = Vec::new();
     for (args, path, response) in [
         (vec!["status"], "/v1/clusters/managed-test/status", status),
-        (vec!["status", "run-one"], "/v1/runs/run-one", run),
+        (
+            vec!["status", "delivery-one"],
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            delivery,
+        ),
         (
             vec!["history"],
             "/v1/clusters/managed-test/history?limit=100",
@@ -1682,19 +1682,17 @@ fn managed_use_verifies_access_before_writing_context() {
         let mut foreign = response.clone();
         foreign["meta"]["cluster_id"] = "another-cluster".into();
         reads.push((args.clone(), path, foreign, true));
-        if args == ["status", "run-one"] {
-            for field in ["cluster_id", "run_id"] {
-                let mut foreign = response.clone();
-                foreign["data"][field] = "another-identity".into();
-                reads.push((args.clone(), path, foreign, true));
-            }
+        if args == ["status", "delivery-one"] {
+            let mut foreign = response;
+            foreign["data"]["deployment_id"] = "another-delivery".into();
+            reads.push((args, path, foreign, true));
         }
     }
     let replies = std::iter::once(IntentReply::json(200, body.clone()))
         .chain(
             reads
                 .iter()
-                .map(|(_, _, response, _)| IntentReply::json(200, response.clone())),
+                .map(|(_, _, body, _)| IntentReply::json(200, body.clone())),
         )
         .collect();
     let api = IntentApiFixture::new(replies);
@@ -1714,16 +1712,13 @@ fn managed_use_verifies_access_before_writing_context() {
     assert_eq!(context["version"], 1);
     assert_eq!(context["cluster"], "managed-test");
     assert_eq!(context["api"].as_str(), Some(api.origin.as_str()));
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1);
     assert_control_request(
-        &requests[0],
+        &api.requests()[0],
         "GET",
         "/v1/clusters/managed-test",
-        serde_json::Value::Null,
+        Value::Null,
         None,
     );
-    assert_no_core_effects(temp.path());
     for (index, (args, path, response, refused)) in reads.into_iter().enumerate() {
         let output = managed_cli(temp.path(), &api.origin)
             .args(args)
@@ -1735,57 +1730,42 @@ fn managed_use_verifies_access_before_writing_context() {
             Some(if refused { 2 } else { 0 }),
             "{output:?}"
         );
-        let received = parse_stdout_json(&output);
         if refused {
-            assert_eq!(received["type"], "context_mismatch");
+            assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
         } else {
-            // Observation succeeds even when the inspected run itself failed.
-            assert_eq!(received, response);
+            assert_eq!(parse_stdout_json(&output), response);
         }
-        let requests = api.requests();
-        assert_eq!(
-            requests.len(),
-            index + 2,
-            "no extra requests or submissions"
-        );
-        assert_control_request(&requests[index + 1], "GET", path, Value::Null, None);
+        assert_eq!(api.requests().len(), index + 2);
+        assert_control_request(&api.requests()[index + 1], "GET", path, Value::Null, None);
         assert_no_core_effects(temp.path());
     }
-    let count = api.requests().len();
     let invalid = managed_cli(temp.path(), &api.origin)
         .args(["history", "--since", "not-a-time", "--json"])
         .output()
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
     assert_eq!(parse_stdout_json(&invalid)["type"], "since_invalid");
-    assert_eq!(api.requests().len(), count);
     api.assert_complete();
 }
 
 #[test]
-fn managed_plan_and_apply_submit_exact_intent_without_waiting() {
-    for (kind, arguments, expected) in [
+fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
+    for (arguments, path, expected, body) in [
         (
-            "plan",
-            vec!["plan", "--rev", "pushed-revision"],
-            serde_json::json!({"kind":"plan","revision":"pushed-revision"}),
+            vec!["plan", "--rev", MANAGED_REVISION],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
         ),
         (
-            "apply",
             vec!["apply", "--plan", "saved-plan"],
-            serde_json::json!({"kind":"apply","plan_run":"saved-plan"}),
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
+            managed_delivery("queued"),
         ),
     ] {
         let temp = tempdir().unwrap();
         write_cluster_config_fixture(temp.path());
-        let body = managed_envelope(
-            kind,
-            if kind == "plan" {
-                "proposed"
-            } else {
-                "offered"
-            },
-        );
         let api = IntentApiFixture::new(vec![IntentReply::json(202, body.clone())]);
         write_managed_context(temp.path(), &api.origin);
         let output = output_success(managed_cli(temp.path(), &api.origin).args(arguments).args([
@@ -1797,33 +1777,82 @@ fn managed_plan_and_apply_submit_exact_intent_without_waiting() {
         assert_eq!(parse_stdout_json(&output), body);
         assert!(String::from_utf8_lossy(&output.stderr).contains("exact-key"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("og_fixture_control"));
-        let requests = api.requests();
-        assert_eq!(requests.len(), 1);
         assert_control_request(
-            &requests[0],
+            &api.requests()[0],
             "POST",
-            "/v1/clusters/managed-test/runs",
+            path,
             expected,
             Some("exact-key"),
         );
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
 }
 
 #[test]
-fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
-    for timeout in [false, true] {
+fn managed_plan_omitted_revision_captures_public_source_head_once() {
+    for state in ["ready", "capturing", "failed", "expired"] {
         let temp = tempdir().unwrap();
-        let proposed = managed_envelope("plan", "proposed");
-        let converged = managed_envelope("plan", "converged");
+        let source = serde_json::json!({"data":{"revision":MANAGED_REVISION},"meta":{"cluster_id":"managed-test"}});
+        let expected = managed_preview(state);
         let api = IntentApiFixture::new(vec![
-            IntentReply::json(202, proposed.clone()),
-            IntentReply::json(200, converged.clone()),
+            IntentReply::json(200, source),
+            IntentReply::json(200, expected.clone()),
         ]);
         write_managed_context(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
+            .args(["plan", "--idempotency-key", "snapshot", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(match state {
+                "ready" => 0,
+                "capturing" => 5,
+                _ => 1,
+            })
+        );
+        assert_eq!(parse_stdout_json(&output), expected);
+        assert_control_request(
+            &api.requests()[0],
+            "GET",
+            "/v1/clusters/managed-test/config",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &api.requests()[1],
+            "POST",
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            Some("snapshot"),
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_apply_polls_original_delivery_without_resubmission_or_cancellation() {
+    for timeout in [false, true] {
+        let temp = tempdir().unwrap();
+        let queued = managed_delivery("queued");
+        let complete = managed_complete(true, true, "archived");
+        let replies = if timeout {
+            vec![IntentReply::json(202, queued.clone())]
+        } else {
+            vec![
+                IntentReply::json(202, queued.clone()),
+                IntentReply::json(200, complete.clone()),
+            ]
+        };
+        let api = IntentApiFixture::new(replies);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
             .args([
-                "plan",
+                "apply",
+                "--plan",
+                "saved-plan",
                 "--timeout",
                 if timeout { "1" } else { "10" },
                 "--idempotency-key",
@@ -1835,79 +1864,205 @@ fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
         assert_eq!(
             output.status.code(),
             Some(if timeout { 5 } else { 0 }),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "{output:?}"
         );
         assert_eq!(
             parse_stdout_json(&output),
-            if timeout { proposed } else { converged }
+            if timeout { queued } else { complete }
         );
         if timeout {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("inspect `cluster status --managed run-one`"),
-                "{stderr}"
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cluster status --managed delivery-one")
             );
-            assert!(!stderr.contains("inspect `managed status"), "{stderr}");
         }
-        let requests = api.requests();
-        assert_eq!(requests.len(), if timeout { 1 } else { 2 });
         assert_control_request(
-            &requests[0],
+            &api.requests()[0],
             "POST",
-            "/v1/clusters/managed-test/runs",
-            serde_json::json!({"kind":"plan"}),
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
             Some("poll-key"),
         );
         if !timeout {
             assert_control_request(
-                &requests[1],
+                &api.requests()[1],
                 "GET",
-                "/v1/runs/run-one",
-                serde_json::Value::Null,
+                "/v1/clusters/managed-test/deployments/delivery-one",
+                Value::Null,
                 None,
             );
         }
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
 }
 
 #[test]
-fn managed_terminal_outcomes_and_http_refusals_preserve_json_and_exit_codes() {
-    for (state, code) in [
-        ("converged", 0),
-        ("failed", 1),
-        ("refused", 2),
-        ("blocked", 2),
-        ("partially_converged", 3),
-        ("recovery_required", 4),
-        ("stalled", 5),
-        ("cancelled", 6),
+fn managed_native_outcomes_preserve_activation_archive_and_uncertainty() {
+    let mut refused = managed_delivery("dispatched");
+    refused["data"]["native_result_status"] = serde_json::json!("refused");
+    let mut blocked = managed_delivery("dispatch_unknown");
+    blocked["data"]["observation"] =
+        serde_json::json!({"state":"observation_blocked","reason":"native_authorization_denied"});
+    let mut unavailable = managed_delivery("dispatch_unknown");
+    unavailable["data"]["observation"] = serde_json::json!({"state":"observation_blocked","reason":"native_observation_unavailable"});
+    let mut historical = managed_complete(true, false, "archived");
+    historical["data"]["observation"] = serde_json::json!({"state":"archived","historical":true,"native_result":{"id":"ledger:1:nonce","converged":true}});
+    let mut outstanding = managed_delivery("dispatched");
+    outstanding["data"]["observation"] = serde_json::json!({"state":"observed","native":{"deployment":{"status":"outstanding","id":"ledger:1:nonce","input_digest":"digest","graphs":{}},"active":false,"in_progress":false}});
+    let unknowns = ["not_recorded", "result_expired", "identity_mismatch", "different_ledger"].map(|status| {
+        let mut body = managed_delivery("dispatch_unknown");
+        body["data"]["observation"] = serde_json::json!({"state":"unknown","lookup":{"status":status},"active":false,"in_progress":false,"historical":false});
+        (body, 5)
+    });
+    for (body, code) in [
+        (managed_complete(true, true, "archived"), 0),
+        (managed_complete(false, false, "archived"), 1),
+        (managed_complete(true, false, "archived"), 5),
+        (managed_complete(true, true, "archive_blocked"), 5),
+        (managed_complete(true, true, "pending"), 5),
+        (managed_delivery("dispatch_unknown"), 5),
+        (managed_delivery("expired"), 1),
+        (managed_delivery("cancelled"), 1),
+        (unavailable, 5),
+        (historical, 5),
+        (blocked, 2),
+        (outstanding, 5),
+        (refused, 2),
+    ]
+    .into_iter()
+    .chain(unknowns)
+    {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::new(vec![IntentReply::json(200, body.clone())]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args([
+                "status",
+                "delivery-one",
+                "--wait",
+                "--timeout",
+                "1",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{body}: {output:?}");
+        assert_eq!(parse_stdout_json(&output), body);
+        assert_control_request(
+            &api.requests()[0],
+            "GET",
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            Value::Null,
+            None,
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_current_policy_and_stale_preview_refusals_never_submit_again() {
+    for (status, kind, args) in [
+        (
+            403,
+            "native_authorization_denied",
+            vec!["plan", "--rev", MANAGED_REVISION],
+        ),
+        (
+            409,
+            "native_busy_or_stale",
+            vec!["apply", "--plan", "saved-plan"],
+        ),
+        (
+            403,
+            "native_authorization_denied",
+            vec!["apply", "--plan", "saved-plan"],
+        ),
     ] {
         let temp = tempdir().unwrap();
-        let body = managed_envelope("apply", state);
-        let api = IntentApiFixture::new(vec![IntentReply::json(202, body.clone())]);
+        let problem = serde_json::json!({"type":kind,"status":status,"detail":"current native authority refused"});
+        let api = IntentApiFixture::new(vec![IntentReply::json(status, problem.clone())]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(parse_stdout_json(&output), problem);
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_poll_identity_mismatch_retains_original_delivery_and_native_ids() {
+    for pointer in [
+        "/data/deployment_id",
+        "/data/native_deployment_id",
+        "/data/preview_id",
+        "/data/observation/native/deployment/result/id",
+    ] {
+        let temp = tempdir().unwrap();
+        let queued = managed_delivery("queued");
+        let mut changed = managed_complete(true, true, "archived");
+        *changed.pointer_mut(pointer).unwrap() = serde_json::json!("foreign");
+        let api = IntentApiFixture::new(vec![
+            IntentReply::json(202, queued),
+            IntentReply::json(200, changed),
+        ]);
         write_managed_context(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(code), "state {state}");
-        assert_eq!(parse_stdout_json(&output), body);
-        assert_eq!(api.requests().len(), 1);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let problem = parse_stdout_json(&output);
+        assert_eq!(problem["type"], "context_mismatch");
+        assert_eq!(
+            problem["accepted_deployment"]["deployment_id"],
+            "delivery-one"
+        );
+        assert_eq!(
+            problem["accepted_deployment"]["native_deployment_id"],
+            "ledger:1:nonce"
+        );
+        assert_eq!(
+            api.requests().iter().filter(|r| r.method == "POST").count(),
+            1
+        );
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
+}
+
+#[test]
+fn managed_lost_submission_retains_key_without_effect_retry() {
     let temp = tempdir().unwrap();
-    let problem = serde_json::json!({"type":"scope_missing","status":403,"detail":"apply denied"});
-    let api = IntentApiFixture::new(vec![IntentReply::json(403, problem.clone())]);
+    let api = IntentApiFixture::new(vec![IntentReply {
+        status: 202,
+        headers: vec![],
+        body: b"{".to_vec(),
+    }]);
     write_managed_context(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
-        .args(["apply", "--plan", "saved-plan", "--json"])
+        .args([
+            "apply",
+            "--plan",
+            "saved-plan",
+            "--idempotency-key",
+            "original-key",
+            "--json",
+        ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output), problem);
-    assert_eq!(api.requests().len(), 1);
+    assert_eq!(output.status.code(), Some(1));
+    let result = parse_stdout_json(&output);
+    assert_eq!(result["submission"]["idempotency_key"], "original-key");
+    assert_eq!(result["submission"]["request"]["preview_id"], "saved-plan");
+    assert_eq!(result["submission"]["acceptance"], "unknown");
+    api.assert_complete();
     assert_no_core_effects(temp.path());
 }
 
@@ -2107,7 +2262,6 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
             "--writers-stopped",
         ],
         vec!["cluster", "status", "--managed", "--deployment-id", "id"],
-        vec!["cluster", "status", "--managed", "run", "--wait"],
         vec!["cluster", "status", "--managed", "run", "--timeout", "10"],
         vec!["cluster", "validate", "--managed"],
         vec!["cluster", "observe", "--managed"],
@@ -2178,70 +2332,63 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
 }
 
 #[test]
-fn managed_cancel_checks_selected_cluster_before_any_post() {
+fn managed_cancel_uses_exact_cluster_scope_and_refuses_foreign_response() {
     let temp = tempdir().unwrap();
-    let mut foreign = managed_envelope("plan", "proposed");
-    foreign["data"]["cluster_id"] = serde_json::json!("another-cluster");
+    let mut foreign = managed_delivery("cancelled");
+    foreign["meta"]["cluster_id"] = serde_json::json!("another-cluster");
     let api = IntentApiFixture::new(vec![IntentReply::json(200, foreign)]);
     write_managed_context(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
-        .args(["cancel", "run-one", "--json"])
+        .args(["cancel", "delivery-one", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1);
     assert_control_request(
-        &requests[0],
-        "GET",
-        "/v1/runs/run-one",
-        serde_json::Value::Null,
+        &api.requests()[0],
+        "POST",
+        "/v1/clusters/managed-test/deployments/delivery-one:cancel",
+        Value::Null,
         None,
     );
+    api.assert_complete();
     assert_no_core_effects(temp.path());
 }
 
 #[test]
-fn managed_cancel_selects_pending_cancel_or_completed_plan_abandon() {
-    for (before, after, verb, code) in [
-        ("proposed", "cancelled", "cancel", 6),
-        ("converged", "converged", "abandon", 0),
-    ] {
-        let temp = tempdir().unwrap();
-        let mut result = managed_envelope("plan", after);
-        if verb == "abandon" {
-            result["data"]["abandoned_at"] = serde_json::json!("2026-09-05T00:00:00Z");
-        }
-        let api = IntentApiFixture::new(vec![
-            IntentReply::json(200, managed_envelope("plan", before)),
-            IntentReply::json(200, result.clone()),
-        ]);
-        write_managed_context(temp.path(), &api.origin);
+fn managed_cancel_is_idempotent_and_cannot_cancel_attempted_native_work() {
+    let temp = tempdir().unwrap();
+    let cancelled = managed_delivery("cancelled");
+    let problem = serde_json::json!({"type":"native_cancellation_too_late","status":409,"detail":"an attempt may have reached the native server"});
+    let api = IntentApiFixture::new(vec![
+        IntentReply::json(200, cancelled.clone()),
+        IntentReply::json(200, cancelled.clone()),
+        IntentReply::json(409, problem.clone()),
+    ]);
+    write_managed_context(temp.path(), &api.origin);
+    for (expected, code) in [(cancelled.clone(), 0), (cancelled, 0), (problem, 2)] {
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["cancel", "run-one", "--json"])
+            .args(["cancel", "delivery-one", "--json"])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(code));
-        assert_eq!(parse_stdout_json(&output), result);
-        let requests = api.requests();
-        assert_eq!(requests.len(), 2);
-        assert_control_request(
-            &requests[0],
-            "GET",
-            "/v1/runs/run-one",
-            serde_json::Value::Null,
-            None,
-        );
-        assert_control_request(
-            &requests[1],
-            "POST",
-            &format!("/v1/runs/run-one:{verb}"),
-            serde_json::Value::Null,
-            None,
-        );
-        assert_no_core_effects(temp.path());
+        let mut expected = expected;
+        if code == 2 {
+            expected["requested_deployment_id"] = serde_json::json!("delivery-one");
+        }
+        assert_eq!(parse_stdout_json(&output), expected);
     }
+    for request in api.requests() {
+        assert_control_request(
+            &request,
+            "POST",
+            "/v1/clusters/managed-test/deployments/delivery-one:cancel",
+            Value::Null,
+            None,
+        );
+    }
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
 }
 
 #[test]
@@ -3392,4 +3539,63 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
         parse_stdout_json(&out)["datasets"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
     );
+}
+
+#[test]
+fn managed_invalid_acknowledgements_keep_request_identity_in_json_and_human_output() {
+    for (command, mut body, field) in [
+        ("apply", managed_delivery("queued"), "/data/preview_id"),
+        ("apply", managed_delivery("queued"), "/meta/cluster_id"),
+        ("plan", managed_preview("ready"), "/data/revision"),
+    ] {
+        *body.pointer_mut(field).unwrap() = serde_json::json!("foreign");
+        for json in [false, true] {
+            let temp = tempdir().unwrap();
+            let api = IntentApiFixture::new(vec![IntentReply::json(200, body.clone())]);
+            write_managed_context(temp.path(), &api.origin);
+            let mut cli = managed_cli(temp.path(), &api.origin);
+            cli.args(if command == "apply" {
+                vec!["apply", "--plan", "saved-plan"]
+            } else {
+                vec!["plan", "--rev", MANAGED_REVISION]
+            })
+            .args(["--idempotency-key", "original-key"]);
+            if json {
+                cli.arg("--json");
+            }
+            let output = cli.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            if json {
+                let body = parse_stdout_json(&output);
+                assert_eq!(body["submission"]["idempotency_key"], "original-key");
+                assert_eq!(body["submission"]["acceptance"], "unknown");
+                assert!(body.get("accepted_deployment").is_none());
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("submission:") && stderr.contains("original-key"));
+            }
+            api.assert_complete();
+            assert_no_core_effects(temp.path());
+        }
+    }
+}
+
+#[test]
+fn managed_cancellation_never_claims_an_attempted_delivery_was_cancelled() {
+    let temp = tempdir().unwrap();
+    let mut body = managed_delivery("cancelled");
+    body["data"]["attempted_at"] = serde_json::json!("2026-10-08T00:00:00Z");
+    let api = IntentApiFixture::new(vec![IntentReply::json(200, body)]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = managed_cli(temp.path(), &api.origin)
+        .args(["cancel", "delivery-one", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        parse_stdout_json(&output)["requested_deployment_id"],
+        "delivery-one"
+    );
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
 }
