@@ -3,9 +3,9 @@
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
-    ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
-    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields,
+    AggregateFields, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId,
+    PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind,
+    RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -181,7 +181,7 @@ impl Lower for Trace {
     fn aggregate(
         &mut self,
         id: NodeId,
-        _: &[IRProjection],
+        _: AggregateFields<'_>,
         input: String,
     ) -> Result<String, PlanError> {
         self.call("aggregate", id, &[&input])
@@ -333,6 +333,7 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
         inner,
         outer_var: "o".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+        aggregate: None,
     });
     plan.set_root(anti);
 

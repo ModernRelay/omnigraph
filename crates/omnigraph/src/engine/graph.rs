@@ -439,11 +439,19 @@ pub(super) async fn prepare_selected_edges(
         .map_err(|error| memory.error(error))?;
     let mut prepared = Vec::with_capacity(step.members().len());
     for member in step.members() {
+        let table = format!("edge:{}", member.edge_type);
+        let dataset = env.snapshot.open_lance_dataset(&table).await?;
+        super::typed_value::check_stored_schema(
+            &dataset,
+            &env.catalog.edge_types[&member.edge_type].arrow_schema,
+            &table,
+            [
+                env.catalog.system_columns.src,
+                env.catalog.system_columns.dst,
+            ],
+        )?;
         prepared.push(PreparedEdge {
-            dataset: env
-                .snapshot
-                .open_lance_dataset(&format!("edge:{}", member.edge_type))
-                .await?,
+            dataset,
             probes: endpoint_probes(member.direction, env.catalog.system_columns),
         });
     }
@@ -602,6 +610,12 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
+    super::typed_value::check_stored_schema(
+        &edge_ds,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        [catalog.system_columns.src, catalog.system_columns.dst],
+    )?;
     let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
     for orientation in endpoint_probes(direction, catalog.system_columns)
         .iter()
@@ -794,6 +808,14 @@ where
                 .await?
         }
     };
+    super::typed_value::check_stored_schema(
+        &dataset,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &format!("edge:{edge_type}"),
+        [catalog.system_columns.src, catalog.system_columns.dst]
+            .into_iter()
+            .chain(attach_columns.iter().copied()),
+    )?;
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)

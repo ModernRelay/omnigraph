@@ -316,20 +316,34 @@ fn bounded_property<'a>(
     source: &dyn PlanSource,
 ) -> Option<(&'a str, u64)> {
     let (left, op, right) = filter.comparison_parts()?;
-    let constant = |expr: &IRExpr| matches!(expr, IRExpr::Literal(_) | IRExpr::Param(_));
+    fn constant(expr: &IRExpr) -> bool {
+        match expr {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            IRExpr::Cast { expr, .. } => constant(expr),
+            _ => false,
+        }
+    }
+    fn list_len(expr: &IRExpr, source: &dyn PlanSource) -> Option<usize> {
+        match expr {
+            IRExpr::Literal(Literal::List(items), _) => Some(items.len()),
+            IRExpr::Param(name, _) => source.list_parameter_len(name),
+            IRExpr::Cast { expr, .. } => list_len(expr, source),
+            _ => None,
+        }
+    }
     let of_binding = |expr: &'a IRExpr| match expr {
-        IRExpr::PropAccess { variable, property } if variable == binding => Some(property.as_str()),
+        IRExpr::PropAccess {
+            variable,
+            property,
+            ty: _,
+        } if variable == binding => Some(property.as_str()),
         _ => None,
     };
     match op {
         CompOp::Eq if constant(right) => Some((of_binding(left)?, 1)),
         CompOp::Eq if constant(left) => Some((of_binding(right)?, 1)),
         CompOp::Contains => {
-            let members = match left {
-                IRExpr::Literal(Literal::List(items)) => items.len(),
-                IRExpr::Param(name) => source.list_parameter_len(name)?,
-                _ => return None,
-            };
+            let members = list_len(left, source)?;
             Some((of_binding(right)?, members.max(1) as u64))
         }
         _ => None,
@@ -588,5 +602,50 @@ mod tests {
         let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
         assert!(!should_switch_to_csr(40, 20, 2, false, &i));
         assert!(should_switch_to_csr(40, 20, 2, true, &i));
+    }
+}
+
+#[cfg(test)]
+mod cast_bound_tests {
+    use super::*;
+    use crate::MemorySource;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    fn ty(scalar: ScalarType) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(scalar, false))
+    }
+
+    #[test]
+    fn constant_casts_keep_bounds_but_cast_columns_do_not_claim_direct_lookup() {
+        let source = MemorySource::default();
+        let property = IRExpr::PropAccess {
+            variable: "p".into(),
+            property: "age".into(),
+            ty: ty(ScalarType::I64),
+        };
+        let constant = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(Literal::Float(1.0), ty(ScalarType::F64))),
+            ty: ty(ScalarType::I64),
+        };
+        let filter = IRExpr::comparison(property.clone(), CompOp::Eq, constant);
+        assert_eq!(bounded_property(&filter, "p", &source), Some(("age", 1)));
+        let filter = IRExpr::comparison(
+            IRExpr::Cast {
+                expr: Box::new(property.clone()),
+                ty: ty(ScalarType::F64),
+            },
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Float(1.5), ty(ScalarType::F64)),
+        );
+        assert_eq!(bounded_property(&filter, "p", &source), None);
+        let items = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::List(vec![Literal::Float(1.0), Literal::Float(2.0)]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+            )),
+            ty: ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+        };
+        let filter = IRExpr::comparison(items, CompOp::Contains, property);
+        assert_eq!(bounded_property(&filter, "p", &source), Some(("age", 2)));
     }
 }

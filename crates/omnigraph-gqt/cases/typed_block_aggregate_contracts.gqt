@@ -1,0 +1,381 @@
+# issue: none
+# notes: Integer block sums finalize once to F64; extrema retain their declared numeric type.
+# notes: The plan owns aggregate arithmetic and both comparison domains, independently of parameter values.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Group { name: String @key }
+node Cell { key: String @key signed: I64? unsigned: U64? }
+edge InGroup: Cell -> Group
+
+--- seed
+{"type":"Group","data":{"name":"cancel"}}
+{"type":"Cell","data":{"key":"cancel_0","signed":9007199254740993}}
+{"edge":"InGroup","from":"cancel_0","to":"cancel"}
+{"type":"Cell","data":{"key":"cancel_1","signed":-9007199254740992}}
+{"edge":"InGroup","from":"cancel_1","to":"cancel"}
+{"type":"Group","data":{"name":"single"}}
+{"type":"Cell","data":{"key":"single_0","signed":9007199254740993}}
+{"edge":"InGroup","from":"single_0","to":"single"}
+{"type":"Group","data":{"name":"overflow_a"}}
+{"type":"Cell","data":{"key":"overflow_a_0","signed":9223372036854775807}}
+{"edge":"InGroup","from":"overflow_a_0","to":"overflow_a"}
+{"type":"Cell","data":{"key":"overflow_a_1","signed":1}}
+{"edge":"InGroup","from":"overflow_a_1","to":"overflow_a"}
+{"type":"Cell","data":{"key":"overflow_a_2","signed":-1}}
+{"edge":"InGroup","from":"overflow_a_2","to":"overflow_a"}
+{"type":"Group","data":{"name":"overflow_b"}}
+{"type":"Cell","data":{"key":"overflow_b_0","signed":9223372036854775807}}
+{"edge":"InGroup","from":"overflow_b_0","to":"overflow_b"}
+{"type":"Cell","data":{"key":"overflow_b_1","signed":-1}}
+{"edge":"InGroup","from":"overflow_b_1","to":"overflow_b"}
+{"type":"Cell","data":{"key":"overflow_b_2","signed":1}}
+{"edge":"InGroup","from":"overflow_b_2","to":"overflow_b"}
+{"type":"Group","data":{"name":"unsigned_sum"}}
+{"type":"Cell","data":{"key":"unsigned_sum_0","unsigned":9223372036854775808}}
+{"edge":"InGroup","from":"unsigned_sum_0","to":"unsigned_sum"}
+{"type":"Cell","data":{"key":"unsigned_sum_1","unsigned":600}}
+{"edge":"InGroup","from":"unsigned_sum_1","to":"unsigned_sum"}
+{"type":"Cell","data":{"key":"unsigned_sum_2","unsigned":600}}
+{"edge":"InGroup","from":"unsigned_sum_2","to":"unsigned_sum"}
+{"type":"Group","data":{"name":"unsigned_boundary"}}
+{"type":"Cell","data":{"key":"unsigned_boundary_0","unsigned":9223372036854775808}}
+{"edge":"InGroup","from":"unsigned_boundary_0","to":"unsigned_boundary"}
+{"type":"Group","data":{"name":"empty"}}
+
+--- query
+query cancellation_total_stays_one() {
+    match {
+        $g: Group { name: "cancel" }
+        sum($c.signed) { $c inGroup $g } = 1
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+{"group_name":"cancel"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
+type sum($c.signed): F64?
+cast 1: I64 -> F64
+
+--- query
+query single_sum_rounds_before_comparison() {
+    match {
+        $g: Group { name: "single" }
+        sum($c.signed) { $c inGroup $g } > 9007199254740992
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
+cast 9007199254740992: I64 -> F64
+no cast sum($c.signed)
+
+--- query
+query overflow_order_a_rounds_final_total() {
+    match {
+        $g: Group { name: "overflow_a" }
+        sum($c.signed) { $c inGroup $g } > 9223372036854775806
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
+cast 9223372036854775806: I64 -> F64
+
+--- query
+query overflow_order_b_rounds_final_total() {
+    match {
+        $g: Group { name: "overflow_b" }
+        sum($c.signed) { $c inGroup $g } > 9223372036854775806
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
+cast 9223372036854775806: I64 -> F64
+
+--- query
+query unsigned_sum_rounds_once() {
+    match {
+        $g: Group { name: "unsigned_sum" }
+        sum($c.unsigned) { $c inGroup $g } > 9223372036854775807
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+{"group_name":"unsigned_sum"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.unsigned): sum(U64?) exact_integer round_to_nearest -> F64?
+cast 9223372036854775807: I64 -> F64
+
+--- query
+query unsigned_min_retains_exact_value($bound: I64) {
+    match {
+        $g: Group { name: "unsigned_boundary" }
+        min($c.unsigned) { $c inGroup $g } > $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":9223372036854775807}
+--- expect unordered
+{"group_name":"unsigned_boundary"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate min($c.unsigned): min(U64?) extremum error -> U64?
+cast min($c.unsigned): U64? -> exact_integer?
+cast $bound: I64 -> exact_integer
+
+--- query
+query unsigned_max_retains_exact_value($bound: I64) {
+    match {
+        $g: Group { name: "unsigned_boundary" }
+        max($c.unsigned) { $c inGroup $g } > $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":9223372036854775807}
+--- expect unordered
+{"group_name":"unsigned_boundary"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate max($c.unsigned): max(U64?) extremum error -> U64?
+cast max($c.unsigned): U64? -> exact_integer?
+cast $bound: I64 -> exact_integer
+
+--- query
+query integer_max_narrows_exact_literal() {
+    match {
+        $g: Group { name: "single" }
+        max($c.signed) { $c inGroup $g } > 9007199254740992.0
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+{"group_name":"single"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate max($c.signed): max(I64?) extremum error -> I64?
+cast 9007199254740992.0: F64 -> I64
+no cast max($c.signed)
+
+--- query
+query integer_max_widens_for_declared_float($bound: F64) {
+    match {
+        $g: Group { name: "single" }
+        max($c.signed) { $c inGroup $g } > $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":9007199254740992.0}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate max($c.signed): max(I64?) extremum error -> I64?
+cast max($c.signed): I64? -> F64?
+type $bound: F64
+no cast $bound
+
+--- query
+query integer_avg_uses_float_accumulation() {
+    match {
+        $g: Group { name: "cancel" }
+        avg($c.signed) { $c inGroup $g } = 0
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+{"group_name":"cancel"}
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate avg($c.signed): avg(I64?) float64 round_to_nearest -> F64?
+type avg($c.signed): F64?
+cast 0: I64 -> F64
+
+--- query
+query empty_sum_stays_null() {
+    match {
+        $g: Group { name: "empty" }
+        sum($c.signed) { $c inGroup $g } >= 0
+    }
+    return { $g.name as group_name }
+}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+block aggregate sum($c.signed): sum(I64?) exact_integer round_to_nearest -> F64?
+type sum($c.signed): F64?
+
+--- query
+query integer_max_keeps_declared_float_domain_for_second_value($bound: F64) {
+    match {
+        $g: Group { name: "single" }
+        max($c.signed) { $c inGroup $g } > $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":2.5}
+--- expect unordered
+{"group_name":"single"}
+--- expect shape
+group_name: String
+--- expect plan
+cast max($c.signed): I64? -> F64?
+type $bound: F64
+no cast $bound
+
+--- query
+query row_count_f64_bound_0($bound: F64) {
+    match {
+        $g: Group
+        count { $c inGroup $g } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":2.0}
+--- expect unordered
+{"group_name":"cancel"}
+{"group_name":"overflow_a"}
+{"group_name":"overflow_b"}
+{"group_name":"unsigned_sum"}
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> F64
+type $bound: F64
+no cast $bound
+
+--- query
+query row_count_f64_bound_1($bound: F64) {
+    match {
+        $g: Group
+        count { $c inGroup $g } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":3.0}
+--- expect unordered
+{"group_name":"overflow_a"}
+{"group_name":"overflow_b"}
+{"group_name":"unsigned_sum"}
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> F64
+type $bound: F64
+no cast $bound
+
+--- query
+query row_count_u64_bound_0($bound: U64) {
+    match {
+        $g: Group
+        count { $c inGroup $g } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":2}
+--- expect unordered
+{"group_name":"cancel"}
+{"group_name":"overflow_a"}
+{"group_name":"overflow_b"}
+{"group_name":"unsigned_sum"}
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> exact_integer
+type $bound: U64
+cast $bound: U64 -> exact_integer
+
+--- query
+query row_count_u64_bound_1($bound: U64) {
+    match {
+        $g: Group
+        count { $c inGroup $g } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":3}
+--- expect unordered
+{"group_name":"overflow_a"}
+{"group_name":"overflow_b"}
+{"group_name":"unsigned_sum"}
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> exact_integer
+type $bound: U64
+cast $bound: U64 -> exact_integer
+
+--- query
+query null_unsigned_row_count_bound_satisfies_nothing($bound: U64?) {
+    match {
+        $g: Group
+        count { $c inGroup $g } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":null}
+--- expect unordered
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> exact_integer
+cast $bound: U64? -> exact_integer?
+
+--- query
+query filtered_row_count_uses_the_same_float_comparison($bound: F64) {
+    match {
+        $g: Group
+        count { $c inGroup $g $c.signed > 0 } >= $bound
+    }
+    return { $g.name as group_name }
+}
+--- params
+{"bound":2.0}
+--- expect unordered
+{"group_name":"overflow_a"}
+{"group_name":"overflow_b"}
+--- expect shape
+group_name: String
+--- expect plan
+type count: I64
+cast count: I64 -> F64
+no cast $bound

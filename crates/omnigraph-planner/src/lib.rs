@@ -22,6 +22,7 @@
 //! Query traversal schemas in this crate remain conservative input schemas;
 //! the engine derives their complete runtime output schemas from the catalog.
 
+pub mod aggregate;
 pub mod bound;
 pub mod cost;
 pub mod error;
@@ -32,11 +33,17 @@ pub mod lower;
 pub mod mirror;
 pub mod operation;
 pub mod optimizer;
+pub mod output;
 pub mod physical;
 pub mod registry;
 pub mod route;
 pub mod source;
+mod typed;
 
+pub use aggregate::{
+    Accumulator, AggregateSpec, Overflow, plan_aggregate, plan_block_aggregate,
+    validate_aggregate_specs,
+};
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, CSR_BUILD_FACTOR, ExpandCostInputs, ExpandMode, ExpandPolicy,
@@ -51,10 +58,12 @@ pub use logical::{
     Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
 };
 pub use lower::{
-    ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    AggregateFields, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, RankFuseFields,
+    SortMergeJoinFields,
 };
 pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
+pub use output::{NodeObjectType, validate_output_schemas};
 pub use physical::{
     Assumptions, DatasetPin, Estimate, GatePolicy, Hop, NodeId, OverfetchRung, PhysicalNode,
     PhysicalPlan, Prefilter, PrefilterMode, Properties, RankArm, RankKind, RankScope, RankedAccess,

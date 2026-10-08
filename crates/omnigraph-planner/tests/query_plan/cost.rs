@@ -365,7 +365,10 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
                     filters: vec![IRExpr::comparison(
                         prop("a", property),
                         CompOp::Eq,
-                        IRExpr::Literal(Literal::String("x".into())),
+                        IRExpr::Literal(
+                            Literal::String("x".into()),
+                            value_type(ScalarType::String, false),
+                        ),
                     )],
                 },
                 expand("a", "b", vec![]),

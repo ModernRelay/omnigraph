@@ -22,9 +22,18 @@ pub(crate) fn validate_query(ir: &QueryIR) -> Result<()> {
     let mut introduced = HashSet::new();
     validate_pipeline(&ir.pipeline, &mut introduced)?;
     for projection in &ir.return_exprs {
+        projection.expr.check_types()?;
+        if projection.expr.ty() != &projection.ty
+            || matches!(projection.ty, crate::types::ExprType::ExactInteger { .. })
+        {
+            return Err(CompilerError::Plan(
+                "projection type differs from its expression or exposes an internal carrier".into(),
+            ));
+        }
         check_expr(&projection.expr, &introduced)?;
     }
     for ordering in &ir.order_by {
+        ordering.expr.check_types()?;
         check_expr(&ordering.expr, &introduced)?;
     }
     Ok(())
@@ -72,10 +81,11 @@ fn validate_pipeline(pipeline: &[IROp], introduced: &mut HashSet<String>) -> Res
                 if !outer_var.is_empty() {
                     check_reference(outer_var, introduced)?;
                 }
+                predicate.check_types()?;
                 check_expr(&predicate.right, introduced)?;
                 let mut inner_scope = introduced.clone();
                 validate_pipeline(inner, &mut inner_scope)?;
-                if let Some(arg) = &predicate.arg {
+                if let Some(arg) = predicate.left.arg() {
                     check_expr(arg, &inner_scope)?;
                 }
             }
@@ -110,57 +120,56 @@ fn check_filters(filters: &[IRExpr], introduced: &HashSet<String>) -> Result<()>
 /// Exhaustive over `IRExpr`, so a new variant that carries a variable is a
 /// compile error here rather than an unchecked reference.
 fn check_expr(expr: &IRExpr, introduced: &HashSet<String>) -> Result<()> {
-    match expr {
-        IRExpr::PropAccess { variable, .. } | IRExpr::Nearest { variable, .. } => {
-            check_reference(variable, introduced)?;
-            if let IRExpr::Nearest { query, .. } = expr {
-                check_expr(query, introduced)?;
+    expr.check_types()?;
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            IRExpr::PropAccess { variable, .. } => check_reference(variable, introduced)?,
+            IRExpr::Nearest {
+                variable, query, ..
+            } => {
+                check_reference(variable, introduced)?;
+                pending.push(query);
             }
-            Ok(())
+            IRExpr::Variable(variable, _) => check_reference(variable, introduced)?,
+            IRExpr::Search { field, query, .. }
+            | IRExpr::MatchText { field, query, .. }
+            | IRExpr::Bm25 { field, query, .. } => pending.extend([field.as_ref(), query.as_ref()]),
+            IRExpr::Fuzzy {
+                field,
+                query,
+                max_edits,
+                ..
+            } => {
+                pending.extend([field.as_ref(), query.as_ref()]);
+                pending.extend(max_edits.as_deref());
+            }
+            IRExpr::Rrf {
+                primary,
+                secondary,
+                k,
+                ..
+            } => {
+                pending.extend([primary.as_ref(), secondary.as_ref()]);
+                pending.extend(k.as_deref());
+            }
+            IRExpr::Aggregate { arg, .. }
+            | IRExpr::Not(arg, _)
+            | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Cast { expr: arg, .. } => pending.push(arg),
+            IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Param(_, _) | IRExpr::Literal(_, _) | IRExpr::AliasRef(_, _) => {}
         }
-        IRExpr::Variable(variable) => check_reference(variable, introduced),
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => {
-            check_expr(field, introduced)?;
-            check_expr(query, introduced)
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            check_expr(field, introduced)?;
-            check_expr(query, introduced)?;
-            max_edits
-                .as_deref()
-                .map_or(Ok(()), |e| check_expr(e, introduced))
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            check_expr(primary, introduced)?;
-            check_expr(secondary, introduced)?;
-            k.as_deref().map_or(Ok(()), |e| check_expr(e, introduced))
-        }
-        IRExpr::Aggregate { arg, .. } => check_expr(arg, introduced),
-        IRExpr::Binary { left, right, .. } => {
-            check_expr(left, introduced)?;
-            check_expr(right, introduced)
-        }
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => check_expr(inner, introduced),
-        IRExpr::Param(_) | IRExpr::Literal(_) | IRExpr::AliasRef(_) => Ok(()),
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::ast::CompOp;
+    use crate::query::ast::{AggFunc, CompOp, Literal};
     use crate::traversal::{EdgeMember, EdgeSelection};
-    use crate::types::Direction;
+    use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
     fn scan(variable: &str) -> IROp {
         IROp::NodeScan {
@@ -191,6 +200,10 @@ mod tests {
         IRExpr::PropAccess {
             variable: variable.to_string(),
             property: "name".to_string(),
+            ty: crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
+                crate::types::ScalarType::String,
+                false,
+            )),
         }
     }
 
@@ -202,6 +215,50 @@ mod tests {
         run(pipeline)
             .expect_err("expected the plan to be refused")
             .to_string()
+    }
+
+    /// Malformed stored signatures cannot be supplied through GQ source.
+    #[test]
+    fn aggregate_types_reject_wrong_results_and_unsupported_arguments() {
+        let integer = ExprType::from_prop(&PropType::scalar(ScalarType::I64, false));
+        let float = ExprType::from_prop(&PropType::scalar(ScalarType::F64, true));
+        for (arg, result, accepted) in [
+            (integer.clone(), float.clone(), true),
+            (integer.clone(), integer.clone(), false),
+            (
+                integer,
+                ExprType::from_prop(&PropType::scalar(ScalarType::F64, false)),
+                false,
+            ),
+            (
+                ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+                float.clone(),
+                false,
+            ),
+            (
+                ExprType::Node {
+                    type_name: "Person".into(),
+                },
+                float,
+                false,
+            ),
+        ] {
+            let expression = IRExpr::null_test(
+                IRExpr::Aggregate {
+                    func: AggFunc::Sum,
+                    arg: Box::new(IRExpr::Literal(
+                        Literal::Integer(1),
+                        crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
+                            crate::types::ScalarType::I64,
+                            false,
+                        )),
+                    )),
+                    signature: AggSignature { arg, result },
+                },
+                false,
+            );
+            assert_eq!(expression.check_types().is_ok(), accepted, "{expression:?}");
+        }
     }
 
     #[test]
@@ -230,7 +287,13 @@ mod tests {
         let filter = IROp::Filter(IRExpr::comparison(
             prop("q"),
             CompOp::Eq,
-            IRExpr::Literal(crate::query::ast::Literal::String("x".to_string())),
+            IRExpr::Literal(
+                crate::query::ast::Literal::String("x".to_string()),
+                crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
+                    crate::types::ScalarType::String,
+                    false,
+                )),
+            ),
         ));
         assert!(refusal(vec![scan("p"), filter]).contains("`q` before"));
     }

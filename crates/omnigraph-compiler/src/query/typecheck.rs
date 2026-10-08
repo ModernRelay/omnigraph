@@ -7,7 +7,10 @@ use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemFieldRole};
 use crate::catalog::{Catalog, EdgeType};
 use crate::error::{CompilerError, Result};
 use crate::traversal::{EDGE_TYPE_META, EdgeMember, EdgeSelection, common_edge_property};
-use crate::types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};
+use crate::types::{
+    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
+    check_datetime_literal,
+};
 
 use super::ast::*;
 use super::codes::*;
@@ -61,7 +64,7 @@ pub(crate) struct CheckedSubquery {
 impl TypeContext {
     /// No bindings, no aliases: the read context of a mutation scope, where
     /// every name resolves through the scope instead.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             bindings: HashMap::new(),
             aliases: HashMap::new(),
@@ -75,7 +78,7 @@ impl TypeContext {
 /// `resolve_expr_type`; the scope decides what a bare name means and which
 /// node kinds are refused, one binder per clause over one expression type.
 #[derive(Clone, Copy)]
-enum Scope<'a> {
+pub(crate) enum Scope<'a> {
     /// A read clause over the match bindings.
     Read,
     /// A mutation `where`: a bare name is a property of the target.
@@ -89,7 +92,7 @@ enum Scope<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum ConstantClause {
+pub(crate) enum ConstantClause {
     Assignment,
     BindingMatch,
 }
@@ -183,7 +186,8 @@ pub struct ResolvedTraversal {
 pub enum ResolvedType {
     Scalar(PropType),
     Node(String),
-    Aggregate,
+    Aggregate(ExprType),
+    ForwardAlias,
 }
 
 impl ResolvedType {
@@ -191,7 +195,8 @@ impl ResolvedType {
         match self {
             Self::Scalar(prop) => prop.display_name(),
             Self::Node(type_name) => format!("node `{}`", type_name),
-            Self::Aggregate => "aggregate".to_string(),
+            Self::Aggregate(_) => "aggregate".to_string(),
+            Self::ForwardAlias => "aggregate".to_string(),
         }
     }
 }
@@ -1122,6 +1127,32 @@ fn block_references_outer(clauses: &[Clause], outer_vars: &[String]) -> bool {
     })
 }
 
+/// The checked owner of a block aggregate. Counting a node binding uses the
+/// row-count path; column aggregates retain the ordinary nullable signature.
+pub(crate) fn block_aggregate_signature(
+    catalog: &Catalog,
+    subquery: &Subquery,
+    inner_ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<Option<AggSignature>> {
+    match &subquery.arg {
+        None if subquery.func == AggFunc::Count => Ok(None),
+        None => Err(CompilerError::typed(
+            T40,
+            "a block aggregate without an argument must count rows",
+        )),
+        Some(arg) => {
+            let signature =
+                aggregate_signature(catalog, subquery.func, arg, inner_ctx, params, true)?;
+            if subquery.func == AggFunc::Count && matches!(signature.arg, ExprType::Node { .. }) {
+                Ok(None)
+            } else {
+                Ok(Some(signature))
+            }
+        }
+    }
+}
+
 /// The comparison of a subquery predicate: the aggregate's result type from
 /// the block's scope (the argument rule of a `return` aggregate), the right
 /// operand from the outer scope, compatible under the filter rule.
@@ -1133,29 +1164,39 @@ fn typecheck_subquery_predicate(
     params: &HashMap<String, PropType>,
 ) -> Result<()> {
     let func = subquery.func;
-    let result = match &subquery.arg {
+    if matches!(
+        subquery.op,
+        CompOp::Contains | CompOp::StringContains | CompOp::StartsWith
+    ) {
+        return Err(CompilerError::typed(
+            T40,
+            "a block comparison requires equality or ordering",
+        ));
+    }
+    let result = match block_aggregate_signature(catalog, subquery, inner_ctx, params)? {
         None => PropType::scalar(ScalarType::I64, false),
-        Some(arg) => {
-            let arg_type = resolve_expr_type(catalog, arg, inner_ctx, params, Scope::Read)?;
-            reject_blob_read_value(&arg_type, arg)?;
-            check_aggregate_argument(&func, arg, &arg_type)?;
-            match (func, &arg_type) {
-                (AggFunc::Count, _) => PropType::scalar(ScalarType::I64, false),
-                (AggFunc::Sum | AggFunc::Avg, _) => PropType::scalar(ScalarType::F64, false),
-                (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s)) => {
-                    PropType::scalar(s.scalar, false)
-                }
-                (_, other) => {
-                    return Err(CompilerError::typed(
-                        T40,
-                        format!(
-                            "{func} over a block requires a scalar argument, got {}",
-                            other.display_name()
-                        ),
-                    ));
-                }
+        Some(signature) => match signature.result {
+            ExprType::Value {
+                scalar,
+                list,
+                nullable,
+            } => PropType {
+                scalar,
+                nullable,
+                list,
+                enum_values: None,
+            },
+            ExprType::Node { type_name } => {
+                return Err(CompilerError::Plan(format!(
+                    "{func} over a block has node result type `{type_name}`"
+                )));
             }
-        }
+            ExprType::ExactInteger { .. } => {
+                return Err(CompilerError::Plan(
+                    "block aggregate exposes an internal carrier".into(),
+                ));
+            }
+        },
     };
     let bound = match &subquery.right {
         Expr::Literal(_) | Expr::Now => true,
@@ -1169,6 +1210,12 @@ fn typecheck_subquery_predicate(
         ));
     }
     let right = resolve_expr_type(catalog, &subquery.right, ctx, params, Scope::Read)?;
+    let right = contextual_literal_type(
+        &subquery.right,
+        &ResolvedType::Scalar(result.clone()),
+        Some(false),
+    )
+    .unwrap_or(right);
     let ResolvedType::Scalar(r) = &right else {
         return Err(CompilerError::typed(
             T40,
@@ -1772,6 +1819,39 @@ fn boolean_scalar(resolved: &ResolvedType) -> Option<&PropType> {
     }
 }
 
+/// Infer a type for direct nulls and empty/all-null literal lists from another operand.
+fn contextual_literal_type(
+    expr: &Expr,
+    other: &ResolvedType,
+    list: Option<bool>,
+) -> Option<ResolvedType> {
+    let nullable = match expr {
+        Expr::Literal(Literal::Null) => true,
+        Expr::Literal(Literal::List(items))
+            if items.iter().all(|item| matches!(item, Literal::Null)) =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    let ResolvedType::Scalar(other) = other else {
+        return None;
+    };
+    let mut prop = other.clone();
+    prop.nullable = nullable;
+    prop.list = matches!(expr, Expr::Literal(Literal::List(_))) || list.unwrap_or(other.list);
+    prop.enum_values = None;
+    Some(ResolvedType::Scalar(prop))
+}
+
+fn contextual_boolean(expr: &Expr, resolved: ResolvedType, scope: Scope<'_>) -> ResolvedType {
+    if matches!(scope, Scope::Read) && matches!(expr, Expr::Literal(Literal::Null)) {
+        ResolvedType::Scalar(PropType::scalar(ScalarType::Bool, true))
+    } else {
+        resolved
+    }
+}
+
 /// `left <op> right`: the operand rules of a comparison (T7, T38) and its
 /// type, `Bool`, nullable when an operand is; in a mutation `where`, a target
 /// property against a literal, a parameter or `now()` keeps the T3/T7 texts.
@@ -1784,8 +1864,23 @@ fn typecheck_comparison(
     params: &HashMap<String, PropType>,
     scope: Scope<'_>,
 ) -> Result<PropType> {
-    let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
-    let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+    let mut left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
+    let mut right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+    if matches!(scope, Scope::Read) {
+        let member = op == CompOp::Contains
+            && !matches!(&left_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })
+                if !matches!(left, Expr::Literal(Literal::Null))
+                    || matches!(&right_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })));
+        if let Some(contextual) = contextual_literal_type(left, &right_type, member.then_some(true))
+        {
+            left_type = contextual;
+        }
+        if let Some(contextual) =
+            contextual_literal_type(right, &left_type, member.then_some(false))
+        {
+            right_type = contextual;
+        }
+    }
 
     if (left.is_search_call() || right.is_search_call())
         && !(left.is_search_call()
@@ -2044,6 +2139,47 @@ fn read_property_type(
         }
     };
     Ok(prop.clone())
+}
+
+pub(crate) fn aggregate_signature(
+    catalog: &Catalog,
+    func: AggFunc,
+    arg: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+    nullable: bool,
+) -> Result<AggSignature> {
+    let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
+    reject_blob_read_value(&resolved_arg, arg)?;
+    let arg = check_aggregate_argument(&func, arg, &resolved_arg)?;
+    let scalar = func.result_type(&arg).ok_or_else(|| {
+        CompilerError::Plan(format!(
+            "{func} has no result type for argument {}",
+            arg.spelling()
+        ))
+    })?;
+    Ok(AggSignature {
+        arg,
+        result: ExprType::from_prop(&PropType::scalar(scalar, nullable)),
+    })
+}
+
+/// The checked expression type consumed by lowering in its original scope.
+pub(crate) fn expression_type(
+    catalog: &Catalog,
+    expr: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+    scope: Scope<'_>,
+) -> Result<ExprType> {
+    match resolve_expr_type(catalog, expr, ctx, params, scope)? {
+        ResolvedType::Scalar(prop) => Ok(ExprType::from_prop(&prop)),
+        ResolvedType::Node(type_name) => Ok(ExprType::Node { type_name }),
+        ResolvedType::Aggregate(ty) => Ok(ty),
+        ResolvedType::ForwardAlias => Err(CompilerError::Plan(
+            "unresolved forward alias during lowering".into(),
+        )),
+    }
 }
 
 fn resolve_expr_type(
@@ -2514,18 +2650,15 @@ fn resolve_expr_type(
         }
         Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
-            let arg_type = resolve_expr_type(catalog, arg, ctx, params, scope)?;
-            reject_blob_read_value(&arg_type, arg)?;
-            check_aggregate_argument(func, arg, &arg_type)?;
-
-            Ok(ResolvedType::Aggregate)
+            let signature = aggregate_signature(catalog, *func, arg, ctx, params, true)?;
+            Ok(ResolvedType::Aggregate(signature.result))
         }
         Expr::AliasRef(name) => match scope {
             Scope::Read => Ok(ctx
                 .aliases
                 .get(name)
                 .cloned()
-                .unwrap_or(ResolvedType::Aggregate)),
+                .unwrap_or(ResolvedType::ForwardAlias)),
             Scope::MutationWhere(target) => {
                 mutation_property_type(catalog, target, target.type_name(), name)
                     .map(ResolvedType::Scalar)
@@ -2546,7 +2679,10 @@ fn resolve_expr_type(
                 return Err(refusal);
             }
             let list_type = resolve_expr_type(catalog, list, ctx, params, scope)?;
-            if !matches!(&list_type, ResolvedType::Scalar(list) if list.list) {
+            if !matches!(&list_type, ResolvedType::Scalar(list) if list.list)
+                && !(matches!(scope, Scope::Read)
+                    && matches!(list.as_ref(), Expr::Literal(Literal::Null)))
+            {
                 return Err(CompilerError::typed(
                     T7,
                     format!(
@@ -2566,8 +2702,16 @@ fn resolve_expr_type(
             )?))
         }
         Expr::Binary { left, op, right } => {
-            let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
-            let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+            let left_type = contextual_boolean(
+                left,
+                resolve_expr_type(catalog, left, ctx, params, scope)?,
+                scope,
+            );
+            let right_type = contextual_boolean(
+                right,
+                resolve_expr_type(catalog, right, ctx, params, scope)?,
+                scope,
+            );
             let (Some(l), Some(r)) = (boolean_scalar(&left_type), boolean_scalar(&right_type))
             else {
                 return Err(CompilerError::typed(
@@ -2585,7 +2729,11 @@ fn resolve_expr_type(
             )))
         }
         Expr::Not(inner) => {
-            let inner_type = resolve_expr_type(catalog, inner, ctx, params, scope)?;
+            let inner_type = contextual_boolean(
+                inner,
+                resolve_expr_type(catalog, inner, ctx, params, scope)?,
+                scope,
+            );
             let Some(b) = boolean_scalar(&inner_type) else {
                 return Err(CompilerError::typed(
                     T41,
@@ -2766,40 +2914,44 @@ fn infer_projection_field(
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
 ) -> Result<Field> {
-    let name = projection_name(expr, alias);
-    match expr {
+    let ty = projection_type(catalog, expr, alias, order_clause, ctx, params)?;
+    projection_field(catalog, &projection_name(expr, alias), &ty)
+}
+
+/// The declared type of a return item, shared by inference and IR lowering.
+pub(crate) fn projection_type(
+    catalog: &Catalog,
+    expr: &Expr,
+    alias: Option<&str>,
+    order_clause: &[Ordering],
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<ExprType> {
+    let ty = match expr {
         Expr::Aggregate { func, arg } => {
-            // Keep result-schema inference fail-closed even when a caller has
-            // not first passed through `typecheck_read_query`. In particular,
-            // Count's output shape is fixed, but its argument may still be an
-            // unsupported Blob value.
-            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
-            reject_blob_read_value(&resolved_arg, arg)?;
-            check_aggregate_argument(func, arg, &resolved_arg)?;
-            check_projection(expr, alias, order_clause)?;
-            let (data_type, nullable) = match func {
-                AggFunc::Count => (DataType::Int64, true),
-                AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
-                AggFunc::Min | AggFunc::Max => {
-                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved_arg)?;
-                    (data_type, true)
-                }
-            };
-            Ok(Field::new(name, data_type, nullable))
+            aggregate_signature(catalog, *func, arg, ctx, params, true)?.result
         }
         Expr::Nearest { .. } | Expr::Bm25 { .. } => {
             resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
-            check_projection(expr, alias, order_clause)?;
-            Ok(Field::new(name, DataType::Float32, false))
+            ExprType::from_prop(&PropType::scalar(ScalarType::F32, false))
         }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
             reject_blob_read_value(&resolved, expr)?;
-            check_projection(expr, alias, order_clause)?;
-            let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
-            Ok(Field::new(name, data_type, nullable))
+            match resolved {
+                ResolvedType::Scalar(prop) => ExprType::from_prop(&prop),
+                ResolvedType::Node(type_name) => ExprType::Node { type_name },
+                ResolvedType::Aggregate(ty) => ty,
+                ResolvedType::ForwardAlias => {
+                    return Err(CompilerError::Plan(
+                        "unresolved forward alias in projection".into(),
+                    ));
+                }
+            }
         }
-    }
+    };
+    check_projection(expr, alias, order_clause)?;
+    Ok(ty)
 }
 
 /// The column name a projection carries in the executed result batch
@@ -2826,7 +2978,7 @@ pub fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
     }
 }
 
-fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
+pub(crate) fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
     if let Some(alias) = alias {
         return alias.to_string();
     }
@@ -2853,13 +3005,19 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
 
 /// T8: `count` takes a scalar or a node, `sum`/`avg` a numeric, `min`/`max` an
 /// orderable scalar; none takes an aggregate.
-fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType) -> Result<()> {
+fn check_aggregate_argument(
+    func: &AggFunc,
+    arg: &Expr,
+    arg_type: &ResolvedType,
+) -> Result<ExprType> {
     match (func, arg_type) {
-        (_, ResolvedType::Aggregate) => Err(CompilerError::typed(
+        (_, ResolvedType::Aggregate(_) | ResolvedType::ForwardAlias) => Err(CompilerError::typed(
             T8,
             format!("{func} cannot take an aggregate or a forward alias reference as its argument"),
         )),
-        (AggFunc::Count, _) => Ok(()),
+        (AggFunc::Count, ResolvedType::Node(type_name)) => Ok(ExprType::Node {
+            type_name: type_name.clone(),
+        }),
         (_, ResolvedType::Node(_)) => {
             let subject = match arg {
                 Expr::Variable(name) => format!("node binding `${name}`"),
@@ -2893,17 +3051,24 @@ fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType)
                 ),
             ))
         }
-        _ => Ok(()),
+        (_, ResolvedType::Scalar(prop)) => Ok(ExprType::from_prop(prop)),
     }
 }
 
-fn resolved_type_to_field_shape(
-    catalog: &Catalog,
-    resolved: &ResolvedType,
-) -> Result<(DataType, bool)> {
-    match resolved {
-        ResolvedType::Scalar(prop_type) => Ok((prop_type.to_arrow(), prop_type.nullable)),
-        ResolvedType::Node(type_name) => {
+/// Convert a stored return type to a field without inferring its expression again.
+pub(crate) fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<Field> {
+    let (data_type, nullable) = match ty {
+        ExprType::Value { nullable, .. } => (
+            ty.to_arrow()
+                .ok_or_else(|| CompilerError::Plan("value has no Arrow type".into()))?,
+            *nullable,
+        ),
+        ExprType::ExactInteger { .. } => {
+            return Err(CompilerError::Plan(
+                "internal exact integer cannot be a result column".into(),
+            ));
+        }
+        ExprType::Node { type_name } => {
             let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
                 CompilerError::typed(T51, format!("type `{}` not found in catalog", type_name))
             })?;
@@ -2913,10 +3078,10 @@ fn resolved_type_to_field_shape(
                     Field::new(member, field.data_type().clone(), field.is_nullable())
                 })
                 .collect();
-            Ok((DataType::Struct(fields.into()), false))
+            (DataType::Struct(fields.into()), false)
         }
-        ResolvedType::Aggregate => Ok((DataType::Int64, true)),
-    }
+    };
+    Ok(Field::new(name, data_type, nullable))
 }
 
 /// The refusal of `$a in $b` where `$a` is a node binding, the shape of a
@@ -2948,7 +3113,7 @@ fn membership_over_a_node(
     ))
 }
 
-fn literal_type(lit: &Literal) -> Result<PropType> {
+pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
     match lit {
         // Null is compatible with any nullable type; default to String for inference.
         Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
@@ -2967,26 +3132,38 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
             Ok(PropType::scalar(ScalarType::DateTime, false))
         }
         Literal::List(items) => {
-            if items.is_empty() {
-                return Ok(PropType::list_of(ScalarType::String, false));
-            }
-            let first = literal_type(&items[0])?;
-            if first.list {
-                return Err(CompilerError::typed(
-                    T52,
-                    "nested list literals are not supported".to_string(),
-                ));
-            }
-            for item in items.iter().skip(1) {
+            let mut scalar = None;
+            for item in items {
+                if matches!(item, Literal::Null) {
+                    continue;
+                }
                 let item_type = literal_type(item)?;
-                if item_type.list || !types_compatible(&first, &item_type) {
+                if item_type.list {
                     return Err(CompilerError::typed(
-                        T53,
-                        "list literal elements must share a compatible scalar type".to_string(),
+                        T52,
+                        "nested list literals are not supported".to_string(),
                     ));
                 }
+                scalar = Some(match scalar {
+                    None => item_type.scalar,
+                    Some(previous) if previous == item_type.scalar => previous,
+                    Some(ScalarType::I64 | ScalarType::F64)
+                        if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
+                    {
+                        ScalarType::F64
+                    }
+                    Some(_) => {
+                        return Err(CompilerError::typed(
+                            T53,
+                            "list literal elements must share a compatible scalar type".to_string(),
+                        ));
+                    }
+                });
             }
-            Ok(PropType::list_of(first.scalar, false))
+            Ok(PropType::list_of(
+                scalar.unwrap_or(ScalarType::String),
+                false,
+            ))
         }
     }
 }

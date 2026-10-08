@@ -15,6 +15,13 @@ for nearest-neighbor ordering.
 | `bm25($d.body, $q)` | BM25 relevance score. |
 | `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
 
+Search arguments use their declared types. `fuzzy` defaults `max_edits` to 2
+when omitted; a supplied value must be an integer from 0 to 4,294,967,295.
+`rrf` defaults `k` to 60 when omitted; a supplied value must be an integer
+from 1 to 4,294,967,295. A supplied null is an error, including a nullable
+parameter that was omitted from the parameter map. Query text and vectors
+must also be non-null; vector elements must convert to finite F32 values.
+
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
