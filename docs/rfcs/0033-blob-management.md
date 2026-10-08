@@ -1255,6 +1255,53 @@ show that long-lived Blob streams can starve ordinary reads, a separate workload
 permit may be added without changing byte, snapshot, or generation semantics;
 it still needs a cost/latency test before becoming a default.
 
+### 10.1 Beyond the 32 MiB envelope
+
+The 32 MiB ceilings are a resource envelope, not a limit of the data model.
+They exist for three reasons:
+
+- Lance's merge-insert runs its join with an unbounded memory pool, so a
+  transaction's memory is bounded only by bounding its input (RFC 0023);
+- a mutation or load holds its batches in memory until its one publication;
+- Lance writes a Blob value from an in-memory Arrow array.
+
+The ceilings are not a setting. The figure is backed by a measured process-memory
+bound, and a setting without a measured memory multiplier would promise a bound
+it cannot keep. Going beyond them means keeping large data out of the write
+path's memory. There are three separate limits, each with its own dependency
+and trigger:
+
+1. **Large objects by reference.** An external reference has no size limit, and
+   reads redirect without touching it. Today only an overwrite load keeps a
+   source-supplied reference; every incremental write copies the object, because
+   Lance's merge-insert writes with default `WriteParams` and refuses a reference
+   outside the dataset's bases. The missing piece is a merge-insert that accepts
+   write parameters ([lance#6426](https://github.com/lance-format/lance/issues/6426),
+   implemented by the open [lance#7969](https://github.com/lance-format/lance/pull/7969)).
+   [lance#9532](https://github.com/lance-format/lance/pull/9532), merged for
+   Lance 13, already keeps a reference that merge-insert carries for a Blob
+   column the source omits. Whether that carry bounds the payload of a managed
+   column it also carries must be checked before OmniGraph relies on it. Once
+   both are available:
+   - incremental writes can store a source-supplied reference without copying it;
+   - updates and `blob put` can carry a sibling's reference instead of reading
+     it, which also removes the denying-policy case in §4.3.
+
+   Trigger: the Lance release that ships the write parameters.
+2. **Managed values above 32 MiB.** Lance 12 adds a streaming
+   `DedicatedBlobWriter` and writer-prepared descriptors, so a value can be
+   written without holding it in memory. But a dedicated sidecar's path is bound
+   to the data file it belongs to, and merge-insert names its own data files.
+   Using it therefore means a single-row replacement outside the key-fenced
+   merge-insert that RFC 0023 requires for keyed writes. That needs its own RFC
+   after the Lance 12 bump. The PUT wire shape, a raw body, already allows a
+   higher limit without change.
+3. **Atomic operations above 32 MiB.** Mutation and load would stage a bounded
+   chain of Lance transactions under one publication, as branch merge does, and
+   validation would have to stream. Deferred until a workload needs an atomic
+   write larger than the envelope; until then a large load is split into several
+   commits, or replaces whole types with an overwrite load.
+
 ## 11. Error and observability contract
 
 New errors use existing structured families where possible. The public contract
@@ -1905,6 +1952,9 @@ publisher architecture.
     stale-generation outcome stays with the runtime for every route.
   - `clear` is not gated by a CLI confirmation; `If-Match` has one parser in the
     API types.
+  - The 32 MiB ceilings stay as the Phase 3 envelope. §10.1 records the three
+    paths beyond it (references, streamed managed values, atomic chains), what
+    blocks each, and its trigger.
 
   Superseded: §4's `impl Omnigraph` placement of the write methods; §4.3's "The
   raw managed payload limit is 32 MiB inclusive. The engine rejects a larger
