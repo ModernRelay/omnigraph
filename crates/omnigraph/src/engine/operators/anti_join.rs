@@ -19,6 +19,7 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::ir::{ParamMap, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
+use omnigraph_planner::AggregateSpec;
 
 use super::subquery_aggregate::{RowCountPredicate, SubqueryAggregate, absorb_inner_batches};
 use super::{GraphEnv, breaker_properties, breaker_stream, drain, drain_one, external, polled};
@@ -135,6 +136,7 @@ pub(crate) struct AntiJoinMaskExec {
     inner: Arc<dyn ExecutionPlan>,
     outer_var: String,
     predicate: SubqueryPredicate,
+    aggregate: Option<AggregateSpec>,
     params: Arc<ParamMap>,
     tag_column: String,
     slot: Arc<OuterSlot>,
@@ -152,6 +154,7 @@ impl AntiJoinMaskExec {
         inner: Arc<dyn ExecutionPlan>,
         outer_var: String,
         predicate: SubqueryPredicate,
+        aggregate: Option<AggregateSpec>,
         params: Arc<ParamMap>,
         tag_column: String,
         slot: Arc<OuterSlot>,
@@ -164,6 +167,7 @@ impl AntiJoinMaskExec {
             inner,
             outer_var,
             predicate,
+            aggregate,
             params,
             tag_column,
             slot,
@@ -260,6 +264,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
             inner,
             self.outer_var.clone(),
             self.predicate.clone(),
+            self.aggregate,
             Arc::clone(&self.params),
             self.tag_column.clone(),
             Arc::clone(&self.slot),
@@ -280,6 +285,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
         let inner_ctx = Arc::clone(&ctx);
         let outer_var = self.outer_var.clone();
         let predicate = self.predicate.clone();
+        let aggregate_spec = self.aggregate;
         let params = Arc::clone(&self.params);
         let tag_column = self.tag_column.clone();
         let tagged = tagged_schema(&schema, &tag_column);
@@ -330,17 +336,18 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         drop(filled);
                         let inner_batches = result?;
                         reservation.entries::<u64>(num_rows)?;
-                        if SubqueryAggregate::tracks_values(predicate.func) {
+                        if SubqueryAggregate::tracks_values(aggregate_spec) {
                             reservation
                                 .entries::<super::subquery_aggregate::ValueAccumulator>(num_rows)?;
                         }
-                        let mut aggregate = SubqueryAggregate::new(&predicate, &params, num_rows)
-                            .map_err(external)?;
+                        let mut aggregate =
+                            SubqueryAggregate::new(&predicate, aggregate_spec, &params, num_rows)
+                                .map_err(external)?;
                         absorb_inner_batches(
                             &mut aggregate,
                             &inner_batches,
                             &tag_column,
-                            predicate.arg.as_ref(),
+                            predicate.left.arg(),
                             &|batch, arg| crate::engine::expr::evaluate_expr(batch, arg, &params),
                         )
                         .map_err(external)?;

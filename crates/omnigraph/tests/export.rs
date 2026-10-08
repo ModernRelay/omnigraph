@@ -887,7 +887,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Int32 range"));
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds I32 range"),
+            "{message}"
+        );
     }
     assert_eq!(count_rows(&mutation, "node:SignedBoundary").await, 1);
 
@@ -910,7 +914,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("UInt32 range"));
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds U32 range"),
+            "{message}"
+        );
     }
     assert_eq!(count_rows(&mutation, "node:UnsignedBoundary").await, 1);
 
@@ -926,7 +934,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
         .mutate("main", NARROWING_MUTATIONS, "put_float", &float_overflow)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("Float32 range"));
+    let message = error.to_string();
+    assert!(
+        message.contains("param 'value':") && message.contains("exceeds F32 range"),
+        "{message}"
+    );
     assert_eq!(count_rows(&mutation, "node:FloatBoundary").await, 1);
 }
 

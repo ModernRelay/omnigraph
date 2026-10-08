@@ -1,7 +1,9 @@
 use super::*;
 
 use arrow_array::StructArray;
+use arrow_ord::cmp;
 use arrow_schema::Fields;
+use datafusion::arrow::compute::kernels::boolean;
 use omnigraph_compiler::catalog::NodeType;
 use omnigraph_planner::PhysicalNode;
 
@@ -58,6 +60,37 @@ impl ProjectionContext {
         self.catalog.node_types.get(self.bindings.get(variable)?)
     }
 
+    pub(super) fn declared_field(
+        &self,
+        name: &str,
+        ty: &omnigraph_compiler::types::ExprType,
+    ) -> Result<Field> {
+        use omnigraph_compiler::types::ExprType;
+        match ty {
+            ExprType::Value { nullable, .. } => Ok(Field::new(
+                name,
+                ty.to_arrow()
+                    .ok_or_else(|| OmniError::manifest_internal("value has no Arrow type"))?,
+                *nullable,
+            )),
+            ExprType::ExactInteger { .. } => Err(OmniError::manifest_internal(
+                "internal exact integer cannot be a public result field",
+            )),
+            ExprType::Node { type_name } => {
+                let node = self.catalog.node_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("node type {type_name} is absent"))
+                })?;
+                let fields: Vec<_> = node
+                    .node_object_members()
+                    .map(|(member, field)| {
+                        Field::new(member, field.data_type().clone(), field.is_nullable())
+                    })
+                    .collect();
+                Ok(Field::new(name, DataType::Struct(fields.into()), false))
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn bindings(&self) -> &HashMap<String, String> {
         &self.bindings
@@ -98,26 +131,32 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
     }
 }
 
-/// Evaluate a Boolean expression against a batch, producing a mask: `and`,
-/// `or` and `not` under Arrow's three-valued Kleene kernels, a null test
-/// through `is_null`/`is_not_null`, a comparison through `evaluate_comparison`,
-/// and any other expression as a Boolean column.
+/// Evaluate a typed Boolean expression using the same kernels as projections.
 pub(super) fn evaluate_filter(
     batch: &RecordBatch,
     filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<BooleanArray> {
-    use datafusion::arrow::compute::kernels::boolean;
+    boolean_mask(evaluate_expr(batch, filter, params)?, filter)
+}
+
+fn evaluate_boolean(
+    batch: &RecordBatch,
+    filter: &IRExpr,
+    params: &ParamMap,
+) -> Result<BooleanArray> {
     match filter {
         IRExpr::Binary {
             left,
             op: BinaryOp::Compare(op),
             right,
+            ty: _,
         } => evaluate_comparison(batch, left, *op, right, params),
         IRExpr::Binary {
             left,
             op: BinaryOp::And,
             right,
+            ty: _,
         } => {
             let left = evaluate_filter(batch, left, params)?;
             let right = evaluate_filter(batch, right, params)?;
@@ -127,16 +166,21 @@ pub(super) fn evaluate_filter(
             left,
             op: BinaryOp::Or,
             right,
+            ty: _,
         } => {
             let left = evaluate_filter(batch, left, params)?;
             let right = evaluate_filter(batch, right, params)?;
             boolean::or_kleene(&left, &right).map_err(OmniError::arrow_internal)
         }
-        IRExpr::Not(inner) => {
+        IRExpr::Not(inner, _) => {
             let inner = evaluate_filter(batch, inner, params)?;
             boolean::not(&inner).map_err(OmniError::arrow_internal)
         }
-        IRExpr::IsNull { expr, negated } => {
+        IRExpr::IsNull {
+            expr,
+            negated,
+            ty: _,
+        } => {
             let values = evaluate_expr(batch, expr, params)?;
             if *negated {
                 boolean::is_not_null(&values)
@@ -145,31 +189,35 @@ pub(super) fn evaluate_filter(
             }
             .map_err(OmniError::arrow_internal)
         }
-        other => boolean_mask(evaluate_expr(batch, other, params)?, other),
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Cast { .. } => Err(OmniError::manifest_internal("expected a Boolean operator")),
     }
 }
 
-/// A Boolean column as the mask it is; the untyped null `literal_to_array`
-/// broadcasts for `Literal::Null` (a nullable parameter bound to null) is cast
-/// to Boolean, so `$p.enabled and $flag` follows the null rules.
 fn boolean_mask(values: ArrayRef, expr: &IRExpr) -> Result<BooleanArray> {
-    if let Some(mask) = values.as_any().downcast_ref::<BooleanArray>() {
-        return Ok(mask.clone());
-    }
-    if values.null_count() == values.len() {
-        let mask = arrow_cast::cast::cast(&values, &DataType::Boolean)
-            .map_err(OmniError::arrow_internal)?;
-        return Ok(arrow_array::cast::as_boolean_array(&mask).clone());
-    }
-    Err(OmniError::manifest(format!(
-        "filter `{expr}` is not Boolean: got {}",
-        values.data_type()
-    )))
+    values
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .cloned()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "filter `{expr}` is not Boolean: got {}",
+                values.data_type()
+            ))
+        })
 }
 
-/// `left <op> right` over a batch: the operands through `evaluate_expr`, two
-/// numbers on their common type (`common_numeric_type`), any other pair with
-/// the right cast to the left's type, then Arrow's comparison kernels.
 fn evaluate_comparison(
     batch: &RecordBatch,
     left: &IRExpr,
@@ -179,143 +227,105 @@ fn evaluate_comparison(
 ) -> Result<BooleanArray> {
     let left = evaluate_expr(batch, left, params)?;
     let right = evaluate_expr(batch, right, params)?;
+    compare_arrays(&left, op, &right)
+}
 
+/// Execute a comparison after both operands reached their recorded domain.
+pub(super) fn compare_arrays(
+    left: &ArrayRef,
+    op: CompOp,
+    right: &ArrayRef,
+) -> Result<BooleanArray> {
     if op == CompOp::Contains {
-        return evaluate_contains_filter(&left, &right);
+        return evaluate_contains_filter(left, right);
     }
     if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
-        return evaluate_string_match_filter(op, &left, &right);
+        return evaluate_string_match_filter(op, left, right);
     }
-    let (left, right) = match common_numeric_type(left.data_type(), right.data_type()) {
-        Some(common) => (cast_to(&left, &common)?, cast_to(&right, &common)?),
-        None if left.data_type() != right.data_type() => {
-            let right = cast_to(&right, left.data_type())?;
-            (left, right)
-        }
-        None => (left, right),
-    };
-
-    use arrow_ord::cmp;
-    let result = match op {
-        CompOp::Eq => cmp::eq(&left, &right),
-        CompOp::Ne => cmp::neq(&left, &right),
-        CompOp::Gt => cmp::gt(&left, &right),
-        CompOp::Lt => cmp::lt(&left, &right),
-        CompOp::Ge => cmp::gt_eq(&left, &right),
-        CompOp::Le => cmp::lt_eq(&left, &right),
+    if left.data_type() != right.data_type() {
+        return Err(OmniError::manifest_internal(format!(
+            "comparison operands have different recorded domains: {} and {}",
+            left.data_type(),
+            right.data_type()
+        )));
+    }
+    match op {
+        CompOp::Eq => cmp::eq(left, right),
+        CompOp::Ne => cmp::neq(left, right),
+        CompOp::Gt => cmp::gt(left, right),
+        CompOp::Lt => cmp::lt(left, right),
+        CompOp::Ge => cmp::gt_eq(left, right),
+        CompOp::Le => cmp::lt_eq(left, right),
         CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
             unreachable!("handled above")
         }
     }
-    .map_err(OmniError::arrow_internal)?;
-
-    Ok(result)
+    .map_err(OmniError::arrow_internal)
 }
 
-/// The type two numeric operands of different types are both cast to, so
-/// neither is truncated toward the other (`2 = 2.7` is false, as in
-/// `fold::evaluate`); `None` for one type or a non-numeric operand.
-fn common_numeric_type(left: &DataType, right: &DataType) -> Option<DataType> {
-    if left == right || !left.is_numeric() || !right.is_numeric() {
-        return None;
-    }
-    Some(if left.is_floating() || right.is_floating() {
-        DataType::Float64
-    } else if left.is_unsigned_integer() && right.is_unsigned_integer() {
-        DataType::UInt64
-    } else if matches!(left, DataType::UInt64) || matches!(right, DataType::UInt64) {
-        DataType::Decimal128(20, 0)
-    } else {
-        DataType::Int64
-    })
-}
-
-fn cast_to(values: &ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
-    arrow_cast::cast::cast(values, data_type).map_err(OmniError::arrow_internal)
-}
-
-/// Evaluate an IR expression against a wide batch, producing an array; a
-/// Boolean expression produces its mask as the array.
+/// Execute an expression in its recorded type and check the produced array.
 pub(super) fn evaluate_expr(
     batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<ArrayRef> {
-    match expr {
-        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
-            Ok(Arc::new(evaluate_filter(batch, expr, params)?) as ArrayRef)
+    let values: ArrayRef = match expr {
+        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
+            Arc::new(evaluate_boolean(batch, expr, params)?)
         }
-        IRExpr::PropAccess { variable, property } => {
-            let col_name = format!("{}.{}", variable, property);
-            batch.column_by_name(&col_name).cloned().ok_or_else(|| {
-                OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
-            })
+        IRExpr::Cast { expr: child, ty } => {
+            let values = evaluate_expr(batch, child, params)?;
+            super::typed_value::cast_array(&values, child, ty)?
         }
-        IRExpr::Literal(lit) => literal_to_array(lit, batch.num_rows()),
-        IRExpr::Param(name) => {
+        IRExpr::PropAccess {
+            variable, property, ..
+        } => {
+            let col_name = format!("{variable}.{property}");
+            Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
+                OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
+            })?)
+        }
+        IRExpr::Literal(lit, ty) => typed_literal_to_array(lit, ty, batch.num_rows())?,
+        IRExpr::Param(name, ty) => {
             let lit = params
                 .get(name)
-                .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?;
-            literal_to_array(lit, batch.num_rows())
+                .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?;
+            typed_literal_to_array(lit, ty, batch.num_rows())?
         }
-        _ => Err(OmniError::manifest(format!(
-            "unsupported expression in filter: {}",
-            expr
-        ))),
-    }
+        IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => {
+            return Err(OmniError::manifest(format!(
+                "unsupported expression in filter: {expr}"
+            )));
+        }
+    };
+    check_array_type(&values, expr.ty(), &expr.to_string())?;
+    Ok(values)
 }
 
-/// Broadcast a literal in its natural Arrow type for residual and pushed filters.
-pub(super) fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
-    Ok(match lit {
-        Literal::Null => arrow_array::new_null_array(&DataType::Utf8, num_rows),
-        Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef,
-        Literal::Integer(n) => Arc::new(Int64Array::from(vec![*n; num_rows])) as ArrayRef,
-        Literal::Float(f) => Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef,
-        Literal::Bool(b) => Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef,
-        Literal::Date(s) => {
-            let days = crate::loader::parse_date32_literal(s)?;
-            Arc::new(Date32Array::from(vec![days; num_rows])) as ArrayRef
-        }
-        Literal::DateTime(s) => {
-            let ms = crate::loader::parse_date64_literal(s)?;
-            Arc::new(Date64Array::from(vec![ms; num_rows])) as ArrayRef
-        }
-        Literal::List(items) => literal_list_to_array(items, num_rows)?,
-    })
-}
-
-/// List membership per row, null where the list or the needle is null; the
-/// untyped all-null column `literal_to_array` broadcasts for a nullable list
-/// parameter bound to null is that null list. A numeric needle and a numeric
-/// element type meet on their `common_numeric_type`, as `=` does.
+/// Membership is null for a null list or needle; null items never match.
 pub(super) fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
     let DataType::List(field) = left.data_type() else {
-        if left.null_count() == left.len() {
-            return Ok(BooleanArray::new_null(left.len()));
-        }
-        return Err(OmniError::manifest(
-            "contains requires a list property on the left".to_string(),
+        return Err(OmniError::manifest_internal(
+            "contains requires a recorded list domain",
         ));
     };
-    let (left, right) = match common_numeric_type(field.data_type(), right.data_type()) {
-        Some(common) => {
-            let item = Arc::new(Field::new(field.name(), common.clone(), true));
-            (
-                cast_to(left, &DataType::List(item))?,
-                cast_to(right, &common)?,
-            )
-        }
-        None if right.data_type() != field.data_type() => {
-            (Arc::clone(left), cast_to(right, field.data_type())?)
-        }
-        None => (Arc::clone(left), Arc::clone(right)),
-    };
+    if field.data_type() != right.data_type() || left.len() != right.len() {
+        return Err(OmniError::manifest_internal(
+            "contains operands have different recorded domains or lengths",
+        ));
+    }
     let list = left
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| OmniError::manifest("contains requires an Arrow ListArray"))?;
-
+        .ok_or_else(|| OmniError::manifest_internal("contains requires an Arrow ListArray"))?;
     let mut values = Vec::with_capacity(list.len());
     for row in 0..list.len() {
         if list.is_null(row) || right.is_null(row) {
@@ -335,25 +345,33 @@ pub(super) fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Res
     Ok(BooleanArray::from(values))
 }
 
-/// Evaluate exact, case-sensitive string predicates using Arrow's string kernels.
-/// A null on either side is null, as on the pushed arm, so `not` over the
-/// result agrees across the arms.
 pub(super) fn evaluate_string_match_filter(
     op: CompOp,
     left: &ArrayRef,
     right: &ArrayRef,
 ) -> Result<BooleanArray> {
-    let right = if right.data_type() != left.data_type() {
-        arrow_cast::cast::cast(right, left.data_type()).map_err(OmniError::arrow_internal)?
-    } else {
-        Arc::clone(right)
-    };
-    let (left_dyn, right_dyn): (&dyn Array, &dyn Array) = (left.as_ref(), right.as_ref());
-    match op {
-        CompOp::StartsWith => arrow_string::like::starts_with(&left_dyn, &right_dyn),
-        _ => arrow_string::like::contains(&left_dyn, &right_dyn),
+    if left.data_type() != &DataType::Utf8 || right.data_type() != &DataType::Utf8 {
+        return Err(OmniError::manifest_internal(
+            "string comparison requires recorded String domains",
+        ));
     }
-    .map_err(|e| OmniError::manifest(format!("{op} requires String operands: {e}")))
+    let (left, right): (&dyn Array, &dyn Array) = (left.as_ref(), right.as_ref());
+    match op {
+        CompOp::StartsWith => arrow_string::like::starts_with(&left, &right),
+        CompOp::StringContains => arrow_string::like::contains(&left, &right),
+        CompOp::Eq
+        | CompOp::Ne
+        | CompOp::Gt
+        | CompOp::Lt
+        | CompOp::Ge
+        | CompOp::Le
+        | CompOp::Contains => {
+            return Err(OmniError::manifest_internal(
+                "invalid string comparison operator",
+            ));
+        }
+    }
+    .map_err(OmniError::arrow_internal)
 }
 
 pub(super) fn array_value_eq(
@@ -362,175 +380,17 @@ pub(super) fn array_value_eq(
     right: &dyn Array,
     right_index: usize,
 ) -> Result<bool> {
+    if left.data_type() != right.data_type() {
+        return Err(OmniError::manifest_internal(
+            "membership element and needle domains differ",
+        ));
+    }
     if left.is_null(left_index) || right.is_null(right_index) {
         return Ok(false);
     }
-    let left_value = array_value_to_string(left, left_index).map_err(OmniError::arrow_internal)?;
-    let right_value =
-        array_value_to_string(right, right_index).map_err(OmniError::arrow_internal)?;
-    Ok(left_value == right_value)
-}
-
-pub(super) fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef> {
-    if items.is_empty() {
-        let mut builder = ListBuilder::new(StringBuilder::new());
-        for _ in 0..num_rows {
-            builder.append(true);
-        }
-        return Ok(Arc::new(builder.finish()));
-    }
-
-    let scalar_type = list_scalar_type(items)?;
-    match scalar_type {
-        ScalarType::String => {
-            let mut builder = ListBuilder::with_capacity(StringBuilder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Utf8, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::String(value) => builder.values().append_value(value),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::Bool => {
-            let mut builder = ListBuilder::with_capacity(BooleanBuilder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Boolean, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::Bool(value) => builder.values().append_value(*value),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::I32 => {
-            let mut builder = ListBuilder::with_capacity(Int32Builder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Int32, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::Integer(value) => builder.values().append_value(*value as i32),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::I64 | ScalarType::U32 | ScalarType::U64 => {
-            let mut builder = ListBuilder::with_capacity(Int64Builder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Int64, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::Integer(value) => builder.values().append_value(*value),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::F32 | ScalarType::F64 => {
-            let mut builder = ListBuilder::with_capacity(Float64Builder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Float64, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::Integer(value) => builder.values().append_value(*value as f64),
-                        Literal::Float(value) => builder.values().append_value(*value),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::Date => {
-            let mut builder = ListBuilder::with_capacity(Date32Builder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Date32, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::Date(value) => builder
-                            .values()
-                            .append_value(crate::loader::parse_date32_literal(value)?),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::DateTime => {
-            let mut builder = ListBuilder::with_capacity(Date64Builder::new(), num_rows)
-                .with_field(Arc::new(Field::new("item", DataType::Date64, true)));
-            for _ in 0..num_rows {
-                for item in items {
-                    match item {
-                        Literal::DateTime(value) => builder
-                            .values()
-                            .append_value(crate::loader::parse_date64_literal(value)?),
-                        _ => builder.values().append_null(),
-                    }
-                }
-                builder.append(true);
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        ScalarType::Vector(_) | ScalarType::Blob => Err(OmniError::manifest(
-            "unsupported list literal element type".to_string(),
-        )),
-    }
-}
-
-/// The element type of a list literal: the type its non-null elements share,
-/// `F64` for integers beside floats, `String` when every element is null.
-pub(super) fn list_scalar_type(items: &[Literal]) -> Result<ScalarType> {
-    if items.is_empty() {
-        return Err(OmniError::manifest("empty list literal"));
-    }
-    let mut expected = None;
-    for item in items.iter().filter(|item| !matches!(item, Literal::Null)) {
-        let item_type = literal_scalar_type(item)?;
-        expected = Some(match expected {
-            None => item_type,
-            Some(seen) if seen == item_type => seen,
-            Some(ScalarType::I64 | ScalarType::F64)
-                if matches!(item_type, ScalarType::I64 | ScalarType::F64) =>
-            {
-                ScalarType::F64
-            }
-            Some(_) => {
-                return Err(OmniError::manifest(
-                    "list literal elements must share a compatible scalar type".to_string(),
-                ));
-            }
-        });
-    }
-    Ok(expected.unwrap_or(ScalarType::String))
-}
-
-pub(super) fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
-    match lit {
-        Literal::Null => Ok(ScalarType::String),
-        Literal::String(_) => Ok(ScalarType::String),
-        Literal::Integer(_) => Ok(ScalarType::I64),
-        Literal::Float(_) => Ok(ScalarType::F64),
-        Literal::Bool(_) => Ok(ScalarType::Bool),
-        Literal::Date(_) => Ok(ScalarType::Date),
-        Literal::DateTime(_) => Ok(ScalarType::DateTime),
-        Literal::List(_) => Err(OmniError::manifest(
-            "nested list literals are not supported".to_string(),
-        )),
-    }
+    let equal = arrow_ord::cmp::eq(&left.slice(left_index, 1), &right.slice(right_index, 1))
+        .map_err(OmniError::arrow_internal)?;
+    Ok(equal.value(0))
 }
 
 /// Evaluate a single projection expression against a wide batch; a Boolean
@@ -543,34 +403,48 @@ pub(super) fn evaluate_projection(
     ctx: &ProjectionContext,
 ) -> Result<(String, ArrayRef)> {
     match expr {
-        IRExpr::PropAccess { variable, property } => {
+        IRExpr::PropAccess {
+            variable,
+            property,
+            ty,
+        } => {
             let col_name = format!("{}.{}", variable, property);
             let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
                 OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
             })?;
+            check_array_type(col, ty, &col_name)?;
             Ok((col_name, col.clone()))
         }
-        IRExpr::Literal(lit) => {
-            let arr = literal_to_array(lit, wide_batch.num_rows())?;
+        IRExpr::Literal(lit, ty) => {
+            let arr = typed_literal_to_array(lit, ty, wide_batch.num_rows())?;
             Ok(("literal".to_string(), arr))
         }
-        IRExpr::Param(name) => {
+        IRExpr::Param(name, ty) => {
             let lit = params
                 .get(name)
                 .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?;
-            let arr = literal_to_array(lit, wide_batch.num_rows())?;
+            let arr = typed_literal_to_array(lit, ty, wide_batch.num_rows())?;
             Ok((name.clone(), arr))
         }
-        IRExpr::Variable(name) => {
+        IRExpr::Variable(name, ty) => {
             let node_type = ctx.node_type(name).ok_or_else(|| {
                 OmniError::manifest(format!("variable '{}' is not a node binding", name))
             })?;
+            if ty
+                != &(omnigraph_compiler::types::ExprType::Node {
+                    type_name: node_type.name.clone(),
+                })
+            {
+                return Err(OmniError::manifest_internal(
+                    "node variable type disagrees with its binding",
+                ));
+            }
             let wide_schema = wide_batch.schema();
             let mut fields: Vec<Field> = Vec::new();
             let mut columns: Vec<ArrayRef> = Vec::new();
             for (member, field) in node_type.node_object_members() {
                 let col_name = format!("{}.{}", name, field.name());
-                let (idx, wide_field) =
+                let (idx, _wide_field) =
                     wide_schema.column_with_name(&col_name).ok_or_else(|| {
                         OmniError::manifest(format!(
                             "column '{}' not found in wide batch",
@@ -578,10 +452,17 @@ pub(super) fn evaluate_projection(
                         ))
                     })?;
                 let col = wide_batch.column(idx).clone();
+                if col.data_type() != field.data_type()
+                    || !field.is_nullable() && col.null_count() != 0
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "node member {col_name} violates its declared field"
+                    )));
+                }
                 fields.push(Field::new(
                     member,
-                    col.data_type().clone(),
-                    wide_field.is_nullable(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
                 ));
                 columns.push(col);
             }
@@ -589,11 +470,17 @@ pub(super) fn evaluate_projection(
                 .map_err(OmniError::arrow_internal)?;
             Ok((name.clone(), Arc::new(node) as ArrayRef))
         }
-        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
-            let mask = evaluate_filter(wide_batch, expr, params)?;
-            Ok((expr.to_string(), Arc::new(mask) as ArrayRef))
+        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } | IRExpr::Cast { .. } => {
+            Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?))
         }
-        _ => Err(OmniError::manifest(format!(
+        IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => Err(OmniError::manifest(format!(
             "unsupported projection expression: {}",
             expr
         ))),
