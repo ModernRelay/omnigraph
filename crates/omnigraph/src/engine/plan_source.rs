@@ -313,7 +313,6 @@ impl PlanSource for QuerySource<'_> {
             edge_count,
             src_node_count: node_count(src_type)?,
             dst_node_count: node_count(dst_type)?,
-            same_type: edge_def.from_type == edge_def.to_type,
             max_frontier_cap: self.expand_caps.max_frontier,
             max_hops_cap: self.expand_caps.max_hops,
         })

@@ -72,7 +72,6 @@ pub struct ExpandStatistics {
     pub edge_count: u64,
     pub src_node_count: u64,
     pub dst_node_count: u64,
-    pub same_type: bool,
     pub max_frontier_cap: u64,
     pub max_hops_cap: u32,
 }

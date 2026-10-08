@@ -1050,6 +1050,71 @@ return { $f.name }
 }
 
 #[test]
+fn test_cross_type_multi_hop_bound_is_refused() {
+    let catalog = setup();
+    for (pattern, rendered, fix) in [
+        (
+            "$p: Person $p worksAt{1,2} $c",
+            "worksAt{1,2}",
+            "`$p worksAt $c`",
+        ),
+        (
+            "$p: Person $p worksAt{2,2} $c",
+            "worksAt{2,2}",
+            "no `WorksAt` path reaches hop 2, so this pattern matches nothing; to go further, start another traversal at the `Company` endpoint",
+        ),
+        (
+            "$c: Company $c worksAt{1,3} $p",
+            "worksAt{1,3}",
+            "`$c worksAt $p`",
+        ),
+        (
+            "$c: Company $c worksAt{3,4} $p",
+            "worksAt{3,4}",
+            "no `WorksAt` path reaches hop 3, so this pattern matches nothing; to go further, start another traversal at the `Person` endpoint",
+        ),
+        (
+            "$p: Person not { $p worksAt{1,2} $_ }",
+            "worksAt{1,2}",
+            "`$p worksAt $_`",
+        ),
+    ] {
+        let source = format!("query q() {{ match {{ {pattern} }} return {{ $p.name }} }}");
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
+        let diagnostic = err.diagnostic().expect("a typecheck diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T5", "{pattern}: {err}");
+        assert!(
+            diagnostic.message.contains(&format!(
+                "multi-hop traversal `{rendered}` requires the same node type at both endpoints, but `WorksAt: Person -> Company` connects different types"
+            )),
+            "{pattern}: {err}"
+        );
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .is_some_and(|text| text.contains(fix)),
+            "{pattern}: {diagnostic:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cross_type_single_hop_bound_is_valid() {
+    let catalog = setup();
+    for traversal in ["$p worksAt $c", "$p worksAt{1,1} $c"] {
+        let source =
+            format!("query q() {{ match {{ $p: Person {traversal} }} return {{ $c.name }} }}");
+        let qf = parse_query(&source).unwrap();
+        let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
+        assert_eq!(ctx.traversals[0].src_type, "Person", "{traversal}");
+        assert_eq!(ctx.traversals[0].dst_type, "Company", "{traversal}");
+        assert_eq!(ctx.traversals[0].max_hops, Some(1), "{traversal}");
+    }
+}
+
+#[test]
 fn test_negation_typecheck() {
     let catalog = setup();
     let qf = parse_query(

@@ -143,7 +143,7 @@ pub struct ExpandCostInputs {
     pub edge_count: u64,
     /// |V_src|, the node count of the keyed endpoint type.
     pub src_node_count: u64,
-    /// Effective max hop count for this Expand (`cost_effective_hops`).
+    /// Effective max hop count for this Expand (`executed_hops`).
     pub effective_max_hops: u32,
     /// Hard ceiling above which the indexed path is never used (resolved
     /// `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`).
@@ -247,22 +247,12 @@ pub fn should_switch_to_csr(
     remaining_cost > csr_cost
 }
 
-/// Hops the indexed path will actually run. A cross-type edge cannot chain, so
-/// the engine caps it at one hop regardless of the requested range; the cost
-/// model must use that, or it over-estimates the indexed cost of a cross-type
-/// variable-length expand and skews toward CSR.
-pub fn cost_effective_hops(requested_max_hops: u32, same_type: bool) -> u32 {
-    if same_type {
-        requested_max_hops
-    } else {
-        requested_max_hops.min(1)
-    }
-}
-
 /// The hops an `Expand` runs for the cost model: its `max_hops`, or its
-/// `min_hops` (at least one) when unbounded, through `cost_effective_hops`.
-pub fn executed_hops(min_hops: u32, max_hops: Option<u32>, same_type: bool) -> u32 {
-    cost_effective_hops(max_hops.unwrap_or(min_hops.max(1)), same_type)
+/// `min_hops` (at least one) when unbounded. A cross-type expand never asks
+/// for more than one: the type checker and the engine's plan validation both
+/// refuse it.
+pub fn executed_hops(min_hops: u32, max_hops: Option<u32>) -> u32 {
+    max_hops.unwrap_or(min_hops.max(1))
 }
 
 /// Per-hop probe multiplier for the indexed path: one scan for a directed
@@ -375,7 +365,7 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
                 .edge_count
                 .div_ceil(stats.src_node_count.max(1))
                 .max(1);
-            let hops = executed_hops(*min_hops, *max_hops, stats.same_type);
+            let hops = executed_hops(*min_hops, *max_hops);
             let mut rows = input_rows;
             for _ in 0..hops.max(1) {
                 let next = rows.saturating_mul(fanout).min(stats.dst_node_count);

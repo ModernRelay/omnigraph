@@ -41,8 +41,7 @@ pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
     AccessPath, CSR_BUILD_FACTOR, ExpandCostInputs, ExpandMode, ExpandPolicy,
     HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
-    cost_effective_hops, direction_probe_factor, estimate_rows, executed_hops, scan_row_estimate,
-    should_switch_to_csr,
+    direction_probe_factor, estimate_rows, executed_hops, scan_row_estimate, should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;
