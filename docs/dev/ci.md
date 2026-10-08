@@ -54,8 +54,8 @@ all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 case arming a seam turns the guard red where the PR can see it. The fixture
 parity test in `crates/omnigraph-bench/src/branch_merge.rs` also reads
 `generated_branch_merge_dataset.gqt` from the corpus. `GQT (ordinary)` runs
-that exact test on `run_gqt`, including cases-only changes, while
-`Test Workspace` covers it on engine input. No crate reads a deployment
+it with the other benchmark unit tests on `run_gqt`, including cases-only
+changes, while `Test Workspace` covers it on engine input. No crate reads a deployment
 file. `scripts/check-change-classes.py` keeps the
 literal-spelling half of this true: it replays the classifier over fixture
 diffs and fails when a string literal in a Rust or TOML file under `crates/`
@@ -146,13 +146,18 @@ Current-version live schema and policy deployment remains required by `Test Work
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
-unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
-the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
-the same flagless shape; the guard is a source walk whose crate declares no
-workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
-`toml`), so
-it adds no second engine build. The same ordinary job runs the benchmark
-fixture parity test against the generated branch-merge corpus case.
+unavailable-DST refusal and the unit tests of `omnigraph-gqt`,
+`omnigraph-gqt-core` and `omnigraph-bench` under an empty `RUSTFLAGS`, then
+runs the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`)
+in the same flagless shape. Both of its engine invocations select those same
+three packages, so they resolve one feature graph and the engine builds once:
+each crate alone resolves a different graph (`omnigraph-gqt` enables the
+engine's `test-util` and depends on `omnigraph-dst`), and three selections
+cost three engine builds, about 20 minutes each warm. The guard is a source
+walk whose crate declares no workspace crate (its dev-dependencies are
+`serde_yaml`, `syn`, `tempfile` and `toml`), so it adds no second engine
+build. The benchmark units include the fixture parity test against the
+generated branch-merge corpus case.
 The dispatch owner also checks external-store admission and persistence.
 Automatic corpus runs supply no `--store`, so schema-less query files are
 refused there; schema-and-seed datasets with zero steps are admitted.
