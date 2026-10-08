@@ -2,6 +2,32 @@
 
 Workflow YAML under `.github/workflows/` is the source of truth. This page explains the boundaries; it does not duplicate every job or pinned version.
 
+## Issue triage
+
+Issue forms apply `needs-triage` plus `bug` or `feature` according to the selected
+form. `issue-triage.yml` provides an asynchronous fallback for newly opened
+issues submitted through other paths.
+It skips opening events already carrying `needs-triage`, then checks the current
+issue before writing. Closed issues and issues with any lifecycle status are
+left unchanged. It only adds `needs-triage`; it never replaces other labels or
+runs in response to later label edits.
+
+Failed API operations are retried up to three attempts, with a fresh status
+check before each write attempt. Runs for the same issue are serialized; issues
+with different numbers run independently. The workflow uses only `issues: write`
+and does not check out or execute repository or issue content.
+
+To repair missed intake, a maintainer with write access can select **Actions >
+Issue triage > Run workflow** on the default branch and enter one positive issue
+number. Manual runs use the same lifecycle checks and reject pull request
+numbers. They do not scan or relabel the backlog.
+
+Actions must be enabled and the run must succeed. Issues created using
+`GITHUB_TOKEN` do not trigger this workflow automatically; their creators must
+set `needs-triage`, or a maintainer can use the manual repair. Status reads and
+label writes are separate API calls, so a maintainer edit can still race a write.
+Who can change labels is controlled by repository permissions, not this workflow.
+
 ## Pull-request gates
 
 `ci.yml` always classifies the diff (from the merge base with the base branch,
@@ -11,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -25,8 +51,12 @@ all under `GQ Logic Tests`, whose `dst-clippy` job compiles the crate so
 `crates/omnigraph-seams/tests/failpoint_names_guard.rs`, which counts a case's
 `at:` name as arming a seam: `Test Workspace` runs it on engine input and
 `GQT (ordinary)` runs it on `run_gqt`, so a cases-only PR that drops the last
-case arming a seam turns the guard red where the PR can see it. No crate
-reads a deployment file. `scripts/check-change-classes.py` keeps the
+case arming a seam turns the guard red where the PR can see it. The fixture
+parity test in `crates/omnigraph-bench/src/branch_merge.rs` also reads
+`generated_branch_merge_dataset.gqt` from the corpus. `GQT (ordinary)` runs
+that exact test on `run_gqt`, including cases-only changes, while
+`Test Workspace` covers it on engine input. No crate reads a deployment
+file. `scripts/check-change-classes.py` keeps the
 literal-spelling half of this true: it replays the classifier over fixture
 diffs and fails when a string literal in a Rust or TOML file under `crates/`
 or `tools/` spells a class path (root-relative or `../`-relative) without the
@@ -72,6 +102,54 @@ Branch protection currently requires these reporting contexts:
 - `Storage Upgrade Compatibility`
 - `Dependency Guard (cargo deny)`
 
+`Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
+runs on every change and in the merge queue. It builds the genuine stamp-13
+CLI from the immutable `STAMP_13_SOURCE_COMMIT` in a detached worktree into
+the job's target directory, copies the binary out, cleans the path-package
+artifacts through both manifests (the predecessor and current packages share
+names and versions) and exports `OMNIGRAPH_V13_BIN`. The step
+`Install released v0.10.0 and v0.11.0 CLIs` downloads the two releases with
+`scripts/install.sh` and exports `OMNIGRAPH_V6_BIN` and `OMNIGRAPH_V011_BIN`:
+0.11.0 writes stamp 9, and 0.10.0 followed by the 0.11.0 `upgrade` gives the
+stamp-8 source (`--to-format 8`) and the stamp-9 source its default target
+leaves. The step trusts the release assets exactly as the `test` job's
+v0.9.0 and v0.10.0 installs do: `install.sh` downloads the archive and its
+`.sha256` from the same GitHub release and verifies the one against the other
+before extracting; no digest is pinned in the workflow. Each download gets
+three attempts (`install_release`), the only retry in the job; a failed
+attempt leaves no binary behind. The job's added runtime (two downloads and
+the five journeys) is UNVERIFIED against its `timeout-minutes: 90` until the
+first hosted run; the timeout was not changed. With
+`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` a missing binary fails the five
+genuine journeys (`genuine_v13_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_preserves_history`,
+`genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
+`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
+`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`)
+instead of skipping them; the v6 format fence in the `test` job keeps its own
+resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
+scopes then run, each checked against its log by
+`scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
+cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
+`lance_version_columns` and `forbidden_apis`. All four select the
+`Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude
+omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
+graph, the one `Test Workspace` builds, and the engine scopes reuse the
+crossversion scope's build; a scope that selected `-p omnigraph-engine
+--features failpoints` resolved a third graph, about 20 minutes warm. The
+script's `--self-test` pins
+the scopes, the predecessor build and install scripts (compared exactly) and
+the required case names, so removing or altering one fails `Check Workflow Action Pins` and
+this job. The 90-minute budget covers two cold builds into one target
+directory: the predecessor CLI alone (one package, one bin, no test features),
+then the current tree's test targets, whose dev-dependency features (lance-io
+defaults and `test-util`) differ, so only dependency artifacts with matching
+features are reused.
+
+The released 0.12 cluster-ledger journey is separate
+[manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
+Current-version live schema and policy deployment remains required by `Test Workspace`.
+
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating three qualification jobs. `GQT (ordinary)` checks
 unit tests and unavailable-DST refusal under an empty `RUSTFLAGS`, then runs
@@ -79,7 +157,12 @@ the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`) in
 the same flagless shape; the guard is a source walk whose crate declares no
 workspace crate (its dev-dependencies are `serde_yaml`, `syn`, `tempfile` and
 `toml`), so
-it adds no second engine build.
+it adds no second engine build. The same ordinary job runs the benchmark
+fixture parity test against the generated branch-merge corpus case.
+The dispatch owner also checks external-store admission and persistence.
+Automatic corpus runs supply no `--store`, so schema-less query files are
+refused there; schema-and-seed datasets with zero steps are admitted.
+`--measure` refuses a selection with no DST environment.
 `GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
 `--- expect same as v1` comparison runs inside it, so no job selects an
 engine. `GQT (dst-clippy)` checks all package targets with Clippy. All
@@ -259,7 +342,10 @@ in a job must not change the dependency graph: it selects packages whose
 graph the first invocation already built, or it rebuilds every crate whose
 features differ (issue #755 was `GQT (ordinary)`
 running the seam guard as an engine integration test, whose
-dev-dependencies resolve a second graph, 49 minutes cold against 45).
+dev-dependencies resolve a second graph, 49 minutes cold against 45; the
+Azurite job ran its owners under six per-crate selections, four of them
+with the Lance stack, 89 minutes on `main`). A job that runs several owners
+names one selection once and passes each owner only its target.
 
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
 pin with a bare `rustup toolchain install`; the rustc version is part of
@@ -286,8 +372,11 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   context, and after merge, on tags, and by manual dispatch: the configured
   Azure owners run nowhere else, so a change that removes or renames one
   reports on the pull request instead of first appearing on `main`; wait for
-  it before clicking Merge when ready. Its 90-minute ceiling is the cold-cache
-  envelope; a warm run takes minutes. A red run on a pull request that touched
+  it before clicking Merge when ready. Every owner runs under the `Test
+  Workspace` selection (`--workspace --exclude omnigraph-gqt --exclude
+  omnigraph-dst --features "$FAILPOINT_FEATURES"`) and names only its
+  target, so the job builds one Lance graph. Its 90-minute ceiling is the
+  cold-cache envelope; a warm run takes minutes. A red run on a pull request that touched
   no object-store code, or one that names no test (the image pull, Azurite
   readiness), is inherited from `main` or from infrastructure: compare with
   the latest `main` run before reading it as the pull request's.
@@ -326,6 +415,10 @@ step runs from the repo root under the workspace Cargo configuration; the
 refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
 guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
+`gqt-slow-nightly.yml` (cron 03:30 UTC + manual dispatch) runs the cases under
+`crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
+a time; it is not a required context, and it is its own workflow because the
+GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
 
 ## Local pre-push checks
 
@@ -345,11 +438,12 @@ cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 From `crates/omnigraph-gqt`, also run the complete configured package:
 
 ```bash
-cargo test -p omnigraph-gqt --locked
-cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro
+cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked
+cargo clippy -p omnigraph-gqt -p omnigraph-gqt-core --all-targets --locked -- -D warnings -W clippy::dbg_macro
 ```
 
-For repository metadata and workflow changes:
+For repository metadata and workflow changes, first
+[activate the documentation environment](documentation.md#documentation-tools):
 
 ```bash
 bash scripts/check-agents-md.sh
@@ -371,6 +465,24 @@ shellcheck scripts/*.sh
 `typos` (`cargo install typos-cli --locked --version 1.50.1`, the version `ci.yml` pins; the misspelling list grows per release, so a newer local binary can flag words CI accepts), `cargo-deny` (`cargo install cargo-deny --locked --version 0.20.2`, the version the pinned `cargo-deny-action` bundles; `deny.toml` uses the `unsound` scope field, which needs 0.19 or newer; run it from the repository root once `Cargo.lock` is current, since `--locked` refuses a stale lockfile and a subdirectory run scopes the graph to that package and reports the root's ignores as unmatched; the advisory database grows daily, so a local run can report an advisory CI has not seen yet or the reverse), `actionlint` and `shellcheck` are developer tools, not workspace dependencies. Run the applicable subset when a change does not touch their surface.
 
 ## Release workflows
+
+`Check AGENTS.md Links` validates release-note inputs, runs the focused Python
+composer tests and uploads a `release-notes-preview` artifact with links pinned
+to its selected commit. The checker and composer use the same pinned CommonMark
+dependencies from `scripts/requirements-docs.txt`, installed in a temporary
+environment. Its full-history checkout supplies the explicit previous release
+and pinned migration source.
+Note-only changes use the documentation class. The
+[authoring guide](documentation.md#release-notes) describes permanent fragments,
+the supported link format and snapshot generation.
+
+For v0.12.0 and later, the stable publisher requires a generated release snapshot
+whose complete note manifest and configuration still match its audited source.
+The recorded input commit is informational, allowing squash merges; release base
+and migration source ancestry are still required. The publisher installs the
+same pinned parser in a temporary environment after the historical cutoff. It
+derives the GitHub body from that same snapshot with links pinned to the release
+tag. Earlier manual backfills keep their asset-only route. Edge is unchanged.
 
 | Workflow | Trigger and output |
 |---|---|

@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "original": "crates/omnigraph/benches/scenarios.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios.rs.disabled",
+      "sha256": "0d5a57283ae028d1452cfd7cad8d4786130e05607a9f29995dd5aa3236ed3d10"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/branch_control.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/branch_control.rs.disabled",
+      "sha256": "64c982363ffad6d9b22621d5e6aeb206bd8695211218d1b46028110c4f75eb6d"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/child_protocol.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/child_protocol.rs.disabled",
+      "sha256": "d2eb780470b8041e0dd4cf8885095abf390791ae0a68f3e8f940b9b4b4106571"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/concurrent_writes.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/concurrent_writes.rs.disabled",
+      "sha256": "c1287fc499601b76d4a5c680e024ce2afbac12faa13ffa374863de979f8a836f"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/fixture_controls.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/fixture_controls.rs.disabled",
+      "sha256": "647424c8a7c945657ade2fb88619cd330abecc83ce7aa8ddb9691981120677b9"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/rfc023.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/rfc023.rs.disabled",
+      "sha256": "69bf8c90d391c9e40ea3534ab2b020a63dc983722df1dc113f1e49bdd2533c3f"
+    },
+    {
+      "original": "crates/omnigraph/benches/scenarios/rfc023_limits.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/benches/scenarios/rfc023_limits.rs.disabled",
+      "sha256": "c67e07a9d2d215f360ab5bc9701d3033312356ce8c1dc821de8a215a99a115eb"
+    },
+    {
+      "original": "crates/omnigraph/tests/benchmark_scenario_contract.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/tests/benchmark_scenario_contract.rs.disabled",
+      "sha256": "77e27581ab16097758f8a14ce065a98c06941fa70cd40f6e2f4c4198b86246b8"
+    },
+    {
+      "original": "crates/omnigraph/tests/compaction_memory.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled",
+      "sha256": "da0779b948e850ef2ff16bb84fec7190520779b1a599571894d1cef4992126cb"
+    },
+    {
+      "original": "crates/omnigraph/tests/manifest_history_curve.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/tests/manifest_history_curve.rs.disabled",
+      "sha256": "6f4552d1efc11726021ca063a17730dc3fb22ab3acab1ccfafcc5ad087865d8a"
+    },
+    {
+      "original": "crates/omnigraph/examples/bench_expand.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/examples/bench_expand.rs.disabled",
+      "sha256": "3bb763f7f11b478df7cf6e0d8ab4c63e879c53e197f4d796419b2ad9593e7ed3"
+    },
+    {
+      "original": "crates/omnigraph-bench/examples/compare_engines.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-bench/examples/compare_engines.rs.disabled",
+      "sha256": "058898de0dda03f0b7f27ac82ccc14cdc58e6a8d1ac06898244ac341de3c2f15"
+    },
+    {
+      "original": "crates/omnigraph-bench/examples/issue_shapes.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-bench/examples/issue_shapes.rs.disabled",
+      "sha256": "ba9de1e0701556a1f7d81a6c1e4e65b9678e5ff4a83f89a0756d7cefb38888d7"
+    },
+    {
+      "original": "crates/omnigraph-server/examples/bench_concurrent_http.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-server/examples/bench_concurrent_http.rs.disabled",
+      "sha256": "8d2a69efe6f692e3cd618dc8b8c241e9bc33b0893a6965eaff7e2e2d73574bda",
+      "source_revision": "b54f47096c000fd1db9474a9f7700406a6a80684"
+    },
+    {
+      "original": "crates/omnigraph-server/examples/bench_actor_isolation.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-server/examples/bench_actor_isolation.rs.disabled",
+      "sha256": "444927fa177c16bbedff4d31086dca6c363874739fe51d6d31404a025cbfe5f1",
+      "source_revision": "b54f47096c000fd1db9474a9f7700406a6a80684"
+    },
+    {
+      "original": "crates/omnigraph-cli/tests/support/http_bench.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-cli/tests/support/http_bench.rs.disabled",
+      "sha256": "777d8d2e501605ea251ae22006abfac40d277243998efcf5586da5c857ab7557"
+    },
+    {
+      "original": "crates/omnigraph-cli/tests/support/http_retention.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-cli/tests/support/http_retention.rs.disabled",
+      "sha256": "e55629847ea1c307801e68e4d949eed0727ebd5bb65d0a91d24de322eb738055"
+    },
+    {
+      "original": "crates/omnigraph-cli/tests/support/http_soak.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-cli/tests/support/http_soak.rs.disabled",
+      "sha256": "a7e2ba45fe0f7f4ed76276e0c4e53b3212becdb4a1a19b6cc88d3ddb51d0fe10"
+    },
+    {
+      "original": "crates/omnigraph-cli/tests/support/http_perf_layout.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph-cli/tests/support/http_perf_layout.rs.disabled",
+      "sha256": "910ddd4ba106205ab10c9990a2ec6d2f7fc1093398c0dc175294c2591f3faa75"
+    },
+    {
+      "original": "scripts/bench-branch-age.py",
+      "preserved": "benchmarks/deferred/scripts/bench-branch-age.py.disabled",
+      "sha256": "fc383889ac57adf5b12c0c4f28bc58e8e13b9c17e0ece226c2847a9b0170d9e3"
+    },
+    {
+      "original": "crates/omnigraph/tests/manifest_row_bytes.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/tests/manifest_row_bytes.rs.disabled",
+      "sha256": "ac17cb1dfd6d887b7dbba5e6d7813bee1ef9b60904ce3ea4dae929d46dd0c2c4"
+    },
+    {
+      "original": "crates/omnigraph/tests/repro_issue_563.rs",
+      "preserved": "benchmarks/deferred/crates/omnigraph/tests/repro_issue_563.rs.disabled",
+      "sha256": "6b20f86173b2dea6264ef37fb09a089e52434e83f578b52ca3466980334e22c0",
+      "retained_active": "Overflow-scale correctness test; timing test removed."
+    }
+  ]
+}

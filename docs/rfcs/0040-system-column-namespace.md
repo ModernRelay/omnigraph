@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-08-23
-updated: 2026-09-30
+updated: 2026-10-02
 discussion: https://github.com/ModernRelay/omnigraph/issues/529
 supersedes: []
 superseded_by: []
@@ -375,12 +375,12 @@ Per-name reservation lists must never come back.
 
 **Current implementation.** [Detached table commits](0067-detached-table-commits.md)
 and [detached-only tables](2026-09-21-detached-only-tables.md) replaced the
-recovery-intent protocol below. The upgrade now stages detached renames, publishes
-once, and installs the schema contract using its publishing commit evidence;
-published table pins need no promotion. Column vintage is independent of storage
-format: both vintages are served at v11 and v12, and an upgrade on v11 publishes
-v12 through the ordinary manifest conversion.
-See [schema completion](../dev/recovery.md) and the supported
+recovery-intent protocol below. The upgrade now stages detached renames and
+publishes their pins with the complete schema contract in one manifest commit;
+no contract-file installation or table promotion follows. Column vintage is
+independent of storage format: both vintages are served at v13, after any
+required explicit offline storage conversion.
+See [schema contract publication](2026-09-30-schema-contract-in-manifest.md) and the supported
 [offline, standalone upgrade procedure](../user/operations/upgrade.md#system-column-upgrade-legacy-spellings).
 Cluster-managed system-column upgrades remain refused.
 
@@ -576,9 +576,9 @@ user fields.
 Storage format and system-column vintage have separate authorities. The
 manifest stamp determines whether a binary can serve the graph; the accepted
 schema IR's `system-columns` feature determines its column spellings. Both
-vintages are served at v11 and v12. Fresh graphs use v12, and any publication
-on a v11 branch converts that branch to v12, including a system-column
-upgrade. Changing storage format does not implicitly respell columns; adding
+vintages are served at v13. Fresh graphs use v13; older formats require the
+explicit offline conversion before ordinary open or a system-column upgrade.
+Changing storage format does not implicitly respell columns; adding
 `system-columns` remains an explicit operation.
 
 Normal open refuses unsupported storage stamps before recovery or writes.
@@ -631,8 +631,8 @@ the default for new graphs is a one-line policy change. The meta-field
 namespace is additive. The prefix reservation is the least reversible piece
 socially (releasing a namespace is easy, reclaiming it is not) and the one
 with the strongest external precedent. The upgrade itself is not reversible
-in place after publication: the next read-write open or write on the same
-handle finishes installing the published schema contract. Before publication,
+in place after publication: the renamed table pins and complete schema contract
+are already authoritative together. Before publication,
 an interrupted attempt leaves the accepted legacy graph unchanged and may be
 retried. There is no reverse respelling operation; a rebuilt graph is
 new-vintage and the new export envelope does not load into an older binary.
@@ -668,8 +668,8 @@ handle. That historical rationale does not make current column vintage a
 storage-format discriminator; current admission follows Compatibility above.
 
 **Rejected: compensating a published upgrade.** Once publication makes the new
-pins authoritative, completion installs their exact schema contract rather than
-renaming tables back. Before publication, detached renames remain unreachable
+pins and their exact schema contract authoritative together, no installation or
+reverse rename follows. Before publication, detached renames remain unreachable
 and no visible graph effect needs compensation. The earlier intent-based
 roll-forward rationale remains in the historical protocol in The upgrade.
 
@@ -778,18 +778,16 @@ The gates this RFC owns, each stated beside the behavior that defines it:
   graph is refused with the error naming the upgrade (The upgrade; Existing
   graphs).
 - Upgrade effects: after the upgrade every table spells `__id`/`__src`/
-  `__dst`, the IR carries `system-columns` at `ir_version` 5, `_schema.pg`
+  `__dst`, the IR carries `system-columns` at `ir_version` 5, the accepted source's
   constraint references read `@src`/`@dst`, and a query valid before the upgrade
-  returns the same rows after it. Its publication follows ordinary format
-  conversion: a v11 main becomes v12, while a v12 main stays v12; `--check`
+  returns the same rows after it. Its publication stays at v13; `--check`
   changes neither stamp nor spelling (The upgrade).
 - Upgrade interruption: faults before publication, including between detached
   renames, leave the legacy graph readable with no recovery sidecar. The next
-  read-write open discards unpublished schema staging, and a fresh attempt can
-  retry. Faults after publication leave exact published pins and the staged
-  contract: a read-only open refuses until the next read-write open or write on
-  the same handle installs that contract. Neither outcome exposes mixed
-  spellings. Extend the system-column failure tests and DST schema-apply owner
+  attempt can retry without schema staging or sentinel cleanup. Faults after
+  publication leave exact published pins and the complete accepted contract;
+  fresh read-only and read-write opens see that coherent state. Neither outcome
+  exposes mixed spellings. Extend the system-column failure tests and DST schema-apply owner
   at these boundaries (The upgrade).
 - Lance surface guard: on the pinned Lance version, a rename-only
   `alter_columns` commits a `Project` transaction, preserves every field ID
@@ -839,12 +837,12 @@ per-test enumeration; the owners above carry later protocol changes.
    of spelling vintage (Compatibility and reversibility).
 3. The engine operation, standalone CLI, historical query planning and Lance
    surface guard are implemented. The operation stages detached renames,
-   publishes once, then installs the contract; interruption is classified by
+   publishes the pins and complete contract once; interruption is classified by
    whether publication occurred (Evidence and tests). Use the
    [standalone operator procedure](../user/operations/upgrade.md#system-column-upgrade-legacy-spellings):
    stop all servers serving the graph, retain a verified backup, run the
    preflight and explicit upgrade, and verify the accepted schema and data
-   before resuming service. Completion means the new column vintage is installed,
+   before resuming service. Completion means the new column vintage is published,
    not that a particular historical manifest stamp is present.
 
 The proposed cluster-config surface and the end-to-end change-feed gate across
@@ -984,3 +982,10 @@ None.
     cluster apply/restart instructions with implemented detached publication and
     the supported standalone procedure. Cluster configuration and the cross-upgrade
     change-feed gate remain follow-ups; no implementation status changes.
+- 2026-10-02: The upgrade and Compatibility replace current v11/v12 serving,
+  implicit conversion and post-publication installation with v13 admission,
+  explicit offline conversion and atomic contract publication. Compatibility
+  and Alternatives replace the later-installation and compensation sentences;
+  Evidence replaces `_schema.pg`, v11-to-v12 publication and staged-contract
+  recovery gates; Rollout replaces "then installs the contract" and "vintage is
+  installed" with publication. The historical protocol and status are unchanged.

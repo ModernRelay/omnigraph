@@ -14,6 +14,8 @@ deployment.
 
 - [Schema language](schema/index.md)
 - [Query language](queries/index.md), [session settings](queries/settings.md), and [explain](queries/explain.md)
+- [Traversal patterns and edge selections](queries/traversal.md)
+- [Diagnostics](queries/diagnostics.md)
 - [Mutations and loading](mutations/index.md)
 - [Search](search/index.md) and [embeddings](search/embeddings.md)
 - [Blob values](blobs.md)
@@ -46,5 +48,7 @@ deployment.
 ## Releases and internals
 
 User-visible changes are recorded in the [release notes](../releases/).
+See [0.13 highlights and upgrade requirements](../releases/v0.13.0-overview.md)
+for a short overview of the release.
 Contributors should start with the [developer guide](../dev/index.md). Design
 decisions and proposals live in [RFCs](../rfcs/).

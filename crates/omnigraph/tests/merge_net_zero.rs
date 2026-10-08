@@ -127,7 +127,7 @@ async fn assert_adopted_string_change(
     .unwrap();
 
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::FastForward,
     );
 
@@ -163,7 +163,7 @@ async fn assert_adopted_string_change(
     }
 
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate,
         "the value must land before merge lineage is considered complete",
     );
@@ -369,7 +369,7 @@ query set_note($title: String, $note: String) {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.stage_known_present_update_rows(),
         0,
@@ -382,6 +382,7 @@ query set_note($title: String, $note: String) {
         0,
         "suppressing the inherited managed row must avoid Blob selection/materialization"
     );
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         helpers::pinned_version(&main, "main", "node:Document").await,
         source_pin,
@@ -491,7 +492,7 @@ query replace_content($title: String, $content: Blob) {
     );
 
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::FastForward,
     );
     assert_eq!(
@@ -504,7 +505,7 @@ query replace_content($title: String, $content: Blob) {
         b"New!",
     );
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate,
     );
 }
@@ -531,16 +532,16 @@ async fn branch_whose_edits_net_to_zero_merges_and_records_its_lineage() {
         .expect("a branch whose net content change is zero must be mergeable");
 
     // The target never moved, so this is a fast-forward.
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     // The lineage landed: `feature`'s head is now an ancestor of `main`.
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate,
         "the first merge must record its lineage, not silently publish nothing",
     );
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate,
         "repeating a landed merge stays a typed no-op",
     );
@@ -640,9 +641,9 @@ async fn net_zero_branch_merges_into_a_target_that_moved() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
-        main.branch_merge("feature", "main").await.unwrap(),
+        main.branch_merge("feature", "main").await.unwrap().outcome,
         MergeOutcome::AlreadyUpToDate,
     );
     assert_eq!(
@@ -743,9 +744,13 @@ async fn net_zero_branch_merges_into_a_branch_that_owns_the_table() {
         .branch_merge("source", "target")
         .await
         .expect("a branch-owned target must accept a net-zero source");
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
-        target.branch_merge("source", "target").await.unwrap(),
+        target
+            .branch_merge("source", "target")
+            .await
+            .unwrap()
+            .outcome,
         MergeOutcome::AlreadyUpToDate,
     );
 }

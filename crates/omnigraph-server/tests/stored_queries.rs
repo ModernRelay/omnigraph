@@ -3,6 +3,7 @@
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, ProcessDefaults};
 use serde_json::{Value, json};
@@ -11,16 +12,53 @@ use serial_test::serial;
 mod support;
 use support::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_wildcard_keeps_both_authorization_gates_issue_659() {
+    let source = r#"query neighbors() {
+        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        return { $f.name }
+    }"#;
+    let (_temp, app) = app_with_stored_queries(
+        &[("neighbors", source, false)],
+        &[
+            ("act-invoke", "t-invoke"),
+            ("act-noinvoke", "t-noinvoke"),
+            ("act-invokeonly", "t-invokeonly"),
+        ],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (missing_status, missing_body) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invoke", json!({})),
+    )
+    .await;
+    let (hidden_status, hidden_body) =
+        json_response(&app, invoke_request("neighbors", "t-noinvoke", json!({}))).await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_status, StatusCode::NOT_FOUND);
+    assert_eq!(hidden_body, missing_body);
+    let (status, body) =
+        json_response(&app, invoke_request("neighbors", "t-invokeonly", json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) =
+        json_response(&app, invoke_request("neighbors", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 2);
+}
+
 #[tokio::test]
-async fn signed_stored_invocation_requires_both_outer_and_inner_grants() {
+async fn signed_stored_invocation_requires_both_outer_and_inner_policy_permissions() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
-    let policy = format!(
-        "{}\n  - id: invoke\n    allow:\n      actors: {{group: permitted}}\n      actions: [invoke_query]\n",
-        permit_all_policy_yaml(&[&tokens.actor])
-    );
+    let invoker = "01M00000000000000000000005";
+    let writer = "01M00000000000000000000006";
+    let policy = INVOKE_POLICY_YAML
+        .replace("act-noinvoke", &tokens.actor)
+        .replace("\"act-invoke\"", &format!("\"principal:{invoker}\""))
+        .replace("act-full", &format!("principal:{writer}"));
     std::fs::write(&policy_path, policy).unwrap();
     let registry = stored_query_registry(&[
         (
@@ -44,14 +82,23 @@ async fn signed_stored_invocation_requires_both_outer_and_inner_grants() {
     .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = omnigraph_server::build_app(state);
-    let read = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+    let retired =
+        tokens.token(json!([{"graph_id":"default","actions":["invoke_query","change","read"]}]));
+    let (status, _) =
+        json_response(&app, invoke_request("signed_insert", &retired, json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "retired grants cannot authorize invocation"
+    );
+    let read = tokens.identity_token();
     let (status, _) = json_response(&app, invoke_request("signed_read", &read, json!({}))).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
         "missing invoke grant must hide the query"
     );
-    let invoke = tokens.token(json!([{"graph_id":"default","actions":["invoke_query","read"]}]));
+    let invoke = tokens.identity_token_for(invoker);
     let (status, _) = json_response(&app, invoke_request("signed_read", &invoke, json!({}))).await;
     assert_eq!(status, StatusCode::OK);
     let (_, before) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
@@ -68,11 +115,10 @@ async fn signed_stored_invocation_requires_both_outer_and_inner_grants() {
     );
     let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(after, before);
-    let write =
-        tokens.token(json!([{"graph_id":"default","actions":["invoke_query","change","read"]}]));
+    let write = tokens.identity_token_for(writer);
     let (status, body) = json_response(&app, invoke_request("signed_insert", &write, params)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor_id"], tokens.actor);
+    assert_eq!(body["actor_id"], format!("principal:{writer}"));
 }
 
 async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value, token: &str) {
@@ -121,6 +167,245 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     );
 }
 
+/// E1 qualification probe, not a supported deployment path: a raw engine apply
+/// cannot replace the serving contract captured before body collection. The
+/// negative control deliberately bypasses cluster admission. The positive
+/// control uses the production same-view transition on the same router before
+/// the separate, deliberately unqualified schema/query replacement probe.
+/// This needs HTTP body scheduling and handle identity, which GQT cannot express.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Bytes;
+    use axum::http::Request;
+    use omnigraph_server::{GraphHandle, build_app, workload::WorkloadController};
+    use omnigraph_server::{graph_id::GraphId, identity::GraphKey};
+    use tower::ServiceExt;
+
+    fn request(body: Body) -> Request<Body> {
+        Request::post(g("/queries/find_person"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    for finish_before_apply in [false, true] {
+        let temp = init_loaded_graph().await;
+        let state = AppState::open_single_with_queries(
+            graph_path(temp.path()).to_string_lossy().into_owned(),
+            vec![],
+            None,
+            stored_query_registry(&[("find_person", FIND_PERSON_GQ, true)]),
+        )
+        .await
+        .unwrap();
+        let handle = Arc::clone(state.routing().registry.list().pop().unwrap().handle());
+        let sibling_temp = init_loaded_graph().await;
+        let sibling = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("sibling").unwrap()),
+            uri: graph_path(sibling_temp.path())
+                .to_string_lossy()
+                .into_owned(),
+            engine: Arc::new(
+                omnigraph::db::Omnigraph::open(graph_path(sibling_temp.path()).to_str().unwrap())
+                    .await
+                    .unwrap(),
+            ),
+            policy: None,
+            queries: None,
+        });
+        let state = AppState::new_multi(
+            vec![Arc::clone(&handle), sibling],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let operations = state.operation_runtime().clone();
+        let original_epoch = state
+            .routing()
+            .registry
+            .list()
+            .into_iter()
+            .find(|view| view.key == handle.key)
+            .unwrap()
+            .epoch();
+        let original_contract = handle.engine.schema_contract_digest();
+        let original_head = handle.engine.list_commits(None).await.unwrap()[0]
+            .graph_commit_id
+            .clone();
+        let app = build_app(state.clone());
+        let (polled, body_polled) = tokio::sync::oneshot::channel();
+        let (release, body_released) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures::stream::once(async move {
+            polled.send(()).unwrap();
+            body_released.await.unwrap();
+            Ok::<_, std::io::Error>(Bytes::from_static(br#"{"params":{"name":"Alice"}}"#))
+        }));
+        let invocation_app = app.clone();
+        let invocation =
+            tokio::spawn(async move { json_response(&invocation_app, request(body)).await });
+        tokio::time::timeout(Duration::from_secs(10), body_polled)
+            .await
+            .expect("body collection must reach the deterministic parking point")
+            .unwrap();
+        assert_eq!(operations.snapshot().active_reads, 1);
+        assert!(!invocation.is_finished());
+
+        let transition = if finish_before_apply {
+            let transition = state
+                .prepare_same_view(
+                    &handle.key,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap()
+                .close()
+                .unwrap();
+            {
+                let wait = transition.wait_requests();
+                tokio::pin!(wait);
+                assert!(
+                    futures::poll!(&mut wait).is_pending(),
+                    "body collection must retain the graph root before engine snapshot capture"
+                );
+            }
+            let refused = app
+                .clone()
+                .oneshot(request(Body::from(r#"{"params":{"name":"Alice"}}"#)))
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!refused.headers().contains_key("retry-after"));
+            drop(refused);
+            let (status, ready) = json_response(&app, get_request("/readyz", "")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(ready["status"], "degraded");
+            assert_eq!(ready["ready_graph_count"], 1);
+            assert_eq!(ready["blocked_graph_count"], 1);
+            let (status, _) =
+                json_response(&app, get_request("/graphs/sibling/snapshot", "")).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an unrelated graph remains available"
+            );
+            Some(transition)
+        } else {
+            None
+        };
+
+        if !finish_before_apply {
+            // Deliberately unsafe composition: this is not cluster apply or the
+            // guarded HTTP schema route, which validates the current registry.
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        }
+        release.send(()).unwrap();
+        let (status, output) = tokio::time::timeout(Duration::from_secs(10), invocation)
+            .await
+            .expect("released invocation must finish")
+            .unwrap();
+        // Result delivery can precede the producer's final observer drop.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), operations.wait_logical_owners())
+                .await
+                .expect("released invocation's logical owners must settle")
+        );
+        assert_eq!(operations.snapshot().active_reads, 0);
+        if finish_before_apply {
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            let transition = transition.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), transition.wait_requests())
+                .await
+                .unwrap()
+                .unwrap();
+            let next_epoch = transition.resume_same_view().unwrap();
+            assert_ne!(next_epoch, original_epoch);
+            let resumed = state
+                .routing()
+                .registry
+                .list()
+                .into_iter()
+                .find(|view| view.key == handle.key)
+                .unwrap();
+            assert_eq!(resumed.epoch(), next_epoch);
+            assert!(Arc::ptr_eq(resumed.handle(), &handle));
+            assert_eq!(resumed.schema_contract(), &original_contract);
+            assert_eq!(handle.engine.schema_contract_digest(), original_contract);
+            assert_eq!(
+                handle.engine.list_commits(None).await.unwrap()[0].graph_commit_id,
+                original_head
+            );
+            let (status, output) =
+                json_response(&app, request(Body::from(r#"{"params":{"name":"Alice"}}"#))).await;
+            assert_eq!(status, StatusCode::OK, "{output}");
+            assert_eq!(output["rows"], json!([{ "p.age": 30 }]));
+            assert!(!operations.snapshot().closed);
+            handle
+                .engine
+                .apply_schema(&renamed_age_schema())
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{output}");
+            assert!(
+                output["error"].as_str().unwrap().contains("age"),
+                "{output}"
+            );
+        }
+
+        // Updating the engine does not update the immutable serving binding.
+        // Even refresh cannot repair the stale stored-query source.
+        handle.engine.refresh().await.unwrap();
+        let old_queries = handle.queries.as_ref().unwrap();
+        assert_eq!(
+            old_queries.lookup("find_person").unwrap().source.as_ref(),
+            FIND_PERSON_GQ
+        );
+        assert!(
+            omnigraph_server::queries::check(old_queries, &handle.engine.catalog()).has_breakages()
+        );
+
+        let new_source = FIND_PERSON_GQ.replace("$p.age", "$p.years");
+        let new_queries = stored_query_registry(&[("find_person", &new_source, true)]);
+        assert!(
+            !omnigraph_server::queries::check(&new_queries, &handle.engine.catalog())
+                .has_breakages()
+        );
+        let replacement = Arc::new(GraphHandle {
+            key: handle.key.clone(),
+            uri: handle.uri.clone(),
+            engine: Arc::clone(&handle.engine),
+            policy: None,
+            queries: Some(Arc::new(new_queries)),
+        });
+        assert!(Arc::ptr_eq(&replacement.engine, &handle.engine));
+        let state = AppState::new_multi(
+            vec![replacement],
+            vec![],
+            None,
+            WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let (status, output) = json_response(
+            &build_app(state),
+            request(Body::from(r#"{"params":{"name":"Alice"}}"#)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{output}");
+        assert_eq!(output["rows"], json!([{ "p.years": 30 }]));
+    }
+}
+
 #[tokio::test]
 async fn server_refuses_boot_on_type_broken_stored_query() {
     // A stored query referencing a type not in the schema (`Widget`)
@@ -158,7 +443,19 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
     let (_temp, app) = app_with_stored_queries(
-        &[("find_person", FIND_PERSON_GQ, false)],
+        &[
+            ("find_person", FIND_PERSON_GQ, false),
+            (
+                "load",
+                &FIND_PERSON_GQ.replace("find_person", "load"),
+                false,
+            ),
+            (
+                "ingest",
+                &FIND_PERSON_GQ.replace("find_person", "ingest"),
+                false,
+            ),
+        ],
         &[("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
     )
@@ -180,9 +477,51 @@ async fn invoke_stored_read_returns_rows() {
     );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
 
+    // The stored query name is a parameter, never an upload-route selector.
+    // A second chunk proves refusal happened at collection's 1 MiB bound,
+    // rather than after buffering up to the load route's 32 MiB allowance.
+    for name in ["find_person", "load", "ingest"] {
+        use axum::body::Bytes;
+        use futures::StreamExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 1024 * 1024 + 1])),
+            Ok(Bytes::from_static(b"second chunk")),
+        ])
+        .inspect(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let response = app
+            .clone()
+            .oneshot(invoke_request_bytes(
+                name,
+                "t-invoke",
+                Body::from_stream(chunks),
+                Some("application/json"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{name}");
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "{name}");
+        drop(response);
+        let (status, body) = json_response(
+            &app,
+            invoke_request(name, "t-invoke", json!({"params":{"name":"Alice"}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        assert_eq!(body["row_count"], 1, "{name}: {body}");
+    }
+
     // The graph-head precondition is mutation-only. A stored read must reject
     // it instead of silently ignoring a caller's concurrency requirement.
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/find_person"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -323,6 +662,8 @@ async fn invoke_stored_read_accepts_absent_or_empty_body() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_mutation_double_gates_on_change() {
+    use tower::ServiceExt;
+
     let specs: &[(&str, &str, bool)] = &[(
         "add_person",
         "query add_person($name: String) { insert Person { name: $name } }",
@@ -351,6 +692,23 @@ async fn invoke_stored_mutation_double_gates_on_change() {
         "invoke_query without change must 403; body: {body}"
     );
 
+    // Saturate the read response lane with tiny, unconsumed catalog bodies.
+    // The registry's typed mutation kind must reserve independent write
+    // capacity even though reads and writes share the same invocation route.
+    let mut reads = Vec::new();
+    for _ in 0..omnigraph_server::operations::DEFAULT_READ_OBSERVERS {
+        let response = app
+            .clone()
+            .oneshot(get_request(&g("/queries"), "t-full"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        reads.push(response);
+    }
+    let (status, _) =
+        json_response(&app, invoke_request("does_not_exist", "t-full", json!({}))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
     // Has invoke_query + change → applied.
     let (status, body) = json_response(
         &app,
@@ -363,6 +721,7 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    drop(reads);
     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
@@ -407,8 +766,17 @@ async fn invoke_stored_query_bad_param_is_400() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
+    use tower::ServiceExt;
+
     let (_temp, app) = app_with_stored_queries(
-        &[("find_person", FIND_PERSON_GQ, false)],
+        &[
+            ("find_person", FIND_PERSON_GQ, false),
+            (
+                "add_person",
+                "query add_person($name: String) { insert Person { name: $name } }",
+                false,
+            ),
+        ],
         &[("act-invoke", "t-invoke"), ("act-noinvoke", "t-noinvoke")],
         INVOKE_POLICY_YAML,
     )
@@ -437,6 +805,24 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
         unknown_body, denied_body,
         "deny must be byte-identical to a missing query (no catalog probing)"
     );
+
+    let mut reads = Vec::new();
+    for _ in 0..omnigraph_server::operations::DEFAULT_READ_OBSERVERS {
+        let response = app
+            .clone()
+            .oneshot(get_request(&g("/queries"), "t-invoke"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        reads.push(response);
+    }
+    for name in ["find_person", "add_person", "does_not_exist"] {
+        let (status, body) =
+            json_response(&app, invoke_request(name, "t-noinvoke", json!({}))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+        assert_eq!(body, denied_body, "admission must not reveal {name}'s kind");
+    }
+    drop(reads);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -630,6 +1016,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
         expected_commit: &str,
     ) -> axum::http::Request<Body> {
         axum::http::Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/queries/{name}/if-graph-commit")))
             .method(axum::http::Method::POST)
             .header("content-type", "application/json")
@@ -650,6 +1037,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
 
     let conditional_body = json!({ "params": { "name": "Refused" } });
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/add_person/if-graph-commit"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -663,6 +1051,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
         "the stored conditional capability route requires its header"
     );
     let request = axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g("/queries/add_person"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -793,6 +1182,7 @@ fn spec(name: &str, source: &str) -> RegistrySpec {
 
 fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Request<Body> {
     axum::http::Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(format!("/graphs/{graph_id}/queries/{name}"))
         .method(axum::http::Method::POST)
         .header("content-type", "application/json")
@@ -863,7 +1253,7 @@ graphs:
     )
     .unwrap();
     std::fs::write(reserved.path().join("cluster.yaml"), cluster_yaml).unwrap();
-    let import = omnigraph_cluster::import_config_dir(reserved.path()).await;
+    let import = omnigraph_cluster::validate_config_dir(reserved.path());
     assert!(!import.ok, "{:?}", import.diagnostics);
     let parse_errors: Vec<&str> = import
         .diagnostics
@@ -899,12 +1289,16 @@ graphs:
     )
     .unwrap();
     std::fs::write(rewritten.path().join("cluster.yaml"), cluster_yaml).unwrap();
-    let import = omnigraph_cluster::import_config_dir(rewritten.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(rewritten.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    support::apply_cluster_fixture(rewritten.path()).await;
 
-    let settings = cluster_settings(rewritten.path()).await.unwrap();
+    let mut settings = cluster_settings(rewritten.path()).await.unwrap();
+    settings
+        .cluster_admission
+        .take()
+        .unwrap()
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,

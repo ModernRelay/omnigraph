@@ -45,7 +45,12 @@ switch to: the other mode when the cost model chose and may re-decide from
 the observed frontier, the probed index coverage or a warm CSR; empty when
 the mode was pinned or chosen without statistics), `frontier_estimate`
 (the row-count estimate it chose from, `null` when the snapshot holds no
-statistics) and `version` (the pinned dataset version of `edge:<type>`). A traversal's destination is reached one of two ways. A
+statistics). For budgeted expansion, this is the input row-count estimate.
+It records `edges` as an object with `kind` (`named`, `alternation`, or `wildcard`)
+and `members`, an array of `{ "edge_type": "Knows", "direction": "out" }`
+objects. Directions are `out`, `in`, or `both`; names are canonical schema names.
+`src_type` and `dst_type` are the endpoint types. `versions` maps every member name to its pinned dataset version or `null`
+when absent. Budgeted selections have no CSR alternative. A traversal's destination is reached one of two ways. A
 physical `Scan` row with `id_restriction` `input` reads the destination once
 per slice of at most 256 traversal rows and carries `access` `id_lookup`. A
 physical `HashJoin` row reads the destination table once (its second input,
@@ -65,7 +70,10 @@ partitions probed per index delta; `null` is no cap) and `scope` (`order`
 for the query's own order, `primary` or `secondary` for an arm of `rrf()`). A
 physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k` and `limit`. A
+`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` and
+`row_tiebreak`. These downstream row keys follow the arm's score and fused node
+ID; selected edges use `$e.@type` before `$e.@id`. Fusion still scores the
+ranked node by its ID. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
 planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
@@ -86,7 +94,9 @@ value); `settings`, each setting it read with its spelling (`traversal`,
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
 the `rrf_plan` mode and the prefilter gate's admission thresholds; and
-`memory_limit`, the query pool in bytes. Query
+`memory_limit`, the query pool in bytes. Selector statements also capture
+`traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
+retained through rewrites so historical replay can enforce the target rule. Query
 plans omit `pipelines` and node `properties.schema`: their executable schema
 is derived when lowering. Every query scan records its pinned `version`, or
 `null` when that type has no dataset in the requested snapshot.
@@ -94,8 +104,9 @@ Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by
 the query's plain keys; a fusion's ordering is `rrf($a, $b) desc` and it
-plans no `Sort`. A `Sort` row's `tiebreak` lists the id keys it appends after
-`keys` (`$p.@id`), empty where equal rows are indistinguishable.
+plans no `Sort`. A `Sort` row's `tiebreak` lists the metadata keys it appends after
+`keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges), empty
+where equal rows are indistinguishable.
 
 The `datafusion` tree is the plan the query executes on the `v2` route: the
 physical tree lowered to operators, every read operator omnigraph's own
@@ -135,12 +146,15 @@ operator of a declared switch it is the side that ran: `hash_join` or
 on the `ExpandExec` of an `Expand`, the mode the traversal ended on. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 3.
+`Executed::profile`). The row schema is `explain_version` 4. Saved physical
+plans use a `bound_plan_version: 1` envelope whose `body` contains `plan` and
+`values`. Older unversioned plans and unsupported versions are refused with a
+regeneration instruction, including plans without traversal nodes.
 
 An `explain` statement is served by `omnigraph query` and `POST /query`. It
 takes the same `--branch`/`--snapshot` target and `--params` as the query
-itself and needs the same `read` policy decision. `mutate` and the deprecated
-routes refuse it, and so is a mutation declaration under `explain`.
+itself and needs the same `read` policy decision. `mutate` refuses it, as does a
+mutation declaration under `explain`.
 
 Every read executes on engine v2, the one value of the session setting
 `engine`, so explain describes the route the query runs. See

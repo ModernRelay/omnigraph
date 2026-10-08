@@ -1,0 +1,96 @@
+# issue: none
+# notes: 64 indexed docs on a line; eligibility n>3 makes d004,d005,d006 exact nearest winners from 2.3. This bounded one-partition setting case does not reproduce custom-centroid or multi-partition ANN probe-budget experiments.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key n: I64 @index embedding: Vector(4) @index }
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d005","n":5,"embedding":[5.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d006","n":6,"embedding":[6.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d007","n":7,"embedding":[7.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d008","n":8,"embedding":[8.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d009","n":9,"embedding":[9.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d010","n":10,"embedding":[10.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d011","n":11,"embedding":[11.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d012","n":12,"embedding":[12.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d013","n":13,"embedding":[13.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d014","n":14,"embedding":[14.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d015","n":15,"embedding":[15.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d016","n":16,"embedding":[16.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d017","n":17,"embedding":[17.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d018","n":18,"embedding":[18.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d019","n":19,"embedding":[19.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d020","n":20,"embedding":[20.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d021","n":21,"embedding":[21.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d022","n":22,"embedding":[22.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d023","n":23,"embedding":[23.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d024","n":24,"embedding":[24.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d025","n":25,"embedding":[25.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d026","n":26,"embedding":[26.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d027","n":27,"embedding":[27.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d028","n":28,"embedding":[28.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d029","n":29,"embedding":[29.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d030","n":30,"embedding":[30.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d031","n":31,"embedding":[31.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d032","n":32,"embedding":[32.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d033","n":33,"embedding":[33.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d034","n":34,"embedding":[34.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d035","n":35,"embedding":[35.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d036","n":36,"embedding":[36.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d037","n":37,"embedding":[37.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d038","n":38,"embedding":[38.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d039","n":39,"embedding":[39.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d040","n":40,"embedding":[40.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d041","n":41,"embedding":[41.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d042","n":42,"embedding":[42.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d043","n":43,"embedding":[43.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d044","n":44,"embedding":[44.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d045","n":45,"embedding":[45.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d046","n":46,"embedding":[46.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d047","n":47,"embedding":[47.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d048","n":48,"embedding":[48.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d049","n":49,"embedding":[49.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d050","n":50,"embedding":[50.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d051","n":51,"embedding":[51.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d052","n":52,"embedding":[52.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d053","n":53,"embedding":[53.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d054","n":54,"embedding":[54.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d055","n":55,"embedding":[55.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d056","n":56,"embedding":[56.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d057","n":57,"embedding":[57.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d058","n":58,"embedding":[58.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d059","n":59,"embedding":[59.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d060","n":60,"embedding":[60.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d061","n":61,"embedding":[61.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d062","n":62,"embedding":[62.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d063","n":63,"embedding":[63.0,0.0,0.0,0.0]}}
+
+--- query
+set ann_nprobes = 1;
+query nearest_matching_rows($q: Vector(4)) {
+    match { $d: Doc $d.n > 3 }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[2.3,0.0,0.0,0.0]}
+
+--- expect ordered
+{"d.slug":"d004"}
+{"d.slug":"d005"}
+{"d.slug":"d006"}
+--- expect shape
+d.slug: String
+

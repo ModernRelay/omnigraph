@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-05
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,17 @@ blocked_on: []
 ---
 
 # RFC 0030: Graph change feed and retained-history contract
+
+> **Detached-only tables disposition:**
+> [RFC: Detached-only tables](2026-09-21-detached-only-tables.md) changed the
+> feed for detached pins: the change set comes from the commit itself, with
+> deletes read from its `omnigraph.deleted_ids` record. Linear intervals only:
+> the row-lineage stamp classification in §4.2, the §4.3 rules that a removing
+> commit always falls back to the exact ID comparison and that no delete record
+> is persisted for the reader, and the adjacent-version admission and
+> `_row_last_updated_at_version` filter of the §14 candidate pruning. Current:
+> the feed contract, which is entity changes, the exact ordered comparison as
+> authority and fallback, cursors, and retention gaps.
 
 C0–C3 are implemented. The §4.4 ordering, client-pagination, and
 continuation-size gates are closed as recorded in §14; C4+ remain design-stage.
@@ -1088,3 +1099,13 @@ implementation, recorded here so later phases inherit them:
   - CLI auto-pagination incrementally renders the historical aggregate output
     shape, retaining only the current page/open split block and withholding the
     durable cursor until the terminal page.
+- **Key-only ordered walks (2026-10-02).** The change feed's ordered scans
+  sorted complete rows. A row wider than the 37.5 MiB sorter cap, or an
+  ordinary row that Lance 11's byte-targeted scan handed to the sort as a
+  one-row slice measured at its parent buffer's size, failed the commit diff,
+  the feed and the baseline with `ordered_scan_input_batch_bytes`, which the
+  change routes report as an internal error (ModernRelay/omnigraph#705). Every
+  change-surface walk now uses the branch merge's two-phase cursor: only `id`,
+  `_rowid` and `_rowaddr` enter the sort, and complete rows hydrate in bounded,
+  compacted chunks. The `O(N log N)` sort and full-table key read on the exact
+  fallback remain.

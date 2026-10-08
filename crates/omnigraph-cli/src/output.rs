@@ -25,6 +25,7 @@ pub(crate) struct LoadOutput {
     pub(crate) nodes: Vec<GraphBatchDeclarationOutput>,
     pub(crate) edges: Vec<GraphBatchDeclarationOutput>,
     pub(crate) total_entities: usize,
+    pub(crate) embedding_generation: Option<omnigraph_api_types::LoadEmbeddingGeneration>,
     pub(crate) commit: Option<CommitOutput>,
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn load_output_from_graph_batch(
         nodes: output.nodes.clone(),
         edges: output.edges.clone(),
         total_entities: output.total_entities,
+        embedding_generation: output.embedding_generation,
         commit: output.commit.clone(),
     }
 }
@@ -57,6 +59,7 @@ pub(crate) fn load_output_from_receipt(
     branch: &str,
     mode: &'static str,
     receipt: &omnigraph::loader::LoadReceipt,
+    catalog: &omnigraph_compiler::catalog::Catalog,
 ) -> LoadOutput {
     let result = &receipt.result;
     let mut nodes = result
@@ -91,6 +94,9 @@ pub(crate) fn load_output_from_receipt(
         nodes,
         edges,
         total_entities,
+        embedding_generation: omnigraph_api_types::LoadEmbeddingGeneration::for_load(
+            catalog, result,
+        ),
         commit: Some(omnigraph_api_types::commit_output(&receipt.commit)),
     }
 }
@@ -109,7 +115,11 @@ pub(crate) fn print_schema_apply_human(output: &SchemaApplyOutput) {
     println!("applied: {}", if output.applied { "yes" } else { "no" });
     println!("graph_manifest_version: {}", output.graph_manifest_version);
     if output.steps.is_empty() {
-        println!("no schema changes");
+        if output.applied {
+            println!("schema source updated; no table migration steps");
+        } else {
+            println!("no schema changes");
+        }
         return;
     }
     for step in &output.steps {
@@ -201,11 +211,7 @@ pub(crate) fn print_cluster_validate_human(output: &ValidateOutput) {
 
 pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
     if output.ok {
-        println!(
-            "cluster plan: {} change(s), {} approval gate(s)",
-            output.changes.len(),
-            output.approvals_required.len()
-        );
+        println!("cluster plan: {} change(s)", output.changes.len());
         match output.authority {
             omnigraph_cluster::LedgerAuthority::Observed => {
                 println!("  authority: observed (no lock taken, nothing written)");
@@ -243,55 +249,6 @@ pub(crate) fn print_cluster_plan_human(output: &PlanOutput) {
     print_cluster_diagnostics(&output.diagnostics);
 }
 
-pub(crate) fn print_cluster_apply_human(output: &ApplyOutput) {
-    if output.ok {
-        println!(
-            "cluster apply: {} applied, {} deferred/blocked",
-            output.applied_count, output.deferred_count
-        );
-    } else {
-        println!("cluster apply failed");
-    }
-    // The change list prints on failure too: an operator debugging a partial
-    // apply (payload or state-write error) needs to see what was attempted.
-    print_cluster_apply_changes(&output.changes);
-    if output.ok {
-        let state = &output.state_observations;
-        println!(
-            "  state: revision {}, converged: {}, written: {}",
-            state.state_revision, output.converged, output.state_written
-        );
-        println!(
-            "  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected"
-        );
-    }
-    print_cluster_diagnostics(&output.diagnostics);
-}
-
-pub(crate) fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
-    for change in changes {
-        let bindings = if change.binding_change {
-            " [bindings]"
-        } else {
-            ""
-        };
-        match (&change.disposition, change.reason.as_deref()) {
-            (Some(disposition), Some(reason)) => println!(
-                "  {:?} {}{bindings} [{disposition:?}: {reason}]",
-                change.operation, change.resource
-            ),
-            (Some(disposition), None) => println!(
-                "  {:?} {}{bindings} [{disposition:?}]",
-                change.operation, change.resource
-            ),
-            _ => println!("  {:?} {}{bindings}", change.operation, change.resource),
-        }
-    }
-    if changes.is_empty() {
-        println!("  no changes");
-    }
-}
-
 pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
     if output.ok {
         let state = &output.state_observations;
@@ -319,8 +276,6 @@ pub(crate) fn print_cluster_status_human(output: &StatusOutput) {
 
 pub(crate) fn print_cluster_state_sync_human(output: &StateSyncOutput) {
     let operation = match output.operation {
-        omnigraph_cluster::StateSyncOperation::Refresh => "refresh",
-        omnigraph_cluster::StateSyncOperation::Import => "import",
         omnigraph_cluster::StateSyncOperation::Observe => "observe",
     };
     if output.ok {
@@ -399,6 +354,27 @@ pub(crate) fn cluster_lock_summary(state: &omnigraph_cluster::StateObservations)
     format!(" ({})", parts.join(", "))
 }
 
+/// Where a refused query fails and its one fix, one indented line each, to
+/// print under the line that names the refusal: `--> line, column` for a
+/// parse refusal, `--> stage: expression` for a later one, then `fix:`.
+pub(crate) fn diagnostic_detail_lines(
+    diagnostic: &omnigraph_api_types::DiagnosticOutput,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(at) = &diagnostic.position {
+        lines.push(format!("  --> line {}, column {}", at.line, at.column));
+    } else if let Some(stage) = &diagnostic.stage {
+        match &diagnostic.expression {
+            Some(expression) => lines.push(format!("  --> {stage}: {expression}")),
+            None => lines.push(format!("  --> {stage}")),
+        }
+    }
+    if let Some(fix) = &diagnostic.fix {
+        lines.push(format!("  fix: {fix}"));
+    }
+    lines
+}
+
 pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
     for diagnostic in diagnostics {
         let label = match diagnostic.severity {
@@ -409,6 +385,12 @@ pub(crate) fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagno
             "{label} {} {}: {}",
             diagnostic.code, diagnostic.path, diagnostic.message
         );
+        if let Some(detail) = &diagnostic.detail {
+            let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
+            for line in diagnostic_detail_lines(&detail) {
+                println!("{line}");
+            }
+        }
     }
 }
 
@@ -430,46 +412,6 @@ pub(crate) fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()>
         print_json(output)?;
     } else {
         print_cluster_plan_human(output);
-    }
-    if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_cluster_apply(output: &ApplyOutput, json: bool) -> Result<()> {
-    if json {
-        print_json(output)?;
-    } else {
-        print_cluster_apply_human(output);
-    }
-    if !output.ok {
-        io::stdout().flush()?;
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-pub(crate) fn finish_cluster_approve(output: &ApproveOutput, json: bool) -> Result<()> {
-    if json {
-        print_json(output)?;
-    } else if output.ok {
-        println!(
-            "cluster approve: {} {} approved by {} (approval {})",
-            output
-                .operation
-                .as_ref()
-                .map(|operation| format!("{operation:?}").to_lowercase())
-                .unwrap_or_default(),
-            output.resource.as_deref().unwrap_or("?"),
-            output.approved_by.as_deref().unwrap_or("?"),
-            output.approval_id.as_deref().unwrap_or("?"),
-        );
-        print_cluster_diagnostics(&output.diagnostics);
-    } else {
-        println!("cluster approve failed");
-        print_cluster_diagnostics(&output.diagnostics);
     }
     if !output.ok {
         io::stdout().flush()?;
@@ -532,36 +474,8 @@ pub(crate) fn print_load_human(payload: &LoadOutput) {
             println!("branch {} created from {}", payload.branch, base);
         }
     }
-}
-
-pub(crate) fn print_ingest_human(output: &IngestOutput) {
-    println!(
-        "ingested {} entities from {} into branch {} from {} with {} ({})",
-        output.total_entities,
-        output.uri,
-        output.branch,
-        output.base_branch.as_deref().unwrap_or("main"),
-        output.mode.as_str(),
-        if output.branch_created {
-            "branch created"
-        } else {
-            "branch exists"
-        }
-    );
-    for declaration in &output.nodes {
-        println!(
-            "node type '{}': {} entities loaded",
-            declaration.name, declaration.entities_loaded
-        );
-    }
-    for declaration in &output.edges {
-        println!(
-            "edge type '{}': {} entities loaded",
-            declaration.name, declaration.entities_loaded
-        );
-    }
-    if let Some(actor_id) = &output.actor_id {
-        println!("actor_id: {}", actor_id);
+    if let Some(diagnostic) = payload.embedding_generation {
+        println!("{}", diagnostic.message());
     }
 }
 
@@ -569,7 +483,7 @@ pub(crate) fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
     println!("schema plan for {}", uri);
     println!("supported: {}", if plan.supported { "yes" } else { "no" });
     if plan.steps.is_empty() {
-        println!("no schema changes");
+        println!("no table migration steps");
         return;
     }
     for step in &plan.steps {
@@ -665,28 +579,21 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
-        SchemaMigrationStep::DropType {
-            type_kind,
-            name,
-            mode,
-        } => format!(
-            "drop {} type '{}' ({} mode)",
+        SchemaMigrationStep::DropType { type_kind, name } => format!(
+            "drop {} type '{}'",
             schema_type_kind_label(*type_kind),
             name,
-            drop_mode_label(*mode),
         ),
         SchemaMigrationStep::DropProperty {
             type_kind,
             type_name,
             property_name,
-            mode,
         } => format!(
-            "drop property '{}.{}' of {} '{}' ({} mode)",
+            "drop property '{}.{}' of {} '{}'",
             type_name,
             property_name,
             schema_type_kind_label(*type_kind),
             type_name,
-            drop_mode_label(*mode),
         ),
         SchemaMigrationStep::UnsupportedChange { entity, reason, .. } => {
             // When a schema-lint code is attached, render code + tier
@@ -721,13 +628,6 @@ pub(crate) fn schema_lint_tier_label(tier: omnigraph_compiler::SafetyTier) -> &'
         omnigraph_compiler::SafetyTier::Safe => "safe",
         omnigraph_compiler::SafetyTier::Validated => "validated",
         omnigraph_compiler::SafetyTier::Destructive => "destructive",
-    }
-}
-
-pub(crate) fn drop_mode_label(mode: omnigraph_compiler::DropMode) -> &'static str {
-    match mode {
-        omnigraph_compiler::DropMode::Soft => "soft",
-        omnigraph_compiler::DropMode::Hard => "hard",
     }
 }
 
@@ -940,6 +840,8 @@ pub(crate) fn print_policy_explain(
 pub(crate) struct QueriesIssue {
     pub(crate) query: String,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<omnigraph_api_types::DiagnosticOutput>,
 }
 
 #[derive(serde::Serialize)]

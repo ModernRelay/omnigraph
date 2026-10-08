@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - azimafroozeh
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -17,6 +17,14 @@ blocked_on: []
 # RFC: Compatibility surfaces
 
 > A term set in ***bold italics*** is being defined at that exact spot; it is plain text everywhere after.
+
+The mixed-version HTTP behavior proposed below remains an unaccepted alternative
+to [the accepted HTTP contract admission decision](2026-09-30-v012-http-admission.md).
+Missing-header admission, warning and continuing with older peers, and the
+previous-release CLI interoperability suite are neither prerequisites nor support
+promises for the current server contract. This scope note leaves the independent
+surface/hash proposal and its proposed mechanism unchanged; it establishes no
+implemented runtime behavior.
 
 ## Summary
 
@@ -198,4 +206,14 @@ Decided by the maintainers on this PR, before acceptance:
 
 ## Decision log
 
+- 2026-09-30: The HTTP scope note now points to the accepted A1 admission decision; this draft's broader surface/hash framework remains an independent proposal.
+
+- 2026-09-30: Scoped the proposed mixed-version HTTP behavior and previous-release
+  interoperability suite as an unaccepted alternative outside the v0.12 server
+  proposal. The surface/hash framework, proposed mechanism, and draft status are
+  unchanged.
 - 2026-09-14: draft opened. `info.version` carries the wire version; a different major between CLI and server is refused, at admission before any effect, on the `omnigraph-http-api` header the CLI sends, which carries version and root in both directions so the CLI never fetches `/compat` for its checks. Later the same day: compatibility is directional (produced shapes must stay readable, accepted shapes may widen); the policy file's DTOs belong to the policy surface beside the Cedar schema; a major bump with an unchanged unit map is allowed for a semantic break, with its regression case; the served record lists only enrolled surfaces; versions describe the states of `main`; every release note after phase 4 carries a generated compatibility block, checked by `check-docs.py`; each surface also commits a units file with every unit's rendering so a diff shows the change itself; the phase 4 floor runs a semantic OpenAPI diff on the HTTP wire; a CLI unit whose root is a shared api-types type references the HTTP unit, target hash included, instead of rendering it again; the previous release's CLI is run against the new server in CI, within a major; a unit is removed only after a release that deprecated it; GQ logic cases' query-step expectations are units in a versionless `gq_cases` file; the served record carries one root over its `surfaces` map and storage stamp; a response-side major mismatch is a distinct outcome that never claims the request had no effect; units without a marker slot are deprecated through per-surface lists; a CLI root references an HTTP unit only when the HTTP surface enrolls it.
+
+- 2026-10-07: Replaced the opening scope note's v0.12 references with the
+  current accepted HTTP admission decision. This draft still adds no mixed-version
+  support or qualification requirement.

@@ -268,7 +268,7 @@ fn merge_validation_is_delta_scoped() {
                 deletion.lineage_candidate_address_take_rows(),
                 deletion.lineage_candidate_address_take_max_rows(),
             );
-            assert_eq!(result.unwrap(), omnigraph::db::MergeOutcome::Merged);
+            assert_eq!(result.unwrap().outcome, omnigraph::db::MergeOutcome::Merged);
             assert_eq!(
                 deletion.completed_lineage_classification_calls(),
                 1,
@@ -356,7 +356,11 @@ fn merge_lineage_setting_selects_the_completed_classifier() {
                 with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
                     .await
                     .unwrap();
-            assert_eq!(outcome, MergeOutcome::Merged, "merge_lineage = {mode}");
+            assert_eq!(
+                outcome.outcome,
+                MergeOutcome::Merged,
+                "merge_lineage = {mode}"
+            );
             assert_eq!(
                 probes.completed_full_walk_classification_calls(),
                 expected_walks,
@@ -411,7 +415,7 @@ fn merge_back_after_three_way_merge_uses_lineage() {
             .unwrap();
         }
         assert_eq!(
-            db.branch_merge("feature", "main").await.unwrap(),
+            db.branch_merge("feature", "main").await.unwrap().outcome,
             MergeOutcome::Merged
         );
         db.mutate(
@@ -427,7 +431,7 @@ fn merge_back_after_three_way_merge_uses_lineage() {
         let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("main", "feature"))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::Merged);
+        assert_eq!(outcome.outcome, MergeOutcome::Merged);
         assert_eq!(probes.completed_full_walk_classification_calls(), 0);
         assert_eq!(probes.completed_lineage_classification_calls(), 1);
 
@@ -494,7 +498,7 @@ fn merge_manifest_cost_is_flat_in_history() {
                     current += 1;
 
                     let (res, io) = measure(db.branch_merge(&br, &target)).await;
-                    assert_eq!(res.unwrap(), omnigraph::db::MergeOutcome::Merged);
+                    assert_eq!(res.unwrap().outcome, omnigraph::db::MergeOutcome::Merged);
                     let merged = db
                         .snapshot_of(omnigraph::db::ReadTarget::branch(&target))
                         .await

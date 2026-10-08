@@ -1,0 +1,339 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Endpoint declarations belong to their lexical block; checked nested directions and anonymous endpoints survive lowering.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company
+edge Employs: Company -> Person
+edge Knows: Person -> Person
+edge Likes: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"p"}}
+{"type":"Person","data":{"name":"x"}}
+{"type":"Company","data":{"name":"acme"}}
+{"type":"Company","data":{"name":"idle"}}
+{"edge":"WorksAt","id":"works","from":"p","to":"acme","data":{}}
+{"edge":"Employs","id":"employs","from":"acme","to":"p","data":{}}
+{"edge":"Knows","id":"knows","from":"p","to":"x","data":{}}
+{"edge":"Likes","id":"likes","from":"p","to":"x","data":{}}
+
+--- query
+query later_endpoint_declaration() {
+    match { $c $e:(worksAt | employs) $p $c: Company { name: "acme" } }
+    return { $p.name as person, $e.@type as kind }
+}
+--- expect unordered
+{"person":"p","kind":"WorksAt"}
+{"person":"p","kind":"Employs"}
+
+--- expect shape
+person: String
+kind: String
+
+--- query
+query permuted_members() {
+    match { $c $e:(employs | worksAt) $p $c: Company { name: "acme" } }
+    return { $p.name as person, $e.@type as kind }
+}
+--- expect unordered
+{"person":"p","kind":"WorksAt"}
+{"person":"p","kind":"Employs"}
+
+--- expect shape
+person: String
+kind: String
+
+--- query
+query later_wildcard_declarations() {
+    match { $c $e:* $p $c: Company { name: "acme" } $p: Person }
+    return { $p.name as person, $e.@type as kind }
+}
+--- expect unordered
+{"person":"p","kind":"WorksAt"}
+{"person":"p","kind":"Employs"}
+
+--- expect shape
+person: String
+kind: String
+
+--- query
+query later_inner_declaration() {
+    match { $c: Company exists { $c * $p $p: Person } }
+    return { $c.name as company }
+}
+--- expect unordered
+{"company":"acme"}
+
+--- expect shape
+company: String
+
+--- query
+query anonymous_destination_is_independent() {
+    match { $_: Company { name: "idle" } $p: Person { name: "p" } $p knows $_ }
+    return { $p.name as person }
+}
+--- expect unordered
+{"person":"p"}
+
+--- expect shape
+person: String
+
+--- query
+query anonymous_source_is_independent() {
+    match { $_: Company { name: "idle" } $p: Person { name: "x" } $_ knows $p }
+    return { $p.name as person }
+}
+--- expect unordered
+{"person":"x"}
+
+--- expect shape
+person: String
+
+--- query
+query named_reverse_not() {
+    match { $c: Company not { $c worksAt $p } }
+    return { $c.name as company }
+}
+--- expect unordered
+{"company":"idle"}
+
+--- expect shape
+company: String
+
+--- query
+query named_reverse_exists() {
+    match { $c: Company exists { $c worksAt $p } }
+    return { $c.name as company }
+}
+--- expect unordered
+{"company":"acme"}
+
+--- expect shape
+company: String
+
+--- query
+query named_reverse_count() {
+    match { $c: Company count { $c worksAt $p } > 0 }
+    return { $c.name as company }
+}
+--- expect unordered
+{"company":"acme"}
+
+--- expect shape
+company: String
+
+--- query
+query named_child_string_argument() {
+    match { $p: Person count($f.name contains "x") { $p knows $f } > 0 }
+    return { $p.name as person }
+}
+--- expect unordered
+{"person":"p"}
+
+--- expect shape
+person: String
+
+--- query
+query named_unanchored() {
+    match { $p: Person $x knows $y }
+    return { $p.name }
+}
+--- expect error: requires an executable source or destination node binding
+
+--- query
+query selected_unanchored() {
+    match { $p: Person $x (knows | likes) $y }
+    return { $p.name }
+}
+--- expect error: requires an executable source or destination node binding
+
+--- query
+query nested_unanchored() {
+    match { $p: Person not { $p.name = "p" $x knows $y } }
+    return { $p.name }
+}
+--- expect error: requires an executable source or destination node binding
+
+--- query
+query child_declaration_does_not_escape() {
+    match { $c: Company exists { $c worksAt $p $p: Person } $c * $p }
+    return { $c.name }
+}
+--- expect error: requires explicitly declared source and destination node bindings
+
+--- query
+query reverse_expand_selection() {
+    match { $c: Company { name: "acme" } $p: Person $p $e:(worksAt | employs) $c }
+    return { $p.name as person, $e.@type as kind }
+}
+--- expect unordered
+{"person":"p","kind":"WorksAt"}
+{"person":"p","kind":"Employs"}
+
+--- expect shape
+person: String
+kind: String
+
+--- query
+query cycle_closing_selection() {
+    match { $p: Person { name: "p" } $p (knows | likes) $f $f (knows | likes) $p }
+    return { $f.name as person }
+}
+--- expect unordered
+
+--- expect shape
+person: String
+
+--- query
+query named_type_values() {
+    match { $p: Person $p $e:knows $f $e.@type = "Knows" }
+    return { $e.@type as kind, $f.name as person }
+    order { $e.@type }
+}
+--- expect unordered
+{"kind":"Knows","person":"x"}
+
+--- expect shape
+kind: String
+person: String
+
+--- query
+query undirected_cross_type_wildcard() {
+    match { $c: Company $p: Person $c <*> $p }
+    return { $c.name }
+}
+--- expect error: T22:
+
+--- query
+query cross_type_same_variable() {
+    match { $p: Person $p (worksAt | employs) $p }
+    return { $p.name }
+}
+--- expect error: T5:
+
+--- query
+query future_outer_name_is_not_correlated() {
+    match { $p: Person { name: "p" } exists { $p knows $x } $x: Company { name: "idle" } }
+    return { $p.name as person, $x.name as company }
+}
+--- expect unordered
+{"person":"p","company":"idle"}
+
+--- expect shape
+person: String
+company: String
+
+--- query
+query future_outer_name_not_block() {
+    match { $p: Person not { $p knows $x } $x: Company { name: "idle" } }
+    return { $p.name as person, $x.name as company }
+}
+--- expect unordered
+{"person":"x","company":"idle"}
+
+--- expect shape
+person: String
+company: String
+
+--- query
+query undeclared_same_variable_cross_type() {
+    match { $p: Person $x (worksAt | worksAt) $x $p knows $x }
+    return { $p.name }
+}
+--- expect error: cannot have both type
+
+--- query
+query undeclared_mixed_orientation_forward_member_first() {
+    match { $p: Person $x (worksAt | employs) $y $p knows $x }
+    return { $p.name }
+}
+--- expect error: mixed endpoint orientations requires a declared endpoint type
+
+--- query
+query undeclared_mixed_orientation_reverse_member_first() {
+    match { $p: Person $x (employs | worksAt) $y $p knows $x }
+    return { $p.name }
+}
+--- expect error: mixed endpoint orientations requires a declared endpoint type
+
+--- query
+query future_outer_selected_edge_does_not_capture_child_edge() {
+    match {
+        $p: Person
+        exists {
+            $p $e:(knows | likes) $x
+            exists { $e.@type = "Knows" }
+        }
+        $p $e:(knows | likes) $f
+    }
+    return { $p.name as person, $e.@type as kind, $e.@id as id }
+}
+--- expect unordered
+{"person":"p","kind":"Knows","id":"knows"}
+{"person":"p","kind":"Likes","id":"likes"}
+--- expect shape
+person: String
+kind: String
+id: String
+
+--- query
+query future_outer_named_edge_does_not_capture_child_edge() {
+    match {
+        $p: Person
+        exists { $p $e:knows $x }
+        $p $e:knows $f
+    }
+    return { $p.name as person, $e.@id as id }
+}
+--- expect unordered
+{"person":"p","id":"knows"}
+--- expect shape
+person: String
+id: String
+
+--- query
+query future_outer_node_does_not_capture_grandchild_node() {
+    match {
+        $p: Person
+        exists {
+            $p.name = "p"
+            exists { $p knows $x }
+        }
+        $x: Company { name: "idle" }
+    }
+    return { $p.name as person, $x.name as company }
+}
+--- expect unordered
+{"person":"p","company":"idle"}
+--- expect shape
+person: String
+company: String
+
+--- query
+query nested_local_names_remain_independent() {
+    match {
+        $p: Person
+        count($x.name) {
+            $p.name = "p"
+            exists { $p knows $x $x.name = "x" }
+            $x: Company { name: "acme" }
+            exists { $x worksAt $q $q.name = "p" }
+        } = 1
+        $x: Company { name: "idle" }
+    }
+    return { $p.name as person, $x.name as company }
+}
+--- expect unordered
+{"person":"p","company":"idle"}
+--- expect shape
+person: String
+company: String

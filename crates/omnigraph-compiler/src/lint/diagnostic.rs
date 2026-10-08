@@ -16,7 +16,7 @@
 /// per-resource Cedar policy integration (MR-722).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
-    /// Destructive — data-loss class. Always requires explicit opt-in.
+    /// Destructive — data-loss class.
     DS,
     /// Maybe-fail — data-dependent, may fail on existing entities.
     MF,
@@ -55,13 +55,13 @@ impl Family {
     }
 }
 
-/// Tier classification for a migration step. Determines apply-path
-/// behavior:
-/// - `Safe`: applies without scan or flag.
-/// - `Validated`: requires a single-pass scan of existing entities; fails on
-///   the first violation.
-/// - `Destructive`: requires explicit `--allow-data-loss` (or equivalent
-///   opt-in) at apply time.
+/// Tier classification for a schema-lint rule. Plan output shows it beside
+/// the code of an `UnsupportedChange` step
+/// (`SchemaMigrationStep::diagnostic`); apply refuses those steps whatever
+/// their tier:
+/// - `Safe`: would apply without a scan.
+/// - `Validated`: would require a single-pass scan of existing entities.
+/// - `Destructive`: would lose data or narrow values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SafetyTier {
     Safe,

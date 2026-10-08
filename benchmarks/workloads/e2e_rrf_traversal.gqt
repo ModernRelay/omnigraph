@@ -1,0 +1,62 @@
+# issue: none
+# notes: Complete auto-planned BM25/BM25 RRF query with traversal and exact winner x; bounded replacement for the rrf-gate engine read. One operation on a fresh handle is timed; checks and restart are outside the timer.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]
+
+--- restart
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+        $c: Chunk
+        $a: Artifact
+        $c chunkOfArtifact $a
+        search($c.text, $q1)
+    }
+    return { $c.slug }
+    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+rank fuse row tiebreak [$a.@id]

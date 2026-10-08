@@ -4,7 +4,7 @@ OmniGraph provides four direct-storage maintenance commands:
 
 - `optimize` compacts data and reconciles declared indexes.
 - `rebuild-full-text-indexes` replaces full-text indexes on one branch.
-- `repair` classifies storage drift and can publish an approved repair.
+- `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
@@ -44,6 +44,26 @@ the same conflict and is retried by its caller. Lance compacts neighbouring
 fragments only when the same indexes cover them, so a table whose index
 coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.
+
+Compacting a table with Blob properties reads each managed Blob value into
+memory to rewrite it. Optimize sizes the read batches of each compaction task
+(a group of neighbouring fragments compacted together) from the task's largest
+row, summing that row's managed Blob values, so one batch materializes at most
+32 MiB of managed Blob payload whatever the fragment sizes. External Blob
+references are carried without reading the referenced object and count
+nothing. A task holding a row over 16 MiB compacts one row per batch, and a
+single row over 32 MiB is materialized whole. This bounds the payload of a
+batch, not the process heap: Lance's writer copies each inline payload into
+the arrays it prepares while it still holds the batch, so memory use exceeds
+the payload. Every task of a Blob table gets this batch size explicitly, 1 to
+8192 rows, so it takes precedence over `LANCE_DEFAULT_BATCH_SIZE` there,
+including when the variable is smaller. When a fragment being compacted holds
+a Blob descriptor the engine's decoder rejects, sizing can refuse the
+compaction with a Blob integrity error before that table is rewritten, and
+nothing is committed; a table with nothing to compact is not scanned.
+Optimize works on up to
+`OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables at once (default 8), so budget for
+that many Blob tables compacting together.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -118,17 +138,13 @@ directory; no read or write of the graph resolves the linear HEAD, so
 foreign drift changes no query result and blocks no writer. For a
 `foreign_drift` table `repair` prints the last linear version, the HEAD and
 the number of foreign versions in `operations`, takes no action (`no_op`)
-and exits 0. It never adopts the foreign commit, with or without
-`--force --confirm`. `cleanup` leaves foreign versions and their files in
+and exits 0. It never adopts the foreign commit. `cleanup` leaves foreign versions and their files in
 place and lists them per table under `foreign_versions`. A HEAD below the
 recorded last linear version is reported as an internal manifest error.
 Each `repair --json` row carries `type_key`, `published_dataset_version`,
 `lance_head_version`, `classification`, `action`, `operations` and `error`.
 
-`--confirm` and `--force --confirm` remain accepted and publish nothing on a
-v11 graph: the classes they used to publish (`verified_maintenance`,
-`suspicious`, `unverifiable`) described a table whose registration named its
-linear HEAD, which no v11 registration does. To discard foreign commits,
+The removed `--confirm` and `--force` options are rejected. To discard foreign commits,
 export the graph and load it into a new one; see
 [Troubleshooting](troubleshooting.md#foreign-drift).
 
@@ -214,7 +230,9 @@ cause and rerun cleanup to converge. The run derives each branch's history
 and pins from one captured version, then validates that the live inventory,
 versions, incarnations and tags still match after all table inventories.
 A changed observation refuses the whole plan before deletion; rerun with the
-same policy. Retirement archives exact branch identity and ancestry inside
+same policy. This includes a branch deleted after cleanup listed it: cleanup
+returns a retryable conflict, and a new run captures the current branches.
+Retirement archives exact branch identity and ancestry inside
 its native tree, then removes the active ref. Creation does not scan retired
 histories. Cleanup removes unneeded retired trees and their archives, while
 preserving trees needed by live descendants, merge bases or tags.
@@ -268,5 +286,5 @@ for tables with an `error`.
 - Run `cleanup` from an explicit retention policy after backups and rollback
   requirements have been reviewed.
 
-Storage-format upgrades are `omnigraph upgrade`, not maintenance. See
+Moving a graph to another storage format is not maintenance. See
 [Upgrading](upgrade.md).

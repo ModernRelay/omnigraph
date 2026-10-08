@@ -5545,7 +5545,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
@@ -5556,7 +5556,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-azure-admission"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5576,7 +5576,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-bench"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5591,6 +5591,7 @@ dependencies = [
  "object_store",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-gqt-core",
  "predicates",
  "serde",
  "serde_json",
@@ -5604,16 +5605,20 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-catalog"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "datafusion",
  "futures",
  "lance",
  "lance-core",
+ "lance-encoding",
  "lance-file",
+ "lance-io",
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
@@ -5634,7 +5639,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -5668,7 +5673,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
@@ -5689,7 +5694,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -5710,7 +5715,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-core"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5720,6 +5725,7 @@ dependencies = [
  "datafusion",
  "frostem",
  "futures",
+ "globset",
  "lance",
  "lance-core",
  "lance-file",
@@ -5751,13 +5757,12 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-dst"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
  "async-trait",
  "bytes",
  "futures",
- "globset",
  "lance-core",
  "lance-io",
  "object_store",
@@ -5774,7 +5779,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -5831,10 +5836,8 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
- "arrow-array",
- "arrow-schema",
  "async-trait",
  "datatest-stable",
  "futures",
@@ -5842,19 +5845,38 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-dst",
  "omnigraph-engine",
- "omnigraph-planner",
+ "omnigraph-gqt-core",
  "omnigraph-reference-engine",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
+name = "omnigraph-gqt-core"
+version = "0.13.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "futures",
+ "libm",
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "omnigraph-planner",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "omnigraph-planner"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-schema",
  "omnigraph-compiler",
@@ -5865,7 +5887,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -5878,7 +5900,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-reference-engine"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5902,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-seams"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "serde_yaml",
  "syn",
@@ -5912,7 +5934,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5925,10 +5947,12 @@ dependencies = [
  "dashmap",
  "futures",
  "headers",
+ "http-body-util",
  "jsonwebtoken",
  "lance",
  "lance-index",
  "libc",
+ "object_store",
  "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",
@@ -5936,6 +5960,7 @@ dependencies = [
  "omnigraph-policy",
  "p256",
  "regex",
+ "reqwest 0.12.28",
  "rmcp",
  "rsa",
  "serde",
@@ -5957,7 +5982,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-storage"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -5971,7 +5996,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-vocabulary-guard"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "clap",
  "proc-macro2",

@@ -53,12 +53,13 @@ Use `@id`, `@src`, and `@dst` for system fields in queries. Edge constraints may
 name `@src`/`@dst`; no constraint may name `@id` (identity is already the row
 key). Name rules depend on the graph's vintage:
 
-- **New (v9) graphs** store system fields as `__id`, `__src`, and `__dst`,
+- **New graphs** store system fields as `__id`, `__src`, and `__dst`,
   and may declare ordinary properties named `id`, `src`, or `dst`. Every
   property name beginning `_` is reserved.
-- **Legacy (v8) graphs** retain physical `id`/`src`/`dst` and refuse `id` on
-  any type, `src`/`dst` on edges, and `__id`/`__src`/`__dst`. Other `_` names
-  are still accepted there, but they block the v9 upgrade.
+- **Legacy graphs** (spellings kept by `omnigraph upgrade`) retain physical
+  `id`/`src`/`dst` and refuse `id` on any type, `src`/`dst` on edges, and
+  `__id`/`__src`/`__dst`. Other `_` names are still accepted there, but they
+  block `schema upgrade-system-columns`.
 - **All vintages:** `from` and `to` are reserved edge property names (insert
   endpoints), and `_distance`/`_score` are refused as property names.
 
@@ -66,7 +67,7 @@ Inspect `system_columns` in `schema show --json` rather than inferring the
 graph vintage from the binary. Writing bare `src` in an edge constraint on a
 new graph fails at `init`/`schema plan` (offline `lint` does not catch it) with
 `unknown property reference 'Knows.src'; the system field is '@src'`; respell
-local `.pg` files after an upgrade to v9.
+local `.pg` files after `schema upgrade-system-columns`.
 
 ### Edge constraints go inside a body block
 
@@ -112,17 +113,12 @@ If `supported: false`, fix the source before applying. Plan is free; run it as o
 Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
 a code is present, match it rather than the free-form message text.
 
-**Destructive drops are gated.** Dropping a property or type is a soft drop by
-default. To preview and execute a hard destructive drop, opt in on both steps:
-
-```bash
-omnigraph schema plan --schema next.pg s3://bucket/repo --allow-data-loss --json
-# inspect the hard-drop plan
-omnigraph schema apply --schema next.pg s3://bucket/repo --allow-data-loss
-```
-
-Without the flag, supported drops preserve prior physical data through soft
-drop semantics. A cluster-only server rejects
+**Drops reclaim nothing at apply.** Dropping a property or type removes it from
+the current schema; older commits still read the dropped data until
+`omnigraph cleanup` stops retaining them, and only then is it gone for good. No
+flag makes a drop destructive at apply: to reclaim the space, run `cleanup`
+with a retention that excludes the commits before the drop. A cluster-only
+server rejects
 `POST /graphs/{id}/schema/apply` with `409`; evolve a served graph through
 `cluster plan` and `cluster apply`.
 
@@ -242,15 +238,18 @@ schema is declared (`graphs.<id>.schema:` in `cluster.yaml`) and converged:
 
 ```bash
 $EDITOR schema.pg
-omnigraph cluster plan  --config .   # shows the engine's migration steps
-omnigraph cluster apply --config . --as <you>
-# restart the --cluster server to serve the new shape
+omnigraph cluster plan  --config . --observe   # migration steps; takes no cluster lock
+omnigraph cluster apply --server <name|url> --config .
+# the running server publishes and activates the new shape; no restart
 ```
 
-Differences from direct `schema apply` (on a non-cluster store): **soft drops
-only** (`--allow-data-loss` is not reachable from cluster apply — prior versions
-retain dropped columns),
-and out-of-band schema changes on the live graph are *drift* — `cluster
-refresh` flags them and the next `apply` converges the graph back to the
-declared schema. Everything else in this file (`@rename_from`, backfills,
+Without `--server`, `cluster apply --config . --as <you>` writes the storage
+root itself: stop the server and transfer its cluster lock first (see
+[`cluster.md`](cluster.md)), then start the server to serve the new shape.
+
+Differences from direct `schema apply` (on a non-cluster store): out-of-band
+schema changes on the live graph are *drift* — the next `cluster apply`
+refuses with `applied_schema_drift`, and `--schema-correction` accepts a
+reviewed observed schema.
+Everything else in this file (`@rename_from`, backfills,
 linting, enum discipline) applies unchanged to the `.pg` you edit.

@@ -49,7 +49,7 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `U32`, `U64` | Unsigned integers |
 | `F32`, `F64` | Floating-point numbers |
 | `Date` | Calendar date |
-| `DateTime` | Timestamp |
+| `DateTime` | Timestamp with millisecond precision |
 | `Vector(N)` | `N` 32-bit floating-point values |
 | `Blob` | Managed bytes or an external reference; see [Blobs](../blobs.md) |
 | `enum(a, b, ...)` | One of the declared strings |
@@ -152,17 +152,23 @@ omnigraph schema apply --schema next.pg graph.omni
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
-soft-dropping node, edge, or property declarations.
+dropping node, edge, or property declarations.
+
+Applying changed schema text, including comments or formatting, records the new
+source in one graph commit even when no table changes are needed. Applying the
+same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities, changing a property
 type (except enum widening), changing edge endpoints or cardinality, changing a
 node's implemented interfaces, and adding or removing most constraints are
 rejected. The plan reports the exact unsupported step before anything changes.
 
-A normal drop removes the declaration from the current schema while older
-commits remain readable until destructive cleanup removes their storage.
-`schema apply --allow-data-loss` makes drops immediately destructive. Review its
-plan carefully; it cannot be undone.
+A drop removes the declaration from the current schema and reclaims no storage
+at apply. Older commits still read the dropped data until `omnigraph cleanup`
+stops retaining them; after that, the dropped data cannot be recovered. Review
+the plan carefully, and treat the cleanup that follows as the step that cannot
+be undone. To reclaim the space, run cleanup with a retention that excludes
+the commits before the drop. See [cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.

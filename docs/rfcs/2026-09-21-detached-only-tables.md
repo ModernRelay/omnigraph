@@ -31,6 +31,8 @@ part of it, promotion, and replaces what promotion was buying.
 RFC 0067's probe table, excluding probe 14, and its Decision log; draft
 [RFC 0068](0068-graph-commit-record.md).
 
+The added-type retry rule is extended by [Schema contract in the manifest](2026-09-30-schema-contract-in-manifest.md#apply-and-table-creation): an empty original version may be reused or replaced by a detached candidate at logical version 2, preserving linear version 1.
+
 ## Summary
 
 Under RFC 0067 a write stages each table effect as a ***detached commit***,

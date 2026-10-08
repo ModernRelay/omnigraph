@@ -38,8 +38,8 @@ Avoid line-number links in documentation; these modules are the stable owners.
 
 ## Traversal and joins
 
-Unbound `Expand` and `AntiJoin` use a CSR/CSC `GraphIndex` scoped to the
-edge types actually referenced by the query. The cache key includes each
+Ordinary unbound named traversal and eligible bulk `AntiJoin` probes can use a
+CSR/CSC `GraphIndex` scoped to the edge types actually referenced by the query. The cache key includes each
 covered edge table's physical identity and version, so unrelated edge types do
 not force a graph-wide scan and a lazy branch may reuse an identical inherited
 table view.
@@ -53,6 +53,48 @@ anti-join over its typed inner pipeline, keeping each outer row by a
 
 Do not replace these shapes with eager cross-products. Keep intermediate rows
 factorized and flatten only where the result contract needs it.
+
+### Selected edge traversal
+
+Alternatives and wildcard lower to one `EdgeSelection` with canonical member
+names, per-member directions and fixed endpoint types. Wildcard resolution uses
+the captured `Catalog` once. Every member contributes a dataset pin, including
+an explicit absent entry. Shared frontier and visited state preserve shortest
+distance across mixed-type paths. Bound selections normalize common properties
+and synthesize `~edge_type`; Lance never projects that query-only column.
+Ordinary named bindings omit this payload because their `@type` expressions
+are canonical String constants after compilation.
+
+Statements with a selection declare `ExpandPolicy::Budgeted` and `IndexedScan`
+for every expansion, including named and nested ones. They declare no CSR
+alternative, and omit topology prefilters and bulk adjacency shortcuts. Forced
+CSR is refused because the shared graph-index artifact can cover more than the
+selected types. The ordinary cost model below applies to unbudgeted named
+traversals. Unbound selections and named multi-hop traversals share the BFS
+core; ordinary unbudgeted named single-hop traversals use `single_hop`.
+Budgeted execution disables transitions to CSR. A budgeted producer prepares
+its pinned member datasets once and consumes source windows of at most 8,192
+rows. These windows are independent of upstream batch boundaries.
+
+`QueryResources` owns one checked atomic traversal-work counter, captured in the
+plan and shared across operators and overfetch retries. The plan validator
+supplies a nonzero limit; a second generic settings entry is refused. Source
+rows are charged when admitted to a window; each edge scan admits its pinned fragments' trusted physical
+row total before execution, including deleted positions. Missing trustworthy
+counts and physical-row sum overflow produce distinct admission errors. The
+full selected-table count is charged for each nonempty frontier probe, even if
+an index returns only a few neighbors. Examined adjacency entries and bound-source replication
+also consume work. This bounds declared traversal row work, not source filtering,
+destination scans, bytes or elapsed time. Memory, scratch and cancellation remain
+separate. Neither fallback nor released memory refunds work.
+
+Replay validates complete member pins, finite bounds, budget policy and counter
+presence. It also checks each RankFuse arm against the complete canonical
+downstream identity-key list; missing, reordered or duplicate saved keys refuse
+before execution. Historical wildcard refusal checks both captured provenance and live
+wildcard expansions. A selected dataset absent from the captured snapshot fails
+when opened; empty input need not open it. Bound plans use a versioned envelope
+and require regeneration when the stored version is unsupported.
 
 ### Expand path selection
 
@@ -214,14 +256,14 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `MetadataCount` | `MetadataCountExec`: exact live-row count from the pinned dataset, with the single output row charged to the query pool | omnigraph |
 | `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance` or `_score`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). A marked plain table read (no `ranked` access, so no search mode) is a pipeline operator: with a filter or without one (an inert scan too) it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 11 decodes whichever bound is smaller; `LANCE_DEFAULT_BATCH_SIZE` replaces the row count), `PIPELINED_READAHEAD` (2) batches decoded ahead outside the pool; it holds each batch as `runtime filter input`, sieves it (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and the kept batch leaves as it is read, held as `v2 scan batch` only until the join takes it, so the table is never held whole; `runtime_filter_rows_read` counts every row the scan reads, an inert scan's too; every other scan (a ranked scan and its ANN ladder, a dependent scan, an unmarked table read) is a breaker through `execute_node_scan`, and both build the Lance scanner through one `NodeRead` | omnigraph |
 | `HashJoin` | `HashJoinExec`: the build (a table `ScanExec` of the destination with the pushed filters and projection) drained under the query pool and hashed on `<binding>.<id>`, the traversal (`probe`) joined in its own order, one `take` per side per probe batch, output charged as `hash join output`; the declared `id_lookup` fallback is a branch of the same operator (below); the first probe batch is read before the build, so an empty probe executes nothing on the build | omnigraph |
-| `RankFuse` | `RankFuseExec` over its two arm subtrees, each lowered once with its own ranked `Scan`; the operator ranks each arm by its score column, the fused binding's id and every other binding's id before fusing; body `fuse_arms` | omnigraph |
+| `RankFuse` | `RankFuseExec` over its two arm subtrees, each lowered once with its own ranked `Scan`; the operator ranks each arm by its score column, the fused binding's id and planner-declared downstream row keys before fusing. Selected edge keys place concrete type before id. Fusion still identifies and scores the fused node by its id; body `fuse_arms` | omnigraph |
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right. The node's `filters` (conjuncts over both bindings) run in the join; every pair goes through one `PairBuffer`, which charges each right batch's row-size scratch before it grows it, filters the held pairs into a kept batch when it holds the session's batch size of pairs, when their estimated bytes reach the producer's batch bytes, and at each right batch's end, and sends the kept batches as one output once their rows reach the batch size or their bytes the batch bytes (the rest at the end), so an output exceeds the batch size by at most one kept batch | omnigraph |
 | `ContainsJoin` | `ContainsJoinExec`: the planner's join for a `Filter` over a `CrossJoin` holding a `$r.x contains $l.y` conjunct whose `$r` is the unranked table `Scan` on the right and whose two properties are text (`optimizer.rs` `filtered_cross_join`, reported as the `join_algorithm` pass; a search order that later ranks that scan takes the marker off again and turns the join back into the `CrossJoin` of its conjuncts, `Lowering::unmark`, since a ranked scan runs under a search mode and no runtime filter); the filter's other conjuncts are the node's `residual`, and the right scan's `ScanSpec` carries `runtime_filter` (`column`, `needle`, `kind` `text_contains_any`), which the engine's lowering turns into the `RuntimeFilterSlot` both operators share; the lowering refuses a plan (a replayed or edited one) whose marked scan's column or needle differs from its `ContainsJoin`'s, or whose marked plain table scan no `ContainsJoin` fills (a marker on any other scan is not read, and that scan reads unfiltered). The left input is collected under the query pool (`contains join left`); the join admits its `PairBuffer`, then fills that slot (a fill first clears any earlier execution's filter) with one Aho-Corasick automaton over the distinct non-empty `y` values, charged once as `runtime filter needles` and shared with the join (the scan is left unfiltered when a value is empty, since that value is in every text, though the join still pairs through the automaton; none, and the join tests every pair, when the pool refuses it; no right execution when every value is null); both operators print `runtime_filter=$r.x contains any($l.y)`, and `ScanExec` sieves each Lance batch through it as the `Scan` row describes (`runtime_filter_rows_read`, `runtime_filter_rows_dropped`, `runtime_filter_inert`; the join's `runtime_filter_needles`). At its first right batch the join builds its needle rows over that same automaton, which the streaming scan may still be sieving through (`contains_join=aho_corasick`; only the row tables are charged, as `contains join needles`): each non-null text pairs only with the left rows of the needles it holds, the pass over a text stopping once every needle is found and checking for cancellation every 4,096 occurrences, and each empty needle's row pairs with each non-null text; when the pool refuses the needle rows it pairs every row. Every pair goes through the same `PairBuffer` as `CrossJoinExec`, which tests only the `residual` conjuncts on the needle-rows path, whose every pair holds the `contains` conjunct by construction, and the `contains` conjunct with them on the every-row path; with the right scan streaming, the join's memory is the left side plus the shared automaton, the needle rows, one right batch and one output batch, beside the producer queue's two batches in flight. `contains_join_matcher` is 1 when the run paired through the needle rows, 0 when the pool refused them, and absent when no right row reached the join; `contains_join_pairs` counts the pairs found for the non-empty needles before the residual conjuncts, beside a matcher of 1 | omnigraph |
 | `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns | omnigraph |
-| `Expand` | `ExpandExec`: a single unbound hop streams, one vectorized walk per input batch (`operators/single_hop.rs`); bound edges run the bounded pair producer, spillable pair ordering and incremental hydration per input batch; multi-hop drains its frontier into the BFS breaker `execute_expand`, which emits its pairs in chunks of at most 256 as the walk finds them (`expand_pairs` counts the pairs handed on), so a downstream `Limit` that drops the stream cancels the walk | omnigraph |
+| `Expand` | `ExpandExec`: an unbudgeted named unbound single hop uses one vectorized walk per input batch (`operators/single_hop.rs`); unbudgeted named multi-hop drains its input into the BFS breaker `execute_expand`. Budgeted expansions, including selected multi-hop, consume fixed source windows through `SourceWindows`. Bound edges use the bounded pair producer, spillable pair ordering and incremental hydration within each input batch or budgeted source window. Output chunks contain at most 256 rows (`expand_pairs` counts pairs handed on); dropping the stream at a downstream `Limit` cancels the producer | omnigraph |
 | `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan: the bulk CSR degree mask when the predicate counts rows and the inner is one single-hop, filter-free, unbound expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, and `SubqueryAggregate` folds the tagged inner rows per outer row and applies the predicate | omnigraph |
-| `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; when a `Sort` consumes it, every column the sort reads and every declared tie-break id follow the return columns under the hidden prefix `~`, which the sort drops | omnigraph |
-| `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the `<binding>.<id>` columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares every binding in scope, name-sorted, and none where ids cannot change the visible order: group rows, a `return` whose every expression is an order key, a binding whose `@id` is a key; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans no `Sort`, and an aggregate under a search order plans none | omnigraph |
+| `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; when a `Sort` consumes it, every column the sort reads and every declared tie-break metadata column follow the return columns under the hidden prefix `~`, which the sort drops | omnigraph |
+| `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the metadata columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares identity columns in binding-name order, with selected bound-edge type before its ID. Each metadata key already explicitly ordered is omitted independently; group rows and a `return` whose every expression is an order key need no hidden ties; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans no `Sort`, and an aggregate under a search order plans none | omnigraph |
 | `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |
 | `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (an integer `sum`/`avg` argument cast to `Float64`, the result type); `count($v)` counts the identity column; DataFusion emits the group keys before the aggregates, and `run_plan` puts the collected result back in return order (`lower::in_order`) | DataFusion |
 
@@ -356,7 +398,33 @@ inside Lance or Arrow.
 
 `ExpandExec` runs traversal work on `spawn_blocking` with cooperative
 cancellation checks. Dropping its consumer signals that work to stop;
-reservations held by the worker remain alive until it exits. Custom operators
+reservations held by the worker remain alive until it exits. A query-owned
+registration precedes each graph producer and blocking job. The registration
+outlives its captured future, resources and abandoned result, including on
+panic or cancellation. `QueryContext::run_owned` drops the completed execution
+future, closes new root registrations and joins these children before returning
+success, an error or the original panic payload. This includes a panic when
+dropping the completed execution future; successive search passes share the
+same scope. Dropping an embedded caller closes registration while surviving
+children retain their leases. HTTP/MCP read execution stays owned after caller
+disconnect or response timeout, allowing this join to finish.
+After closure a root registration (`QueryWorkScope::register`, which
+`WorkMemory::blocking` takes) is refused; a live child adds workers only through
+its own lease (`QueryWorkLease::child`, `WorkMemory::blocking_owned`).
+This covers OmniGraph's graph workers, not opaque DataFusion tasks or native
+Lance/storage I/O, and cannot authorize engine reuse.
+
+The wait in `run_owned` has no deadline. It ends when every registered worker
+has dropped its lease: a running blocking poll drops it when the poll returns,
+and a cancelled worker stops at its next cooperative `memory.check()`.
+`GraphIndex::build`, the whole-input `lexsort_to_indices` call in the sort
+operator and the hash-join build loop run without a check, so a cancelled
+worker inside one of them finishes that stretch first. An aborted blocking job
+that is still queued holds its lease until the blocking pool dequeues it. The
+The `/query` route has no route timeout. No benchmark or timing test
+measures the latency this wait adds to a query that errors or stops early.
+
+Custom operators
 publish output-row and elapsed-compute metrics, with `output_batches` for
 every `ExpandExec` and scan metrics for ANN
 probe/search outcomes. `engine::execute_query` keeps the nearest prefilter
@@ -482,7 +550,8 @@ else about the query: no settings argument exists, and
 `engine::plan_pins_snapshot` refuses a snapshot that does not hold every
 dataset the planner read at the identity it recorded in
 `Assumptions.datasets` (path, Lance branch and version per table key, or its
-absence); the `version` on a `Scan`, `MetadataCount` or `Expand` row is the
+absence); `Expand.versions` records every selected member's version, while the
+`version` on a `Scan` or `MetadataCount` row is the
 same fact printed for the reader.
 It is `pub` and `#[doc(hidden)]` for the replay tests
 ([testing.md](testing.md#plan-replay)): with the settings gone from the
@@ -610,9 +679,21 @@ All load modes share the mutation publisher and recovery protocol:
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
 
-Mutation and keyed Load reject a table's accumulated input above 8,192 rows or
-32 MiB before recovery is armed. Larger imports must be split into separately
-atomic graph commits; Overwrite remains the initial bulk-replacement path.
+Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
+and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
+The sum uses `get_array_memory_size`, preserving conservative shared-buffer
+counting. Keyed parsing separately caps its decoded-payload estimate across
+types at 32 MiB before retaining each row. External Blob copy admission includes
+the retained keyed batches plus copied payload estimates before payload reads;
+materialized batches are checked again before fragment staging.
+
+Mutation delete, cascading delete and Overwrite replacement removal scan IDs
+incrementally under one 32 MiB allowance per operation, charging UTF-8 bytes
+plus one `String` slot before copying an ID. These checks precede this
+operation's data fragments and publication. They do not bound JSON containers,
+simultaneous conversion copies, predicate/validation state or native scan
+buffers. Overwrite's bulk input retains its existing separate checks and is not
+subject to the keyed row limit. See [writes.md](writes.md#keyed-writes).
 
 `load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
 line is one logical node or edge envelope; duplicate members, physical fields,

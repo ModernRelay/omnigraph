@@ -16,6 +16,29 @@ pub fn check_date_literal(value: &str) -> Result<(), String> {
     ))
 }
 
+/// Refuse a `DateTime` string with a non-zero fractional digit past the third.
+/// A `DateTime` is Arrow `Date64` milliseconds and its parsers floor the rest, so
+/// `00:00:00.123456Z` would store and compare as `00:00:00.123Z`.
+///
+/// # Errors
+///
+/// The refusal message naming `value`. Only precision is judged: a string that
+/// is not a `DateTime` at all can pass, and the parser refuses it.
+pub fn check_datetime_literal(value: &str) -> Result<(), String> {
+    let after_point = value.split_once('.').map_or("", |(_, rest)| rest);
+    let millisecond_exact = after_point
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .skip(3)
+        .all(|digit| digit == b'0');
+    if millisecond_exact {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid DateTime literal '{value}': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,
@@ -245,7 +268,7 @@ impl PropType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {
     Out,
     In,

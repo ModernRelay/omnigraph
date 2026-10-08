@@ -190,6 +190,12 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
+    fn traversal_work_limit(&self) -> Option<u64> {
+        self.ir
+            .has_edge_selections()
+            .then(|| self.settings.traversal_work_limit())
+    }
+
     fn schema(&self, side: SideId) -> std::result::Result<SchemaRef, PlanError> {
         Err(PlanError::Unresolved {
             detail: format!("a query plan names its scans by type, not by side {side:?}"),
@@ -360,12 +366,16 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
     }
     let mut resolved = resolved_params.unwrap_or_else(|| params.clone());
     let now_name = omnigraph_compiler::query::ast::NOW_PARAM_NAME;
-    if !resolved.contains_key(now_name) {
-        let now = time::OffsetDateTime::from(crate::dst_clock::system_time_now())
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
-        resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    if resolved.contains_key(now_name) {
+        return Err(OmniError::manifest(format!(
+            "param '{now_name}': reserved for now() and cannot be bound"
+        )));
     }
+    let now = time::OffsetDateTime::from(crate::dst_clock::system_time_now())
+        .truncate_to_millisecond()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
+    resolved.insert(now_name.to_string(), Literal::DateTime(now));
     Ok(ResolvedParams(Arc::new(resolved)))
 }
 

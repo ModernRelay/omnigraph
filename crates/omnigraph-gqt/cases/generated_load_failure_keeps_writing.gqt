@@ -1,0 +1,56 @@
+# issue: none
+# notes: A generated load crosses the shared detached-write seam and a failed publication preserves the branch across restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person { name: String @key }
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- seam
+at: mutation.post_finalize_pre_publisher
+occurrence: 1
+action: fail
+scope: next_step
+
+--- load generate: v1 seed: 42 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      name: {kind: literal, value: bob}
+--- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
+
+--- restart
+--- query
+query unchanged() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- load generate: v1 seed: 42 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      name: {kind: literal, value: carol}
+--- expect ok
+
+--- query
+query after_load() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

@@ -4,12 +4,17 @@
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
+use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeMember, common_edge_properties};
 use omnigraph_planner::{ExpandCostInputs, ExpandMode, choose_expand_mode, should_switch_to_csr};
 
 use datafusion::physical_plan::metrics::Gauge;
 
+use crate::error::missing_graph_type_at_snapshot;
+
 use super::operators::memory::WorkMemory;
-use super::operators::{ExpandStep, GraphEnv, RowCountPredicate, Switch};
+use super::operators::{
+    ExpandExecution, ExpandStep, GraphEnv, NamedExpand, RowCountPredicate, Switch,
+};
 use super::*;
 
 /// Bundles the per-handle embedding client cell with the optional injected
@@ -419,14 +424,40 @@ pub(super) struct ExpandedPairs {
     _memory: WorkMemory,
 }
 
-/// Run the topology path the plan recorded on `step` (the multi-hop breaker)
-/// and pass its ID pairs to `emit` a chunk at a time, so the consumer ends
-/// the walk once it has its rows; a later multi-hop `Expand` drains this one
-/// whole before it walks. The start is `decide_expand_start`'s.
+pub(super) struct PreparedEdge {
+    pub(super) dataset: Dataset,
+    pub(super) probes: Vec<EndpointColumns>,
+}
+
+pub(super) async fn prepare_selected_edges(
+    env: &GraphEnv,
+    step: &ExpandStep,
+    memory: &WorkMemory,
+) -> Result<Vec<PreparedEdge>> {
+    memory
+        .entries::<PreparedEdge>(step.members().len())
+        .map_err(|error| memory.error(error))?;
+    let mut prepared = Vec::with_capacity(step.members().len());
+    for member in step.members() {
+        prepared.push(PreparedEdge {
+            dataset: env
+                .snapshot
+                .open_lance_dataset(&format!("edge:{}", member.edge_type))
+                .await?,
+            probes: endpoint_probes(member.direction, env.catalog.system_columns),
+        });
+    }
+    Ok(prepared)
+}
+
+/// Emit topology pairs for one Budgeted source window or a drained legacy input.
+/// Budgeted execution uses prepared indexed members; legacy execution chooses
+/// its recorded start through `decide_expand_start`.
 pub(super) async fn execute_expand<F>(
     wide: &RecordBatch,
     env: &GraphEnv,
     step: &ExpandStep,
+    prepared: Option<&[PreparedEdge]>,
     switch: &Gauge,
     memory: &WorkMemory,
     emit: impl FnMut(ExpandedPairs) -> F + Send,
@@ -439,26 +470,53 @@ where
         .map_err(|error| memory.error(error))?;
     let memory = &work;
     memory.check().map_err(|error| memory.error(error))?;
-    let start = decide_expand_start(
-        Some(wide.num_rows()),
-        &env.graph_index,
-        &env.snapshot,
-        &env.catalog,
-        step,
-        memory,
-    )
-    .await?;
-    let (start_indexed, hop_policy) = match start {
-        ExpandStart::Csr => {
-            Switch::Csr.record(switch);
-            (None, HopPolicy::Off)
+    if step.members().is_empty() {
+        return Ok(());
+    }
+    let (start_indexed, hop_policy) = match &step.execution {
+        ExpandExecution::Budgeted(_) => {
+            memory
+                .entries::<(Dataset, Vec<EndpointColumns>)>(step.members().len())
+                .map_err(|error| memory.error(error))?;
+            let prepared = prepared.ok_or_else(|| {
+                OmniError::manifest_internal("budgeted expansion requires prepared datasets")
+            })?;
+            let datasets = prepared
+                .iter()
+                .map(|edge| (edge.dataset.clone(), edge.probes.clone()))
+                .collect();
+            (Some(datasets), HopPolicy::Off)
         }
-        ExpandStart::Indexed {
-            edge_ds,
-            hop_policy,
-        } => {
-            Switch::IndexedScan.record(switch);
-            (Some(*edge_ds), hop_policy)
+        ExpandExecution::Named(named) => {
+            let start = decide_expand_start(
+                Some(wide.num_rows()),
+                &env.graph_index,
+                &env.snapshot,
+                &env.catalog,
+                step,
+                named,
+                memory,
+            )
+            .await?;
+            match start {
+                ExpandStart::Csr => {
+                    Switch::Csr.record(switch);
+                    (None, HopPolicy::Off)
+                }
+                ExpandStart::Indexed {
+                    edge_ds,
+                    hop_policy,
+                } => {
+                    Switch::IndexedScan.record(switch);
+                    (
+                        Some(vec![(
+                            *edge_ds,
+                            endpoint_probes(named.member.direction, env.catalog.system_columns),
+                        )]),
+                        hop_policy,
+                    )
+                }
+            }
         }
     };
     execute_expand_bfs(
@@ -475,8 +533,6 @@ where
     .await
 }
 
-/// Where an Expand starts: the CSR, or the BTREE edge scans with the policy
-/// that may still switch it to the CSR mid-flight.
 pub(super) enum ExpandStart {
     Csr,
     Indexed {
@@ -503,13 +559,22 @@ pub(super) async fn decide_expand_start(
     snapshot: &Snapshot,
     catalog: &Catalog,
     step: &ExpandStep,
+    named: &NamedExpand,
     memory: &WorkMemory,
 ) -> Result<ExpandStart> {
+    let member = &named.member;
+    let edge_type = &member.edge_type;
+    let direction = member.direction;
     let effective_max_hops = step.max_hops;
-    let key_col = endpoint_columns(step.direction, catalog.system_columns).key;
-    let edge_table_key = format!("edge:{}", step.edge_type);
+    let key_col = endpoint_columns(direction, catalog.system_columns).key;
+    let edge_table_key = format!("edge:{edge_type}");
+    if snapshot.dataset(&edge_table_key).is_none() {
+        return Err(OmniError::manifest(missing_graph_type_at_snapshot(
+            &edge_table_key,
+        )));
+    }
 
-    let observed_indexed = match (&step.origin, frontier_rows, step.mode) {
+    let observed_indexed = match (&named.origin, frontier_rows, named.mode) {
         (ModeOrigin::Costed(inputs), Some(observed), ExpandMode::Csr)
             if (observed as u64) < inputs.frontier_rows =>
         {
@@ -521,10 +586,10 @@ pub(super) async fn decide_expand_start(
         _ => false,
     };
 
-    if step.mode == ExpandMode::Csr && !observed_indexed {
+    if named.mode == ExpandMode::Csr && !observed_indexed {
         tracing::debug!(
             target: "omnigraph::traverse",
-            edge = %step.edge_type,
+            edge = %edge_type,
             frontier = ?frontier_rows,
             estimate = ?step.frontier_estimate,
             hops = effective_max_hops,
@@ -538,7 +603,7 @@ pub(super) async fn decide_expand_start(
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
     let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
-    for orientation in endpoint_probes(step.direction, catalog.system_columns)
+    for orientation in endpoint_probes(direction, catalog.system_columns)
         .iter()
         .skip(1)
     {
@@ -550,7 +615,7 @@ pub(super) async fn decide_expand_start(
         };
     }
 
-    let corrected = match &step.origin {
+    let corrected = match &named.origin {
         ModeOrigin::Costed(inputs) => {
             let mut inputs = inputs.clone();
             if let Some(observed) = frontier_rows {
@@ -568,7 +633,7 @@ pub(super) async fn decide_expand_start(
     {
         tracing::debug!(
             target: "omnigraph::traverse",
-            edge = %step.edge_type,
+            edge = %edge_type,
             frontier = ?frontier_rows,
             estimate = ?step.frontier_estimate,
             hops = effective_max_hops,
@@ -583,7 +648,7 @@ pub(super) async fn decide_expand_start(
 
     tracing::debug!(
         target: "omnigraph::traverse",
-        edge = %step.edge_type,
+        edge = %edge_type,
         frontier = ?frontier_rows,
         estimate = ?step.frontier_estimate,
         hops = effective_max_hops,
@@ -592,10 +657,10 @@ pub(super) async fn decide_expand_start(
     );
     crate::instrumentation::record_expand_path(true);
     memory.metric("expand_indexed", 1);
-    warn_on_degraded_coverage(&coverage, key_col, &step.edge_type);
+    warn_on_degraded_coverage(&coverage, key_col, edge_type);
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
-        None if matches!(step.origin, ModeOrigin::Pinned) => HopPolicy::Off,
+        None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
         None => {
             return Err(OmniError::manifest_internal(
                 "indexed expand requires a pinned mode or cost inputs",
@@ -608,30 +673,23 @@ pub(super) async fn decide_expand_start(
     })
 }
 
-/// An edge type's property columns that a filtered scan may project, sorted for
-/// determinism. Blobs are excluded: Lance rejects blob projection in a filtered
-/// scan (node scans carry the same guard) and typecheck rejects the access.
-pub(super) fn projectable_edge_property_columns(
-    edge_def: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<&str> {
-    let mut cols: Vec<&str> = edge_def
-        .properties
-        .keys()
-        .map(String::as_str)
-        .filter(|c| !edge_def.blob_properties.contains(*c))
-        .collect();
-    cols.sort_unstable();
-    cols
-}
-
+/// A common attachment schema, shared by every member and the final output.
+/// The concrete type is synthesized after reading persisted columns.
 pub(super) fn bound_edge_pair_schema(
     catalog: &Catalog,
-    edge_type: &str,
+    members: &[EdgeMember],
+    include_type: bool,
 ) -> Result<arrow_schema::SchemaRef> {
-    let edge = catalog
-        .edge_types
-        .get(edge_type)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{edge_type}'")))?;
+    let mut names = Vec::with_capacity(members.len());
+    for member in members {
+        if !catalog.edge_types.contains_key(&member.edge_type) {
+            return Err(OmniError::manifest(format!(
+                "unknown edge type '{}'",
+                member.edge_type
+            )));
+        }
+        names.push(member.edge_type.clone());
+    }
     let mut fields = vec![
         Field::new("~expand_source_row", DataType::UInt32, false),
         Field::new("~expand_destination_id", DataType::Utf8, false),
@@ -640,21 +698,29 @@ pub(super) fn bound_edge_pair_schema(
         catalog.system_columns.id,
         catalog.system_columns.src,
         catalog.system_columns.dst,
-    ]
-    .into_iter()
-    .chain(projectable_edge_property_columns(edge))
-    {
-        if fields.iter().any(|field| field.name() == name) {
+    ] {
+        fields.push(Field::new(name, DataType::Utf8, false));
+    }
+    if include_type {
+        fields.push(Field::new(EDGE_TYPE_COLUMN, DataType::Utf8, false));
+    }
+    for (name, prop) in common_edge_properties(catalog, &names) {
+        // Blob properties are never projected, as in node scans: typecheck
+        // refuses a Blob as a `.gq` read value, so this scan leaves its
+        // descriptors unread, and Blob values are read through `read_blob_at`.
+        if members.iter().any(|member| {
+            catalog.edge_types[&member.edge_type]
+                .blob_properties
+                .contains(&name)
+        }) {
+            continue;
+        }
+        if fields.iter().any(|field| field.name() == &name) {
             return Err(OmniError::manifest_internal(format!(
                 "duplicate bound-edge pair column '{name}'"
             )));
         }
-        fields.push(
-            edge.arrow_schema
-                .field_with_name(name)
-                .cloned()
-                .map_err(OmniError::arrow_internal)?,
-        );
+        fields.push(Field::new(name, prop.to_arrow(), prop.nullable));
     }
     Ok(Arc::new(Schema::new(fields)))
 }
@@ -665,15 +731,17 @@ pub(super) async fn produce_bound_edge_pairs<F>(
     snapshot: &Snapshot,
     catalog: &Catalog,
     src_var: &str,
-    edge_type: &str,
-    direction: Direction,
+    member: &EdgeMember,
+    prepared: Option<&Dataset>,
+    schema: &arrow_schema::SchemaRef,
     memory: &Arc<WorkMemory>,
     mut emit: impl FnMut(RecordBatch, Arc<WorkMemory>) -> F + Send,
 ) -> Result<()>
 where
     F: std::future::Future<Output = Result<()>> + Send,
 {
-    let schema = bound_edge_pair_schema(catalog, edge_type)?;
+    let edge_type = &member.edge_type;
+    let direction = member.direction;
     if wide.num_rows() == 0 {
         return Ok(());
     }
@@ -697,6 +765,9 @@ where
         .string(src_ids.value_data().len())
         .map_err(|error| memory.error(error))?;
     let mut rows_by_src: HashMap<&str, Vec<u32>> = HashMap::new();
+    source_memory
+        .charge_traversal(src_ids.len() as u64)
+        .map_err(|error| memory.error(error))?;
     for row in 0..src_ids.len() {
         source_memory.check().map_err(|error| memory.error(error))?;
         let ordinal = u32::try_from(row)
@@ -710,13 +781,19 @@ where
     let attach_columns: Vec<&str> = schema.fields()[2..]
         .iter()
         .map(|field| field.name().as_str())
+        .filter(|name| *name != EDGE_TYPE_COLUMN)
         .collect();
     source_memory
         .checkpoint()
         .map_err(|error| memory.error(error))?;
-    let dataset = snapshot
-        .open_lance_dataset(&format!("edge:{edge_type}"))
-        .await?;
+    let dataset = match prepared {
+        Some(dataset) => dataset.clone(),
+        None => {
+            snapshot
+                .open_lance_dataset(&format!("edge:{edge_type}"))
+                .await?
+        }
+    };
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
@@ -757,7 +834,47 @@ where
                 .map(|name| batch.schema().index_of(name))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(OmniError::arrow_internal)?;
-            let attach = batch.project(&indices).map_err(OmniError::arrow_internal)?;
+            let persisted = batch.project(&indices).map_err(OmniError::arrow_internal)?;
+            let type_values: Option<ArrayRef> = if schema.index_of(EDGE_TYPE_COLUMN).is_ok() {
+                input_memory
+                    .string(edge_type.len().saturating_mul(batch.num_rows()))
+                    .map_err(|error| memory.error(error))?;
+                input_memory
+                    .entries::<i32>(batch.num_rows().saturating_add(1))
+                    .map_err(|error| memory.error(error))?;
+                Some(Arc::new(StringArray::from_iter_values(
+                    std::iter::repeat_n(edge_type.as_str(), batch.num_rows()),
+                )))
+            } else {
+                None
+            };
+            let columns = schema.fields()[2..]
+                .iter()
+                .map(|field| {
+                    if field.name() == EDGE_TYPE_COLUMN {
+                        Ok(Arc::clone(
+                            type_values
+                                .as_ref()
+                                .expect("type field requests synthesized values"),
+                        ))
+                    } else {
+                        persisted
+                            .column_by_name(field.name())
+                            .cloned()
+                            .ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "bound edge scan has no '{}'",
+                                    field.name()
+                                ))
+                            })
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let attach = RecordBatch::try_new(
+                Arc::new(Schema::new(schema.fields()[2..].to_vec())),
+                columns,
+            )
+            .map_err(OmniError::arrow_internal)?;
             let data: Vec<_> = attach
                 .columns()
                 .iter()
@@ -772,6 +889,9 @@ where
                     .map_err(|error| memory.error(error))?,
             );
             for row in 0..batch.num_rows() {
+                memory
+                    .charge_traversal(1)
+                    .map_err(|error| memory.error(error))?;
                 if probe == 1 && keys.value(row) == opposites.value(row) {
                     continue;
                 }
@@ -791,6 +911,9 @@ where
                     })
                     .map_err(OmniError::arrow_internal)?;
                 for &source_row in wide_rows {
+                    memory
+                        .charge_traversal(1)
+                        .map_err(|error| memory.error(error))?;
                     memory.check().map_err(|error| memory.error(error))?;
                     if !source_rows.is_empty()
                         && (source_rows.len() == row_limit
@@ -798,7 +921,7 @@ where
                     {
                         let output = bound_edge_pair_batch(
                             &attach,
-                            &schema,
+                            schema,
                             opposite_col,
                             std::mem::take(&mut source_rows),
                             std::mem::take(&mut edge_rows),
@@ -823,7 +946,7 @@ where
             if !source_rows.is_empty() {
                 let output = bound_edge_pair_batch(
                     &attach,
-                    &schema,
+                    schema,
                     opposite_col,
                     source_rows,
                     edge_rows,
@@ -910,36 +1033,16 @@ pub(super) fn resolve_csr<'g>(
     })
 }
 
-/// The one Expand BFS, shared by both execution strategies. Per hop it asks
-/// the active source for neighbors — a batched `scan_edges_by_endpoint` per
-/// orientation against the persisted src/dst BTREE (Indexed: cost scales with
-/// the frontier, not |E|), or in-memory adjacency slices (Csr). Emission,
-/// dedup and hop gating are identical either way, so
-/// both strategies produce the same `(src_row, dst_id)` pairs by construction.
-///
-/// Multi-hop only advances for same-type edges; a cross-type traversal is
-/// structurally single-hop. The Indexed source enforces that BEFORE scanning:
-/// it interns every endpoint string into ONE dense id space, so a cross-type
-/// id-string collision (a Person and a Company sharing an id) would otherwise
-/// let hop 2 de-intern a destination id back to the colliding source-type id
-/// and match its edges, emitting rows the CSR source never produces.
-///
-/// Issue #533 lives here: `hop_policy` is consulted at the top of every
-/// indexed hop after the first with the OBSERVED union frontier, and a
-/// traversal that has outgrown the indexed path swaps to CSR mid-flight,
-/// translating frontier/visited/seen state through the id strings once. Every
-/// emitted destination so far is an edge endpoint, so it exists in the CSR
-/// dictionaries — nothing is lost in translation; a frontier or visited entry
-/// absent from the CSR dictionary has no edges at all and is dropped as
-/// unreachable.
-///
+/// Shared BFS keeps one visited set across member orientations and source kinds.
+/// Budgeted indexed hops admit full physical-table rows before endpoint scans.
+/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
     step: &ExpandStep,
-    start_indexed: Option<Dataset>,
+    start_indexed: Option<Vec<(Dataset, Vec<EndpointColumns>)>>,
     hop_policy: HopPolicy,
     side: &Gauge,
     memory: &WorkMemory,
@@ -949,8 +1052,6 @@ where
     F: std::future::Future<Output = Result<()>> + Send,
 {
     let src_var = &step.src;
-    let edge_type = &step.edge_type;
-    let direction = step.direction;
     let min_hops = step.min_hops;
     let work = memory
         .child("execute_expand_bfs")
@@ -968,26 +1069,41 @@ where
         .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
         .clone();
 
-    let edge_def = catalog
-        .edge_types
-        .get(edge_type)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
-    let same_type = edge_def.from_type == edge_def.to_type;
-    let probes = endpoint_probes(direction, catalog.system_columns);
-
+    let same_type = step.src_type == step.dst_type;
+    let csr_details = match &step.execution {
+        ExpandExecution::Named(named) => {
+            let edge = catalog
+                .edge_types
+                .get(&named.member.edge_type)
+                .ok_or_else(|| {
+                    OmniError::manifest(format!("unknown edge type '{}'", named.member.edge_type))
+                })?;
+            Some((edge, &named.member))
+        }
+        ExpandExecution::Budgeted(_) => None,
+    };
+    let budgeted = step.budgeted();
     let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
 
     let mut active = match start_indexed {
-        Some(edge_ds) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
-            edge_ds,
+        Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
+            datasets,
             interner: crate::graph_index::TypeIndex::new(),
             neighbor_map: HashMap::new(),
         })),
         None => {
+            let (edge_def, member) = csr_details.ok_or_else(|| {
+                OmniError::manifest_internal("budgeted expansion cannot build CSR")
+            })?;
             let gi = graph_index.get().await?.ok_or_else(|| {
                 OmniError::manifest("graph index required for CSR traversal".to_string())
             })?;
-            ActiveExpandSource::Csr(resolve_csr(gi, edge_def, edge_type, direction)?)
+            ActiveExpandSource::Csr(resolve_csr(
+                gi,
+                edge_def,
+                &member.edge_type,
+                member.direction,
+            )?)
         }
     };
 
@@ -1069,6 +1185,9 @@ where
                 ),
             };
             if switch {
+                let (edge_def, member) = csr_details.ok_or_else(|| {
+                    OmniError::manifest_internal("budgeted expansion cannot switch to CSR")
+                })?;
                 crate::instrumentation::record_traversal_mid_switch();
                 crate::instrumentation::record_expand_path(false);
                 memory.metric("expand_csr", 1);
@@ -1076,8 +1195,12 @@ where
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
-                let csr_source =
-                    ActiveExpandSource::Csr(resolve_csr(gi, edge_def, edge_type, direction)?);
+                let csr_source = ActiveExpandSource::Csr(resolve_csr(
+                    gi,
+                    edge_def,
+                    &member.edge_type,
+                    member.direction,
+                )?);
                 let old = std::mem::replace(&mut active, csr_source);
                 let ActiveExpandSource::Indexed(old_src) = old else {
                     unreachable!("switch only fires while the Indexed source is active");
@@ -1112,7 +1235,7 @@ where
                 }
                 tracing::debug!(
                     target: "omnigraph::traverse",
-                    edge = %edge_type,
+                    edge = %member.edge_type,
                     hop,
                     frontier = union_dense.len(),
                     mode = "csr",
@@ -1142,16 +1265,18 @@ where
                         .to_string()
                 })
                 .collect();
-            scan_neighbor_map(
-                &src.edge_ds,
-                &probes,
-                &union_keys,
-                &mut src.interner,
-                &mut src.neighbor_map,
-                &hop_memory,
-                memory,
-            )
-            .await?;
+            for (dataset, probes) in &src.datasets {
+                scan_neighbor_map(
+                    dataset,
+                    probes,
+                    &union_keys,
+                    &mut src.interner,
+                    &mut src.neighbor_map,
+                    &hop_memory,
+                    memory,
+                )
+                .await?;
+            }
         }
 
         for i in 0..n {
@@ -1172,7 +1297,13 @@ where
                     ),
                 };
                 for &neighbor in fwd.iter().chain(rev) {
-                    memory.check().map_err(|error| memory.error(error))?;
+                    if budgeted {
+                        memory
+                            .charge_traversal(1)
+                            .map_err(|error| memory.error(error))?;
+                    } else {
+                        memory.check().map_err(|error| memory.error(error))?;
+                    }
                     let is_self = same_type && hop == 1 && neighbor == node;
                     if !is_self && same_type {
                         if visited[i].contains(&neighbor) {
@@ -1345,7 +1476,7 @@ pub(super) enum ActiveExpandSource<'g> {
 }
 
 pub(super) struct IndexedExpandSource {
-    pub(super) edge_ds: Dataset,
+    pub(super) datasets: Vec<(Dataset, Vec<EndpointColumns>)>,
     pub(super) interner: crate::graph_index::TypeIndex,
     /// This hop's dense key -> dense neighbors (scan order; duplicates
     /// preserved, like CSR multi-edges). Rebuilt per hop.
@@ -1437,6 +1568,26 @@ async fn scan_edges(
         .map_err(|error| memory.error(error))
 }
 
+/// The backend has no selective pre-page admission hook. Reserve the
+/// captured dataset's trusted physical rows before each indexed probe.
+fn physical_scan_rows<E: std::fmt::Display>(
+    rows: impl IntoIterator<Item = std::result::Result<usize, E>>,
+) -> Result<u64> {
+    rows.into_iter().try_fold(0u64, |total, rows| {
+        let rows = rows.map_err(|error| {
+            OmniError::manifest(format!(
+                "cannot bound traversal scan: physical fragment metadata unavailable: {error}"
+            ))
+        })?;
+        let rows = u64::try_from(rows).map_err(|_| {
+            OmniError::manifest("cannot bound traversal scan: physical row count exceeds UInt64")
+        })?;
+        total.checked_add(rows).ok_or_else(|| {
+            OmniError::manifest("cannot bound traversal scan: physical row count sum overflow")
+        })
+    })
+}
+
 async fn scan_edges_stream(
     ds: &Dataset,
     orientation: EndpointColumns,
@@ -1444,6 +1595,16 @@ async fn scan_edges_stream(
     keys: &[String],
     memory: &WorkMemory,
 ) -> Result<SendableRecordBatchStream> {
+    if memory.traversal_limited() {
+        let rows = physical_scan_rows(
+            ds.get_fragments()
+                .iter()
+                .map(|fragment| fragment.fast_physical_rows()),
+        )?;
+        memory
+            .charge_traversal(rows)
+            .map_err(|error| memory.error(error))?;
+    }
     memory
         .entries::<datafusion::prelude::Expr>(keys.len())
         .map_err(|error| memory.error(error))?;
@@ -1477,4 +1638,44 @@ async fn scan_edges_stream(
     .await?;
     let (_, stream) = memory.stream(plan).map_err(|error| memory.error(error))?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod traversal_scan_admission_tests {
+    use super::physical_scan_rows;
+
+    #[test]
+    fn trusted_physical_rows_are_summed_without_a_scan_issue_659() {
+        assert_eq!(physical_scan_rows([Ok::<_, &str>(3), Ok(7)]).unwrap(), 10);
+        assert_eq!(
+            physical_scan_rows(std::iter::empty::<Result<usize, &str>>()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_fragment_metadata_keeps_the_backend_cause_issue_659() {
+        let error = physical_scan_rows([Ok(3), Err("writer version is absent")]).unwrap_err();
+        assert!(
+            matches!(&error, crate::error::OmniError::Manifest(error) if error.kind == crate::error::ManifestErrorKind::BadRequest)
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("physical fragment metadata unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("writer version is absent"), "{text}");
+        assert!(!text.contains("sum overflow"), "{text}");
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn physical_row_sum_overflow_has_a_distinct_refusal_issue_659() {
+        let error = physical_scan_rows([Ok::<_, &str>(usize::MAX), Ok(1)]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("physical row count sum overflow")
+        );
+    }
 }

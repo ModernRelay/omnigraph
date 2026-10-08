@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
-mod seams;
+pub(crate) mod seams;
 mod settings;
 
 #[cfg(tokio_unstable)]
@@ -22,16 +23,24 @@ pub(crate) use seams::{admit_seam, arm_seams, finish_seams, refuse_two_store_act
 
 const WORKER_INPUT: &str = "OMNIGRAPH_GQT_WORKER_INPUT";
 const WORKER_REPORT: &str = "OMNIGRAPH_GQT_WORKER_REPORT";
-const LIMIT: usize = 16 * 1024 * 1024;
+const LIMIT: usize = 256 * 1024 * 1024;
 
 tokio::task_local! {
     static OBSERVATIONS: RefCell<Observations>;
 }
 
 #[derive(Default)]
+struct SessionObservations {
+    values: Vec<String>,
+    evidence: Vec<serde_json::Value>,
+}
+
+#[derive(Default)]
 struct Observations {
     values: Vec<String>,
+    sessions: BTreeMap<usize, SessionObservations>,
     bytes: usize,
+    entries: usize,
     overflow: bool,
     operation: Option<serde_json::Value>,
     evidence: Vec<serde_json::Value>,
@@ -60,10 +69,28 @@ pub(crate) fn observe(value: impl FnOnce() -> String) {
             }
             let value = value();
             events.bytes += value.len();
-            if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
+            if events.bytes > LIMIT || events.entries >= 100_000 {
                 events.overflow = true;
             } else {
-                events.values.push(value);
+                events.entries += 1;
+                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
+                    events.sessions.entry(index).or_default().values.push(value);
+                } else {
+                    events.values.push(value);
+                }
+            }
+        })
+        .unwrap_or_default();
+}
+
+/// Append each session's ordered evidence in declaration order, independent of completion timing.
+pub(crate) fn finish_concurrent_observations() {
+    OBSERVATIONS
+        .try_with(|events| {
+            let mut events = events.borrow_mut();
+            for (_, session) in std::mem::take(&mut events.sessions) {
+                events.values.extend(session.values);
+                events.evidence.extend(session.evidence);
             }
         })
         .unwrap_or_default();
@@ -92,7 +119,7 @@ fn lifecycle_probe() -> (
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     ];
     let guards = [
-        &omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN,
+        &omnigraph::seams::catalog::INIT_AFTER_COORDINATOR_INIT,
         &omnigraph::seams::catalog::OPEN_BEFORE_SCHEMA_CONTRACT_READ,
     ]
     .into_iter()
@@ -165,7 +192,7 @@ const SCHEDULE_COUNTS: [&str; 3] = ["makespan", "span", "phases"];
 
 /// At the end of the run, one `io` evidence row per label group (the counts)
 /// and one measurement per group (bytes, the request log); the groups cover
-/// every request the store saw.
+/// every request either store saw, the Lance realm's and the control realm's.
 pub(crate) fn measure_finish() {
     for group in crate::measure::finish() {
         let label = group.label;
@@ -218,10 +245,20 @@ pub(crate) fn record(kind: &str, value: serde_json::Value) {
                 event["session"] = serde_json::json!(session);
             }
             events.bytes += event.to_string().len();
-            if events.bytes > LIMIT || events.values.len() + events.evidence.len() >= 100_000 {
+            if events.bytes > LIMIT || events.entries >= 100_000 {
                 events.overflow = true;
             } else {
-                events.evidence.push(event);
+                events.entries += 1;
+                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
+                    events
+                        .sessions
+                        .entry(index)
+                        .or_default()
+                        .evidence
+                        .push(event);
+                } else {
+                    events.evidence.push(event);
+                }
             }
         })
         .unwrap_or_default();
@@ -301,6 +338,8 @@ struct Input {
     effective_settings: settings::EffectiveSettings,
     #[serde(default)]
     engine: Engine,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     bless: bool,
     /// `--measure`: the DST worker records every store request per step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -579,6 +618,7 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
         Selection {
             target: None,
             storage: None,
+            store: None,
             seed: None,
             fast_tier: true,
             measure: None,
@@ -600,6 +640,7 @@ pub fn run_selected(
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
+    store: Option<&str>,
 ) -> CaseOutcome {
     run_with_selection(
         path,
@@ -608,6 +649,7 @@ pub fn run_selected(
         Selection {
             target,
             storage,
+            store,
             seed,
             fast_tier: false,
             measure,
@@ -619,6 +661,7 @@ pub fn run_selected(
 struct Selection<'a> {
     target: Option<&'a str>,
     storage: Option<&'a str>,
+    store: Option<&'a str>,
     seed: Option<u64>,
     fast_tier: bool,
     measure: Option<MeasureOptions>,
@@ -1249,7 +1292,15 @@ fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), Strin
         .keep()
         .map_err(|e| format!("report_failed: retain summary: {e}"))?;
     println!("GQT report: {}", path.display());
-    println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        println!("GQT replay unavailable: external store contents are not frozen");
+    } else {
+        println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    }
     Ok(())
 }
 
@@ -1407,8 +1458,19 @@ fn run_invocation(
     if selected_envs.is_empty() {
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
+    case.admit_store(selection.store)?;
+    if selection.measure.is_some()
+        && !selected_envs.iter().any(|env| {
+            matches!(
+                env.execution,
+                Execution::Dst { .. } | Execution::ServerDst { .. }
+            )
+        })
+    {
+        return Err("invalid_case: --measure requires a selected DST environment".into());
+    }
     for env in &selected_envs {
-        env.admit(case.needs_dst())?;
+        env.admit_store(case.needs_dst(), selection.store)?;
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -1477,6 +1539,7 @@ fn run_invocation(
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
+                    store: selection.store.map(str::to_owned),
                     bless,
                     measure: selection.measure.is_some(),
                     model: selection
@@ -1540,6 +1603,24 @@ fn run_invocation(
     }
 }
 
+fn store_environment_variable(store: &str, key: &str) -> bool {
+    if store.starts_with("s3://") {
+        return key.starts_with("AWS_");
+    }
+    store.starts_with("az://")
+        && (key.starts_with("AZURE_")
+            || matches!(
+                key,
+                "AZURITE_BLOB_STORAGE_URL"
+                    | "IDENTITY_ENDPOINT"
+                    | "IDENTITY_HEADER"
+                    | "MSI_ENDPOINT"
+                    | "AWS_ALLOW_HTTP"
+                    | "OBJECT_STORE_CLIENT_MAX_RETRIES"
+                    | "OBJECT_STORE_CLIENT_RETRY_TIMEOUT"
+            ))
+}
+
 fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<WorkerReport, String> {
     input.effective_settings.verify_expected(input.seed)?;
     let started = Instant::now();
@@ -1559,6 +1640,12 @@ fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<Worke
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     input.effective_settings.configure(&mut cmd);
+    if let Some(store) = &input.store {
+        cmd.envs(std::env::vars_os().filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| store_environment_variable(store, key))
+        }));
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("worker_failed: spawn: {e}"))?;
@@ -1671,7 +1758,10 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(case.needs_dst())?;
+    case.admit_store(input.store.as_deref())?;
+    input
+        .environment
+        .admit_store(case.needs_dst(), input.store.as_deref())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1692,7 +1782,13 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                 .map_err(|e| format!("worker_failed: runtime: {e}"))?;
             runtime.block_on(capture(
                 input_digest,
-                crate::execute_case_on_engine(&case, &input.case_path, input.bless, input.engine),
+                crate::execute_case_on_engine(
+                    &case,
+                    &input.case_path,
+                    input.bless,
+                    input.engine,
+                    input.store.as_deref(),
+                ),
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
@@ -1736,6 +1832,7 @@ async fn capture(
                 });
             #[cfg(tokio_unstable)]
             clear_phase_observers();
+            finish_concurrent_observations();
             measure_finish();
             let observations = OBSERVATIONS.with(|events| events.take());
             let result = if observations.overflow {
@@ -1790,7 +1887,8 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
             crate::measure::prepare(model)
         });
         crate::concurrent::install(measure);
-        let base: std::sync::Arc<dyn StorageAdapter> = resources.adapter.clone();
+        let base: std::sync::Arc<dyn StorageAdapter> =
+            crate::measure::wrap_adapter(resources.adapter.clone(), crate::concurrent::touch);
         let decoration =
             omnigraph_dst::harness::FailingStorage::quiet(base, resources.root.clone());
         omnigraph::storage::STORAGE.clear();
@@ -1936,6 +2034,13 @@ fn replay_attempts(
 ) -> Result<(), String> {
     refuse_ambient()?;
     crate::engine_from_env()?;
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        return Err("invalid_case: external-store invocations cannot replay; the report does not freeze store contents".into());
+    }
     for attempt in &summary.attempts {
         attempt
             .input
@@ -2070,6 +2175,62 @@ mod action_tests {
     use crate::runner_config::SeamAction;
 
     #[test]
+    fn external_worker_environment_is_scoped_to_its_backend() {
+        for (uri, accepted) in [
+            ("file:///tmp/graph", vec![]),
+            (
+                "s3://bucket/graph",
+                vec![
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_ALLOW_HTTP",
+                    "AWS_S3_FORCE_PATH_STYLE",
+                ],
+            ),
+            (
+                "az://container/graph",
+                vec![
+                    "AZURE_STORAGE_ACCOUNT_NAME",
+                    "AZURE_STORAGE_ACCOUNT_KEY",
+                    "AZURE_STORAGE_USE_EMULATOR",
+                    "AZURITE_BLOB_STORAGE_URL",
+                    "IDENTITY_ENDPOINT",
+                    "IDENTITY_HEADER",
+                    "MSI_ENDPOINT",
+                    "AWS_ALLOW_HTTP",
+                    "OBJECT_STORE_CLIENT_MAX_RETRIES",
+                    "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
+                ],
+            ),
+        ] {
+            for key in &accepted {
+                assert!(super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+            for key in [
+                "FAILPOINTS",
+                "RAYON_NUM_THREADS",
+                "LANCE_CPU_THREADS",
+                "OMNIGRAPH_ENGINE",
+                "DST_ENTROPY_SEED",
+                "HOME",
+                "PATH",
+                "GQT_WORKER_INPUT",
+            ] {
+                assert!(!super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+        }
+        assert!(!super::store_environment_variable(
+            "s3://bucket/graph",
+            "AZURE_STORAGE_ACCOUNT_KEY"
+        ));
+        assert!(!super::store_environment_variable(
+            "az://container/graph",
+            "AWS_SECRET_ACCESS_KEY"
+        ));
+    }
+    #[test]
     fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
         for effects in [
             [Effect::Fail, Effect::Contention],
@@ -2093,6 +2254,200 @@ mod action_tests {
             admitted_effect(SeamAction::Contention, &[Effect::Fail, Effect::Skip]),
             None,
             "explicit contention cannot fall back to another effect"
+        );
+    }
+
+    fn concurrent_session(index: usize, step: u64) -> crate::measure::SessionCtx {
+        crate::measure::SessionCtx::new(
+            index,
+            crate::measure::Label {
+                slot: ["w2", "r1"][index],
+                step,
+                line: Some(18),
+                kind: "query",
+            },
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_capture_retains_partial_session_evidence_after_panic() {
+        let report = super::capture(
+            "same-input".into(),
+            crate::measure::SESSION.scope(concurrent_session(1, 1), async {
+                super::begin_operation(serde_json::json!({"ordinal": 1}));
+                super::observe(|| "partial read".into());
+                super::record("query_result", serde_json::json!({"rows": ["alice"]}));
+                panic!("session panicked before block completion");
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.code, "worker_failed");
+        assert_eq!(report.observations, ["partial read"]);
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(report.evidence[0]["session"], "r1");
+        assert_eq!(report.evidence[0]["operation"]["ordinal"], 1);
+        assert_eq!(
+            report.evidence[0]["value"]["rows"],
+            serde_json::json!(["alice"])
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_capture_shares_report_limits_across_sessions() {
+        let entries = super::capture("same-input".into(), async {
+            crate::measure::SESSION
+                .scope(concurrent_session(0, 1), async {
+                    for _ in 0..50_000 {
+                        super::observe(|| "observation".into());
+                    }
+                })
+                .await;
+            super::finish_concurrent_observations();
+            crate::measure::SESSION
+                .scope(concurrent_session(1, 1), async {
+                    for _ in 0..50_001 {
+                        super::record("result", serde_json::Value::Null);
+                    }
+                })
+                .await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(entries.code, "report_failed");
+        assert_eq!(entries.observations.len(), 50_000);
+        assert_eq!(entries.evidence.len(), 50_000);
+
+        let bytes = super::capture("same-input".into(), async {
+            for index in [0, 1] {
+                crate::measure::SESSION
+                    .scope(concurrent_session(index, 1), async {
+                        super::observe(|| "x".repeat(super::LIMIT / 2));
+                    })
+                    .await;
+            }
+            super::record("result", serde_json::Value::Null);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes.code, "report_failed");
+        assert_eq!(bytes.observations.len(), 2);
+        assert!(bytes.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_preserves_session_results_across_interleavings() {
+        async fn report(order: &[usize], row: &str) -> super::WorkerReport {
+            super::capture("same-input".into(), async {
+                for ordinal in [1, 2] {
+                    super::begin_operation(serde_json::json!({"ordinal": ordinal}));
+                    super::observe(|| format!("before block {ordinal}"));
+                    for &event in order {
+                        let index = event / 2;
+                        let ctx = concurrent_session(index, ordinal);
+                        crate::measure::SESSION
+                            .scope(ctx, async {
+                                super::observe(|| format!("session {index} event {}", event % 2));
+                                super::record(
+                                    "query_result",
+                                    serde_json::json!({"event": event % 2, "rows": [{"name": row}]}),
+                                );
+                            })
+                            .await;
+                    }
+                    crate::record_concurrent_outcome(
+                        ordinal as usize,
+                        &[serde_json::json!({"label": "w2", "outcome": "ok"}),
+                          serde_json::json!({"label": "r1", "outcome": "ok"})],
+                        &crate::concurrent::Outcome {
+                            stuck_at: None,
+                            failure: None,
+                            unattributed: 0,
+                            log: Vec::new(),
+                            wall_ms: 0,
+                        },
+                    );
+                    super::observe(|| format!("after block {ordinal}"));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        let expected = super::comparable(&report(&[0, 2, 1, 3], "alice").await).unwrap();
+        let interleaved = super::comparable(&report(&[2, 0, 3, 1], "alice").await).unwrap();
+        assert!(
+            expected == interleaved,
+            "session completion order must not change replay evidence"
+        );
+        for (order, row) in [
+            (&[1, 2, 0, 3][..], "alice"),
+            (&[0, 2, 1][..], "alice"),
+            (&[0, 2, 1, 3][..], "bob"),
+        ] {
+            assert_ne!(
+                expected,
+                super::comparable(&report(order, row).await).unwrap(),
+                "per-session order, completeness and rows remain replay evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_replay_compares_outcomes_without_background_measurements() {
+        async fn report(
+            sessions: &[serde_json::Value],
+            block: &crate::concurrent::Outcome,
+        ) -> super::WorkerReport {
+            super::capture("same-input".into(), async {
+                crate::record_concurrent_outcome(3, sessions, block);
+                Ok(())
+            })
+            .await
+            .unwrap()
+        }
+
+        let mut sessions = vec![serde_json::json!({
+            "label": "r1", "outcome": "ok", "message": null, "script": null,
+        })];
+        let mut block = crate::concurrent::Outcome {
+            stuck_at: None,
+            failure: None,
+            unattributed: 2,
+            log: Vec::new(),
+            wall_ms: 5,
+        };
+        let expected = super::comparable(&report(&sessions, &block).await).unwrap();
+        block.unattributed = 3;
+        block.wall_ms = 9;
+        block.log.push(serde_json::json!({"wall_ms": 7}));
+        let measured = super::comparable(&report(&sessions, &block).await).unwrap();
+        assert!(
+            expected == measured,
+            "background I/O and timing measurements must not change replay equality"
+        );
+
+        block.stuck_at = Some(0);
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.stuck_at = None;
+        block.failure = Some("session starved".into());
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
+        );
+        block.failure = None;
+        sessions[0]["outcome"] = "failed".into();
+        sessions[0]["message"] = "query failed".into();
+        assert_ne!(
+            expected,
+            super::comparable(&report(&sessions, &block).await).unwrap()
         );
     }
 

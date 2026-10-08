@@ -11,6 +11,7 @@ use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 use super::TableIdentity;
 
 const MANIFEST_DIR: &str = "__manifest";
+const HISTORY_DIR: &str = "__history";
 const BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS: usize = 8;
 
 pub(crate) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
@@ -27,6 +28,12 @@ pub(crate) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
 
 pub fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
+}
+
+/// The `__history` dataset of the graph at `root`, a sibling of `__manifest`
+/// that every graph branch shares.
+pub fn history_uri(root: &str) -> String {
+    format!("{}/{}", root.trim_end_matches('/'), HISTORY_DIR)
 }
 
 /// Resolve a logical graph branch to its live native manifest ref.
@@ -105,7 +112,8 @@ pub async fn open_manifest_dataset_native_with_session(
 }
 
 /// Open one manifest branch together with the exact Lance branch lifetime
-/// that selected it.
+/// that selected it and the native ref name the logical branch resolved to
+/// (`None` for main).
 ///
 /// `checkout_branch` and `BranchContents` are separate reads. Surrounding the
 /// checkout with identifier reads prevents a concurrent delete/recreate from
@@ -113,18 +121,6 @@ pub async fn open_manifest_dataset_native_with_session(
 /// A later recreation is harmless: the returned identifier remains the
 /// witness for this pinned dataset and the coordinator's freshness probe will
 /// observe the new identity.
-pub(crate) async fn open_manifest_dataset_with_identifier_with_session(
-    root_uri: &str,
-    branch: Option<&str>,
-    control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, BranchIdentifier)> {
-    let (dataset, identifier, _native) =
-        open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
-    Ok((dataset, identifier))
-}
-
-/// [`open_manifest_dataset_with_identifier_with_session`] that also returns
-/// the native ref name the logical branch resolved to (`None` for main).
 pub(crate) async fn open_manifest_branch_with_identifier(
     root_uri: &str,
     branch: Option<&str>,
@@ -165,10 +161,6 @@ pub(crate) async fn open_manifest_branch_with_identifier(
     )))
 }
 
-fn format_table_version(version: u64) -> String {
-    format!("{version:020}")
-}
-
 pub(crate) fn table_object_id(identity: TableIdentity) -> String {
     format!(
         "table:{:016x}:{:016x}",
@@ -176,47 +168,10 @@ pub(crate) fn table_object_id(identity: TableIdentity) -> String {
     )
 }
 
-/// Row key of a registration: the identity plus the `__manifest` version that
-/// wrote it (RFC 0062 amends RFC 0028 §4.5's trailing Lance data version).
-pub(crate) fn version_object_id(identity: TableIdentity, manifest_version: u64) -> String {
-    format!(
-        "table_version:{:016x}:{:016x}:{}",
-        identity.stable_table_id,
-        identity.table_incarnation_id,
-        format_table_version(manifest_version)
-    )
-}
-
-pub(crate) fn tombstone_object_id(identity: TableIdentity, manifest_version: u64) -> String {
-    format!(
-        "table_tombstone:{:016x}:{:016x}:{}",
-        identity.stable_table_id,
-        identity.table_incarnation_id,
-        format_table_version(manifest_version)
-    )
-}
-
-/// The manifest version a registration or tombstone row key carries: the
-/// trailing segment of `version_object_id` / `tombstone_object_id`, so the
-/// clock is read from the already-projected `object_id` and no column is added.
-pub(crate) fn manifest_version_from_object_id(
-    object_id: &str,
-    identity: TableIdentity,
-    object_type: &str,
-) -> Result<u64> {
-    let prefix = format!(
-        "{object_type}:{:016x}:{:016x}:",
-        identity.stable_table_id, identity.table_incarnation_id
-    );
-    object_id
-        .strip_prefix(&prefix)
-        .filter(|suffix| suffix.len() == 20 && suffix.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|suffix| suffix.parse::<u64>().ok())
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "manifest {object_type} row has object_id '{object_id}', expected '{prefix}<manifest version>'"
-            ))
-        })
+/// Row key of a `replaced_table` row: the identity and the `__manifest`
+/// version whose publish replaced the row.
+pub(crate) fn replaced_table_object_id(identity: TableIdentity, replaced_at: u64) -> String {
+    format!("{}@{replaced_at}", table_object_id(identity))
 }
 
 pub(crate) fn table_uri_for_path(

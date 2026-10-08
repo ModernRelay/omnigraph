@@ -443,8 +443,12 @@ needs one). Files are UTF-8 with `\n` endings (a `\r` anywhere is
 refused); a trailing newline is
 insignificant; blank lines in the JSONL sections (seed, expect) are
 ignored; a `#` line inside a JSONL section is refused (comments live in
-the header); `//` comments inside query and mutate sections are simply GQ
-text. Header lines are `#` lines before the first section, keys
+the header), while inside a YAML section (runner, seam, generated recipe)
+it is YAML text; a YAML section's body is read with every line
+newline-terminated, so a block scalar ending the body keeps the final line
+break the file shows, and its mapping keys must be strings (a plain `true`,
+`1` or `~` key is refused); `//` comments inside query and mutate sections
+are simply GQ text. Header lines are `#` lines before the first section, keys
 `# issue:`, `# red_on:`, `# notes:`, `# traversal:`. `# issue:` is always
 required; `# red_on:` is required when `# issue:` names a number and
 optional under `# issue: none`; a header line is accepted exactly when
@@ -462,14 +466,36 @@ path (Execution semantics owns the default); a statement step traverses
 nothing and runs outside the pin. `# traversal:` in a file that names a
 server API (Execution routes, below) is refused: the pin is a task-local seam of the runner process.
 
-A file is: required `--- runner` (Explicit execution environments),
-then `--- schema`, then
-`--- seed`, then one or more steps, of
-which at least one is a query, mutate or cli step; a file missing any of these
-three leading sections, ordering them differently, or carrying no query,
-mutate or cli step (nothing would be asserted, a restart-only step list
-included) is refused. A `--- seam` may precede an operation as specified
+A file starts with required `--- runner` (Explicit execution environments),
+optionally followed by `--- schema` and then `--- seed`, then zero or more
+steps. Schema and seed must both be present or both absent; neither may occur
+after a step. Without them, execution requires an existing store supplied
+through `omnigraph-gqt --store <URI>`. With them, `--store` is refused.
+Dataset-only and restart-only files are admitted. The corpus supplies no
+store and refuses files without schema and seed. External stores require
+direct engine execution with a matching backend (`file://`, `s3://` or
+`az://`); DST owns its own initialized store and refuses `--store`.
+A `--- seam` may precede an operation as specified
 in Seams at an explicit step. A step is one of:
+
+- `--- load generate: v1 seed: <u64> mode: append|merge [branch: <name>]`
+  holds a bounded YAML table recipe, followed by `--- expect ok` or
+  `--- expect error: <substring>`. It accepts no params or other expectation
+  kinds. A seed may use `--- seed generate: v1 seed: <u64>` with the same
+  recipe, appending batches in order instead of loading inline JSONL with
+  overwrite semantics. Generators include literals, repeated strings,
+  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors
+  and ordinal/uniform/Zipf endpoints. Table `commits` fixes the number of
+  loader calls, with optional `batch_rows` fixing the chunk boundaries.
+  A generated load requires at least one nonempty batch; empty recipes are
+  admitted only as seeds, and any explicit batch size remains bounded.
+  Each call publishes independently; a failure preserves earlier commits.
+  The exact grammar, limits and pinned SHA-256 and Zipf algorithms are the
+  [generated fixture contract](../../crates/omnigraph-gqt/README.md#generated-fixtures-and-loads).
+  A load inside a loop repeats its fixed recipe without interpolation.
+  Mutation and any-write seams may precede it. One-call loads encode their
+  input before host operation callbacks; multi-call loads include generation
+  between calls and cannot represent one engine-only benchmark sample.
 
 - `--- query via <api>[, <api>]` (the APIs of Execution routes, below) holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
@@ -506,7 +532,7 @@ in Seams at an explicit step. A step is one of:
   `OMNIGRAPH_GQ_BLESS=1` and review the diff. A rows step may carry one
   optional `--- expect plan` section, the ***plan section***, directly after
   its shape section: one assertion per line over the plan the step's query
-  runs under, in nine forms. A `scan <Type>[ as $var]:` head
+  runs under, in the supported forms. A `scan <Type>[ as $var]:` head
   selects the scans of that node type (every scan of it, or the one bound
   to `$var`) and claims one fact of each: `columns [<a>, <b>]` the exact
   columns it projects; `not columns [<a>, <b>]` columns it must not read;
@@ -529,9 +555,19 @@ in Seams at an explicit step. A step is one of:
   id lookup or the destination table read once as a hash join's build side;
   it fails when the physical plan holds no such scan, the scan is a table
   scan, or its access path differs.
-  Every list is a set. A plan section anywhere but directly
-  after a shape section, an empty one, or a line outside the nine forms is
-  refused with the forms spelled out. A plan section on a step that names
+  Projection and filter-read lists are sets. Sort identity keys, RankFuse
+  downstream row keys and edge-selection members are exact ordered lists.
+  `sort tiebreak [$a.@id, $e.@type, $e.@id]` checks the metadata keys
+  appended after user order keys; `$a` abbreviates `$a.@id`, and
+  `sort no tiebreak` requires none. `rank fuse row tiebreak [...]` checks
+  RankFuse's downstream keys; `rank fuse no row tiebreak` requires none.
+  Missing, extra or reordered keys fail these assertions.
+  `expand $a $b: selection alternation [Knows out, Likes in]` checks
+  the resolved member types and directions in order. Selection kinds are
+  `named`, `alternation` and `wildcard`; `wildcard []` checks an empty
+  selection. A plan section anywhere but directly after a shape section,
+  an empty one, or a line outside the supported forms is refused with
+  the forms spelled out. A plan section on a step that names
   any API (Execution routes, below) but `engine` is refused.
   A query step may end with one `--- expect same as v1` section, the
   ***reference comparison***, directly after its shape section or, when it
@@ -971,9 +1007,9 @@ the glob; without it, every crossing.
 The seam must exist in the engine's catalog, or be a store place in the
 decoration's table `STORE_PLACES` (RFC 0066 §Design **Store places**), and
 be crossed by the kind of step it precedes: a seam of operation `mutation`
-before a mutate step, one of `branch_merge`, `branch_create` or
+before a mutate or load step, one of `branch_merge`, `branch_create` or
 `branch_delete` before the matching branch statement, one of `any_write`
-before either, a store place before either; a seam whose operation no step
+before any of those, a store place before any of those; a seam whose operation no step
 starts is refused as unreachable. No caller-supplied code or
 arbitrary action string is accepted. A new seam requires an implementation,
 a declared operation and set of effects in the catalog, and a proof case
@@ -1547,11 +1583,16 @@ expect section is JSONL, one object per row, same keys.
   Aggregate result batches have no `<var>.id` columns, so their user sort
   keys must determine a total order. The harness cannot prove this
   statically (`ordered_two_key_sort.gqt` is a corpus example). The harness checks the parsed declaration and refuses
-  `ordered` where no total order is possible: no `order` clause; an
-  `order` clause led by
-  `rrf()`, whose fusion sorts by score alone; and any aggregate in the
+  `ordered` for shapes whose total order it does not support: no `order`
+  clause; an `order` clause led by `rrf()`; and any aggregate in the
   `return` list (an `Aggregate` expression, the engine's own
-  `projections_have_aggregates` definition). One authoring rule follows
+  `projections_have_aggregates` definition). RankFuse orders each arm
+  by score, fused binding identity and downstream metadata keys before
+  fusion. Fused entities are stably sorted by fused score, preserving
+  their arm-derived insertion order on ties, and each winner retains
+  its ranked downstream rows. The harness still refuses `ordered` for
+  RRF because it does not promise a total order for every fusion shape.
+  One authoring rule follows
   for `bm25`-led `ordered` steps: such a step must not follow a `mutate`
   step that adds or changes indexed text, because rows in fragments the
   index does not cover are scored by a different scorer and two score
@@ -1641,10 +1682,12 @@ live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
 plan assertions in `cases/v2/planner/`. Directory placement is organizational:
 every case runs on engine v2, the `engine` setting's one value, and discovery
 never supplies a setting. The runner it
-calls (parser, execution, comparison, bless) is the crate's library,
-`crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
-tests beside it in `crates/omnigraph-gqt/src/tests.rs`; the crate is
-`publish = false` and never built for release. Direct-engine cases run on one shared
+calls delegates parsing, ordinary execution, comparison and bless to
+`omnigraph-gqt-core`. Format self-tests live in
+`crates/omnigraph-gqt-core/src/tests.rs`. The GQT runner retains discovery,
+process isolation, DST and reference execution; both crates are
+`publish = false`. The shared core is also linked into the release benchmark
+worker without the runner's test-only dependencies. Direct-engine cases run on one shared
 multi-thread tokio runtime whose worker stacks are 16 MiB (the engine's
 query futures overflow the 2 MiB default; the value equals the CI jobs'
 `RUST_MIN_STACK`, so the harness target does not depend on that

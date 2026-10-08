@@ -1,0 +1,250 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query hop2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a knows $b
+        $b knows $c
+    }
+    return { $a.name, $c.name }
+}
+--- expect unordered
+{"a.name":"p0","c.name":"p2"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p8"}
+{"a.name":"p1","c.name":"p3"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p9"}
+{"a.name":"p2","c.name":"p4"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p10"}
+{"a.name":"p3","c.name":"p5"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p11"}
+{"a.name":"p4","c.name":"p6"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p12"}
+{"a.name":"p5","c.name":"p7"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p13"}
+{"a.name":"p6","c.name":"p8"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p14"}
+{"a.name":"p7","c.name":"p9"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p15"}
+{"a.name":"p8","c.name":"p10"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p0"}
+{"a.name":"p9","c.name":"p11"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p1"}
+{"a.name":"p10","c.name":"p12"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p2"}
+{"a.name":"p11","c.name":"p13"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p3"}
+{"a.name":"p12","c.name":"p14"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p4"}
+{"a.name":"p13","c.name":"p15"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p5"}
+{"a.name":"p14","c.name":"p0"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p6"}
+{"a.name":"p15","c.name":"p1"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p7"}
+--- expect shape
+a.name: String
+c.name: String
+
+--- query
+query hop2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a knows $b
+        $b knows $c
+    }
+    return { $a.name, $c.name }
+}
+--- expect unordered
+{"a.name":"p0","c.name":"p2"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p8"}
+{"a.name":"p1","c.name":"p3"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p9"}
+{"a.name":"p2","c.name":"p4"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p10"}
+{"a.name":"p3","c.name":"p5"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p11"}
+{"a.name":"p4","c.name":"p6"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p12"}
+{"a.name":"p5","c.name":"p7"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p13"}
+{"a.name":"p6","c.name":"p8"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p14"}
+{"a.name":"p7","c.name":"p9"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p15"}
+{"a.name":"p8","c.name":"p10"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p0"}
+{"a.name":"p9","c.name":"p11"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p1"}
+{"a.name":"p10","c.name":"p12"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p2"}
+{"a.name":"p11","c.name":"p13"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p3"}
+{"a.name":"p12","c.name":"p14"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p4"}
+{"a.name":"p13","c.name":"p15"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p5"}
+{"a.name":"p14","c.name":"p0"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p6"}
+{"a.name":"p15","c.name":"p1"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p7"}
+--- expect shape
+a.name: String
+c.name: String
+
+--- restart
+
+--- query
+query hop2() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $a knows $b
+        $b knows $c
+    }
+    return { $a.name, $c.name }
+}
+--- expect unordered
+{"a.name":"p0","c.name":"p2"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p5"}
+{"a.name":"p0","c.name":"p8"}
+{"a.name":"p1","c.name":"p3"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p6"}
+{"a.name":"p1","c.name":"p9"}
+{"a.name":"p2","c.name":"p4"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p7"}
+{"a.name":"p2","c.name":"p10"}
+{"a.name":"p3","c.name":"p5"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p8"}
+{"a.name":"p3","c.name":"p11"}
+{"a.name":"p4","c.name":"p6"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p9"}
+{"a.name":"p4","c.name":"p12"}
+{"a.name":"p5","c.name":"p7"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p10"}
+{"a.name":"p5","c.name":"p13"}
+{"a.name":"p6","c.name":"p8"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p11"}
+{"a.name":"p6","c.name":"p14"}
+{"a.name":"p7","c.name":"p9"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p12"}
+{"a.name":"p7","c.name":"p15"}
+{"a.name":"p8","c.name":"p10"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p13"}
+{"a.name":"p8","c.name":"p0"}
+{"a.name":"p9","c.name":"p11"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p14"}
+{"a.name":"p9","c.name":"p1"}
+{"a.name":"p10","c.name":"p12"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p15"}
+{"a.name":"p10","c.name":"p2"}
+{"a.name":"p11","c.name":"p13"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p0"}
+{"a.name":"p11","c.name":"p3"}
+{"a.name":"p12","c.name":"p14"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p1"}
+{"a.name":"p12","c.name":"p4"}
+{"a.name":"p13","c.name":"p15"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p2"}
+{"a.name":"p13","c.name":"p5"}
+{"a.name":"p14","c.name":"p0"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p3"}
+{"a.name":"p14","c.name":"p6"}
+{"a.name":"p15","c.name":"p1"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p4"}
+{"a.name":"p15","c.name":"p7"}
+--- expect shape
+a.name: String
+c.name: String

@@ -27,6 +27,7 @@ use omnigraph::{
     BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy, Session,
 };
 
+use helpers::wide_rows::*;
 use helpers::*;
 
 /// Insert `n` brand-new persons (fresh ids) onto `branch`, forking the Person
@@ -180,7 +181,7 @@ async fn append_only_fast_forward_merge_is_a_pointer_switch() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     assert_eq!(
         probes.table_walk_interval_count(),
@@ -257,7 +258,7 @@ async fn lazy_target_pointer_fast_forward_uses_pin_after_main_advances() {
     let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge("source", "target"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.stage_fenced_insert_calls(),
         0,
@@ -379,7 +380,7 @@ node Person {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert!(
         probes.validation_scan_batches() > 0,
@@ -442,7 +443,7 @@ node Person {
         with_merge_write_probes(first_probes.clone(), source.branch_merge("leaf", "source"))
             .await
             .unwrap();
-    assert_eq!(first, MergeOutcome::FastForward);
+    assert_eq!(first.outcome, MergeOutcome::FastForward);
     assert_eq!(first_probes.stage_fenced_insert_rows(), 0);
     assert_eq!(first_probes.stage_merge_insert_calls(), 0);
     assert_eq!(first_probes.stage_append_calls(), 0);
@@ -479,7 +480,7 @@ node Person {
         with_merge_write_probes(final_probes.clone(), main.branch_merge("source", "main"))
             .await
             .unwrap();
-    assert_eq!(final_outcome, MergeOutcome::FastForward);
+    assert_eq!(final_outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &final_probes, pins).await;
     assert_eq!(
         final_probes.proven_insert_history_read_calls(),
@@ -541,7 +542,7 @@ async fn append_only_fast_forward_merge_of_a_commit_chain_is_a_pointer_switch() 
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(
         probes.proven_insert_history_read_calls(),
@@ -605,7 +606,7 @@ async fn nested_source_lineage_merges_without_false_read_set_conflict() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("experiment", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(count_rows(&main, "node:Person").await, base_count + 2);
     let names = collect_column_strings(&read_table(&main, "node:Person").await, "name");
@@ -701,7 +702,7 @@ async fn missing_source_transaction_history_falls_back_to_ordered_diff() {
         let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(outcome.outcome, MergeOutcome::FastForward);
         assert!(
             probes.ordered_cursor_scan_calls() >= 2,
             "missing provenance must enter the ordered base/source fallback"
@@ -765,7 +766,7 @@ async fn changed_only_adopt_onto_main_is_a_pointer_switch() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_eq!(probes.stage_known_present_update_rows(), 0);
     assert_single_physical_publish(&probes);
@@ -864,7 +865,7 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     assert_eq!(
         node_string_value(&main, "Doc", "x", "body").await,
@@ -913,7 +914,7 @@ async fn three_way_merge_detects_row_prefix_named_property_change() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     assert_eq!(
         node_string_value(&main, "Doc", "x", "row_notes").await,
@@ -1050,41 +1051,6 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
 }
 
-const WIDE_ROW_SCHEMA: &str = r#"
-node Doc {
-    key: String @key
-    payload: String?
-}
-"#;
-
-const WIDE_ROW_SET_PAYLOAD: &str = "query set_payload($key: String, $payload: String) {\n    update Doc set { payload: $payload } where key = $key\n}";
-
-/// One `Doc` table whose `wide` row decodes past the 37.5 MiB ordered-scan
-/// single-row hard cap, plus three small rows. Overwrite load deliberately
-/// bypasses the keyed 32 MiB Arrow envelope (bulk-replacement contract), so a
-/// wider-than-cap logical row is legitimate pre-existing table state.
-async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize) -> Session {
-    let uri = dir.path().to_str().unwrap();
-    let main = helpers::session(Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap());
-    let mut rows = serde_json::json!({
-        "type": "Doc",
-        "data": { "key": "wide", "payload": "x".repeat(wide_payload_bytes) },
-    })
-    .to_string();
-    for key in ["small-0", "small-1", "small-2"] {
-        rows.push('\n');
-        rows.push_str(
-            &serde_json::json!({
-                "type": "Doc",
-                "data": { "key": key, "payload": "tiny" },
-            })
-            .to_string(),
-        );
-    }
-    main.load("main", &rows, LoadMode::Overwrite).await.unwrap();
-    main
-}
-
 /// Regression for iss-branch-merge-ordered-scan-row-cap, adopt-fallback route:
 /// a small branch update must merge even when an unrelated pre-existing row
 /// exceeds the ordered-scan single-row hard cap. The update makes the proven
@@ -1093,8 +1059,6 @@ async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize)
 /// with `ordered_scan_input_batch_bytes` even though the row was untouched.
 #[tokio::test]
 async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
-    // Comfortably past the 150 MiB / 4 = 37.5 MiB SortExec input cap.
-    const WIDE_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
@@ -1114,7 +1078,7 @@ async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert!(
         probes.ordered_cursor_scan_calls() >= 2,
         "the adopt fallback must walk base and source"
@@ -1146,7 +1110,6 @@ async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
 /// wide row flows through every cursor and must not reach a SortExec input.
 #[tokio::test]
 async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
-    const WIDE_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
@@ -1171,7 +1134,7 @@ async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
     .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         node_string_value(&main, "Doc", "small-1", "payload").await,
         Some(Some("edited".to_string()))
@@ -1223,7 +1186,7 @@ async fn run_bounded_hydration_case(rows: String, expected_rows: usize, edited_k
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     let max_chunk = probes.ordered_cursor_hydration_max_chunk_bytes();
     assert!(
         max_chunk <= MAX_CHUNK_BYTES,
@@ -1333,7 +1296,7 @@ async fn fast_forward_merge_yields_source_state() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_pointer_switch_onto_main(&main, &probes, pins).await;
     assert_single_physical_publish(&probes);
 
@@ -1389,7 +1352,7 @@ async fn fast_forward_merge_defers_vector_index_to_reconciler() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
 
     assert_eq!(
         probes.stage_vector_index_calls(),
@@ -1437,7 +1400,7 @@ async fn merged_outcome_defers_vector_index_to_reconciler() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(outcome.outcome, MergeOutcome::Merged);
     assert_eq!(
         probes.table_walk_interval_count(),
         1,
@@ -1498,7 +1461,7 @@ async fn fast_forward_merge_switches_blob_table_pin() {
     let outcome = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
         .await
         .unwrap();
-    assert_eq!(outcome, MergeOutcome::FastForward);
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward);
     assert_eq!(
         probes.table_walk_interval_count(),
         0,
@@ -1511,6 +1474,7 @@ async fn fast_forward_merge_switches_blob_table_pin() {
         "Blob descriptor classification must not pull a proven insert interval back through the general base/source diff"
     );
     assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         probes.stage_vector_index_calls(),
         0,
@@ -1634,7 +1598,7 @@ query set_note($title: String, $note: String) {
                     .unwrap();
             }
             assert_eq!(
-                main.branch_merge("feature", "main").await.unwrap(),
+                main.branch_merge("feature", "main").await.unwrap().outcome,
                 MergeOutcome::FastForward
             );
             ("main", "feature")
@@ -1663,7 +1627,7 @@ query set_note($title: String, $note: String) {
         let outcome = with_merge_write_probes(probes.clone(), merger.branch_merge(source, target))
             .await
             .unwrap();
-        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert_eq!(outcome.outcome, MergeOutcome::FastForward);
         assert_eq!(
             probes.stage_known_present_update_calls(),
             0,

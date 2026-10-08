@@ -8,6 +8,7 @@ pub mod query_input;
 pub mod result;
 pub mod schema;
 pub mod settings;
+pub mod traversal;
 pub mod types;
 
 pub use catalog::schema_ir::{
@@ -23,7 +24,7 @@ pub use catalog::schema_ir::{
     schema_shape_hash_from_ir, system_columns_for_features, validate_schema_ir,
 };
 pub use catalog::schema_plan::{
-    DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
+    SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
 pub use catalog::schema_shape::{
     EdgeShape, EmbedSourceShape, InterfaceShape, NodeShape, PropertyConstraintShape, PropertyShape,
@@ -35,14 +36,19 @@ pub use ir::ParamMap;
 
 /// The GQ grammar's version, major when it accepts less or a produced shape
 /// changes, minor when it only accepts more (`docs/rfcs/2026-09-14-compatibility-surfaces.md`);
-/// `(2, 0)` reserves `and`, `or`, `not`, `is`, `null` (`docs/rfcs/2026-09-24-shared-expression-model.md`).
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 0);
+/// `(2, 0)` introduced the shared expression model;
+/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`).
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 1);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,
+};
+pub use query::diagnostic::{
+    Applicability, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, Stage, Suggestion,
+    TextEdit,
 };
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
@@ -54,4 +60,4 @@ pub use query_input::{
     find_read_statement, json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
-pub use types::{Direction, PropType, ScalarType, check_date_literal};
+pub use types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};

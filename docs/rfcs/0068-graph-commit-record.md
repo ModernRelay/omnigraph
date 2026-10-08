@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -458,7 +458,113 @@ Each stop leaves `main` shippable; the stamp gates activation.
   record), and if so whether only deleted ids or the full inserted, updated
   and deleted sets, and at what size they spill to a delta object.
 
+## Amendment: legacy commits of the stamp-13 upgrade
+
+This section is implemented and stands apart from the draft above. Storage
+stamp 14 kept `__manifest` and bounded its history another way: a branch's
+`__manifest` holds the head and a byte-bounded buffer of commits, and older
+commits are released into immutable Lance files under `__history`
+([versioning.md](../dev/versioning.md#current-storage-contract)). The offline
+upgrade from stamp 13 ([RFC 0064](0064-explicit-storage-upgrades.md)) has to
+keep every pre-upgrade commit addressable by its id. Those ids are ULIDs, not
+the `hb1.<block>.<slot>.<nonce>` ids whose name is their address, so the
+upgrade writes a ***legacy area***, `__history/legacy/`, once, and nothing
+writes there again.
+
+### Legacy area layout
+
+Every object is immutable, created with `put_if_absent`, and never deleted.
+
+| Object | Path under `__history/` | Format | Content | Bound |
+|---|---|---|---|---|
+| Data file | `legacy/data/<n:08>.lance` | Lance V2_2 file with the columns of every `__history` extent | the complete `HistoryRecord`s of one writer's consecutive own commits, in chain order | commit fields ≤ `HISTORY_RELEASE_BYTES` (256 KiB); record bytes ≤ `LEGACY_FILE_RECORD_BYTES` (2 MiB); rows ≤ `HISTORY_BLOCK_SLOTS`; a lone larger record takes its own file |
+| Directory | `legacy/locator/directory.oglx` | `OGLD0001`, layout version, source stamp, attempt ULID, counts, then one entry per data file (version range, rows, SHA-256 of its records), per id shard and per writer shard (key range, entries, SHA-256), the sorted absent merged parents, and a trailing SHA-256 | the whole locator | ≤ `TAIL_BYTES` (512 KiB) |
+| Id shard | `legacy/locator/ids/<n:08>.oglx` | `OGLI0001`, count, 24-byte entries sorted by binary ULID: id, file, row | commit id to (file, row) | ≤ `TAIL_BYTES`: 21,844 entries |
+| Writer shard | `legacy/locator/writers/<n:08>.oglx` | `OGLW0001`, entries sorted by SHA-256 of the native name: kind (`Main`, `Live`, `Retired`, `Orphaned`), name, parent name and version, head version and id, first file and file count | one entry per writer with own commits | ≤ `TAIL_BYTES` |
+| Schema content | `schemas/<sha256>.schema` | the existing `OGSC0001` archive | each distinct contract a legacy record names | existing |
+
+At about 430 bytes of commit fields and 6 KiB of record per commit the 2 MiB
+cap binds first, near 340 commits per file:
+
+| Legacy commits | Data files | Id shards | Directory | Lookup by id, first / later / warm | Full lineage walk |
+|---|---|---|---|---|---|
+| 10,000 | 30 | 1 (234 KiB) | about 2 KiB | 4 / 1 / 0 GETs | 1 LIST + 30 suffix GETs |
+| 1,000,000 | about 2,950 | 46 | about 153 KiB | 4 / 1 or 2 / 0 GETs | 3 LIST pages + 2,950 suffix GETs |
+
+The second row sizes the locator only: the stamp-13 census refuses above
+about 75,000 commits on one lineage. The directory reaches `TAIL_BYTES` near
+10,000 files, about 3.4 million commits. Two levels stay because a
+single-level map of a million commits is 24 MiB, above what the extent cache
+holds.
+
+### Why this is not a deny-list shape
+
+The [deny-list](../dev/invariants.md#deny-list) rejects a storage primitive
+Lance already owns, maintained parallel truth and cold full-history
+reconstruction per request. The legacy area is argued against each.
+
+- **The records are Lance files.** A data file is an extent like a native
+  block: the same columns, the same writer (`write_extent`), the same reader,
+  one suffix GET of `TAIL_BYTES` for its whole lineage. Only its key and its
+  validation (one writer, a first-parent chain, no `hb1` id) are new.
+- **The locator is a map, written once.** The Lance-owned alternative is a
+  dataset with a scalar index on the commit id. That brings a manifest, a
+  version chain, a transaction log and index files for content that is
+  written by one offline, fenced process and then never changes; a lookup
+  would read a manifest and index pages where the flat form reads one shard
+  of bounded size. No object here is updated, so there is no transaction to
+  manage, no log and no concurrent writer. The shape is the one the merged
+  schema archive already has: a magic, a byte-exact re-encode check on decode
+  and SHA-256 digests.
+- **It is not parallel truth.** After a ref is converted its `__manifest`
+  holds the head alone; the legacy data files are the only copy of the
+  earlier commits. The locator is derived from them, and cannot drift
+  because neither is ever rewritten: the directory carries the digest of
+  every shard and of every file's records, the upgrade intent carries the
+  digest of the directory before the fence, and the upgrade reads every
+  object again against those digests before it activates the graph. A
+  converted head that is later released as a singleton is an equal copy,
+  proven before the fence, and full reads require copies to be equal.
+- **No read reconstructs history.** A lookup by id on a handle that has seen
+  the directory is one shard GET and one data-file read; a full lineage walk
+  is one LIST and one suffix GET per file, as for native blocks. A root born
+  at stamp 14 pays one directory miss per handle on a commit id that is
+  genuinely absent, and nothing otherwise.
+
+Two details follow from the substrate. All locator objects share the prefix
+`legacy/locator/` because a local `put_if_absent` can leave a
+`<path>.tmp.<uuid>` file behind; the extent listing skips that one prefix and
+still refuses any other unknown key. And the absence of the directory is the
+one absence a handle keeps: the directory is written before activation and
+never again, no handle can exist before activation because the pending key
+refuses every open, and a root restore clears the handle's cache.
+
+A merged parent that exists nowhere in the source (a merge followed by a
+branch delete before stamp 8 reclaimed the tree) is kept verbatim on its
+commit and listed in the directory; lineage reads treat a listed id as known
+absent. A first-parent gap refuses the upgrade.
+
+Reversal is restoring the pre-upgrade backup. A stamp-14 binary built before
+this amendment reads no `legacy/` and reports pre-upgrade ids as not found.
+
 ## Decision log
 
 - 2026-09-15: drafted as the sequel to RFC 0067 after the write-path
   investigation; probe 14 recorded as initial evidence.
+- 2026-10-04: amendment added for the legacy area of the stamp-13 to stamp-14
+  upgrade: Lance data files plus flat locator objects under
+  `__history/legacy/`, in place of a Lance dataset with an id index. The
+  draft's record stream is not changed by it.
+- 2026-10-04: the legacy area of the amendment also holds the pre-upgrade
+  commits of a stamp-8 or stamp-9 source (release v0.11.0), which the same
+  upgrade now converts ([RFC 0064](0064-explicit-storage-upgrades.md)). The
+  layout, the bounds and the argument of the amendment are unchanged; the
+  directory's source stamp field is 8, 9 or 13. Two statements of the
+  amendment hold for a stamp-13 source only. The schema content row lists
+  each distinct contract a legacy record names: for a stamp-8 or stamp-9
+  source that is one contract, the one at the graph root at the upgrade,
+  named by every record. And the census bound of about 75,000 commits on
+  one lineage is derived from the stamp-13 overwrite publish; a stamp-8 or
+  stamp-9 `__manifest` keeps every row and every version, and its bound in
+  commits has not been derived. The amendment's heading keeps its name so
+  that existing links resolve.

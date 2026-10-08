@@ -1,0 +1,52 @@
+# issue: 857
+# red_on: 2026-10-04, main @ 92f5f953: step 1, the six-digit param query, succeeded instead of refusing (the filed case: it returns the row stored at .123).
+# notes: A DateTime holds milliseconds: a param or datetime() literal with a non-zero digit past the third fractional digit is refused, zero padding names the same instant, and a mutation writing now() still commits.
+# notes: The clock now() reads is not a parameter: binding its reserved name is refused, where a six-digit string under that name used to match the row stored at .123 in a read and a mutation predicate.
+# notes: Load and Rust ParamMap coverage: load_refuses_datetime_string_with_sub_millisecond_digits, datetime_param_with_sub_millisecond_digits_is_refused_from_a_rust_param_map.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Event { name: String @key at: DateTime }
+
+--- seed
+{"type":"Event","data":{"name":"a","at":"2024-01-01T00:00:00.123Z"}}
+
+--- query
+query at_param($t: DateTime) { match { $e: Event $e.at = $t } return { $e.name } }
+--- params
+{"t": "2024-01-01T00:00:00.123456Z"}
+--- expect error: param 't': invalid DateTime literal '2024-01-01T00:00:00.123456Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero
+
+--- query
+query at_literal() { match { $e: Event $e.at = datetime("2024-01-01T00:00:00.123456Z") } return { $e.name } }
+--- expect error: invalid DateTime literal '2024-01-01T00:00:00.123456Z'
+
+--- query
+query zero_padded($us: DateTime, $ns: DateTime) { match { $e: Event $e.at = $us $e.at = $ns } return { $e.name } }
+--- params
+{"us": "2024-01-01T00:00:00.123000Z", "ns": "2024-01-01T05:00:00.123000000+05:00"}
+--- expect unordered
+{"e.name": "a"}
+--- expect shape
+e.name: String
+
+--- query
+query at_now() { match { $e: Event $e.at = now() } return { $e.name } }
+--- params
+{"__nanograph_now": "2024-01-01T00:00:00.123456Z"}
+--- expect error: param '__nanograph_now': reserved for now() and cannot be bound
+
+--- mutate
+query move_now() { update Event set { at: datetime("2025-01-01T00:00:00Z") } where at = now() }
+--- params
+{"__nanograph_now": "2024-01-01T00:00:00.123456Z"}
+--- expect error: param '__nanograph_now': reserved for now() and cannot be bound
+
+--- mutate
+query set_now() { update Event set { at: now() } where name = "a" }
+--- expect affected: nodes=1 edges=0

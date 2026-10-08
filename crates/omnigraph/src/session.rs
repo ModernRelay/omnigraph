@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::SettingStmt;
+use omnigraph_compiler::query::codes::Q003;
+use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
 use omnigraph_compiler::settings::{
     DEFINITIONS, SessionSettings, SessionSettingsError, SettingId, SettingRow, SettingValue,
@@ -185,9 +187,13 @@ impl Session {
             return Ok(self.settings.clone());
         }
         let file = parse_query(source).map_err(OmniError::Compiler)?;
-        let scoped = self
-            .with_prefix(&file.settings)
-            .map_err(|error| OmniError::Compiler(CompilerError::Parse(error.to_string())))?;
+        let scoped = self.with_prefix(&file.settings).map_err(|error| {
+            OmniError::Compiler(CompilerError::query(QueryDiagnostic::parse(
+                Q003,
+                error.to_string(),
+                None,
+            )))
+        })?;
         Ok(scoped.settings)
     }
 
@@ -269,6 +275,28 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, id.name());
         (rows[0].value.clone(), rows[0].source)
+    }
+
+    #[test]
+    fn history_release_bytes_default_is_the_catalog_constant() {
+        assert_eq!(
+            SessionSettings::default().history_release_bytes(),
+            omnigraph_catalog::HISTORY_RELEASE_BYTES
+        );
+        assert_eq!(
+            SettingId::HistoryReleaseBytes.spec().default,
+            omnigraph_catalog::HISTORY_RELEASE_BYTES.to_string()
+        );
+        let omnigraph_compiler::settings::SettingKind::Integer { max, .. } =
+            SettingId::HistoryReleaseBytes.spec().kind
+        else {
+            panic!("history_release_bytes is an integer setting");
+        };
+        assert_eq!(
+            max,
+            Some(omnigraph_catalog::HISTORY_RELEASE_BYTES as i64),
+            "a session may only lower the budget: the row's maximum is the production constant"
+        );
     }
 
     fn assert_at_baseline(session: &Session) {

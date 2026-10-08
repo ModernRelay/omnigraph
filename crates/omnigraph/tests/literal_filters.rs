@@ -257,6 +257,146 @@ query touch_born($d: Date) { update Metric set { active: false } where born = $d
     );
 }
 
+/// The Rust `ParamMap` door: a `.gqt` binds params only through JSON, whose `DateTime`
+/// arm refuses first, so no case reaches these refusals (a sub-millisecond
+/// `Literal::DateTime`, a `Literal::String`, `Null` on a non-nullable parameter).
+#[tokio::test]
+async fn datetime_param_with_sub_millisecond_digits_is_refused_from_a_rust_param_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    let datetime = |value: &str| omnigraph_compiler::Literal::DateTime(value.to_string());
+    let q = r#"
+query seen_eq_param($t: DateTime) { match { $m: Metric  $m.seen = $t } return { $m.name } }
+query seen_in_param($ts: [DateTime]) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
+query seen_opt_param($t: DateTime?) { match { $m: Metric  $m.seen = $t } return { $m.name } }
+query seen_in_opt_param($ts: [DateTime]?) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
+"#;
+    let m = r#"
+query touch_seen($t: DateTime) { update Metric set { active: false } where seen = $t }
+"#;
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), datetime("2024-06-01T12:00:00.000500Z"));
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("a DateTime param finer than a millisecond is refused on read");
+    assert!(
+        err.to_string().contains(
+            "param 't': invalid DateTime literal '2024-06-01T12:00:00.000500Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+        ),
+        "{err}"
+    );
+    let err = db
+        .mutate("main", m, "touch_seen", &params)
+        .await
+        .expect_err("the same param is refused in a mutation predicate");
+    assert!(
+        err.to_string()
+            .contains("param 't': invalid DateTime literal '2024-06-01T12:00:00.000500Z'"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![
+            datetime("2024-06-01T12:00:00Z"),
+            datetime("2024-06-01T12:00:00.000000001Z"),
+        ]),
+    );
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a list item with a non-zero ninth fractional digit is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': invalid DateTime literal '2024-06-01T12:00:00.000000001Z'"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "t".to_string(),
+        omnigraph_compiler::Literal::String("2024-06-01T12:00:00.000500Z".to_string()),
+    );
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("a String literal bound to a DateTime parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 't': expected DateTime, got String(\"2024-06-01T12:00:00.000500Z\")"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![omnigraph_compiler::Literal::String(
+            "2024-06-01T12:00:00Z".to_string(),
+        )]),
+    );
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a String item in a [DateTime] list is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got List("),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert("ts".to_string(), datetime("2024-06-01T12:00:00Z"));
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a scalar DateTime bound to a [DateTime] parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got DateTime("),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![omnigraph_compiler::Literal::Null]),
+    );
+    let err = query_main(&db, q, "seen_in_opt_param", &params)
+        .await
+        .expect_err("a Null item in a nullable [DateTime] list is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got List([Null])"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), omnigraph_compiler::Literal::Null);
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("Null on a non-nullable DateTime parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 't': expected DateTime, got Null"),
+        "{err}"
+    );
+    let rows = query_main(&db, q, "seen_opt_param", &params)
+        .await
+        .expect("Null on a nullable DateTime parameter passes the check");
+    assert_eq!(rows.num_rows(), 0);
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), datetime("2024-06-01T12:00:00.000000Z"));
+    let rows = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect("zero padding past the millisecond names the same instant");
+    assert_eq!(rows.num_rows(), 1);
+    let affected = db
+        .mutate("main", m, "touch_seen", &params)
+        .await
+        .expect("the zero-padded param and the now() every mutation binds both pass")
+        .affected_nodes;
+    assert_eq!(affected, 1);
+}
+
 // Exact string predicates: `starts_with` and the String overload of
 // `contains`. Standalone filters on a scanned variable are hoisted into the
 // NodeScan (the pushdown arm — Lance probes a covering BTREE/NGRAM index when

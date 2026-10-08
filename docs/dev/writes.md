@@ -25,7 +25,7 @@ acquire shared schema permit → branch → sorted-table gates, recheck the comp
         ↓
 commit each participant as a detached version of its pin
         ↓
-publish every pin (published_dataset_version, staged_version, transaction_uuid) + lineage in one __manifest CAS
+publish every pin + accepted schema contract + lineage in one __manifest CAS
 ```
 
 An error before the manifest CAS leaves the graph unchanged: the detached
@@ -36,9 +36,9 @@ effect has post-publication work. A lost acknowledgement is resolved
 against the exact attempted manifest; unavailable readback stays indeterminate.
 No writer arms a recovery record, and no write replans around a partial state, because
 no partial state is ever visible. Schema apply and the system-column upgrade
-additionally stage and install the schema contract around their CAS; only
-they can report `RecoveryRequired`, naming a manifest commit that landed
-while the contract installation did not.
+include the replacement schema-contract row in the same publication as their
+table references. A later `RecoveryRequired` outcome can identify a committed
+publication; it does not leave durable contract files to install.
 
 ## Captured authority
 
@@ -47,16 +47,18 @@ schema/catalog, target graph branch, optional graph head, native branch
 identity, table-incarnation identities, and expected table versions. Every
 planning and validation step uses that view.
 
-Branch merge also uses the captured target for physical table opens and
-publication. It never changes the `Omnigraph` handle's active branch while the
+Ordinary non-bound branch writes retain their capture in the same one-entry
+coordinator cache used by branch merge. Branch merge also uses the captured
+target for physical table opens and publication. It never changes the `Omnigraph` handle's active branch while the
 merge runs. Publication reuses the active coordinator, or takes the cached
 non-active target coordinator, only when its branch identity, graph head, and
 manifest version match the captured transaction; otherwise it opens the target
 coordinator from durable state. The publisher independently reads fresh authority
 and enforces the exact graph-head precondition on every attempt. Successful
 publication returns a taken coordinator to the one-entry merge cache; failure
-drops it. Commit IDs and timestamps are minted for the captured branch without
-reloading manifest history. The existing schema and branch gates still serialize
+drops it. The intent nonce and timestamps are minted for the captured branch
+without reloading manifest history; the publish wraps the nonce into the
+addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
 conflicting control operations.
 
 Native branch creation uses an operation-local capture of the bound coordinator
@@ -67,8 +69,8 @@ path. Captures share immutable lineage and the Lance session, copy current
 table state, and leave the handle's active branch unchanged.
 
 Create admission lists native ref names and reads bodies only for the source,
-the target's incarnations and logical ancestors or descendants, and the
-schema-apply sentinel. Physical path checks include retired ref names. The
+the target's incarnations and logical ancestors or descendants. Physical path
+checks include retired ref names. The
 exact target ref must be absent; an empty listing of its exact native tree
 allows creation without forced reclamation. A nonempty tree and clone-only
 recovery keep Lance's full dependency and tag checks.
@@ -83,7 +85,7 @@ it does not protect an input from concurrent cleanup.
 
 Ref-name listing still grows with the physical ref inventory. Cold recreation
 of the same logical name reads its retained incarnations to validate retirement
-and liveness; source, hierarchy and sentinel incarnations also remain relevant.
+and liveness; source and hierarchy incarnations also remain relevant.
 Unrelated retired ref bodies add no reads to an ordinary fresh create.
 
 After a content publication, the publisher returns the projection (the
@@ -94,17 +96,29 @@ cache has adopted the published lineage. A foreign advance, unsupported base,
 or failure before lineage adoption leaves the full-refresh fallback armed.
 Registration replacement, rename, tombstone, and same-version physical-owner
 handoff use the existing complete fold. This is disposable process memory;
-`__manifest` remains the only durable graph authority. Publication still scans
-history for collision, expected-version, and lineage validation.
+`__manifest` remains the only durable graph authority.
 
-The capture itself (`open_write_txn`) takes no permit on the common path:
-when a schema-apply sentinel stands and an apply in this process holds the
-exclusive permit, it parks on the shared side until the apply releases, then
-recaptures under the promoted contract. A sentinel under a free gate is
-another process's apply and gets the typed refusal at once. Only `mutate`
-and `load` reach the park: merge, index maintenance, optimize, cleanup and
-repair call `ensure_schema_apply_idle` before their capture, so a standing
-sentinel refuses them one call earlier.
+`GraphNamespacePublisher` retains at most one complete stored row batch from
+its last acknowledged publication. Every attempt opens the target branch's
+latest `__manifest` again. Reuse requires matching native manifest location,
+version, naming scheme, complete Lance manifest and schema metadata; known
+ETag or size mismatches reject reuse. Dictionary-bearing schemas bypass this
+cache. Cached rows pass through the same decoder and collision, expected-version,
+lineage and exact-head checks as scanned rows. The zero-retry version CAS and
+lost-acknowledgement readback remain unchanged. Foreign movement, missing rows
+or an image above the 8 MiB accounted Arrow-buffer/key budget use a full scan.
+This budget bounds retained cache accounting, not total process memory. The
+copy-on-write publication still rewrites the complete live row set.
+
+The capture (`open_write_txn`) obtains the accepted contract identity from
+the selected manifest snapshot. It validates that snapshot's complete contract
+row before reusing a catalog with the same identity. An unchanged captured
+manifest image reuses its validation; newly observed images carry the contract
+from their state scan, and acknowledged publications reuse their retained rows.
+The cache is disposable; a missing or invalid row
+cannot be repaired from root files. Captures and finalization retain the
+process-local schema gate and complete-authority checks without a sentinel
+branch or `ensure_schema_apply_idle` pass.
 
 Finalization acquires the root-shared gate order:
 
@@ -130,7 +144,7 @@ physical-effect proofs:
 | Writer | Physical adapter | Publication |
 |---|---|---|
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
-| SchemaApply | Exact existing-table rewrites plus new-type dataset creation (a linear `v1` create) and the complete schema/manifest delta | One main-branch graph commit |
+| SchemaApply | Existing-table detached rewrites; original added-type Create or qualified reuse/detached replacement; complete table delta and replacement schema-contract row | One main-branch graph commit |
 | BranchMerge | Onto main: a pointer switch, main's registration taking the source's pin. Into a named branch: a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
@@ -152,7 +166,10 @@ resource validation before staging. `stage_all` opens each touched table at
 its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
 moving HEAD. `commit_all` enters the gates, revalidates the complete
-authority, and commits every participant as a detached version of its pinned
+authority (for a branch other than the handle's bound one, the captured
+manifest probe first: an unchanged version and branch identifier keep the
+captured authority, a mismatch is a fresh coherent capture), and commits
+every participant as a detached version of its pinned
 base: no recovery sidecar is armed, a table's linear HEAD never moves, and
 nothing can rebase. Every detached commit records the authority it was staged
 against in its transaction properties,
@@ -163,7 +180,11 @@ removed under `omnigraph.deleted_ids` (inline up to 64 KiB) or
 discovery read them. The manifest then publishes every pin as
 `(base + 1, staged_version, transaction_uuid)` in one CAS; a publish that
 loses the CAS returns the plain `ReadSetChanged`, and the staging it leaves
-is unpublished until the collector reclaims it. The published pin is final:
+is unpublished until the collector reclaims it. The probe reads only the
+held native ref, so a second live incarnation of the branch name (two
+processes creating it at once) is refused by the publisher's own branch
+resolution after the detached commits, not before them; the graph is
+unchanged and the staging is reclaimed the same way. The published pin is final:
 readers open `staged_version` directly, and `published_dataset_version`
 keeps its number, `base + 1`, as the table's logical version inside its
 `__manifest` lineage without naming a Lance version. Every registration
@@ -171,10 +192,12 @@ records `omnigraph.last_linear_version`, the highest linear version a pin
 ever reached (`1` for a table created under v11), and every writer that
 rebuilds the row copies it forward (`TableVersionMetadata`,
 `crates/omnigraph-core/src/metadata.rs`). A writer whose captured snapshot predates another
-publication loses the CAS and reprepares (`ReadSetChanged`). No writer reads
-the linear HEAD: a foreign linear commit above
-`omnigraph.last_linear_version` is what `repair` reports as `foreign_drift`
-(`repair.rs`, `judge_against_last_linear_version`), never a writer's concern.
+publication loses the CAS and reprepares (`ReadSetChanged`). Existing-table
+writes do not read linear HEAD; `repair` reports a foreign linear commit above
+`omnigraph.last_linear_version` as `foreign_drift`
+(`repair.rs`, `judge_against_last_linear_version`). Added-type admission can
+inspect an unregistered deterministic path's HEAD only to prove it remains
+its qualified original empty version 1; it never adopts an advanced HEAD.
 
 Detached manifests are reclaimed by the tracing collector `cleanup` runs
 (`db/omnigraph/collector.rs`; `optimize.rs`, `cleanup_detached_only`). Its
@@ -206,23 +229,68 @@ including full-text search through the batch's certificate, serve from the
 staged version.
 
 Schema apply stages each existing-table rewrite as a detached Overwrite of
-the table's pin and publishes it as a pin one past the published version. An
-added type is a linear
-version-one create at its identity path; that path is a deterministic
-function of the accepted identity allocator, so an attempt that died after
-creating the dataset left it exactly where the retry creates it, and the
-retry reclaims the unregistered leftover under the schema sentinel before
-creating. The schema contract is staged before the manifest commit with the
-graph commit it publishes recorded in `__schema_state.json.staging`, and the
-writer installs the live contract from memory after the commit. No sidecar is
-armed: a failure before the commit leaves detached versions, a created
-dataset and a staged contract that the next read-write open discards; a
-failure after it leaves a published manifest whose contract installation the
-same handle's next write, or the next read-write open, completes because the
-recorded commit is in main's lineage. A read-only open refuses that state and serves
-an unpublished staging as if it were absent. The open also reclaims a
-sentinel left by a crashed apply, under the same one-mutation-process
-boundary as every other open-time recovery decision.
+the table's pin and publishes it one logical version past the published
+version. An added type uses its identity-derived path, which a retry derives
+again from the accepted allocator. Retry preserves that path and every
+existing version. It can reuse an original empty, stable-row-ID version-one
+Create with the desired physical schema. If that original Create has another
+schema from an uncommitted attempt, it stages an empty detached Overwrite
+based on version one. The replacement publishes at logical version 2 with its
+detached version, transaction UUID and `last_linear_version = 1`, against
+expected absent table version 0. Fresh or matching original Creates remain
+logical version 1; nonempty or otherwise unqualified leftovers refuse.
+
+One main-branch manifest CAS publishes the table delta, graph-lineage change
+and replacement contract row. A competing stale attempt cannot delete an
+existing table path; the final CAS decides publication. A pre-publication
+failure leaves the previous contract and graph visible. After publication,
+both are complete and only the disposable in-memory view may need refresh.
+There are no staged root contract files, schema-apply sentinel or durable
+post-publication install. The system-column upgrade uses the same publication
+boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+
+`prepare_schema_apply_as` binds the canonical root and schema identity domain,
+exact main-branch authority, numeric manifest base, desired contract, actor and
+a preallocated intent nonce before table effects; the published commit id
+`hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by the intent names
+the commit through `commit_id_answers`, never by equality. Preparation supports a
+read-only handle: it captures authority and plans, without issuing native writes.
+`apply_prepared_schema_as` rechecks that authority and the current policy under
+the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
+publish only at `M + 1`, and metadata-only contention that preserves graph HEAD
+still refuses rather than rebasing. Version-1 intents are rejected; this is an
+internal protocol change, not a graph-storage format change. An effectful success
+returns the operation's own `GraphCommit` and contract identity, not a later head
+observation. The prepared
+value is execution input, not an authorization grant or a distributed writer
+fence.
+
+A schema no-op requires the exact source and accepted contract. Changed comments
+or formatting publish a replacement contract and lineage once while preserving
+every table pin. An empty migration plan alone cannot certify the desired
+source. The ordinary apply API uses the same preparation, execution and
+exact-version rule, including refusal on head-preserving metadata contention.
+
+`reconcile_schema_apply_as` only reads retained, exact publication evidence and
+returns `Committed`, `NoOp` or `Unknown`. It checks the single candidate manifest
+version immediately after the prepared base, without walking history. Missing
+evidence, including metadata-only interposition, stays unknown; a no-op requires
+the exact captured base still to be current. Reconciliation neither applies the
+schema nor authorizes replay. Callers still own durable intent recording,
+evidence retention and fencing the previous owner before they can establish
+terminal non-publication.
+
+For a durably accepted invocation, `prepare_schema_settlement_as` issues a
+separate neutral lineage intent bound to that original and its one `M + 1`.
+The caller persists it before `settle_prepared_schema_as` can publish its fence.
+A verified occupied candidate or exact fence receipt proves `NotPublished`;
+missing evidence remains `Unknown`. A stale no-op certificate is `NoOpRefused`.
+Settlement never replays the original schema, authorizes adopting a foreign
+contract into the achieved projection, or proves accepted native I/O has stopped. Prior-owner quiescence, current policy,
+exclusive admission and protected evidence remain caller obligations. These
+engine boundaries do not enable online server activation; the deployment
+protocol remains in the
+[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
 
 Branch merge follows it too. A merge onto main is a pointer switch: main's
 registration takes the source's pin, and the merge stages no fenced insert,
@@ -267,8 +335,30 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before any
-  effect.
+- one table's keyed input is bounded to 8,192 rows and 32 MiB before its
+  data is staged.
+
+Insert/update mutations and keyed Append/Merge loads also cap the sum of
+retained Arrow batches across tables at 32 MiB
+(`retained keyed batch bytes per operation`). Admission uses
+`get_array_memory_size` accounting; shared buffers may be conservatively counted
+more than once. An update's pending-aware scan charges the same sum under the
+same resource name. The keyed parse spool separately caps its decoded-payload
+estimate across tables at 32 MiB (`keyed parsed entity bytes per operation`).
+External Blob copy admission adds copied payload estimates, which are not yet
+read, to the retained keyed batches under the same resource name before reading
+payloads, then checks materialized batches before staging fragments.
+
+Delete mutations, cascades and Overwrite's removed-ID detection stream matches
+instead of collecting the full scan. One 32 MiB
+`retained removed-id bytes per operation` allowance covers all tables, charging
+each ID's UTF-8 length plus one 24-byte `String` slot before copying it.
+Overwrite's bulk input is not subject to the keyed row/batch limits. These are
+fixed representation limits with no setting, not a
+combined allocator/RSS budget; native scan buffers, conversion copies and
+validation's derived state are outside them. Refusal precedes the current
+operation's fragment staging and publication, though writable open may have
+completed earlier schema work and a load may already have created its branch.
 
 An insertion-only transaction may carry the internal
 `omnigraph.insert_absence = "v1"` certificate after its absence and physical
@@ -329,7 +419,9 @@ Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
 external bytes under the operation's 32 MiB budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
-adoption does no source I/O. See [blob.md](blob.md).
+adoption does no source I/O. An update never reads the Blobs it assigns; a
+carried stored external reference the policy refuses fails as
+`StoredExternalBlobDenied` before effects. See [blob.md](blob.md).
 
 ## Failure outcomes
 
@@ -340,9 +432,9 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |
 | Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
-| Schema apply or the system-column upgrade fails after publication, before its contract is installed | `RecoveryRequired` naming the published commit; the next read-write open, `refresh`, or that handle's next write installs the staged contract |
+| Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
-| A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
+| A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 
 An acknowledgement is returned only after the manifest commit is durable and
 visible.

@@ -324,7 +324,7 @@ pub struct PropMatch {
 #[derive(Debug, Clone)]
 pub struct Traversal {
     pub src: String,
-    pub edge_name: String,
+    pub selector: EdgeSelector,
     pub dst: String,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
@@ -334,6 +334,14 @@ pub struct Traversal {
     /// Optional name for the matched edge (`$p $w:knows $f`), making the
     /// edge's own properties addressable as `$w.<prop>`.
     pub edge_binding: Option<String>,
+}
+
+/// The source spelling of the edge types a traversal selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeSelector {
+    Named(String),
+    Alternation(Vec<String>),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

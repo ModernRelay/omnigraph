@@ -1,10 +1,7 @@
-//! Data commands: load/read/change/branch/commit/export/snapshot/policy/embed/maintenance.
+//! Data commands: load/query/mutate/branch/commit/export/snapshot/policy/embed/maintenance.
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
-use std::sync::mpsc;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -953,8 +950,8 @@ fn repair_json_reports_noop_on_clean_graph() {
     let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(payload["confirm"], false);
-    assert_eq!(payload["force"], false);
+    assert!(payload.get("confirm").is_none());
+    assert!(payload.get("force").is_none());
     assert_eq!(payload["graph_manifest_version"], Value::Null);
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
@@ -965,7 +962,7 @@ fn repair_json_reports_noop_on_clean_graph() {
     }));
 
     let human = stdout_string(&output_success(cli().arg("repair").arg(&graph)));
-    assert!(human.contains("preview mode, 4 datasets"), "{human}");
+    assert!(human.contains("4 datasets"), "{human}");
     assert!(human.contains("node type 'Person'"), "{human}");
     assert!(!human.contains("node:Person"), "{human}");
 }
@@ -1002,7 +999,7 @@ fn rebuild_full_text_indexes_json_noops_without_full_text_properties() {
 }
 
 #[test]
-fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_forced() {
+fn repair_reports_foreign_drift_and_refuses_removed_flags() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -1010,42 +1007,36 @@ fn repair_confirm_json_reports_foreign_drift_and_publishes_nothing_even_when_for
     let graph_manifest_before = manifest_dataset_version(&graph);
     let (table_manifest_before, table_head_before) = forge_person_foreign_commit(&graph);
 
-    for force in [false, true] {
-        let mut command = cli();
-        command.arg("repair").arg("--confirm");
-        if force {
-            command.arg("--force");
-        }
-        let output = output_success(command.arg("--json").arg(&graph));
-        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(
-            payload["graph_manifest_version"],
-            Value::Null,
-            "force {force}"
-        );
-        let person = payload["datasets"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|dataset| dataset["type_key"] == "node:Person")
-            .unwrap();
-        assert_eq!(person["classification"], "foreign_drift", "force {force}");
-        assert_eq!(person["action"], "no_op", "force {force}");
-        assert_eq!(person["published_dataset_version"], table_manifest_before);
-        assert_eq!(person["lance_head_version"], table_head_before);
-        assert!(
-            person["operations"][0]
-                .as_str()
-                .is_some_and(|operation| operation.contains("foreign linear version")),
-            "force {force}: {}",
-            person["operations"]
-        );
+    let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    let person = payload["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|dataset| dataset["type_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "foreign_drift");
+    assert_eq!(person["action"], "no_op");
+    assert_eq!(person["published_dataset_version"], table_manifest_before);
+    assert_eq!(person["lance_head_version"], table_head_before);
+    assert!(
+        person["operations"][0]
+            .as_str()
+            .is_some_and(|operation| operation.contains("foreign linear version")),
+        "{}",
+        person["operations"]
+    );
+    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+    for flag in ["--confirm", "--force"] {
+        let refused = output_failure(cli().arg("repair").arg(flag).arg(&graph));
+        assert_eq!(refused.status.code(), Some(2));
         assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
     }
 }
 
 #[test]
-fn query_lint_json_with_schema_reports_warnings() {
+fn lint_json_with_schema_reports_warnings() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1075,7 +1066,6 @@ query list_policies() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1124,7 +1114,7 @@ query list_policies() {
 }
 
 #[test]
-fn query_lint_json_omits_operation_after_compile_failure() {
+fn lint_json_omits_operation_after_compile_failure() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1147,7 +1137,6 @@ query broken($slug: String) {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1163,187 +1152,46 @@ query broken($slug: String) {
 }
 
 #[test]
-fn lint_top_level_matches_deprecated_query_lint_output() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let canonical = output_success(
-        cli()
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_lint = output_success(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_check = output_success(
-        cli()
-            .arg("query")
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_lint));
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
-
-    // Canonical form must NOT emit the deprecation warning.
-    let canonical_stderr = String::from_utf8(canonical.stderr).unwrap();
-    assert!(
-        !canonical_stderr.contains("deprecated"),
-        "`omnigraph lint` is canonical and must not warn; got stderr: {canonical_stderr}"
-    );
-
-    // Deprecated forms MUST emit the one-line warning, pointing at the
-    // new top-level `omnigraph lint`.
-    let lint_stderr = String::from_utf8(deprecated_lint.stderr).unwrap();
-    assert!(
-        lint_stderr.contains("`omnigraph query lint` is deprecated")
-            && lint_stderr.contains("`omnigraph lint`"),
-        "expected deprecation warning pointing at `omnigraph lint`; got: {lint_stderr}"
-    );
-    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
-    assert!(
-        check_stderr.contains("`omnigraph query check` is deprecated")
-            && check_stderr.contains("`omnigraph lint`"),
-        "expected deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
-    );
+fn removed_cli_spellings_refuse_and_canonical_commands_remain_available() {
+    for args in [
+        vec!["read"],
+        vec!["change"],
+        vec!["ingest"],
+        vec!["check"],
+        vec![
+            "query",
+            "lint",
+            "--query",
+            "missing.gq",
+            "--schema",
+            "missing.pg",
+        ],
+        vec![
+            "query",
+            "check",
+            "--query",
+            "missing.gq",
+            "--schema",
+            "missing.pg",
+        ],
+        vec!["export", "--jsonl"],
+    ] {
+        let output = output_failure(cli().args(&args));
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+            "{args:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+    }
+    for command in ["query", "mutate", "load", "lint", "export"] {
+        output_success(cli().args([command, "--help"]));
+    }
 }
 
 #[test]
-fn deprecated_check_top_level_rewrites_to_lint() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let canonical = output_success(
-        cli()
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let deprecated_check = output_success(
-        cli()
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
-
-    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
-    assert!(
-        check_stderr.contains("`omnigraph check` is deprecated")
-            && check_stderr.contains("`omnigraph lint`"),
-        "expected `omnigraph check` deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
-    );
-
-    // `check` must NOT appear in the canonical `omnigraph --help` output —
-    // agents copy the surface from help text and would otherwise emit both
-    // names interchangeably.
-    let help = cli().arg("--help").output().unwrap();
-    let stdout = String::from_utf8(help.stdout).unwrap();
-    let check_aliased = stdout
-        .lines()
-        .any(|line| line.trim_start().starts_with("lint") && line.contains("check"));
-    assert!(
-        !check_aliased,
-        "`check` must not be advertised as a visible alias of `lint`; help output: {stdout}"
-    );
-}
-
-#[test]
-fn deprecated_read_and_change_subcommands_emit_warnings() {
-    // Both subcommands require `--query`/`--query-string`, so invoking them
-    // with no args will exit non-zero. That's fine -- we only care that the
-    // deprecation warning is printed before the argument-required error.
-    let output = cli().arg("read").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("`omnigraph read` is deprecated") && stderr.contains("`omnigraph query`"),
-        "expected `omnigraph read` deprecation warning; got: {stderr}"
-    );
-
-    let output = cli().arg("change").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("`omnigraph change` is deprecated")
-            && stderr.contains("`omnigraph mutate`"),
-        "expected `omnigraph change` deprecation warning; got: {stderr}"
-    );
-
-    // Sanity check the inverse: the canonical names must NOT print the
-    // deprecation banner.
-    let output = cli().arg("query").arg("--help").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !stderr.contains("deprecated"),
-        "`omnigraph query` is canonical and must not warn; got: {stderr}"
-    );
-    let output = cli().arg("mutate").arg("--help").output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        !stderr.contains("deprecated"),
-        "`omnigraph mutate` is canonical and must not warn; got: {stderr}"
-    );
-}
-
-#[test]
-fn query_lint_can_use_local_graph_via_positional_uri() {
+fn lint_can_use_local_graph_via_positional_uri() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let query_path = temp.path().join("queries.gq");
@@ -1360,7 +1208,6 @@ query list_people() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1378,7 +1225,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_can_resolve_graph_from_store_scope() {
+fn lint_can_resolve_graph_from_store_scope() {
     // RFC-011: lint resolves its graph target through `--store` (the direct
     // scope), not omnigraph.yaml's cli.graph; the .gq path is plain cwd-relative.
     let temp = tempdir().unwrap();
@@ -1397,7 +1244,6 @@ query list_people() {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1416,7 +1262,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_rejects_http_targets_without_schema() {
+fn lint_rejects_http_targets_without_schema() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -1431,7 +1277,6 @@ query list_people() {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1449,7 +1294,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_requires_schema_or_resolvable_graph_target() {
+fn lint_requires_schema_or_resolvable_graph_target() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -1462,13 +1307,7 @@ query list_people() {
 "#,
     );
 
-    let output = output_failure(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path),
-    );
+    let output = output_failure(cli().arg("lint").arg("--query").arg(&query_path));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("lint requires --schema <schema.pg>")
@@ -1478,7 +1317,7 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_human_output_reports_warnings() {
+fn lint_human_output_reports_warnings() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1503,7 +1342,6 @@ query update_policy($slug: String, $name: String) {
 
     let output = output_success(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1522,7 +1360,7 @@ query update_policy($slug: String, $name: String) {
 }
 
 #[test]
-fn query_lint_human_output_reports_strict_validation_errors() {
+fn lint_human_output_reports_strict_validation_errors() {
     let temp = tempdir().unwrap();
     let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
@@ -1546,7 +1384,6 @@ query bad_update($slug: String) {
 
     let output = output_failure(
         cli()
-            .arg("query")
             .arg("lint")
             .arg("--query")
             .arg(&query_path)
@@ -1600,6 +1437,7 @@ fn load_json_outputs_summary_for_main_branch() {
         );
     }
     assert_eq!(payload["total_entities"], 11);
+    assert_eq!(payload.get("embedding_generation"), Some(&Value::Null));
     assert_eq!(
         payload["nodes"],
         serde_json::json!([
@@ -1678,7 +1516,7 @@ fn read_json_outputs_rows_for_named_query() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1790,8 +1628,7 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("--branch")
             .arg("feature")
             .arg("--type")
-            .arg("Person")
-            .arg("--jsonl"),
+            .arg("Person"),
     );
     let rows = stdout_string(&output)
         .lines()
@@ -1913,7 +1750,7 @@ fn read_resolves_uri_from_default_store_scope() {
     let output = output_success(
         cli()
             .env("OMNIGRAPH_HOME", home.path())
-            .arg("read")
+            .arg("query")
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("get_person")
@@ -1934,7 +1771,7 @@ fn read_csv_format_outputs_header_and_row_values() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -1971,7 +1808,7 @@ fn read_uses_operator_default_output_format() {
         let mut command = cli();
         command
             .env("OMNIGRAPH_HOME", operator_home.path())
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2006,7 +1843,7 @@ fn read_jsonl_format_outputs_metadata_header_first() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2041,7 +1878,7 @@ query insert_person($name: String, $age: I32) {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2060,7 +1897,7 @@ query insert_person($name: String, $age: I32) {
 
     let verify = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2151,18 +1988,21 @@ fn explain_statement_answers_the_plan_as_rows() {
             .arg(EXPLAIN_ADULTS)
             .arg("--json"),
     );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    let refusal: Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert!(
-        stderr.contains("statement 'explain' is a read; use POST /query"),
-        "{stderr}"
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("statement 'explain' is a read; use POST /query"),
+        "{refusal}"
     );
 }
 
 /// GitHub #365: the embedded transport must preserve the typed stale-head
-/// outcome all the way through the CLI boundary. This is deliberately local
-/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+/// details all the way through the CLI boundary. A writable open may complete
+/// older work, so this cannot claim whole-command no effects or exit 4.
 #[test]
-fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     const FIND_PERSON: &str =
         "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
@@ -2215,8 +2055,8 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
         .unwrap();
     assert_eq!(
         lost.status.code(),
-        Some(4),
-        "lost embedded --if-commit must exit 4; stderr: {}",
+        Some(1),
+        "embedded writable open prevents whole-command no-effect proof; stderr: {}",
         String::from_utf8_lossy(&lost.stderr)
     );
     let body: Value = serde_json::from_slice(&lost.stdout)
@@ -2224,6 +2064,10 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
     assert_eq!(
         body["precondition_failure"]["expected"],
         Value::String(stale_head)
+    );
+    assert_eq!(
+        body["command_outcome"],
+        serde_json::json!({"execution":"unknown","effects":"unknown","action":"refresh"})
     );
 
     let verify = output_success(
@@ -2240,57 +2084,65 @@ fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
     assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
 }
 
-/// A conditional remote mutation must advertise the capability in its path,
-/// not only in an optional header. An older server can ignore an unknown
-/// header after executing `/change` or `/mutate`; it cannot accidentally run a
-/// route it does not have, so the new CLI must receive 404 before any mutation
-/// handler is reachable.
+/// An older server cannot establish the current HTTP contract. Discovery must
+/// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
     const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (line_tx, line_rx) = mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        line_tx.send(request_line).unwrap();
-        let body = r#"{"error":"not found"}"#;
-        write!(
-            reader.get_mut(),
-            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
-        reader.get_mut().flush().unwrap();
-    });
+    use support::managed_http::{IntentApiFixture, IntentReply};
+    for (status, headers) in [
+        (404, vec![]),
+        (
+            200,
+            vec![(
+                omnigraph_api_types::HTTP_API_CONTRACT_HEADER.into(),
+                "0.12".into(),
+            )],
+        ),
+    ] {
+        let server = IntentApiFixture::new(vec![IntentReply {
+            status,
+            headers,
+            body: br#"{"error":"untrusted body"}"#.to_vec(),
+        }]);
 
-    let output = cli()
-        .arg("mutate")
-        .arg("--server")
-        .arg(format!("http://{address}"))
-        .arg("--graph")
-        .arg("legacy")
-        .arg("-e")
-        .arg(SET_AGE)
-        .arg("--params")
-        .arg(r#"{"name":"Alice","age":52}"#)
-        .arg("--if-commit")
-        .arg("01HOLDHEAD")
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(!output.status.success(), "an old server must fail closed");
-    server.join().unwrap();
-    assert_eq!(
-        line_rx.recv().unwrap().trim_end(),
-        "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
-        "the CLI must not send a conditional write to an older server's ordinary mutation route"
-    );
+        let output = cli()
+            .arg("mutate")
+            .arg("--server")
+            .arg(&server.origin)
+            .arg("--graph")
+            .arg("legacy")
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":52}"#)
+            .arg("--if-commit")
+            .arg("01HOLDHEAD")
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "an old server must fail closed");
+        let error = parse_stdout_json(&output);
+        assert_eq!(error["code"], "api_contract_mismatch");
+        assert_eq!(error["http_status"], status);
+        assert_eq!(error["request_dispatched"], false);
+        assert_eq!(
+            error["command_outcome"],
+            serde_json::json!({
+                "execution":"not_started", "effects":"none", "action":"refresh"
+            })
+        );
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the CLI must not send any data request to an older server"
+        );
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        server.assert_complete();
+    }
 }
 
 #[test]
@@ -2334,6 +2186,43 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             }),
             4,
         ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            409,
+            serde_json::json!({
+                "error":"wrong status cannot establish a conditional refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"wrong condition cannot establish this request's refusal",
+                "precondition_failure":{"expected":"another-condition","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted"],
+            412,
+            serde_json::json!({
+                "error":"unsolicited condition cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"}
+            }),
+            1,
+        ),
+        (
+            vec!["mutate", "restricted", "--if-commit", "head-before"],
+            412,
+            serde_json::json!({
+                "error":"contradictory effect evidence cannot establish a refusal",
+                "precondition_failure":{"expected":"head-before","actual":"head-after"},
+                "recovery_required":{"operation_id":"published"}
+            }),
+            1,
+        ),
     ] {
         let formats: &[&[&str]] = if arguments[0] == "query" {
             &[&["--json"], &["--format", "json"]]
@@ -2341,7 +2230,7 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             &[&["--json"]]
         };
         for format in formats {
-            let server = IntentApiFixture::new(vec![IntentReply::json(status, body.clone())]);
+            let server = IntentApiFixture::graph(vec![IntentReply::json(status, body.clone())]);
             let output = cli()
                 .env_remove("OMNIGRAPH_BEARER_TOKEN")
                 .args(["--server", &server.origin, "--graph", "knowledge"])
@@ -2354,17 +2243,283 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 Some(exit),
                 "{arguments:?} {format:?}: {output:?}"
             );
+            let mut actual = serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
+                panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
+            });
+            if arguments[0] == "mutate" {
+                assert_eq!(actual["http_status"], status);
+                assert_eq!(
+                    actual["command_outcome"]["execution"],
+                    if exit == 4 { "not_started" } else { "unknown" }
+                );
+                assert_eq!(
+                    actual["command_outcome"]["effects"],
+                    if exit == 4 { "none" } else { "unknown" }
+                );
+                let fields = actual.as_object_mut().unwrap();
+                fields.remove("http_status");
+                fields.remove("command_outcome");
+            }
             assert_eq!(
-                serde_json::from_slice::<Value>(&output.stdout).unwrap_or_else(|error| {
-                    panic!("{arguments:?} {format:?} lost structured HTTP {status}: {error}; {output:?}")
-                }),
-                body,
+                actual, body,
                 "{arguments:?} {format:?} must preserve the server's complete error contract"
             );
             assert!(
                 output.stderr.is_empty(),
                 "{arguments:?} {format:?}: {output:?}"
             );
+            server.assert_complete();
+        }
+    }
+}
+
+/// Whole-command retry classification needs real CLI processes and a wire
+/// census; row/error GQT expectations cannot observe exits or resubmission.
+#[test]
+fn data_write_outcomes_and_retry_permission_issue_466() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    let temp = tempdir().unwrap();
+    let data = temp.path().join("batch.ndjson");
+    fs::write(&data, "").unwrap();
+    let data = data.to_str().unwrap();
+    let commands = [
+        vec!["mutate", "stored_write"],
+        vec!["mutate", "-e", "mutation write() {}"],
+        vec!["mutate", "-e", "branch create review"],
+        vec!["branch", "create", "review"],
+        vec!["branch", "delete", "review", "--yes"],
+        vec!["branch", "merge", "review"],
+        vec!["load", "--data", data, "--mode", "append"],
+        vec![
+            "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
+        ],
+    ];
+    let cases = [
+        (
+            429,
+            serde_json::json!({"error":"actor is busy","code":"too_many_requests"}),
+            75,
+            "retry",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"unqualified proxy throttle"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"conflict","code":"conflict"}),
+            1,
+            "reconcile",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"unavailable"}),
+            1,
+            "reconcile",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"authority changed","read_set_conflict":{"member":"graph_head","expected":"before","actual":"after"}}),
+            1,
+            "refresh",
+        ),
+        (
+            409,
+            serde_json::json!({"error":"input too large","resource_limit":{"resource":"entities","limit":10,"actual":11}}),
+            1,
+            "refresh",
+        ),
+        // Admission probes an external Blob source before any effect; the
+        // typed detail, not the status, makes the refusal a refresh.
+        (
+            424,
+            serde_json::json!({"error":"source unavailable","external_blob_source":{"uri":"s3://bucket/object","reason":"not found"}}),
+            1,
+            "refresh",
+        ),
+        (
+            424,
+            serde_json::json!({"error":"source unavailable"}),
+            1,
+            "reconcile",
+        ),
+        (
+            503,
+            serde_json::json!({"error":"schema completion required","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+        (
+            429,
+            serde_json::json!({"error":"contradictory refusal","code":"too_many_requests","recovery_required":{"operation_id":"published-commit"}}),
+            1,
+            "recover",
+        ),
+    ];
+    for arguments in &commands {
+        for (status, body, exit, action) in &cases {
+            let mut reply = IntentReply::json(*status, body.clone());
+            reply.headers.push(("Retry-After".into(), "17".into()));
+            let server = IntentApiFixture::graph(vec![reply]);
+            let output = cli()
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args([
+                    "--quiet",
+                    "--server",
+                    &server.origin,
+                    "--graph",
+                    "knowledge",
+                ])
+                .args(arguments)
+                .arg("--json")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(*exit),
+                "{arguments:?} HTTP {status}: {output:?}"
+            );
+            let mut actual = parse_stdout_json(&output);
+            assert_eq!(actual["http_status"], *status);
+            assert_eq!(actual["retry_after"], "17");
+            assert_eq!(
+                actual["command_outcome"],
+                serde_json::json!({
+                    "execution": if *exit == 75 {"not_started"} else {"unknown"},
+                    "effects": if *exit == 75 {"none"} else {"unknown"},
+                    "action": action,
+                }),
+                "{arguments:?} HTTP {status}"
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("command_outcome");
+            fields.remove("http_status");
+            fields.remove("retry_after");
+            assert_eq!(&actual, body, "preserve every typed detail");
+            assert_eq!(
+                server.requests().len(),
+                2,
+                "one discovery and one submission, without replay"
+            );
+            server.assert_complete();
+        }
+    }
+
+    // Both bad JSON and a severed body may follow graph publication. The
+    // fixture writes fewer bytes than Content-Length in the second case.
+    for headers in [vec![], vec![("Content-Length".into(), "1024".into())]] {
+        let server = IntentApiFixture::graph(vec![IntentReply {
+            status: 200,
+            headers,
+            body: b"{unfinished".to_vec(),
+        }]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "mutate",
+                "stored_write",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let actual = parse_stdout_json(&output);
+        assert_eq!(
+            actual["command_outcome"],
+            serde_json::json!({"execution":"unknown","effects":"unknown","action":"reconcile"})
+        );
+        assert_eq!(actual["http_status"], 200);
+        assert_eq!(server.requests().len(), 2);
+        server.assert_complete();
+    }
+}
+
+#[test]
+fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
+    use omnigraph_api_types::{HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER};
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (status, headers) in [
+        (200, vec![]),
+        (403, vec![(HEADER.into(), "0.11".into())]),
+        (200, vec![(HEADER.into(), "0.12".into())]),
+        (200, vec![(HEADER.into(), "0.14".into())]),
+        (
+            503,
+            vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
+        ),
+        (
+            200,
+            vec![
+                (HEADER.into(), CONTRACT.into()),
+                (HEADER.into(), CONTRACT.into()),
+            ],
+        ),
+    ] {
+        for arguments in [
+            vec!["mutate", "write"],
+            vec!["mutate", "write", "--json"],
+            vec!["query", "read", "--format", "json"],
+            vec!["query", "read", "--format", "jsonl"],
+        ] {
+            let server = IntentApiFixture::new(vec![
+                IntentReply {
+                    status: 200, headers: vec![(HEADER.into(), CONTRACT.into())], body: vec![],
+                },
+                IntentReply {
+                    status, headers: headers.clone(),
+                    body: br#"{"error":"untrusted-secret-body","code":"forbidden","rows":[{"success":true}]}"#.to_vec(),
+                },
+            ]);
+            let mut command = cli();
+            command
+                .env_remove("OMNIGRAPH_BEARER_TOKEN")
+                .args(["--server", &server.origin, "--graph", "knowledge"])
+                .args(&arguments);
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            if arguments.len() > 2 {
+                let error = parse_stdout_json(&output);
+                assert_eq!(error["code"], "api_contract_mismatch");
+                assert_eq!(error["http_status"], status);
+                assert_eq!(error["request_dispatched"], true);
+                assert!(
+                    error["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("effects are unknown")
+                );
+                assert!(output.stderr.is_empty());
+                if arguments.last() == Some(&"jsonl") {
+                    assert_eq!(
+                        stdout_string(&output).lines().count(),
+                        1,
+                        "JSONL contract errors must occupy one line"
+                    );
+                }
+            } else {
+                assert!(output.stdout.is_empty());
+                let error = String::from_utf8_lossy(&output.stderr);
+                assert!(error.contains("effects are unknown"), "{error}");
+                assert!(error.contains(&format!("HTTP {status}")), "{error}");
+            }
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted-secret-body"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("untrusted-secret-body"));
+            let requests = server.requests();
+            assert_eq!(
+                requests.len(),
+                2,
+                "no retry or fallback after response mismatch"
+            );
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[0].path, "/healthz");
+            assert_eq!(requests[1].headers[HEADER], CONTRACT);
             server.assert_complete();
         }
     }
@@ -2386,7 +2541,7 @@ fn remote_human_and_invalid_json_errors_remain_diagnostics() {
             "server returned 403",
         ),
     ] {
-        let server = IntentApiFixture::new(vec![IntentReply {
+        let server = IntentApiFixture::graph(vec![IntentReply {
             status: 403,
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
@@ -2434,7 +2589,7 @@ query insert_person($name: String, $age: I32) {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2457,7 +2612,7 @@ fn read_requires_name_for_multi_query_files() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2479,7 +2634,7 @@ fn read_refuses_an_empty_source_as_no_query() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&graph)
             .arg("--query")
@@ -2499,7 +2654,7 @@ fn read_supports_inline_query_string() {
 
     let output = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")
@@ -2515,14 +2670,17 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
-fn positional_http_uri_on_a_data_verb_is_rejected() {
+fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
+    use support::managed_http::IntentApiFixture;
+
     // RFC-011: a `--store` http(s):// URL no longer dispatches to a remote
     // server — that requires `--server <url>`.
+    let server = IntentApiFixture::new(vec![]);
     let output = output_failure(
         cli()
             .arg("query")
             .arg("--store")
-            .arg("http://127.0.0.1:1")
+            .arg(&server.origin)
             .arg("-e")
             .arg("query q() { match { $p: Person { } } return { $p } }"),
     );
@@ -2531,30 +2689,58 @@ fn positional_http_uri_on_a_data_verb_is_rejected() {
         stderr.contains("must be addressed with `--server <url>`"),
         "expected store-remote rejection; got: {stderr}"
     );
+    // Both read and write resolvers reject conflicting addressing before the
+    // optional no-graph registry discovery can make a network request.
+    for arguments in [
+        vec!["snapshot", "graph.omni"],
+        vec!["export", "graph.omni"],
+        vec!["schema", "show", "graph.omni"],
+        vec!["branch", "list", "--uri", "graph.omni"],
+        vec!["branch", "merge", "feature", "--uri", "graph.omni"],
+        vec!["query", "--store", "graph.omni", "-e", "branch list"],
+    ] {
+        let output = output_failure(cli().args(["--server", &server.origin]).args(&arguments));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("mutually exclusive"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }
 
 #[test]
 fn as_on_a_served_write_is_rejected() {
-    // RFC-011: a served write resolves the actor from the bearer token, so --as
-    // cannot set identity. It errors while building the remote client — before
-    // any HTTP call, so no server is needed.
-    let output = output_failure(
-        cli()
+    use support::managed_http::IntentApiFixture;
+
+    // A served write resolves the actor from the bearer token. Refuse --as
+    // before both discovery and the optional no-graph registry probe.
+    let server = IntentApiFixture::new(vec![]);
+    for graph in [None, Some("knowledge")] {
+        let mut command = cli();
+        command
             .arg("mutate")
             .arg("--server")
-            .arg("http://127.0.0.1:1")
+            .arg(&server.origin)
             .arg("--as")
             .arg("act-nope")
             .arg("-e")
             .arg("query add($name: String) { insert Person { name: $name } }")
             .arg("--params")
-            .arg(r#"{"name":"X"}"#),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("`--as` is not allowed on a served write"),
-        "expected --as-served rejection; got: {stderr}"
-    );
+            .arg(r#"{"name":"X"}"#);
+        if let Some(graph) = graph {
+            command.args(["--graph", graph]);
+        }
+        let output = output_failure(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`--as` is not allowed on a served write"),
+            "expected --as-served rejection; got: {stderr}"
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.assert_complete();
 }
 
 #[test]
@@ -2566,7 +2752,7 @@ fn change_supports_inline_query_string() {
 
     let output = output_success(
         cli()
-            .arg("change")
+            .arg("mutate")
             .arg("--store")
             .arg(&repo)
             .arg("--query-string")
@@ -2581,7 +2767,7 @@ fn change_supports_inline_query_string() {
 
     let verify = output_success(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")
@@ -2603,7 +2789,7 @@ fn read_rejects_query_string_combined_with_query() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("--query")
@@ -2627,7 +2813,7 @@ fn read_rejects_empty_query_string() {
 
     let output = output_failure(
         cli()
-            .arg("read")
+            .arg("query")
             .arg("--store")
             .arg(&repo)
             .arg("-e")
@@ -2824,11 +3010,10 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
             .arg("feature")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("refusing destructive `branch delete`") && stderr.contains("--yes"),
-        "expected a non-local destructive refusal; stderr: {stderr}"
-    );
+    let output = parse_stdout_json(&output);
+    let error = output["error"].as_str().unwrap();
+    assert!(error.contains("refusing destructive `branch delete`") && error.contains("--yes"));
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]
@@ -2865,11 +3050,14 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .arg("s3://fake-bucket/g.omni")
             .arg("--json"),
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
+    let output = parse_stdout_json(&output);
     assert!(
-        stderr.contains("refusing destructive `load --mode overwrite`"),
-        "expected a non-local overwrite refusal; stderr: {stderr}"
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("refusing destructive `load --mode overwrite`")
     );
+    assert_eq!(output["command_outcome"]["effects"], "none");
 }
 
 #[test]
@@ -2972,13 +3160,32 @@ fn branch_merge_defaults_target_to_main() {
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
-            .arg("feature")
+            .arg(" feature ")
             .arg("--json"),
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["source"], "feature");
     assert_eq!(merge_payload["target"], "main");
     assert_eq!(merge_payload["outcome"], "fast_forward");
+    let receipt = &merge_payload["commit"];
+    assert!(receipt["graph_commit_id"].is_string(), "{merge_payload}");
+    assert!(receipt["parent_commit_id"].is_string(), "{merge_payload}");
+    assert!(
+        receipt["merged_parent_commit_id"].is_string(),
+        "{merge_payload}"
+    );
+    let persisted = parse_stdout_json(&output_success(
+        cli()
+            .args([
+                "commit",
+                "show",
+                receipt["graph_commit_id"].as_str().unwrap(),
+                "--uri",
+            ])
+            .arg(&graph)
+            .arg("--json"),
+    ));
+    assert_eq!(*receipt, persisted);
 
     let snapshot_output = output_success(
         cli()
@@ -2998,6 +3205,172 @@ fn branch_merge_defaults_target_to_main() {
         .as_u64()
         .unwrap();
     assert_eq!(person_entity_count, 5);
+}
+
+#[test]
+fn remote_merge_requires_consistent_receipts_without_replay() {
+    use serde_json::json;
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    for (source, target) in [(" ", "main"), ("review", "\t")] {
+        let server = IntentApiFixture::graph(vec![]);
+        let output = output_failure(cli().args([
+            "--server",
+            &server.origin,
+            "--graph",
+            "knowledge",
+            "branch",
+            "merge",
+            source,
+            "--into",
+            target,
+        ]));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("branch merge source and target must not be empty"),
+            "{output:?}"
+        );
+        assert!(server.requests().is_empty());
+        server.assert_complete();
+    }
+
+    let commit = json!({
+        "graph_commit_id": "merge-a", "graph_manifest_version": 9,
+        "graph_branch": null, "parent_commit_id": "target-before",
+        "merged_parent_commit_id": "source-before", "actor_id": "alice",
+        "created_at": 1234567
+    });
+    for (statement, padded) in [(false, false), (false, true), (true, false)] {
+        let mut cases = vec![
+            ("fast_forward", Some(commit.clone()), true),
+            ("merged", Some(commit.clone()), true),
+            ("already_up_to_date", Some(Value::Null), true),
+            ("fast_forward", None, false),
+            ("merged", Some(Value::Null), false),
+            ("already_up_to_date", None, false),
+            ("already_up_to_date", Some(commit.clone()), false),
+        ];
+        for (field, value) in [
+            ("graph_branch", json!("other")),
+            ("graph_commit_id", json!("")),
+            ("graph_manifest_version", json!(0)),
+            ("parent_commit_id", Value::Null),
+            ("merged_parent_commit_id", Value::Null),
+            ("actor_id", json!("somebody-else")),
+        ] {
+            let mut bad_commit = commit.clone();
+            bad_commit[field] = value;
+            cases.push(("merged", Some(bad_commit), false));
+        }
+        for (outcome, receipt, valid) in cases {
+            let mut body = if statement {
+                json!({"branch":"main", "query_name":"branch merge",
+                    "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
+                    "outcome":{"kind":"merged", "source":"review", "target":"main", "merge":outcome}})
+            } else {
+                json!({"source":"review", "target":"main", "outcome":outcome, "actor_id":"alice"})
+            };
+            if let Some(receipt) = receipt {
+                body["commit"] = receipt;
+            }
+            let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+            let mut command = cli();
+            command.args(["--server", &server.origin, "--graph", "knowledge"]);
+            if statement {
+                command.args(["mutate", "-e", "branch merge review into main", "--json"]);
+            } else if padded {
+                command.args(["branch", "merge", " review ", "--into", " main ", "--json"]);
+            } else {
+                command.args(["branch", "merge", "review", "--json"]);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{body}: {output:?}"
+            );
+            if valid {
+                assert_eq!(parse_stdout_json(&output), body);
+            } else {
+                assert!(
+                    !stdout_string(&output).contains("graph_commit_id"),
+                    "invalid receipt reported as success: {output:?}"
+                );
+            }
+            server.assert_complete();
+            let requests = server.workflow_requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "a protocol failure must not replay the merge"
+            );
+            assert_eq!(requests[0].method, "POST");
+            if !statement {
+                assert_eq!(requests[0].body["source"], "review");
+                assert_eq!(requests[0].body["target"], "main");
+            }
+        }
+    }
+
+    // Optional deletion has its own required result. An old alias or missing
+    // structured failure cannot turn an incomplete response into success.
+    for (deleted, details, legacy, valid) in [
+        (Some(true), None, None, true),
+        (
+            Some(false),
+            Some(json!({"error":"deletion denied", "code":"forbidden"})),
+            None,
+            true,
+        ),
+        (None, None, None, false),
+        (Some(false), None, None, false),
+        (Some(false), None, Some("deletion denied"), false),
+        (
+            Some(true),
+            Some(json!({"error":"deletion denied"})),
+            None,
+            false,
+        ),
+    ] {
+        let mut body = json!({"source":"review", "target":"main", "outcome":"merged",
+            "actor_id":"alice", "commit":commit});
+        if let Some(deleted) = deleted {
+            body["branch_deleted"] = json!(deleted);
+        }
+        if let Some(details) = details {
+            body["branch_delete_error_details"] = details;
+        }
+        if let Some(legacy) = legacy {
+            body["branch_delete_error"] = json!(legacy);
+        }
+        let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+        let output = cli()
+            .args([
+                "--server",
+                &server.origin,
+                "--graph",
+                "knowledge",
+                "branch",
+                "merge",
+                " review ",
+                "--into",
+                " main ",
+                "--delete-branch",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if valid { 0 } else { 1 }),
+            "{body}: {output:?}"
+        );
+        if valid {
+            assert_eq!(parse_stdout_json(&output), body);
+        }
+        server.assert_complete();
+        assert_eq!(server.workflow_requests().len(), 1);
+    }
 }
 
 #[test]
@@ -3119,7 +3492,9 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "fast_forward");
     assert_eq!(merge_payload["branch_deleted"], true);
-    assert!(merge_payload["branch_delete_error"].is_null());
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload.get("branch_delete_error_details").is_none());
+    assert!(merge_payload["commit"]["graph_commit_id"].is_string());
 
     let list_output = output_success(
         cli()
@@ -3169,8 +3544,11 @@ fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
     assert_eq!(merge_payload["outcome"], "already_up_to_date");
     assert_eq!(merge_payload["branch_deleted"], false);
+    assert!(merge_payload.get("branch_delete_error").is_none());
+    assert!(merge_payload["branch_delete_error_details"]["code"].is_string());
+    assert_eq!(merge_payload.get("commit"), Some(&Value::Null));
     assert!(
-        merge_payload["branch_delete_error"]
+        merge_payload["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("cannot delete branch 'main'")
