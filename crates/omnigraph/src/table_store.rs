@@ -74,8 +74,9 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
-    KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
+    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_BLOB_PAYLOAD_MAX_BYTES,
+    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedBytes, KeyedWriteSemantics,
+    PendingScanBudget, ProvenInsertChunk, blob_payload_resource,
 };
 
 pub(crate) use crate::error::is_scratch_exhaustion;
@@ -1931,17 +1932,18 @@ impl TableStore {
         None
     }
 
-    /// Conservative pre-read size for a persisted descriptor batch. The raw
-    /// one-row Arrow allocation already accounts every ordinary column and
-    /// descriptor buffer; adding logical payload bytes may overestimate the
-    /// smaller logical Blob descriptor, but cannot understate retained memory.
+    /// Conservative pre-read size for a persisted descriptor batch: its raw
+    /// Arrow allocation, every ordinary column and descriptor buffer, as
+    /// framing, and the logical payload its Blob cells will materialize. The
+    /// descriptor buffers may overestimate the smaller logical Blob framing,
+    /// but cannot understate retained memory.
     pub(crate) fn predicted_materialized_blob_batch_bytes(
         &self,
         ds: &Dataset,
         batch: &RecordBatch,
         external: &ExternalBlobPreflight,
         max_blob_bytes: u64,
-    ) -> Result<u64> {
+    ) -> Result<KeyedBytes> {
         let payload = self.persisted_blob_payload_bytes(ds.schema(), batch, external)?;
         if payload > max_blob_bytes {
             return Err(OmniError::resource_limit(
@@ -1950,12 +1952,7 @@ impl TableStore {
                 payload,
             ));
         }
-        let retained = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("persisted Blob batch memory size exceeds u64")
-        })?;
-        retained.checked_add(payload).ok_or_else(|| {
-            OmniError::manifest_internal("materialized Blob batch byte count overflow")
-        })
+        KeyedBytes::of(batch)?.checked_add(KeyedBytes::payload(payload))
     }
 
     async fn rebuild_blob_column(
@@ -2787,8 +2784,6 @@ impl TableStore {
                 "stage_keyed_write called with empty batch",
             ));
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size())
-            .map_err(|_| OmniError::manifest_internal("keyed write batch bytes exceed u64"))?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("keyed write entities for {type_key}"),
@@ -2796,13 +2791,7 @@ impl TableStore {
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {type_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                batch_bytes,
-            ));
-        }
+        KeyedBytes::of(&batch)?.ensure_fits(&format!("keyed write bytes for {type_key}"))?;
         let id_field_id = exact_id_primary_key_field_id(&ds, system_columns, "stage_keyed_write")?;
         let expected_read_version = ds.version().version;
         let expected_schema_preorder_ids = schema_preorder_field_ids(&ds, "stage_keyed_write")?;
@@ -2957,9 +2946,6 @@ impl TableStore {
                 "{context} called with empty batch"
             )));
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal(format!("{context} batch bytes exceed u64"))
-        })?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("keyed write entities for {table_key}"),
@@ -2967,13 +2953,7 @@ impl TableStore {
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                batch_bytes,
-            ));
-        }
+        KeyedBytes::of(&batch)?.ensure_fits(&format!("keyed write bytes for {table_key}"))?;
 
         let batch = self
             .prepare_keyed_write_batch(table_key, batch, system_columns)
@@ -3108,38 +3088,21 @@ impl TableStore {
         self.validate_keyed_write_batch(table_key, &batch, system_columns)?;
         let external_uris = collect_external_blob_uris(&batch)?;
         let payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
-        if payload_bytes > KEYED_WRITE_MAX_BYTES {
+        if payload_bytes > KEYED_BLOB_PAYLOAD_MAX_BYTES {
             return Err(OmniError::resource_limit(
                 "materialized external blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
+                KEYED_BLOB_PAYLOAD_MAX_BYTES,
                 payload_bytes,
             ));
         }
-        let retained_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("keyed write input batch bytes exceed u64")
-        })?;
-        let predicted_bytes = retained_bytes.checked_add(payload_bytes).ok_or_else(|| {
-            OmniError::manifest_internal("materialized keyed Blob byte count overflow")
-        })?;
-        if predicted_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                predicted_bytes,
-            ));
-        }
+        let resource = format!("keyed write bytes for {table_key}");
+        KeyedBytes::of(&batch)?
+            .checked_add(KeyedBytes::payload(payload_bytes))?
+            .ensure_fits(&resource)?;
         let batch =
-            materialize_external_blob_inputs(batch, KEYED_WRITE_MAX_BYTES, preflight).await?;
-        let materialized_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("materialized keyed write batch bytes exceed u64")
-        })?;
-        if materialized_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                materialized_bytes,
-            ));
-        }
+            materialize_external_blob_inputs(batch, KEYED_BLOB_PAYLOAD_MAX_BYTES, preflight)
+                .await?;
+        KeyedBytes::of(&batch)?.ensure_fits(&resource)?;
         Ok(batch)
     }
 
@@ -4643,7 +4606,7 @@ impl TableStore {
             // columns now so an already-overwide match fails before
             // `take_rows` performs the second full-row read.
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
-            let payload_budget = account.remaining_bytes_after(non_blob_bytes)?;
+            let payload_budget = account.payload_remaining_after(non_blob_bytes)?;
 
             if let Some(schema) = &carried_without_blobs {
                 let carried_rows = predicate_rows_as(schema, &batch)?;
@@ -4690,16 +4653,10 @@ impl TableStore {
                         .unwrap_or(error));
                 }
                 Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
-                    let actual = account
-                        .bytes_with(non_blob_bytes)?
-                        .checked_add(actual)
-                        .ok_or_else(|| {
-                            OmniError::manifest_internal("pending scan byte count overflow")
-                        })?;
                     return Err(OmniError::resource_limit(
-                        "retained keyed batch bytes per operation",
-                        KEYED_WRITE_MAX_BYTES,
-                        actual,
+                        blob_payload_resource("retained keyed batch bytes per operation"),
+                        KEYED_BLOB_PAYLOAD_MAX_BYTES,
+                        account.payload_with(actual)?,
                     ));
                 }
                 Err(error) => return Err(error),
@@ -4974,7 +4931,7 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
 struct PendingScanAccount {
     table_key: String,
     rows: u64,
-    bytes: u64,
+    bytes: KeyedBytes,
 }
 
 impl PendingScanAccount {
@@ -4982,7 +4939,7 @@ impl PendingScanAccount {
         let mut account = Self {
             table_key: budget.table_key,
             rows: 0,
-            bytes: 0,
+            bytes: KeyedBytes::default(),
         };
         account.add_usage(budget.initial_rows, budget.initial_bytes)?;
         Ok(account)
@@ -5002,12 +4959,10 @@ impl PendingScanAccount {
     fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let bytes = u64::try_from(batch.get_array_memory_size())
-            .map_err(|_| OmniError::manifest_internal("pending scan bytes exceed u64"))?;
-        self.add_usage(rows, bytes)
+        self.add_usage(rows, KeyedBytes::of(batch)?)
     }
 
-    fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
+    fn add_usage(&mut self, rows: u64, bytes: KeyedBytes) -> Result<()> {
         let next_rows = self
             .rows
             .checked_add(rows)
@@ -5021,15 +4976,8 @@ impl PendingScanAccount {
         }
         let next_bytes = self
             .bytes
-            .checked_add(bytes)
-            .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
-        if next_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "retained keyed batch bytes per operation",
-                KEYED_WRITE_MAX_BYTES,
-                next_bytes,
-            ));
-        }
+            .checked_add(bytes)?
+            .ensure_fits("retained keyed batch bytes per operation")?;
         self.rows = next_rows;
         self.bytes = next_bytes;
         Ok(())
@@ -5052,22 +5000,21 @@ impl PendingScanAccount {
         Ok(())
     }
 
-    fn bytes_with(&self, bytes: u64) -> Result<u64> {
+    fn payload_with(&self, payload: u64) -> Result<u64> {
         self.bytes
-            .checked_add(bytes)
-            .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))
+            .payload
+            .checked_add(payload)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan payload byte count overflow"))
     }
 
-    fn remaining_bytes_after(&self, bytes: u64) -> Result<u64> {
-        let actual = self.bytes_with(bytes)?;
-        if actual > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "retained keyed batch bytes per operation",
-                KEYED_WRITE_MAX_BYTES,
-                actual,
-            ));
-        }
-        Ok(KEYED_WRITE_MAX_BYTES - actual)
+    /// Charge a match's non-Blob framing and return the payload its carried
+    /// Blob cells may still materialize.
+    fn payload_remaining_after(&self, framing: u64) -> Result<u64> {
+        let bytes = self
+            .bytes
+            .checked_add(KeyedBytes::framing(framing))?
+            .ensure_fits("retained keyed batch bytes per operation")?;
+        Ok(KEYED_BLOB_PAYLOAD_MAX_BYTES - bytes.payload)
     }
 
     fn next_scan_rows(&self) -> usize {
@@ -5078,7 +5025,9 @@ impl PendingScanAccount {
     }
 
     fn next_scan_bytes(&self) -> u64 {
-        KEYED_WRITE_MAX_BYTES.saturating_sub(self.bytes).max(1)
+        KEYED_WRITE_MAX_BYTES
+            .saturating_sub(self.bytes.framing)
+            .max(1)
     }
 }
 
@@ -5255,6 +5204,38 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
 struct LogicalBlobInput<'a> {
     data: &'a LargeBinaryArray,
     uris: &'a StringArray,
+}
+
+/// The logical length of every managed Blob value a batch carries in the
+/// logical input shape (`{data, uri}`): the payload half of
+/// [`crate::storage_layer::KeyedBytes`]. A Blob column in any other shape, such
+/// as a persisted descriptor, holds no payload bytes and counts as framing.
+pub(crate) fn logical_blob_payload_bytes(batch: &RecordBatch) -> Result<u64> {
+    let mut total = 0_u64;
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let is_blob =
+            lance::datatypes::Field::try_from(field.as_ref()).is_ok_and(|field| field.is_blob());
+        if !is_blob {
+            continue;
+        }
+        let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
+            continue;
+        };
+        let Ok(input) = logical_blob_input(descriptions, field.name()) else {
+            continue;
+        };
+        for row in 0..descriptions.len() {
+            if descriptions.is_null(row) || input.data.is_null(row) {
+                continue;
+            }
+            let length = u64::try_from(input.data.value_length(row))
+                .map_err(|_| OmniError::manifest_internal("negative Blob payload length"))?;
+            total = total
+                .checked_add(length)
+                .ok_or_else(|| OmniError::manifest_internal("Blob payload byte count overflow"))?;
+        }
+    }
+    Ok(total)
 }
 
 fn logical_blob_input<'a>(
@@ -5973,7 +5954,7 @@ fn bounded_proven_insert_stream(
             None::<(RecordBatch, usize)>,
             Vec::<RecordBatch>::new(),
             0_usize,
-            0_u64,
+            KeyedBytes::default(),
             schema,
             table_key,
         ),
@@ -5992,21 +5973,17 @@ fn bounded_proven_insert_stream(
                 if let Some((batch, consumed_rows)) = pending.take() {
                     let batch_rows = batch.num_rows();
                     let batch_bytes =
-                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                            OmniError::manifest_internal(
-                                "proven insert delta batch bytes exceed u64",
-                            )
-                            .into_datafusion_external()
-                        })?;
+                        KeyedBytes::of(&batch).map_err(OmniError::into_datafusion_external)?;
+                    let next_bytes = accumulated_bytes
+                        .checked_add(batch_bytes)
+                        .map_err(OmniError::into_datafusion_external)?;
                     let fits = accumulated_rows
                         .checked_add(batch_rows)
                         .is_some_and(|rows| rows <= KEYED_WRITE_MAX_ROWS)
-                        && accumulated_bytes
-                            .checked_add(batch_bytes)
-                            .is_some_and(|bytes| bytes <= KEYED_WRITE_MAX_BYTES);
+                        && next_bytes.fits();
                     if accumulated.is_empty() || fits {
                         accumulated_rows += batch_rows;
-                        accumulated_bytes += batch_bytes;
+                        accumulated_bytes = next_bytes;
                         accumulated.push(batch);
                         current_offset += consumed_rows;
                         if current
@@ -6016,9 +5993,7 @@ fn bounded_proven_insert_stream(
                             current = None;
                             current_offset = 0;
                         }
-                        if accumulated_rows == KEYED_WRITE_MAX_ROWS
-                            || accumulated_bytes == KEYED_WRITE_MAX_BYTES
-                        {
+                        if accumulated_rows == KEYED_WRITE_MAX_ROWS || accumulated_bytes.is_full() {
                             let output = finish_proven_insert_batch(
                                 &schema,
                                 std::mem::take(&mut accumulated),
@@ -6034,7 +6009,7 @@ fn bounded_proven_insert_stream(
                                     None,
                                     Vec::new(),
                                     0,
-                                    0,
+                                    KeyedBytes::default(),
                                     schema,
                                     table_key,
                                 ),
@@ -6059,7 +6034,7 @@ fn bounded_proven_insert_stream(
                             pending,
                             Vec::new(),
                             0,
-                            0,
+                            KeyedBytes::default(),
                             schema,
                             table_key,
                         ),
@@ -6102,7 +6077,7 @@ fn bounded_proven_insert_stream(
                                 pending,
                                 Vec::new(),
                                 0,
-                                0,
+                                KeyedBytes::default(),
                                 schema,
                                 table_key,
                             ),
@@ -6149,43 +6124,47 @@ fn next_proven_insert_batch(
     let (mut rows, mut logical_bytes) = largest_proven_insert_prefix(batch, offset, max_rows)?;
     loop {
         let is_whole_batch = offset == 0 && rows == batch.num_rows();
-        let retained_bytes = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
+        let retained = KeyedBytes::of(batch)?;
+        let retained_bytes = retained.framing.saturating_add(retained.payload);
+        let logical_total = logical_bytes.framing.saturating_add(logical_bytes.payload);
         // ArrayData's logical slice measure excludes the backing capacity held
         // by an Arrow slice. Preserve an already-compact whole scanner batch,
         // but copy any selected prefix or obvious retained-parent emission.
         let retained_parent_slop = 64_u64 * 1024;
         let keeps_only_logical_slice =
-            retained_bytes <= logical_bytes.saturating_add(retained_parent_slop);
-        let candidate = if is_whole_batch
-            && retained_bytes <= KEYED_WRITE_MAX_BYTES
-            && keeps_only_logical_slice
-        {
+            retained_bytes <= logical_total.saturating_add(retained_parent_slop);
+        let candidate = if is_whole_batch && retained.fits() && keeps_only_logical_slice {
             batch.clone()
         } else {
             copy_proven_insert_batch_range(batch, offset, rows)?
         };
-        let bytes = u64::try_from(candidate.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("proven insert delta batch bytes exceed u64")
-        })?;
-        if bytes <= KEYED_WRITE_MAX_BYTES {
+        let bytes = KeyedBytes::of(&candidate)?;
+        if bytes.fits() {
             validate_proven_insert_source_batch(&candidate, table_key)?;
             return Ok((candidate, rows));
         }
         if rows == 1 {
-            return Err(OmniError::resource_limit(
-                format!("proven insert delta bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                bytes,
-            ));
+            bytes.ensure_fits(&format!("proven insert delta bytes for {table_key}"))?;
         }
         drop(candidate);
-        rows = ((u128::try_from(rows).unwrap() * u128::from(KEYED_WRITE_MAX_BYTES))
-            / u128::from(bytes))
+        rows = shrunk_row_count(rows, bytes).clamp(1, rows - 1);
+        logical_bytes = proven_insert_slice_bytes(batch, offset, rows)?;
+    }
+}
+
+/// Scale a row count down in proportion to the half of `bytes` that most
+/// exceeds its ceiling.
+fn shrunk_row_count(rows: usize, bytes: KeyedBytes) -> usize {
+    let scaled = |actual: u64, ceiling: u64| {
+        if actual <= ceiling {
+            return u128::MAX;
+        }
+        u128::try_from(rows).unwrap_or(u128::MAX) * u128::from(ceiling) / u128::from(actual)
+    };
+    scaled(bytes.framing, KEYED_WRITE_MAX_BYTES)
+        .min(scaled(bytes.payload, KEYED_BLOB_PAYLOAD_MAX_BYTES))
         .try_into()
         .unwrap_or(1_usize)
-        .clamp(1, rows - 1);
-        logical_bytes = proven_insert_slice_memory_size(batch, offset, rows)?;
-    }
 }
 
 /// Select the largest row prefix whose logical Arrow buffers fit the byte
@@ -6196,14 +6175,14 @@ fn largest_proven_insert_prefix(
     batch: &RecordBatch,
     offset: usize,
     max_rows: usize,
-) -> Result<(usize, u64)> {
-    let one_row_bytes = proven_insert_slice_memory_size(batch, offset, 1)?;
-    if max_rows == 1 || one_row_bytes > KEYED_WRITE_MAX_BYTES {
+) -> Result<(usize, KeyedBytes)> {
+    let one_row_bytes = proven_insert_slice_bytes(batch, offset, 1)?;
+    if max_rows == 1 || !one_row_bytes.fits() {
         return Ok((1, one_row_bytes));
     }
 
-    let max_bytes = proven_insert_slice_memory_size(batch, offset, max_rows)?;
-    if max_bytes <= KEYED_WRITE_MAX_BYTES {
+    let max_bytes = proven_insert_slice_bytes(batch, offset, max_rows)?;
+    if max_bytes.fits() {
         return Ok((max_rows, max_bytes));
     }
 
@@ -6211,13 +6190,27 @@ fn largest_proven_insert_prefix(
     let mut high = max_rows - 1;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if proven_insert_slice_memory_size(batch, offset, middle)? <= KEYED_WRITE_MAX_BYTES {
+        if proven_insert_slice_bytes(batch, offset, middle)?.fits() {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-    Ok((low, proven_insert_slice_memory_size(batch, offset, low)?))
+    Ok((low, proven_insert_slice_bytes(batch, offset, low)?))
+}
+
+/// The selected rows' compact Arrow size, split like [`KeyedBytes::of`].
+fn proven_insert_slice_bytes(
+    batch: &RecordBatch,
+    offset: usize,
+    rows: usize,
+) -> Result<KeyedBytes> {
+    let total = proven_insert_slice_memory_size(batch, offset, rows)?;
+    let payload = logical_blob_payload_bytes(&batch.slice(offset, rows))?;
+    let framing = total.checked_sub(payload).ok_or_else(|| {
+        OmniError::manifest_internal("Blob payload bytes exceed their slice's Arrow memory")
+    })?;
+    Ok(KeyedBytes { framing, payload })
 }
 
 fn proven_insert_slice_memory_size(batch: &RecordBatch, offset: usize, rows: usize) -> Result<u64> {
@@ -6275,15 +6268,7 @@ fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> 
             batch.num_rows() as u64,
         ));
     }
-    let bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("proven insert delta batch bytes exceed u64"))?;
-    if bytes > KEYED_WRITE_MAX_BYTES {
-        return Err(OmniError::resource_limit(
-            format!("proven insert delta bytes for {table_key}"),
-            KEYED_WRITE_MAX_BYTES,
-            bytes,
-        ));
-    }
+    KeyedBytes::of(batch)?.ensure_fits(&format!("proven insert delta bytes for {table_key}"))?;
     Ok(())
 }
 

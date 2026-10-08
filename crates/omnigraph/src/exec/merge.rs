@@ -7,7 +7,8 @@ use crate::ordered_cursor::{
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{
-    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
+    KEYED_BLOB_PAYLOAD_MAX_BYTES, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedBytes,
+    KeyedWriteSemantics, ProvenInsertChunk,
 };
 use crate::table_store::certified_insert_absence_rows;
 use futures::StreamExt;
@@ -608,7 +609,7 @@ struct StagedTableWriter {
     dir: TempDir,
     dataset: Option<Dataset>,
     buffered_rows: usize,
-    buffered_bytes: u64,
+    buffered_bytes: KeyedBytes,
     row_count: u64,
     chunk_rows: Vec<usize>,
     batches: Vec<RecordBatch>,
@@ -627,7 +628,7 @@ impl StagedTableWriter {
             dir,
             dataset: None,
             buffered_rows: 0,
-            buffered_bytes: 0,
+            buffered_bytes: KeyedBytes::default(),
             row_count: 0,
             chunk_rows: Vec::new(),
             batches: Vec::new(),
@@ -651,24 +652,16 @@ impl StagedTableWriter {
                 &row.dataset,
                 &input,
                 external_preflight,
-                KEYED_WRITE_MAX_BYTES,
+                KEYED_BLOB_PAYLOAD_MAX_BYTES,
             )?
         } else {
-            u64::try_from(input.get_array_memory_size()).map_err(|_| {
-                OmniError::manifest_internal("branch merge row memory size exceeds u64")
-            })?
-        };
-        if predicted_row_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "branch-merge fenced entity bytes",
-                KEYED_WRITE_MAX_BYTES,
-                predicted_row_bytes,
-            ));
+            KeyedBytes::of(&input)?
         }
-        let predicted_overflow = self
+        .ensure_fits("branch-merge fenced entity bytes")?;
+        let predicted_overflow = !self
             .buffered_bytes
             .checked_add(predicted_row_bytes)
-            .is_none_or(|bytes| bytes > KEYED_WRITE_MAX_BYTES);
+            .is_ok_and(KeyedBytes::fits);
         if self.buffered_rows > 0
             && (self.buffered_rows >= KEYED_WRITE_MAX_ROWS || predicted_overflow)
         {
@@ -679,20 +672,11 @@ impl StagedTableWriter {
         let batch = self
             .row_batch(row, input, materializer, external_preflight)
             .await?;
-        let row_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge row memory size exceeds u64")
-        })?;
-        if row_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "branch-merge fenced entity bytes",
-                KEYED_WRITE_MAX_BYTES,
-                row_bytes,
-            ));
-        }
-        let would_exceed_bytes = self
+        let row_bytes = KeyedBytes::of(&batch)?.ensure_fits("branch-merge fenced entity bytes")?;
+        let would_exceed_bytes = !self
             .buffered_bytes
             .checked_add(row_bytes)
-            .is_none_or(|bytes| bytes > KEYED_WRITE_MAX_BYTES);
+            .is_ok_and(KeyedBytes::fits);
         if self.buffered_rows > 0
             && (self.buffered_rows >= KEYED_WRITE_MAX_ROWS || would_exceed_bytes)
         {
@@ -703,14 +687,9 @@ impl StagedTableWriter {
             .checked_add(1)
             .ok_or_else(|| OmniError::manifest_internal("branch merge row count overflow"))?;
         self.buffered_rows += 1;
-        self.buffered_bytes = self
-            .buffered_bytes
-            .checked_add(row_bytes)
-            .ok_or_else(|| OmniError::manifest_internal("branch merge byte count overflow"))?;
+        self.buffered_bytes = self.buffered_bytes.checked_add(row_bytes)?;
         self.batches.push(batch);
-        if self.buffered_rows >= KEYED_WRITE_MAX_ROWS
-            || self.buffered_bytes >= KEYED_WRITE_MAX_BYTES
-        {
+        if self.buffered_rows >= KEYED_WRITE_MAX_ROWS || self.buffered_bytes.is_full() {
             self.flush().await?;
         }
         Ok(())
@@ -728,7 +707,7 @@ impl StagedTableWriter {
                 .materialize_blob_batch_bounded_with_preflight_cache(
                     &row.dataset,
                     batch,
-                    KEYED_WRITE_MAX_BYTES,
+                    KEYED_BLOB_PAYLOAD_MAX_BYTES,
                     external_preflight,
                     &mut self.external_payloads,
                 )
@@ -779,7 +758,7 @@ impl StagedTableWriter {
                 .map_err(OmniError::arrow_internal)?
         };
         self.buffered_rows = 0;
-        self.buffered_bytes = 0;
+        self.buffered_bytes = KeyedBytes::default();
         self.chunk_rows.push(batch.num_rows());
         let chunk_count = u64::try_from(self.chunk_rows.len())
             .map_err(|_| OmniError::manifest_internal("branch merge chunk count exceeds u64"))?;
@@ -4319,12 +4298,13 @@ async fn next_exact_staged_chunk(
     } else {
         arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::arrow_internal)?
     };
-    let chunk_bytes = u64::try_from(chunk.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("branch merge chunk bytes exceed u64"))?;
-    if chunk.num_rows() > KEYED_WRITE_MAX_ROWS || chunk_bytes > KEYED_WRITE_MAX_BYTES {
+    let chunk_bytes = KeyedBytes::of(&chunk)?;
+    if chunk.num_rows() > KEYED_WRITE_MAX_ROWS || !chunk_bytes.fits() {
         return Err(OmniError::manifest_internal(format!(
-            "branch merge reconstructed a keyed chunk outside its planned bound: {} rows / {chunk_bytes} bytes",
-            chunk.num_rows()
+            "branch merge reconstructed a keyed chunk outside its planned bound: {} rows / {} framing and {} payload bytes",
+            chunk.num_rows(),
+            chunk_bytes.framing,
+            chunk_bytes.payload
         )));
     }
     Ok(chunk)
@@ -5169,10 +5149,10 @@ impl Omnigraph {
             .preflight_persisted_blob_selection(&blob_selection)
             .await?;
         let carried_blob_bytes = blob_selection.materialized_payload_bytes(&external_preflight)?;
-        if carried_blob_bytes > KEYED_WRITE_MAX_BYTES {
+        if carried_blob_bytes > KEYED_BLOB_PAYLOAD_MAX_BYTES {
             return Err(OmniError::resource_limit(
                 "materialized blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
+                KEYED_BLOB_PAYLOAD_MAX_BYTES,
                 carried_blob_bytes,
             ));
         }

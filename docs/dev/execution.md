@@ -682,8 +682,9 @@ All load modes share the mutation publisher and recovery protocol:
 Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
 and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
 The sum uses `get_array_memory_size`, preserving conservative shared-buffer
-counting. Keyed parsing separately caps its decoded-payload estimate across
-types at 32 MiB before retaining each row. External Blob copy admission includes
+counting, and managed Blob payloads are charged apart from it under their own
+32 MiB ceilings (see [writes](writes.md)). Keyed parsing separately caps its
+decoded-payload estimate across types at 32 MiB before retaining each row. External Blob copy admission includes
 the retained keyed batches plus copied payload estimates before payload reads;
 materialized batches are checked again before fragment staging.
 

@@ -5054,6 +5054,9 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 // a silently-wrong batch) in release. Faithful transcription of lance#7444's
 // minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
 // This guard turns red if a future Lance bump regresses the upstream fix.
+// It also pins that the merge-update keeps the updated row's stable row id:
+// a Blob write reads that id back from its own detached commit to form the
+// ETag a later read at the published snapshot returns (RFC 0033 §4.3).
 #[tokio::test]
 async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
     use futures::TryStreamExt;
@@ -5108,11 +5111,29 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         (1..=40).map(|i| format!("r{i}")).collect(),
     );
     let ds = merge(ds, seed, schema.clone()).await;
+    let row_id_of = |ds: Dataset, slug: &'static str| async move {
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("slug = '{slug}'")).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1, "{slug}");
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0)
+    };
+    let seeded_row_id = row_id_of(ds.clone(), "t3").await;
     let updates = mk_batch(
         (1..=15).map(|i| format!("t{i}")).collect(),
         (1..=15).map(|i| format!("e{i}")).collect(),
     );
     let ds = Arc::new(merge(ds, updates, schema.clone()).await);
+    assert_eq!(
+        row_id_of((*ds).clone(), "t3").await,
+        seeded_row_id,
+        "a whole-row merge-update keeps the updated row's stable row id"
+    );
 
     // The delete's deletion vector makes the overlapping id region sparse.
     let staged = lance::dataset::DeleteBuilder::new(ds.clone(), "slug = 't20'")
@@ -5142,6 +5163,72 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
+}
+
+// --- Guard: merge-insert refuses an external Blob reference outside the bases ---
+//
+// Lance 11's merge-insert writer stages its files with `WriteParams::default()`,
+// whose `allow_external_blob_outside_bases` is false, and a merge-insert takes
+// no other write params. A keyed write therefore cannot carry a stored external
+// reference as a reference: the engine reads it and stores managed bytes, or
+// refuses it under a denying policy (RFC 0033 §4.3). When this goes red,
+// merge-insert stores such a reference, and carrying a sibling's reference
+// without reading it is open again (RFC 0033, Phase 4).
+#[tokio::test]
+async fn merge_insert_refuses_an_external_blob_outside_the_dataset_bases() {
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("outside.bin");
+    std::fs::write(&external_path, b"outside the dataset").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let row = |content: arrow_array::ArrayRef| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a"])), content],
+        )
+        .unwrap()
+    };
+    let mut managed = BlobArrayBuilder::new(1);
+    managed.push_bytes(b"managed").unwrap();
+    let ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(row(managed.finish().unwrap()))], schema.clone()),
+        dir.path().join("table.lance").to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut external = BlobArrayBuilder::new(1);
+    external.push_uri(external_uri.as_str()).unwrap();
+    let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let error = job
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(row(external.finish().unwrap()))],
+            schema.clone(),
+        ))
+        .await
+        .expect_err("merge-insert must refuse a reference outside the dataset's bases");
+    assert!(
+        error
+            .to_string()
+            .contains("is outside registered external bases"),
+        "{error}"
+    );
 }
 
 // --- Guard 21: starts_with routes to the BTREE (LikePrefix) and stays literal --

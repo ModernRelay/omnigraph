@@ -73,27 +73,114 @@ use crate::table_store::{
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The operation-wide sibling of the per-table keyed ceiling. This uses the
-/// existing Arrow accounting (including its conservative shared-buffer count),
-/// not a second allocator or a claim about native execution/RSS.
-pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64> {
-    let actual = current
-        .checked_add(additional)
-        .ok_or_else(|| OmniError::manifest_internal("retained keyed batch byte count overflow"))?;
-    if actual > KEYED_WRITE_MAX_BYTES {
-        return Err(OmniError::resource_limit(
-            "retained keyed batch bytes per operation",
-            KEYED_WRITE_MAX_BYTES,
-            actual,
-        ));
-    }
-    Ok(actual)
+/// The ceiling on managed Blob payload bytes, by logical length, that one
+/// keyed write retains: the payload half of [`KeyedBytes`]. A single managed
+/// value of exactly this size is admitted.
+pub(crate) const KEYED_BLOB_PAYLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// What a keyed batch retains, under two ceilings. `payload` is the logical
+/// length of every managed Blob value the batch carries; `framing` is the rest
+/// of its Arrow memory, the Blob columns' offsets, validity and URIs included,
+/// with the existing conservative count of a slice's complete backing buffers.
+/// The two always sum to the batch's Arrow memory, so splitting them moves no
+/// byte out of the accounting. One combined ceiling could not admit a value of
+/// exactly [`KEYED_BLOB_PAYLOAD_MAX_BYTES`]: the batch around it is never empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyedBytes {
+    pub(crate) framing: u64,
+    pub(crate) payload: u64,
 }
 
-pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u64> {
-    let bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("retained keyed batch bytes exceed u64"))?;
-    retained_keyed_bytes(current, bytes)
+impl KeyedBytes {
+    pub(crate) fn of(batch: &RecordBatch) -> Result<Self> {
+        let total = u64::try_from(batch.get_array_memory_size())
+            .map_err(|_| OmniError::manifest_internal("keyed batch bytes exceed u64"))?;
+        let payload = crate::table_store::logical_blob_payload_bytes(batch)?;
+        let framing = total.checked_sub(payload).ok_or_else(|| {
+            OmniError::manifest_internal("Blob payload bytes exceed their batch's Arrow memory")
+        })?;
+        Ok(Self { framing, payload })
+    }
+
+    pub(crate) fn framing(framing: u64) -> Self {
+        Self {
+            framing,
+            payload: 0,
+        }
+    }
+
+    pub(crate) fn payload(payload: u64) -> Self {
+        Self {
+            framing: 0,
+            payload,
+        }
+    }
+
+    pub(crate) fn checked_add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            framing: self
+                .framing
+                .checked_add(other.framing)
+                .ok_or_else(|| OmniError::manifest_internal("keyed framing byte count overflow"))?,
+            payload: self
+                .payload
+                .checked_add(other.payload)
+                .ok_or_else(|| OmniError::manifest_internal("keyed payload byte count overflow"))?,
+        })
+    }
+
+    pub(crate) fn fits(self) -> bool {
+        self.framing <= KEYED_WRITE_MAX_BYTES && self.payload <= KEYED_BLOB_PAYLOAD_MAX_BYTES
+    }
+
+    /// Whether either half has reached its ceiling, so nothing more fits.
+    pub(crate) fn is_full(self) -> bool {
+        self.framing >= KEYED_WRITE_MAX_BYTES || self.payload >= KEYED_BLOB_PAYLOAD_MAX_BYTES
+    }
+
+    /// Refuse a half above its ceiling. `resource` names the framing ceiling
+    /// ("... bytes ..."); the payload ceiling is the same name with "Blob
+    /// payload bytes" in place of its first "bytes".
+    pub(crate) fn ensure_fits(self, resource: &str) -> Result<Self> {
+        if self.framing > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                resource,
+                KEYED_WRITE_MAX_BYTES,
+                self.framing,
+            ));
+        }
+        if self.payload > KEYED_BLOB_PAYLOAD_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                blob_payload_resource(resource),
+                KEYED_BLOB_PAYLOAD_MAX_BYTES,
+                self.payload,
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// The payload ceiling's name for a framing ceiling's name.
+pub(crate) fn blob_payload_resource(resource: &str) -> String {
+    debug_assert!(resource.contains(" bytes"), "{resource}");
+    resource.replacen(" bytes", " Blob payload bytes", 1)
+}
+
+/// The operation-wide sibling of the per-table keyed ceilings. This uses the
+/// existing Arrow accounting (including its conservative shared-buffer count),
+/// split by [`KeyedBytes`], not a second allocator or a claim about native
+/// execution/RSS.
+pub(crate) fn retained_keyed_bytes(
+    current: KeyedBytes,
+    additional: KeyedBytes,
+) -> Result<KeyedBytes> {
+    current
+        .checked_add(additional)?
+        .ensure_fits("retained keyed batch bytes per operation")
+}
+
+pub(crate) fn retain_keyed_batch(current: KeyedBytes, batch: &RecordBatch) -> Result<KeyedBytes> {
+    retained_keyed_bytes(current, KeyedBytes::of(batch)?)
 }
 
 /// One allowance per mutation (all tables and cascades) or load (all replacement
@@ -146,11 +233,15 @@ pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) struct PendingScanBudget {
     pub(crate) table_key: String,
     pub(crate) initial_rows: u64,
-    pub(crate) initial_bytes: u64,
+    pub(crate) initial_bytes: KeyedBytes,
 }
 
 impl PendingScanBudget {
-    pub(crate) fn new(table_key: impl Into<String>, initial_rows: u64, initial_bytes: u64) -> Self {
+    pub(crate) fn new(
+        table_key: impl Into<String>,
+        initial_rows: u64,
+        initial_bytes: KeyedBytes,
+    ) -> Self {
         Self {
             table_key: table_key.into(),
             initial_rows,

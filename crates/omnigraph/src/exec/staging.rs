@@ -27,8 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::storage_layer::{
-    DeletedIdBudget, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    SnapshotHandle, StagedHandle, retain_keyed_batch, retained_keyed_bytes,
+    DeletedIdBudget, KEYED_BLOB_PAYLOAD_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedBytes,
+    KeyedWriteSemantics, SnapshotHandle, StagedHandle, retain_keyed_batch, retained_keyed_bytes,
 };
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
@@ -76,15 +76,12 @@ impl PendingTable {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
 
-    fn total_bytes(&self) -> Result<u64> {
-        self.batches.iter().try_fold(0_u64, |bytes, batch| {
-            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                OmniError::manifest_internal("pending keyed batch bytes exceed u64")
-            })?;
-            bytes
-                .checked_add(batch_bytes)
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
-        })
+    fn total_bytes(&self) -> Result<KeyedBytes> {
+        self.batches
+            .iter()
+            .try_fold(KeyedBytes::default(), |bytes, batch| {
+                bytes.checked_add(KeyedBytes::of(batch)?)
+            })
     }
 }
 
@@ -120,7 +117,7 @@ pub(crate) struct MutationStaging {
     /// In-memory accumulated batches per table (insert/update path).
     pub(crate) pending: HashMap<String, PendingTable>,
     /// Monotonic retained-batch accounting, updated only by `append_batch`.
-    pending_bytes: u64,
+    pending_bytes: KeyedBytes,
     /// Per-table delete predicates from delete-touching ops. D₂ guarantees a
     /// table is write-XOR-delete within one query, so this never overlaps
     /// `pending`. Staged as one combined `stage_delete` per table at
@@ -259,8 +256,7 @@ impl MutationStaging {
                 )));
             }
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size())
-            .map_err(|_| OmniError::manifest_internal("pending keyed batch bytes exceed u64"))?;
+        let batch_bytes = KeyedBytes::of(&batch)?;
         let pending_bytes = if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
             let existing_rows = self
                 .pending
@@ -279,23 +275,14 @@ impl MutationStaging {
             }
             let existing_bytes = match self.pending.get(table_key) {
                 Some(existing) => existing.total_bytes()?,
-                None => 0,
+                None => KeyedBytes::default(),
             };
-            let bytes = existing_bytes
-                .checked_add(batch_bytes)
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
-            if bytes > KEYED_WRITE_MAX_BYTES {
-                return Err(OmniError::resource_limit(
-                    format!("keyed entity bytes for {table_key}"),
-                    KEYED_WRITE_MAX_BYTES,
-                    bytes,
-                ));
-            }
+            existing_bytes
+                .checked_add(batch_bytes)?
+                .ensure_fits(&format!("keyed entity bytes for {table_key}"))?;
             retained_keyed_bytes(self.pending_bytes, batch_bytes)?
         } else {
-            self.pending_bytes
-                .checked_add(batch_bytes)
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?
+            self.pending_bytes.checked_add(batch_bytes)?
         };
         let entry = self
             .pending
@@ -402,7 +389,7 @@ impl MutationStaging {
     /// keyed-write fence, while bytes include every pending table so one graph
     /// mutation cannot multiply the 32 MiB retained-memory budget by touching
     /// several tables.
-    pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<(u64, u64)> {
+    pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<(u64, KeyedBytes)> {
         let rows = u64::try_from(
             self.pending
                 .get(table_key)
@@ -512,26 +499,32 @@ impl MutationStaging {
             .collect::<Vec<_>>();
         let copied_external_blob_bytes =
             external_blob_preflight.materialized_payload_bytes(&copied_external_blob_uris)?;
-        if copied_external_blob_bytes > KEYED_WRITE_MAX_BYTES {
+        if copied_external_blob_bytes > KEYED_BLOB_PAYLOAD_MAX_BYTES {
             return Err(OmniError::resource_limit(
                 "materialized external blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
+                KEYED_BLOB_PAYLOAD_MAX_BYTES,
                 copied_external_blob_bytes,
             ));
         }
-        let retained_batch_bytes = stage_inputs.iter().try_fold(0, |bytes, (_, table, _, _)| {
-            if table.mode == PendingMode::Overwrite {
-                Ok(bytes)
-            } else {
-                retain_keyed_batch(bytes, &table.batch)
-            }
-        })?;
-        retained_keyed_bytes(retained_batch_bytes, copied_external_blob_bytes)?;
+        let retained_batch_bytes =
+            stage_inputs
+                .iter()
+                .try_fold(KeyedBytes::default(), |bytes, (_, table, _, _)| {
+                    if table.mode == PendingMode::Overwrite {
+                        Ok(bytes)
+                    } else {
+                        retain_keyed_batch(bytes, &table.batch)
+                    }
+                })?;
+        retained_keyed_bytes(
+            retained_batch_bytes,
+            KeyedBytes::payload(copied_external_blob_bytes),
+        )?;
 
         // Only after the complete operation has passed policy, source, and
         // aggregate-copy admission do we read payload bytes. Reuse remains
         // batch-bounded so this vector cannot retain an operation-sized cache.
-        let mut materialized_keyed_bytes = 0;
+        let mut materialized_keyed_bytes = KeyedBytes::default();
         for (table_key, table, _, _) in &mut stage_inputs {
             table.batch = match table.mode {
                 PendingMode::StrictInsert | PendingMode::Upsert => {
@@ -662,26 +655,18 @@ fn prepare_pending_table(
     }
 
     if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
-        let (rows, bytes) =
-            table
-                .batches
-                .iter()
-                .try_fold((0_u64, 0_u64), |(rows, bytes), batch| {
-                    let batch_rows = u64::try_from(batch.num_rows())
-                        .map_err(|_| OmniError::manifest_internal("keyed batch rows exceed u64"))?;
-                    let batch_bytes =
-                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                            OmniError::manifest_internal("keyed batch bytes exceed u64")
-                        })?;
-                    Ok::<_, OmniError>((
-                        rows.checked_add(batch_rows).ok_or_else(|| {
-                            OmniError::manifest_internal("keyed row count overflow")
-                        })?,
-                        bytes.checked_add(batch_bytes).ok_or_else(|| {
-                            OmniError::manifest_internal("keyed byte count overflow")
-                        })?,
-                    ))
-                })?;
+        let (rows, bytes) = table.batches.iter().try_fold(
+            (0_u64, KeyedBytes::default()),
+            |(rows, bytes), batch| {
+                let batch_rows = u64::try_from(batch.num_rows())
+                    .map_err(|_| OmniError::manifest_internal("keyed batch rows exceed u64"))?;
+                Ok::<_, OmniError>((
+                    rows.checked_add(batch_rows)
+                        .ok_or_else(|| OmniError::manifest_internal("keyed row count overflow"))?,
+                    bytes.checked_add(KeyedBytes::of(batch)?)?,
+                ))
+            },
+        )?;
         if rows > KEYED_WRITE_MAX_ROWS as u64 {
             return Err(OmniError::resource_limit(
                 format!("keyed entities for {table_key}"),
@@ -689,13 +674,7 @@ fn prepare_pending_table(
                 rows,
             ));
         }
-        if bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed entity bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                bytes,
-            ));
-        }
+        bytes.ensure_fits(&format!("keyed entity bytes for {table_key}"))?;
     }
 
     let mode = table.mode;

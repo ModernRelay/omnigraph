@@ -342,12 +342,22 @@ Insert/update mutations and keyed Append/Merge loads also cap the sum of
 retained Arrow batches across tables at 32 MiB
 (`retained keyed batch bytes per operation`). Admission uses
 `get_array_memory_size` accounting; shared buffers may be conservatively counted
-more than once. An update's pending-aware scan charges the same sum under the
-same resource name. The keyed parse spool separately caps its decoded-payload
-estimate across tables at 32 MiB (`keyed parsed entity bytes per operation`).
-External Blob copy admission adds copied payload estimates, which are not yet
-read, to the retained keyed batches under the same resource name before reading
-payloads, then checks materialized batches before staging fragments.
+more than once. Every keyed byte check splits that count with one function,
+`KeyedBytes::of` in `storage_layer.rs`: the logical length of each managed Blob
+value in the logical `{data, uri}` shape is payload, under its own 32 MiB
+ceiling (`KEYED_BLOB_PAYLOAD_MAX_BYTES`, reported as `… Blob payload bytes …`),
+and the rest is framing, under the existing ceilings. The halves sum to the
+Arrow count, so the split moves no byte out of the accounting; one combined
+ceiling could never admit a value of exactly 32 MiB beside its row. An update's
+pending-aware scan charges the same sums under the same resource names, and
+the payload remaining is the budget for reading its carried Blob cells. The
+keyed parse spool separately caps its pre-decode estimate across tables at
+32 MiB (`keyed parsed entity bytes per operation`), split the same way, a
+`base64:` value counting its decoded length as payload. External Blob copy
+admission adds copied payload estimates, which are not yet read, to the payload
+half before reading payloads, then checks materialized batches before staging
+fragments. Branch merge's row buffering and proven-insert chunking use the
+same split.
 
 Delete mutations, cascades and Overwrite's removed-ID detection stream matches
 instead of collecting the full scan. One 32 MiB
