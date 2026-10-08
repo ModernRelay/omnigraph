@@ -183,6 +183,32 @@ fn redaction_covers_secret_values_and_object_keys_without_provider_error_text() 
 }
 
 #[tokio::test]
+async fn explicit_api_credentials_are_scrubbed_from_success_and_error_responses() {
+    let token = "explicit-automation-secret";
+    let fixture = IntentApiFixture::new(vec![
+        IntentReply::json(200, json!({"data":{"reflected":token},"meta":{}})),
+        IntentReply::json(403, json!({"type":"permission_denied","detail":token})),
+    ]);
+    let api = Api::new(fixture.origin.clone(), Some(token.into())).unwrap();
+    let response = api
+        .request(Method::GET, "/v1/auth/session", None, None)
+        .await
+        .unwrap();
+    assert!(!response.to_string().contains(token));
+    let error = api
+        .request(Method::GET, "/v1/auth/session", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.exit, 2);
+    assert_eq!(error.body["type"], "permission_denied");
+    assert!(!error.body.to_string().contains(token));
+    for request in fixture.requests() {
+        assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
+    }
+    fixture.assert_complete();
+}
+
+#[tokio::test]
 async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_retry() {
     let transport = MockTransport::with(vec![
         (

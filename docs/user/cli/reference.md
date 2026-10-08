@@ -273,20 +273,17 @@ query, or fragment. HTTPS is required except for exact localhost,
 
 See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
 
-All accept `--config DIR` and `--json`. Managed plan and apply accept
-`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. Without a
-supplied key, plan or apply generates one and prints it to stderr before
-submission. Retain the key and exact revision or preview ID after an uncertain
-response. Reusing that key with the identical body retrieves the same
-reservation; changing its body refuses. The CLI never automatically repeats
-the submission. Once a delivery ID is known, observe that ID instead of
-submitting again. Cancellation is idempotent for the original delivery;
-after a possible dispatch it refuses and cannot stop native effects.
-Plan and apply do not upload local files or infer a revision from uncommitted
-changes; `cluster push --managed` explicitly prepares managed source. A preview
-does not hold a change lease. Source edits grant no deployment permissions;
-the applied cluster policy authorizes the native plan and effects. A stale
-generation or changed policy refuses; the CLI never substitutes a new preview.
+All accept `--config DIR` and `--json`. Plan and apply also accept
+`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
+generated and printed before submission. Retain it and the exact request after
+uncertainty: replaying the same key/body retrieves the same reservation;
+changed input refuses. The CLI never repeats a submission automatically.
+Once an ID is known, observe it. Cancellation is idempotent, but refuses after
+possible dispatch and cannot stop native effects.
+Plan and apply read pushed source, not uncommitted local edits; use
+`cluster push --managed` to upload. Previews hold no change lease. Source edits
+grant no deployment permission: applied policy authorizes native effects.
+A stale generation or changed policy refuses without substituting a preview.
 
 Plan returns its synchronous preview. Replaying its key returns metadata,
 without redisclosing the saved native plan. Apply and exact-ID status waiting
@@ -308,18 +305,14 @@ stderr; refusals use a JSON problem object with a `type` field.
 | Explicit refusal | 2 |
 | Local wait deadline with delivery, observation, activation or archive unresolved | 5 |
 
-Status and history reads exit 0 when retrieved successfully. Abandoning a
-saved plan is no longer an operation. Historical results cannot establish
-current activation. An unresolved preview replay exits 5 and retains its ID.
-Managed delivery does not infer retry safety or exit 75 from HTTP status.
+Snapshot reads exit 0 without implying deployment success. Historical results
+cannot establish current activation. Unresolved preview replay exits 5 with its
+ID. There is no plan abandonment or inferred retry safety/exit 75 from HTTP.
 Cloud lifecycle commands retain their [separate outcomes](managed-lifecycle.md#recover-an-uncertain-response).
-Managed apply does not
-prompt for an additional approval: the API checks the authenticated caller's
-permissions. `--as`, `--server`, `--profile`, `--graph`, `--store`, and the
-global `--cluster` selector do not apply to these managed cluster operations.
+Applied policy authorizes execution. `--as`, `--server`, `--profile`, `--graph`,
+`--store`, and global `--cluster` do not select managed cluster operations.
 
-For unattended execution, provide an explicitly scoped automation token and
-its API origin together:
+For unattended execution, supply an accepted service bearer and its API origin:
 
 ```bash
 export OMNIGRAPH_CONTROL_API=https://control.example
@@ -339,8 +332,7 @@ local deployment. Service-only `create`, `push`, `delete`, `undo-delete`, `token
 `--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
 be combined with them.
 Use `cluster operation --managed OPERATION_ID [--wait]` for service lifecycle observation;
-`cluster status --managed [DEPLOYMENT_ID]` reads cluster projections or a managed delivery. Self-hosted
-`cluster status --deployment-id ID` addresses a separate deployment receipt.
+self-hosted `cluster status --deployment-id ID` addresses a native receipt.
 
 ## Managed data access
 
@@ -348,8 +340,7 @@ After login and cluster selection, use `graphs list` to discover graphs, then
 `query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
 Missing or expired identity credentials are acquired before the operation;
 applied Cedar policy decides permissions. See [managed data access](managed-data.md)
-for offline behavior, identity binding,
-discovery and credential clearing.
+for offline behavior, identity binding, discovery and credential clearing.
 
 ## Confirmation rules
 
