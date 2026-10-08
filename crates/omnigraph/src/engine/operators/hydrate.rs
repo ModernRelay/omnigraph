@@ -3,7 +3,9 @@
 //! return projection below carries); this operator takes the deferred
 //! columns of those rows from the binding's pinned table by address, one
 //! chunk at a time under `hydrate_chunk_bytes`, and emits the return columns
-//! in return order without the addresses.
+//! in return order without the addresses. A chunk's bound covers the fetched
+//! rows and their copies, one per output row, which the pool admits before
+//! Arrow builds them.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -11,10 +13,11 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
-use arrow_select::take::take;
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
@@ -32,8 +35,16 @@ use super::{external, polled, streaming_properties};
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
-/// The pool owner of one hydrated chunk: the taken rows and the output.
+/// The pool owner of one hydrated chunk: the fetched rows, then the output.
 const CHUNK: &str = "hydrate chunk";
+
+/// The admission of a chunk's copied values while Arrow builds them.
+const OUTPUT: &str = "hydrate output";
+
+/// The gauge of the most bytes one chunk held at once: its fetched rows and
+/// their copies. It stays under `hydrate_chunk_bytes` unless one row alone
+/// exceeds it.
+const PEAK_CHUNK_BYTES: &str = "peak_chunk_bytes";
 
 /// Rows of the first chunk, before a hydrated row's width is measured.
 const SEED_ROWS: usize = 4;
@@ -233,6 +244,7 @@ impl ExecutionPlan for HydrateExec {
             bindings: self.bindings.clone(),
             snapshot: self.snapshot.clone(),
             schema: Arc::clone(&schema),
+            peak: MetricBuilder::new(&self.metrics).gauge(PEAK_CHUNK_BYTES, 0),
         };
         let stream = producer_stream(
             schema,
@@ -250,6 +262,7 @@ struct Hydration {
     bindings: Vec<HydratedBinding>,
     snapshot: Snapshot,
     schema: SchemaRef,
+    peak: Gauge,
 }
 
 /// One deferred binding's pinned table and the columns taken from it.
@@ -301,7 +314,8 @@ async fn hydrate(
                 .collect(),
         });
     }
-    // The widest hydrated row seen so far plans the next chunk's rows.
+    // The costliest output row seen so far, its share of the fetched rows
+    // and its own copy, plans the next window's rows.
     let mut row_bytes = 0usize;
     while let Some(batch) = input.next().await {
         let batch = batch?;
@@ -316,17 +330,45 @@ async fn hydrate(
                 memory.check()?;
                 let window = batch.slice(start, rows);
                 let chunk = Arc::new(memory.child(CHUNK)?);
-                let (taken, bytes) = take_window(&window, &sources, &plan.schema, &chunk).await?;
-                row_bytes = row_bytes.max(bytes / rows.max(1)).max(1);
-                if bytes > hard && rows > 1 {
+                let (fetched, fetched_bytes) =
+                    fetch_window(&window, &sources, &plan.schema, &chunk).await?;
+                if fetched_bytes > hard && rows > 1 {
                     rows = rows.div_ceil(2);
                     continue;
                 }
-                let output = assemble(&window, &taken, &plan)?;
-                chunk.hold(&output)?;
-                memory.metric("hydrated_rows", rows);
+                // A row a join repeats is copied once per output row, so the
+                // window keeps a prefix, halved until the pool's estimate of
+                // its copies fits beside the fetched rows; the rest is the
+                // next window.
+                let mut keep = rows;
+                let mut copied = copy_bytes(&fetched, keep, &chunk)?;
+                while keep > 1 && fetched_bytes.saturating_add(copied) > hard {
+                    keep = keep.div_ceil(2);
+                    copied = copy_bytes(&fetched, keep, &chunk)?;
+                }
+                row_bytes = row_bytes
+                    .max(fetched_bytes.saturating_add(copied) / keep)
+                    .max(1);
+                let taken = fetched
+                    .iter()
+                    .map(|source| {
+                        chunk
+                            .take_once(&source.values, &source.indices.slice(0, keep), OUTPUT)
+                            .map(|values| values.columns().to_vec())
+                    })
+                    .collect::<DfResult<Vec<_>>>()?;
+                let copies = taken
+                    .iter()
+                    .flatten()
+                    .map(|column| column.get_array_memory_size())
+                    .sum::<usize>();
+                plan.peak.set_max(fetched_bytes.saturating_add(copies));
+                drop(fetched);
+                let output = assemble(&window.slice(0, keep), &taken, &plan)?;
+                chunk.output(&output)?;
+                memory.metric("hydrated_rows", keep);
                 sender.send(output, chunk).await?;
-                start += rows;
+                start += keep;
                 break;
             }
         }
@@ -334,16 +376,33 @@ async fn hydrate(
     Ok(())
 }
 
-/// Each source's deferred columns for the rows of `window`, as arrays aligned
-/// with them, and the bytes the takes hold, all charged to `chunk`. A row
-/// address the pinned table does not hold is an integrity failure.
-async fn take_window(
+/// One source's deferred columns for a window: `values` holds them for the
+/// distinct rows Lance returned (one null row when every address is null),
+/// and `indices` places each window row among those rows, null for a null
+/// address.
+struct Fetched {
+    values: RecordBatch,
+    indices: UInt32Array,
+}
+
+/// What `take_once` admits to copy the first `rows` rows of the window from
+/// every source.
+fn copy_bytes(fetched: &[Fetched], rows: usize, chunk: &WorkMemory) -> DfResult<usize> {
+    fetched.iter().try_fold(0usize, |sum, source| {
+        Ok(sum.saturating_add(chunk.take_bytes(&source.values, &source.indices.slice(0, rows))?))
+    })
+}
+
+/// Each source's deferred columns for the distinct rows of `window`, held
+/// by `chunk`, and the bytes Lance returned. A row address the pinned table
+/// does not hold is an integrity failure.
+async fn fetch_window(
     window: &RecordBatch,
     sources: &[Source],
     schema: &SchemaRef,
     chunk: &WorkMemory,
-) -> DfResult<(Vec<Vec<ArrayRef>>, usize)> {
-    let mut taken = Vec::with_capacity(sources.len());
+) -> DfResult<(Vec<Fetched>, usize)> {
+    let mut fetched = Vec::with_capacity(sources.len());
     let mut bytes = 0usize;
     for source in sources {
         let addresses = window
@@ -359,84 +418,88 @@ async fn take_window(
         unique.sort_unstable();
         unique.dedup();
         chunk.entries::<(u64, u32)>(unique.len())?;
-        let rows = if unique.is_empty() {
-            None
-        } else {
-            let batch = TakeBuilder::try_new_from_addresses(
-                Arc::clone(&source.dataset),
-                unique,
-                Arc::clone(&source.projection),
-            )
-            .map(|builder| builder.with_row_address(true))
-            .map_err(|error| external(OmniError::storage_context("hydrate take", error)))?
-            .execute()
-            .await
-            .map_err(|error| {
-                external(OmniError::storage_context(
-                    format!("hydrating the return columns of `${}`", source.binding),
-                    error,
-                ))
-            })?;
-            chunk.hold(&batch)?;
-            bytes = bytes.saturating_add(batch.get_array_memory_size());
-            Some(batch)
-        };
-        let columns = match rows {
-            None => source
-                .columns
+        let fields = source
+            .columns
+            .iter()
+            .map(|(output, _)| {
+                let field = schema.field_with_name(output)?;
+                Ok(Field::new(output, field.data_type().clone(), true))
+            })
+            .collect::<DfResult<Vec<Field>>>()?;
+        let values_schema = Arc::new(Schema::new(fields));
+        if unique.is_empty() {
+            let columns = values_schema
+                .fields()
                 .iter()
-                .map(|(output, _)| {
-                    let field = schema.field_with_name(output)?;
-                    Ok(new_null_array(field.data_type(), window.num_rows()))
-                })
-                .collect::<DfResult<Vec<ArrayRef>>>()?,
-            Some(batch) => {
-                let positions: HashMap<u64, u32> = batch
-                    .column_by_name(ROW_ADDR)
-                    .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                    .ok_or_else(|| {
-                        DataFusionError::Internal("a row-address take returned no _rowaddr".into())
-                    })?
-                    .values()
-                    .iter()
-                    .enumerate()
-                    .map(|(row, address)| Ok((*address, u32::try_from(row)?)))
-                    .collect::<std::result::Result<_, std::num::TryFromIntError>>()
-                    .map_err(|_| {
-                        DataFusionError::Internal("a hydrated chunk exceeds u32 rows".into())
-                    })?;
-                let indices = addresses
-                    .iter()
+                .map(|field| new_null_array(field.data_type(), 1))
+                .collect();
+            fetched.push(Fetched {
+                values: RecordBatch::try_new(values_schema, columns)?,
+                indices: UInt32Array::new_null(window.num_rows()),
+            });
+            continue;
+        }
+        let batch = TakeBuilder::try_new_from_addresses(
+            Arc::clone(&source.dataset),
+            unique,
+            Arc::clone(&source.projection),
+        )
+        .map(|builder| builder.with_row_address(true))
+        .map_err(|error| external(OmniError::storage_context("hydrate take", error)))?
+        .execute()
+        .await
+        .map_err(|error| {
+            external(OmniError::storage_context(
+                format!("hydrating the return columns of `${}`", source.binding),
+                error,
+            ))
+        })?;
+        chunk.hold(&batch)?;
+        bytes = bytes.saturating_add(batch.get_array_memory_size());
+        let positions: HashMap<u64, u32> = batch
+            .column_by_name(ROW_ADDR)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                DataFusionError::Internal("a row-address take returned no _rowaddr".into())
+            })?
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(row, address)| Ok((*address, u32::try_from(row)?)))
+            .collect::<std::result::Result<_, std::num::TryFromIntError>>()
+            .map_err(|_| DataFusionError::Internal("a hydrated chunk exceeds u32 rows".into()))?;
+        let indices = addresses
+            .iter()
+            .map(|address| {
+                address
                     .map(|address| {
-                        address
-                            .map(|address| {
-                                positions.get(&address).copied().ok_or_else(|| {
-                                    external(OmniError::manifest_internal(format!(
-                                        "row address {address} of `${}` is not in its pinned table",
-                                        source.binding
-                                    )))
-                                })
-                            })
-                            .transpose()
+                        positions.get(&address).copied().ok_or_else(|| {
+                            external(OmniError::manifest_internal(format!(
+                                "row address {address} of `${}` is not in its pinned table",
+                                source.binding
+                            )))
+                        })
                     })
-                    .collect::<DfResult<UInt32Array>>()?;
-                source
-                    .columns
-                    .iter()
-                    .map(|(_, property)| {
-                        let column = batch.column_by_name(property).ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "a row-address take returned no '{property}'"
-                            ))
-                        })?;
-                        Ok(take(column.as_ref(), &indices, None)?)
-                    })
-                    .collect::<DfResult<Vec<ArrayRef>>>()?
-            }
-        };
-        taken.push(columns);
+                    .transpose()
+            })
+            .collect::<DfResult<UInt32Array>>()?;
+        let columns = source
+            .columns
+            .iter()
+            .map(|(_, property)| {
+                batch.column_by_name(property).cloned().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "a row-address take returned no '{property}'"
+                    ))
+                })
+            })
+            .collect::<DfResult<Vec<ArrayRef>>>()?;
+        fetched.push(Fetched {
+            values: RecordBatch::try_new(values_schema, columns)?,
+            indices,
+        });
     }
-    Ok((taken, bytes))
+    Ok((fetched, bytes))
 }
 
 /// The return columns of `window` in return order, as `plan.layout` places

@@ -1343,6 +1343,85 @@ async fn a_wide_column_read_under_a_limit_follows_its_result() {
     assert_released(&probes);
 }
 
+/// A join repeats a row once per output row, and hydration copies its
+/// values once per repetition: a `limit 108` over a hub's 512 edges returns
+/// copies of the hub's 40 KiB payload under a 16 MiB pool, and no chunk holds
+/// more than `hydrate_chunk_bytes` (2 MiB) of fetched rows and copies.
+/// Sixteen narrow sources come first, so the seed plans a window far wider
+/// than the hub's rows allow. GQT cannot set the pool or read the operator's
+/// gauge.
+#[tokio::test]
+#[serial]
+async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), GRAPH_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let person = |name: String, payload: String| {
+        serde_json::json!({"type":"Person", "data":{"name":name, "payload":payload}}).to_string()
+    };
+    let knows = |from: String, to: String| {
+        serde_json::json!({"edge":"Knows", "from":from, "to":to}).to_string()
+    };
+    let mut lines: Vec<String> = (0..16)
+        .map(|narrow| person(format!("a{narrow:02}"), String::new()))
+        .collect();
+    lines.push(person("hub".into(), "h".repeat(40 * 1024)));
+    lines.extend((0..512).map(|leaf| person(format!("leaf{leaf:03}"), String::new())));
+    lines.extend((0..16).map(|narrow| knows(format!("a{narrow:02}"), format!("leaf{narrow:03}"))));
+    lines.extend((0..512).map(|leaf| knows("hub".into(), format!("leaf{leaf:03}"))));
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    let fanout = r#"query fanout() {
+        match { $a: Person $a knows $b }
+        return { $a.name, $a.payload }
+        limit 108
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(16 * MIB, query_main(&v2, fanout, "fanout", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 108);
+    let column = |index: usize| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+    let (names, payloads) = (column(0), column(1));
+    let mut hub_rows = 0;
+    for row in 0..batch.num_rows() {
+        let width = if names.value(row) == "hub" {
+            hub_rows += 1;
+            40 * 1024
+        } else {
+            0
+        };
+        assert_eq!(payloads.value(row).len(), width, "{}", names.value(row));
+    }
+    assert!(hub_rows >= 92, "{hub_rows} of the rows are the hub's");
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [108]);
+    let peak = counter(&probes, "HydrateExec", "peak_chunk_bytes");
+    assert_eq!(peak.len(), 1);
+    assert!(
+        peak[0] > 40 * 1024 && peak[0] as u64 <= omnigraph_planner::hydrate_chunk_bytes(16 * MIB),
+        "a chunk held {} bytes",
+        peak[0]
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_released(&probes);
+}
+
 /// 64 MiB of passage text under a 48 MiB pool: the Passage scan streams a
 /// batch at a time with or without needles, so the plain filtered product
 /// and the contains join both answer; only the join's marked scan sieves,
