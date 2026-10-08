@@ -598,9 +598,11 @@ included, to the existing keyed-write byte ceilings in Arrow memory. One shared
 accounting function applies both. A single budget cannot keep the inclusive
 promise: a one-row batch holding a 33,554,432-byte value and an `id` measures
 33,555,112 bytes in Arrow memory (arrow 58.3), so the old combined ceiling
-refused every exact-limit value, from `blob put` and from a `base64:` value in an
-incremental load or an update alike. The bound per operation is the sum of the
-two budgets.
+refused every exact-limit value, from `blob put`, an embedded `.gq` parameter or
+a carried cell alike. A load stays bounded earlier by its text: a 32 MiB value
+is about 42.7 MiB of `base64:` text, above the load's 32 MiB line and parse
+ceilings, which size the JSON it holds. The bound per operation is the sum of
+the two budgets.
 
 The target cell's old payload is not read or charged before replacement. A
 predicate `.gq` update is not replayed after a pre-effect `ReadSetChanged`,
@@ -1361,9 +1363,9 @@ The implementation extends existing owners before creating new fixtures, per
   and accepted state unchanged.
 - `writes.rs` also owns the payload/framing split (§4.3): an exact 32 MiB PUT is
   accepted and one more byte is refused by the payload limit, not by a framing
-  ceiling; a 32 MiB `base64:` value in an incremental load and in a `.gq`
-  update is accepted where the combined ceiling refused it; and a framing
-  refusal still names its keyed-write ceiling. It owns the sibling carry rule
+  ceiling; a 32 MiB value carried by an update and one inserted through an
+  embedded `.gq` parameter are accepted where the combined ceiling refused
+  them; and a framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
   too: an external sibling becomes managed under an admitting policy (visible
   through `stat`), fails with `StoredExternalBlobDenied` naming the sibling under
   a denying one, and on a row with two external cells under a denying policy a
@@ -1861,9 +1863,10 @@ publisher architecture.
   - Payload bytes and batch framing get separate budgets for every keyed writer
     (§4.3). A one-row batch holding a 33,554,432-byte value measures 33,555,112
     bytes in Arrow memory, so the combined 32 MiB ceiling refused every
-    exact-limit value from a PUT and from a `base64:` value in an incremental
-    load or update; the inclusive promise is kept by counting payloads by
-    logical length.
+    exact-limit value from a PUT, an embedded `.gq` parameter or a carried
+    cell; the inclusive promise is kept by counting payloads by logical
+    length. A load's own line and parse ceilings, sized on its `base64:`
+    text, still bound a loaded value below 32 MiB.
   - Untouched sibling Blob cells are carried by value under the `.gq` update
     rule, including an external sibling becoming managed, or
     `StoredExternalBlobDenied` under a denying policy (§4.3). Lance 11 offers no
