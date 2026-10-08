@@ -38,6 +38,7 @@ n: I64
 
 --- expect plan
 pass aggregate_pushdown
+result columns [n: I64?]
 
 --- query
 set engine = v2;
@@ -54,6 +55,7 @@ b: I64
 
 --- expect plan
 pass aggregate_pushdown
+result columns [a: I64?, b: I64?]
 
 --- query
 set engine = v2;
@@ -69,6 +71,7 @@ d: I64
 
 --- expect plan
 pass aggregate_pushdown
+result columns [d: I64?]
 
 --- query
 set engine = v2;
@@ -84,6 +87,7 @@ n: I64
 
 --- expect plan
 pass aggregate_pushdown
+result columns [n: I64?]
 
 --- query
 set engine = v2;

@@ -1218,6 +1218,446 @@ mod schema_drift {
     }
 }
 
+mod result_contract {
+    use arrow_array::{Float64Array, Int32Array, Int64Array, StructArray};
+    use omnigraph_compiler::ir::{IRExpr, IRProjection};
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+    use omnigraph_planner::{Estimate, NodeObjectType, PhysicalNode, PhysicalPlan, Properties};
+
+    use super::*;
+
+    fn node_fields() -> arrow_schema::Fields {
+        vec![
+            Field::new("@id", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]
+        .into()
+    }
+
+    fn plan(nullable: bool) -> BoundPlan {
+        let mut plan = PhysicalPlan::new();
+        let input = plan.add(PhysicalNode::OuterReference {
+            outer_var: "p".into(),
+        });
+        let root = plan.add(PhysicalNode::Projection {
+            input,
+            return_exprs: vec![
+                IRProjection {
+                    expr: IRExpr::Literal(
+                        Literal::Float(1.0),
+                        ExprType::from_prop(&PropType::scalar(ScalarType::F64, nullable)),
+                    ),
+                    alias: Some("total".into()),
+                    column: "total".into(),
+                    ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, nullable)),
+                },
+                IRProjection {
+                    expr: IRExpr::Variable(
+                        "p".into(),
+                        omnigraph_compiler::types::ExprType::Node {
+                            type_name: "Person".into(),
+                        },
+                    ),
+                    alias: Some("person".into()),
+                    column: "person".into(),
+                    ty: ExprType::Node {
+                        type_name: "Person".into(),
+                    },
+                },
+            ],
+            node_objects: vec![NodeObjectType {
+                type_name: "Person".into(),
+                fields: node_fields(),
+            }],
+        });
+        plan.set_properties(
+            root,
+            Properties {
+                schema: Arc::new(Schema::new(vec![
+                    Field::new("total", DataType::Float64, nullable),
+                    Field::new("person", DataType::Struct(node_fields()), false),
+                ])),
+                ordering: None,
+                rows: Estimate::Unknown,
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: vec![],
+            },
+        );
+        plan.set_root(root);
+        BoundPlan {
+            plan,
+            values: Default::default(),
+        }
+    }
+
+    fn decl() -> QueryDecl {
+        parse_query(
+            "query q() { match { $p: Person } return { sum($p.age) as total, $p as person } }",
+        )
+        .unwrap()
+        .single_decl()
+        .clone()
+    }
+
+    fn result(total: ArrayRef, age: ArrayRef) -> QueryResult {
+        let fields = vec![
+            Field::new("@id", DataType::Utf8, false),
+            Field::new("age", age.data_type().clone(), true),
+        ]
+        .into();
+        let person: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(StringArray::from(vec!["alice"])), age],
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("total", total.data_type().clone(), true),
+            Field::new("person", person.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![total, person]).unwrap();
+        QueryResult::new(schema, vec![batch])
+    }
+
+    fn matching() -> QueryResult {
+        result(
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int32Array::from(vec![30])),
+        )
+    }
+
+    #[test]
+    fn planned_results_require_order_names_and_full_node_types() {
+        let bound = plan(true);
+        assert_eq!(check_planned_results(&bound, &matching()), Ok(()));
+        let wrong = result(
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&bound, &wrong)
+                .unwrap_err()
+                .contains("`total`")
+        );
+        let wrong = result(
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(Int64Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&bound, &wrong)
+                .unwrap_err()
+                .contains("`person`")
+        );
+        let reversed = matching().batches()[0].project(&[1, 0]).unwrap();
+        let reversed = QueryResult::new(reversed.schema(), vec![reversed]);
+        assert!(check_planned_results(&bound, &reversed).is_err());
+        let mut wrong_name = plan(true);
+        let root = wrong_name.plan.root();
+        let mut properties = wrong_name.plan.properties(root).unwrap().clone();
+        properties.schema = Arc::new(Schema::new(vec![
+            Field::new("other", DataType::Float64, true),
+            Field::new("person", DataType::Struct(node_fields()), false),
+        ]));
+        wrong_name.plan.set_properties(root, properties);
+        assert!(check_planned_results(&wrong_name, &matching()).is_err());
+    }
+
+    #[test]
+    fn planned_nullability_checks_cells_and_inference_checks_flags() {
+        assert_eq!(check_planned_results(&plan(false), &matching()), Ok(()));
+        let null = result(
+            Arc::new(Float64Array::from(vec![None::<f64>])),
+            Arc::new(Int32Array::from(vec![30])),
+        );
+        assert!(
+            check_planned_results(&plan(false), &null)
+                .unwrap_err()
+                .contains("returned 1 null(s)")
+        );
+        assert_eq!(check_planned_results(&plan(true), &null), Ok(()));
+        let bound = plan(true);
+        assert_eq!(
+            check_inferred_results(&decl(), declared_result_schema(&bound).unwrap(), &bound),
+            Ok(())
+        );
+        assert!(
+            check_inferred_results(
+                &decl(),
+                declared_result_schema(&plan(false)).unwrap(),
+                &bound
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn round_trip_checks_stored_shapes_even_when_explain_is_equal() {
+        let original = plan(true);
+        let mut restored = original.clone();
+        let root = restored.plan.root();
+        let mut properties = restored.plan.properties(root).unwrap().clone();
+        properties.schema = Arc::new(Schema::new(vec![
+            Field::new("total", DataType::Float64, false),
+            Field::new("person", DataType::Struct(node_fields()), false),
+        ]));
+        restored.plan.set_properties(root, properties);
+        assert_eq!(original.plan.to_json(), restored.plan.to_json());
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("schema")
+        );
+        let mut restored = original.clone();
+        let Some(PhysicalNode::Projection { node_objects, .. }) = restored.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        node_objects[0].fields = vec![
+            Field::new("@id", DataType::Int64, false),
+            Field::new("age", DataType::Int32, true),
+        ]
+        .into();
+        assert_eq!(original.plan.to_json(), restored.plan.to_json());
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("typed declarations")
+        );
+    }
+
+    #[test]
+    fn planner_typed_renderer_and_gqt_validator_agree_on_every_expression_kind() {
+        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::types::AggSignature;
+        let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
+        let text = || {
+            IRExpr::Literal(
+                Literal::String("needle".into()),
+                ty(ScalarType::String, false),
+            )
+        };
+        let property = || IRExpr::PropAccess {
+            variable: "p".into(),
+            property: "name".into(),
+            ty: ty(ScalarType::String, true),
+        };
+        let node = || {
+            IRExpr::Variable(
+                "p".into(),
+                ExprType::Node {
+                    type_name: "Person".into(),
+                },
+            )
+        };
+        let rank = || IRExpr::Bm25 {
+            field: Box::new(property()),
+            query: Box::new(text()),
+            ty: ty(ScalarType::F32, false),
+        };
+        let expressions = vec![
+            property(),
+            text(),
+            node(),
+            IRExpr::Param("term".into(), ty(ScalarType::String, false)),
+            IRExpr::AliasRef("term".into(), ty(ScalarType::String, false)),
+            IRExpr::Nearest {
+                variable: "p".into(),
+                property: "embedding".into(),
+                query: Box::new(text()),
+                ty: ty(ScalarType::F32, false),
+            },
+            IRExpr::Search {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::Fuzzy {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                max_edits: Some(Box::new(IRExpr::Literal(
+                    Literal::Integer(1),
+                    ty(ScalarType::I64, false),
+                ))),
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::MatchText {
+                field: Box::new(property()),
+                query: Box::new(text()),
+                ty: ty(ScalarType::Bool, false),
+            },
+            rank(),
+            IRExpr::Rrf {
+                primary: Box::new(rank()),
+                secondary: Box::new(rank()),
+                k: None,
+                ty: ty(ScalarType::F64, false),
+            },
+            IRExpr::Aggregate {
+                func: AggFunc::Count,
+                arg: Box::new(node()),
+                signature: AggSignature {
+                    arg: ExprType::Node {
+                        type_name: "Person".into(),
+                    },
+                    result: ty(ScalarType::I64, true),
+                },
+            },
+            IRExpr::comparison(property(), CompOp::Eq, text()),
+            IRExpr::Not(
+                Box::new(IRExpr::Param("flag".into(), ty(ScalarType::Bool, true))),
+                ty(ScalarType::Bool, true),
+            ),
+            IRExpr::IsNull {
+                expr: Box::new(property()),
+                negated: false,
+                ty: ty(ScalarType::Bool, false),
+            },
+            IRExpr::Cast {
+                expr: Box::new(IRExpr::Literal(
+                    Literal::Integer(1),
+                    ty(ScalarType::I64, false),
+                )),
+                ty: ty(ScalarType::F64, false),
+            },
+        ];
+        for expression in expressions {
+            let mut bound = plan(false);
+            let root = bound.plan.root();
+            let Some(PhysicalNode::Projection { return_exprs, .. }) = bound.plan.node_mut(root)
+            else {
+                panic!("projection");
+            };
+            return_exprs[0].ty = expression.ty().clone();
+            return_exprs[0].expr = expression;
+            let rendered = bound.plan.to_json();
+            assert_eq!(plan::validate_typed_plan(&rendered), Ok(()), "{rendered}");
+            assert_eq!(check_bound_plan_round_trip(&bound), Ok(()), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn block_typed_trees_and_specs_survive_every_row_round_trip_guard() {
+        use omnigraph_compiler::AggSignature;
+        use omnigraph_compiler::ir::{BlockAggregateExpr, SubqueryPredicate};
+        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
+        let leaf = BlockAggregateExpr::Aggregate {
+            func: AggFunc::Sum,
+            arg: Box::new(IRExpr::PropAccess {
+                variable: "p".into(),
+                property: "age".into(),
+                ty: ty(ScalarType::I64, true),
+            }),
+            signature: AggSignature {
+                arg: ty(ScalarType::I64, true),
+                result: ty(ScalarType::F64, true),
+            },
+        };
+        let cases = vec![
+            (
+                leaf,
+                IRExpr::Literal(Literal::Float(0.0), ty(ScalarType::F64, false)),
+            ),
+            (
+                BlockAggregateExpr::CountRows {
+                    ty: ty(ScalarType::I64, false),
+                },
+                IRExpr::Literal(Literal::Integer(0), ty(ScalarType::I64, false)),
+            ),
+            (
+                BlockAggregateExpr::Cast {
+                    expr: Box::new(BlockAggregateExpr::CountRows {
+                        ty: ty(ScalarType::I64, false),
+                    }),
+                    ty: ty(ScalarType::F64, false),
+                },
+                IRExpr::Param("bound".into(), ty(ScalarType::F64, false)),
+            ),
+        ];
+        for (left, right) in cases {
+            let mut bound = plan(false);
+            let input = bound.plan.root();
+            let aggregate = omnigraph_planner::plan_block_aggregate(&left).unwrap();
+            let id = bound.plan.add(PhysicalNode::AntiJoin {
+                input,
+                inner: input,
+                outer_var: "p".into(),
+                aggregate,
+                predicate: SubqueryPredicate {
+                    left,
+                    op: CompOp::Gt,
+                    right,
+                },
+            });
+            bound.plan.set_root(id);
+            assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
+            let mut wrong = bound.clone();
+            let Some(PhysicalNode::AntiJoin { aggregate, .. }) = wrong.plan.node_mut(id) else {
+                panic!("block");
+            };
+            *aggregate = Some(omnigraph_planner::AggregateSpec {
+                accumulator: omnigraph_planner::Accumulator::Float64,
+                overflow: omnigraph_planner::Overflow::Error,
+            });
+            assert!(check_restored_plan(&bound, &wrong).is_err());
+        }
+    }
+
+    #[test]
+    fn round_trip_detects_cast_child_type_loss_with_unchanged_gq() {
+        let mut original = plan(false);
+        let root = original.plan.root();
+        let Some(PhysicalNode::Projection { return_exprs, .. }) = original.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        return_exprs[0].expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Integer(1),
+                ExprType::from_prop(&PropType::scalar(ScalarType::I64, false)),
+            )),
+            ty: return_exprs[0].ty.clone(),
+        };
+        assert_eq!(check_bound_plan_round_trip(&original), Ok(()));
+        let mut restored = original.clone();
+        let Some(PhysicalNode::Projection { return_exprs, .. }) = restored.plan.node_mut(root)
+        else {
+            panic!("projection");
+        };
+        let IRExpr::Cast { expr, .. } = &mut return_exprs[0].expr else {
+            panic!("cast");
+        };
+        let IRExpr::Literal(_, ty) = expr.as_mut() else {
+            panic!("literal");
+        };
+        *ty = ExprType::from_prop(&PropType::scalar(ScalarType::I32, false));
+        assert_eq!(
+            original.plan.to_json()["exprs"],
+            restored.plan.to_json()["exprs"]
+        );
+        assert!(
+            check_restored_plan(&original, &restored)
+                .unwrap_err()
+                .contains("explain")
+        );
+    }
+
+    #[test]
+    fn bound_plan_round_trip_preserves_return_types_and_node_declarations() {
+        let bound = plan(true);
+        omnigraph_planner::validate_output_schemas(&bound.plan).unwrap();
+        assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));
+        let restored: BoundPlan =
+            serde_json::from_slice(&serde_json::to_vec(&bound).unwrap()).unwrap();
+        assert_eq!(restored, bound);
+        omnigraph_planner::validate_output_schemas(&restored.plan).unwrap();
+        assert_eq!(
+            bound.plan.to_json()["columns"],
+            serde_json::json!(["total: F64?", "person: Person"])
+        );
+    }
+}
+
 mod shape_section {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Fields};

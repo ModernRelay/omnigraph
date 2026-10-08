@@ -36,6 +36,11 @@ total: F64
 mean: F64
 n: I64
 
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
+
 --- query
 query totals_by_team() {
     match { $p: Person }
@@ -51,6 +56,11 @@ p.team: String
 total: F64?
 mean: F64?
 n: I64
+
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
 
 --- query
 query totals_of_nobody() {
@@ -68,6 +78,11 @@ query totals_of_nobody() {
 n: I64
 total: F64?
 mean: F64?
+
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
 
 --- query
 query birthdates_by_team() {

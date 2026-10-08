@@ -60,4 +60,7 @@ pub use query_input::{
     find_read_statement, json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
-pub use types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};
+pub use types::{
+    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
+    check_datetime_literal,
+};

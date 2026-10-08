@@ -35,6 +35,13 @@ Omnigraph is engineered for the new workload introduced by long-horizon agents: 
 **Object-storage**: scales at the lowest cost.
 
 
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero.png">
+    <img alt="One dark terminal window: four agents write to the same Omnigraph company graph at once, each in its own pane and on its own branch; three merge into main, and main refuses the fourth, a decision that contradicts one already merged; beside them, the graph grows as each write lands and marks the refused one" src="assets/readme/hero.webp">
+  </picture>
+</p>
+
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
 

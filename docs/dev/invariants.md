@@ -83,6 +83,18 @@ five more changes like this one?**
    mutations, polymorphism, policy predicates, and future planner capabilities
    belong in AST, IR, and typed plan structures. Do not smuggle semantics
    through strings, transport flags, global state, or side tables.
+   Expressions and parameter declarations retain the compiler's type.
+   Numeric comparison conversions are explicit Cast nodes; execution and scan
+   pushdown never select a domain from values. The internal exact integer
+   carrier cannot appear in a declared property, parameter or public result.
+   Mutation statements retain the compiler-selected node or edge target;
+   execution does not choose again when both namespaces contain the same name.
+   Binding validates every declared parameter, including unused declarations;
+   replay validates used values against the retained leaves. Projection fields
+   come from those declarations, including empty results. Opened Lance fields
+   must match the accepted storage schema in type and nullability. Derived
+   operator fields may widen nullable flags, but values may not violate a
+   declared non-null constraint.
 
 10. **Trust is established at the boundary and enforced at the engine.** HTTP
     resolves bearer tokens to actors; a client never supplies its trusted actor

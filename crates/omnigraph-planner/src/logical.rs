@@ -439,7 +439,7 @@ pub enum LogicalNode {
     /// `limit` the query's limit, which sizes a nearest arm.
     RankFuse {
         input: LogicalId,
-        arms: [SearchArm; 2],
+        arms: Box<[SearchArm; 2]>,
         k: Option<IRExpr>,
         limit: Option<u64>,
         reads: Vec<ColumnRef>,
@@ -723,19 +723,27 @@ impl LogicalPlan {
             LogicalNode::Filter { conjuncts, .. } => json!({
                 "node": "Filter",
                 "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
+                "typed_filters": crate::typed::exprs(conjuncts),
             }),
-            LogicalNode::Projection { reads, .. } => json!({
+            LogicalNode::Projection {
+                reads,
+                return_exprs,
+                ..
+            } => json!({
                 "node": "Projection",
                 "columns": rendered(reads),
+                "typed_exprs": crate::typed::returns(return_exprs),
             }),
             LogicalNode::Sort {
                 keys,
+                order_by,
                 fetch,
                 tiebreak,
                 ..
             } => json!({
                 "node": "Sort",
                 "keys": keys,
+                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
                 "fetch": fetch,
                 "tiebreak": tiebreak_text(tiebreak),
             }),
@@ -801,12 +809,15 @@ impl LogicalPlan {
                 "node": "AntiJoin",
                 "outer_var": outer_var,
                 "predicate": predicate.to_string(),
+                "typed_left": crate::typed::block(&predicate.left),
+                "typed_right": crate::typed::expr(&predicate.right),
             }),
             LogicalNode::OuterReference { outer_var } => json!({
                 "node": "OuterReference",
                 "outer_var": outer_var,
             }),
             LogicalNode::Nearest {
+                query,
                 binding,
                 property,
                 k,
@@ -816,10 +827,12 @@ impl LogicalPlan {
                 "node": "Nearest",
                 "binding": binding,
                 "property": property,
+                "typed_query": crate::typed::expr(query),
                 "k": k,
                 "reads": rendered(reads),
             }),
             LogicalNode::TextSearch {
+                query,
                 binding,
                 property,
                 reads,
@@ -828,22 +841,31 @@ impl LogicalPlan {
                 "node": "TextSearch",
                 "binding": binding,
                 "property": property,
+                "typed_query": crate::typed::expr(query),
                 "reads": rendered(reads),
             }),
             LogicalNode::RankFuse {
                 arms,
+                k,
                 reads,
                 row_tiebreak,
                 ..
             } => json!({
                 "node": "RankFuse",
                 "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
+                "typed_queries": arms.iter().map(|arm| crate::typed::expr(&arm.query)).collect::<Vec<_>>(),
+                "typed_k": k.as_ref().map(crate::typed::expr),
                 "reads": rendered(reads),
                 "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
-            LogicalNode::Aggregate { reads, .. } => json!({
+            LogicalNode::Aggregate {
+                reads,
+                return_exprs,
+                ..
+            } => json!({
                 "node": "Aggregate",
                 "reads": rendered(reads),
+                "typed_exprs": crate::typed::returns(return_exprs),
             }),
         };
         let inputs: Vec<Value> = node
@@ -882,6 +904,7 @@ pub(crate) fn scan_json(name: &str, spec: &ScanSpec) -> Value {
             "filter": spec.filter,
         }),
     };
+    value["typed_filter"] = json!(spec.filter.as_ref().map(crate::typed::predicate));
     if let Some(runtime_filter) = &spec.runtime_filter {
         value["runtime_filter"] = json!(runtime_filter);
     }
@@ -904,6 +927,8 @@ fn rendered(reads: &[ColumnRef]) -> Vec<String> {
 
 pub(crate) fn metadata_count_json(spec: &ScanSpec, return_exprs: &[IRProjection]) -> Value {
     let mut value = scan_json("MetadataCount", spec);
+    value["columns"] = json!(crate::output::return_columns(return_exprs));
+    value["typed_exprs"] = json!(crate::typed::returns(return_exprs));
     value["exprs"] = json!(
         return_exprs
             .iter()
