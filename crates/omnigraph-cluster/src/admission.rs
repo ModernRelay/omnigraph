@@ -35,10 +35,11 @@ impl ClusterAdmissionPurpose {
 /// Dropping this value never unlocks. In particular, returning from a command,
 /// draining HTTP owners, or stopping a runtime is not a native settlement proof.
 #[derive(Debug, Clone)]
-pub struct ClusterAdmission(Arc<AdmissionOwner>);
+pub struct ClusterAdmission(Option<Arc<AdmissionOwner>>);
 
 #[derive(Debug)]
 struct AdmissionOwner {
+    changed: Arc<tokio::sync::Notify>,
     store: ClusterStore,
     guard: StateLockGuard,
     canonical_root: String,
@@ -48,6 +49,10 @@ struct AdmissionOwner {
 }
 
 impl ClusterAdmission {
+    fn owner(&self) -> &Arc<AdmissionOwner> {
+        self.0.as_ref().expect("admission has not been consumed")
+    }
+
     /// Only the private policy-only bootstrap protocol can transfer an
     /// already-held lock into an admission. Neither owner is ever unlocked.
     pub(crate) fn from_bootstrap_lock(
@@ -60,7 +65,8 @@ impl ClusterAdmission {
         } else {
             ClusterAdmissionPurpose::Deployment
         };
-        Self(Arc::new(AdmissionOwner {
+        Self(Some(Arc::new(AdmissionOwner {
+            changed: Arc::new(tokio::sync::Notify::new()),
             canonical_root: store
                 .canonical_root()
                 .expect("bootstrap has a validated S3 root"),
@@ -69,31 +75,31 @@ impl ClusterAdmission {
             schema_contracts: BTreeMap::new(),
             serving_deployment,
             purpose,
-        }))
+        })))
     }
 
     pub fn canonical_root(&self) -> &str {
-        &self.0.canonical_root
+        &self.owner().canonical_root
     }
 
     pub fn lock_id(&self) -> &str {
-        self.0.guard.lock_id()
+        self.owner().guard.lock_id()
     }
 
     /// Explicit storage lifetime acquired before the first native lock request.
     pub fn io_scope(&self) -> Option<omnigraph_storage::StorageIoScope> {
-        self.0.store.io_scope()
+        self.owner().store.io_scope()
     }
 
     pub(crate) fn store(&self) -> ClusterStore {
-        self.0.store.clone()
+        self.owner().store.clone()
     }
 
     /// The running server and direct deployment executor use the same durable
     /// root ownership. Check the exact persisted owner before control effects.
     pub(crate) async fn validate_deployment(&self) -> Result<(), Diagnostic> {
         if !matches!(
-            self.0.purpose,
+            self.owner().purpose,
             ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::Deployment
         ) {
             return Err(crate::deployment::refusal(
@@ -107,7 +113,7 @@ impl ClusterAdmission {
     /// Completion uses the accepted deployment's current base, not the graph
     /// inventory captured when a long-lived server first acquired this owner.
     pub(crate) async fn validate_completion(&self, deployment_id: &str) -> Result<(), Diagnostic> {
-        match &self.0.purpose {
+        match &self.owner().purpose {
             ClusterAdmissionPurpose::Serve | ClusterAdmissionPurpose::Deployment => {}
             ClusterAdmissionPurpose::Reconcile {
                 deployment_id: original,
@@ -123,9 +129,9 @@ impl ClusterAdmission {
     }
 
     async fn validate_current_lock(&self) -> Result<(), Diagnostic> {
-        let mut observations = self.0.store.observations();
+        let mut observations = self.owner().store.observations();
         let mut diagnostics = Vec::new();
-        self.0
+        self.owner()
             .store
             .observe_lock(&mut observations, &mut diagnostics)
             .await;
@@ -143,7 +149,7 @@ impl ClusterAdmission {
 
     /// A recovery/deployment owner cannot be reinterpreted as a serving owner.
     pub fn validate_serving(&self) -> Result<(), Diagnostic> {
-        if self.0.purpose != ClusterAdmissionPurpose::Serve {
+        if self.owner().purpose != ClusterAdmissionPurpose::Serve {
             return Err(Diagnostic::error(
                 "cluster_admission_purpose_mismatch",
                 "__cluster/lock.json",
@@ -163,7 +169,7 @@ impl ClusterAdmission {
         self.validate_serving()?;
         let graph_id = self.admitted_graph_id(graph_uri)?;
         Ok(self
-            .0
+            .owner()
             .schema_contracts
             .get(&graph_id)
             .expect("admitted graph"))
@@ -172,7 +178,26 @@ impl ClusterAdmission {
     /// The current converged receipt captured under this admission. This is
     /// startup input, not evidence that this process has installed its bindings.
     pub fn serving_deployment(&self) -> Option<&crate::DeploymentResult> {
-        self.0.serving_deployment.as_ref()
+        self.owner().serving_deployment.as_ref()
+    }
+
+    /// Wait until every other admission handle has actually been dropped.
+    ///
+    /// This only drains process-local ownership; it is not storage settlement
+    /// or permission to release the native lock. The caller must keep its
+    /// existing shutdown deadline in force and still use the checked release.
+    /// Cancellation leaves this admission and its persisted lock unchanged.
+    pub async fn wait_for_exclusive_owner(&self) {
+        let owner = self.owner();
+        loop {
+            let changed = owner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if Arc::strong_count(owner) == 1 {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Explicitly release a uniquely owned admission after the caller has
@@ -185,17 +210,22 @@ impl ClusterAdmission {
     /// replace a successor. A lost release acknowledgement remains an error,
     /// never a reason to delete or retry against a newer version. Operators
     /// must still exclude concurrent administrative force-unlock.
-    pub async fn release_after_settlement(self) -> Result<(), Diagnostic> {
-        let owner = Arc::try_unwrap(self.0).map_err(|owner| {
-            Diagnostic::error(
-                "cluster_admission_in_use",
-                "__cluster/lock.json",
-                format!(
-                    "admission {} still has live owners; retaining its lock",
-                    owner.guard.lock_id()
-                ),
-            )
-        })?;
+    pub async fn release_after_settlement(mut self) -> Result<(), Diagnostic> {
+        let owner = match Arc::try_unwrap(self.0.take().expect("admission not consumed")) {
+            Ok(owner) => owner,
+            Err(owner) => {
+                let error = Diagnostic::error(
+                    "cluster_admission_in_use",
+                    "__cluster/lock.json",
+                    format!(
+                        "admission {} still has live owners; retaining its lock",
+                        owner.guard.lock_id()
+                    ),
+                );
+                drop_owner(owner);
+                return Err(error);
+            }
+        };
         owner.store.release_settled(owner.guard.lock_id()).await
     }
 
@@ -207,7 +237,11 @@ impl ClusterAdmission {
     }
 
     fn admitted_graph_id(&self, graph_uri: &str) -> Result<String, Diagnostic> {
-        admitted_graph_id(self.canonical_root(), &self.0.schema_contracts, graph_uri)
+        admitted_graph_id(
+            self.canonical_root(),
+            &self.owner().schema_contracts,
+            graph_uri,
+        )
     }
 
     /// Only a completed read-only preflight may call this. Abandonment and
@@ -220,6 +254,22 @@ impl ClusterAdmission {
             Err(error) => release_failure(refusal, &lock_id, error),
         }
     }
+}
+
+impl Drop for ClusterAdmission {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            drop_owner(owner);
+        }
+    }
+}
+
+fn drop_owner(owner: Arc<AdmissionOwner>) {
+    let changed = Arc::clone(&owner.changed);
+    // Notification must follow the actual reference-count decrement. A
+    // transport can report completion before dropping its service state.
+    drop(owner);
+    changed.notify_waiters();
 }
 
 /// Shared membership semantics for exclusive admission and read-only captures.
@@ -376,14 +426,15 @@ pub(crate) async fn acquire_with_store(
         Ok(captured) => captured,
         Err(error) => return Err(release_refused_preflight(store, guard.lock_id(), error).await),
     };
-    Ok(Some(ClusterAdmission(Arc::new(AdmissionOwner {
+    Ok(Some(ClusterAdmission(Some(Arc::new(AdmissionOwner {
+        changed: Arc::new(tokio::sync::Notify::new()),
         store: store.clone(),
         guard,
         canonical_root,
         schema_contracts,
         serving_deployment,
         purpose,
-    }))))
+    })))))
 }
 
 /// Canonical process-owner identity for a graph URI, including local aliases.
@@ -575,6 +626,56 @@ mod tests {
         // prevent its capture; graph-open errors belong to per-graph startup.
         assert!(!graph.join("__manifest").exists());
         next.release_after_settlement().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclusive_wait_observes_actual_clone_drop_and_cancellation_keeps_lock() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        for refused_release in [false, true] {
+            let dir = state_fixture(2, false);
+            let owner = acquire_cluster_admission(
+                dir.path().to_str().unwrap(),
+                ClusterAdmissionPurpose::Serve,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let held = owner.clone();
+            let lock = dir.path().join("__cluster/lock.json");
+            let before = std::fs::read(&lock).unwrap();
+            {
+                let mut cancelled = std::pin::pin!(owner.wait_for_exclusive_owner());
+                std::future::poll_fn(|cx| {
+                    assert!(cancelled.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+            }
+            assert_eq!(std::fs::read(&lock).unwrap(), before);
+            {
+                let mut waiting = std::pin::pin!(owner.wait_for_exclusive_owner());
+                std::future::poll_fn(|cx| {
+                    assert!(waiting.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                if refused_release {
+                    assert_eq!(
+                        held.release_after_settlement().await.unwrap_err().code,
+                        "cluster_admission_in_use"
+                    );
+                } else {
+                    drop(held);
+                }
+                tokio::time::timeout(Duration::from_secs(1), waiting)
+                    .await
+                    .expect("the actual final clone drop must wake the waiter");
+            }
+            assert_eq!(std::fs::read(&lock).unwrap(), before);
+            owner.release_after_settlement().await.unwrap();
+            assert!(!lock.exists());
+        }
     }
 
     #[tokio::test]

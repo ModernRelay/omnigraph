@@ -2677,6 +2677,10 @@ async fn serve_config(
                 "storage completion uncertain; retaining cluster admission"
             ));
         }
+        // Axum's connection completion notification can precede destruction
+        // of its Hyper service and AppState. Drain those actual owners too;
+        // the original process watchdog still bounds this wait.
+        owner.wait_for_exclusive_owner().await;
         owner
             .release_after_settlement()
             .await
