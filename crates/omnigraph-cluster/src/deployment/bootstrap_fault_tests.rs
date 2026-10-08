@@ -30,6 +30,7 @@ enum Point {
     StateAccepted,
     StateTerminal,
     Claim,
+    Release,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,7 +72,17 @@ impl Controlled {
 
     fn point(uri: &str, payload: &str, cas: bool) -> Option<Point> {
         if uri.ends_with("/__cluster/lock.json") {
-            Some(if cas { Point::Claim } else { Point::LockCreate })
+            Some(
+                if serde_json::from_str::<serde_json::Value>(payload).unwrap()["release_id"]
+                    .is_string()
+                {
+                    Point::Release
+                } else if cas {
+                    Point::Claim
+                } else {
+                    Point::LockCreate
+                },
+            )
         } else if uri.ends_with("/__cluster/state.json") {
             if !cas {
                 Some(Point::StateCreate)
@@ -460,6 +471,145 @@ async fn cancellation_after_backend_commit_never_releases_or_adopts_ownership() 
             assert!(bootstrap_in_store(&store, &bundle, &caller).await.is_err());
         }
         assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
+        adapter.assert_no_forbidden_calls().await;
+    }
+}
+
+#[tokio::test]
+async fn clean_release_and_concurrent_reacquisition_keep_delayed_writes_harmless() {
+    use crate::admission::{ClusterAdmissionPurpose, acquire_with_store};
+
+    let (_directory, bundle, store, adapter) = fixture();
+    let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
+        .await
+        .unwrap();
+    let (_, _, owner) = claim_in_store(&store, &receipt).await.unwrap().into_parts();
+    let owner = owner.unwrap();
+    let old_id = owner.lock_id().to_owned();
+    let state = adapter.read(CLUSTER_STATE_FILE).await;
+    assert!(store.release_settled("not-the-owner").await.is_err());
+    owner.release_after_settlement().await.unwrap();
+    let released = adapter.read(CLUSTER_LOCK_FILE).await;
+    let released_value: serde_json::Value = serde_json::from_str(&released).unwrap();
+    assert_eq!(released_value["version"], 2);
+    assert_eq!(released_value["lock_id"], old_id);
+    assert!(released_value["release_id"].is_string());
+    let mut observations = store.observations();
+    let mut diagnostics = Vec::new();
+    store
+        .observe_lock(&mut observations, &mut diagnostics)
+        .await;
+    assert!(!observations.locked);
+    assert!(observations.lock_id.is_none());
+    assert!(diagnostics.is_empty());
+    // A released marker must not be deleted through an old exact-ID repair.
+    assert!(
+        store
+            .force_unlock(&old_id, &mut observations)
+            .await
+            .is_err()
+    );
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, released);
+    let old_writes = adapter.writes.lock().unwrap().clone();
+
+    *adapter.claim_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+    let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            acquire_with_store(&store, ClusterAdmissionPurpose::Serve),
+            acquire_with_store(&store, ClusterAdmissionPurpose::Serve)
+        )
+    })
+    .await
+    .expect("both ordinary claimants reach marker CAS");
+    *adapter.claim_barrier.lock().unwrap() = None;
+    let next = match (one, two) {
+        (Ok(Some(owner)), Err(error)) | (Err(error), Ok(Some(owner))) => {
+            assert_eq!(error.code, "state_lock_held");
+            owner
+        }
+        other => panic!("exactly one successor must acquire: {other:?}"),
+    };
+    assert_ne!(next.lock_id(), old_id);
+    next.validate_serving().unwrap();
+    let current = adapter.read(CLUSTER_LOCK_FILE).await;
+    for write in old_writes {
+        if let Some(expected) = write.expected_version {
+            assert!(
+                adapter
+                    .inner
+                    .write_text_if_match(adapter.key(&write.uri), &write.payload, &expected)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                !adapter
+                    .inner
+                    .write_text_if_absent(adapter.key(&write.uri), &write.payload)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, current);
+    assert_eq!(adapter.read(CLUSTER_STATE_FILE).await, state);
+    assert!(claim_in_store(&store, &receipt).await.is_err());
+    drop(next);
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, current);
+    adapter.assert_no_forbidden_calls().await;
+}
+
+#[tokio::test]
+async fn lost_release_acknowledgement_never_replays_over_the_successor() {
+    use crate::admission::{ClusterAdmissionPurpose, acquire_with_store};
+
+    for fault in [Fault::LostResponse, Fault::CancelAfterCommit] {
+        let (_directory, bundle, store, adapter) = fixture();
+        let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
+            .await
+            .unwrap();
+        let (_, _, owner) = claim_in_store(&store, &receipt).await.unwrap().into_parts();
+        let owner = owner.unwrap();
+        let old_id = owner.lock_id().to_owned();
+        adapter.arm(Point::Release, fault);
+        match fault {
+            Fault::LostResponse => {
+                assert!(owner.release_after_settlement().await.is_err());
+            }
+            Fault::CancelAfterCommit => {
+                let release = owner.release_after_settlement();
+                tokio::pin!(release);
+                tokio::select! {
+                    result = &mut release => panic!("release must wait after commit: {result:?}"),
+                    () = adapter.committed.notified() => {},
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("release did not reach backend"),
+                }
+            }
+        }
+        assert!(adapter.fault.lock().unwrap().is_none());
+        let release = adapter.writes.lock().unwrap().last().unwrap().clone();
+        let next = acquire_with_store(&store, ClusterAdmissionPurpose::Serve)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.lock_id(), old_id);
+        let current = adapter.read(CLUSTER_LOCK_FILE).await;
+        assert!(
+            adapter
+                .inner
+                .write_text_if_match(
+                    adapter.key(&release.uri),
+                    &release.payload,
+                    release.expected_version.as_deref().unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.release_settled(&old_id).await.is_err());
+        assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, current);
+        drop(next);
         adapter.assert_no_forbidden_calls().await;
     }
 }

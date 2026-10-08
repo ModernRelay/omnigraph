@@ -154,8 +154,10 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   unsupported; unexpected roots and schema drift refuse rather than infer
   identity from matching text.
   One outstanding durable authority owns completion/recovery. Generic drain
-  does not prove native-I/O settlement or authorize lock release; excluded raw
-  and older writers remain an operator obligation.
+  does not prove native-I/O settlement. Clean server release additionally closes
+  its explicit storage scope, drains accepted backend mutations and refuses
+  sticky uncertainty; S3 release/reacquisition uses the same lock key by CAS.
+  Excluding raw and older writers remains an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.

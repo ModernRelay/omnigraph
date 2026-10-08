@@ -18,7 +18,9 @@ use omnigraph_storage::{
 };
 
 use crate::deployment::{DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state};
-use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
+use crate::state_lock::{
+    StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock, release_settled_lock,
+};
 use crate::{
     CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR, CLUSTER_RESOURCES_DIR, CLUSTER_STATE_FILE,
     ClusterState, Diagnostic, RecoverySidecar, ResourceKind, StateLockFile, StateObservations,
@@ -155,6 +157,27 @@ fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diag
 }
 
 impl ClusterStore {
+    /// Rebind qualified backends before admission/effects; descendants share
+    /// this scope. Azure retains its existing external-admission boundary.
+    pub(crate) fn with_io_scope(
+        mut self,
+        scope: omnigraph_storage::StorageIoScope,
+    ) -> Result<Self, Diagnostic> {
+        if self.kind() == StorageKind::Azure {
+            return Ok(self);
+        }
+        self.storage = omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope)
+            .map_err(|error| {
+                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+            })?;
+        self.adapter = self.storage.adapter();
+        Ok(self)
+    }
+
+    pub(crate) fn io_scope(&self) -> Option<omnigraph_storage::StorageIoScope> {
+        self.adapter.io_scope()
+    }
+
     /// The default layout: storage root = the config directory itself
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
     /// cluster on disk.
@@ -1033,7 +1056,14 @@ impl ClusterStore {
         observations: &mut StateObservations,
     ) -> Result<StateLockGuard, Diagnostic> {
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
-        match acquire_state_lock(&self.storage, &lock_uri, operation).await {
+        match acquire_state_lock(
+            self.adapter.clone(),
+            self.storage.kind(),
+            &lock_uri,
+            operation,
+        )
+        .await
+        {
             Ok(StateLockAcquire::Acquired(guard)) => {
                 observations.lock_acquired = true;
                 observations.acquired_lock_id = Some(guard.lock_id().to_string());
@@ -1060,6 +1090,65 @@ impl ClusterStore {
         }
     }
 
+    pub(crate) async fn release_settled(&self, lock_id: &str) -> Result<(), Diagnostic> {
+        // Permanently close graph/control adapters before the final lock write.
+        // This private client can only execute the exact-owner release below;
+        // no caller receives a general escape from a closed storage scope.
+        let release_scope = if let Some(scope) = self.io_scope() {
+            scope.close();
+            scope.wait_idle().await;
+            if scope.is_uncertain() {
+                return Err(Diagnostic::error(
+                    "cluster_admission_io_uncertain",
+                    CLUSTER_LOCK_FILE,
+                    "accepted storage work is uncertain; retaining cluster admission",
+                ));
+            }
+            Some(omnigraph_storage::StorageIoScope::new())
+        } else {
+            None
+        };
+        let adapter = if let Some(scope) = &release_scope {
+            omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope.clone())
+                .map_err(|error| {
+                    Diagnostic::error(
+                        "cluster_admission_release_failed",
+                        CLUSTER_LOCK_FILE,
+                        error.to_string(),
+                    )
+                })?
+                .adapter()
+        } else {
+            self.adapter.clone()
+        };
+        let result = release_settled_lock(
+            &adapter,
+            self.storage.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+            lock_id,
+        )
+        .await
+        .map_err(|error| {
+            Diagnostic::error(
+                "cluster_admission_release_failed",
+                CLUSTER_LOCK_FILE,
+                format!("exact settled lock release was not confirmed: {error}"),
+            )
+        });
+        if let Some(scope) = release_scope {
+            scope.close();
+            scope.wait_idle().await;
+            if scope.is_uncertain() {
+                return Err(Diagnostic::error(
+                    "cluster_admission_release_failed",
+                    CLUSTER_LOCK_FILE,
+                    "final lock release acknowledgement is uncertain; do not replay it",
+                ));
+            }
+        }
+        result
+    }
+
     pub(crate) async fn force_unlock(
         &self,
         lock_id: &str,
@@ -1084,6 +1173,13 @@ impl ClusterStore {
             }
         };
         let lock = parse_lock_file_for_unlock(&text)?;
+        if lock.is_released() {
+            return Err(Diagnostic::error(
+                "state_lock_released",
+                CLUSTER_LOCK_FILE,
+                "the native lock is already released; start the next owner normally",
+            ));
+        }
         observations.observe_lock_metadata(&lock);
         observations.locked = true;
         if lock.lock_id() != lock_id {

@@ -12,10 +12,15 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri, redacted_storage_uri};
+pub use omnigraph_storage::{
+    ListDirBounds, StorageIoScope, StorageKind, join_uri, redacted_storage_uri,
+};
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        None
+    }
     async fn read_text(&self, uri: &str) -> Result<String>;
     /// Read a text object if it exists using one backend GET.
     ///
@@ -165,6 +170,9 @@ impl ObjectStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for ObjectStorageAdapter {
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        omnigraph_storage::StorageAdapter::io_scope(&self.inner)
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         Ok(omnigraph_storage::StorageAdapter::read_text(&self.inner, uri).await?)
     }
@@ -283,6 +291,20 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
         StorageKind::S3 => Ok(Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?)),
         StorageKind::Azure => Ok(Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?)),
     }
+}
+
+/// Select a native adapter carrying the same explicit lifetime as its Lance clients.
+pub fn storage_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<Arc<dyn StorageAdapter>> {
+    let inner = match storage_kind_for_uri(uri)? {
+        StorageKind::Local => omnigraph_storage::ObjectStorageAdapter::local_scoped(scope),
+        StorageKind::S3 => {
+            omnigraph_storage::ObjectStorageAdapter::s3_from_root_uri_scoped(uri, scope)?
+        }
+        StorageKind::Azure => {
+            omnigraph_storage::ObjectStorageAdapter::azure_from_root_uri_scoped(uri, scope)?
+        }
+    };
+    Ok(Arc::new(ObjectStorageAdapter { inner }))
 }
 
 /// Exact Lance object-store parameters for one physical dataset URI.

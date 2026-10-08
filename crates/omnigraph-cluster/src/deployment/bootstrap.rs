@@ -77,7 +77,8 @@ pub async fn bootstrap_serving(
 ) -> Result<BootstrapServingReceipt, Diagnostic> {
     let bundle = capture_deployment(config_dir)?;
     require_s3(&bundle.canonical_root)?;
-    let store = ClusterStore::for_storage_root(&bundle.canonical_root)?;
+    let store = ClusterStore::for_storage_root(&bundle.canonical_root)?
+        .with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     bootstrap_in_store(&store, &bundle, caller).await
 }
 
@@ -168,6 +169,7 @@ async fn bootstrap_in_store(
     store
         .verify_bootstrap_lock(&receipt.bootstrap_lock_id, &receipt.bootstrap_lock_version)
         .await?;
+    require_settled_io(store).await?;
     // No effects follow terminal verification. Dropping this private owner
     // retains the original lock; only the exact claim below can replace it.
     Ok(receipt)
@@ -183,7 +185,8 @@ pub async fn claim_bootstrap_serving(
     let result = async {
         receipt.validate()?;
         require_s3(root)?;
-        let store = ClusterStore::for_storage_root(root)?;
+        let store = ClusterStore::for_storage_root(root)?
+            .with_io_scope(omnigraph_storage::StorageIoScope::new())?;
         if store.canonical_root()? != receipt.canonical_root {
             return Err(refusal(
                 "bootstrap_root_mismatch",
@@ -224,11 +227,25 @@ async fn claim_in_store(
             "claimed bootstrap snapshot changed",
         ));
     }
+    require_settled_io(store).await?;
     Ok(AdmittedServingSnapshot::from_bootstrap(
         snapshot,
         receipt.canonical_root.clone(),
         admission,
     ))
+}
+
+async fn require_settled_io(store: &ClusterStore) -> Result<(), Diagnostic> {
+    if let Some(scope) = store.io_scope() {
+        scope.wait_idle().await;
+        if scope.is_uncertain() {
+            return Err(refusal(
+                "bootstrap_io_uncertain",
+                "a native storage request has an uncertain outcome; retaining ownership",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn validate_terminal(

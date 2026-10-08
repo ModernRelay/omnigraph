@@ -17,6 +17,9 @@ use url::Url;
 
 use thiserror::Error;
 
+mod scoped;
+pub use scoped::StorageIoScope;
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The typed condition established at a storage-substrate boundary.
@@ -1017,6 +1020,11 @@ impl CanonicalAzureRoot {
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
+    /// Explicit mutation owner, when this adapter participates in settlement.
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        None
+    }
+
     async fn read_text(&self, uri: &str) -> Result<String>;
     /// Read a text object if it exists using one backend GET.
     ///
@@ -1184,6 +1192,7 @@ impl StorageHandle {
 #[derive(Debug)]
 pub struct ObjectStorageAdapter {
     store: Arc<DynObjectStore>,
+    scope: Option<StorageIoScope>,
     codec: UriCodec,
     /// Whether the backend implements `PutMode::Update` (ETag-conditioned
     /// put). Gates BOTH the version-token source in `read_text_versioned`
@@ -1230,6 +1239,7 @@ impl ObjectStorageAdapter {
     pub fn local() -> Self {
         Self {
             store: Arc::new(LocalFileSystem::new()),
+            scope: None,
             codec: UriCodec::Local,
             supports_conditional_update: false,
             #[cfg(test)]
@@ -1239,12 +1249,35 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// Local storage whose mutations belong to the supplied owner.
+    pub fn local_scoped(scope: StorageIoScope) -> Self {
+        Self::local().with_scope(scope)
+    }
+
+    fn with_scope(mut self, scope: StorageIoScope) -> Self {
+        self.store = scope.wrap_object_store(self.store);
+        self.scope = Some(scope);
+        self
+    }
+
     /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
     /// endpoint come from the standard `AWS_*` environment variables (the
     /// same ones Lance reads for its dataset stores).
     pub fn s3_from_root_uri(root_uri: &str) -> Result<Self> {
+        Self::s3_from_root_uri_with_scope(root_uri, None)
+    }
+
+    /// Single-attempt S3 mutations accounted to the supplied owner.
+    pub fn s3_from_root_uri_scoped(root_uri: &str, scope: StorageIoScope) -> Result<Self> {
+        Self::s3_from_root_uri_with_scope(root_uri, Some(scope))
+    }
+
+    fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&location.bucket);
+        if scope.is_some() {
+            builder = builder.with_retry(single_attempt_retry_config());
+        }
 
         if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
             .ok()
@@ -1271,8 +1304,9 @@ impl ObjectStorageAdapter {
             )
         })?;
 
-        Ok(Self {
+        let adapter = Self {
             store: Arc::new(store),
+            scope: None,
             codec: UriCodec::S3 {
                 bucket: location.bucket,
             },
@@ -1281,6 +1315,10 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+        };
+        Ok(match scope {
+            Some(scope) => adapter.with_scope(scope),
+            None => adapter,
         })
     }
 
@@ -1290,8 +1328,29 @@ impl ObjectStorageAdapter {
         Self::azure_from_root(&root)
     }
 
+    /// Azure URI convenience constructor with explicit mutation accounting.
+    pub fn azure_from_root_uri_scoped(root_uri: &str, scope: StorageIoScope) -> Result<Self> {
+        Self::azure_from_root_scoped(&CanonicalAzureRoot::from_env(root_uri)?, scope)
+    }
+
     /// Azure backend scoped to the canonical root's container.
     pub fn azure_from_root(root: &CanonicalAzureRoot) -> Result<Self> {
+        Self::azure_from_root_with_scope(root, None)
+    }
+
+    /// Account Azure mutations without changing its independent admission
+    /// boundary. Transport retries are disabled for this client.
+    pub fn azure_from_root_scoped(
+        root: &CanonicalAzureRoot,
+        scope: StorageIoScope,
+    ) -> Result<Self> {
+        Self::azure_from_root_with_scope(root, Some(scope))
+    }
+
+    fn azure_from_root_with_scope(
+        root: &CanonicalAzureRoot,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
         root.verify_environment_unchanged()?;
         // Starting from `new` is load-bearing: `from_env` would refresh live
         // process state and could move control objects away from Lance after
@@ -1311,6 +1370,9 @@ impl ObjectStorageAdapter {
             .with_container_name(root.container())
             .with_endpoint(root.storage_endpoint.clone())
             .with_use_emulator(false);
+        if scope.is_some() {
+            builder = builder.with_retry(single_attempt_retry_config());
+        }
         let store = builder.build().map_err(|_| {
             StorageError::backend(
                 StorageFailureKind::Configuration,
@@ -1320,8 +1382,9 @@ impl ObjectStorageAdapter {
                 ),
             )
         })?;
-        Ok(Self {
+        let adapter = Self {
             store: Arc::new(store),
+            scope: None,
             codec: UriCodec::Azure {
                 container: root.container().to_string(),
             },
@@ -1330,6 +1393,10 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+        };
+        Ok(match scope {
+            Some(scope) => adapter.with_scope(scope),
+            None => adapter,
         })
     }
 
@@ -1340,6 +1407,7 @@ impl ObjectStorageAdapter {
     pub fn in_memory() -> Self {
         Self {
             store: Arc::new(InMemory::new()),
+            scope: None,
             codec: UriCodec::Memory,
             supports_conditional_update: true,
             #[cfg(test)]
@@ -1543,7 +1611,10 @@ impl ObjectStorageAdapter {
     /// so probing the destination directory distinguishes "this filesystem
     /// cannot do create-if-absent" from a generic backend failure.
     fn create_if_absent_error(&self, uri: &str, err: object_store::Error) -> StorageError {
-        if matches!(self.codec, UriCodec::Local)
+        // A scoped refusal must not start unaccounted diagnostic writes after
+        // mutation admission has closed or become uncertain.
+        if self.scope.is_none()
+            && matches!(self.codec, UriCodec::Local)
             && let Ok(path) = local_path_from_uri(uri)
             && let Ok(path) = absolutize_lexically(path)
             && let Some(dir) = path.parent()
@@ -1638,6 +1709,10 @@ fn is_hard_link_capability_refusal(error: &std::io::Error) -> bool {
 
 #[async_trait]
 impl StorageAdapter for ObjectStorageAdapter {
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        self.scope.clone()
+    }
+
     async fn read_text(&self, uri: &str) -> Result<String> {
         let location = self.object_path(uri)?;
         let bytes = self
@@ -2169,11 +2244,23 @@ impl StorageAdapter for ObjectStorageAdapter {
         // still-present. remove_dir_all reclaims them in one call.
         if self.codec == UriCodec::Local {
             let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
-            return match tokio::fs::remove_dir_all(&path).await {
+            let mutation = self
+                .scope
+                .as_ref()
+                .map(StorageIoScope::begin)
+                .transpose()
+                .map_err(|error| storage_backend_error("delete_prefix", prefix_uri, error))?;
+            let result = match tokio::fs::remove_dir_all(&path).await {
                 Ok(()) => Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(err) => Err(StorageError::io(err)),
             };
+            if result.is_ok()
+                && let Some(mutation) = mutation
+            {
+                mutation.settle();
+            }
+            return result;
         }
         let prefix = self.object_path(prefix_uri.trim_end_matches('/'))?;
         let mut entries = self.store.list(Some(&prefix));
@@ -2247,6 +2334,30 @@ pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
             adapter: Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?),
             kind: StorageKind::Azure,
         }),
+    }
+}
+
+/// Select a concrete single-attempt backend belonging to one mutation owner.
+pub fn storage_handle_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<StorageHandle> {
+    let kind = storage_kind_for_uri(uri)?;
+    let adapter = match kind {
+        StorageKind::Local => ObjectStorageAdapter::local_scoped(scope),
+        StorageKind::S3 => ObjectStorageAdapter::s3_from_root_uri_scoped(uri, scope)?,
+        StorageKind::Azure => ObjectStorageAdapter::azure_from_root_scoped(
+            &CanonicalAzureRoot::from_env(uri)?,
+            scope,
+        )?,
+    };
+    Ok(StorageHandle {
+        adapter: Arc::new(adapter),
+        kind,
+    })
+}
+
+fn single_attempt_retry_config() -> object_store::RetryConfig {
+    object_store::RetryConfig {
+        max_retries: 0,
+        ..Default::default()
     }
 }
 
@@ -3657,6 +3768,7 @@ mod tests {
         (
             ObjectStorageAdapter {
                 store,
+                scope: None,
                 codec: UriCodec::Azure {
                     container: "container".to_string(),
                 },
@@ -4249,6 +4361,7 @@ mod tests {
         // slash before streaming pages.
         let s3_adapter = ObjectStorageAdapter {
             store: Arc::new(InMemory::new()),
+            scope: None,
             codec: UriCodec::S3 {
                 bucket: "bounded-list-bucket".to_string(),
             },
@@ -5096,6 +5209,7 @@ mod tests {
     fn azure_codec_refuses_cross_container_and_empty_object_access() {
         let adapter = ObjectStorageAdapter {
             store: Arc::new(InMemory::new()),
+            scope: None,
             codec: UriCodec::Azure {
                 container: "container-one".to_string(),
             },

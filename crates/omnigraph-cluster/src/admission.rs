@@ -80,6 +80,15 @@ impl ClusterAdmission {
         self.0.guard.lock_id()
     }
 
+    /// Explicit storage lifetime acquired before the first native lock request.
+    pub fn io_scope(&self) -> Option<omnigraph_storage::StorageIoScope> {
+        self.0.store.io_scope()
+    }
+
+    pub(crate) fn store(&self) -> ClusterStore {
+        self.0.store.clone()
+    }
+
     /// The running server and direct deployment executor use the same durable
     /// root ownership. Check the exact persisted owner before control effects.
     pub(crate) async fn validate_deployment(&self) -> Result<(), Diagnostic> {
@@ -170,15 +179,12 @@ impl ClusterAdmission {
     /// proved all graph/native effects and accepted control I/O settled.
     ///
     /// This method does not establish that proof. Error, cancellation, an
-    /// outstanding clone, or abandonment retains the persisted lock. Operators
-    /// must exclude concurrent force-unlock/release; the backend has no
-    /// conditional-delete guarantee.
-    ///
-    /// After bootstrap transfer, this obligation includes earlier accepted
-    /// bootstrap control I/O, not only the current serving process. Otherwise
-    /// deleting this lock could let a delayed bootstrap create-if-absent
-    /// recreate its old lock. The transfer proves those attempts harmless
-    /// only while the lock remains continuously present.
+    /// outstanding clone, or abandonment never authorizes release. On S3 the
+    /// held version becomes a unique released marker by CAS; the key remains
+    /// present so a delayed release or original bootstrap create cannot
+    /// replace a successor. A lost release acknowledgement remains an error,
+    /// never a reason to delete or retry against a newer version. Operators
+    /// must still exclude concurrent administrative force-unlock.
     pub async fn release_after_settlement(self) -> Result<(), Diagnostic> {
         let owner = Arc::try_unwrap(self.0).map_err(|owner| {
             Diagnostic::error(
@@ -190,11 +196,7 @@ impl ClusterAdmission {
                 ),
             )
         })?;
-        let mut observations = owner.store.observations();
-        owner
-            .store
-            .force_unlock(owner.guard.lock_id(), &mut observations)
-            .await
+        owner.store.release_settled(owner.guard.lock_id()).await
     }
 
     /// Verify a graph's current membership while this root remains excluded.
@@ -267,7 +269,7 @@ pub(crate) async fn release_refused_preflight(
     lock_id: &str,
     refusal: Diagnostic,
 ) -> Diagnostic {
-    match store.force_unlock(lock_id, &mut store.observations()).await {
+    match store.release_settled(lock_id).await {
         Ok(()) => refusal,
         Err(error) => release_failure(refusal, lock_id, error),
     }
@@ -279,7 +281,10 @@ pub async fn acquire_cluster_admission(
     storage_root: &str,
     purpose: ClusterAdmissionPurpose,
 ) -> Result<Option<ClusterAdmission>, Diagnostic> {
-    let store = ClusterStore::for_storage_root(storage_root)?;
+    let mut store = ClusterStore::for_storage_root(storage_root)?;
+    if purpose == ClusterAdmissionPurpose::Serve {
+        store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
+    }
     acquire_with_store(&store, purpose).await
 }
 

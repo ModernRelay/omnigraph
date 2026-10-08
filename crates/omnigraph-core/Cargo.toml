@@ -9,7 +9,7 @@ repository = "https://github.com/ModernRelay/omnigraph"
 [features]
 default = []
 failpoints = ["omnigraph-seams/decide"]
-dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io"]
+dst = ["omnigraph-storage/dst", "omnigraph-seams/install"]
 # test helpers other crates' tests reach across the boundary (cfg(test) is crate-local)
 test-util = []
 
@@ -33,7 +33,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 object_store = { workspace = true }
-lance-io = { workspace = true, optional = true }
+lance-io = { workspace = true }
 ulid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }

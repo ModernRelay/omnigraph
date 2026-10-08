@@ -639,7 +639,7 @@ async fn execute(
         );
         let uri = omnigraph::storage::normalize_root_uri(&graph.uri)
             .map_err(|error| uncertain(format!("achieved graph URI is invalid: {error}")))?;
-        let prepared = match crate::prepare_single_graph(graph, Some(contract.clone())) {
+        let mut prepared = match crate::prepare_single_graph(graph, Some(contract.clone())) {
             Ok(prepared) => prepared,
             Err(error) if !live.contains_key(&id) => {
                 unavailable.push(Arc::new(crate::BlockedGraph {
@@ -656,6 +656,10 @@ async fn execute(
                 )));
             }
         };
+        prepared.io_scope = state
+            .cluster_admission
+            .as_ref()
+            .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
         if let Some(engine) = live.get(&id) {
             let policy = prepared
                 .pending

@@ -7,9 +7,7 @@
 use std::process;
 use std::sync::Arc;
 
-use omnigraph_storage::{
-    StorageAdapter, StorageError, StorageHandle, StorageKind, normalize_root_uri,
-};
+use omnigraph_storage::{StorageAdapter, StorageError, StorageKind, normalize_root_uri};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -17,6 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
 const LOCK_VERSION: u32 = 1;
+const RELEASED_LOCK_VERSION: u32 = 2;
 const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 
 #[derive(Debug, Error)]
@@ -27,7 +26,7 @@ pub(crate) enum StateLockError {
     LockEncode(serde_json::Error),
     #[error("could not parse cluster state lock: {0}")]
     LockParse(serde_json::Error),
-    #[error("unsupported cluster state lock version {0}; expected 1")]
+    #[error("unsupported cluster state lock version {0}")]
     LockVersion(u32),
     #[error("invalid cluster state lock binding: {0}")]
     InvalidBinding(String),
@@ -42,6 +41,8 @@ pub(crate) struct StateLockFile {
     operation: String,
     created_at: String,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_id: Option<String>,
 }
 
 impl StateLockFile {
@@ -54,15 +55,33 @@ impl StateLockFile {
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
             pid: process::id(),
+            release_id: None,
         }
     }
 
     pub(crate) fn parse(text: &str) -> Result<Self, StateLockError> {
         let lock: Self = serde_json::from_str(text).map_err(StateLockError::LockParse)?;
-        if lock.version != LOCK_VERSION {
-            return Err(StateLockError::LockVersion(lock.version));
+        match (lock.version, lock.release_id.as_deref()) {
+            (LOCK_VERSION, None) => {}
+            (RELEASED_LOCK_VERSION, Some(id)) if Ulid::from_string(id).is_ok() => {}
+            (LOCK_VERSION | RELEASED_LOCK_VERSION, _) => {
+                return Err(StateLockError::InvalidBinding(
+                    "held and released lock shapes must match their wire version".into(),
+                ));
+            }
+            (version, _) => return Err(StateLockError::LockVersion(version)),
         }
         Ok(lock)
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.release_id.is_some()
+    }
+
+    fn mark_released(mut self) -> Self {
+        self.version = RELEASED_LOCK_VERSION;
+        self.release_id = Some(Ulid::new().to_string());
+        self
     }
 
     pub(crate) fn lock_id(&self) -> &str {
@@ -167,24 +186,86 @@ async fn release_remote_lock_if_owned(adapter: &Arc<dyn StorageAdapter>, uri: &s
 }
 
 pub(crate) async fn acquire_state_lock(
-    storage: &StorageHandle,
+    adapter: Arc<dyn StorageAdapter>,
+    kind: StorageKind,
     lock_uri: &str,
     operation: &str,
 ) -> Result<StateLockAcquire, StateLockError> {
     let _validated_cluster_root = cluster_root_from_lock_uri(lock_uri)?;
-    let adapter = storage.adapter();
     let lock = StateLockFile::new(operation);
     let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
-    if adapter.write_text_if_absent(lock_uri, &payload).await? {
+    let created = adapter.write_text_if_absent(lock_uri, &payload).await?;
+    let acquired = if created {
+        true
+    } else if kind == StorageKind::S3 {
+        // Keep the key present across serving lifetimes. A delayed release or
+        // old create cannot overwrite the fresh owner. Never refresh a failed
+        // CAS or adopt a write whose acknowledgement was lost.
+        let Some((text, version)) = adapter
+            .read_text_versioned_if_exists_bounded(lock_uri, 64 * 1024)
+            .await?
+        else {
+            return Ok(StateLockAcquire::Held);
+        };
+        let previous = StateLockFile::parse(&text)?;
+        previous.is_released()
+            && adapter
+                .write_text_if_match(lock_uri, &payload, &version)
+                .await?
+                .is_some()
+    } else {
+        false
+    };
+    if acquired {
         return Ok(StateLockAcquire::Acquired(StateLockGuard {
             adapter,
             uri: lock_uri.to_string(),
-            kind: storage.kind(),
+            kind,
             lock,
-            release_on_drop: true,
+            release_on_drop: kind != StorageKind::S3,
         }));
     }
     Ok(StateLockAcquire::Held)
+}
+
+/// The caller must have settled every accepted effect and excluded competing
+/// administrative unlocks. Remote clean release never deletes the lock key.
+pub(crate) async fn release_settled_lock(
+    adapter: &Arc<dyn StorageAdapter>,
+    kind: StorageKind,
+    uri: &str,
+    lock_id: &str,
+) -> Result<(), StateLockError> {
+    let (text, version) = adapter
+        .read_text_versioned_if_exists_bounded(uri, 64 * 1024)
+        .await?
+        .ok_or_else(|| StateLockError::InvalidBinding("held lock is absent".into()))?;
+    let lock = StateLockFile::parse(&text)?;
+    if lock.is_released() || lock.lock_id() != lock_id {
+        return Err(StateLockError::InvalidBinding(
+            "settled release no longer owns the exact held lock".into(),
+        ));
+    }
+    match kind {
+        // Azure preserves the explicit legacy settlement obligation and its
+        // independent admission wrapper; server shutdown does not call this
+        // as an automatic Azure release path.
+        StorageKind::Local | StorageKind::Azure => adapter.delete(uri).await?,
+        StorageKind::S3 => {
+            let payload = serde_json::to_string_pretty(&lock.mark_released())
+                .map_err(StateLockError::LockEncode)?;
+            if adapter
+                .write_text_if_match(uri, &payload, &version)
+                .await?
+                .is_none()
+            {
+                return Err(StateLockError::InvalidBinding(
+                    "settled release lost its exact-version CAS".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 const BOOTSTRAP_OPERATION: &str = "bootstrap_serving";
@@ -239,7 +320,8 @@ async fn read_bootstrap_lock(
         .await?
         .ok_or_else(|| StateLockError::InvalidBinding("bootstrap lock is absent".into()))?;
     let lock = StateLockFile::parse(&text)?;
-    if lock.operation != BOOTSTRAP_OPERATION
+    if lock.is_released()
+        || lock.operation != BOOTSTRAP_OPERATION
         || version.is_empty()
         || version.len() > 1024
         || version.chars().any(char::is_control)
@@ -325,11 +407,16 @@ mod tests {
         assert_eq!(parsed.operation(), "apply");
         assert_eq!(parsed.pid(), 42);
 
-        let future = valid.replace("\"version\": 1", "\"version\": 2");
+        let future = valid.replace("\"version\": 1", "\"version\": 3");
         assert!(matches!(
             StateLockFile::parse(&future),
-            Err(StateLockError::LockVersion(2))
+            Err(StateLockError::LockVersion(3))
         ));
+        let released = parsed.mark_released();
+        let encoded = serde_json::to_string(&released).unwrap();
+        assert!(StateLockFile::parse(&encoded).unwrap().is_released());
+        assert!(StateLockFile::parse(&encoded.replace("\"version\":2", "\"version\":1")).is_err());
+        assert!(StateLockFile::parse(&valid.replace("\"version\": 1", "\"version\": 2")).is_err());
         let unknown = valid.replace("\"pid\": 42", "\"pid\": 42, \"extra\": true");
         assert!(matches!(
             StateLockFile::parse(&unknown),
@@ -343,7 +430,7 @@ mod tests {
         let root = format!("file://{}", dir.path().display());
         let storage = storage_handle_for_uri(&root).unwrap();
         let lock_uri = format!("{root}/__cluster/lock.json");
-        let guard = match acquire_state_lock(&storage, &lock_uri, "apply")
+        let guard = match acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
             .await
             .unwrap()
         {
@@ -372,7 +459,7 @@ mod tests {
             5
         );
         assert!(matches!(
-            acquire_state_lock(&storage, &lock_uri, "apply")
+            acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
                 .await
                 .unwrap(),
             StateLockAcquire::Held
@@ -381,7 +468,7 @@ mod tests {
         drop(guard);
         assert!(!lock_path.exists());
         assert!(matches!(
-            acquire_state_lock(&storage, &lock_uri, "apply")
+            acquire_state_lock(storage.adapter(), storage.kind(), &lock_uri, "apply")
                 .await
                 .unwrap(),
             StateLockAcquire::Acquired(_)

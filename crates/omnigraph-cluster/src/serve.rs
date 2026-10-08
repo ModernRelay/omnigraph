@@ -138,6 +138,9 @@ pub async fn admit_serving_snapshot(
     } else {
         store_for_serving_snapshot(Path::new(cluster))?
     };
+    let store = store
+        .with_io_scope(omnigraph_storage::StorageIoScope::new())
+        .map_err(|diagnostic| vec![diagnostic])?;
     let admission = crate::admission::acquire_with_store(
         &store,
         crate::admission::ClusterAdmissionPurpose::Serve,
@@ -181,6 +184,9 @@ pub async fn acquire_serving_admission(
     } else {
         store_for_serving_snapshot(Path::new(cluster))?
     };
+    let store = store
+        .with_io_scope(omnigraph_storage::StorageIoScope::new())
+        .map_err(|diagnostic| vec![diagnostic])?;
     crate::admission::acquire_with_store(&store, crate::admission::ClusterAdmissionPurpose::Serve)
         .await
         .map_err(|diagnostic| vec![diagnostic])

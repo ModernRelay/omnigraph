@@ -438,9 +438,7 @@ pub async fn upgrade_deployment_ledger(
         .write_state_for_ledger_upgrade(&state, &cas)
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))?;
-    store
-        .force_unlock(guard.lock_id(), &mut observations)
-        .await?;
+    store.release_settled(guard.lock_id()).await?;
     deployment_status(root, None, caller).await
 }
 
@@ -522,7 +520,7 @@ async fn bootstrap_ledger(
         .map_err(|error| retained_error(error, guard.lock_id()))?;
     // Only awaited control writes happened. No graph/native operation started.
     store
-        .force_unlock(guard.lock_id(), &mut observations)
+        .release_settled(guard.lock_id())
         .await
         .map_err(|error| retained_error(error, guard.lock_id()))
 }
@@ -954,6 +952,8 @@ async fn open_graph(
         .map_err(|error| refusal("graph_recovery_required", error.to_string()))?;
     let db = if read_only {
         Omnigraph::open_read_only(&uri).await
+    } else if let Some(scope) = store.io_scope() {
+        Omnigraph::open_with_io_scope(&uri, scope).await
     } else {
         Omnigraph::open(&uri).await
     }
@@ -1618,7 +1618,7 @@ async fn execute_captured_deployment(
     on_accepted: impl FnOnce(DeploymentLookup),
     effects_started: &mut bool,
 ) -> Result<DeploymentLookup, Diagnostic> {
-    let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
+    let store = admission.store();
     execute_captured_deployment_in_store(
         &store,
         bundle,
@@ -1766,7 +1766,7 @@ pub(super) async fn execute_captured_deployment_in_store(
                 .state = GraphDeploymentState::Started;
             cas = replace(store, &mut state, &cas).await?;
             seams::fail(&DEPLOYMENT_AFTER_STARTED)?;
-            let db = Omnigraph::apply_prepared_graph_create(create).await
+            let db = Omnigraph::apply_prepared_graph_create_with_io_scope(create, store.io_scope()).await
                 .map_err(|error| refusal("deployment_outcome_unknown", format!("deployment {id} graph creation remains outstanding under admission {}: {error}", admission.lock_id())))?;
             let snapshot = db
                 .snapshot_of(ReadTarget::branch("main"))
