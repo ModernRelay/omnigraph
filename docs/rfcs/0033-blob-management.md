@@ -1424,9 +1424,11 @@ The implementation extends existing owners before creating new fixtures, per
 - Phase 3 adds two surface guards. One pins that a whole-row merge-insert update
   on a stable-row-id table keeps the updated row's stable row id, which the
   write's ETag evidence reads back (§4.3). The other pins that the merge-insert
-  writer refuses an external URI outside the dataset's bases because it writes
-  with default `WriteParams`; it goes red at the Lance bump that lets a caller
-  pass them, which reopens carrying a sibling's reference (§4.3, Phase 4).
+  writer refuses an external URI outside the dataset's bases, because it writes
+  with default `WriteParams`; it goes red when merge-insert stores such a
+  reference, which reopens carrying a sibling's reference (§4.3, Phase 4). A
+  Lance release that lets a caller pass `WriteParams` to merge-insert reopens it
+  too, through the dependency bump review.
 
 ### 12.4 Server, CLI, parity, and cost
 
@@ -1874,7 +1876,7 @@ publisher architecture.
     and its merge-insert writes with default `WriteParams`; a row with two
     external cells under a denying policy is changed only by an update that
     assigns both. Keeping a sibling's reference stays in Phase 4, behind a
-    guard that goes red when Lance lets the writer pass `WriteParams`.
+    guard that goes red when merge-insert stores an outside-base reference.
   - The write methods are `Session` methods; edges are written by the same
     exact-ID adapter while `.gq` keeps refusing an edge `update`.
   - Put and clear re-prepare after a pre-effect conflict, unlike a predicate
