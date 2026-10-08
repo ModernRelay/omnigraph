@@ -1,0 +1,22 @@
+# Run: omnigraph-bench run --config benchmarks/custom.example.yaml
+# All source paths are relative to this file. Keep the operation text exact;
+# use `omnigraph-bench init --help` to generate it from a workload.
+# An explicit run list prevents accidentally running every scenario or group.
+version: 2
+defaults:
+  repetitions: 5
+  deadline_seconds: 60
+scenarios:
+- id: custom-tiny-read
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query items() {
+          match { $i: Item }
+          return { $i.key as key, $i.val as val }
+      }
+run:
+- custom-tiny-read

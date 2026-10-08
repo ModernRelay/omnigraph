@@ -283,18 +283,42 @@ unavailable rather than assumed. This is the same-ruler pattern recorded in
 
 ### Adding a case: definition, not wiring
 
-**Protocol compliance is structural.** A new benchmark case enters by definition alone, at one of two tiers: a new point of an existing scenario is a schema-versioned declarative YAML ***case definition***. YAML is presentation: comments, key order, formatting, display names, and acquisition quantities do not enter identity. The harness parses it into the typed case schema, materializes defaults, and derives `point_id` from the identity-bearing projection, so the definition is its own registration. A new scenario kind implements a fixed harness interface whose obligations mirror the protocol (declare the factors it consumes, prepare against a fixture, run the measured operation, and verify non-vacuous work: an interface with no default verification, so a scenario that cannot prove it did real work cannot be added). Everything this RFC requires is inherited by every case from the harness, never reimplemented per case: point identity and display naming; the record contract and its identity keys, series keyed by spec and each record by invocation id; the release-build guard; cache-condition control; dispersion reporting. A case author cannot produce a rule-violating case without modifying the harness itself.
+**Protocol compliance is structural.** Authored single-operation workloads use
+one `gqt-v1` adapter. Ordinary GQT dataset files describe schema, seed and
+preparation; schema-less query files describe reads, the selected operation,
+and explicit following verification. Versioned case YAML references those
+files and supplies infrastructure: backend, reset, attribution, deadline, and
+selected ordinal plus the exact operation header/body echo. The adapter
+refuses moved/changed selectors, ambiguous repeated selections, prefix writes,
+and missing explicit verification rather than supplying a default oracle.
+
+The harness freezes contents, derives cache treatment from executed prefix
+reads/reopen, and binds final `point_id` only after dataset construction or
+cache validation supplies its logical witness. Syntax-only planning therefore
+reports a pre-build experiment digest, not a final point ID. Paths, display
+names, repetition counts, physical tree bytes, and cache hits remain outside
+point identity. The current logical-equivalence domain includes all live
+branches' current keyed contents and normalized two-parent history topology;
+it excludes generated unkeyed edge IDs and historical row images. Registered
+fixed sources additionally retain an identity-aware export digest before
+preparation. These limits must remain explicit in the record and documentation.
+
+The infrastructure still owns release admission, process/reset containment,
+identity, records/archive/projection, dispersion, and deadline enforcement.
+A new authored GQT workload needs no Rust scenario module. A future execution
+kind outside this adapter's envelope must implement the same protocol
+obligations rather than silently approximate unsupported work.
 
 ## Reference-level design: protocol rules
 
 Each rule states what it forbids; violating a measurement rule (1 to 4, 7) makes a number invalid, not merely unpolished, and violating a process rule (5, 6) makes the practice nonconforming, with the number-level consequence stated in the rule.
 
 1. **Open-loop driving with on-time validity.** Applies when the workload is scheduled (the realistic profile); a single-operation workload has no schedule to violate. Every scheduled-workload latency or throughput claim comes from an open-loop driver, and each workload declares its on-time validity rule. Numbers from an invalid run are unpublishable.
-2. **Release-build guard (wall-clock only).** A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC 0031's timing-versus-counting separation applied per dimension.
+2. **Release-build guard (wall-clock only).** The benchmark adapter owns this guard even when it shares a production GQT executor with correctness tests; the GQT runner does not acquire benchmark wall-clock. A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC 0031's timing-versus-counting separation applied per dimension.
 3. **Repetitions, dispersion, controlled cache condition.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned, per DBTest 2018's guidance that means reported without dispersion mislead. A cell declares its complete cache condition, and every repetition must actually execute under it: mixing process lifecycles, engine preparation, page-cache conditions, or warm-up programs invalidates the cell. A tail percentile requires a sample count that supports it: p95 at least 20 samples (RFC 0031's rule), p99 at least 100; smaller-sample cells are directional evidence only, labeled so in the record. The requested repetition count is sample quantity, not cell identity: changing only that target keeps the same point and cell, while every record persists both requested and observed counts.
 4. **Identity on every number.** Every published number carries its backend identity and its machine specification; numbers from different backends or machine specifications never compare silently. Conclusions drawn only from a local backend are provisional and labeled so.
 5. **Manual before automatic.** The benchmark runs manually until its run-to-run variance is understood; only then may it earn a schedule, because automating un-understood variance automates the production of noise. Numbers produced by a schedule that was not earned this way are unpublishable. All scheduling (nightly MinIO runs, the real-S3 trend series, alerting) is a separate later change gated on that understanding.
-6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC 0031 §§6 and 11 assign them (RFC 0031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
+6. **This instrument never gates.** GQT parsing, declared result assertions, and benchmark-adapter integrity tests remain ordinary correctness gates; they do not gate on measured performance. No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC 0031 §§6 and 11 assign them (RFC 0031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
 7. **Effects clear the floor.** Every comparison-bearing claim (a fix's effect, a regression, a difference between systems) must exceed the applicable per-metric noise floor by a declared margin, and the margin is itself persisted: a protocol-level default, or a per-claim declaration recorded beside the citation, never an after-the-fact choice. An effect below floor-plus-margin is reported as "no detected effect", never as a small effect. The floor is itself a recorded measurement, so every effect claim carries its own denominator.
 
 ## Relation to existing instruments

@@ -8,12 +8,15 @@ use omnigraph_compiler::catalog::Catalog;
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
-use super::commit_graph::{CommitGraph, CommitGraphSnapshot, FirstParentEdge, GraphCommit};
-use super::is_internal_system_branch;
+use super::commit_graph::{
+    CommitGraph, FirstParentEdge, GraphCommit, HistoryCache, Lineage,
+    graph_commit_from_manifest_row,
+};
 use super::manifest::{
-    CapturedManifestProbe, DatasetUpdate, ExpectedTableVersions, GenesisManifestAttempt,
-    LineageIntent, LineageRefresh, ManifestChange, ManifestCoordinator, ManifestIncarnation,
-    ManifestInitError, PublishPrecondition,
+    BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
+    GenesisManifestAttempt, HistoryRecord, HistoryReleaseBytes, LineageIntent, ManifestChange,
+    ManifestCoordinator, ManifestIncarnation, ManifestInitError, PublishPrecondition,
+    SchemaContractRow,
 };
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
@@ -121,8 +124,34 @@ pub(crate) struct GraphCoordinator {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
-    commit_graph: CommitGraph,
     bound_branch: Option<String>,
+}
+
+/// What a merge reads of one captured branch beside its write transaction: the
+/// captured head's record, the buffer of the `__manifest` version that holds
+/// it, and the commit graph that can load that exact head's lineage if needed.
+pub(crate) struct CapturedLineage {
+    head: HistoryRecord,
+    buffer: CommitBuffer,
+    pub graph: CommitGraph,
+}
+
+impl CapturedLineage {
+    /// The records a merge of the captured branch appends to `__history`: its
+    /// buffered commits after `merge_base`, oldest first, then its head.
+    pub(crate) fn into_records(self, merge_base: &str) -> BranchRecords {
+        BranchRecords {
+            buffer: self.buffer,
+            head: self.head,
+            merge_base: Some(merge_base.to_string()),
+        }
+    }
+}
+
+/// A graph commit with the snapshot of the graph as of it.
+pub(crate) struct CommitState {
+    pub commit: GraphCommit,
+    pub snapshot: Snapshot,
 }
 
 decide_seam! {
@@ -139,6 +168,7 @@ impl GraphCoordinator {
     pub(crate) async fn init_commit_with_session(
         root_uri: &str,
         catalog: &Catalog,
+        contract: &SchemaContractRow,
         control_session: &Arc<lance::session::Session>,
         attempt: &GenesisManifestAttempt,
     ) -> std::result::Result<Dataset, ManifestInitError> {
@@ -146,7 +176,7 @@ impl GraphCoordinator {
         // The genesis graph commit is folded into the manifest init write, so
         // `__manifest` is the single source of graph lineage from version one
         // (RFC-013 Phase 7).
-        ManifestCoordinator::init_commit(&root, catalog, control_session, attempt).await
+        ManifestCoordinator::init_commit(&root, catalog, contract, control_session, attempt).await
     }
 
     /// Reopen an acknowledgement-unknown manifest Create and construct a
@@ -160,15 +190,12 @@ impl GraphCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
-        let (manifest, lineage_rows) =
-            ManifestCoordinator::open_exact_genesis_with_lineage(&root, attempt, control_session)
-                .await?;
-        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
+        let manifest =
+            ManifestCoordinator::open_exact_genesis(&root, attempt, control_session).await?;
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
-            commit_graph,
             bound_branch: None,
         })
     }
@@ -182,13 +209,11 @@ impl GraphCoordinator {
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
-        let (manifest, lineage_rows) = ManifestCoordinator::finish_init(&root, dataset).await?;
-        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
+        let manifest = ManifestCoordinator::finish_init(&root, dataset).await?;
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
-            commit_graph,
             bound_branch: None,
         })
     }
@@ -205,14 +230,13 @@ impl GraphCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<Self> {
         let root = normalize_root_uri(root_uri)?;
-        let (manifest, lineage_rows) =
-            ManifestCoordinator::open_with_lineage(&root, None, control_session).await?;
-        let commit_graph = CommitGraph::from_manifest_rows(&root, None, lineage_rows);
+        let (manifest, _lineage_rows, _contract) =
+            ManifestCoordinator::open_with_lineage_and_contract(&root, None, control_session)
+                .await?;
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
-            commit_graph,
             bound_branch: None,
         })
     }
@@ -227,6 +251,38 @@ impl GraphCoordinator {
         Self::open_branch_with_session(root_uri, branch, storage, &control_session).await
     }
 
+    pub(crate) async fn open_with_contract(
+        root_uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+        prepared: crate::db::manifest::PreparedManifestOpen,
+    ) -> Result<(Self, SchemaContractRow)> {
+        let root = normalize_root_uri(root_uri)?;
+        let (manifest, _lineage_rows, contract) =
+            ManifestCoordinator::open_prepared_with_lineage_and_contract(&root, prepared).await?;
+        let mut coordinator = Self {
+            root_uri: root,
+            storage,
+            manifest,
+            bound_branch: None,
+        };
+        let contract = coordinator.refresh_contract_capture(contract).await?;
+        Ok((coordinator, contract))
+    }
+
+    async fn refresh_contract_capture(
+        &mut self,
+        contract: Result<SchemaContractRow>,
+    ) -> Result<SchemaContractRow> {
+        let captured = self.snapshot();
+        self.refresh().await?;
+        self.manifest.validate_serving_format()?;
+        if self.snapshot().same_manifest_image(&captured) {
+            contract
+        } else {
+            self.read_schema_contract().await
+        }
+    }
+
     pub(crate) async fn open_branch_with_session(
         root_uri: &str,
         branch: &str,
@@ -239,31 +295,55 @@ impl GraphCoordinator {
         };
 
         let root = normalize_root_uri(root_uri)?;
-        let (manifest, lineage_rows) =
-            ManifestCoordinator::open_with_lineage(&root, Some(&branch_name), control_session)
-                .await?;
-        let commit_graph = CommitGraph::from_manifest_rows(&root, Some(&branch_name), lineage_rows);
+        let (manifest, _lineage_rows, _contract) =
+            ManifestCoordinator::open_with_lineage_and_contract(
+                &root,
+                Some(&branch_name),
+                control_session,
+            )
+            .await?;
 
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
-            commit_graph,
             bound_branch: Some(branch_name),
         })
     }
 
+    /// The coordinator of `branch` (`None` = main), opened from its
+    /// `__manifest` and reading settled commits through this coordinator's
+    /// history cache.
+    async fn open_sibling(&self, branch: Option<&str>) -> Result<Self> {
+        let session = self.manifest.control_session();
+        let storage = Arc::clone(&self.storage);
+        let sibling = match branch {
+            Some(branch) => {
+                Self::open_branch_with_session(self.root_uri(), branch, storage, &session).await?
+            }
+            None => Self::open_with_session(self.root_uri(), storage, &session).await?,
+        };
+        Ok(sibling.sharing_history(self.history().clone()))
+    }
+
+    /// This coordinator reading settled commits through `history`.
+    pub(crate) fn sharing_history(mut self, history: HistoryCache) -> Self {
+        self.manifest.share_history(history);
+        self
+    }
+
+    pub(crate) fn history(&self) -> &HistoryCache {
+        self.manifest.history()
+    }
+
     /// An operation-local source for native branch controls. Current table
-    /// state is copied; cached lineage and the Lance session are shared.
-    /// Callers must first probe the complete manifest incarnation. This copy
-    /// does not establish lineage completeness after a state-only refresh;
-    /// native creation uses only its manifest, and other uses must refresh.
+    /// state and the head are copied; the history cache and the Lance session
+    /// are shared. Callers must first probe the complete manifest incarnation.
     pub(crate) fn capture_for_branch_control(&self) -> Self {
         Self {
             root_uri: self.root_uri.clone(),
             storage: Arc::clone(&self.storage),
             manifest: self.manifest.capture(),
-            commit_graph: self.commit_graph.capture(),
             bound_branch: self.bound_branch.clone(),
         }
     }
@@ -291,64 +371,42 @@ impl GraphCoordinator {
         self.manifest.branch_identifier().await
     }
 
-    /// Exact `graph_head:<active-branch>` pointer, preserving `None` for a
-    /// freshly-created named branch even though its inherited commit history has
-    /// an inferred head. Sourced from the manifest coordinator's SAME pinned
-    /// state as [`Self::snapshot`], not the separately refreshed lineage cache.
+    /// The exact head of the active branch: the head commit when this branch
+    /// incarnation wrote it, `None` on a fork that has not published. From the
+    /// same `__manifest` version as [`Self::snapshot`].
     pub(crate) fn exact_graph_head(&self) -> Option<String> {
         self.manifest.exact_graph_head()
     }
 
-    /// Effective lineage head for the manifest snapshot held by this
-    /// coordinator. The exact branch-head row is authoritative once the branch
-    /// owns a commit. Its absence is first-class only for a fresh fork, where
-    /// the commit projection loaded from the same branch manifest supplies the
-    /// inherited source head.
+    /// The head commit of the `__manifest` version this coordinator holds,
+    /// which a fork that has not published inherited from its source.
+    pub(crate) fn head_commit(&self) -> GraphCommit {
+        graph_commit_from_manifest_row(self.manifest.head().clone())
+    }
+
+    /// The id of [`Self::head_commit`].
     pub(crate) async fn effective_graph_head(&self) -> Result<Option<String>> {
-        match self.exact_graph_head() {
-            Some(head) => Ok(Some(head)),
-            None => self
-                .head_commit_id()
-                .await
-                .map(|head| head.map(|head| head.as_str().to_string())),
-        }
+        Ok(Some(self.manifest.head().graph_commit_id.clone()))
     }
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::wrap(self.manifest.snapshot())
     }
 
+    /// Read the contract of the same pinned manifest image as [`Self::snapshot`],
+    /// using captured content when available and a filtered scan otherwise.
+    pub(crate) async fn read_schema_contract(&self) -> Result<SchemaContractRow> {
+        self.manifest.read_schema_contract().await
+    }
+
     pub fn current_branch(&self) -> Option<&str> {
         self.bound_branch.as_deref()
     }
 
+    /// Install the latest version of the branch's `__manifest`: the table
+    /// state and the head, from one read of that version.
     pub async fn refresh(&mut self) -> Result<()> {
-        match self.manifest.refresh_with_lineage().await? {
-            LineageRefresh::Replace(rows) => self.commit_graph.replace_from_manifest_rows(rows),
-            LineageRefresh::Append(rows) => self.commit_graph.append_manifest_rows(rows),
-        }
-        Ok(())
-    }
-
-    /// Refresh the live read snapshot and, only when its exact branch-head row
-    /// is absent, the inherited lineage fallback. `ManifestCoordinator`
-    /// completes every required read before installing either new view, so a
-    /// failure cannot leave replacement rows paired with stale branch lineage.
-    pub(crate) async fn refresh_for_live_read(&mut self) -> Result<()> {
-        // Disjoint field borrows: the membership probe reads `commit_graph`
-        // while `manifest` is mutably borrowed. The lineage projection is
-        // refreshed whenever the durable branch head is a commit it does not
-        // already contain — a foreign handle's commit must never leave a new
-        // head paired with a stale commit map.
-        let commit_graph = &self.commit_graph;
-        if let Some(lineage_rows) = self
-            .manifest
-            .refresh_for_live_read(|head| commit_graph.get_commit(head).is_some())
-            .await?
-        {
-            self.commit_graph.replace_from_manifest_rows(lineage_rows);
-        }
-        Ok(())
+        self.manifest.refresh().await
     }
 
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
@@ -356,30 +414,29 @@ impl GraphCoordinator {
         self.manifest.probe_latest_incarnation().await
     }
 
-    /// Clone the already-loaded lineage projection. This performs no storage
-    /// I/O; branch merge uses it to compute the base from the same coordinator
-    /// instances that supplied source/target authority.
-    pub(crate) async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
-        self.commit_graph.load_commits().await
+    /// The lineage of the head this coordinator holds. Every operation that
+    /// asks for history reads it here; the read of `__history` behind it is
+    /// skipped while the history cache holds the head's parents.
+    async fn lineage(&self) -> Result<Lineage> {
+        self.manifest.commit_graph().lineage().await
     }
 
-    /// O(1) lineage authority handle for merge-base selection. Unlike
-    /// `load_commits`, this does not clone the complete history.
-    pub(crate) fn commit_graph_snapshot(&self) -> CommitGraphSnapshot {
-        self.commit_graph.snapshot()
-    }
-
-    pub async fn branch_list(&self) -> Result<Vec<String>> {
-        self.manifest.list_graph_branches().await.map(|branches| {
-            branches
-                .into_iter()
-                .filter(|branch| !is_internal_system_branch(branch))
-                .collect()
+    /// The head this coordinator holds, as a merge captures it.
+    pub(crate) async fn captured_lineage(&self) -> Result<CapturedLineage> {
+        Ok(CapturedLineage {
+            head: self.manifest.head_record().clone(),
+            buffer: self.manifest.buffer().clone(),
+            graph: self.manifest.commit_graph(),
         })
     }
 
-    pub(crate) async fn schema_apply_locked(&self) -> Result<bool> {
-        self.manifest.schema_apply_locked().await
+    /// The commits of the branch, oldest first.
+    pub(crate) async fn load_commits(&self) -> Result<Vec<GraphCommit>> {
+        self.manifest.commit_graph().load_commits().await
+    }
+
+    pub async fn branch_list(&self) -> Result<Vec<String>> {
+        self.manifest.list_graph_branches().await
     }
 
     pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
@@ -403,23 +460,9 @@ impl GraphCoordinator {
         self.manifest.create_branch(&branch).await
     }
 
-    pub(crate) async fn branch_delete(&mut self, name: &str) -> Result<()> {
-        let branch = normalize_branch_name(name)?
-            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        if self.current_branch() == Some(branch.as_str()) {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete currently active branch '{}'",
-                branch
-            )));
-        }
-
-        self.manifest.delete_branch(&branch).await
-    }
-
     /// Delete the branch represented by an operation-local post-gate capture.
     ///
-    /// Unlike [`Self::branch_delete`], this permits the disposable coordinator
-    /// itself to be bound to `name`. The exact captured BranchIdentifier fences
+    /// The disposable coordinator may be bound to `name`. Its captured BranchIdentifier fences
     /// delete/recreate ABA; the caller discards this coordinator after the
     /// native authority change.
     pub(crate) async fn branch_delete_captured(
@@ -438,10 +481,11 @@ impl GraphCoordinator {
         &self,
         graph_manifest_version: u64,
     ) -> Result<Snapshot> {
-        ManifestCoordinator::snapshot_at(
+        ManifestCoordinator::snapshot_at_in(
             self.root_uri(),
             self.current_branch(),
             graph_manifest_version,
+            self.history(),
         )
         .await
         .map(Snapshot::wrap)
@@ -449,58 +493,55 @@ impl GraphCoordinator {
 
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
-        let other = match normalized.as_deref() {
-            Some(branch) => {
-                GraphCoordinator::open_branch_with_session(
-                    self.root_uri(),
-                    branch,
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
+        let opened;
+        let coordinator = if normalized.as_deref() == self.current_branch()
+            && self
+                .probe_latest_incarnation()
                 .await?
-            }
-            None => {
-                GraphCoordinator::open_with_session(
-                    self.root_uri(),
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
-                .await?
-            }
+                .matches(&self.manifest_incarnation())
+        {
+            self
+        } else {
+            opened = match normalized.as_deref() {
+                Some(branch) => {
+                    GraphCoordinator::open_branch_with_session(
+                        self.root_uri(),
+                        branch,
+                        Arc::clone(&self.storage),
+                        &self.manifest.control_session(),
+                    )
+                    .await?
+                }
+                None => {
+                    GraphCoordinator::open_with_session(
+                        self.root_uri(),
+                        Arc::clone(&self.storage),
+                        &self.manifest.control_session(),
+                    )
+                    .await?
+                }
+            };
+            &opened
         };
 
-        Ok(other.head_commit_id().await?.unwrap_or_else(|| {
-            SnapshotId::synthetic(
-                other.current_branch(),
-                other.version(),
-                other.manifest_incarnation().e_tag.as_deref(),
-            )
-        }))
+        Ok(coordinator
+            .effective_graph_head()
+            .await?
+            .map(SnapshotId::new)
+            .unwrap_or_else(|| {
+                SnapshotId::synthetic(
+                    coordinator.current_branch(),
+                    coordinator.version(),
+                    coordinator.manifest_incarnation().e_tag.as_deref(),
+                )
+            }))
     }
 
     pub async fn resolve_target(&self, target: &ReadTarget) -> Result<ResolvedTarget> {
         match target {
             ReadTarget::Branch(branch) => {
                 let normalized = normalize_branch_name(branch)?;
-                let other = match normalized.as_deref() {
-                    Some(branch) => {
-                        GraphCoordinator::open_branch_with_session(
-                            self.root_uri(),
-                            branch,
-                            Arc::clone(&self.storage),
-                            &self.manifest.control_session(),
-                        )
-                        .await?
-                    }
-                    None => {
-                        GraphCoordinator::open_with_session(
-                            self.root_uri(),
-                            Arc::clone(&self.storage),
-                            &self.manifest.control_session(),
-                        )
-                        .await?
-                    }
-                };
+                let other = self.open_sibling(normalized.as_deref()).await?;
                 let graph_commit_id = other.effective_graph_head().await?;
                 let snapshot_id = graph_commit_id
                     .as_deref()
@@ -521,37 +562,7 @@ impl GraphCoordinator {
                 })
             }
             ReadTarget::Snapshot(snapshot_id) => {
-                let commit = self.resolve_commit(snapshot_id).await?;
-                let snapshot = Snapshot::wrap(
-                    ManifestCoordinator::snapshot_at(
-                        self.root_uri(),
-                        commit.graph_branch.as_deref(),
-                        commit.graph_manifest_version,
-                    )
-                    .await?,
-                );
-                // The reopen above is keyed only by (manifest branch, numeric
-                // version). A named branch deleted and recreated at the same
-                // numeric version between this handle's commit resolution and
-                // the reopen would resolve REPLACEMENT state under the
-                // commit's label — and a warm handle can hold the old commit
-                // in its lineage projection long after the recreation. Every
-                // commit is written as the head of its own manifest version,
-                // so the reopened snapshot must still name it as that branch's
-                // graph head (the same structural proof the feed's
-                // commit_snapshot performs); fail closed otherwise. Main
-                // cannot undergo branch-name ABA, but the check is structural
-                // and harmless there.
-                if snapshot.graph_head(commit.graph_branch.as_deref())
-                    != Some(commit.graph_commit_id.as_str())
-                {
-                    return Err(OmniError::manifest(format!(
-                        "commit '{}' has no persisted native-branch incarnation \
-                         witness at the reopened snapshot; the branch was deleted \
-                         and recreated since this handle resolved it",
-                        commit.graph_commit_id
-                    )));
-                }
+                let CommitState { commit, snapshot } = self.commit_state(snapshot_id).await?;
                 Ok(ResolvedTarget {
                     requested: target.clone(),
                     branch: commit.graph_branch.clone(),
@@ -563,25 +574,86 @@ impl GraphCoordinator {
         }
     }
 
+    /// The commit `snapshot_id` names and the graph as of it, from its record:
+    /// held by this coordinator, else in `__history`, else in a live branch.
+    /// Refused once the branch incarnation that wrote it is not live.
+    async fn commit_state(&self, snapshot_id: &SnapshotId) -> Result<CommitState> {
+        let session = self.manifest.control_session();
+        let id = snapshot_id.as_str();
+        if self.exact_graph_head().as_deref() == Some(id) {
+            ManifestCoordinator::ensure_incarnation_live(
+                self.root_uri(),
+                &session,
+                self.manifest.head(),
+            )
+            .await?;
+            return Ok(CommitState {
+                commit: self.head_commit(),
+                snapshot: self.snapshot(),
+            });
+        }
+        let record = match self.manifest.held_record(id) {
+            Some(record) => Some(record),
+            None => match self
+                .history()
+                .read_record(self.root_uri(), &session, id)
+                .await?
+            {
+                Some(record) => Some(record),
+                None => self.record_in_live_branches(id).await?,
+            },
+        };
+        match record {
+            Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
+            None => Err(commit_not_found(snapshot_id)),
+        }
+    }
+
+    /// The record of a commit a read of `__history` did not find: held by the
+    /// latest `__manifest` version of a live branch, the bound one first,
+    /// else appended to `__history` since, which a second read finds.
+    async fn record_in_live_branches(&self, id: &str) -> Result<Option<HistoryRecord>> {
+        if let Some(record) = self.manifest.record_in_live_branches(id).await? {
+            return Ok(Some(record));
+        }
+        self.history()
+            .read_record(self.root_uri(), &self.manifest.control_session(), id)
+            .await
+    }
+
+    /// The commit `snapshot_id` names: the head of the active branch or a
+    /// commit its `__manifest` buffers, a settled commit of `__history`, or
+    /// what [`Self::record_in_live_branches`] finds.
     pub async fn resolve_commit(&self, snapshot_id: &SnapshotId) -> Result<GraphCommit> {
-        if let Some(commit) = self.commit_graph.get_commit(snapshot_id.as_str()) {
+        let id = snapshot_id.as_str();
+        if let Some(commit) = self.manifest.held_commit(id) {
+            return Ok(graph_commit_from_manifest_row(commit.clone()));
+        }
+        if let Some(commit) = self.history().get_commit(id) {
             return Ok(commit);
         }
-
-        for branch in self.manifest.list_graph_branches().await? {
-            let normalized = normalize_branch_name(&branch)?;
-            let commit_graph = self
-                .open_commit_graph_for_branch(normalized.as_deref())
-                .await?;
-            if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
-                return Ok(commit);
-            }
+        let session = self.manifest.control_session();
+        if let Some(commit) = self
+            .history()
+            .read_commit(self.root_uri(), &session, id)
+            .await?
+        {
+            return Ok(graph_commit_from_manifest_row(commit));
         }
+        match self.record_in_live_branches(id).await? {
+            Some(record) => Ok(graph_commit_from_manifest_row(record.commit)),
+            None => Err(commit_not_found(snapshot_id)),
+        }
+    }
 
-        Err(OmniError::manifest_not_found(format!(
-            "commit '{}' not found",
-            snapshot_id
-        )))
+    /// The captured head, buffer and history cache only, with no read of
+    /// `__history` and no branch fanout on a miss. `commit_id` names a held
+    /// commit by its published ID or by its intent nonce.
+    pub(crate) fn captured_commit(&self, commit_id: &str) -> Result<Option<GraphCommit>> {
+        match self.manifest.held_commit_answering(commit_id)? {
+            Some(held) => Ok(Some(graph_commit_from_manifest_row(held.clone()))),
+            None => self.history().get_commit_answering(commit_id),
+        }
     }
 
     /// Resolve both endpoints and classify direct first-parent adjacency from
@@ -601,58 +673,36 @@ impl GraphCoordinator {
     }
 
     pub(crate) async fn head_commit_id(&self) -> Result<Option<SnapshotId>> {
-        self.commit_graph
-            .head_commit_id()
-            .await
-            .map(|id| id.map(SnapshotId::new))
+        Ok(Some(SnapshotId::new(
+            self.manifest.head().graph_commit_id.clone(),
+        )))
     }
 
-    /// Capture one coherent change-feed cut of a branch: its lineage head, its
-    /// branch-incarnation witness, its first-parent genesis, and the full
-    /// commit projection — all from ONE branch-pinned coordinator open, so a
-    /// concurrent commit cannot split the head from the chain it tops.
     /// Capture a change-feed cut by COLD-opening the requested branch. Used
     /// only when the requested branch differs from this handle's warm
     /// coordinator; the common same-branch poll uses [`Self::build_change_feed_cut`]
-    /// on the already-warm coordinator (no manifest re-open or lineage re-fold).
+    /// on the already-warm coordinator (no manifest re-open).
     pub(crate) async fn capture_change_cut(
         &self,
         branch: Option<&str>,
     ) -> Result<crate::changes::feed::ChangeFeedCut> {
-        let other = match branch {
-            Some(branch) => {
-                GraphCoordinator::open_branch_with_session(
-                    self.root_uri(),
-                    branch,
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
-                .await?
-            }
-            None => {
-                GraphCoordinator::open_with_session(
-                    self.root_uri(),
-                    Arc::clone(&self.storage),
-                    &self.manifest.control_session(),
-                )
-                .await?
-            }
-        };
-        other.build_change_feed_cut().await
+        self.open_sibling(branch)
+            .await?
+            .build_change_feed_cut()
+            .await
     }
 
-    /// Build a change-feed cut from THIS coordinator's current state. When the
-    /// coordinator is the warm handle already bound to the polled branch, this
-    /// performs no cold manifest open and no lineage re-fold — `load_commits`
-    /// reads the in-memory projection and uses the branch identifier captured
-    /// with that projection — so a caught-up poll's cost does not grow with
-    /// commit history and cannot pair old lineage with a replacement witness.
+    /// Build a change-feed cut from THIS coordinator's current state: the
+    /// head and its snapshot, the branch identifier captured with them, and
+    /// the lineage of that head, so a concurrent commit cannot split the head
+    /// from the chain it tops and old lineage cannot be paired with a
+    /// replacement witness. The lineage reads `__history` only while the
+    /// history cache lacks the head's parents.
     pub(crate) async fn build_change_feed_cut(
         &self,
     ) -> Result<crate::changes::feed::ChangeFeedCut> {
-        let head = self.effective_graph_head().await?.ok_or_else(|| {
-            OmniError::manifest_internal("branch has no lineage head; genesis is always published")
-        })?;
+        let lineage = self.lineage().await?;
+        let head = lineage.head().graph_commit_id.clone();
         // Main cannot be deleted/recreated, so a fixed witness suffices; a
         // named ref's Lance-native identifier changes on delete/recreate and
         // fences cursor ABA. This is the identifier captured with the head and
@@ -669,20 +719,14 @@ impl GraphCoordinator {
                 crate::changes::token::hashed_identity(&encoded)
             }
         };
-        let commits: std::collections::HashMap<String, GraphCommit> = self
-            .load_commits()
-            .await?
-            .into_iter()
-            .map(|commit| (commit.graph_commit_id.clone(), commit))
-            .collect();
         // One walk finds genesis AND builds the forward first-parent child
         // index (chain member → its unique on-chain child), so a poll can walk
         // FORWARD from its cursor bounded by its commit ceiling instead of
         // cloning the whole unread backlog, and on-chain validation is O(1).
-        let mut first_parent_children = std::collections::HashMap::with_capacity(commits.len());
+        let mut first_parent_children = std::collections::HashMap::new();
         let mut genesis = head.clone();
         loop {
-            let commit = commits.get(&genesis).ok_or_else(|| {
+            let commit = lineage.get_commit(&genesis).ok_or_else(|| {
                 OmniError::manifest_internal(format!("lineage chain is missing commit '{genesis}'"))
             })?;
             match &commit.parent_commit_id {
@@ -696,9 +740,13 @@ impl GraphCoordinator {
         Ok(crate::changes::feed::ChangeFeedCut {
             branch: self.bound_branch.clone(),
             head,
+            head_record: self.manifest.head_record().clone(),
+            head_snapshot: self.snapshot(),
+            buffer: self.manifest.buffer().clone(),
+            control_session: self.manifest.control_session(),
             witness,
             genesis,
-            commits,
+            lineage,
             first_parent_children,
         })
     }
@@ -758,10 +806,8 @@ impl GraphCoordinator {
     }
 
     /// Publish a pre-minted lineage intent under an explicit authority
-    /// precondition. The intent's identity and timestamp remain stable across
-    /// publisher retries and can also be persisted by the caller before this
-    /// method is invoked (schema apply records the commit id in its staged
-    /// contract).
+    /// precondition. The intent's nonce and timestamp remain stable across
+    /// publisher retries.
     pub(crate) async fn commit_changes_with_intent_and_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -770,7 +816,7 @@ impl GraphCoordinator {
         precondition: &PublishPrecondition,
     ) -> Result<PublishedSnapshot> {
         fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
-        let mut outcome = self
+        let outcome = self
             .manifest
             .commit_changes_with_lineage_and_precondition(
                 changes,
@@ -780,8 +826,12 @@ impl GraphCoordinator {
             )
             .await?;
         fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
-        let commit = self.apply_lineage_to_cache(intent, &outcome);
-        self.manifest.acknowledge_published_lineage(&mut outcome);
+        let record = outcome.commit.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "a publish with a lineage intent returned no graph commit record",
+            )
+        })?;
+        let commit = graph_commit_from_manifest_row(record);
         Ok(PublishedSnapshot {
             graph_manifest_version: outcome.version,
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
@@ -790,18 +840,20 @@ impl GraphCoordinator {
     }
 
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
-    /// fresh ULID (stable across the publisher's CAS retries) and a timestamp.
+    /// fresh intent nonce (stable across CAS retries) and a timestamp. The returned
+    /// publication carries the actual addressed graph commit ID.
     /// The parent is NOT chosen here — the publisher resolves it per attempt
     /// against the manifest it commits against.
     pub(crate) fn new_lineage_intent(
         &self,
         actor_id: Option<&str>,
-        merged_parent_commit_id: Option<String>,
+        merged_parent: Option<BranchRecords>,
     ) -> Result<LineageIntent> {
         Self::new_lineage_intent_for_branch(
             self.current_branch(),
             actor_id,
-            merged_parent_commit_id,
+            merged_parent,
+            HistoryReleaseBytes::PRODUCTION,
         )
     }
 
@@ -811,51 +863,41 @@ impl GraphCoordinator {
     pub(crate) fn new_lineage_intent_for_branch(
         branch: Option<&str>,
         actor_id: Option<&str>,
-        merged_parent_commit_id: Option<String>,
+        merged_parent: Option<BranchRecords>,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<LineageIntent> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
         Ok(LineageIntent {
             graph_commit_id: crate::dst_ids::new_ulid().to_string(),
             branch,
             actor_id: actor_id.map(str::to_string),
-            merged_parent_commit_id,
+            merged_parent,
             created_at: crate::db::now_micros()?,
+            history_release_bytes,
         })
     }
 
-    /// Insert the just-published commit into the in-memory commit cache from the
-    /// intent + the publisher-resolved parent + the new manifest version. No
-    /// storage I/O: the durable write already happened in the publish CAS, and
-    /// this keeps a same-handle read's `head_commit_id` consistent with the
-    /// snapshot it just advanced.
-    fn apply_lineage_to_cache(
-        &mut self,
-        intent: crate::db::manifest::LineageIntent,
-        outcome: &crate::db::manifest::CommitOutcome,
-    ) -> GraphCommit {
-        let commit = GraphCommit {
-            graph_commit_id: intent.graph_commit_id.clone(),
-            graph_branch: intent.branch,
-            graph_manifest_version: outcome.version,
-            parent_commit_id: outcome.parent_commit_id.clone(),
-            merged_parent_commit_id: intent.merged_parent_commit_id,
-            actor_id: intent.actor_id,
-            created_at: intent.created_at,
-        };
-        self.commit_graph.insert_committed(commit.clone());
-        commit
-    }
-
-    async fn open_commit_graph_for_branch(&self, branch: Option<&str>) -> Result<CommitGraph> {
-        match branch {
-            Some(branch) => CommitGraph::open_at_branch(self.root_uri(), branch).await,
-            None => CommitGraph::open(self.root_uri()).await,
-        }
-    }
-
     pub(crate) async fn list_commits(&self) -> Result<Vec<GraphCommit>> {
-        self.commit_graph.load_commits().await
+        self.load_commits().await
     }
+}
+
+/// The state of a settled commit, from the `table` rows of its record.
+async fn settled_commit_state(
+    root_uri: &str,
+    control_session: &Arc<lance::session::Session>,
+    record: HistoryRecord,
+) -> Result<CommitState> {
+    ManifestCoordinator::ensure_incarnation_live(root_uri, control_session, &record.commit).await?;
+    let snapshot = Snapshot::wrap(record.snapshot(root_uri)?);
+    Ok(CommitState {
+        commit: graph_commit_from_manifest_row(record.commit),
+        snapshot,
+    })
+}
+
+fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
+    OmniError::manifest_not_found(format!("commit '{}' not found", snapshot_id))
 }
 
 /// Wrap each `DatasetUpdate` as a `ManifestChange::Update` for the publisher.
@@ -885,6 +927,246 @@ fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cold_open_refresh_uses_content_only_from_the_held_image() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        const CAPTURE_ERROR: &str = "captured contract content error";
+        for advance in [false, true] {
+            for captured_error in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().to_str().unwrap();
+                let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+                    .await
+                    .unwrap();
+                let session = crate::lance_access::control_session();
+                let (manifest, _lineage, captured) =
+                    ManifestCoordinator::open_with_lineage_and_contract(root, None, &session)
+                        .await
+                        .unwrap();
+                let mut expected = captured.unwrap();
+                let old_head = expected.head.clone();
+                let old_version = manifest.version();
+                let mut reader = GraphCoordinator {
+                    root_uri: normalize_root_uri(root).unwrap(),
+                    storage: crate::storage::storage_for_uri(root).unwrap(),
+                    manifest,
+                    bound_branch: None,
+                };
+                let captured = if captured_error {
+                    Err(OmniError::manifest_internal(CAPTURE_ERROR))
+                } else {
+                    Ok(expected.clone())
+                };
+                let expected_version = if advance {
+                    expected.source = format!("\n{}\n", expected.source);
+                    expected.ir = format!("\n{}\n", expected.ir);
+                    assert_eq!(expected.head, old_head);
+                    let mut writer = ManifestCoordinator::open_with_session(root, &session)
+                        .await
+                        .unwrap();
+                    let version = writer
+                        .commit_changes(&[ManifestChange::SchemaContract(expected.clone())])
+                        .await
+                        .unwrap();
+                    assert!(version > old_version);
+                    version
+                } else {
+                    old_version
+                };
+                let probes = crate::instrumentation::QueryIoProbes::default();
+                let scans = Arc::clone(&probes.manifest_scan_count);
+                let result = crate::instrumentation::with_query_io_probes(
+                    probes,
+                    reader.refresh_contract_capture(captured),
+                )
+                .await;
+                assert_eq!(reader.version(), expected_version);
+                assert_eq!(
+                    reader.manifest.snapshot().schema_contract(),
+                    Some(&old_head)
+                );
+                if captured_error && !advance {
+                    match result.unwrap_err() {
+                        OmniError::Manifest(error) => {
+                            assert_eq!(error.kind, crate::error::ManifestErrorKind::Internal);
+                            assert_eq!(error.message, CAPTURE_ERROR);
+                            assert!(error.details.is_none());
+                            assert!(!error.publication_in_doubt);
+                        }
+                        error => panic!("unexpected capture error: {error:?}"),
+                    }
+                } else {
+                    assert_eq!(result.unwrap(), expected);
+                }
+                let scans = scans.load(std::sync::atomic::Ordering::Relaxed);
+                if advance {
+                    assert!(scans > 0, "the replacement must read its pinned content");
+                } else {
+                    assert_eq!(scans, 0, "unchanged success/error must reuse the capture");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_cold_open_refreshes_content_published_after_admission() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let session = crate::lance_access::control_session();
+        let prepared = ManifestCoordinator::prepare_open_with_contract(root, &session)
+            .await
+            .unwrap();
+        let mut writer = ManifestCoordinator::open_with_session(root, &session)
+            .await
+            .unwrap();
+        let mut expected = writer.read_schema_contract().await.unwrap();
+        let old_head = expected.head.clone();
+        expected.source = format!("\n{}\n", expected.source);
+        expected.ir = format!("\n{}\n", expected.ir);
+        let version = writer
+            .commit_changes(&[ManifestChange::SchemaContract(expected.clone())])
+            .await
+            .unwrap();
+        let (reader, contract) = GraphCoordinator::open_with_contract(
+            root,
+            crate::storage::storage_for_uri(root).unwrap(),
+            prepared,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.version(), version);
+        assert_eq!(contract.head, old_head);
+        assert_eq!(contract, expected);
+    }
+
+    /// A read by commit id of a commit made under an earlier schema takes that
+    /// schema's text from `__history/schemas/`, with no open or scan of
+    /// `__manifest`, so it survives the pruning of old `__manifest` versions.
+    #[tokio::test]
+    async fn commit_under_an_earlier_schema_reads_its_contract_from_the_archive() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let session = crate::lance_access::control_session();
+        let open = || async {
+            let storage = crate::storage::storage_for_uri(root).unwrap();
+            GraphCoordinator::open_with_session(root, storage, &session)
+                .await
+                .unwrap()
+        };
+        let at_genesis = open().await;
+        let genesis = SnapshotId::new(at_genesis.exact_graph_head().unwrap());
+        let genesis_contract = at_genesis.read_schema_contract().await.unwrap();
+        db.apply_schema("node Person {\n    name: String\n    nickname: String?\n}\n")
+            .await
+            .unwrap();
+
+        let reader = open().await;
+        let applied_contract = reader.read_schema_contract().await.unwrap();
+        assert_ne!(applied_contract, genesis_contract);
+        let resolved = reader
+            .resolve_target(&ReadTarget::Snapshot(genesis.clone()))
+            .await
+            .unwrap();
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        let opens = Arc::clone(&probes.internal_open_count);
+        let scans = Arc::clone(&probes.manifest_scan_count);
+        let contract = crate::instrumentation::with_query_io_probes(
+            probes,
+            resolved.snapshot.read_schema_contract(root),
+        )
+        .await
+        .unwrap();
+        assert_eq!(contract, genesis_contract);
+        assert_eq!(
+            (
+                opens.load(std::sync::atomic::Ordering::Relaxed),
+                scans.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            (0, 0),
+            "the contract of an earlier commit is read without `__manifest`"
+        );
+
+        let digest = omnigraph_catalog::history::schema_content_hash(&genesis_contract).unwrap();
+        std::fs::remove_file(
+            dir.path()
+                .join(format!("__history/schemas/{digest}.schema")),
+        )
+        .unwrap();
+        let error = resolved
+            .snapshot
+            .read_schema_contract(root)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is missing"), "{error}");
+    }
+
+    /// `captured_commit` names a commit by its intent nonce after the commit
+    /// left the buffer for `__history`, which holds it under its `hb1` id.
+    #[tokio::test]
+    async fn captured_commit_answers_the_nonce_of_a_released_commit() {
+        use omnigraph_core::graph_commit_id::{intent_nonce, parse_history_block_id};
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let settings = crate::settings::SessionSettings::default()
+            .with("history_release_bytes", "2048")
+            .unwrap();
+        let lowered = crate::Session::from_defaults(Arc::new(db), settings);
+        let slot_of = |id: &str| parse_history_block_id(id).unwrap().unwrap().slot;
+        let mut published: Vec<String> = Vec::new();
+        for load in 0..64 {
+            let line = format!(r#"{{"type": "Person", "data": {{"name": "P{load}"}}}}"#);
+            let receipt = lowered
+                .load_as_with_receipt("main", None, &line, crate::loader::LoadMode::Append, None)
+                .await
+                .unwrap();
+            published.push(receipt.commit.graph_commit_id);
+            if published.len() > 2 && slot_of(&published[published.len() - 2]) == 0 {
+                break;
+            }
+        }
+        assert!(
+            published.len() > 2 && slot_of(&published[published.len() - 2]) == 0,
+            "64 loads under 2048 bytes released no block: {published:?}"
+        );
+        let released = &published[0];
+        let nonce = intent_nonce(released).unwrap();
+        let storage = crate::storage::storage_for_uri(root).unwrap();
+        let session = crate::lance_access::control_session();
+        let coordinator = GraphCoordinator::open_with_session(root, storage, &session)
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .manifest
+                .held_commit_answering(&nonce)
+                .unwrap()
+                .is_none(),
+            "the first load's commit left the buffer"
+        );
+        coordinator.list_commits().await.unwrap();
+        let found = coordinator
+            .captured_commit(&nonce)
+            .unwrap()
+            .expect("a released commit answers its intent nonce");
+        assert_eq!(&found.graph_commit_id, released);
+    }
+
     fn commit(
         id: &str,
         parent_commit_id: Option<&str>,
@@ -894,6 +1176,7 @@ mod tests {
             graph_commit_id: id.to_string(),
             graph_branch: None,
             graph_manifest_version: 1,
+            generation: 0,
             parent_commit_id: parent_commit_id.map(str::to_string),
             merged_parent_commit_id: merged_parent_commit_id.map(str::to_string),
             actor_id: None,
@@ -940,5 +1223,68 @@ mod tests {
             classify_commit_range(right, merge),
             ResolvedCommitRange::Arbitrary { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_cold_open_refuses_a_legacy_stamp_published_after_admission() {
+        #[cfg(feature = "failpoints")]
+        let _scenario = crate::seams::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let _owner = crate::db::Omnigraph::init(root, "node Person { name: String }")
+            .await
+            .unwrap();
+        let session = crate::lance_access::control_session();
+        let prepared = ManifestCoordinator::prepare_open_with_contract(root, &session)
+            .await
+            .unwrap();
+        let mut dataset =
+            crate::db::manifest::layout::open_manifest_dataset_with_session(root, None, &session)
+                .await
+                .unwrap();
+        let captured_version = dataset.version().version;
+        crate::db::manifest::migrations::set_stamp_for_test(&mut dataset, 12)
+            .await
+            .unwrap();
+        assert!(dataset.version().version > captured_version);
+        assert_eq!(
+            crate::db::manifest::migrations::read_stamp(&dataset),
+            Some(12)
+        );
+        let probes = crate::instrumentation::QueryIoProbes::default();
+        let opens = Arc::clone(&probes.internal_open_count);
+        let result = crate::instrumentation::with_query_io_probes(
+            probes,
+            GraphCoordinator::open_with_contract(
+                root,
+                crate::storage::storage_for_uri(root).unwrap(),
+                prepared,
+            ),
+        )
+        .await;
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let error = result
+            .err()
+            .expect("final refreshed image must still be served format");
+        let OmniError::Manifest(error) = error else {
+            panic!("expected typed format refusal: {error:?}");
+        };
+        assert_eq!(error.kind, crate::error::ManifestErrorKind::BadRequest);
+        assert!(
+            error.message.contains("internal schema v12"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(&format!(
+                "reads only v{} to v{}",
+                crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+            )),
+            "{}",
+            error.message
+        );
+        assert!(error.details.is_none());
+        assert!(!error.publication_in_doubt);
     }
 }

@@ -7,7 +7,7 @@ use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemFieldRole};
 use crate::catalog::{Catalog, EdgeType};
 use crate::error::{CompilerError, Result};
 use crate::traversal::{EDGE_TYPE_META, EdgeMember, EdgeSelection, common_edge_property};
-use crate::types::{Direction, PropType, ScalarType};
+use crate::types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};
 
 use super::ast::*;
 use super::codes::*;
@@ -2923,11 +2923,15 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
         Literal::Date(value) => {
-            crate::types::check_date_literal(value)
+            check_date_literal(value)
                 .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
             Ok(PropType::scalar(ScalarType::Date, false))
         }
-        Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
+        Literal::DateTime(value) => {
+            check_datetime_literal(value)
+                .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
+            Ok(PropType::scalar(ScalarType::DateTime, false))
+        }
         Literal::List(items) => {
             if items.is_empty() {
                 return Ok(PropType::list_of(ScalarType::String, false));

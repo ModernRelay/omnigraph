@@ -1,0 +1,63 @@
+# issue: none
+# notes: A graph opened without an external Blob policy refuses a new external URI on insert and on update,
+# notes: and the refused write leaves the row and its scalars as they were.
+# notes: The URI is admitted per matched row, so an update whose predicate matches no row affects nothing and is not refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","content":"base64:AQID","title":"alpha"}}
+
+--- mutate
+query insert_external_uri($content: Blob?) {
+    insert Doc { slug: "b", content: $content, title: "beta" }
+}
+
+--- params
+{"content": "s3://assets/external/file.bin"}
+
+--- expect error: external blob URI 's3://assets/external/file.bin' is not allowed: new external Blob URI ingress is denied for this graph
+
+--- mutate
+query update_to_external_uri($content: Blob?) {
+    update Doc set { content: $content, title: "changed" } where slug = "a"
+}
+
+--- params
+{"content": "s3://assets/external/file.bin"}
+
+--- expect error: external blob URI 's3://assets/external/file.bin' is not allowed: new external Blob URI ingress is denied for this graph
+
+--- mutate
+query update_to_external_uri_matching_no_row($content: Blob?) {
+    update Doc set { content: $content } where slug = "nobody"
+}
+
+--- params
+{"content": "s3://assets/external/file.bin"}
+
+--- expect affected: nodes=0 edges=0
+
+--- query
+query rows_after_refused_writes() {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+}
+
+--- expect unordered
+{"d.slug": "a", "d.title": "alpha"}
+
+--- expect shape
+d.slug: String
+d.title: String

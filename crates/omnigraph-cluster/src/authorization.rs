@@ -1,7 +1,6 @@
 //! Configuration-owned authorization for callers that already authenticated
 //! an identity. The applied ledger owns policy; candidate files never do.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use omnigraph_policy::{PolicyAction, PolicyEngine, PolicyRequest};
@@ -98,6 +97,34 @@ impl IdentityAuthorization {
     pub fn actor(&self) -> &str {
         &self.actor
     }
+
+    pub(crate) fn has_bootstrap_authority(&self) -> bool {
+        self.bootstrap.is_some()
+    }
+
+    pub(crate) fn check_bootstrap_input(
+        &self,
+        config_digest: &str,
+        resources: &BTreeMap<String, String>,
+    ) -> Result<(), Diagnostic> {
+        let bootstrap = self.bootstrap.as_ref().ok_or_else(|| {
+            refusal(
+                "bootstrap_authority_required",
+                "bootstrap",
+                "initialization requires exact, explicitly granted bootstrap authority",
+            )
+        })?;
+        if bootstrap.initial_config_digest != config_digest
+            || &bootstrap.initial_resource_digests != resources
+        {
+            return Err(refusal(
+                "bootstrap_authority_mismatch",
+                "bootstrap",
+                "initial configuration differs from the explicitly authorized initialization",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,16 +179,6 @@ pub struct AuthorizedPlanOutput {
     pub authorization: Option<PlanAuthorization>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthorizedApplyOutput {
-    pub apply: ApplyOutput,
-    /// `None` guarantees this call stopped before recovery, graph or catalog
-    /// effects (it may have acquired/released the cluster lock). `Some` records
-    /// completed preflight; later failure may have effects and needs the normal
-    /// recovery analysis. This says nothing about effects from earlier calls.
-    pub authorization: Option<PlanAuthorization>,
-}
-
 /// Current applied-policy evidence for a protected result projection.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReadAuthorization {
@@ -175,13 +192,30 @@ pub struct PlanReadAuthorization {
 }
 
 pub(crate) struct AppliedPolicies {
-    cluster: PolicyEngine,
+    cluster: Option<PolicyEngine>,
     graphs: BTreeMap<String, Arc<PolicyEngine>>,
-    digests: BTreeMap<String, String>,
+    pub(crate) digests: BTreeMap<String, String>,
 }
 
 impl AppliedPolicies {
     pub(crate) async fn load(
+        backend: &ClusterStore,
+        state: &ClusterState,
+    ) -> Result<Self, Diagnostic> {
+        let policies = Self::load_optional(backend, state).await?;
+        if policies.cluster.is_none() {
+            return Err(refusal(
+                "cluster_policy_required",
+                "cluster",
+                "identity-authorized operations require an applied cluster management policy; migrate existing clusters explicitly",
+            ));
+        }
+        Ok(policies)
+    }
+
+    /// Storage owners need no management policy, but every installed graph
+    /// policy is still loaded and enforced by the engine.
+    pub(crate) async fn load_optional(
         backend: &ClusterStore,
         state: &ClusterState,
     ) -> Result<Self, Diagnostic> {
@@ -260,15 +294,21 @@ impl AppliedPolicies {
             digests.insert(address.clone(), entry.digest.clone());
         }
         Ok(Self {
-            cluster: cluster.ok_or_else(|| refusal("cluster_policy_required", "cluster", "identity-authorized operations require an applied cluster management policy; migrate existing clusters explicitly"))?,
+            cluster,
             graphs,
             digests,
         })
     }
 
-    fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
+    pub(crate) fn check_cluster(&self, actor: &str) -> Result<(), Diagnostic> {
         check(
-            &self.cluster,
+            self.cluster.as_ref().ok_or_else(|| {
+                refusal(
+                    "cluster_policy_required",
+                    "cluster",
+                    "identity-authorized operations require an applied cluster policy",
+                )
+            })?,
             actor,
             PolicyAction::ConfigManage,
             "cluster",
@@ -277,7 +317,7 @@ impl AppliedPolicies {
         )
     }
 
-    fn check_graph(
+    pub(crate) fn check_graph(
         &self,
         actor: &str,
         graph: &str,
@@ -332,12 +372,13 @@ fn check(
 pub(crate) async fn authorize_candidate(
     backend: &ClusterStore,
     desired: &DesiredCluster,
-    state: Option<&ClusterState>,
-    observations: &StateObservations,
+    captured: &CapturedDeployment,
+    snapshot: &store::StateSnapshot,
     changes: &[PlanChange],
     identity: &IdentityAuthorization,
     applying: bool,
 ) -> Result<(PlanAuthorization, Option<AppliedPolicies>), Diagnostic> {
+    let state = snapshot.state.as_ref();
     if !desired.state_lock {
         return Err(refusal(
             "authorization_requires_lock",
@@ -365,13 +406,7 @@ pub(crate) async fn authorize_candidate(
                 "initial configuration differs from the explicitly authorized initialization",
             ));
         }
-        if state.is_some_and(|state| {
-            state.state_revision > 1
-                || !state.applied_revision.resources.is_empty()
-                || !state.approval_records.is_empty()
-                || !state.recovery_records.is_empty()
-                || state.applied_revision.config_digest.as_deref() != Some(&desired.config_digest)
-        }) {
+        if state.is_some_and(|state| !pristine_bootstrap_state(state)) {
             return Err(refusal(
                 "bootstrap_already_initialized",
                 "bootstrap",
@@ -381,7 +416,7 @@ pub(crate) async fn authorize_candidate(
         // The explicit capability authorizes installation, not candidate-policy
         // self-authorization. Validate that it actually installs an initial
         // management policy for the authenticated creator.
-        validate_initial_policy(desired, &identity.actor)?;
+        validate_initial_policy(desired, captured, &identity.actor)?;
         None
     } else {
         let state = state.ok_or_else(|| {
@@ -496,6 +531,22 @@ pub(crate) async fn authorize_candidate(
             })
             .collect::<BTreeSet<_>>();
         for graph in affected_graphs {
+            if !captured.resources.contains_key(&graph_address(&graph))
+                && !backend
+                    .graph_root_exists(&backend.graph_root(&graph))
+                    .await
+                    .map_err(|error| {
+                        refusal(
+                            "graph_unavailable",
+                            graph_address(&graph),
+                            error.to_string(),
+                        )
+                    })?
+            {
+                // The applied identity still authorizes removing an already
+                // absent graph; it must never be recreated to inspect recovery.
+                continue;
+            }
             Omnigraph::ensure_no_pending_recovery(&backend.graph_root(&graph))
                 .await
                 .map_err(|error| {
@@ -512,9 +563,9 @@ pub(crate) async fn authorize_candidate(
         version: 1,
         actor: identity.actor.clone(),
         canonical_root: backend.canonical_root()?,
-        state_revision: observations.state_revision,
-        state_cas: observations.state_cas.clone(),
-        applied_config_digest: observations.applied_config_digest.clone(),
+        state_revision: state.map_or(0, |state| state.state_revision),
+        state_cas: snapshot.state_cas.clone(),
+        applied_config_digest: state.and_then(|state| state.applied_revision.config_digest.clone()),
         desired_config_digest: desired.config_digest.clone(),
         policy_digests: policies
             .as_ref()
@@ -527,7 +578,11 @@ pub(crate) async fn authorize_candidate(
     Ok((evidence, policies))
 }
 
-fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), Diagnostic> {
+fn validate_initial_policy(
+    desired: &DesiredCluster,
+    captured: &CapturedDeployment,
+    actor: &str,
+) -> Result<(), Diagnostic> {
     let (address, _) = desired
         .policy_bindings
         .iter()
@@ -539,29 +594,20 @@ fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), 
                 "initialization must explicitly declare a cluster management policy",
             )
         })?;
-    let resource = desired
-        .resources
-        .iter()
-        .find(|resource| &resource.address == address)
-        .ok_or_else(|| {
-            refusal(
-                "bootstrap_policy_required",
-                address,
-                "initial policy source missing",
-            )
-        })?;
-    let file = fs::File::open(resource.path.as_ref().ok_or_else(|| {
+    let resource = captured.resources.get(address).ok_or_else(|| {
         refusal(
             "bootstrap_policy_required",
             address,
             "initial policy source missing",
         )
-    })?)
-    .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
-    let mut source = String::new();
-    file.take(MAX_POLICY_BYTES as u64 + 1)
-        .read_to_string(&mut source)
-        .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
+    })?;
+    let source = captured.sources.get(&resource.digest).ok_or_else(|| {
+        refusal(
+            "bootstrap_policy_required",
+            address,
+            "initial policy source missing",
+        )
+    })?;
     if source.len() > MAX_POLICY_BYTES || sha256_hex(source.as_bytes()) != resource.digest {
         return Err(refusal(
             "resource_content_changed",
@@ -569,7 +615,7 @@ fn validate_initial_policy(desired: &DesiredCluster, actor: &str) -> Result<(), 
             "initial policy source differs from its authorized digest",
         ));
     }
-    let policy = PolicyEngine::load_cluster_from_source(&source)
+    let policy = PolicyEngine::load_cluster_from_source(source)
         .map_err(|err| refusal("bootstrap_policy_required", address, err.to_string()))?;
     check(
         &policy,
@@ -588,22 +634,15 @@ pub(crate) fn compare_authorization(
     let same_base = expected.state_revision == actual.state_revision
         && expected.state_cas == actual.state_cas
         && expected.applied_config_digest == actual.applied_config_digest;
-    // The existing explicit import initializes only the empty ledger between
-    // an absent-root bootstrap plan and its apply. No normal path gets this.
-    let bootstrap_import = expected.bootstrap
-        && actual.bootstrap
-        && expected.state_revision == 0
-        && expected.state_cas.is_none()
-        && actual.state_revision == 1
-        && actual.applied_config_digest.as_ref() == Some(&actual.desired_config_digest);
     if expected.version != 1
+        || expected.actor != actual.actor
         || expected.effects.len() > MAX_AUTHORIZATION_RESOURCES
         || expected.canonical_root != actual.canonical_root
         || expected.desired_config_digest != actual.desired_config_digest
         || expected.policy_digests != actual.policy_digests
         || expected.effects != actual.effects
         || expected.bootstrap != actual.bootstrap
-        || !(same_base || bootstrap_import)
+        || !same_base
     {
         return Err(refusal(
             "plan_authorization_stale",
@@ -703,14 +742,16 @@ pub async fn authorize_plan_read(
 
 /// Effect-free execution preflight for a trusted orchestrator. This checks the
 /// complete candidate against current applied policy before the caller writes
-/// its own execution artifacts. It does not acquire writer authority: the
-/// authorized apply entry point repeats the check under the cluster lock.
+/// its own execution artifacts. It is read-only evidence, never writer
+/// authority. V2 deployment independently rechecks current policy and scope
+/// under the root admission; legacy ledgers require explicit conversion.
 pub async fn authorize_apply_plan(
     config_dir: impl AsRef<Path>,
     identity: &IdentityAuthorization,
     expected: &PlanAuthorization,
 ) -> Result<PlanAuthorization, Diagnostic> {
-    let outcome = load_desired(config_dir.as_ref());
+    let sources = config::capture_desired(config_dir.as_ref());
+    let outcome = sources.outcome;
     if let Some(diagnostic) = outcome
         .diagnostics
         .into_iter()
@@ -728,35 +769,38 @@ pub async fn authorize_apply_plan(
     let backend = store_for(&desired.config_dir, desired.storage_root.as_deref())?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
+    let captured = capture_desired_deployment(&desired, sources.sources, None)?;
     if let Some(state) = &snapshot.state {
+        if state.version != 2 {
+            return Err(refusal(
+                "ledger_upgrade_required",
+                CLUSTER_STATE_FILE,
+                "explicitly convert the stopped legacy ledger before planning deployment",
+            ));
+        }
+        crate::deployment::preview_deployment_scope(state, &captured)?;
         let mut diagnostics = Vec::new();
         if !validate_state_graph_resource_digests(state, &mut diagnostics) {
             return Err(diagnostics.remove(0));
         }
     }
-    let prior = snapshot
-        .state
-        .as_ref()
-        .map(state_resource_digests)
-        .unwrap_or_default();
-    let mut changes = diff_resources(&prior, &desired.resource_digests);
-    append_policy_binding_changes(&mut changes, snapshot.state.as_ref(), &desired);
-    append_embedding_profile_changes(&mut changes, snapshot.state.as_ref(), &desired);
+    let changes = crate::diff::diff_state_resources(
+        &snapshot
+            .state
+            .as_ref()
+            .map(|state| state.applied_revision.resources.clone())
+            .unwrap_or_default(),
+        &captured.resources,
+    );
     let (authorization, _) = authorize_candidate(
-        &backend,
-        &desired,
-        snapshot.state.as_ref(),
-        &observations,
-        &changes,
-        identity,
-        true,
+        &backend, &desired, &captured, &snapshot, &changes, identity, true,
     )
     .await?;
     compare_authorization(expected, &authorization)?;
     Ok(authorization)
 }
 
-fn valid_digest(value: &str) -> bool {
+pub(crate) fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

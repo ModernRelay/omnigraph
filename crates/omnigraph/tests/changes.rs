@@ -1158,6 +1158,179 @@ async fn change_feed_detects_same_length_blob_only_update() {
     );
 }
 
+/// A ranged external Blob descriptor, which only a writer outside OmniGraph
+/// can create, has no load-format spelling, so export refuses it. The change
+/// feed must still cross the commit that introduced it: its image describes
+/// the exact reference as `{uri, offset, length}` without contacting the
+/// object (`s3://bucket/object` does not exist), and the cursor advances past
+/// it to the next commit. The same holds for a range-only update of the same
+/// URI, whose before and after images carry the two exact ranges, and for its
+/// delete, whose before image carries the last range. A baseline taken while
+/// the row exists describes it the same way, where export refuses it, and its
+/// cursor resumes at the next commit.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+    )
+    .await
+    .unwrap();
+    let now = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Now),
+        ))
+        .await
+        .unwrap();
+    let (cursor, _) = boundary_cursor(&now);
+
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+
+    // The baseline is the exact state its consumer starts from. Refusing the
+    // ranged row would leave the graph with no baseline at all, so the
+    // snapshot describes it as the change images do.
+    let mut snapshot = Vec::new();
+    let baseline = db
+        .capture_change_baseline("main", &ChangeFeedScope::default(), &mut snapshot)
+        .await
+        .expect("a ranged external descriptor must not refuse the baseline");
+    let snapshot = String::from_utf8(snapshot)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshot,
+        [serde_json::json!({
+            "type": "Document",
+            "id": "ranged",
+            "data": {
+                "title": "ranged",
+                "content": {"uri": "s3://bucket/object", "offset": 4, "length": 8},
+            },
+        })]
+    );
+    assert!(
+        db.export_jsonl("main", &[]).await.is_err(),
+        "export, whose output reloads, still refuses the ranged row"
+    );
+
+    helpers::replace_ranged_external_blob_range(&db, uri, 16, 3).await;
+    let db = helpers::session(db);
+    db.mutate(
+        "main",
+        "query drop_document($title: String) {\n    delete Document where title = $title\n}\n",
+        "drop_document",
+        &helpers::params(&[("$title", "ranged")]),
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Document","data":{"title":"later","content":"base64:QQ=="}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let one_commit = |cursor: String| {
+        let mut request = feed_request(None, ChangeFeedPosition::Cursor(cursor));
+        request.max_commits = Some(1);
+        request
+    };
+    let ranged_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a ranged external descriptor must not wedge the feed");
+    assert_eq!(ranged_page.blocks.len(), 1);
+    let changes = &ranged_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Insert);
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8})
+    );
+    let (cursor, caught_up) = boundary_cursor(&ranged_page);
+    assert!(!caught_up, "the later commit is still unread");
+
+    let first_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8});
+    let second_range = serde_json::json!({"uri": "s3://bucket/object", "offset": 16, "length": 3});
+    let update_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("a range-only update must not wedge the feed");
+    assert_eq!(update_page.blocks.len(), 1);
+    let changes = &update_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Update);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        first_range
+    );
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    let (cursor, caught_up) = boundary_cursor(&update_page);
+    assert!(!caught_up);
+
+    // The baseline's cursor resumes at the first commit after its snapshot.
+    let resumed = db
+        .poll_change_feed(one_commit(baseline.resume_cursor))
+        .await
+        .unwrap();
+    assert_eq!(resumed.blocks.len(), 1);
+    assert_eq!(
+        resumed.blocks[0].cause.graph_commit_id,
+        update_page.blocks[0].cause.graph_commit_id
+    );
+    assert_eq!(
+        resumed.blocks[0].changes[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .properties["content"],
+        second_range
+    );
+
+    let delete_page = db
+        .poll_change_feed(one_commit(cursor))
+        .await
+        .expect("deleting a ranged row must not wedge the feed");
+    assert_eq!(delete_page.blocks.len(), 1);
+    let changes = &delete_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0].id, "ranged");
+    assert_eq!(changes[0].op, ChangeOpKind::Delete);
+    assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["content"],
+        second_range
+    );
+    assert!(changes[0].after.is_none());
+    let (cursor, caught_up) = boundary_cursor(&delete_page);
+    assert!(!caught_up);
+
+    let later_page = db.poll_change_feed(one_commit(cursor)).await.unwrap();
+    assert_eq!(later_page.blocks.len(), 1);
+    let changes = &later_page.blocks[0].changes;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, "later");
+    assert_eq!(
+        changes[0].after.as_ref().unwrap().properties["content"],
+        serde_json::json!("base64:QQ==")
+    );
+    let (_, caught_up) = boundary_cursor(&later_page);
+    assert!(caught_up);
+}
+
 /// Acceptance #7: the cross-branch net diff shares the same comparator, so a
 /// same-length Blob-only update on a forked branch must surface through
 /// `diff_commits` too.
@@ -1859,6 +2032,114 @@ node Document {
         physical_only.block.changes
     );
     assert!(physical_only.next_page_token.is_none());
+}
+
+/// A one-row update whose before-images come from a parent fragment that also
+/// holds a row wider than the ordered-scan sort cap. The candidate path walks
+/// that whole fragment in id order; sorting its complete rows failed with
+/// `ordered_scan_input_batch_bytes` although the wide row is untouched. The
+/// diff and the feed must both read the commit, carrying one update.
+#[tokio::test]
+async fn commit_changes_and_feed_read_past_a_row_wider_than_the_sort_cap_issue_705() {
+    use helpers::wide_rows::*;
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
+    let loaded = head_commit_id(dir.path().to_str().unwrap(), None).await;
+    let updated = main
+        .mutate_with_receipt(
+            "main",
+            WIDE_ROW_SET_PAYLOAD,
+            "set_payload",
+            &mixed_params(&[("$key", "small-1"), ("$payload", "edited")], &[]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("the update publishes one commit")
+        .graph_commit_id;
+
+    let page = main
+        .commit_changes_page(&updated, &ChangeFeedScope::default(), None, None, None)
+        .await
+        .expect("a commit beside a wide row must be readable");
+    assert_eq!(
+        page.block
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![("small-1", omnigraph::changes::ChangeOpKind::Update)]
+    );
+    let change = &page.block.changes[0];
+    assert_eq!(
+        change.before.as_ref().unwrap().properties["payload"],
+        serde_json::json!("tiny")
+    );
+    assert_eq!(
+        change.after.as_ref().unwrap().properties["payload"],
+        serde_json::json!("edited")
+    );
+
+    let feed = main
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(loaded)),
+        ))
+        .await
+        .expect("the feed must cross a commit beside a wide row");
+    assert_eq!(feed.blocks.len(), 1);
+    assert_eq!(feed.blocks[0].cause.graph_commit_id, updated);
+    assert_eq!(feed.blocks[0].changes.len(), 1);
+    assert_eq!(feed.blocks[0].changes[0].id, "small-1");
+}
+
+/// The production shape: no row is near the sort cap, yet a full
+/// ordered walk of one fragment of ordinary rows failed. Lance's
+/// byte-targeted scan slices a decoded batch without copying and re-slices
+/// the tail until a one-row slice reaches the sort, whose hard cap measures
+/// the whole shared parent buffer. A compaction commit takes the exact full
+/// walk of both versions and must read as an empty block.
+#[tokio::test]
+async fn physical_only_commit_over_a_large_fragment_reads_as_empty_issue_705() {
+    use helpers::wide_rows::*;
+    use omnigraph::changes::ChangeFeedScope;
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_sliced_parent_graph(&dir).await;
+    main.load(
+        "main",
+        r#"{"type":"Doc","data":{"key":"row-tail","payload":"tail"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let stats = main.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|table| table.fragments_removed > 0 && table.committed),
+        "the fixture must actually compact: {stats:?}"
+    );
+    let optimize_commit = head_commit_id(dir.path().to_str().unwrap(), None).await;
+
+    let page = main
+        .commit_changes_page(
+            &optimize_commit,
+            &ChangeFeedScope::default(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a compaction over ordinary rows must be readable");
+    assert!(
+        page.block.changes.is_empty(),
+        "a physical-only commit is an empty block: {:?}",
+        page.block.changes
+    );
+    assert!(page.next_page_token.is_none());
 }
 
 #[tokio::test]
@@ -3387,5 +3668,234 @@ async fn change_feed_resumed_oversized_change_is_delivered_solo() {
             )
         }
         other => panic!("expected a caught-up block boundary after the solo change, got {other:?}"),
+    }
+}
+
+/// The graph as of one commit: every table pin as `(table key, version, rows)`
+/// and the Person names a query at that commit returns.
+#[derive(Debug, PartialEq)]
+struct StateAtCommit {
+    graph_commit_id: String,
+    pins: Vec<(String, u64, u64)>,
+    people: Vec<String>,
+}
+
+/// What the history operations return for main: its commits, the graph as of
+/// each of them, the diff of its oldest and newest commit, and its change feed
+/// from the beginning.
+#[derive(Debug, PartialEq)]
+struct MainHistory {
+    commits: Vec<omnigraph::db::GraphCommit>,
+    states: Vec<StateAtCommit>,
+    diff: Vec<(String, String, ChangeOp)>,
+    feed: Vec<omnigraph::changes::GraphChangeBlock>,
+}
+
+const ALL_PEOPLE: &str =
+    "query all_people() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+
+async fn main_history(db: &Session) -> MainHistory {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let commits = db.list_commits(Some("main")).await.unwrap();
+    let mut states = Vec::new();
+    for commit in &commits {
+        let target = ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+            commit.graph_commit_id.clone(),
+        ));
+        let snapshot = db.snapshot_of(target.clone()).await.unwrap();
+        assert_eq!(
+            snapshot.graph_manifest_version(),
+            commit.graph_manifest_version
+        );
+        let mut pins: Vec<_> = snapshot
+            .datasets()
+            .map(|entry| {
+                (
+                    entry.type_key.clone(),
+                    entry.published_dataset_version,
+                    entry.entity_count,
+                )
+            })
+            .collect();
+        pins.sort();
+        let people = db
+            .query(target, ALL_PEOPLE, "all_people", &params(&[]))
+            .await
+            .unwrap();
+        states.push(StateAtCommit {
+            graph_commit_id: commit.graph_commit_id.clone(),
+            pins,
+            people: first_column_sorted(&people),
+        });
+    }
+    let (newest, oldest) = (commits.first().unwrap(), commits.last().unwrap());
+    let diff = db
+        .diff_commits(
+            &oldest.graph_commit_id,
+            &newest.graph_commit_id,
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    let feed = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    assert!(boundary_cursor(&feed).1, "the poll reaches the head");
+    MainHistory {
+        commits,
+        states,
+        diff: change_tuples(&diff),
+        feed: feed.blocks,
+    }
+}
+
+/// A history operation on main returns the same after a merged branch is
+/// deleted and after it is created again. The head a deleted branch wrote
+/// stays resolvable by id; the graph as of it is refused.
+#[tokio::test]
+async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let insert = |name: &'static str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Linear"))
+        .await
+        .unwrap();
+    let fork_point = snapshot_id(&db, "main").await.unwrap();
+
+    db.branch_create("feature").await.unwrap();
+    for name in ["OnFeature", "FeatureHead"] {
+        mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &insert(name),
+        )
+        .await
+        .unwrap();
+    }
+    let feature_head = snapshot_id(&db, "feature").await.unwrap();
+    mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Diverged"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("AfterMerge"),
+    )
+    .await
+    .unwrap();
+
+    let before = main_history(&db).await;
+    assert_eq!(before.commits.len(), before.feed.len() + 1);
+    let feature_commits = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_commits[0].graph_commit_id, feature_head.as_str());
+    let feature_head_commit = db.get_commit(feature_head.as_str()).await.unwrap();
+    assert_eq!(feature_head_commit, feature_commits[0]);
+    let feature_diff = db
+        .diff_commits(
+            fork_point.as_str(),
+            feature_head.as_str(),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        change_tuples(&feature_diff),
+        vec![
+            (
+                "node:Person".to_string(),
+                "FeatureHead".to_string(),
+                ChangeOp::Insert
+            ),
+            (
+                "node:Person".to_string(),
+                "OnFeature".to_string(),
+                ChangeOp::Insert
+            ),
+        ]
+    );
+
+    db.branch_create("unmerged").await.unwrap();
+    mutate_branch(
+        &db,
+        "unmerged",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Unmerged"),
+    )
+    .await
+    .unwrap();
+    let unmerged_head = snapshot_id(&db, "unmerged").await.unwrap();
+    let unmerged_head_commit = db.get_commit(unmerged_head.as_str()).await.unwrap();
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_delete("unmerged").await.unwrap();
+    let reopened = helpers::session(Omnigraph::open(uri).await.unwrap());
+    for handle in [&db, &reopened] {
+        assert_eq!(main_history(handle).await, before);
+        assert_eq!(
+            handle.get_commit(feature_head.as_str()).await.unwrap(),
+            feature_head_commit,
+            "the head a deleted branch wrote stays resolvable by id"
+        );
+        assert_eq!(
+            handle.get_commit(unmerged_head.as_str()).await.unwrap(),
+            unmerged_head_commit,
+            "a head no branch merged is settled by the delete of its branch"
+        );
+        let refused = handle
+            .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, omnigraph::error::OmniError::BranchNotFound { .. }),
+            "{refused}"
+        );
+    }
+
+    db.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("Recreated"),
+    )
+    .await
+    .unwrap();
+    let recreated = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(
+        recreated[1..],
+        before.commits[..],
+        "a branch created again holds the commits of its source below its own"
+    );
+    for handle in [&db, &reopened] {
+        assert_eq!(main_history(handle).await, before);
+        assert_eq!(
+            handle.get_commit(feature_head.as_str()).await.unwrap(),
+            feature_head_commit
+        );
+        let refused = handle
+            .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("has no persisted native-branch incarnation witness"),
+            "{refused}"
+        );
     }
 }

@@ -182,35 +182,35 @@ fn crosses(op: omnigraph::seams::Op, step: Option<&crate::Step>) -> bool {
     use omnigraph::seams::Op;
     matches!(
         (op, step),
-        (Op::Mutation | Op::AnyWrite, Some(crate::Step::Mutate(_)))
-            | (
-                Op::BranchMerge | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Merge { .. },
-                    ..
-                })),
-            )
-            | (
-                Op::BranchCreate | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Create { .. },
-                    ..
-                })),
-            )
-            | (
-                Op::BranchDelete | Op::AnyWrite,
-                Some(crate::Step::Control(crate::ControlStep {
-                    write: crate::ControlWrite::Delete { .. },
-                    ..
-                })),
-            )
+        (
+            Op::Mutation | Op::AnyWrite,
+            Some(crate::Step::Mutate(_) | crate::Step::Load(_))
+        ) | (
+            Op::BranchMerge | Op::AnyWrite,
+            Some(crate::Step::Control(crate::ControlStep {
+                write: crate::ControlWrite::Merge { .. },
+                ..
+            })),
+        ) | (
+            Op::BranchCreate | Op::AnyWrite,
+            Some(crate::Step::Control(crate::ControlStep {
+                write: crate::ControlWrite::Create { .. },
+                ..
+            })),
+        ) | (
+            Op::BranchDelete | Op::AnyWrite,
+            Some(crate::Step::Control(crate::ControlStep {
+                write: crate::ControlWrite::Delete { .. },
+                ..
+            })),
+        )
     )
 }
 
 /// Admission of one seam directive against the registries and the step it
 /// precedes: the name must resolve, the action must be among what the entry
 /// or row declares, and the step must be of a kind that crosses the seam's
-/// operation (any mutate or branch step for a store place).
+/// operation (any mutate, load or branch step for a store place).
 pub(crate) fn admit_seam(
     seam: &SeamDirective,
     step: Option<&crate::Step>,
@@ -229,7 +229,7 @@ pub(crate) fn admit_seam(
         Admitted::Store(..) => {
             if !crosses(omnigraph::seams::Op::AnyWrite, step) {
                 return Err(format!(
-                    "unsupported_environment: store place {} is admitted before a mutate or branch step only",
+                    "unsupported_environment: store place {} is admitted before a mutate, load or branch step only",
                     seam.at
                 ));
             }

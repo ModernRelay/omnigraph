@@ -26,7 +26,7 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[tokio::test]
-async fn recovery_probe_refuses_unknown_sidecars_and_staging_without_writes() {
+async fn recovery_probe_refuses_unknown_sidecars_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     Omnigraph::init(uri, "node Person { name: String @key }")
@@ -48,24 +48,6 @@ async fn recovery_probe_refuses_unknown_sidecars_and_staging_without_writes() {
     assert_eq!(files(dir.path()), before);
     fs::remove_file(pending).unwrap();
 
-    for name in [
-        "_schema.pg.staging",
-        "_schema.ir.json.staging",
-        "__schema_state.json.staging",
-    ] {
-        let pending = dir.path().join(name);
-        fs::write(&pending, "uncertain staging").unwrap();
-        let before = files(dir.path());
-        let err = Omnigraph::ensure_no_pending_recovery(uri)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("staged schema recovery"),
-            "{name}: {err}"
-        );
-        assert_eq!(files(dir.path()), before);
-        fs::remove_file(pending).unwrap();
-    }
     // Existing inventory semantics ignore non-JSON residue within the bound.
     fs::write(recovery.join("note.txt"), "not a recovery sidecar").unwrap();
     let before = files(dir.path());

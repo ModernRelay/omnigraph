@@ -2,6 +2,7 @@
 mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
+pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
 mod schema_state;
@@ -11,25 +12,27 @@ mod system_roles_tests;
 pub(crate) mod upgrade;
 pub(crate) mod write_queue;
 
-pub(crate) use crate::branch_names::{SCHEMA_APPLY_LOCK_BRANCH, is_schema_apply_lock_branch};
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
-pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
     CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot, CollectorReport,
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
-    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, InitOptions, MergeOutcome,
-    MergeResult, Omnigraph, OpenMode, PendingIndex, RebuiltFullTextIndex, RepairAction,
+    EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
+    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
+    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyOptions, SchemaApplyResult, SkipReason, StagingVerdict,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
     SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };
+pub(crate) use omnigraph::{
+    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+};
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
-pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 pub(crate) use omnigraph_core::metadata::now_micros;
-pub(crate) use schema_state::SchemaContractText;
+pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
 pub use upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
@@ -107,11 +110,4 @@ impl MutationOpKind {
             MutationOpKind::Update | MutationOpKind::Delete | MutationOpKind::SchemaRewrite => true,
         }
     }
-}
-
-pub(crate) fn is_internal_system_branch(name: &str) -> bool {
-    // Legacy `__run__*` staging branches (Run state machine, removed MR-771)
-    // are swept off `__manifest` by the v2→v3 internal-schema migration, so the
-    // only internal branch the engine still creates is the schema-apply lock.
-    is_schema_apply_lock_branch(name)
 }

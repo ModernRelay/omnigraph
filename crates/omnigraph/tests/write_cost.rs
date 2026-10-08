@@ -151,10 +151,8 @@ async fn ensure_indices_writes_no_control_object() {
     );
 }
 
-/// RFC 0067: schema apply arms no recovery sidecar. A property addition
-/// rewrites one table detached; the only control objects written are the
-/// three staged contract files and the three live ones, and the only deletes
-/// retire the staging.
+/// A property addition rewrites a detached table and publishes its contract
+/// in main's manifest. Schema apply writes or deletes no adapter control object.
 #[tokio::test]
 async fn schema_apply_writes_no_control_object() {
     use omnigraph::instrumentation::CountingStorageAdapter;
@@ -177,13 +175,13 @@ async fn schema_apply_writes_no_control_object() {
         .unwrap();
     assert_eq!(
         counts.write_text() - before_write_text,
-        6,
-        "a detached schema apply writes the staged and live contract files and no sidecar"
+        0,
+        "schema apply publishes its contract without control-object writes"
     );
     assert_eq!(
         counts.delete() - before_delete,
-        3,
-        "a detached schema apply deletes only its three staging files"
+        0,
+        "schema apply has no contract files to delete"
     );
     assert!(
         !dir.path().join("__recovery").exists()
@@ -603,14 +601,9 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
 
 // ── (D) Step-3b capture-once fitness asserts (RED today → GREEN after WriteTxn) ──
 
-/// A write performs one full schema validation while capturing the catalog-bound
-/// `WriteTxn`, one trailing state-marker read that fences torn head/schema capture,
-/// and one full validation under the pre-effect gates (7 `read_text` + 4 `exists`
-/// total). Per-table resolves must not add more validation. The gate read is
-/// correctness work: it arbitrates schema identity after preparation and before
-/// any detached table effect; no recovery sidecar is written (RFC 0067). The shape is
-/// the write twin of `warm_read_cost.rs::warm_query_validates_schema_contract_once`,
-/// built with ZERO production change via the counting storage adapter.
+/// A write reads no schema contract file (0 `read_text` + 0 `exists`; 7 + 4
+/// before the row): the identity rides the pinned manifest version and the
+/// pre-effect gate compares the live version's identity against the token.
 #[tokio::test]
 async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
     use omnigraph::instrumentation::CountingStorageAdapter;
@@ -647,13 +640,10 @@ async fn write_schema_io_is_bounded_to_capture_fence_and_effect_gate() {
         "schema-contract reads on one write: read_text={read_text_delta} exists={exists_delta}"
     );
     assert_eq!(
-        read_text_delta, 7,
-        "a write must do capture validation + trailing identity fence + pre-effect validation (7 reads), not per table",
+        read_text_delta, 0,
+        "a write reads no schema contract file: the identity rides the pinned manifest version",
     );
-    assert_eq!(
-        exists_delta, 4,
-        "a write must probe contract-file existence at capture + pre-effect revalidation (4 probes)",
-    );
+    assert_eq!(exists_delta, 0, "a write probes no schema contract file",);
     assert_eq!(
         write_text_delta, 0,
         "a detached write arms no recovery sidecar (RFC 0067): no control-object write",
@@ -704,52 +694,33 @@ async fn keyed_insert_opens_table_at_most_once() {
 
 // ── (E) Ground-truth __manifest counting (PR2.1) — the blind-spot guard ──
 
-/// The warm-coordinator freshness probe rides a long-lived handle, so a per-op
-/// (fresh) tracker installed at measure time CANNOT see its reads — that was the
-/// blind spot. `cost_harness` attaches the tracker BEFORE the coordinator opens, so
-/// the probe's reads ARE counted (`manifest_reads` is ground truth, not just fresh
-/// opens). Proven by measuring the same warm write both ways: ground truth strictly
-/// exceeds fresh-only, by the probe's object-store RPCs. Reverting the ground-truth
-/// wiring (so `manifest_reads` reverts to fresh-per-op) makes the two equal → RED.
+/// Named-branch probes use the warm coordinator's store; the whole-operation
+/// meter must include reads that a fresh-opener-only meter misses.
 #[tokio::test]
 async fn manifest_reads_capture_warm_probe() {
-    // Fresh-only (no `cost_harness`): the warm coordinator handle was opened outside
-    // any meter, so the freshness probe's reads escape `manifest_reads`.
-    //
-    // Heap-allocate this arm. It is the one measurement in this file that does
-    // NOT run inside `cost_harness` (which boxes its body for exactly this
-    // reason), so without the box this test frame carries a full init +
-    // four-write future *plus* the boxed ground-truth arm below. In a debug
-    // build those nested async frames accumulate far enough to overflow a
-    // default test-thread stack — observed on Linux CI while macOS stayed
-    // under the limit.
-    let fresh = Box::pin(async {
-        let dir = tempfile::tempdir().unwrap();
-        let db = local_graph(&dir).await;
-        commit_many(&db, 3).await; // warm the coordinator
-        let io = measure_insert(&db, "fresh").await;
-        eprintln!("fresh-only warm write: __manifest={}", io.manifest_reads);
-        io.manifest_reads
-    })
-    .await;
-
-    // Ground truth (`cost_harness`): the same warm probe is now counted.
-    cost_harness(async move {
+    async fn warm_write() -> u64 {
         let dir = tempfile::tempdir().unwrap();
         let db = local_graph(&dir).await;
         commit_many(&db, 3).await;
-        let io = measure_insert(&db, "ground_truth").await;
-        eprintln!("ground-truth warm write: __manifest={}", io.manifest_reads);
-        assert!(
-            io.manifest_reads > fresh,
-            "ground-truth __manifest reads {} must exceed fresh-only {fresh} by the \
-             warm-coordinator probe's RPCs — else the warm-handle probe is escaping the \
-             tracker (the blind spot this guards). Reads: {:#?}",
-            io.manifest_reads,
-            last_manifest_reads(),
-        );
-    })
-    .await;
+        db.branch_create("meter").await.unwrap();
+        db.sync_branch("meter").await.unwrap();
+        let (result, io) = measure(db.mutate(
+            "meter",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "metered")], &[("$age", 30)]),
+        ))
+        .await;
+        result.unwrap();
+        io.manifest_reads
+    }
+    let fresh = Box::pin(warm_write()).await;
+    cost_harness(async move {
+        let full = warm_write().await;
+        assert!(full > fresh,
+            "warm-coordinator probe reads must enter the full meter: full={full}, fresh={fresh}, reads={:#?}",
+            last_manifest_reads());
+    }).await;
 }
 
 // ── (F) Batched committed `@unique` probes — flat in DELTA rows ──
@@ -820,4 +791,78 @@ node User {
         16,
         "data-table scan reads per load (batched unique probe)",
     );
+}
+
+#[tokio::test]
+async fn named_write_capture_reuses_the_exact_local_publication() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        for (age, expected_scans) in [(31, 2), (32, 0)] {
+            let (result, io) = measure(helpers::mutate_branch(
+                &db,
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            ))
+            .await;
+            result.unwrap();
+            assert_eq!(io.manifest_scan_count, expected_scans, "age {age}: {io:?}");
+            assert!(io.version_probes > 0 && io.manifest_reads > 0);
+        }
+        let foreign = helpers::session(
+            omnigraph::db::Omnigraph::open(dir.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        helpers::mutate_branch(
+            &foreign,
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 77)]),
+        )
+        .await
+        .unwrap();
+        let (result, io) = measure(helpers::mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+        ))
+        .await;
+        result.unwrap();
+        assert!(io.manifest_scan_count > 0 && io.manifest_read_bytes > 0);
+        for (branch, name, age) in [
+            ("feature", "Alice", 33),
+            ("feature", "Bob", 77),
+            ("main", "Alice", 30),
+            ("main", "Bob", 25),
+        ] {
+            let result = db
+                .query(
+                    omnigraph::db::ReadTarget::branch(branch),
+                    helpers::TEST_QUERIES,
+                    "get_person",
+                    &helpers::params(&[("$name", name)]),
+                )
+                .await
+                .unwrap();
+            let batch = result.concat_batches().unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .unwrap()
+                    .value(0),
+                age
+            );
+        }
+    })
+    .await;
 }

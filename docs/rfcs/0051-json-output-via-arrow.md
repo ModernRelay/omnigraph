@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-09-05
+updated: 2026-10-05
 discussion: null
 supersedes: []
 superseded_by: []
@@ -71,11 +71,11 @@ An issue or local refactor is not enough because the change moves a wire contrac
 
 The differential test in Evidence and tests enforces every row but `enum`, whose cells reach the writer as strings. No property type reaches the writer as a struct; the differential test covers structs only as writer input.
 
-**Query results keep their envelope; only the listed spellings change.** The response body keeps its shape: a `ReadOutput` object whose `rows` field is an array of objects keyed by column name in schema order; from phase 1 null cells are omitted. The bytes change only for the phase 1 rows in the table below. `POST /read` keeps its envelope byte-stable as documented; the cell spelling inside its `rows` follows this RFC like every query route, and `Accept` is ignored on `POST /read`.
+**Query results keep their envelope; only the listed spellings change.** The response body keeps its shape: a `ReadOutput` object whose `rows` field is an array of objects keyed by column name in schema order; from phase 1 null cells are omitted. The bytes change only for the phase 1 rows in the table below.
 
 **Export lines keep their grammar and change the listed spellings.** An export line is `{"type":<node type>,"data":<row>}` or `{"edge":<edge type>,"from":<source id>,"to":<destination id>,"data":<row>}`, where `<row>` is the writer's rendering of the row in schema column order with `id` first, `src` and `dst` removed, and `Blob` columns substituted per rule 2. The grammar is unchanged; the key order inside `data` changes from alphabetical (the old `serde_json::Map`) to `id` first and then the catalog's column order; a consumer that keys by name sees no difference. `<node type>`, `<edge type>`, and every id are JSON strings. Dates and datetimes become the strings in the spelling table instead of raw counts. Null cells drop their key; the loader reads a missing key as null. Floats take the spelling table's exponent form. No version field is added: a `Date` or `DateTime` cell is a number in a line written before phase 2 and a string after; a file may mix both and loads either way.
 
-**Arrow IPC is selected by the `Accept` header on the query routes.** Content negotiation on `Accept`, the server choosing the response format from the client's `Accept` header, is new to the server. It applies to `POST /query` and to stored-query invocation; the deprecated `POST /read` always answers JSON. A stored mutation answers its `ChangeOutput` envelope as JSON whatever `Accept` says; there are no batches to stream and the mutation envelope is not a serialization choice. An `Accept` that is absent, `*/*`, or `application/json` receives JSON. An `Accept` whose first supported token is exactly `application/vnd.apache.arrow.stream` (parameters ignored) receives the result as an Arrow IPC stream with that response `Content-Type`; an `Accept` list naming neither form receives 406 with the `ErrorOutput` body; any other media range, `application/*` included, counts as naming neither form. The IPC body carries the same batches the JSON body would serialize, after policy and projection have been applied. The envelope fields travel as response headers: `Omnigraph-Graph-Commit-Id`, `Omnigraph-Query-Name`, `Omnigraph-Branch`, and `Omnigraph-Snapshot-Id`, the spelling the blob routes already send; `row_count` is the sum of batch lengths and `columns` is the IPC schema. The CLI gains `--format arrow`, writing that stream to stdout.
+**Arrow IPC is selected by the `Accept` header on the query routes.** Content negotiation on `Accept`, the server choosing the response format from the client's `Accept` header, is new to the server. It applies to `POST /query` and to stored-query invocation. A stored mutation answers its `ChangeOutput` envelope as JSON whatever `Accept` says; there are no batches to stream and the mutation envelope is not a serialization choice. An `Accept` that is absent, `*/*`, or `application/json` receives JSON. An `Accept` whose first supported token is exactly `application/vnd.apache.arrow.stream` (parameters ignored) receives the result as an Arrow IPC stream with that response `Content-Type`; an `Accept` list naming neither form receives 406 with the `ErrorOutput` body; any other media range, `application/*` included, counts as naming neither form. The IPC body carries the same batches the JSON body would serialize, after policy and projection have been applied. The envelope fields travel as response headers: `Omnigraph-Graph-Commit-Id`, `Omnigraph-Query-Name`, `Omnigraph-Branch`, and `Omnigraph-Snapshot-Id`, the spelling the blob routes already send; `row_count` is the sum of batch lengths and `columns` is the IPC schema. The CLI gains `--format arrow`, writing that stream to stdout.
 
 **Spelling changes a JSON consumer can observe.** Each line is the complete list for its phase; nothing outside it changes.
 
@@ -105,7 +105,7 @@ The differential test in Evidence and tests enforces every row but `enum`, whose
 
 **One writer replaces two.** `QueryResult` gains `to_json_bytes()` (the row array) and `to_json_lines()` (one object per line, used by export and the row images), both on `arrow_json::WriterBuilder` with default options. The engine's export and entity paths call the same writer on their one-row batches. No omnigraph code matches on Arrow types to produce JSON. No schema type maps to an Arrow `Timestamp`. Duplicate return-column names are refused by the typechecker (`T25`): the old encoder collapsed them to the last value, and the writer would emit both keys.
 
-**Rows travel as text.** `ReadOutput.rows` and `LegacyReadOutput.rows` become `Box<serde_json::value::RawValue>`, JSON text validated once by `RawValue::from_string` and carried as bytes, never rebuilt as a `serde_json::Value`; the OpenAPI schema for `rows` is unchanged. The three server handlers pass the text through unchanged. The CLI parses it for the `table`, `csv`, and `kv` formats; `--format json` keeps its pretty-printed envelope with the writer's compact bytes inside `rows`, and `--format jsonl` re-splits the row array. `QueryResult::to_sdk_json` is deleted; `to_rust_json` and `deserialize` parse the writer's bytes; the server never parses.
+**Rows travel as text.** `ReadOutput.rows` becomes `Box<serde_json::value::RawValue>`, JSON text validated once by `RawValue::from_string` and carried as bytes, never rebuilt as a `serde_json::Value`; the OpenAPI schema for `rows` is unchanged. The query handlers pass the text through unchanged. The CLI parses it for the `table`, `csv`, and `kv` formats; `--format json` keeps its pretty-printed envelope with the writer's compact bytes inside `rows`, and `--format jsonl` re-splits the row array. `QueryResult::to_sdk_json` is deleted; `to_rust_json` and `deserialize` parse the writer's bytes; the server never parses.
 
 **OmniGraph owns the blob substitution, the date-range check, the export envelope, and the change-feed null re-insertion.** The `base64:` substitution for `Blob` cells on export and entity fetch, applied before the writer. The range check on `Date` and `DateTime` columns before the writer. The export line envelope and its key order. The re-insertion of explicit nulls into change-feed images by `logical_row_image`, after the writer. Nothing else that spells a cell.
 
@@ -135,7 +135,7 @@ No invariant is weakened. No deny-list item is invoked.
 
 **The spelling table is the contract; `arrow-json` is pinned by the lock file.** The JSON spelling of every property type is the table in User and operational behavior. `arrow-json` is pinned by `Cargo.lock` (58.3.0 at merge); phase 1 adds it under the workspace `arrow-*` requirement `"58"`, and a lock bump is the review point. An upgrade that changes any spelling in that table is a wire change and is treated as one: the differential test turns red, and the change ships with a release note and an updated spelling table, never silently and never through a builder option.
 
-**Rust consumers of `omnigraph-api-types` see `rows` change type.** `ReadOutput.rows` and `LegacyReadOutput.rows` change type in phase 1; `omnigraph-api-types` enables the `serde_json/raw_value` feature.
+**Rust consumers of `omnigraph-api-types` see `rows` change type.** `ReadOutput.rows` changes type in phase 1; `omnigraph-api-types` enables the `serde_json/raw_value` feature.
 
 **A revert restores both encoders.** The phases share one pull request; reverting it restores the compiler's encoder, the engine's encoder, and the `serde_json::Value` rows together. The Arrow IPC route is additive and can be removed without touching JSON.
 
@@ -173,4 +173,8 @@ None that block acceptance.
 
 ## Decision log
 
+- 2026-10-05: Aligned this proposal with the maintainer-authorized removal of
+  `/read` and `LegacyReadOutput`. Removed the query-envelope and Arrow
+  negotiation exceptions for that route, and the retired DTO from the raw-row
+  representation and Rust compatibility clauses. The proposal remains draft.
 - 2026-09-05, amendment from the implementation pull request, after this RFC merged: one pull request carries the three phases; the change feed is a third consumer of the deleted engine encoder and keeps explicit nulls; export `data` key order is `id` first then catalog order; colliding return names were refused by `T25` in #621 ahead of phase 1; no schema-default value path exists; a pre-existing out-of-range date count fails reads and exports of that column until the row is updated; the export stream ends at a 256-row render-window boundary; `RawValue::from_string` validates the bytes once.

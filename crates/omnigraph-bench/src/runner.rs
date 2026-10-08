@@ -19,34 +19,69 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use futures::FutureExt;
+#[cfg(test)]
 use lance::io::WrappingObjectStore;
+#[cfg(test)]
 use omnigraph::Session;
+#[cfg(test)]
 use omnigraph::db::{MergeOutcome, Omnigraph};
+#[cfg(test)]
 use omnigraph::instrumentation::{
-    CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, QueryIoProbes, StorageReadCounts,
-    with_merge_write_probes, with_query_io_probes,
+    CountingStorageAdapter, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
 };
+use omnigraph::instrumentation::{MergeTimingReading, MergeWriteProbes, StorageReadCounts};
+#[cfg(test)]
 use omnigraph::settings::SessionSettings;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+use crate::branch_merge::FixturePreflight;
+#[cfg(test)]
+use crate::branch_merge::initialize_local_fixture;
+#[cfg(test)]
 use crate::branch_merge::{
-    BranchMergePlan, FixtureBuildSummary, FixturePreflight, SOURCE_BRANCH, TARGET_BRANCH,
-    capture_protected_branch_heads, initialize_local_fixture, verify_merged_graph, warm_read_set,
+    BranchMergePlan, FixtureBuildSummary, SOURCE_BRANCH, TARGET_BRANCH,
+    capture_protected_branch_heads, verify_merged_graph, warm_read_set,
 };
-use crate::case::{
-    Attribution, Backend, CacheCondition, Data, EnginePreparation, FixtureBuilder, LocalFilesystem,
-    LocalStorageClass, MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode,
-    State, WarmupProgram,
-};
-use crate::counting::{LogicalCallCounter, LogicalCallCounts};
-use crate::environment::{LocalEnvironmentEvidence, verify_local_environment};
+#[cfg(test)]
+use crate::counting::LogicalCallCounter;
+use crate::counting::LogicalCallCounts;
+use crate::environment::LocalEnvironmentEvidence;
+#[cfg(test)]
+use crate::environment::verify_local_environment;
+#[cfg(test)]
 use crate::fixture_worker::supervise_fixture_build;
-use crate::machine::{MachineIdentityV1, capture_machine_identity};
+use crate::gqt_protocol::{
+    WorkerBuildV1, digest_worker_executable, open_and_digest_worker_executable,
+};
+#[cfg(test)]
+use crate::legacy::case::validate_case;
+#[cfg(test)]
+use crate::legacy::case::{
+    Attribution, Backend, EnginePreparation, LocalFilesystem, LocalStorageClass,
+    MAX_WARMUP_ITERATIONS, PageCacheCondition, ProcessLifecycle, ResetMode, WarmupProgram,
+};
+use crate::legacy::case::{CacheCondition, Data, FixtureBuilder, State};
+#[cfg(test)]
+use crate::legacy::suite::ResolvedRun;
+#[cfg(test)]
+use crate::legacy::suite::ResolvedSuite;
+#[cfg(test)]
+use crate::legacy::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
+use crate::machine::MachineIdentityV1;
+#[cfg(test)]
+use crate::machine::capture_machine_identity;
+#[cfg(test)]
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
+#[cfg(test)]
 use crate::reset::{
     ClonefileTemplate, MetadataDigest, PHYSICAL_TREE_DIGEST_ALGORITHM, PhysicalDigest,
     PlainCopyTemplate, TraversalLimits, accept_clonefile_template_handoff,
@@ -55,12 +90,8 @@ use crate::reset::{
 };
 #[cfg(test)]
 use crate::reset::{digest_metadata_tree, digest_physical_tree, verify_physical_tree};
-use crate::suite::{MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS};
+#[cfg(test)]
 use crate::supervisor::{SupervisionInput, supervise_repetition};
-use crate::worker_protocol::{
-    WorkerBuildV1, digest_worker_executable, open_and_digest_worker_executable,
-};
-use crate::{ResolvedRun, ResolvedSuite, validate_case};
 
 pub const RUNNER_OUTPUT_VERSION: u32 = 2;
 pub const FIXTURE_MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -81,7 +112,9 @@ const RELEASE_PROFILE_ENVIRONMENT_OVERRIDES: &str =
     env!("OMNIGRAPH_BENCH_RELEASE_PROFILE_ENVIRONMENT_OVERRIDES");
 const EFFECTIVE_CODEGEN_OPTIONS_PROVED: &str =
     env!("OMNIGRAPH_BENCH_EFFECTIVE_CODEGEN_OPTIONS_PROVED");
+#[cfg(test)]
 const RUN_OWNER_STACK_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
 const FIXTURE_BUILD_WATCHDOG: Duration = Duration::from_secs(3_600);
 
 /// Invocation-only options. No option may override experiment identity.
@@ -108,6 +141,10 @@ pub struct RunnerError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RunnerErrorContext {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_settled_elapsed_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_partial_run: Option<Box<crate::gqt_runner::RunExecution>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub case_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub point_id: Option<String>,
@@ -119,6 +156,8 @@ pub struct RunnerErrorContext {
     pub completed_samples: Vec<RepObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_sample: Option<Box<RepObservation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gqt_settled_sample: Option<Box<crate::gqt_runner::GqtRepObservation>>,
     /// Complete verified prefix plus the identities needed to finalize a
     /// censored durable record. Kept out of the diagnostic envelope because a
     /// successful archive receipt is the authority for those raw samples.
@@ -135,6 +174,16 @@ pub struct RunnerErrorContext {
     pub quarantined_workspace: Option<PathBuf>,
 }
 
+impl RunnerErrorContext {
+    /// Remove completed evidence after a receipt or recovery envelope takes ownership.
+    pub fn clear_completed_prefix(&mut self) {
+        self.completed_runs.clear();
+        self.completed_samples.clear();
+        self.partial_run = None;
+        self.gqt_partial_run = None;
+    }
+}
+
 impl RunnerError {
     pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
@@ -144,6 +193,7 @@ impl RunnerError {
         }
     }
 
+    #[cfg(test)]
     fn with_run_identity(mut self, run: &ResolvedRun) -> Self {
         self.context.case_id = Some(run.case.definition.id.clone());
         self.context.point_id = Some(run.case.point_id.clone());
@@ -155,16 +205,19 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_completed_samples(mut self, samples: Vec<RepObservation>) -> Self {
         self.context.completed_samples = samples;
         self
     }
 
+    #[cfg(test)]
     fn with_completed_runs(mut self, runs: Vec<RunExecution>) -> Self {
         self.context.completed_runs = runs;
         self
     }
 
+    #[cfg(test)]
     fn with_partial_worker_identity(
         mut self,
         build: Option<&WorkerBuildV1>,
@@ -175,11 +228,25 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_partial_run(mut self, execution: RunExecution) -> Self {
         self.context.partial_run = Some(Box::new(execution));
         self
     }
 
+    pub(crate) fn with_gqt_settled_elapsed(mut self, elapsed_us: u64) -> Self {
+        self.context.gqt_settled_elapsed_us = Some(elapsed_us);
+        self
+    }
+    pub(crate) fn with_gqt_settled_sample(
+        mut self,
+        sample: crate::gqt_runner::GqtRepObservation,
+    ) -> Self {
+        self.context.gqt_settled_elapsed_us = Some(sample.elapsed_us);
+        self.context.gqt_settled_sample = Some(Box::new(sample));
+        self
+    }
+    #[cfg(test)]
     pub(crate) fn with_settled_sample(mut self, sample: RepObservation) -> Self {
         self.context.settled_sample = Some(Box::new(sample));
         self
@@ -190,6 +257,7 @@ impl RunnerError {
         self
     }
 
+    #[cfg(test)]
     fn with_quarantined_workspace(mut self, path: PathBuf) -> Self {
         self.context.quarantined_workspace = Some(path);
         self
@@ -339,6 +407,8 @@ pub struct LogicalFixtureIdentityV1 {
     pub data: Data,
     pub state: State,
     pub logical_content_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<crate::legacy::case::FixturePreparation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -853,6 +923,7 @@ pub struct WallClockSummary {
 /// pass the output of [`crate::load_suite`]; manually constructed values must
 /// exactly match the suite and case definitions currently loaded from the same
 /// canonical paths.
+#[cfg(test)]
 pub async fn execute_suite(
     suite: &ResolvedSuite,
     options: &RunOptions,
@@ -900,6 +971,7 @@ pub async fn execute_suite(
 }
 
 /// Execute one resolved suite entry.
+#[cfg(test)]
 pub async fn execute_run(run: &ResolvedRun, options: &RunOptions) -> RunnerResult<RunExecution> {
     enforce_release_build().map_err(|error| error.with_run_identity(run))?;
     refuse_unmodeled_runtime_overrides().map_err(|error| error.with_run_identity(run))?;
@@ -909,12 +981,14 @@ pub async fn execute_run(run: &ResolvedRun, options: &RunOptions) -> RunnerResul
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct ExecutionGuards {
     verify_environment: bool,
     isolate_repetitions: bool,
     allow_plain_copy: bool,
 }
 
+#[cfg(test)]
 impl ExecutionGuards {
     fn public() -> Self {
         Self {
@@ -1157,7 +1231,7 @@ fn expected_build_attestation_environment(name: &OsStr) -> Option<&'static str> 
     }
 }
 
-fn build_evidence(worker: Option<&WorkerBuildV1>) -> RunnerResult<BuildEvidence> {
+pub(crate) fn build_evidence(worker: Option<&WorkerBuildV1>) -> RunnerResult<BuildEvidence> {
     let build = match worker {
         Some(worker) => worker.clone(),
         None => worker_build_attestation(String::new())?,
@@ -1425,7 +1499,7 @@ fn valid_lower_hex(value: &str, lengths: &[usize]) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct BoundWorkerSource {
+pub(crate) struct BoundWorkerSource {
     configured_executable: PathBuf,
     executable_file: Arc<File>,
     executable_bytes: u64,
@@ -1433,12 +1507,13 @@ struct BoundWorkerSource {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedWorker {
-    executable: PathBuf,
-    executable_sha256: String,
+pub(crate) struct ResolvedWorker {
+    pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
 }
 
-fn validate_production_reset(case: &crate::case::CaseV1) -> RunnerResult<()> {
+#[cfg(test)]
+fn validate_production_reset(case: &crate::legacy::case::CaseV1) -> RunnerResult<()> {
     let linux_xfs_process_cold = cfg!(target_os = "linux")
         && matches!(
             &case.environment.backend,
@@ -1469,6 +1544,7 @@ fn validate_production_reset(case: &crate::case::CaseV1) -> RunnerResult<()> {
     }
 }
 
+#[cfg(test)]
 async fn execute_run_inner(
     run: &ResolvedRun,
     options: &RunOptions,
@@ -1539,6 +1615,7 @@ async fn execute_run_inner(
     })?
 }
 
+#[cfg(test)]
 async fn execute_owned_run(
     run: ResolvedRun,
     options: RunOptions,
@@ -1794,7 +1871,8 @@ async fn execute_owned_run(
     })
 }
 
-fn unix_time_millis() -> RunnerResult<u64> {
+#[cfg(test)]
+pub(crate) fn unix_time_millis() -> RunnerResult<u64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {
@@ -1811,6 +1889,7 @@ fn unix_time_millis() -> RunnerResult<u64> {
     })
 }
 
+#[cfg(test)]
 fn stamp_frozen_fixture(
     run: &ResolvedRun,
     build: &FixtureBuildSummary,
@@ -1835,6 +1914,7 @@ fn stamp_frozen_fixture(
             data: run.case.definition.fixture.data.clone(),
             state: run.case.definition.fixture.state.clone(),
             logical_content_sha256: build.logical_content_sha256.clone(),
+            preparation: run.case.definition.fixture.preparation,
         },
         physical: PhysicalFixtureIdentityV1 {
             digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),
@@ -1858,6 +1938,7 @@ fn stamp_frozen_fixture(
     })
 }
 
+#[cfg(test)]
 fn validate_execution_run(run: &ResolvedRun) -> RunnerResult<()> {
     if !(1..=MAX_REPETITIONS_PER_CASE).contains(&run.repetitions) {
         return Err(RunnerError::new(
@@ -1894,8 +1975,9 @@ fn validate_execution_run(run: &ResolvedRun) -> RunnerResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_execution_suite(suite: &ResolvedSuite) -> RunnerResult<()> {
-    let sealed = crate::load_suite(&suite.suite_path)
+    let sealed = crate::legacy::suite::load_suite(&suite.suite_path)
         .into_result()
         .map_err(|diagnostics| {
             RunnerError::new(
@@ -1924,6 +2006,7 @@ fn validate_execution_suite(suite: &ResolvedSuite) -> RunnerResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_worker(
     options: &RunOptions,
     guards: ExecutionGuards,
@@ -1940,7 +2023,7 @@ fn resolve_worker(
     resolve_bound_worker(executable).map(Some)
 }
 
-fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
+pub(crate) fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
     let executable = std::fs::canonicalize(executable).map_err(|error| {
         RunnerError::new(
             "worker_executable_error",
@@ -1997,7 +2080,10 @@ fn resolve_bound_worker(executable: &Path) -> RunnerResult<BoundWorkerSource> {
     })
 }
 
-fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResult<ResolvedWorker> {
+pub(crate) fn stage_bound_worker(
+    source: BoundWorkerSource,
+    workspace: &Path,
+) -> RunnerResult<ResolvedWorker> {
     let executable = workspace.join("bound-worker-v1");
     let mut input = source.executable_file.try_clone().map_err(|error| {
         RunnerError::new(
@@ -2143,11 +2229,13 @@ fn stage_bound_worker(source: BoundWorkerSource, workspace: &Path) -> RunnerResu
     })
 }
 
+#[cfg(test)]
 enum FrozenTemplate {
     Clonefile(ClonefileTemplate),
     PlainCopy(PlainCopyTemplate),
 }
 
+#[cfg(test)]
 impl FrozenTemplate {
     fn physical_digest(&self) -> &PhysicalDigest {
         match self {
@@ -2189,6 +2277,7 @@ impl FrozenTemplate {
     }
 }
 
+#[cfg(test)]
 fn run_supervised_repetitions(
     workspace: &tempfile::TempDir,
     template: FrozenTemplate,
@@ -2363,6 +2452,7 @@ fn run_supervised_repetitions(
     Ok((samples, attested_build, attested_machine))
 }
 
+#[cfg(test)]
 fn supervised_prefix_error(
     error: RunnerError,
     samples: Vec<RepObservation>,
@@ -2374,6 +2464,7 @@ fn supervised_prefix_error(
         .with_partial_worker_identity(build, machine)
 }
 
+#[cfg(test)]
 fn supervise_workspace(
     workspace: tempfile::TempDir,
     template: FrozenTemplate,
@@ -2419,6 +2510,7 @@ fn supervise_workspace(
     }
 }
 
+#[cfg(test)]
 fn containment_proven(error: &RunnerError) -> bool {
     error
         .context
@@ -2431,6 +2523,7 @@ fn containment_proven(error: &RunnerError) -> bool {
         })
 }
 
+#[cfg(test)]
 async fn run_in_process_repetitions(
     _workspace: &tempfile::TempDir,
     template: &FrozenTemplate,
@@ -2468,6 +2561,7 @@ async fn run_in_process_repetitions(
     Ok(samples)
 }
 
+#[cfg(test)]
 fn remove_active_tree(active_root: &Path) -> RunnerResult<()> {
     match std::fs::symlink_metadata(active_root) {
         Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(active_root)
@@ -2492,6 +2586,7 @@ fn remove_active_tree(active_root: &Path) -> RunnerResult<()> {
     }
 }
 
+#[cfg(test)]
 fn scratch_workspace(options: &RunOptions) -> RunnerResult<tempfile::TempDir> {
     match &options.scratch_root {
         Some(root) => tempfile::Builder::new()
@@ -2509,6 +2604,7 @@ fn scratch_workspace(options: &RunOptions) -> RunnerResult<tempfile::TempDir> {
     })
 }
 
+#[cfg(test)]
 fn local_environment(
     run: &ResolvedRun,
     scratch_path: &Path,
@@ -2553,6 +2649,7 @@ pub(crate) fn phase_observations(readings: Vec<MergeTimingReading>) -> Vec<Phase
 /// A sample carries measurements, not the engine's complete stable-phase
 /// enumeration. This filter is valid only after the raw snapshot passes
 /// [`validate_successful_merge_phase_topology`].
+#[cfg(test)]
 fn observed_phase_evidence(phases: Vec<PhaseObservation>) -> Vec<PhaseObservation> {
     phases
         .into_iter()
@@ -2560,6 +2657,7 @@ fn observed_phase_evidence(phases: Vec<PhaseObservation>) -> Vec<PhaseObservatio
         .collect()
 }
 
+#[cfg(test)]
 async fn execute_rep(
     repetition: u32,
     root: &Path,
@@ -2584,12 +2682,14 @@ async fn execute_rep(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum CachePreparationAction {
     PreparationOnly,
     WarmSameHandle { iterations: u32 },
     WarmThenReopen { iterations: u32 },
 }
 
+#[cfg(test)]
 fn cache_preparation_action(condition: &CacheCondition) -> RunnerResult<CachePreparationAction> {
     match (
         condition.process,
@@ -2635,8 +2735,10 @@ pub(crate) trait MeasurementSignals {
     fn settled(&mut self, elapsed_us: u64) -> RunnerResult<()>;
 }
 
+#[cfg(test)]
 struct ImmediateMeasurementSignals;
 
+#[cfg(test)]
 impl MeasurementSignals for ImmediateMeasurementSignals {
     fn ready(&mut self) -> RunnerResult<()> {
         Ok(())
@@ -2648,6 +2750,7 @@ impl MeasurementSignals for ImmediateMeasurementSignals {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
     repetition: u32,
     root: &Path,
@@ -2685,6 +2788,7 @@ pub(crate) async fn execute_rep_signaled<S: MeasurementSignals>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_rep_body<S: MeasurementSignals>(
     repetition: u32,
     root: &Path,
@@ -2865,6 +2969,7 @@ async fn execute_rep_body<S: MeasurementSignals>(
     }
 }
 
+#[cfg(test)]
 async fn open_counting(
     root_uri: &str,
 ) -> RunnerResult<(Session, Arc<StorageReadCounts>, PreparationWriteGate)> {
@@ -2893,7 +2998,7 @@ async fn open_counting(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ControlSnapshot {
+pub(crate) struct ControlSnapshot {
     read_text: u64,
     read_text_if_exists: u64,
     read_text_versioned: u64,
@@ -2905,7 +3010,7 @@ struct ControlSnapshot {
 }
 
 impl ControlSnapshot {
-    fn read(counts: &StorageReadCounts) -> Self {
+    pub(crate) fn read(counts: &StorageReadCounts) -> Self {
         Self {
             read_text: counts.read_text(),
             read_text_if_exists: counts.read_text_if_exists(),
@@ -2918,7 +3023,7 @@ impl ControlSnapshot {
         }
     }
 
-    fn delta(self, after: Self) -> RunnerResult<ControlCallObservation> {
+    pub(crate) fn delta(self, after: Self) -> RunnerResult<ControlCallObservation> {
         fn checked(after: u64, before: u64, field: &str) -> RunnerResult<u64> {
             after.checked_sub(before).ok_or_else(|| {
                 RunnerError::new(
@@ -2949,6 +3054,7 @@ impl ControlSnapshot {
     }
 }
 
+#[cfg(test)]
 fn summarize_wall_clock(samples: &[RepObservation]) -> RunnerResult<WallClockSummary> {
     if samples.is_empty() {
         return Err(RunnerError::new(
@@ -2975,6 +3081,7 @@ fn summarize_wall_clock(samples: &[RepObservation]) -> RunnerResult<WallClockSum
     })
 }
 
+#[cfg(test)]
 fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     debug_assert!(!sorted.is_empty());
     debug_assert!((1..=100).contains(&percentile));
@@ -2986,6 +3093,7 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
     sorted[rank]
 }
 
+#[cfg(test)]
 fn utf8_path<'a>(path: &'a Path, label: &str) -> RunnerResult<&'a str> {
     path.to_str().ok_or_else(|| {
         RunnerError::new(
@@ -3000,7 +3108,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::parse_case;
+    use crate::legacy::case::parse_case;
 
     fn general_route(merge_insert_calls: u64) -> MergeRouteObservation {
         test_general_merge_route(2, merge_insert_calls)
@@ -4128,7 +4236,7 @@ protocol:
 
     fn checked_catalog_run(repetitions: u32) -> ResolvedRun {
         let case = parse_case(include_str!(
-            "../../../benchmarks/cases/branch-merge-d50-warm.case-v1.yaml"
+            "../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"
         ))
         .into_result()
         .unwrap();
@@ -4139,13 +4247,23 @@ protocol:
         }
     }
 
-    fn checked_catalog_suite() -> ResolvedSuite {
-        crate::load_suite(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/suites/local-smoke.suite-v1.yaml"),
+    fn checked_catalog_suite() -> (tempfile::TempDir, ResolvedSuite) {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = directory.path().join("cases");
+        let suites = directory.path().join("suites");
+        std::fs::create_dir(&cases).unwrap();
+        std::fs::create_dir(&suites).unwrap();
+        std::fs::write(
+            cases.join("legacy.case-v1.yaml"),
+            include_str!("../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"),
         )
-        .into_result()
-        .unwrap()
+        .unwrap();
+        let path = suites.join("legacy.suite-v1.yaml");
+        std::fs::write(&path, "version: 1\nname: legacy-smoke\nruns:\n  - { case: ../cases/legacy.case-v1.yaml, repetitions: 5 }\n").unwrap();
+        let suite = crate::legacy::suite::load_suite(&path)
+            .into_result()
+            .unwrap();
+        (directory, suite)
     }
 
     #[test]
@@ -4165,7 +4283,7 @@ protocol:
 
     #[test]
     fn execution_reseals_the_complete_resolved_suite() {
-        let suite = checked_catalog_suite();
+        let (_directory, suite) = checked_catalog_suite();
         validate_execution_suite(&suite).unwrap();
 
         let mut mislabeled = suite.clone();

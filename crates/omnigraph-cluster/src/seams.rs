@@ -14,14 +14,13 @@ pub mod catalog {
     use omnigraph_seams::DecideSeam;
 
     omnigraph_seams::catalog! {
-        crate::CLUSTER_APPLY_AFTER_GRAPH_CREATE,
-        crate::CLUSTER_APPLY_AFTER_GRAPH_DELETE,
-        crate::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE,
-        crate::CLUSTER_APPLY_AFTER_SCHEMA_APPLY,
-        crate::CLUSTER_APPLY_BEFORE_GRAPH_CREATE,
-        crate::CLUSTER_APPLY_BEFORE_GRAPH_DELETE,
-        crate::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY,
-        crate::CLUSTER_APPLY_BEFORE_STATE_WRITE,
+        crate::deployment::DEPLOYMENT_BEFORE_ACCEPTANCE,
+        crate::deployment::DEPLOYMENT_AFTER_RESULT,
+        crate::deployment::DEPLOYMENT_AFTER_ACCEPTANCE,
+        crate::deployment::DEPLOYMENT_AFTER_STARTED,
+        crate::deployment::DEPLOYMENT_AFTER_SCHEMA,
+        crate::deployment::DEPLOYMENT_AFTER_SETTLEMENT_INTENT,
+        crate::deployment::DEPLOYMENT_BEFORE_RESULT,
     }
 
     /// The one string-keyed lookup: a case file or the harness names a seam, the catalog answers.

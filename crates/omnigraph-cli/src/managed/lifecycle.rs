@@ -11,10 +11,7 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
             | ClusterCommand::Push { .. }
-            | ClusterCommand::Status {
-                operation: Some(_),
-                ..
-            }
+            | ClusterCommand::Operation { .. }
     )
 }
 
@@ -31,19 +28,10 @@ fn context_required(config: &Path) -> Result<Context> {
     })
 }
 
-pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Value, i32)> {
-    reject_scope(cli)?;
-    if cli.direct {
-        return Err(Failure::refused(
-            "managed_context_required",
-            "managed lifecycle and upload commands cannot be used with --direct",
-        ));
-    }
+pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
-        ClusterCommand::Create {
-            name, api, managed, ..
-        } => {
+        ClusterCommand::Create { name, api, run, .. } => {
             if name.is_empty()
                 || name.len() > 64
                 || name.trim() != name
@@ -65,21 +53,17 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
                     kind: "create",
                     context: read_context(config)?,
                     incarnation: None,
-                    managed,
+                    run,
                     tombstone: false,
                 },
             )
             .await
         }
         ClusterCommand::Delete {
-            incarnation,
-            managed,
-            ..
+            incarnation, run, ..
         }
         | ClusterCommand::UndoDelete {
-            incarnation,
-            managed,
-            ..
+            incarnation, run, ..
         } => {
             identifier(incarnation)?;
             let context = context_required(config)?;
@@ -111,14 +95,14 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
                     kind,
                     context: Some(context),
                     incarnation: Some(incarnation),
-                    managed,
+                    run,
                     tombstone,
                 },
             )
             .await
         }
-        ClusterCommand::Status {
-            operation: Some(id),
+        ClusterCommand::Operation {
+            operation_id: id,
             api,
             wait,
             timeout,
@@ -146,7 +130,7 @@ pub(super) async fn dispatch(cli: &Cli, command: &ClusterCommand) -> Result<(Val
                 }
             };
             let api = client(&origin)?;
-            let options = ManagedRunArgs {
+            let options = ClusterRunArgs {
                 no_wait: !wait,
                 timeout: *timeout,
                 idempotency_key: None,
@@ -283,7 +267,7 @@ struct Submission<'a> {
     kind: &'a str,
     context: Option<Context>,
     incarnation: Option<&'a str>,
-    managed: &'a ManagedRunArgs,
+    run: &'a ClusterRunArgs,
     tombstone: bool,
 }
 
@@ -378,7 +362,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
             "the pending create uses another API origin",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(intent.managed.timeout.unwrap_or(300));
+    let deadline = Instant::now() + Duration::from_secs(intent.run.timeout.unwrap_or(300));
     // The service scopes idempotency to the principal. The same captured bearer
     // performs this read and the submission, including after a session renewal.
     let principal = principal(api, deadline).await?;
@@ -388,7 +372,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         &intent.path,
         &intent.body,
         &principal,
-        intent.managed.idempotency_key.as_deref(),
+        intent.run.idempotency_key.as_deref(),
         intent.kind == "create" && intent.context.is_some(),
     )?;
     let response = tokio::time::timeout_at(
@@ -453,7 +437,7 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
         api,
         response,
         &identity,
-        intent.managed,
+        intent.run,
         deadline,
         intent.tombstone,
     )
@@ -464,7 +448,7 @@ async fn wait_operation(
     api: &Api,
     mut body: Value,
     identity: &Identity,
-    options: &ManagedRunArgs,
+    options: &ClusterRunArgs,
     deadline: Instant,
     tombstone: bool,
 ) -> Result<(Value, i32)> {
@@ -497,7 +481,7 @@ async fn wait_operation(
         if next >= deadline {
             tokio::time::sleep_until(deadline).await;
             eprintln!(
-                "wait deadline reached; operation {} continues; use cluster status --operation {}",
+                "wait deadline reached; operation {} continues; use cluster operation --managed {}",
                 identity.operation_id, identity.operation_id
             );
             return Ok((body, 5));

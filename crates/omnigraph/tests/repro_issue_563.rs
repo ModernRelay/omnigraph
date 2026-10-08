@@ -16,15 +16,8 @@
 // checkpoints. The always-on MECHANISM tier lives in tests/search.rs: the
 // capped-scan tests (bm25 under-fill + aggregate exemption, 20-row corpus)
 // and the rrf uncapped-arm pins (20- and 7-row corpora).
-//
-// A second #[ignore]d test below times the join-free ranked read over the
-// same corpus geometry: the scan cap's cost is hydration count, so the
-// timing scales with matched rows (measured 2026-08-29, warm debug builds:
-// 119 ms median on the pre-fix parent commit vs 2 ms with the cap).
 
 mod helpers;
-
-use std::time::Instant;
 
 use arrow_array::StringArray;
 
@@ -193,59 +186,4 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             "row {row}: artifact art-{a:04} is not linked to chunk-{c:05}"
         );
     }
-}
-
-/// Timing instrument for the scan cap: the join-free ranked read over the same
-/// corpus geometry (no edges loaded), one warm-up then five timed runs. Prints
-/// per-run and median wall time; asserts correctness only, never a duration
-/// (wall-time asserts flake in CI). Compare against the parent commit to see
-/// the cap's effect; the cost is hydration count, so the gap grows with the
-/// matched-corpus size.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "expensive: ~1.2 GiB corpus + inverted index build; timing instrument"]
-async fn times_join_free_ranked_read_issue_563() {
-    let filler = filler_block();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
-
-    let mut chunk_batch = String::new();
-    for c in 0..CHUNKS {
-        chunk_batch.push_str(&format!(
-            "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"chunk-{c:05}\",\"text\":\"needle563 {filler}\"}}}}\n"
-        ));
-        if (c + 1) % LOAD_BATCH_ROWS == 0 || c + 1 == CHUNKS {
-            db.load_jsonl(&chunk_batch, LoadMode::Append).await.unwrap();
-            chunk_batch.clear();
-        }
-    }
-    db.ensure_indices().await.unwrap();
-
-    let warmup = query_main(
-        &db,
-        RANKED_JOIN_QUERY,
-        "recall_no_join",
-        &params(&[("$q", "needle563")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(warmup.num_rows(), 20);
-
-    let mut millis: Vec<u128> = Vec::new();
-    for _ in 0..5 {
-        let started = Instant::now();
-        let result = query_main(
-            &db,
-            RANKED_JOIN_QUERY,
-            "recall_no_join",
-            &params(&[("$q", "needle563")]),
-        )
-        .await
-        .unwrap();
-        let elapsed = started.elapsed().as_millis();
-        assert_eq!(result.num_rows(), 20);
-        millis.push(elapsed);
-    }
-    millis.sort_unstable();
-    println!("TIMING runs_ms={millis:?} median_ms={}", millis[2]);
 }

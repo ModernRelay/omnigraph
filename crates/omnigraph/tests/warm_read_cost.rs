@@ -10,15 +10,18 @@ mod helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lance_io::utils::tracking_store::IOTracker;
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::instrumentation::{ProbedStores, QueryIoProbes, with_query_io_probes};
+use omnigraph::loader::LoadMode;
+use omnigraph_catalog::TAIL_MAX_COMMITS;
 
 use helpers::cost::{cost_harness, last_manifest_reads, measure};
 use helpers::{
     MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, Traversal, commit_many, count_rows,
     first_column_sorted, init_and_load, mixed_params, mutate_branch, mutate_main, params, session,
-    with_traversal,
+    with_setting, with_traversal,
 };
 
 /// A warm same-branch read must do ZERO `__manifest` object-store reads and must
@@ -37,14 +40,14 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         // Deep history: warm-read resolution cost must be flat in commit count.
         commit_many(&db, 20).await;
 
-        let (out, io) = measure(db.query(
+        let (out, io) = measure(db.query_with_head(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "total_people",
             &params(&[]),
         ))
         .await;
-        out.unwrap();
+        let (_, head) = out.unwrap();
 
         // A warm same-branch read opens nothing from the internal tables, even at
         // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
@@ -60,6 +63,56 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
             io.version_probes, 1,
             "warm same-branch read performs exactly one version probe"
         );
+        for branch in ["main", " main "] {
+            let (resolved, io) = measure(db.resolve_snapshot(branch)).await;
+            let resolved = resolved.unwrap();
+            assert_eq!(Some(resolved.as_str()), head.as_deref());
+            assert_eq!(io.internal_open_count, 0);
+            assert_eq!(io.manifest_scan_count, 0);
+            assert_eq!(io.version_probes, 1);
+        }
+        assert!(db.resolve_snapshot(" ").await.is_err());
+    })
+    .await;
+}
+
+/// Reading a branch's storage-format stamp (`omnigraph snapshot`, the served
+/// `GET /snapshot`) costs what any warm read costs: one version probe and no
+/// `__manifest` read. The stamp comes from the snapshot's own manifest version,
+/// so it describes the same graph version as the tables beside it, where the
+/// stamp was once read by resolving the branch again and opening `__manifest`
+/// at its newest version.
+#[tokio::test]
+async fn warm_stamp_read_costs_one_version_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        commit_many(&db, 5).await;
+
+        let (stamp, io) = measure(db.internal_schema_version_of(ReadTarget::branch("main"))).await;
+        assert_eq!(stamp.unwrap(), 14);
+        assert_eq!(io.version_probes, 1, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_eq!(io.internal_open_count, 0, "{io:?}");
+
+        let (pair, io) = measure(async {
+            let snapshot = db.snapshot_of(ReadTarget::branch("main")).await?;
+            let stamp = db.internal_schema_version_at(&snapshot).await?;
+            Ok::<_, omnigraph::error::OmniError>((snapshot.graph_manifest_version(), stamp))
+        })
+        .await;
+        let (version, stamp) = pair.unwrap();
+        assert_eq!(stamp, 14);
+        assert_eq!(
+            version,
+            db.snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .graph_manifest_version()
+        );
+        assert_eq!(io.version_probes, 1, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_eq!(io.internal_open_count, 0, "{io:?}");
     })
     .await;
 }
@@ -104,6 +157,7 @@ async fn external_commit_observed_by_warm_reader() {
     let reader = Omnigraph::open(uri).await.unwrap();
 
     let before = count_rows(&reader, "node:Person").await;
+    let old_head = reader.resolve_snapshot("main").await.unwrap();
 
     // External commit through a separate handle.
     mutate_main(
@@ -115,6 +169,10 @@ async fn external_commit_observed_by_warm_reader() {
     .await
     .unwrap();
 
+    let resolved = reader.resolve_snapshot("main").await.unwrap();
+    assert_ne!(resolved, old_head);
+    assert_eq!(resolved, writer.resolve_snapshot("main").await.unwrap());
+
     let after = count_rows(&reader, "node:Person").await;
     assert_eq!(
         after,
@@ -123,20 +181,179 @@ async fn external_commit_observed_by_warm_reader() {
     );
 }
 
-// ── Finding A: drop the redundant per-query schema validation ─────────────────
-//
-// Every query runs `ensure_schema_state_valid`. It ran TWICE per query (once in
-// query()/run_query_at, once again in resolved_target/snapshot_at_graph_manifest_version), each
-// reading 3 contract files + 2 existence probes (~10 storage ops). Finding A
-// removes the redundant caller, so validation runs once. (A cheaper source-only
-// probe was rejected: the codebase requires per-call detection of IR/state drift
-// on long-lived handles -- lifecycle::long_lived_handle_rejects_schema_ir_drift
-// -- which a source-only compare would miss.) Measured at the StorageAdapter
-// boundary with the counting decorator.
+#[tokio::test]
+async fn cold_open_admits_contract_and_state_in_one_scan() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        drop(init_and_load(&dir).await);
+        let uri = dir.path().to_str().unwrap();
+        for read_only in [false, true] {
+            let (opened, io) = measure(async {
+                if read_only {
+                    Omnigraph::open_read_only(uri).await
+                } else {
+                    Omnigraph::open(uri).await
+                }
+            })
+            .await;
+            let db = opened.unwrap();
+            assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+            assert_eq!(io.manifest_scan_count, 1, "read_only={read_only}: {io:?}");
+            assert_eq!(io.internal_open_count, 2, "read_only={read_only}: {io:?}");
+            assert!(io.manifest_reads > 0);
+            let db = session(db);
+            let (rows, query_io) = measure(db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", "Alice")]),
+            ))
+            .await;
+            assert_eq!(rows.unwrap().num_rows(), 1);
+            assert_eq!(query_io.manifest_scan_count, 0);
+        }
+    })
+    .await;
+}
 
-/// A warm query validates the schema contract exactly once (3 reads + 2 exists),
-/// not twice. Fails before finding A, where query() and resolved_target each
-/// validate (6 read_text + 4 exists).
+#[tokio::test]
+async fn named_read_borrows_write_capture_and_rejects_recreated_branch() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        db.branch_create("feature").await.unwrap();
+        mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "OldFeature")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+        let old_head = db.resolve_snapshot("feature").await.unwrap();
+        let old_version = db
+            .graph_manifest_version_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap();
+        let (rows, io) = measure(db.query_with_head(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "OldFeature")]),
+        ))
+        .await;
+        let (rows, head) = rows.unwrap();
+        assert_eq!(rows.num_rows(), 1);
+        assert_eq!(head.as_deref(), Some(old_head.as_str()));
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.version_probes, 1);
+
+        writer.branch_delete("feature").await.unwrap();
+        mutate_main(
+            &writer,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Replacement")], &[("$age", 44)]),
+        )
+        .await
+        .unwrap();
+        let head = writer.resolve_snapshot("main").await.unwrap();
+        writer.branch_create("feature").await.unwrap();
+        assert_eq!(
+            writer
+                .graph_manifest_version_of(ReadTarget::branch("feature"))
+                .await
+                .unwrap(),
+            old_version,
+        );
+        for _ in 0..2 {
+            let (rows, io) = measure(db.query_with_head(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", "Replacement")]),
+            ))
+            .await;
+            let (rows, served_head) = rows.unwrap();
+            assert_eq!(rows.num_rows(), 1);
+            assert_eq!(served_head.as_deref(), Some(head.as_str()));
+            assert_eq!(
+                io.manifest_scan_count, 1,
+                "reads must not refill the write cache"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn branch_delete_reuses_only_a_current_write_capture() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        for foreign in ["none", "write", "recreate"] {
+            db.branch_create("feature").await.unwrap();
+            mutate_branch(
+                &db,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Local")], &[("$age", 22)]),
+            )
+            .await
+            .unwrap();
+            if foreign == "write" {
+                mutate_branch(
+                    &writer,
+                    "feature",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "Foreign")], &[("$age", 33)]),
+                )
+                .await
+                .unwrap();
+            }
+            if foreign == "recreate" {
+                let old_version = writer
+                    .graph_manifest_version_of(ReadTarget::branch("feature"))
+                    .await
+                    .unwrap();
+                writer.branch_delete("feature").await.unwrap();
+                mutate_main(
+                    &writer,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "NewMain")], &[("$age", 44)]),
+                )
+                .await
+                .unwrap();
+                writer.branch_create("feature").await.unwrap();
+                assert_eq!(
+                    writer
+                        .graph_manifest_version_of(ReadTarget::branch("feature"))
+                        .await
+                        .unwrap(),
+                    old_version,
+                );
+            }
+            let main_rows = count_rows(&writer, "node:Person").await;
+            let (deleted, io) = measure(db.branch_delete("feature")).await;
+            deleted.unwrap();
+            assert_eq!(io.manifest_scan_count, u64::from(foreign != "none"));
+            assert_eq!(io.version_probes, 1);
+            assert!(io.manifest_reads > 0);
+            assert!(db.resolve_snapshot("feature").await.is_err());
+            assert_eq!(count_rows(&db, "node:Person").await, main_rows);
+        }
+    })
+    .await;
+}
+
+/// A warm query performs no contract read: 0 `read_text` and 0 `exists`
+/// (before the row: 3 reads + 2 exists per query, the three contract files).
 #[tokio::test]
 async fn warm_query_validates_schema_contract_once() {
     use omnigraph::instrumentation::CountingStorageAdapter;
@@ -164,45 +381,59 @@ async fn warm_query_validates_schema_contract_once() {
 
     assert_eq!(
         counts.read_text() - before_read_text,
-        3,
-        "warm query should validate the schema contract once (3 reads), not twice"
+        0,
+        "a warm query reads no schema contract file"
     );
     assert_eq!(
         counts.exists() - before_exists,
-        2,
-        "warm query should probe contract-file existence once (2 probes), not twice"
+        0,
+        "a warm query probes no schema contract file"
     );
 }
 
-/// The cheap source-compare must still detect that the on-disk schema source has
-/// drifted from the validated contract and fail the read, rather than serving the
-/// stale-but-cached schema. Passes before and after finding A (regression guard
-/// for the documented weaker per-query guard).
+/// A handle serving 1,000 queries after open performs zero `StorageAdapter`
+/// reads of any kind: the unchanged captured manifest image reuses its
+/// validated contract row and accepted catalog.
 #[tokio::test]
-async fn schema_source_drift_is_caught_on_read() {
+async fn thousand_warm_queries_read_no_schema_contract() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
     let dir = tempfile::tempdir().unwrap();
-    let _writer = init_and_load(&dir).await;
+    let _ = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap();
-    let reader = session(Omnigraph::open(uri).await.unwrap());
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = session(Omnigraph::open_with_storage(uri, adapter).await.unwrap());
 
-    // Drift the on-disk schema source behind the reader's back.
-    std::fs::write(
-        dir.path().join("_schema.pg"),
-        "this is not a valid schema {{{",
-    )
-    .unwrap();
-
-    let result = reader
-        .query(
+    let before = [
+        counts.read_text(),
+        counts.read_text_if_exists(),
+        counts.read_bytes_if_exists(),
+        counts.exists(),
+        counts.read_text_versioned(),
+        counts.list_dir(),
+    ];
+    for _ in 0..1_000 {
+        db.query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "total_people",
             &params(&[]),
         )
-        .await;
-    assert!(
-        result.is_err(),
-        "a query must fail when the on-disk schema source has drifted from the validated contract"
+        .await
+        .unwrap();
+    }
+    let after = [
+        counts.read_text(),
+        counts.read_text_if_exists(),
+        counts.read_bytes_if_exists(),
+        counts.exists(),
+        counts.read_text_versioned(),
+        counts.list_dir(),
+    ];
+    assert_eq!(
+        after, before,
+        "1,000 warm queries must perform no StorageAdapter read (read_text, read_text_if_exists, read_bytes_if_exists, exists, read_text_versioned, list_dir)"
     );
 }
 
@@ -223,7 +454,18 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         // The branch snapshot must stay warm and bounded at realistic history
         // depth; a shallow fixture would hide a cold manifest scan.
         commit_many(&db, 20).await;
+        let inherited_head = db.resolve_snapshot("main").await.unwrap();
         db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        let (resolved, io) = measure(db.resolve_snapshot("feature")).await;
+        assert_eq!(resolved.unwrap(), inherited_head);
+        assert_eq!(io.version_probes, 1);
+        assert_eq!(io.internal_open_count, 0);
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.manifest_reads, 1);
+        let reads = last_manifest_reads();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"));
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
             "feature",
@@ -607,8 +849,8 @@ async fn assert_cached_borrower_survives_branch_delete(
             io.manifest_scan_count,
             io.version_probes
         ),
-        (2, 1, 0),
-        "cached table-borrower deletion must stay within its measured control cost"
+        (1, 0, 1),
+        "cached table-borrower deletion must validate and reuse its current capture"
     );
 
     assert!(
@@ -807,6 +1049,11 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     assert_eq!(
         new_version, old_version,
         "test setup must exercise branch incarnation reuse at one Lance version"
+    );
+
+    assert_eq!(
+        reader.resolve_snapshot("feature").await.unwrap(),
+        replacement_inherited_head,
     );
 
     let (new_feature, io) = measure(reader.query_with_head(
@@ -1563,4 +1810,607 @@ async fn warm_query_memoizes_catalog_and_compiled_query_until_schema_apply() {
         2,
         "a query cached under the old catalog recompiles under the rebuilt one"
     );
+}
+
+/// The probe plane of `__history`: its own object-store wrapper, and the
+/// stores behind its opens, whose trackers also see direct local IO.
+struct HistoryPlane {
+    wrapper: IOTracker,
+    stores: ProbedStores,
+}
+
+impl HistoryPlane {
+    fn install() -> (QueryIoProbes, Self) {
+        let wrapper = IOTracker::default();
+        let probes = QueryIoProbes {
+            history_wrapper: Some(Arc::new(wrapper.clone())),
+            ..Default::default()
+        };
+        let stores = probes.history_stores.clone();
+        (probes, Self { wrapper, stores })
+    }
+
+    /// The `(read, write)` requests `__history` received since the last call.
+    fn requests(&self) -> (u64, u64) {
+        let wrapper = self.wrapper.incremental_stats();
+        let (mut reads, mut writes) = (wrapper.read_iops, wrapper.write_iops);
+        for store in self.stores.stores() {
+            let stats = store.io_stats_incremental();
+            reads += stats.read_iops;
+            writes += stats.write_iops;
+        }
+        (reads, writes)
+    }
+}
+
+/// `count` publishes on main, each inserting one `Person` named after `label`.
+async fn insert_people(db: &Session, label: &str, count: usize) {
+    for i in 0..count {
+        let name = format!("{label}_{i}");
+        let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+        mutate_main(db, MUTATION_QUERIES, "insert_person", &person)
+            .await
+            .unwrap();
+    }
+}
+
+/// Whether `__history` holds commit records. Init creates `__history/schemas/`,
+/// so the directory alone says nothing about a release.
+fn history_holds_commits(root: &std::path::Path) -> bool {
+    ["blocks", "singletons"]
+        .iter()
+        .any(|records| root.join("__history").join(records).exists())
+}
+
+/// Publish on main until a publish finds its buffer full and appends it, which
+/// writes the first commit records and leaves one commit in main's buffer.
+async fn publish_until_history_exists(db: &Session, root: &std::path::Path) {
+    for publish in 0..=TAIL_MAX_COMMITS {
+        if history_holds_commits(root) {
+            return;
+        }
+        insert_people(db, &format!("before_history_{publish}"), 1).await;
+    }
+    assert!(
+        history_holds_commits(root),
+        "{} publishes on main appended nothing to `__history`",
+        TAIL_MAX_COMMITS + 1
+    );
+}
+
+/// The commits a buffer took before its release when the release was counted.
+const OLD_COMMIT_COUNT_BOUND: usize = 16;
+
+/// Publish on main until a publish writes to `__history`: the one that finds
+/// its buffer at the byte budget. Every publish before it found room and made
+/// no request to `__history`. Returns the publishes made, the writing one last.
+async fn publish_until_history_is_written(
+    db: &Session,
+    history: &HistoryPlane,
+    label: &str,
+) -> usize {
+    for published in 1..=TAIL_MAX_COMMITS + 1 {
+        insert_people(db, &format!("{label}_{published}"), 1).await;
+        let (reads, writes) = history.requests();
+        if writes > 0 {
+            return published;
+        }
+        assert_eq!(reads, 0, "publish {published} found room in the buffer");
+    }
+    panic!(
+        "{} publishes on main wrote nothing to `__history`",
+        TAIL_MAX_COMMITS + 1
+    );
+}
+
+/// Opening a graph, refreshing it and reading a branch read that branch's
+/// `__manifest` and never `__history`. A publish appends to it only when it
+/// finds its buffer full; a request for history older than the buffer reads it.
+#[tokio::test]
+async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let writer = init_and_load(&dir).await;
+    publish_until_history_exists(&writer, dir.path()).await;
+    writer.branch_create("feature").await.unwrap();
+    let insert = |name: &'static str| mixed_params(&[("$name", name)], &[("$age", 30)]);
+    mutate_branch(
+        &writer,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &insert("OnFeature"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        history_holds_commits(dir.path()),
+        "test setup: the graph has settled commits"
+    );
+    let commits_on_main = writer.list_commits(Some("main")).await.unwrap().len();
+
+    let (probes, history) = HistoryPlane::install();
+    with_query_io_probes(
+        probes,
+        Box::pin(async {
+            let reader = session(Omnigraph::open(uri).await.unwrap());
+            assert_eq!(history.requests(), (0, 0), "open");
+
+            let read_both_branches = || async {
+                for branch in ["main", "feature"] {
+                    reader
+                        .query(
+                            ReadTarget::branch(branch),
+                            TEST_QUERIES,
+                            "total_people",
+                            &params(&[]),
+                        )
+                        .await
+                        .unwrap();
+                    reader.snapshot_of(branch).await.unwrap();
+                    reader.resolve_snapshot(branch).await.unwrap();
+                }
+            };
+            read_both_branches().await;
+            assert_eq!(history.requests(), (0, 0), "branch reads");
+
+            let foreign = publish_until_history_is_written(&writer, &history, "foreign").await;
+            mutate_branch(
+                &writer,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &insert("ForeignOnFeature"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                history.requests(),
+                (0, 0),
+                "a publish on a branch whose buffer has room"
+            );
+
+            read_both_branches().await;
+            reader.refresh().await.unwrap();
+            read_both_branches().await;
+            reader.sync_branch("feature").await.unwrap();
+            read_both_branches().await;
+            reader.sync_branch("main").await.unwrap();
+            assert_eq!(
+                history.requests(),
+                (0, 0),
+                "refresh, stale reads and a branch switch"
+            );
+
+            let own = publish_until_history_is_written(&reader, &history, "own").await;
+            assert!(
+                own > OLD_COMMIT_COUNT_BOUND,
+                "{own} publishes filled the buffer: the release follows the byte budget"
+            );
+
+            let commits = reader.list_commits(Some("main")).await.unwrap();
+            assert_eq!(commits.len(), commits_on_main + foreign + own);
+            let (reads, writes) = history.requests();
+            assert!(reads > 0, "a commit listing reads `__history`");
+            assert_eq!(writes, 0);
+        }),
+    )
+    .await;
+}
+
+/// The `Person` rows of the graph as of `commit`, read by commit id.
+async fn people_as_of(db: &Session, commit: &omnigraph::db::GraphCommit) -> usize {
+    let id = omnigraph::db::SnapshotId::new(commit.graph_commit_id.clone());
+    let snapshot = db.snapshot_of(ReadTarget::snapshot(id)).await.unwrap();
+    let people = snapshot.open_dataset("node:Person").await.unwrap();
+    people.count_rows(None).await.unwrap()
+}
+
+/// A commit the bound branch's `__manifest` holds is resolved and read by id
+/// with no request to `__history`. A commit the branch appended is found, and
+/// so is one that only another branch or a later version holds.
+#[tokio::test]
+async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
+    use omnigraph::changes::{
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart, ChangeFilter,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let writer = init_and_load(&dir).await;
+    publish_until_history_exists(&writer, dir.path()).await;
+    let buffered = 4;
+    insert_people(&writer, "buffered", buffered - 1).await;
+    writer.branch_create("feature").await.unwrap();
+    for name in ["OnFeature", "HeadOfFeature"] {
+        let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+        mutate_branch(
+            &writer,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &person,
+        )
+        .await
+        .unwrap();
+    }
+    let main = writer.list_commits(Some("main")).await.unwrap();
+    let on_feature = writer
+        .list_commits(Some("feature"))
+        .await
+        .unwrap()
+        .remove(1);
+    assert!(
+        main.len() > buffered + 2,
+        "test setup: main has appended commits"
+    );
+    let people_at_head = count_rows(&writer, "node:Person").await;
+
+    let (probes, history) = HistoryPlane::install();
+    with_query_io_probes(
+        probes,
+        Box::pin(async {
+            let reader = session(Omnigraph::open(uri).await.unwrap());
+            for (age, commit) in main.iter().take(buffered + 1).enumerate() {
+                let resolved = reader.get_commit(&commit.graph_commit_id).await.unwrap();
+                assert_eq!(&resolved, commit);
+                assert_eq!(
+                    people_as_of(&reader, commit).await,
+                    people_at_head - age,
+                    "state of the commit {age} publishes before the head"
+                );
+            }
+            reader
+                .diff_commits(
+                    &main[2].graph_commit_id,
+                    &main[1].graph_commit_id,
+                    &ChangeFilter::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                history.requests(),
+                (0, 0),
+                "by-id reads and a diff of the head and the buffered commits"
+            );
+
+            let poll_buffered = || {
+                reader.poll_change_feed(ChangeFeedRequest {
+                    branch: None,
+                    position: ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                        main[buffered].graph_commit_id.clone(),
+                    )),
+                    scope: ChangeFeedScope::default(),
+                    max_changes: None,
+                    max_bytes: None,
+                    max_commits: None,
+                })
+            };
+            poll_buffered().await.unwrap();
+            let (reads, writes) = history.requests();
+            assert!(reads > 0, "the first poll of a handle reads the lineage");
+            assert_eq!(writes, 0);
+            let page = poll_buffered().await.unwrap();
+            assert_eq!(page.blocks.len(), buffered);
+            assert_eq!(
+                history.requests(),
+                (0, 0),
+                "a poll over buffered commits once the handle holds the lineage"
+            );
+
+            let appended = &main[buffered + 1];
+            let resolved = reader.get_commit(&appended.graph_commit_id).await.unwrap();
+            assert_eq!(&resolved, appended);
+            assert_eq!(
+                people_as_of(&reader, appended).await,
+                people_at_head - buffered - 1
+            );
+            let (reads, writes) = history.requests();
+            assert!(reads > 0, "a commit the branch appended is in `__history`");
+            assert_eq!(writes, 0);
+
+            let resolved = reader
+                .get_commit(&on_feature.graph_commit_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved, on_feature,
+                "a commit only the `__manifest` of another branch buffers"
+            );
+            assert_eq!(people_as_of(&reader, &on_feature).await, people_at_head + 1);
+
+            insert_people(&writer, "newer", 2).await;
+            let newer = writer.list_commits(Some("main")).await.unwrap();
+            let resolved = reader.get_commit(&newer[1].graph_commit_id).await.unwrap();
+            assert_eq!(
+                resolved, newer[1],
+                "a commit buffered by a version later than the one this handle holds"
+            );
+            assert_eq!(people_as_of(&reader, &newer[1]).await, people_at_head + 1);
+
+            writer.branch_delete("feature").await.unwrap();
+            let resolved = reader
+                .get_commit(&on_feature.graph_commit_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved, on_feature,
+                "a commit a deleted branch buffered is in `__history`"
+            );
+        }),
+    )
+    .await;
+}
+
+/// A commit neither the handle nor `__history` holds is looked up in the
+/// handle's own branch, then main, then the branches created last first: the
+/// `__manifest` scans of a by-id read follow where recent commits are.
+#[tokio::test]
+async fn by_id_read_of_a_commit_held_elsewhere_scans_the_likely_branches_first() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let insert_on = |branch: &'static str, name: &'static str| {
+            let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+            let writer = &writer;
+            async move {
+                mutate_branch(writer, branch, MUTATION_QUERIES, "insert_person", &person)
+                    .await
+                    .unwrap();
+            }
+        };
+        for branch in ["a_idle", "b_idle", "c_idle", "task", "z_recent"] {
+            writer.branch_create(branch).await.unwrap();
+        }
+        insert_on("task", "BeforeOpen").await;
+
+        let reader = session(Omnigraph::open(uri).await.unwrap());
+        reader.sync_branch("task").await.unwrap();
+        let held = writer.list_commits(Some("task")).await.unwrap().remove(0);
+        let (found, held_io) = measure(reader.get_commit(&held.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), held);
+
+        insert_on("task", "Later").await;
+        insert_on("task", "Latest").await;
+        let later = writer.list_commits(Some("task")).await.unwrap().remove(1);
+        let (found, io) = measure(reader.get_commit(&later.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), later);
+        let opens_and_scans = |io: &helpers::cost::IoCounts| {
+            (
+                io.internal_open_count - held_io.internal_open_count,
+                io.manifest_scan_count - held_io.manifest_scan_count,
+            )
+        };
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "a commit the handle's branch published after the version the handle holds: one \
+             open of `__manifest` and one scan of the branch; `__history` is asked by object \
+             name, which opens no dataset"
+        );
+
+        insert_on("z_recent", "Recent").await;
+        insert_on("z_recent", "MostRecent").await;
+        let recent = writer
+            .list_commits(Some("z_recent"))
+            .await
+            .unwrap()
+            .remove(1);
+        let (found, io) = measure(reader.get_commit(&recent.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), recent);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 3),
+            "the handle's branch, main, then the branch created last"
+        );
+    })
+    .await;
+}
+
+/// A merge appends the source commits after the merge base it resolved: three merges
+/// of one open source branch into main, main releasing its buffer after each so it
+/// holds no merge commit at the next, archive each source commit in one range extent.
+#[tokio::test]
+async fn repeated_merges_of_an_open_branch_append_each_source_commit_once() {
+    use omnigraph_core::graph_commit_id::parse_history_block_id;
+    const MERGES: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let writer = init_and_load(&dir).await;
+    writer.branch_create("feature").await.unwrap();
+    let (probes, history) = HistoryPlane::install();
+    with_query_io_probes(
+        probes,
+        Box::pin(async {
+            for merge in 1..=MERGES {
+                let name = format!("Merged{merge}");
+                let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+                mutate_branch(
+                    &writer,
+                    "feature",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &person,
+                )
+                .await
+                .unwrap();
+                let merged = writer.branch_merge("feature", "main").await.unwrap();
+                let merge_commit = merged
+                    .commit
+                    .expect("test setup: each merge publishes a merge commit")
+                    .graph_commit_id;
+                history.requests();
+                publish_until_history_is_written(&writer, &history, &format!("release_{merge}"))
+                    .await;
+                let released = omnigraph_catalog::history::read_commit(
+                    uri,
+                    &omnigraph_core::lance_access::control_session(),
+                    &merge_commit,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    released.is_some(),
+                    "test setup: main's release after merge {merge} archived its merge commit, \
+                     so main holds no merge commit at merge {}",
+                    merge + 1
+                );
+            }
+        }),
+    )
+    .await;
+
+    let source = writer.list_commits(Some("feature")).await.unwrap();
+    let source_block = parse_history_block_id(&source[0].graph_commit_id)
+        .unwrap()
+        .expect("the source head is a history block commit");
+    let mut source_slots: Vec<u16> = source
+        .iter()
+        .filter_map(|commit| parse_history_block_id(&commit.graph_commit_id).unwrap())
+        .filter(|id| id.block == source_block.block)
+        .map(|id| id.slot)
+        .collect();
+    source_slots.sort_unstable();
+    assert_eq!(
+        source_slots.len(),
+        MERGES,
+        "test setup: the source block holds the {MERGES} merged commits"
+    );
+
+    let block_dir = dir
+        .path()
+        .join("__history")
+        .join("blocks")
+        .join(source_block.block.to_string());
+    let mut stored: Vec<String> = std::fs::read_dir(&block_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    stored.sort();
+    let mut expected: Vec<String> = source_slots
+        .iter()
+        .map(|slot| format!("{slot}-{slot}.lance"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        stored, expected,
+        "main held no merge commit at any merge after the first, and merge i still archives \
+         source slot i alone: the merge base passed by `branch_merge_impl` cuts the source run"
+    );
+}
+
+/// A `branch merge` and a `load` publish under the session's `history_release_bytes` as a
+/// mutation does: at 2048 bytes each closes its branch's block (slot 0) within
+/// `OLD_COMMIT_COUNT_BOUND` publishes of its own kind, and the publish after it releases.
+#[tokio::test]
+async fn merge_and_load_close_a_block_under_the_session_budget() {
+    use omnigraph_core::graph_commit_id::parse_history_block_id;
+    let slot_of = |graph_commit_id: &str| {
+        parse_history_block_id(graph_commit_id)
+            .unwrap()
+            .expect("a publish of this build mints a history block commit id")
+            .slot
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let lowered = with_setting(&init_and_load(&dir).await, "history_release_bytes", "2048");
+    lowered.branch_create("feature").await.unwrap();
+    let (probes, history) = HistoryPlane::install();
+    with_query_io_probes(
+        probes,
+        Box::pin(async {
+            let (lowered, history) = (&lowered, &history);
+            let merge_feature_into_main = move |name: String| async move {
+                let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+                mutate_branch(
+                    lowered,
+                    "feature",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &person,
+                )
+                .await
+                .unwrap();
+                history.requests();
+                let merged = lowered.branch_merge("feature", "main").await.unwrap();
+                merged.commit.expect("each merge publishes a merge commit")
+            };
+            let block_dir_of = |graph_commit_id: &str| {
+                dir.path().join("__history").join("blocks").join(
+                    parse_history_block_id(graph_commit_id)
+                        .unwrap()
+                        .expect("a publish of this build mints a history block commit id")
+                        .block
+                        .to_string(),
+                )
+            };
+            let released_files = |block_dir: &std::path::Path| {
+                std::fs::read_dir(block_dir).map_or(0, |entries| entries.count())
+            };
+            let mut closing_merge = None;
+            for merge in 1..=OLD_COMMIT_COUNT_BOUND {
+                let commit = merge_feature_into_main(format!("Merged{merge}")).await;
+                if slot_of(&commit.graph_commit_id) == 0 {
+                    closing_merge = Some(commit);
+                    break;
+                }
+            }
+            let closing_merge = closing_merge.unwrap_or_else(|| {
+                panic!(
+                    "{OLD_COMMIT_COUNT_BOUND} merges closed no block on main: the merge published \
+                     under the production budget"
+                )
+            });
+            let closed_block = block_dir_of(
+                closing_merge
+                    .parent_commit_id
+                    .as_deref()
+                    .expect("a merge commit on main has a first parent"),
+            );
+            assert_eq!(
+                released_files(&closed_block),
+                0,
+                "the block the slot-0 merge closed is not under `__history` until the publish after it"
+            );
+            merge_feature_into_main("MergedAfterClose".to_string()).await;
+            assert!(
+                released_files(&closed_block) > 0,
+                "the merge after the closing one releases main's buffer: the closed block gains a \
+                 `__history` extent (every merge writes the source's records, so the \
+                 `__history` write count alone cannot tell a release from the archive)"
+            );
+
+            lowered.branch_create("loaded").await.unwrap();
+            let load_one = move |name: &str| {
+                let line =
+                    format!(r#"{{"type": "Person", "data": {{"name": "{name}", "age": 30}}}}"#);
+                async move {
+                    history.requests();
+                    let receipt = lowered
+                        .load_as_with_receipt("loaded", None, &line, LoadMode::Append, None)
+                        .await
+                        .unwrap();
+                    receipt.commit.graph_commit_id
+                }
+            };
+            let mut load_closed_a_block = false;
+            for load in 1..=OLD_COMMIT_COUNT_BOUND {
+                if slot_of(&load_one(&format!("Loaded{load}")).await) == 0 {
+                    load_closed_a_block = true;
+                    break;
+                }
+            }
+            assert!(
+                load_closed_a_block,
+                "{OLD_COMMIT_COUNT_BOUND} loads closed no block on `loaded`: the load published \
+                 under the production budget"
+            );
+            load_one("LoadedAfterClose").await;
+            assert!(
+                history.requests().1 > 0,
+                "the load after the closing one releases the branch's buffer"
+            );
+        }),
+    )
+    .await;
 }

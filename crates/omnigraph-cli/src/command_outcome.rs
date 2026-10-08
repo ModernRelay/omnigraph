@@ -29,7 +29,6 @@ pub(crate) fn applies(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Command::Load { .. }
-            | Command::Ingest { .. }
             | Command::Mutate { .. }
             | Command::Branch {
                 command: BranchCommand::Create { .. }
@@ -217,6 +216,7 @@ impl Failure {
             || output.published_dataset_version_conflict.is_some()
             || output.key_conflict.is_some()
             || output.resource_limit.is_some()
+            || output.external_blob_source.is_some()
             || !output.merge_conflicts.is_empty()
             || output.diagnostic.is_some()
         {

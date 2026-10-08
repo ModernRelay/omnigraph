@@ -1,12 +1,16 @@
 use super::*;
 
+use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
     check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
 };
+use crate::instrumentation::record_mutation_table_open;
+use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::PendingScanBudget;
+use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
 use datafusion::prelude::Expr;
+use futures::TryStreamExt;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -340,14 +344,16 @@ fn typed_list_literal_to_array(
 /// Build a single-element blob array from a URI or base64 value string.
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    crate::loader::append_blob_value(&mut builder, value)?;
+    append_blob_value(&mut builder, value)?;
     builder.finish().map_err(OmniError::lance_internal)
 }
 
-/// Build a null blob array with one element.
-fn build_null_blob_array() -> Result<ArrayRef> {
-    let mut builder = BlobArrayBuilder::new(1);
-    builder.push_null().map_err(OmniError::lance_internal)?;
+/// Build a null blob array with `num_rows` elements.
+fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(num_rows);
+    for _ in 0..num_rows {
+        builder.push_null().map_err(OmniError::lance_internal)?;
+    }
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -368,7 +374,7 @@ fn build_insert_batch(
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
             } else if field.is_nullable() {
-                columns.push(build_null_blob_array()?);
+                columns.push(build_null_blob_array(1)?);
             } else {
                 return Err(OmniError::manifest(format!(
                     "missing required blob property '{}'",
@@ -431,15 +437,9 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
     }
 }
 
-/// Replace specific columns in a RecordBatch with new literal values.
-///
-/// Blob-bearing updates always arrive with the full logical schema. Committed
-/// blob payloads were materialized by the caller and rebuilt as logical
-/// `Struct<data,uri>` arrays; pending batches already have that shape. An
-/// unassigned blob is copied through, while an assigned string URI is rebuilt
-/// with the same blob writer used by inserts. Consequently every update batch
-/// has the catalog schema and can safely share one pending merge stream with
-/// inserts and earlier updates.
+/// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
+/// with the assigned values, so every update batch shares one pending merge
+/// stream with inserts and earlier updates.
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -449,26 +449,36 @@ fn apply_assignments(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
-            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
-                // Assigned: build a single blob column from the URI.
-                let mut builder = BlobArrayBuilder::new(batch.num_rows());
-                for _ in 0..batch.num_rows() {
-                    crate::loader::append_blob_value(&mut builder, uri)?;
+            let column = match assignments.get(field.name()) {
+                Some(Literal::String(uri)) => {
+                    let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                    for _ in 0..batch.num_rows() {
+                        append_blob_value(&mut builder, uri)?;
+                    }
+                    builder.finish().map_err(OmniError::lance_internal)?
                 }
-                columns.push(builder.finish().map_err(OmniError::lance_internal)?);
-            } else {
+                Some(Literal::Null) => build_null_blob_array(batch.num_rows())?,
+                Some(other) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Blob property '{}' assigned non-string constant {other:?}",
+                        field.name()
+                    )));
+                }
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
-                let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "blob column '{}' not found in full-schema mutation scan",
-                        field.name()
-                    ))
-                })?;
-                columns.push(col.clone());
-            }
+                None => batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "blob column '{}' not found in full-schema mutation scan",
+                            field.name()
+                        ))
+                    })?
+                    .clone(),
+            };
+            columns.push(column);
         } else if let Some(lit) = assignments.get(field.name()) {
             columns.push(literal_to_typed_array(
                 lit,
@@ -523,6 +533,7 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
+    record_mutation_table_open();
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
@@ -808,6 +819,7 @@ impl Session {
             actor_id,
             expected_head,
             settings.stage_write_concurrency(),
+            HistoryReleaseBytes(settings.history_release_bytes()),
         )
         .await
     }
@@ -849,6 +861,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -866,6 +879,7 @@ impl Omnigraph {
                     actor_id,
                     expected_head,
                     stage_write_concurrency,
+                    history_release_bytes,
                     attempt == 0,
                     &mut retryable,
                 )
@@ -882,7 +896,7 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_for_reprepare().await?;
+                    self.refresh_coordinator_only().await?;
                 }
                 result => return result,
             }
@@ -899,169 +913,149 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Direct-publish paths assert this
-        // explicitly so a caller can't write to legacy or system
-        // staging branches by passing the prefix verbatim.
-        if let Some(name) = requested.as_deref() {
-            crate::db::ensure_public_branch_ref(name, "mutate")?;
-        }
-        // Install this handle's published-but-uninstalled schema contract, if
-        // any. This MUST run before `open_write_txn`, which captures the
-        // accepted schema identity and catalog.
-        let completed_prior_work = self.settle_pending_schema_install().await?;
-        let result = async {
-            // Capture one branch-wide write authority: native branch identity,
-            // exact optional graph head, accepted schema identity/catalog, and the
-            // base table snapshot. Execution, validation, staging, and publication
-            // all use this immutable attempt. `commit_all` revalidates the complete
-            // token under the root-shared schema → branch → sorted-table gates
-            // before its first detached commit.
-            let mut txn = self
-                .open_write_txn(requested.as_deref())
-                .await
-                .map_err(|error| {
-                    if first_attempt && !completed_prior_work {
-                        error.before_effect()
-                    } else {
-                        error.without_pre_effect_evidence()
-                    }
-                })?;
-            // Caller CAS gate against the pinned view this attempt executes with —
-            // a separate head lookup would reopen the race. Re-checked per
-            // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
-            if let Some(expected) = expected_head {
-                let actual = txn.effective_graph_head.as_deref();
-                if actual != Some(expected) {
-                    return Err(OmniError::precondition_failed(
-                        requested.as_deref().unwrap_or("main"),
-                        expected,
-                        actual.map(str::to_string),
-                    ));
+        // Capture one branch-wide write authority: native branch identity,
+        // exact optional graph head, accepted schema identity/catalog, and the
+        // base table snapshot. Execution, validation, staging, and publication
+        // all use this immutable attempt. `commit_all` revalidates the complete
+        // token under the root-shared schema → branch → sorted-table gates
+        // before its first detached commit.
+        let mut txn = self
+            .open_write_txn(requested.as_deref())
+            .await
+            .map_err(|error| {
+                if first_attempt {
+                    error.before_effect()
+                } else {
+                    error.without_pre_effect_evidence()
                 }
-                txn.caller_expected_graph_head = Some(expected.to_string());
+            })?;
+        // Caller CAS gate against the pinned view this attempt executes with —
+        // a separate head lookup would reopen the race. Re-checked per
+        // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
+        if let Some(expected) = expected_head {
+            let actual = txn.effective_graph_head.as_deref();
+            if actual != Some(expected) {
+                return Err(OmniError::precondition_failed(
+                    requested.as_deref().unwrap_or("main"),
+                    expected,
+                    actual.map(str::to_string),
+                ));
             }
-            let resolved_params = params.clone();
+            txn.caller_expected_graph_head = Some(expected.to_string());
+        }
+        let resolved_params = params.clone();
 
-            // Per-query staging accumulator. Inserts and updates push batches into
-            // `pending`; deletes push predicates into `delete_predicates`. At the
-            // boundary, `stage_all` prepares one exact transaction per touched table
-            // and `commit_all` commits each as a detached version of its pinned
-            // base (RFC 0067). The publisher then makes the complete result
-            // graph-visible in one manifest CAS. Branch is threaded explicitly — no
-            // coordinator swap.
-            let mut staging = MutationStaging::default();
+        // Per-query staging accumulator. Inserts and updates push batches into
+        // `pending`; deletes push predicates into `delete_predicates`. At the
+        // boundary, `stage_all` prepares one exact transaction per touched table
+        // and `commit_all` commits each as a detached version of its pinned
+        // base (RFC 0067). The publisher then makes the complete result
+        // graph-visible in one manifest CAS. Branch is threaded explicitly — no
+        // coordinator swap.
+        let mut staging = MutationStaging::default();
 
-            // Lower + validate up front so the touched-dataset set is known before
-            // execution. A lowering/validation error returns exactly as it did
-            // when this happened inside execute_named_mutation.
-            let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
-            check_param_date_literals(params, &ir.params)?;
-            // Only an insert-only mutation is safe to replay automatically after a
-            // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-            // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-            // a semantic rebase rather than a fresh execution contract.
-            *retryable = ir
-                .ops
-                .iter()
-                .all(|op| matches!(op, MutationOpIR::Insert { .. }));
+        // Lower + validate up front so the touched-dataset set is known before
+        // execution. A lowering/validation error returns exactly as it did
+        // when this happened inside execute_named_mutation.
+        let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        check_param_date_literals(params, &ir.params)?;
+        // Only an insert-only mutation is safe to replay automatically after a
+        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
+        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
+        // a semantic rebase rather than a fresh execution contract.
+        *retryable = ir
+            .ops
+            .iter()
+            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
-            let exec_result = self
-                .execute_named_mutation(
-                    &ir,
-                    &resolved_params,
-                    requested.as_deref(),
-                    &mut staging,
-                    &txn,
-                )
-                .await;
+        let exec_result = self
+            .execute_named_mutation(
+                &ir,
+                &resolved_params,
+                requested.as_deref(),
+                &mut staging,
+                &txn,
+            )
+            .await;
 
-            match exec_result {
-                Err(e) => Err(e),
-                Ok(total) if staging.is_empty() => {
-                    if txn.caller_expected_graph_head.is_some() {
-                        fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
-                        // A no-op has no table transaction, so it never reaches
-                        // `commit_all`. It still needs a linearization point for
-                        // the caller's CAS promise: under the same schema -> branch
-                        // ordering as effectful writes (shared permit — this pass
-                        // only reads the accepted view), revalidate the complete
-                        // authority and map a moved caller head to terminal 412.
-                        let _schema_permit = self.write_queue().acquire_schema_shared().await;
-                        let _branch_guard = self
-                            .write_queue()
-                            .acquire_branch(requested.as_deref())
-                            .await;
-                        self.revalidate_write_txn(&txn).await?;
-                    }
-                    Ok(crate::MutationReceipt {
-                        result: total,
-                        commit: None,
-                    })
-                }
-                Ok(total) => {
-                    self.validate_staged_mutation(&staging, &txn).await?;
-                    let staged = staging
-                        .stage_all_with_concurrency(
-                            self,
-                            requested.as_deref(),
-                            stage_write_concurrency,
-                        )
-                        .await?;
-                    fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
-                    let lineage_intent = self
-                        .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
-                        .await?;
-                    // `_held_gates` holds the shared schema permit, branch
-                    // effect gate, and sorted table gates acquired by `commit_all`.
-                    // They remain held through manifest publication, covering the
-                    // complete same-process effect lifetime. They are a local
-                    // serialization aid; the exact publisher precondition remains
-                    // the correctness authority.
-                    let super::staging::CommittedMutation {
-                        updates,
-                        expected_versions,
-                        gates: _held_gates,
-                    } = staged.commit_all(self, requested.as_deref(), &txn).await?;
-                    // Failpoint for the detached-effects → publisher boundary:
-                    // every table effect is committed detached but nothing is
-                    // graph-visible. A failure here leaves the graph unchanged and
-                    // the detached versions as reclaimable garbage. See
-                    // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
-                    fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-                    let publish_result = self
-                        .commit_updates_on_branch_with_expected(
-                            requested.as_deref(),
-                            &updates,
-                            &expected_versions,
-                            actor_id,
-                            &txn,
-                            lineage_intent,
-                        )
+        match exec_result {
+            Err(e) => Err(e),
+            Ok(total) if staging.is_empty() => {
+                if txn.caller_expected_graph_head.is_some() {
+                    fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
+                    // A no-op has no table transaction, so it never reaches
+                    // `commit_all`. It still needs a linearization point for
+                    // the caller's CAS promise: under the same schema -> branch
+                    // ordering as effectful writes (shared permit — this pass
+                    // only reads the accepted view), revalidate the complete
+                    // authority and map a moved caller head to terminal 412.
+                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
+                    let _branch_guard = self
+                        .write_queue()
+                        .acquire_branch(requested.as_deref())
                         .await;
-                    // RFC 0067: every effect is a detached commit of its pinned base,
-                    // so a publish failure leaves the graph unchanged; the error
-                    // is returned as is (a moved head is `ReadSetChanged`).
-                    let commit = publish_result?;
-                    Ok(crate::MutationReceipt {
-                        result: total,
-                        commit: Some(commit),
-                    })
+                    self.revalidate_write_txn(&txn).await?;
                 }
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: None,
+                })
+            }
+            Ok(total) => {
+                self.validate_staged_mutation(&staging, &txn).await?;
+                let staged = staging
+                    .stage_all_with_concurrency(self, requested.as_deref(), stage_write_concurrency)
+                    .await?;
+                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+                let lineage_intent = self
+                    .new_lineage_intent_for_branch(
+                        requested.as_deref(),
+                        actor_id,
+                        history_release_bytes,
+                    )
+                    .await?;
+                // `_held_gates` holds the shared schema permit, branch
+                // effect gate, and sorted table gates acquired by `commit_all`.
+                // They remain held through manifest publication, covering the
+                // complete same-process effect lifetime. They are a local
+                // serialization aid; the exact publisher precondition remains
+                // the correctness authority.
+                let super::staging::CommittedMutation {
+                    updates,
+                    expected_versions,
+                    gates: _held_gates,
+                } = staged.commit_all(self, requested.as_deref(), &txn).await?;
+                // Failpoint for the detached-effects → publisher boundary:
+                // every table effect is committed detached but nothing is
+                // graph-visible. A failure here leaves the graph unchanged and
+                // the detached versions as reclaimable garbage. See
+                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
+                fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+                let publish_result = self
+                    .commit_updates_on_branch_with_expected(
+                        requested.as_deref(),
+                        &updates,
+                        &expected_versions,
+                        actor_id,
+                        &txn,
+                        lineage_intent,
+                    )
+                    .await;
+                // RFC 0067: every effect is a detached commit of its pinned base,
+                // so a publish failure leaves the graph unchanged; the error
+                // is returned as is (a moved head is `ReadSetChanged`).
+                let commit = publish_result?;
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: Some(commit),
+                })
             }
         }
-        .await;
-        result.map_err(|error: OmniError| {
-            if completed_prior_work {
-                error.without_pre_effect_evidence()
-            } else {
-                error
-            }
-        })
     }
 
     /// Lower + validate a named mutation query into its IR.
@@ -1351,7 +1345,35 @@ impl Omnigraph {
 
         let schema = catalog.node_types[type_name].arrow_schema.clone();
         let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
+        // Resolved before the table is opened, so a null on a non-nullable
+        // property is refused even when the predicate matches no row.
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let blob_props = catalog.node_types[type_name].blob_properties.clone();
+        // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
+        let assigned_blobs = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                blob_props.contains(field.name()) && resolved.contains_key(field.name())
+            })
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let scan_schema: SchemaRef = if assigned_blobs.is_empty() {
+            schema.clone()
+        } else {
+            let indices = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !assigned_blobs.contains(&field.name().as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            Arc::new(
+                schema
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            )
+        };
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1407,6 +1429,7 @@ impl Omnigraph {
                     pending_schema,
                     Some(pred_expr),
                     Some(catalog.system_columns.id),
+                    &assigned_blobs,
                     scan_budget,
                 )
                 .await?
@@ -1419,14 +1442,10 @@ impl Omnigraph {
             });
         }
 
-        // Concat the matched batches (committed + pending) into one. The
-        // helper binds both sides to the catalog's full logical schema. Any
-        // divergence here is an internal scan/staging contract violation.
-        let matched = concat_match_batches_to_schema(&schema, batches)?;
+        let matched = concat_match_batches_to_schema(&scan_schema, batches)?;
 
         let affected_count = matched.num_rows();
 
-        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
@@ -1493,12 +1512,14 @@ impl Omnigraph {
 
         let scan_filter =
             dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
-        let batches = self
-            .storage()
-            .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), scan_filter)
-            .await?;
-
-        let deleted_ids: Vec<String> = ids_from_batches(&batches);
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            scan_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1517,7 +1538,6 @@ impl Omnigraph {
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
-        staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_expr.clone());
 
         let mut affected_edges = 0usize;
@@ -1577,24 +1597,24 @@ impl Omnigraph {
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
-            let matched_ids = ids_from_batches(
-                &self
-                    .storage()
-                    .scan_filtered(
-                        &edge_ds,
-                        Some(&[txn.catalog.system_columns.id]),
-                        count_filter,
-                    )
-                    .await?,
-            );
+            let matched_ids = scan_deleted_ids(
+                self,
+                &edge_ds,
+                txn.catalog.system_columns.id,
+                count_filter,
+                &mut staging.deleted_id_budget,
+            )
+            .await?;
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
-                staging.record_deleted_ids(&edge_table_key, &matched_ids);
+                staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
+
+        staging.record_deleted_ids(&table_key, deleted_ids);
 
         if affected_edges > 0 {
             self.invalidate_graph_index().await;
@@ -1646,16 +1666,18 @@ impl Omnigraph {
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let deleted_ids = ids_from_batches(
-            &self
-                .storage()
-                .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), count_filter)
-                .await?,
-        );
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            count_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
         let affected = deleted_ids.len();
 
         if affected > 0 {
-            staging.record_deleted_ids(&table_key, &deleted_ids);
+            staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             self.invalidate_graph_index().await;
         }
@@ -1667,23 +1689,33 @@ impl Omnigraph {
     }
 }
 
-/// Extract the `id` column (projection index 0) from scanned batches. Used by
-/// the delete paths to capture the rows they remove, so validation recounts a
-/// src a delete empties without re-resolving the predicate.
-fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..ids.len())
-                .map(|i| ids.value(i).to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// `budget` before copying it.
+async fn scan_deleted_ids(
+    db: &Omnigraph,
+    snapshot: &SnapshotHandle,
+    id_column: &str,
+    filter: Expr,
+    budget: &mut DeletedIdBudget,
+) -> Result<Vec<String>> {
+    let mut stream = db
+        .storage()
+        .scan_filtered(snapshot, Some(&[id_column]), filter)
+        .await?;
+    let mut removed = Vec::new();
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| OmniError::manifest_internal("delete id scan did not return Utf8"))?;
+        for i in 0..ids.len() {
+            let id = ids.value(i);
+            budget.retain(id)?;
+            removed.push(id.to_owned());
+        }
+    }
+    Ok(removed)
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -1711,12 +1743,16 @@ fn concat_match_batches_to_schema(
 
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     let mut resolved = params.clone();
-    if !resolved.contains_key(NOW_PARAM_NAME) {
-        let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
-            .format(&Rfc3339)
-            .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
-        resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
+    if resolved.contains_key(NOW_PARAM_NAME) {
+        return Err(OmniError::manifest(format!(
+            "param '{NOW_PARAM_NAME}': reserved for now() and cannot be bound"
+        )));
     }
+    let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
+        .truncate_to_millisecond()
+        .format(&Rfc3339)
+        .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
+    resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
     Ok(resolved)
 }
 

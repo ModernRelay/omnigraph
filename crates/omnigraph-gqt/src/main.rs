@@ -10,6 +10,7 @@ struct Selection {
     paths: Vec<PathBuf>,
     target: Option<String>,
     storage: Option<String>,
+    store: Option<String>,
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
@@ -20,12 +21,13 @@ enum Invocation {
     Case(Selection),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI>] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
-    let first = args.next().ok_or(USAGE)?;
-    if first == "--replay" {
+    let first = args.peek().ok_or(USAGE)?;
+    if *first == "--replay" {
+        args.next();
         let path = args
             .next()
             .map(PathBuf::from)
@@ -35,20 +37,11 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         }
         return Ok(Invocation::Replay(path));
     }
-    if first.to_string_lossy().starts_with("--") {
-        return Err("expected a case path or --replay".into());
-    }
-    let mut paths = vec![PathBuf::from(first)];
-    while let Some(arg) = args.peek() {
-        if arg.to_string_lossy().starts_with("--") {
-            break;
-        }
-        paths.push(PathBuf::from(args.next().expect("peeked")));
-    }
     let mut selection = Selection {
-        paths,
+        paths: Vec::new(),
         target: None,
         storage: None,
+        store: None,
         seed: None,
         measure: None,
         artifacts: None,
@@ -59,6 +52,15 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut write_baseline = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--store") if selection.store.is_none() => {
+                selection.store = Some(
+                    args.next()
+                        .and_then(|v| v.to_str())
+                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+                        .ok_or("--store requires a URI")?
+                        .into(),
+                );
+            }
             Some("--measure") if !measure => measure = true,
             Some("--artifacts") if selection.artifacts.is_none() => {
                 selection.artifacts = Some(
@@ -114,12 +116,18 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
                         .map_err(|e| format!("invalid seed: {e}"))?,
                 );
             }
+            _ if !arg.to_string_lossy().starts_with("--") => {
+                selection.paths.push(PathBuf::from(arg));
+            }
             _ => {
                 return Err(
                     "unknown or repeated option; configuration belongs in the case file".into(),
                 );
             }
         }
+    }
+    if selection.paths.is_empty() {
+        return Err("expected at least one case path".into());
     }
     if !measure && (model.is_some() || baseline.is_some() || write_baseline) {
         return Err("--model, --baseline and --write-baseline need --measure".into());
@@ -217,6 +225,7 @@ fn run() -> Result<(), String> {
                     selection.seed,
                     selection.measure.clone(),
                     selection.artifacts.clone(),
+                    selection.store.as_deref(),
                 );
                 println!(
                     "{} {} {:.2}s",

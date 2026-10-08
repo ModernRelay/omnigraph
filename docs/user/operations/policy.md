@@ -2,8 +2,8 @@
 
 OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
-Policies are declared in `cluster.yaml`, applied with the cluster, and loaded
-when the server starts.
+Policies are declared in `cluster.yaml` and installed during cluster bootstrap
+or graph creation. Servers load them at startup or when activating a new graph.
 
 ## Actions
 
@@ -28,8 +28,10 @@ applied graph IDs and display names, without gaining permission to read their
 schema or contents. See [signed data credentials](server.md#signed-data-credentials).
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
-the identity-authorized cluster API, including policy membership, stored
-queries, graph creation, and a new graph's initial schema. Changing an existing
+the identity-authorized cluster API, including stored queries, graph creation,
+and policy membership/binding changes on existing graphs. Grants and revocations
+are authorized by the currently applied policy, never the proposed policy.
+Changing an existing
 graph's schema requires that graph's `schema_apply` permission;
 reading its remote schema or migration preview requires `read` on `main`.
 The reserved graph `admin` action does not grant cluster management.
@@ -119,7 +121,11 @@ omnigraph policy explain \
   --actor act-alice --action read --branch main
 ```
 
-Run `cluster apply` and restart servers after changing a policy source.
+Edit the policy file or its `applies_to` bindings, then run
+`cluster apply --server URL --config DIR`. The server finishes admitted requests
+before activating matching HTTP and engine permissions. Later requests use the
+new rules. Cluster management policy changes take effect in the same deployment;
+a newly granted administrator cannot authorize that grant.
 
 ## Actor identity
 
@@ -127,8 +133,7 @@ For HTTP requests, the server maps the bearer token to an actor. Headers,
 query parameters, and request bodies cannot override that identity.
 Signed credentials use `principal:<immutable-principal-id>`; groups and
 permissions come from applied policy. An identity credential contains no
-graph/action grants. Legacy restricted credentials retain an additional
-ceiling; they cannot override a policy denial.
+graph/action grants. Version-1 restricted credentials are not accepted.
 
 For direct CLI writes, actor resolution is:
 

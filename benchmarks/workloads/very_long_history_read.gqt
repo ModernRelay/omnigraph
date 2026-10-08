@@ -1,0 +1,37 @@
+# issue: none
+# notes: Fixed-live-data history checkpoint; selected read is separate from verification.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String

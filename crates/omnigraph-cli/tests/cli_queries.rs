@@ -555,7 +555,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
     });
     for (verb, route, source_field) in [
         ("query", "/graphs/g/query", "query"),
-        ("mutate", "/graphs/g/change", "query_source"),
+        ("mutate", "/graphs/g/mutate", "query"),
     ] {
         let server = IntentApiFixture::graph(vec![IntentReply::json(400, refusal.clone())]);
         let output = output_failure(
@@ -596,7 +596,7 @@ fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
         assert_eq!(requests[1].body[source_field], SOURCE);
         assert_eq!(
             requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
-            "0.12"
+            omnigraph_api_types::HTTP_API_CONTRACT
         );
         server.assert_complete();
     }
@@ -844,53 +844,6 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
     }
 }
 
-#[test]
-fn query_check_alias_matches_lint_output() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let lint_output = output_success(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let check_output = output_success(
-        cli()
-            .arg("query")
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
-}
-
 // Legacy `omnigraph.yaml` `aliases:` invoked via the `--alias` flag were
 // removed in RFC-011 D4 — operator aliases now live under `omnigraph alias
 // <name>` (the happy path is covered by system_local's operator-alias e2e).
@@ -973,7 +926,7 @@ fn queries_list_with_store_flag_errors() {
 #[test]
 fn queries_list_with_as_flag_errors() {
     // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
-    // read the actor; only `cluster apply`/`cluster approve` do. `--as` on a
+    // read the actor; only actor-bound `cluster apply` does. `--as` on a
     // non-attributing control verb must be a loud guard error, not a silently
     // dropped identity (PR #377 review follow-up).
     let output = output_failure(
@@ -1037,8 +990,7 @@ fn converged_cluster_with_query(
         ),
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     temp
 }
 
@@ -1061,11 +1013,11 @@ fn queries_validate_exits_zero_on_clean_registry() {
 }
 
 #[test]
-fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
+fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
     // In the cluster model a stored query is checked at the cluster boundary
-    // (import/apply), so a broken query can never reach the applied state
+    // (apply), so a broken query can never reach the applied state
     // `queries validate` reads — the gate is upstream. `Widget` is not in the
-    // fixture schema, so import must reject `ghost`, naming it; `broken` does
+    // fixture schema, so apply must reject `ghost`, naming it; `broken` does
     // not parse, and the human report also says where, from the diagnostic.
     let cases: [(&str, &str, &[&str]); 2] = [
         (
@@ -1095,7 +1047,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
             ),
         )
         .unwrap();
-        let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+        let output = output_failure(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
         let combined = format!(
             "{}{}",
             stdout_string(&output),
@@ -1104,7 +1056,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
         for needle in expected {
             assert!(
                 combined.contains(needle),
-                "cluster import must reject `{name}` with {needle:?}; got:\n{combined}"
+                "cluster apply must reject `{name}` with {needle:?}; got:\n{combined}"
             );
         }
     }
@@ -1282,8 +1234,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
     let temp = tempdir().unwrap();
     let dir = temp.path();
     write_multi_graph_cluster_fixture(dir);
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     let output = output_success(
         cli()
             .arg("queries")

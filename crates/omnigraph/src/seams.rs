@@ -49,3 +49,7 @@ pub use omnigraph_core::seams::{
     store_effects_list,
 };
 pub(crate) use omnigraph_core::seams::{fail, skip};
+
+pub mod store {
+    pub use omnigraph_core::seams::store::{SUBJECT_MAX_BYTES, StoreAction, Subject};
+}
