@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-14
-updated: 2026-08-23
+updated: 2026-10-05
 discussion: null
 supersedes: ["0010"]
 superseded_by: []
@@ -273,9 +273,9 @@ The CLI validates through verb capability, not plane jargon:
 
 | Capability | Meaning | Examples |
 |---|---|---|
-| `any` | graph-scoped data; served via a server scope; direct only against a **store** scope (local dev / break-glass); **errors on a cluster scope** | `query`, `mutate`, `load`, `export`, branch reads, `schema show/apply` |
+| `any` | graph-scoped data; served via a server scope; direct only against a **store** scope (local dev / break-glass); **errors on a cluster scope** | `query`, `mutate`, `load`, `export`, branch reads, `schema show` |
 | `served` | requires an HTTP server; may be graph-scoped or scope-scoped | `graphs list`, `queries list` |
-| `direct` | graph-scoped storage-native or graph-backed validation; no server form exists | `init`, `optimize`, `repair`, `cleanup`, `schema plan`, graph-backed `lint` |
+| `direct` | graph-scoped storage-native or graph-backed validation; no server form exists | `init`, `optimize`, `repair`, `cleanup`, `schema plan/apply`, graph-backed `lint` |
 | `control` | cluster-scoped catalog/control-plane work; addresses the cluster, not a single raw store | `cluster *`, `queries validate` |
 | `local` | does not address a graph or scope | `config`, `profile`, `lint --query ... --schema ...` |
 
@@ -520,7 +520,7 @@ deferred (see below); they do not block the model.
    `branch delete`) require confirmation when the scope is not local; `--yes` skips
    it; **no TTY without `--yes` errors** (never silently proceed). `--json`/CI never
    prompt — destructive without `--yes` errors.
-10. **Cluster graphs evolve only via `cluster apply`.** `schema apply` (an `any`
+10. **Cluster graphs evolve only via `cluster apply`.** `schema apply` (a `direct`
    verb) targets standalone graphs; against a cluster-managed graph it errors and
    points at `cluster apply` (which records ledger/recovery/approvals — RFC 0004).
    Mirrors `init`'s refusal of a cluster-managed path.
@@ -596,15 +596,15 @@ this RFC canonicalizes how every verb *addresses* a graph.
 
 The full command set under this model, organized by **capability** (the new
 classifying axis) instead of plane — the end-state counterpart to the
-current-taxonomy appendix below. Every command, with its end-state addressing.
+historical taxonomy appendix below. Every command, with its end-state addressing.
 
 ```
 omnigraph
 │
 ├─ any — data verbs · served by default (server scope, or --server <url|name>);
 │        --graph selects the graph in scope; --store forces ad-hoc direct (no catalog)
-│  ├─ query   (alias: read*)    invoke a stored query by NAME; -e/--file for ad-hoc
-│  ├─ mutate  (alias: change*)  invoke a stored mutation by name; -e/--file for ad-hoc
+│  ├─ query                       invoke a stored query by NAME; -e/--file for ad-hoc
+│  ├─ mutate                      invoke a stored mutation by name; -e/--file for ad-hoc
 │  ├─ load                      bulk write — --data, --mode required; --from forks a missing branch
 │  ├─ export                    dump graph data (NDJSON / Arrow)
 │  ├─ snapshot                  current per-table versions
@@ -640,8 +640,9 @@ omnigraph
    └─ version  (-v)
 ```
 
-`*` `read`/`change` remain as deprecated aliases (warn on use); `ingest` and the
-`check`→`lint` argv-shim are **removed**. `get` aliases `schema show`.
+`read`, `change`, `ingest`, `check`, `query lint`, and `query check` compatibility
+spellings are removed. `get` aliases `schema show`. Export always emits JSONL
+and does not accept `--jsonl`.
 
 ### Addressing forms (end state)
 
@@ -664,29 +665,26 @@ from a URI scheme and never toggled.
 
 | Command(s) | Today (plane) | End state (capability) |
 |---|---|---|
-| `query`/`mutate`/`load`/`export`/`snapshot`/`branch`/`commit`/`schema show`/`schema apply` | Data | **`any`** (served-default; `--store` ad-hoc) |
+| `query`/`mutate`/`load`/`export`/`snapshot`/`branch`/`commit`/`schema show` | Data | **`any`** (served-default; `--store` ad-hoc) |
 | `graphs list` | Data (remote-only) | **`served`** |
 | `queries list` | Session | **`served`** (catalog read) |
-| `init`/`optimize`/`repair`/`cleanup`/`schema plan`/graph-backed `lint` | Storage | **`direct`** (privileged) |
+| `init`/`optimize`/`repair`/`cleanup`/`schema plan`/`schema apply`/graph-backed `lint` | Storage | **`direct`** (privileged) |
 | `queries validate` | Storage | **`control`** (catalog validation) |
 | `cluster *` | Control | **control** (unchanged) |
 | `policy *`/`embed`/`login`/`logout`/`config`/`version`/offline `lint --query --schema` | Session | **`local`** |
 | `ingest`; `--target`; `--cluster-graph`; `--uri http` dispatch | present | **removed** |
 | — | — | **added:** `profile { list | show }` (read-only) |
 
-Cross-capability families: `schema` (`plan` is `direct`, `show`/`apply` are
+Cross-capability families: `schema` (`plan`/`apply` are `direct`, `show` is
 `any`), `queries` (`list` is `served`, `validate` is `control`), and `lint`
 (offline with `--schema` is `local`, graph-backed is `direct`) split per
 subcommand/mode, exactly where their authority and data dependencies differ.
 
-## Appendix: current CLI taxonomy (today)
+## Appendix: historical CLI taxonomy before this RFC
 
-The **as-is** command surface this RFC transforms, kept so the RFC is
-self-contained. The source of truth is the exhaustive `command_plane` match in
-`crates/omnigraph-cli/src/planes.rs`.
-Where it disagrees with the design above (four planes, `--target`,
-`--cluster-graph`, scheme-inferred transport), the design is the *target* and this
-is *today*.
+This appendix records the input to the original design. Its commands, aliases,
+planes and enforcement descriptions are historical; current supported behavior
+is documented in the [CLI reference](../user/cli/reference.md).
 
 ### The four planes (today)
 
@@ -765,9 +763,21 @@ Reviewed against the current CLI taxonomy, `planes.rs`, `cli.rs`, `helpers.rs`,
 - Graph selection is no longer universal. Graph-scoped verbs select a graph;
   scope-scoped verbs such as `graphs list`, `queries list`, `queries validate`,
   and `cluster *` address the whole server/cluster scope.
-- The current-state appendix still matches the implemented CLI: four planes,
+- The historical appendix records the pre-change CLI: four planes,
   `--target`, `--cluster-graph`, scheme-inferred transport, `schema plan` as
   Storage, and `schema show/apply` as Data.
 
 Decisions and deferrals are tracked in [Decisions](#decisions) above — not
 duplicated here.
+
+## Decision log
+
+- 2026-10-05: The maintainer requested removal of compatibility interfaces.
+  This replaces the target taxonomy's `read`/`change` aliases and its
+  retained-alias sentence; `check` and query-lint/check argv rewrites and
+  hidden `ingest` are removed, and export has no `--jsonl` switch. The
+  pre-change appendix and matching audit sentence are explicitly historical.
+
+- 2026-10-05: `schema apply` is direct-only; the unused served schema-apply
+  route is removed. Served changes use cluster deployment. Decision 10 and
+  the capability taxonomy now reflect that boundary.

@@ -31,6 +31,7 @@ show all;
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
 {"name": "traversal_work_limit", "value": "1000000", "default": "1000000", "source": "default", "scope": "request"}
+{"name": "history_release_bytes", "value": "262144", "default": "262144", "source": "default", "scope": "request"}
 
 --- query
 show merge_lineage;
@@ -96,3 +97,25 @@ show merge_lineage;
 
 --- expect unordered
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+
+--- mutate
+set history_release_bytes = 2048;
+
+--- expect ok
+
+--- query
+show history_release_bytes;
+
+--- expect unordered
+{"name": "history_release_bytes", "value": "2048", "default": "262144", "source": "file", "scope": "request"}
+
+--- mutate
+reset history_release_bytes;
+
+--- expect ok
+
+--- query
+show history_release_bytes;
+
+--- expect unordered
+{"name": "history_release_bytes", "value": "262144", "default": "262144", "source": "default", "scope": "request"}

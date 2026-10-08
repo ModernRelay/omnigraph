@@ -283,10 +283,20 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
             };
             let error = result.err().expect("a v9 stamp is below the served floor");
             assert!(
-                error.to_string().contains("reads only v11 to v12"),
+                error.to_string().contains(&format!(
+                    "reads only v{} to v{}",
+                    crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+                )),
                 "{error}"
             );
-            assert!(error.to_string().contains("omnigraph upgrade"), "{error}");
+            assert!(error.to_string().contains("omnigraph export"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("omnigraph upgrade <graph> --check"),
+                "{error}"
+            );
             assert_eq!(
                 reached_effects.load(std::sync::atomic::Ordering::SeqCst),
                 0,
@@ -308,7 +318,7 @@ async fn open_refuses_a_stamp_below_the_served_floor_before_any_effect() {
 #[tokio::test]
 async fn open_refuses_unknown_schema_features_before_recovery() {
     let _scenario = crate::seams::FailScenario::setup();
-    for staged in [false, true] {
+    {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         drop(
@@ -316,21 +326,21 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
                 .await
                 .unwrap(),
         );
-        let live_path = dir.path().join(crate::db::schema_state::SCHEMA_IR_FILENAME);
-        let mut ir: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&live_path).unwrap()).unwrap();
+        let mut manifest = ManifestCoordinator::open(uri).await.unwrap();
+        let live_row = manifest.read_schema_contract().await.unwrap();
+        let mut ir: serde_json::Value = serde_json::from_str(&live_row.ir).unwrap();
         ir["features"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::Value::String("time-travel".into()));
-        let target = if staged {
-            dir.path()
-                .join(crate::db::schema_state::SCHEMA_IR_STAGING_FILENAME)
-        } else {
-            live_path
-        };
         let tampered = serde_json::to_string(&ir).unwrap();
-        std::fs::write(&target, &tampered).unwrap();
+        manifest
+            .commit_changes(&[ManifestChange::SchemaContract(SchemaContractRow {
+                ir: tampered.clone(),
+                ..live_row
+            })])
+            .await
+            .unwrap();
         let before_version = open_manifest_dataset(uri, None)
             .await
             .unwrap()
@@ -363,18 +373,21 @@ async fn open_refuses_unknown_schema_features_before_recovery() {
                 .expect("an unknown feature name must refuse open");
             assert!(
                 error.to_string().contains("unknown to this build"),
-                "staged {staged}: {error}"
+                "{error}"
             );
             assert_eq!(
                 reached_effects.load(std::sync::atomic::Ordering::SeqCst),
                 0,
                 "unknown feature names must refuse before the local write probe or recovery"
             );
-            assert_eq!(
-                std::fs::read_to_string(&target).unwrap(),
-                tampered,
-                "staged {staged}: the refused artifact must be left in place"
-            );
+            let planted = ManifestCoordinator::open(uri)
+                .await
+                .unwrap()
+                .read_schema_contract()
+                .await
+                .unwrap()
+                .ir;
+            assert_eq!(planted, tampered, "the refused row must be left unchanged");
             assert_eq!(
                 open_manifest_dataset(uri, None)
                     .await
@@ -814,10 +827,20 @@ fn lineage_now_micros() -> i64 {
         .as_micros() as i64
 }
 
-/// The incremental fold and a clean full reopen must produce the same state
-/// and lineage. This is an explicit correctness oracle, kept out of the
-/// production refresh path so debug cost tests measure the same I/O shape as a
-/// release build.
+/// The commits of the branch `coordinator` holds, oldest first.
+async fn first_parent_chain(coordinator: &ManifestCoordinator) -> Vec<crate::db::GraphCommit> {
+    coordinator
+        .commit_graph()
+        .lineage()
+        .await
+        .unwrap()
+        .first_parent_chain()
+        .unwrap()
+}
+
+/// A refreshed coordinator and a clean reopen must hold the same state, the
+/// same head and the same lineage: the correctness oracle of the refresh, kept
+/// out of the production path so cost tests measure the release I/O shape.
 #[tokio::test]
 async fn projection_refresh_matches_clean_full_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -830,8 +853,9 @@ async fn projection_refresh_matches_clean_full_reopen() {
             graph_commit_id: ulid::Ulid::new().to_string(),
             branch: None,
             actor_id: None,
-            merged_parent_commit_id: None,
+            merged_parent: None,
             created_at: lineage_now_micros(),
+            history_release_bytes: omnigraph_catalog::HistoryReleaseBytes::PRODUCTION,
         };
         publisher
             .publish(&[], &HashMap::new(), Some(&intent))
@@ -840,27 +864,24 @@ async fn projection_refresh_matches_clean_full_reopen() {
     }
     let publisher = GraphNamespacePublisher::new(uri, None);
     let control_session = crate::lance_access::control_session();
-    let (mut reader, _) = ManifestCoordinator::open_with_lineage(uri, None, &control_session)
+    let mut reader = ManifestCoordinator::open_with_session(uri, &control_session)
         .await
         .unwrap();
     let old_head = reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY].clone();
+    assert_eq!(first_parent_chain(&reader).await.len(), 1);
 
     for _ in 0..8 {
         publish_empty_commit(&publisher).await.unwrap();
     }
-    let LineageRefresh::Replace(mut folded_lineage) = reader.refresh_with_lineage().await.unwrap()
-    else {
-        panic!("a copy-on-write publish replaces the fragment set, so refresh must replace");
-    };
+    reader.refresh().await.unwrap();
     assert_ne!(
         reader.known_state.graph_heads[MAIN_BRANCH_HEAD_KEY], old_head,
         "the oracle must exercise mutable graph-head replacement, not only appends"
     );
 
-    let (fresh, mut full_lineage) =
-        ManifestCoordinator::open_with_lineage(uri, None, &control_session)
-            .await
-            .unwrap();
+    let fresh = ManifestCoordinator::open_with_session(uri, &control_session)
+        .await
+        .unwrap();
     assert_eq!(reader.known_state.version, fresh.known_state.version);
     assert_eq!(
         format!("{:?}", reader.known_state.entries),
@@ -870,9 +891,10 @@ async fn projection_refresh_matches_clean_full_reopen() {
         reader.known_state.graph_heads,
         fresh.known_state.graph_heads
     );
-    folded_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
-    full_lineage.sort_by(|a, b| a.graph_commit_id.cmp(&b.graph_commit_id));
-    assert_eq!(folded_lineage, full_lineage);
+    assert_eq!(reader.head(), fresh.head());
+    let refreshed_lineage = first_parent_chain(&reader).await;
+    assert_eq!(refreshed_lineage.len(), 9);
+    assert_eq!(refreshed_lineage, first_parent_chain(&fresh).await);
 
     // A local publish already has the exact next state. Once the graph cache
     // has adopted its lineage, the next refresh must not rebuild that state.
@@ -959,69 +981,39 @@ async fn projection_refresh_matches_clean_full_reopen() {
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"),);
     }
 
-    // Publication alone cannot claim that a separate lineage cache adopted the
-    // commit. This is also the state left by a post-manifest failure.
-    reader.refresh_with_lineage().await.unwrap();
-    let unacknowledged = LineageIntent {
+    let published = LineageIntent {
         graph_commit_id: ulid::Ulid::new().to_string(),
         branch: None,
         actor_id: None,
-        merged_parent_commit_id: None,
+        merged_parent: None,
         created_at: lineage_now_micros(),
+        history_release_bytes: omnigraph_catalog::HistoryReleaseBytes::PRODUCTION,
     };
-    reader
-        .commit_changes_with_lineage(&[], &HashMap::new(), Some(&unacknowledged))
+    let outcome = reader
+        .commit_changes_with_lineage(&[], &HashMap::new(), Some(&published))
         .await
         .unwrap();
-    let LineageRefresh::Replace(rows) = reader.refresh_with_lineage().await.unwrap() else {
-        panic!("an unacknowledged lineage handoff must reconstruct the complete history");
-    };
-    assert!(
-        rows.iter()
-            .any(|row| row.graph_commit_id == unacknowledged.graph_commit_id)
+    let published_id = outcome.commit.unwrap().graph_commit_id;
+    assert_eq!(reader.head().graph_commit_id, published_id);
+    assert_eq!(
+        omnigraph_core::graph_commit_id::parse_history_block_id(&published_id)
+            .unwrap()
+            .unwrap()
+            .nonce
+            .to_string(),
+        published.graph_commit_id,
     );
-}
-
-mod migrations_tests {
-    use crate::db::manifest::migrations::*;
-
-    /// An admitted root opens at the stamp its conversion names and at no
-    /// other; the admission ends with its guard, and a foreign root is never
-    /// admitted.
-    #[tokio::test]
-    async fn conversion_admission_admits_one_root_at_one_stamp_while_held() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        drop(
-            crate::db::Omnigraph::init(root, "node Person { name: String }")
-                .await
-                .unwrap(),
-        );
-        let control_session = crate::lance_access::control_session();
-        let mut manifest = crate::db::manifest::layout::open_manifest_dataset_with_session(
-            root,
-            None,
-            &control_session,
-        )
+    let fresh = ManifestCoordinator::open_with_session(uri, &control_session)
         .await
         .unwrap();
-        set_stamp(&mut manifest, 10).await.unwrap();
-        let refused = guard_stamp(&manifest).unwrap_err().to_string();
-        assert!(refused.contains("reads only v11 to v12"), "{refused}");
-        {
-            let _admission = admit_conversion_source(root, 10);
-            assert_eq!(guard_stamp(&manifest).unwrap(), 10);
-            let _other = admit_conversion_source("/nowhere/else", 9);
-            assert!(guard_stamp(&manifest).is_ok());
-        }
-        assert!(
-            guard_stamp(&manifest).is_err(),
-            "the admission ends with its guard"
-        );
-        let _wrong_stamp = admit_conversion_source(root, 9);
-        assert!(
-            guard_stamp(&manifest).is_err(),
-            "an admission names one stamp and admits no other"
-        );
-    }
+    let lineage = first_parent_chain(&reader).await;
+    assert_eq!(
+        lineage.last().map(|head| head.graph_commit_id.as_str()),
+        Some(published_id.as_str())
+    );
+    assert_eq!(
+        lineage,
+        first_parent_chain(&fresh).await,
+        "a coordinator that publishes after foreign commits holds every commit of the branch"
+    );
 }

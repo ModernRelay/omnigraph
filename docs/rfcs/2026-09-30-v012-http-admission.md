@@ -1,26 +1,26 @@
 ---
 rfc: "2026-09-30-v012-http-admission"
-title: "v0.12 HTTP admission"
+title: "HTTP contract admission"
 track: maintainer
 status: accepted
 implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-07
 discussion: https://github.com/ModernRelay/omnigraph/pull/814
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
-# RFC: v0.12 HTTP admission
+# RFC: HTTP contract admission
 
 ## Decision
 
 Implement A1 of [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md#rollout): one explicit HTTP contract, checked before graph access. Its remaining outcome and lifecycle increments stay separate proposals. This decision changes neither engine publication nor storage formats.
 
-The request and response header is `Omnigraph-Http-Api: 0.12`. Header names are case-insensitive; the value must be exactly `0.12`, occurring once. Missing, duplicate, combined or unsupported values refuse. This identifies the v0.12 HTTP contract, independently of the package version and internal manifest stamp. Deploy CLI, server and integrations from a qualified build together; the identifier does not attest that other server increments are implemented.
+The request and response header is `Omnigraph-Http-Api: 0.13`. Header names are case-insensitive; the value must be exactly `0.13`, occurring once. Missing, duplicate, combined or unsupported values refuse. This identifies the v0.13 HTTP contract, independently of the package version and internal manifest stamp. Deploy CLI, server and integrations from a qualified build together; the identifier does not attest that other server increments are implemented.
 
 ## Admission and discovery
 
@@ -36,11 +36,14 @@ URL, credentials or raw source chain; HTTP discovery refusals retain their statu
 
 Graph HTTP clients disable redirects and automatic retries. This includes raw streaming and NDJSON paths; managed control-plane and OAuth clients retain their independent protocols. Data-request deadlines and response limits remain unchanged; the discovery bound is additional. The server admission check is still necessary: discovery is not a fence against a changed backend or a proxy dropping a header.
 
-A missing or incompatible data response header is a protocol failure with the HTTP status retained and effects classified as unknown. It does not prove non-execution or authorize replay. Preflight failures instead report that the data request was not sent. Errors preserve that distinction in human, JSON and JSONL output. A transport failure after dispatch keeps the existing uncertain-outcome rules. No automatic fallback, retry, data idempotency or exact merge receipt is added.
+A missing or incompatible data response header is a protocol failure with the HTTP status retained and effects classified as unknown. It does not prove non-execution or authorize replay. Preflight failures instead report that the data request was not sent. Errors preserve that distinction in human, JSON and JSONL output. A transport failure after dispatch keeps the existing uncertain-outcome rules. This admission boundary adds no fallback, automatic retry or data idempotency.
+Exact receipts and lifecycle behavior remain with the server runtime decision.
 
 ## Compatibility and invariants
 
-This is an intentional v0.12 breaking boundary. Old clients without the header are refused by new servers; new CLI builds refuse old servers during discovery. Operators upgrade consumers together and configure proxies to preserve the header in both directions. Reverting requires reverting clients and server together; no stored state needs conversion.
+This is an intentional v0.13 breaking boundary. Clients sending `0.12` or omitting the header are refused by new servers; new CLI builds refuse old servers during discovery. Operators upgrade consumers together and configure proxies to preserve the header in both directions. The HTTP discriminator does not migrate stored state. Cluster-ledger conversion
+and its rollback constraints remain with the [cluster deployment
+contract](2026-09-29-server-runtime-and-online-deployment.md#compatibility).
 
 Configured server URLs identify the service root, including any proxy prefix. Replace graph-qualified server URLs with the root plus `--graph`, a profile's `default_graph` or an alias's `graph`. The CLI never guesses the root by stripping a `/graphs` segment, which may belong to the proxy prefix.
 
@@ -54,7 +57,7 @@ Required evidence: missing/mismatched/duplicate headers refuse before graph effe
 
 A1 lands with coordinated client/server code and user migration guidance. It does not complete increment A, enable online deployment or make admitted writes survive disconnect. Those remain with the umbrella RFC. Qualified tests close this RFC's implementation gate.
 
-Qualification passed in the server/API/CLI owners, all 14 loopback system cases, the AWS-feature server suite and generated OpenAPI checks. Live S3/Azure fixtures were not configured; this evidence qualifies the HTTP boundary, not a cloud deployment.
+The original `0.12` implementation qualified in the server/API/CLI owners, all 14 loopback system cases, the AWS-feature server suite and generated OpenAPI checks. Live S3/Azure fixtures were not configured; this evidence qualifies the HTTP boundary, not a cloud deployment.
 
 ## Decision log
 
@@ -64,3 +67,17 @@ Qualification passed in the server/API/CLI owners, all 14 loopback system cases,
   while hardening the reviewed stack. Existing scope validation already precedes
   discovery; it remains unchanged. HTTP status/redirect assertions do not claim
   protocol-level retry-fault qualification.
+
+- 2026-10-07: Advanced the single supported wire contract to `0.13` for the
+  changed cluster deployment, canonical-route and credential shapes. Replaced
+  the Decision paragraph naming `0.12` and the Compatibility paragraph naming
+  the v0.12 breaking boundary; `0.12` now refuses before effects, with no fallback.
+  Replaced the rollback sentence that claimed no stored-state conversion was
+  needed with the independent cluster-ledger contract. The title is version-neutral;
+  the original RFC identity remains unchanged, and the qualification paragraph
+  explicitly identifies the original `0.12` evidence.
+  The `0.13` amendment passed the full server `auth_policy` and `openapi`
+  owners, CLI `cli_data` and `cli_queries` owners, and the six client
+  `graph_http` unit tests (248 tests). These include `0.12` refusal before
+  body polling/publication or CLI dispatch and unknown effects after an
+  incompatible response; this is HTTP evidence, not cloud qualification.

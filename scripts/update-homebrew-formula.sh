@@ -42,7 +42,6 @@ fi
 need_cmd gh
 need_cmd jq
 
-VERSION="${TAG#v}"
 RELEASE_JSON="$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets)"
 
 MACOS_ARM_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-macos-arm64.tar.gz"
@@ -66,7 +65,6 @@ cat >"$FORMULA_PATH" <<EOF
 class Omnigraph < Formula
   desc "Typed property graph database with Git-style workflows"
   homepage "https://github.com/${REPO_SLUG}"
-  version "${VERSION}"
   license "MIT"
   head "https://github.com/${REPO_SLUG}.git", branch: "main"
 

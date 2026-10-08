@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-gqt"
-version = "0.11.0"
+version = "0.13.0"
 edition = "2024"
 description = "GQ logic-test corpus (`cases/**/*.gqt`) and its runner; one named test per case."
 license = "MIT"
@@ -13,20 +13,17 @@ publish = false
 doctest = false
 
 [dependencies]
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
+omnigraph-gqt-core = { path = "../omnigraph-gqt-core", version = "0.13.0" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 # `test-util` is `Session::with_read_executor`, the seam `expect same as v1`
 # installs the reference engine through; GQT is its one regular enabler.
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.11.0", features = ["test-util"] }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
-omnigraph-planner = { path = "../omnigraph-planner", version = "0.11.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.13.0", features = ["test-util"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }
 omnigraph-reference-engine = { path = "../omnigraph-reference-engine" }
 serde_json = { workspace = true }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 omnigraph-dst = { path = "../omnigraph-dst" }
 tempfile = { workspace = true }

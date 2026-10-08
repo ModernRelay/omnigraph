@@ -27,6 +27,7 @@ use omnigraph::{
     BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy, Session,
 };
 
+use helpers::wide_rows::*;
 use helpers::*;
 
 /// Insert `n` brand-new persons (fresh ids) onto `branch`, forking the Person
@@ -1050,41 +1051,6 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
 }
 
-const WIDE_ROW_SCHEMA: &str = r#"
-node Doc {
-    key: String @key
-    payload: String?
-}
-"#;
-
-const WIDE_ROW_SET_PAYLOAD: &str = "query set_payload($key: String, $payload: String) {\n    update Doc set { payload: $payload } where key = $key\n}";
-
-/// One `Doc` table whose `wide` row decodes past the 37.5 MiB ordered-scan
-/// single-row hard cap, plus three small rows. Overwrite load deliberately
-/// bypasses the keyed 32 MiB Arrow envelope (bulk-replacement contract), so a
-/// wider-than-cap logical row is legitimate pre-existing table state.
-async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize) -> Session {
-    let uri = dir.path().to_str().unwrap();
-    let main = helpers::session(Omnigraph::init(uri, WIDE_ROW_SCHEMA).await.unwrap());
-    let mut rows = serde_json::json!({
-        "type": "Doc",
-        "data": { "key": "wide", "payload": "x".repeat(wide_payload_bytes) },
-    })
-    .to_string();
-    for key in ["small-0", "small-1", "small-2"] {
-        rows.push('\n');
-        rows.push_str(
-            &serde_json::json!({
-                "type": "Doc",
-                "data": { "key": key, "payload": "tiny" },
-            })
-            .to_string(),
-        );
-    }
-    main.load("main", &rows, LoadMode::Overwrite).await.unwrap();
-    main
-}
-
 /// Regression for iss-branch-merge-ordered-scan-row-cap, adopt-fallback route:
 /// a small branch update must merge even when an unrelated pre-existing row
 /// exceeds the ordered-scan single-row hard cap. The update makes the proven
@@ -1093,8 +1059,6 @@ async fn init_wide_row_graph(dir: &tempfile::TempDir, wide_payload_bytes: usize)
 /// with `ordered_scan_input_batch_bytes` even though the row was untouched.
 #[tokio::test]
 async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
-    // Comfortably past the 150 MiB / 4 = 37.5 MiB SortExec input cap.
-    const WIDE_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
@@ -1146,7 +1110,6 @@ async fn small_adopt_merge_succeeds_despite_unrelated_wide_row() {
 /// wide row flows through every cursor and must not reach a SortExec input.
 #[tokio::test]
 async fn divergent_merge_succeeds_despite_unrelated_wide_row() {
-    const WIDE_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
     let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
 
@@ -1511,6 +1474,7 @@ async fn fast_forward_merge_switches_blob_table_pin() {
         "Blob descriptor classification must not pull a proven insert interval back through the general base/source diff"
     );
     assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(
         probes.stage_vector_index_calls(),
         0,

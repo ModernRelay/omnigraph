@@ -526,6 +526,48 @@ async fn merge_load_reupsert_existing_key_is_not_unique_violation() {
         .expect("merge-load re-upserting an existing @key is not a unique violation");
 }
 
+// #765 on the Append- and Merge-load paths, which both probe committed rows for
+// `@unique` collisions. `issue_765_camelcase_unique_property_insert.gqt` covers
+// `insert`; a GQT case cannot reach the load paths because it seeds only with
+// Overwrite, which skips the committed probe. A camelCase `@unique` column must
+// be addressed by its exact name, not fail the scan with `No field named
+// messageid`, and a duplicate value must still be refused.
+const CAMEL_UNIQUE_SCHEMA: &str = r#"
+node Message {
+    slug: String @key
+    messageId: String @unique
+}
+"#;
+
+#[tokio::test]
+async fn load_issue_765_camelcase_unique_column_loads_and_rejects_duplicates() {
+    for mode in [LoadMode::Append, LoadMode::Merge] {
+        let (_dir, db) = init_with(CAMEL_UNIQUE_SCHEMA, "").await;
+        db.load_jsonl(
+            r#"{"type":"Message","data":{"slug":"msg-1","messageId":"<a@b>"}}"#,
+            mode,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!("{mode:?} load into a camelCase @unique column must succeed: {err}")
+        });
+        let err = db
+            .load_jsonl(
+                r#"{"type":"Message","data":{"slug":"msg-2","messageId":"<a@b>"}}"#,
+                mode,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@unique violation on Message.messageId"),
+            "{mode:?}: got: {}",
+            err
+        );
+        assert_eq!(count_rows(&db, "node:Message").await, 1, "{mode:?}");
+    }
+}
+
 /// `Overwrite` replaces the touched tables, so edge RI must validate against the
 /// NEW batch image, not the replaced committed one. An edge to a node that exists
 /// only in the new batch loads cleanly (regression against using the old image).

@@ -1036,7 +1036,7 @@ pub(crate) async fn execute_query_lint(
     }
 
     let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = Omnigraph::open(&uri).await?;
+    let db = crate::admission::open_read_only(&uri, None).await?;
     Ok(lint_query_file(
         &db.catalog(),
         &query_source,
@@ -1110,7 +1110,11 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
-        let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
+        let db = crate::admission::open_read_only(
+            &serving_graph.root.to_string_lossy(),
+            snapshot.state_cas.as_deref(),
+        )
+        .await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();
         for b in &report.breakages {
@@ -1271,69 +1275,6 @@ pub(crate) async fn execute_queries_list(
         }
     }
     Ok(())
-}
-
-pub(crate) fn legacy_change_request_body(
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-) -> Value {
-    let mut body = serde_json::json!({
-        "query_source": query_source,
-        "branch": branch,
-    });
-    if let Some(name) = query_name {
-        body["query_name"] = Value::String(name.to_string());
-    }
-    if let Some(params) = params_json {
-        body["params"] = params.clone();
-    }
-    body
-}
-
-pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
-    if args.len() >= 3 {
-        let sub = args[1].to_str();
-        let sub2 = args[2].to_str();
-        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
-            let suffix = sub2.unwrap();
-            eprintln!(
-                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
-            );
-            // Drop the leading `query` token AND normalize `check` -> `lint`.
-            // `check` is no longer a clap visible_alias (MR-981 §6), so the
-            // rewritten argv must reach the canonical `lint` subcommand
-            // directly. Result for `omnigraph query check --query foo.gq`:
-            //   `omnigraph lint --query foo.gq`.
-            let mut out = Vec::with_capacity(args.len() - 1);
-            out.push(args[0].clone());
-            out.push(OsString::from("lint"));
-            out.extend(args[3..].iter().cloned());
-            return out;
-        }
-    }
-    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
-        match sub {
-            "read" => {
-                eprintln!("warning: `omnigraph read` is deprecated; use `omnigraph query` instead")
-            }
-            "change" => eprintln!(
-                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
-            ),
-            "check" => {
-                eprintln!("warning: `omnigraph check` is deprecated; use `omnigraph lint` instead");
-                // Rewrite the top-level subcommand to `lint`; pass through the rest.
-                let mut out = Vec::with_capacity(args.len());
-                out.push(args[0].clone());
-                out.push(OsString::from("lint"));
-                out.extend(args[2..].iter().cloned());
-                return out;
-            }
-            _ => {}
-        }
-    }
-    args
 }
 
 #[cfg(test)]

@@ -110,12 +110,6 @@ pub async fn resolve_live_native_branch(
     crate::branch_names::resolve_native_branch(live.iter().map(String::as_str), logical)
 }
 
-pub async fn schema_apply_locked(dataset: &Dataset) -> Result<bool> {
-    live_manifest_branches_matching(dataset, crate::branch_names::is_schema_apply_lock_branch)
-        .await
-        .map(|branches| !branches.is_empty())
-}
-
 async fn live_manifest_branches_matching(
     dataset: &Dataset,
     matches: impl Fn(&str) -> bool,
@@ -1467,29 +1461,17 @@ mod tests {
         assert_eq!(vanish.injected_failures(), 1);
     }
 
-    /// The scoped sentinel check is a writer fence: unrelated damaged refs
-    /// must not block it, but a damaged sentinel cannot mean "unlocked". Keep
-    /// legacy and generated lifetimes, retirement, and read races in one fixture.
+    /// Relevant damaged refs fail authority reads; unrelated refs do not.
     #[tokio::test]
-    async fn schema_lock_lookup_preserves_authority_while_ignoring_unrelated_refs() {
+    async fn live_branch_lookup_preserves_authority_while_ignoring_unrelated_refs() {
         let dir = tempfile::tempdir().unwrap();
         let mut dataset = test_dataset(&dir).await;
         let version = dataset.version().version;
-        let sentinel = crate::branch_names::SCHEMA_APPLY_LOCK_BRANCH;
+        let logical = "guarded";
         let generated = crate::branch_names::native_branch_name(
-            sentinel,
+            logical,
             &crate::branch_names::mint_incarnation(),
         );
-
-        for logical in [sentinel.to_string(), format!("/{sentinel}")] {
-            let native = crate::branch_names::native_branch_name(
-                &logical,
-                &crate::branch_names::mint_incarnation(),
-            );
-            assert!(crate::branch_names::is_schema_apply_lock_branch(
-                crate::branch_names::logical_branch_name(&native)
-            ));
-        }
 
         dataset
             .create_branch("unrelated", version, None)
@@ -1499,16 +1481,18 @@ mod tests {
         let store = dataset.object_store(None).await.unwrap();
         let unrelated = lance::dataset::refs::branch_contents_path(&root, "unrelated");
         store.put(&unrelated, b"{").await.unwrap();
-        assert!(
-            !schema_apply_locked(&dataset).await.unwrap(),
-            "an unrelated malformed ref must not turn an idle schema into a lock error"
+        assert_eq!(
+            resolve_live_native_branch(&dataset, logical).await.unwrap(),
+            None,
+            "an unrelated malformed ref must not turn an absent branch into a lookup error"
         );
 
-        for native in [sentinel.to_string(), generated] {
+        for native in [logical.to_string(), generated] {
             dataset.create_branch(&native, version, None).await.unwrap();
-            assert!(
-                schema_apply_locked(&dataset).await.unwrap(),
-                "a live sentinel must block writers: {native}"
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                Some(native.clone()),
+                "a live ref must resolve: {native}"
             );
 
             let transient = Arc::new(VanishingBranchRefFault::stale_head_size_once(&format!(
@@ -1517,9 +1501,10 @@ mod tests {
             let wrapped = dataset.with_object_store_wrappers(vec![
                 Arc::clone(&transient) as Arc<dyn WrappingObjectStore>
             ]);
-            assert!(
-                schema_apply_locked(&wrapped).await.unwrap(),
-                "a torn sentinel read must retry without admitting a writer"
+            assert_eq!(
+                resolve_live_native_branch(&wrapped, logical).await.unwrap(),
+                Some(native.clone()),
+                "a torn ref read must retry without reporting the branch absent"
             );
             assert_eq!(transient.injected_failures(), 1);
 
@@ -1527,9 +1512,10 @@ mod tests {
             retire_branch_recoverably(&dataset, &native, &identity)
                 .await
                 .unwrap();
-            assert!(
-                !schema_apply_locked(&dataset).await.unwrap(),
-                "a validated retired sentinel must no longer block writers: {native}"
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                None,
+                "a validated retired ref must no longer resolve: {native}"
             );
 
             let retired = archived_manifest_branch(&dataset, &native)
@@ -1556,9 +1542,9 @@ mod tests {
                     .replace_metadata(&native, metadata)
                     .await
                     .unwrap();
-                let error = schema_apply_locked(&dataset)
+                let error = resolve_live_native_branch(&dataset, logical)
                     .await
-                    .expect_err("malformed or mismatched sentinel retirement must fail closed");
+                    .expect_err("malformed or mismatched retirement must fail closed");
                 assert!(error.to_string().contains("retirement metadata"), "{error}");
                 dataset
                     .branches()
@@ -1575,13 +1561,14 @@ mod tests {
             let wrapped = dataset.with_object_store_wrappers(vec![
                 Arc::clone(&persistent) as Arc<dyn WrappingObjectStore>
             ]);
-            schema_apply_locked(&wrapped)
+            resolve_live_native_branch(&wrapped, logical)
                 .await
-                .expect_err("an unreadable relevant sentinel must never be treated as absent");
+                .expect_err("an unreadable relevant ref must never be treated as absent");
             assert!(persistent.injected_failures() >= BRANCH_REF_READ_MAX_ATTEMPTS);
             assert_eq!(persistent.branch_lists(), 1);
-            assert!(
-                !schema_apply_locked(&dataset).await.unwrap(),
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                None,
                 "the read-only failures must leave the validated retirement intact"
             );
         }

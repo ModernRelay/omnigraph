@@ -191,39 +191,23 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     );
 }
 
-/// `OpenMode::ReadOnly` must NOT run `recover_schema_state_files`,
-/// which can delete or rename schema-staging files. Read-only consumers
-/// may run with read-only object-store credentials, and silent open-time
-/// mutations violate the contract.
-///
-/// This test drops a schema-staging file (which the recovery sweep
-/// would normally delete) then opens with ReadOnly mode. The staging
-/// file must remain untouched.
+/// Served roots ignore legacy schema artifacts in both open modes.
 #[tokio::test]
-async fn read_only_open_skips_schema_state_recovery() {
+async fn open_ignores_legacy_schema_files() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-
-    let _ = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    // Drop a leftover schema-staging file. The schema-state recovery
-    // sweep would normally tidy this on open (either delete or rename
-    // depending on whether it matches the live schema). ReadOnly must
-    // skip that work.
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let staging_path = dir.path().join("_schema.pg.staging");
-    std::fs::write(&staging_path, "node Person { name: String @key }\n").unwrap();
-    assert!(staging_path.exists());
-
-    let _db = Omnigraph::open_read_only(uri).await.unwrap();
-
-    // Staging file must be untouched.
-    assert!(
-        staging_path.exists(),
-        "ReadOnly open must not delete schema-staging files (no object-store mutations)"
-    );
-    let content = std::fs::read_to_string(&staging_path).unwrap();
-    assert_eq!(
-        content, "node Person { name: String @key }\n",
-        "staging file content must be unchanged"
-    );
+    let contents = "invalid legacy schema residue";
+    std::fs::write(&staging_path, contents).unwrap();
+    for read_only in [false, true] {
+        let db = if read_only {
+            Omnigraph::open_read_only(uri).await
+        } else {
+            Omnigraph::open(uri).await
+        }
+        .unwrap();
+        assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+        assert_eq!(std::fs::read_to_string(&staging_path).unwrap(), contents);
+    }
 }

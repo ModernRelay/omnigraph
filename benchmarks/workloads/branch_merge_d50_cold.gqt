@@ -1,0 +1,404 @@
+# issue: none
+# notes: Shared benchmark dataset/query contract.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+branch merge "bench-source" into "bench-target"
+--- expect outcome: merged
+
+--- query branch: main
+query node_0_main() {
+    match { $n: BenchN000 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query edge_0_main() {
+    match { $a: BenchN000
+        $a $e:benche000 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":5,"payloads":5,"lo":0,"hi":4}
+{"cohort":"d50_src_del","n":5,"payloads":5,"lo":5,"hi":9}
+{"cohort":"d50_tgt_upd","n":5,"payloads":5,"lo":10,"hi":14}
+{"cohort":"d50_tgt_del","n":5,"payloads":5,"lo":15,"hi":19}
+{"cohort":"keep","n":99980,"payloads":99980,"lo":20,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query node_1_main() {
+    match { $n: BenchN001 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query edge_1_main() {
+    match { $a: BenchN001
+        $a $e:benche001 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":0,"hi":3}
+{"cohort":"d50_src_del","n":4,"payloads":4,"lo":4,"hi":7}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query node_2_main() {
+    match { $n: BenchN002 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query edge_2_main() {
+    match { $a: BenchN002
+        $a $e:benche002 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":0,"hi":3}
+{"cohort":"d50_src_del","n":4,"payloads":4,"lo":4,"hi":7}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query node_3_main() {
+    match { $n: BenchN003 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: main
+query edge_3_main() {
+    match { $a: BenchN003
+        $a $e:benche003 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":0,"hi":3}
+{"cohort":"d50_src_del","n":4,"payloads":4,"lo":4,"hi":7}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query node_0_bench_source() {
+    match { $n: BenchN000 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query edge_0_bench_source() {
+    match { $a: BenchN000
+        $a $e:benche000 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":5,"payloads":5,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":5,"payloads":5,"lo":10,"hi":14}
+{"cohort":"d50_tgt_del","n":5,"payloads":5,"lo":15,"hi":19}
+{"cohort":"keep","n":99980,"payloads":99980,"lo":20,"hi":99999}
+{"cohort":"new","n":4,"payloads":4,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query node_1_bench_source() {
+    match { $n: BenchN001 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query edge_1_bench_source() {
+    match { $a: BenchN001
+        $a $e:benche001 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":4,"payloads":4,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query node_2_bench_source() {
+    match { $n: BenchN002 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query edge_2_bench_source() {
+    match { $a: BenchN002
+        $a $e:benche002 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":4,"payloads":4,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query node_3_bench_source() {
+    match { $n: BenchN003 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-source
+query edge_3_bench_source() {
+    match { $a: BenchN003
+        $a $e:benche003 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":8,"hi":11}
+{"cohort":"d50_tgt_del","n":4,"payloads":4,"lo":12,"hi":15}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":4,"payloads":4,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query node_0_bench_target() {
+    match { $n: BenchN000 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query edge_0_bench_target() {
+    match { $a: BenchN000
+        $a $e:benche000 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":5,"payloads":5,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":5,"payloads":5,"lo":2147483647,"hi":2147483647}
+{"cohort":"keep","n":99980,"payloads":99980,"lo":20,"hi":99999}
+{"cohort":"new","n":8,"payloads":8,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query node_1_bench_target() {
+    match { $n: BenchN001 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query edge_1_bench_target() {
+    match { $a: BenchN001
+        $a $e:benche001 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":8,"payloads":8,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query node_2_bench_target() {
+    match { $n: BenchN002 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query edge_2_bench_target() {
+    match { $a: BenchN002
+        $a $e:benche002 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":8,"payloads":8,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query node_3_bench_target() {
+    match { $n: BenchN003 }
+    return { $n.cohort as cohort, count($n.name) as n, count($n.payload) as payloads, min($n.val) as lo, max($n.val) as hi }
+}
+--- expect unordered
+{"cohort":"keep","n":100000,"payloads":100000,"lo":0,"hi":99999}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?
+
+--- query branch: bench-target
+query edge_3_bench_target() {
+    match { $a: BenchN003
+        $a $e:benche003 $b }
+    return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
+}
+--- expect unordered
+{"cohort":"d50_src_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"d50_tgt_upd","n":4,"payloads":4,"lo":2147483647,"hi":2147483647}
+{"cohort":"keep","n":99984,"payloads":99984,"lo":16,"hi":99999}
+{"cohort":"new","n":8,"payloads":8,"lo":0,"hi":3}
+--- expect shape
+cohort: String?
+n: I64
+payloads: I64
+lo: I32?
+hi: I32?

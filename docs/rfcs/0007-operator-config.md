@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-11
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,15 @@ blocked_on: []
 ---
 
 # RFC 0007: Per-operator configuration
+
+> **RFC 0008 disposition:** [RFC 0008](0008-retire-omnigraph-yaml.md) retired
+> `./omnigraph.yaml` and [RFC 0011](0011-cli-addressing-and-config.md) completed
+> its removal. Historical: the legacy file in D1, the alias collision rule in
+> D2, the legacy hops in the D3 cascades, the legacy pair in D4 step 3, and the
+> `omnigraph.yaml` cases in D5 rules 1 and 2. Current: the operator surface,
+> including `--server` targeting, operator aliases, keyed credentials, and D5
+> rule 3.
+
 **Builds on:** [RFC 0002](0002-config-cli-architecture.md) (superseded umbrella;
 PRs #139/#162 closed over review findings),
 [RFC 0005](0005-server-cluster-boot.md), and

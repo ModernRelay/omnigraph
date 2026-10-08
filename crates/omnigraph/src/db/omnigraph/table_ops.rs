@@ -85,7 +85,6 @@ pub(super) async fn rebuild_full_text_indices_on_as(
 ) -> Result<FullTextIndexRebuildResult> {
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
-    ensure_public_branch_ref(public_branch, "rebuild_full_text_indices")?;
     db.enforce(
         omnigraph_policy::PolicyAction::Change,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
@@ -233,8 +232,6 @@ async fn maintain_indices_for_branch(
     // Install this handle's pending schema contract, if any, before capturing
     // the index plan's base. The under-gate revalidation below closes the race
     // between this capture and the first table effect.
-    db.settle_pending_schema_install().await?;
-    db.ensure_schema_apply_idle("ensure_indices").await?;
     let txn = db.open_write_txn(branch).await?;
     let snapshot = txn.base.clone();
     let mut pending_by_table = HashMap::<String, Vec<PendingIndex>>::new();
@@ -432,7 +429,11 @@ async fn maintain_indices_for_branch(
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let lineage = db
-            .new_lineage_intent_for_branch(active_branch.as_deref(), actor)
+            .new_lineage_intent_for_branch(
+                active_branch.as_deref(),
+                actor,
+                HistoryReleaseBytes::PRODUCTION,
+            )
             .await?;
 
         let mut updates = Vec::with_capacity(targets.len());
@@ -896,7 +897,6 @@ pub(super) async fn open_for_mutation_on_branch(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<OpenedForMutation> {
-    db.ensure_schema_apply_not_locked("write").await?;
     // Source the resolved (snapshot, branch). With a `WriteTxn` the contract was
     // validated once at capture, so use the pinned base + resolved branch instead
     // of `resolved_branch_target` (which re-runs `ensure_schema_state_valid`). The
@@ -1265,7 +1265,6 @@ pub(super) async fn commit_updates(
     db: &mut Omnigraph,
     updates: &[crate::db::DatasetUpdate],
 ) -> Result<u64> {
-    db.ensure_schema_apply_not_locked("write commit").await?;
     let current_branch = db
         .coordinator
         .read()
@@ -1288,7 +1287,6 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
 ) -> Result<crate::db::GraphCommit> {
-    db.ensure_schema_apply_not_locked("write commit").await?;
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
             "publication branch differs from its captured write transaction",

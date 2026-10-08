@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.11.0"
+    "version": "0.13.0"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
@@ -31,6 +31,740 @@
         }
       }
     },
+    "/cluster/deployments": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_status",
+        "parameters": [
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_apply",
+        "parameters": [
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably accepted; poll the exact receipt until in_progress is false and inspect active",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "; Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/cluster/deployments/{id}": {
+      "get": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_lookup",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Original deployment identity",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/cluster/plan": {
+      "post": {
+        "tags": [
+          "cluster"
+        ],
+        "operationId": "deployment_plan",
+        "parameters": [
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Request body deadline exceeded before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "; Request body exceeds its route limit before operation admission",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs": {
       "get": {
         "tags": [
@@ -43,12 +777,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -61,7 +795,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -82,7 +816,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -103,7 +837,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -124,7 +858,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -145,7 +879,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -177,12 +911,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -195,7 +929,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -216,7 +950,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -237,7 +971,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -258,7 +992,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -403,12 +1137,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -447,7 +1181,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -497,7 +1231,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -538,7 +1272,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -575,7 +1309,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -589,7 +1323,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -610,7 +1344,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -631,7 +1365,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -652,7 +1386,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -688,7 +1422,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -730,7 +1464,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -757,7 +1491,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -778,7 +1512,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -793,13 +1527,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -942,12 +1676,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -986,7 +1720,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1018,7 +1752,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1055,7 +1789,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1069,7 +1803,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1083,7 +1817,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1097,7 +1831,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1111,7 +1845,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1140,7 +1874,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1160,7 +1894,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1174,7 +1908,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1182,13 +1916,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1224,12 +1958,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -1242,7 +1976,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1263,7 +1997,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1284,7 +2018,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1305,7 +2039,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1332,7 +2066,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1347,13 +2081,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1394,12 +2128,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -1422,7 +2156,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1443,7 +2177,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1464,7 +2198,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1485,7 +2219,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1506,7 +2240,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1527,7 +2261,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1548,7 +2282,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1575,7 +2309,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1590,13 +2324,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1639,12 +2373,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -1667,7 +2401,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1688,7 +2422,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1709,7 +2443,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1730,7 +2464,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1751,7 +2485,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1772,7 +2506,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1793,7 +2527,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1814,7 +2548,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1841,7 +2575,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1856,13 +2590,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1914,12 +2648,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -1932,7 +2666,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1953,7 +2687,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1974,7 +2708,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -1995,7 +2729,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2016,7 +2750,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2043,7 +2777,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2058,13 +2792,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2079,273 +2813,6 @@
             }
           }
         },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/graphs/{graph_id}/change": {
-      "post": {
-        "tags": [
-          "mutations"
-        ],
-        "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
-        "description": "Apply a GQ mutation to a branch. The deprecated route retains its request\nand execution semantics, while its response uses the current canonical\nvocabulary; a `settings` field is refused, since the route runs under the\nprocess defaults alone. New integrations should target `POST /mutate`.\nResponses include `Deprecation: true` and\n`Link: <mutate>; rel=\"successor-version\"` headers per RFC 9745 / RFC 8288\nso SDKs and proxies can surface the signal.",
-        "operationId": "cluster_change",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "omnigraph-http-api",
-            "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "0.12"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChangeRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChangeOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "Request body deadline exceeded before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Write-authority conflict",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Keyed write exceeds the per-commit entity or byte ceiling; Request body exceeds its route limit before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "424": {
-            "description": "An allowed external Blob source could not be probed or read",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
-            "headers": {
-              "Retry-After": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
-              },
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -2464,12 +2931,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -2482,7 +2949,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2503,7 +2970,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2524,7 +2991,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2545,7 +3012,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2566,7 +3033,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2587,7 +3054,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2608,7 +3075,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2629,7 +3096,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2656,7 +3123,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2677,7 +3144,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2692,13 +3159,13 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2741,12 +3208,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -2769,7 +3236,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2790,7 +3257,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2811,7 +3278,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2832,7 +3299,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2853,7 +3320,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2874,7 +3341,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2895,7 +3362,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2922,7 +3389,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2943,7 +3410,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -2958,13 +3425,13 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3018,12 +3485,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -3036,7 +3503,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3057,7 +3524,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3078,7 +3545,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3099,7 +3566,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3126,7 +3593,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3141,13 +3608,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3199,12 +3666,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -3217,7 +3684,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3238,7 +3705,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3259,7 +3726,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3280,7 +3747,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3301,7 +3768,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3328,7 +3795,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3343,13 +3810,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3468,12 +3935,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -3486,7 +3953,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3507,7 +3974,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3528,7 +3995,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3549,7 +4016,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3570,7 +4037,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3591,7 +4058,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3612,7 +4079,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3639,7 +4106,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3660,7 +4127,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3675,13 +4142,13 @@
             }
           },
           "503": {
-            "description": "Recovery required before changes can be read; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3724,12 +4191,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -3752,7 +4219,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3769,7 +4236,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3790,7 +4257,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3811,7 +4278,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3832,7 +4299,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3853,7 +4320,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3874,7 +4341,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3895,7 +4362,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3916,7 +4383,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3943,7 +4410,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3958,13 +4425,13 @@
             }
           },
           "503": {
-            "description": "Recovery required; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Recovery required; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -3979,273 +4446,6 @@
             }
           }
         },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/graphs/{graph_id}/ingest": {
-      "post": {
-        "tags": [
-          "mutations"
-        ],
-        "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
-        "description": "Bulk-load NDJSON data into a branch. The deprecated route retains its\nparser and branch defaults, but its response uses the current canonical\nvocabulary. New integrations should target `POST /load`. Responses\ninclude `Deprecation: true` and `Link: <load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
-        "operationId": "cluster_ingest",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "omnigraph-http-api",
-            "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "0.12"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/IngestRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IngestOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "Request body deadline exceeded before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Prepared load authority changed before effects",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling; Request body exceeds its route limit before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "424": {
-            "description": "An allowed external Blob source could not be probed or read",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
-            "headers": {
-              "Retry-After": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
-              },
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -4259,7 +4459,7 @@
           "mutations"
         ],
         "summary": "Compatibility-load NDJSON data through a JSON envelope.",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces type data. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces type data. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.",
         "operationId": "cluster_load",
         "parameters": [
           {
@@ -4274,12 +4474,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -4302,7 +4502,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4323,7 +4523,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4344,7 +4544,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4365,7 +4565,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4386,7 +4586,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4407,7 +4607,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4428,7 +4628,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4449,7 +4649,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4476,7 +4676,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4491,13 +4691,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4580,12 +4780,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -4609,7 +4809,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4630,7 +4830,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4651,7 +4851,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4672,7 +4872,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4693,7 +4893,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4714,7 +4914,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4735,7 +4935,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4756,7 +4956,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4777,7 +4977,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4798,7 +4998,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4825,7 +5025,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4840,13 +5040,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4874,7 +5074,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`, which requires and\nvalidates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` is rejected with 400;\nsend it to `POST /query`.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`, which requires and\nvalidates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.\n\nPairs with `POST /query` (read-only).\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` is rejected with 400;\nsend it to `POST /query`.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -4889,12 +5089,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -4917,7 +5117,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4938,7 +5138,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4959,7 +5159,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -4980,7 +5180,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5001,7 +5201,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5022,7 +5222,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5043,7 +5243,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5064,7 +5264,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5085,7 +5285,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5112,7 +5312,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5127,13 +5327,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5185,12 +5385,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -5213,7 +5413,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5234,7 +5434,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5255,7 +5455,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5276,7 +5476,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5297,7 +5497,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5318,7 +5518,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5339,7 +5539,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5360,7 +5560,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5381,7 +5581,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5408,7 +5608,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5423,13 +5623,13 @@
             }
           },
           "503": {
-            "description": "An overlapping durable recovery intent must be resolved before retry; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5472,12 +5672,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -5490,7 +5690,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5511,7 +5711,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5532,7 +5732,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5553,7 +5753,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5580,7 +5780,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5595,13 +5795,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5653,12 +5853,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -5687,7 +5887,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5708,7 +5908,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5729,7 +5929,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5750,7 +5950,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5771,7 +5971,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5792,7 +5992,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5813,7 +6013,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5834,7 +6034,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5855,7 +6055,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5882,7 +6082,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5903,7 +6103,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5918,13 +6118,13 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -5985,12 +6185,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -6019,7 +6219,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6040,7 +6240,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6061,7 +6261,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6082,7 +6282,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6103,7 +6303,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6124,7 +6324,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6145,7 +6345,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6166,7 +6366,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6187,7 +6387,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6208,7 +6408,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6235,7 +6435,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6256,7 +6456,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6271,13 +6471,13 @@
             }
           },
           "503": {
-            "description": "A stored mutation is blocked by a durable recovery intent; Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "A stored mutation is blocked by a durable recovery intent; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6304,8 +6504,8 @@
         "tags": [
           "queries"
         ],
-        "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. It shares `POST /read` target semantics (branch xor\nsnapshot) and the same Cedar action (Read), while its canonical response\nadditionally carries the pinned graph-commit token.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
+        "summary": "Execute an inline read query.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` for writes. Select a branch or snapshot and obtain\nthe pinned graph-commit token with the response. Cedar authorizes Read.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -6320,12 +6520,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -6348,7 +6548,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6363,13 +6563,13 @@
             }
           },
           "400": {
-            "description": "Bad request - also returned when the query body contains mutations (use POST /mutate, or its deprecated alias POST /change, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Bad request - also returned when the query body contains mutations (use POST /mutate, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6390,7 +6590,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6411,7 +6611,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6432,7 +6632,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6453,7 +6653,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6474,7 +6674,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6501,7 +6701,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6516,13 +6716,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6537,252 +6737,6 @@
             }
           }
         },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/graphs/{graph_id}/read": {
-      "post": {
-        "tags": [
-          "queries"
-        ],
-        "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
-        "description": "Execute a GQ read query. The route is kept indefinitely with a byte-stable\nenvelope; cell spelling follows the JSON writer. A `settings` field, and\na `set` or `reset` prefix in the source, are refused: the route runs under\nthe process defaults alone. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
-        "operationId": "cluster_read",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "omnigraph-http-api",
-            "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "0.12"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReadRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LegacyReadOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "Request body deadline exceeded before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Request body exceeds its route limit before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
-            "headers": {
-              "Retry-After": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
-              },
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -6811,12 +6765,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -6829,7 +6783,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6850,7 +6804,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6871,7 +6825,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6892,7 +6846,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6919,7 +6873,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -6934,258 +6888,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/graphs/{graph_id}/schema/apply": {
-      "post": {
-        "tags": [
-          "mutations"
-        ],
-        "summary": "Apply a schema migration.",
-        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop property, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
-        "operationId": "cluster_applySchema",
-        "parameters": [
-          {
-            "name": "graph_id",
-            "in": "path",
-            "description": "Graph id to route the request to.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "omnigraph-http-api",
-            "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "0.12"
-              ]
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SchemaApplyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Schema apply results",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SchemaApplyOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "Request body deadline exceeded before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "Request body exceeds its route limit before operation admission",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
-            "headers": {
-              "Retry-After": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
-              },
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
-                  ]
-                },
-                "description": "Supported OmniGraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
-            "headers": {
-              "omnigraph-http-api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7239,12 +6948,12 @@
           {
             "name": "omnigraph-http-api",
             "in": "header",
-            "description": "exactly one omnigraph-http-api header with value 0.12 is required",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
             "required": true,
             "schema": {
               "type": "string",
               "enum": [
-                "0.12"
+                "0.13"
               ]
             }
           }
@@ -7257,7 +6966,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7278,7 +6987,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7299,7 +7008,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7320,7 +7029,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7347,7 +7056,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7362,13 +7071,13 @@
             }
           },
           "503": {
-            "description": "Server operation admission is closed; reconcile any earlier write before retrying",
+            "description": "Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7414,7 +7123,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7453,7 +7162,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7469,7 +7178,7 @@
           "health"
         ],
         "summary": "Readiness witness (RFC 0049).",
-        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and how many graphs it serves and does\nnot serve. Graph ids stay behind authenticated catalog endpoints. Answers\n503 once shutdown has begun; `/healthz` stays 200 while the process is\nalive.",
+        "description": "Unauthenticated, and therefore minimal: it reports whether this replica\nis serving or draining, the applied `config_digest` it booted from, the\nledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph\nids stay behind authenticated catalog endpoints. Partial availability is\nready but degraded after loading finishes; loading, no available graph or\nshutdown returns 503. A valid\nempty registry is ready. `/healthz` reports liveness independently.",
         "operationId": "readiness",
         "responses": {
           "200": {
@@ -7479,7 +7188,7 @@
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -7494,13 +7203,13 @@
             }
           },
           "503": {
-            "description": "Draining",
+            "description": "Graphs loading, no graph available or stopping",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
                   "type": "string",
                   "enum": [
-                    "0.12"
+                    "0.13"
                   ]
                 },
                 "description": "Supported OmniGraph HTTP API contract."
@@ -8209,14 +7918,14 @@
               "string",
               "null"
             ],
-            "description": "Name of the mutation to run when `query` declares multiple.\n\nAccepts the legacy field name `query_name` as a deserialization alias."
+            "description": "Name of the mutation to run when `query` declares multiple."
           },
           "params": {
             "description": "JSON object whose keys match the mutation's declared parameters."
           },
           "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           },
           "settings": {
@@ -8230,7 +7939,8 @@
               }
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ChangeTypeOutput": {
         "type": "object",
@@ -8333,6 +8043,60 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "DeploymentRequest": {
+        "type": "object",
+        "required": [
+          "deployment_id",
+          "deployment"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "object"
+          },
+          "deployment_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeploymentResponse": {
+        "type": "object",
+        "required": [
+          "deployment",
+          "active",
+          "in_progress"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "deployment": {
+            "type": "object"
+          },
+          "in_progress": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DeploymentStatusResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "active",
+          "in_progress"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "in_progress": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "object"
           }
         }
       },
@@ -8454,6 +8218,7 @@
           "conflict",
           "too_many_requests",
           "service_unavailable",
+          "graph_unavailable",
           "internal"
         ]
       },
@@ -8671,6 +8436,26 @@
           }
         }
       },
+      "GraphAvailability": {
+        "type": "string",
+        "enum": [
+          "loading",
+          "ready",
+          "transitioning",
+          "blocked",
+          "stopping"
+        ]
+      },
+      "GraphAvailabilityAction": {
+        "type": "string",
+        "enum": [
+          "none",
+          "wait_for_startup",
+          "wait_for_transition",
+          "apply_correction_or_restart",
+          "wait_for_restart"
+        ]
+      },
       "GraphBatchDeclarationOutput": {
         "type": "object",
         "description": "One logical declaration touched by a graph-batch load.\n\nThis deliberately carries the accepted-schema name, not a backing dataset\nselector, path, or Lance identity.",
@@ -8697,7 +8482,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8735,6 +8521,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this batch, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -8791,14 +8588,41 @@
         "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. This legacy metadata includes the storage `uri`; identity-only\nexistence discovery uses [`GraphDiscoveryEntry`] instead.",
         "required": [
           "graph_id",
-          "uri"
+          "uri",
+          "state",
+          "read_available",
+          "write_available",
+          "action"
         ],
         "properties": {
+          "action": {
+            "$ref": "#/components/schemas/GraphAvailabilityAction"
+          },
+          "failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphStartupFailure"
+              }
+            ]
+          },
           "graph_id": {
             "type": "string"
           },
+          "read_available": {
+            "type": "boolean",
+            "description": "Runtime availability; actor policy still gates every operation."
+          },
+          "state": {
+            "$ref": "#/components/schemas/GraphAvailability"
+          },
           "uri": {
             "type": "string"
+          },
+          "write_available": {
+            "type": "boolean"
           }
         }
       },
@@ -8814,15 +8638,19 @@
             "items": {
               "$ref": "#/components/schemas/GraphInfo"
             }
-          },
-          "quarantined": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Graphs the applied revision names that this process does not serve,\nfor any reason, sorted (RFC 0049). Empty when every applied graph is\nserved."
           }
         }
+      },
+      "GraphStartupFailure": {
+        "type": "string",
+        "description": "Bounded startup classification, without storage paths or error text.",
+        "enum": [
+          "invalid_configuration",
+          "invalid_policy",
+          "invalid_external_blob_policy",
+          "open_failed",
+          "invalid_stored_queries"
+        ]
       },
       "HealthOutput": {
         "type": "object",
@@ -8835,7 +8663,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes, the\ntop of the range it serves (v11 and v12 today; a v11 branch converts on\nits next publish); a graph outside that range is refused until an\nexplicit upgrade.",
+            "description": "The internal-schema (storage-format) version this binary writes and\nthe only one it serves; a graph at any other version is refused until\nit is upgraded offline or rebuilt.",
             "minimum": 0
           },
           "source_version": {
@@ -8861,7 +8689,8 @@
           "mode",
           "nodes",
           "edges",
-          "total_entities"
+          "total_entities",
+          "embedding_generation"
         ],
         "properties": {
           "actor_id": {
@@ -8899,6 +8728,17 @@
               "$ref": "#/components/schemas/GraphBatchDeclarationOutput"
             },
             "description": "Logical edge declarations touched by this load, sorted by name."
+          },
+          "embedding_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LoadEmbeddingGeneration",
+                "description": "`unsupported` when a loaded node type declares `@embed`, including\nwhen all vectors were supplied; `null` otherwise."
+              }
+            ]
           },
           "mode": {
             "$ref": "#/components/schemas/LoadMode"
@@ -9020,34 +8860,12 @@
           }
         }
       },
-      "LegacyReadOutput": {
-        "type": "object",
-        "description": "Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell\nspelling follows the JSON writer. The canonical [`ReadOutput`] may grow\nadditive fields; this legacy envelope deliberately cannot carry them.",
-        "required": [
-          "query_name",
-          "target",
-          "row_count",
-          "rows"
-        ],
-        "properties": {
-          "columns": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "query_name": {
-            "type": "string"
-          },
-          "row_count": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "rows": {},
-          "target": {
-            "$ref": "#/components/schemas/ReadTargetOutput"
-          }
-        }
+      "LoadEmbeddingGeneration": {
+        "type": "string",
+        "description": "Load capability for a batch touching a node type with declared `@embed`.",
+        "enum": [
+          "unsupported"
+        ]
       },
       "LoadMode": {
         "type": "string",
@@ -9155,6 +8973,18 @@
           "vector",
           "list"
         ]
+      },
+      "PlanRequest": {
+        "type": "object",
+        "required": [
+          "deployment"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
       },
       "PositionOutput": {
         "type": "object",
@@ -9287,7 +9117,7 @@
       },
       "QueryRequest": {
         "type": "object",
-        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/mutate` (or its deprecated alias `POST /change`) for write queries.\nField names are deliberately short (`query`, `name`) to match the GQ\nkeyword and the CLI `-e` flag.",
+        "description": "Inline read-query request for `POST /query`.\n\nMutations are rejected with 400 — use `POST /mutate` for write queries.\nField names are deliberately short (`query`, `name`) to match the GQ\nkeyword and the CLI `-e` flag.",
         "required": [
           "query"
         ],
@@ -9311,7 +9141,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead. May instead be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "settings": {
@@ -9332,7 +9162,8 @@
             ],
             "description": "Snapshot id to read from. Mutually exclusive with `branch`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ReadOutput": {
         "type": "object",
@@ -9366,46 +9197,6 @@
           "rows": {},
           "target": {
             "$ref": "#/components/schemas/ReadTargetOutput"
-          }
-        }
-      },
-      "ReadRequest": {
-        "type": "object",
-        "required": [
-          "query_source"
-        ],
-        "properties": {
-          "branch": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`."
-          },
-          "params": {
-            "description": "JSON object whose keys match the query's declared parameters."
-          },
-          "query_name": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Name of the query to run when `query_source` declares multiple. Optional\nwhen only one query is declared."
-          },
-          "query_source": {
-            "type": "string",
-            "description": "GQ query source. May declare one or more named queries; pick one with\n`query_name` if there is more than one.",
-            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
-          },
-          "settings": {
-            "description": "Refused when present: the deprecated route runs under the process\ndefaults. Typed as raw JSON so the refusal names the field instead of\na deserialization error."
-          },
-          "snapshot": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Snapshot id to read from. Mutually exclusive with `branch`."
           }
         }
       },
@@ -9458,10 +9249,17 @@
           "status",
           "state_revision",
           "served_graph_count",
-          "quarantined_graph_count",
+          "ready_graph_count",
+          "loading_graph_count",
+          "blocked_graph_count",
           "shutdown_grace_seconds"
         ],
         "properties": {
+          "blocked_graph_count": {
+            "type": "integer",
+            "description": "Unavailable graphs outside startup, including closed transitions.",
+            "minimum": 0
+          },
           "booted_serving_digest": {
             "type": [
               "string",
@@ -9469,18 +9267,23 @@
             ],
             "description": "The `config_digest` of the applied revision this process booted from.\nFixed for the life of the process: the server never reloads."
           },
-          "quarantined_graph_count": {
+          "loading_graph_count": {
             "type": "integer",
-            "description": "How many graphs the applied revision names that this process does\nnot serve, for any reason. `GET /graphs` names them.",
+            "description": "Registered graphs waiting for their initial startup admission.",
             "minimum": 0
           },
           "ready": {
             "type": "boolean",
-            "description": "False once shutdown has begun; the response is then 503."
+            "description": "False during shutdown or when a nonempty inventory has no ready graph."
+          },
+          "ready_graph_count": {
+            "type": "integer",
+            "description": "Registered graphs whose startup completed successfully.",
+            "minimum": 0
           },
           "served_graph_count": {
             "type": "integer",
-            "description": "How many graphs this process serves.",
+            "description": "Number of registered graphs, including blocked entries.",
             "minimum": 0
           },
           "shutdown_grace_seconds": {
@@ -9504,7 +9307,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`serving` or `draining`."
+            "description": "`loading`, `serving`, `degraded`, `blocked` or `draining`."
           }
         }
       },
@@ -9540,58 +9343,6 @@
           },
           "resource": {
             "type": "string"
-          }
-        }
-      },
-      "SchemaApplyOutput": {
-        "type": "object",
-        "required": [
-          "uri",
-          "supported",
-          "applied",
-          "step_count",
-          "graph_manifest_version",
-          "steps"
-        ],
-        "properties": {
-          "applied": {
-            "type": "boolean"
-          },
-          "graph_manifest_version": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "step_count": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "steps": {
-            "type": "array",
-            "items": {}
-          },
-          "supported": {
-            "type": "boolean"
-          },
-          "uri": {
-            "type": "string"
-          }
-        }
-      },
-      "SchemaApplyRequest": {
-        "type": "object",
-        "required": [
-          "schema_source"
-        ],
-        "properties": {
-          "allow_data_loss": {
-            "type": "boolean",
-            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior property data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
-          },
-          "schema_source": {
-            "type": "string",
-            "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",
-            "example": "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
           }
         }
       },
@@ -9632,6 +9383,12 @@
             "enum": [
               "v2"
             ]
+          },
+          "history_release_bytes": {
+            "type": "integer",
+            "description": "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
+            "maximum": 262144,
+            "minimum": 1024
           },
           "merge_lineage": {
             "type": "string",
@@ -9714,7 +9471,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. Branches of one graph can differ (v11 beside v12) while a\nv11 graph converts branch by branch on publish.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. This binary serves only its own storage-format version; a\ngraph at any other version is refused until it is upgraded offline or rebuilt.",
             "minimum": 0
           }
         }

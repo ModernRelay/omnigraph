@@ -90,43 +90,42 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
             ""
         }
     );
-    println!("route: {}", report.route.join(" -> "));
+    println!("route: {}", joined(&report.route, " -> "));
     println!(
         "completed handlers: {}",
-        report.completed_handlers.join(", ")
+        joined(&report.completed_handlers, ", ")
     );
     println!(
         "last durable completed boundary: {}",
         report
             .last_durable_completed_boundary
             .as_deref()
-            .unwrap_or("unknown")
+            .unwrap_or("none")
+    );
+    let work = &report.work;
+    println!(
+        "source: {} live refs, {} retired refs, {} orphan writers, {} legacy commits, \
+         {} bookkeeping versions, {} absent parents",
+        work.live_refs,
+        work.retired_refs,
+        work.orphan_writers,
+        work.legacy_commits,
+        work.bookkeeping_versions,
+        work.absent_parents
     );
     println!(
-        "work: {} metadata rows, {} retained snapshots, {} payload bytes copied, {} payload bytes rewritten",
-        report.work.metadata_rows,
-        report.work.retained_snapshots,
-        report.work.payload_bytes_copied,
-        report.work.payload_bytes_rewritten
+        "legacy objects: {} data files, {} id shards, {} writer shards, {} schema contents, \
+         {} bytes",
+        work.data_files,
+        work.id_shards,
+        work.writer_shards,
+        work.schema_contents,
+        work.legacy_bytes
     );
     println!(
-        "validation bytes: {}",
-        report
-            .work
-            .validation_bytes
-            .map_or_else(|| "unknown".into(), |v| v.to_string())
+        "census: {} reads, {} cells",
+        work.census_reads, work.census_cells
     );
-    for check in &report.work.deferred_checks {
-        println!("validation deferred until the preceding conversion completes: {check}");
-    }
-    for exclusion in &report.work.external_blob_exclusions {
-        println!("external bytes excluded from preservation: {exclusion}");
-    }
-    for property in &report.work.historical_blob_identity_limits {
-        println!(
-            "historical Blob delivery retains the pre-0.10 property-lifetime restriction: {property}"
-        );
-    }
     for finding in &report.findings {
         println!("{}: {}", finding.code, finding.message);
     }
@@ -137,10 +136,20 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
     }
     if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
         println!(
-            "Check is advisory. Stop all writers and maintenance and retain a verified backup before execution."
+            "Check is advisory. Keep the graph offline: stop all readers, writers and \
+             maintenance, retain a verified backup of the whole root, then run `omnigraph \
+             upgrade <graph>` without `--check`."
         );
     }
     Ok(())
+}
+
+fn joined(items: &[String], separator: &str) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(separator)
+    }
 }
 
 #[cfg(test)]
@@ -155,12 +164,12 @@ mod tests {
             "graph.omni",
             "--check",
             "--to-format",
-            "8",
+            "14",
             "--json",
         ])
         .unwrap();
         assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(8), json: true } if uri == "graph.omni")
+            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(14), json: true } if uri == "graph.omni")
         );
         assert_eq!(
             planes::command_capability(&cli.command),

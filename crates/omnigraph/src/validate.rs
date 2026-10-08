@@ -38,7 +38,7 @@ use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::loader::{
     composite_unique_key, format_tuple, validate_enum_constraints, validate_value_constraints,
 };
-use crate::table_store::TableStore;
+use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 
 /// A single integrity violation, surface-neutral. Maps to the merge path's
 /// [`MergeConflict`] today via [`Violation::into_merge_conflict`]; a write-path
@@ -602,16 +602,6 @@ async fn scan_filtered(ds: &Dataset, projection: &[&str], expr: Expr) -> Result<
     .map_err(OmniError::storage)
 }
 
-/// Scan `projection` from every row (no filter). Used to enumerate a table's
-/// committed ids when computing what an `Overwrite` removes.
-async fn scan_all(ds: &Dataset, projection: &[&str]) -> Result<Vec<RecordBatch>> {
-    TableStore::scan_stream_with(ds, Some(projection), None, None, false, |_| Ok(()))
-        .await?
-        .try_collect()
-        .await
-        .map_err(OmniError::storage)
-}
-
 /// Ids an `Overwrite` of `table_key` removes: committed ids in `base` that are
 /// NOT in `change`'s replacement image (`added ∪ changed`). The loader folds
 /// these into the change-set's `deleted_ids` so edge-RI (path-b) and cardinality
@@ -623,25 +613,37 @@ pub(crate) async fn overwrite_removed_ids(
     table_key: &str,
     change: &TableChange,
     system_columns: SystemColumns,
+    mut admit: impl FnMut(&str) -> Result<()>,
 ) -> Result<Vec<String>> {
     if base.dataset(table_key).is_none() {
         return Ok(Vec::new());
     }
-    let mut new_ids: HashSet<String> = HashSet::new();
+    let mut new_ids: HashSet<&str> = HashSet::new();
     for batch in change.value_batches() {
         let column = string_col(batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) {
-                new_ids.insert(column.value(i).to_string());
+                new_ids.insert(column.value(i));
             }
         }
     }
     let ds = base.open_lance_dataset(table_key).await?;
     let mut removed = Vec::new();
-    for batch in &scan_all(&ds, &[system_columns.id]).await? {
-        let column = string_col(batch, system_columns.id)?;
+    let mut stream = TableStore::scan_stream_bounded(
+        &ds,
+        Some(&[system_columns.id]),
+        None,
+        None,
+        false,
+        ID_SCAN_BATCH_ROWS,
+        ID_SCAN_BATCH_BYTES,
+    )
+    .await?;
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let column = string_col(&batch, system_columns.id)?;
         for i in 0..column.len() {
             if !column.is_null(i) && !new_ids.contains(column.value(i)) {
+                admit(column.value(i))?;
                 removed.push(column.value(i).to_string());
             }
         }

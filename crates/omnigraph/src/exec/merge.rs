@@ -1,5 +1,9 @@
 use super::*;
 use crate::changes::row_compare::{RawRow, rows_equal};
+use crate::db::manifest::HistoryReleaseBytes;
+use crate::ordered_cursor::{
+    HYDRATION_SCAN_BATCH_BYTES, KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject,
+};
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{
@@ -460,78 +464,13 @@ async fn cursor_rows_equal(a: Option<&CursorRow>, b: Option<&CursorRow>) -> Resu
     }
 }
 
-/// Per-chunk decoded-byte planning target when hydrating sorted keys back
-/// into complete logical rows. Planning uses the widest per-row average this
-/// cursor has measured (decayed geometrically so one wide region does not
-/// force single-row chunks over a later narrow tail) — but planning is an
-/// efficiency knob only. The memory bound does not depend on it: chunk
-/// hydration streams through a byte-governed scan and hard-charges every
-/// retained batch, so an over-budget chunk is dropped mid-stream and retried
-/// with half the rows regardless of how it was planned.
-pub(crate) const HYDRATION_CHUNK_TARGET_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
-/// Hard retained-byte ceiling for one hydration chunk. Crossing it aborts
-/// the chunk's scan and halves the row count (down to one row, which is
-/// always accepted — a single indivisible row must hydrate whatever its
-/// width; the staging writer's per-row envelope remains the authority for
-/// what a merge may actually write). Peak resident hydration is therefore
-/// bounded by this ceiling plus one in-flight scanner batch for every data
-/// shape, including widths no sampling could have predicted.
-pub(crate) const HYDRATION_CHUNK_HARD_BYTES: u64 = 2 * KEYED_WRITE_MAX_BYTES;
-/// First-chunk row count before any width measurement exists.
-pub(crate) const HYDRATION_CHUNK_SEED_ROWS: usize = 4;
-/// Row and decoded-byte targets for the hydration scan's emitted batches.
-/// Small batches make the hard charge granular: the accumulation check runs
-/// per batch, so the one uncharged in-flight batch stays near this byte
-/// target (an indivisible row still arrives as its own batch).
-const HYDRATION_SCAN_BATCH_ROWS: usize = 1024;
-const HYDRATION_SCAN_BATCH_BYTES: u64 = 8 * 1024 * 1024;
-
-/// One hydrated chunk: the scanned batches plus the (batch, row) position of
-/// every sorted key, so rows are emitted in key order without interleaving
-/// or copying batch data.
-struct HydratedChunk {
-    batches: Vec<RecordBatch>,
-    order: Vec<(usize, usize)>,
-}
-
-/// Outcome of one bounded chunk-scan attempt.
-enum ChunkScan {
-    Complete {
-        chunk: HydratedChunk,
-        bytes: u64,
-    },
-    OverBudget {
-        retained_bytes: u64,
-        retained_rows: usize,
-    },
-}
-
-/// An id-ordered stream of one snapshot's complete rows, produced in two
-/// phases so no payload column ever reaches a SortExec input:
-///
-/// 1. a narrow bounded ordered scan sorts only `id` + `_rowid` + `_rowaddr`
-///    (a few dozen bytes per row, far below the ordered-scan single-row hard
-///    cap that a wide logical row can otherwise trip), then
-/// 2. sorted keys are hydrated back into complete rows in bounded chunks via
-///    an unordered, fragment-scoped scan filtered to the chunk's exact
-///    `_rowaddr` set against the same pinned dataset. The scan's decode is
-///    byte-governed and streamed, every retained batch is hard-charged, and
-///    an over-budget chunk aborts and retries with half the rows — the
-///    per-chunk memory bound holds by construction for any row-width shape.
+/// An id-ordered stream of one snapshot's complete rows for the merge
+/// walks: the shared two-phase [`OrderedRowCursor`] (keys sorted, rows
+/// hydrated in bounded chunks) plus one row of look-ahead and the typed
+/// comparison unit each row needs.
 struct OrderedTableCursor {
-    key_stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
+    rows: OrderedRowCursor,
     dataset: Option<Dataset>,
-    table_key: String,
-    role: &'static str,
-    key_batch: Option<RecordBatch>,
-    key_row: usize,
-    hydrated: Option<HydratedChunk>,
-    hydrated_pos: usize,
-    /// Widest measured per-row average, decayed by half at each observation
-    /// so planning recovers geometrically after a wide region. Zero until the
-    /// first measurement; the seed row count governs until then. Planning
-    /// only — the retained-byte ceiling is enforced independently.
-    max_row_bytes: u64,
     peeked: Option<CursorRow>,
     /// When false, the adopt path builds the typed comparison unit only for
     /// common rows. New/deleted rows therefore avoid comparison work, while
@@ -596,48 +535,23 @@ impl OrderedTableCursor {
         role: &'static str,
         id_col: &'static str,
     ) -> Result<Self> {
-        let key_stream = if let Some(ds) = &dataset {
-            // A filtered scan is not a full-table scan; record no cursor-scan
-            // probe, so probe-count assertions keep counting full walks only.
-            if filter.is_none() {
-                crate::instrumentation::record_ordered_cursor_scan(
-                    KEYED_WRITE_MAX_ROWS,
-                    KEYED_WRITE_MAX_BYTES,
-                );
-            }
-            Some(Box::pin(
-                crate::table_store::TableStore::scan_stream_with(
-                    ds,
-                    Some(&[id_col]),
-                    filter,
-                    Some(vec![ColumnOrdering::asc_nulls_last(id_col.to_string())]),
-                    true,
-                    |scanner| {
-                        scanner.batch_size(KEYED_WRITE_MAX_ROWS);
-                        scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
-                        // `_rowaddr` addresses the hydration take against the
-                        // same pinned version; payload columns (including Blob
-                        // descriptors) arrive only through that take.
-                        scanner.with_row_address();
-                        Ok(())
-                    },
-                )
-                .await?,
-            ))
-        } else {
-            None
-        };
-
+        let rows = OrderedRowCursor::open(
+            dataset.clone(),
+            KeyOrder {
+                filter: filter.map(KeyFilter::Sql),
+                ..KeyOrder::full()
+            },
+            WalkSubject {
+                operation: "branch-merge",
+                table: table_key.to_string(),
+                role,
+            },
+            id_col,
+        )
+        .await?;
         Ok(Self {
-            key_stream,
+            rows,
             dataset,
-            table_key: table_key.to_string(),
-            role,
-            key_batch: None,
-            key_row: 0,
-            hydrated: None,
-            hydrated_pos: 0,
-            max_row_bytes: 0,
             peeked: None,
             eager_signatures,
             id_col,
@@ -658,332 +572,32 @@ impl OrderedTableCursor {
         self.next_row().await
     }
 
-    /// Attach the table and snapshot role this cursor serves to a typed
-    /// resource failure. The generic bounded ordered-scan executor cannot know
-    /// which merge snapshot it was reading; this layer is the one that does.
-    fn with_scan_context(&self, error: OmniError) -> OmniError {
-        match error {
-            OmniError::ResourceLimitExceeded {
-                resource,
-                limit,
-                actual,
-            } => OmniError::ResourceLimitExceeded {
-                resource: format!("{resource} for {} ({} snapshot)", self.table_key, self.role),
-                limit,
-                actual,
-            },
-            other => other,
-        }
-    }
-
-    /// Like [`Self::with_scan_context`], additionally naming the sorted-key id
-    /// range of the failing hydration take. Storage and manifest failures —
-    /// the shapes a take actually produces — keep their classification and
-    /// gain the context in-message via `with_context`.
-    fn with_hydration_context(&self, error: OmniError, first_id: &str, last_id: &str) -> OmniError {
-        match error {
-            OmniError::ResourceLimitExceeded {
-                resource,
-                limit,
-                actual,
-            } => OmniError::ResourceLimitExceeded {
-                resource: format!(
-                    "{resource} for {} ({} snapshot, rows '{first_id}'..='{last_id}')",
-                    self.table_key, self.role
-                ),
-                limit,
-                actual,
-            },
-            other => other.with_context(format!(
-                "branch-merge hydration for {} ({} snapshot, rows '{first_id}'..='{last_id}')",
-                self.table_key, self.role
-            )),
-        }
-    }
-
     async fn next_row(&mut self) -> Result<Option<CursorRow>> {
-        loop {
-            if let Some(chunk) = &self.hydrated {
-                if self.hydrated_pos < chunk.order.len() {
-                    let (batch_index, row_index) = chunk.order[self.hydrated_pos];
-                    self.hydrated_pos += 1;
-                    let batch = chunk.batches[batch_index].clone();
-                    let dataset = self.dataset.clone().ok_or_else(|| {
-                        OmniError::manifest("cursor row missing source dataset".to_string())
-                    })?;
-                    let typed = if self.eager_signatures {
-                        Some(RawRow::single(&dataset, &batch, row_index, self.id_col)?)
-                    } else {
-                        None
-                    };
-                    return Ok(Some(CursorRow {
-                        id: row_id_at(&batch, row_index, self.id_col)?,
-                        typed,
-                        dataset,
-                        batch,
-                        row_index,
-                        id_col: self.id_col,
-                    }));
-                }
-                self.hydrated = None;
-                self.hydrated_pos = 0;
-            }
-
-            if let Some(keys) = &self.key_batch {
-                if self.key_row < keys.num_rows() {
-                    self.hydrate_next_chunk().await?;
-                    continue;
-                }
-                self.key_batch = None;
-                self.key_row = 0;
-            }
-
-            let Some(stream) = self.key_stream.as_mut() else {
-                return Ok(None);
-            };
-            match stream.try_next().await {
-                Ok(Some(batch)) => {
-                    self.key_batch = Some(batch);
-                    self.key_row = 0;
-                }
-                Ok(None) => {
-                    self.key_stream = None;
-                    return Ok(None);
-                }
-                Err(err) => {
-                    return Err(self.with_scan_context(
-                        crate::table_store::TableStore::ordered_scan_error(err),
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Rows the next chunk may plan, from the pessimistic width estimate.
-    /// Planning only: the retained-byte ceiling bounds memory regardless of
-    /// this value; a good plan merely avoids abort-and-retry work.
-    fn planned_chunk_rows(&self) -> usize {
-        if self.max_row_bytes == 0 {
-            return HYDRATION_CHUNK_SEED_ROWS;
-        }
-        usize::try_from(HYDRATION_CHUNK_TARGET_BYTES / self.max_row_bytes)
-            .unwrap_or(KEYED_WRITE_MAX_ROWS)
-            .clamp(1, KEYED_WRITE_MAX_ROWS)
-    }
-
-    /// Hydrate the next bounded chunk of sorted keys into complete rows.
-    ///
-    /// The chunk is read through an unordered, fragment-scoped scan filtered
-    /// to exactly the chunk's `_rowaddr` set, so the decode is byte-governed
-    /// and streamed. Every retained batch is hard-charged; crossing the
-    /// retained ceiling drops the stream and retries with half the rows, so
-    /// peak memory is the ceiling plus one in-flight batch for any row-width
-    /// shape — no sample or estimate is load-bearing for the bound.
-    async fn hydrate_next_chunk(&mut self) -> Result<()> {
+        let Some(row) = self.rows.next().await? else {
+            return Ok(None);
+        };
         let dataset = self
             .dataset
             .clone()
-            .ok_or_else(|| OmniError::manifest("cursor keys missing source dataset".to_string()))?;
-        let keys = self
-            .key_batch
-            .clone()
-            .ok_or_else(|| OmniError::manifest_internal("hydration without a key batch"))?;
-        let start = self.key_row;
-        let available = keys.num_rows().saturating_sub(start).max(1);
-        let mut len = self.planned_chunk_rows().min(available);
-        loop {
-            match self.scan_chunk(&dataset, &keys, start, len).await? {
-                ChunkScan::Complete { chunk, bytes } => {
-                    crate::instrumentation::record_ordered_cursor_hydration(len, bytes);
-                    // Fold the measured chunk into the planning estimate with
-                    // decay: a wide region shrinks later plans immediately,
-                    // while a narrow tail recovers geometrically instead of
-                    // staying at single-row chunks forever.
-                    let average = (bytes / len as u64).max(1);
-                    self.max_row_bytes = average.max(self.max_row_bytes / 2);
-                    self.key_row = start + len;
-                    self.hydrated = Some(chunk);
-                    self.hydrated_pos = 0;
-                    return Ok(());
-                }
-                ChunkScan::OverBudget {
-                    retained_bytes,
-                    retained_rows,
-                } => {
-                    // Fold what was measured before the abort so both this
-                    // retry and future planning shrink; nothing oversized was
-                    // retained.
-                    let average = (retained_bytes / retained_rows.max(1) as u64).max(1);
-                    self.max_row_bytes = self.max_row_bytes.max(average);
-                    len = (len / 2).max(1);
-                }
-            }
-        }
-    }
-
-    /// One bounded chunk-scan attempt over `len` sorted keys from `start`.
-    /// Blob columns come back as descriptors (the typed comparator's identity
-    /// unit); `_rowid` and `_rowaddr` ride along for the comparator's Blob
-    /// tie-break and fragment-identity mapping. Rows are emitted in scan
-    /// order and mapped back to key order positionally — never copied.
-    async fn scan_chunk(
-        &mut self,
-        dataset: &Dataset,
-        keys: &RecordBatch,
-        start: usize,
-        len: usize,
-    ) -> Result<ChunkScan> {
-        use datafusion::prelude::{col, lit};
-
-        let addresses_column = keys
-            .column_by_name(lance_core::ROW_ADDR)
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::manifest_internal("ordered cursor key batch is missing row addresses")
-            })?;
-        let addresses: Vec<u64> = (start..start + len)
-            .map(|row| addresses_column.value(row))
-            .collect();
-        // The chunk's sorted key range is the only stable row identity safely
-        // available at this layer; carry it so an operator can find the
-        // offending rows without replaying the merge.
-        let first_id = row_id_at(keys, start, self.id_col)?;
-        let last_id = row_id_at(keys, start + len - 1, self.id_col)?;
-
-        let fragment_ids: HashSet<u64> = addresses.iter().map(|address| address >> 32).collect();
-        let fragments: Vec<lance_table::format::Fragment> = dataset
-            .get_fragments()
-            .into_iter()
-            .filter(|fragment| fragment_ids.contains(&fragment.metadata().id))
-            .map(|fragment| fragment.metadata().clone())
-            .collect();
-        if fragments.len() != fragment_ids.len() {
-            return Err(OmniError::manifest_internal(format!(
-                "ordered cursor hydration for {} ({} snapshot) could not resolve every chunk \
-                 fragment",
-                self.table_key, self.role
-            )));
-        }
-        let address_filter = col(lance_core::ROW_ADDR).in_list(
-            addresses.iter().map(|address| lit(*address)).collect(),
-            false,
-        );
-
-        let mut stream = crate::table_store::TableStore::scan_stream_with(
+            .ok_or_else(|| OmniError::manifest("cursor row missing source dataset".to_string()))?;
+        let typed = if self.eager_signatures {
+            Some(RawRow::single(
+                &dataset,
+                &row.batch,
+                row.row_index,
+                self.id_col,
+            )?)
+        } else {
+            None
+        };
+        Ok(Some(CursorRow {
+            id: row.id,
+            typed,
             dataset,
-            None,
-            None,
-            None,
-            true,
-            |scanner| {
-                scanner.with_fragments(fragments);
-                scanner.filter_expr(address_filter);
-                scanner.batch_size(HYDRATION_SCAN_BATCH_ROWS);
-                scanner.batch_size_bytes(HYDRATION_SCAN_BATCH_BYTES);
-                // Blob columns must yield DESCRIPTORS (not payloads) for the
-                // shared typed comparator's data-file identity.
-                scanner.blob_handling(lance_core::datatypes::BlobHandling::BlobsDescriptions);
-                scanner.with_row_address();
-                Ok(())
-            },
-        )
-        .await
-        .map_err(|error| self.with_hydration_context(error, &first_id, &last_id))?;
-
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut retained_bytes = 0u64;
-        let mut retained_rows = 0usize;
-        loop {
-            match stream.try_next().await {
-                Ok(Some(batch)) => {
-                    // Compact before charging and retaining: scanned arrays
-                    // can be slices of larger decode buffers, so an
-                    // uncompacted batch both overcounts (shared parents) and
-                    // pins those parent allocations for as long as the chunk
-                    // is retained. The copy makes the retained-byte charge
-                    // measure exactly the rows the chunk owns.
-                    let indices = UInt64Array::from_iter_values(0..batch.num_rows() as u64);
-                    let batch = arrow_select::take::take_record_batch(&batch, &indices)
-                        .map_err(OmniError::arrow_internal)?;
-                    retained_bytes = retained_bytes.saturating_add(
-                        u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
-                    );
-                    retained_rows += batch.num_rows();
-                    batches.push(batch);
-                    // A single key must hydrate whatever its width — that one
-                    // indivisible row is the only allowance above the ceiling.
-                    if len > 1 && retained_bytes > HYDRATION_CHUNK_HARD_BYTES {
-                        return Ok(ChunkScan::OverBudget {
-                            retained_bytes,
-                            retained_rows,
-                        });
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    return Err(self.with_hydration_context(
-                        crate::table_store::TableStore::ordered_scan_error(error),
-                        &first_id,
-                        &last_id,
-                    ));
-                }
-            }
-        }
-
-        // Map every sorted key to its scanned row; any mismatch means this
-        // hydration cannot be trusted to feed the classification loop.
-        let mut by_address: HashMap<u64, (usize, usize)> = HashMap::with_capacity(len);
-        for (batch_index, batch) in batches.iter().enumerate() {
-            let scanned = batch
-                .column_by_name(lance_core::ROW_ADDR)
-                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(
-                        "ordered cursor hydration batch is missing row addresses",
-                    )
-                })?;
-            for row in 0..batch.num_rows() {
-                if by_address
-                    .insert(scanned.value(row), (batch_index, row))
-                    .is_some()
-                {
-                    return Err(OmniError::manifest_internal(format!(
-                        "ordered cursor hydration for {} ({} snapshot) returned a duplicate row",
-                        self.table_key, self.role
-                    )));
-                }
-            }
-        }
-        if retained_rows != len {
-            return Err(OmniError::manifest_internal(format!(
-                "ordered cursor hydration for {} ({} snapshot) returned {} rows for {} keys",
-                self.table_key, self.role, retained_rows, len
-            )));
-        }
-        let mut order = Vec::with_capacity(len);
-        for (offset, address) in addresses.iter().enumerate() {
-            let &(batch_index, row) = by_address.get(address).ok_or_else(|| {
-                OmniError::manifest_internal(format!(
-                    "ordered cursor hydration for {} ({} snapshot) is missing a requested row",
-                    self.table_key, self.role
-                ))
-            })?;
-            if row_id_at(&batches[batch_index], row, self.id_col)?
-                != row_id_at(keys, start + offset, self.id_col)?
-            {
-                return Err(OmniError::manifest_internal(format!(
-                    "ordered cursor hydration for {} ({} snapshot) returned a row out of key \
-                     order",
-                    self.table_key, self.role
-                )));
-            }
-            order.push((batch_index, row));
-        }
-
-        Ok(ChunkScan::Complete {
-            chunk: HydratedChunk { batches, order },
-            bytes: retained_bytes,
-        })
+            batch: row.batch,
+            row_index: row.row_index,
+            id_col: self.id_col,
+        }))
     }
 }
 
@@ -3281,22 +2895,45 @@ fn validation_schema(
     Ok(Arc::new(arrow_schema::Schema::new(fields)))
 }
 
+/// Same table state: every `DatasetEntry` field except `type_key` (the lookup key)
+/// and `manifest_version` (which `__manifest` publish wrote the row).
 fn same_manifest_state(
     left: Option<&crate::db::DatasetEntry>,
     right: Option<&crate::db::DatasetEntry>,
 ) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
-            left.identity == right.identity
-                && left.dataset_path == right.dataset_path
-                && left.published_dataset_version == right.published_dataset_version
-                && left.native_dataset_branch == right.native_dataset_branch
-                && left.entity_count == right.entity_count
-                && left.version_metadata == right.version_metadata
+            let crate::db::DatasetEntry {
+                identity,
+                type_key: _,
+                dataset_path,
+                published_dataset_version,
+                native_dataset_branch,
+                entity_count,
+                version_metadata,
+                manifest_version: _,
+            } = left;
+            *identity == right.identity
+                && *dataset_path == right.dataset_path
+                && *published_dataset_version == right.published_dataset_version
+                && *native_dataset_branch == right.native_dataset_branch
+                && *entity_count == right.entity_count
+                && *version_metadata == right.version_metadata
         }
         (None, None) => true,
         _ => false,
     }
+}
+
+/// Same graph state: equal `schema_contract` and `same_manifest_state` for every table.
+fn same_graph_state(left: &Snapshot, right: &Snapshot) -> bool {
+    left.schema_contract() == right.schema_contract()
+        && left.datasets().chain(right.datasets()).all(|entry| {
+            same_manifest_state(
+                left.dataset(&entry.type_key),
+                right.dataset(&entry.type_key),
+            )
+        })
 }
 
 fn ensure_merge_identity_compatible(
@@ -3756,15 +3393,9 @@ async fn validate_merge_candidates(
     }
 }
 
-/// Whether exact pure-insert provenance already discharges every logical check
-/// that would otherwise require materializing a fast-forward `ChangeSet`.
-///
-/// This deliberately recognizes only node tables with identity-backed `@key`
-/// semantics and no additional value, enum, or non-key uniqueness constraint.
-/// Edge candidates retain validation because RI/cardinality are cross-table;
-/// every unfamiliar candidate shape also retains the general evaluator. The
-/// source rows were accepted under the same schema identity, and strict exact-
-/// `id` publication rechecks their only remaining target interaction.
+/// Whether certified pure inserts into node types constrained only by `@key` discharge
+/// every check a fast forward's `ChangeSet` would run: the target holds the base's rows,
+/// and edges keep validation for their cross-table checks.
 fn proven_fast_forward_needs_no_validation(
     catalog: &Catalog,
     candidates: &HashMap<String, CandidateTableState>,
@@ -3794,16 +3425,6 @@ fn proven_fast_forward_needs_no_validation(
                     .values()
                     .all(|property| property.enum_values.is_none())
         })
-}
-
-pub(crate) fn row_id_at(batch: &RecordBatch, row: usize, id_col: &str) -> Result<String> {
-    let ids = batch
-        .column_by_name(id_col)
-        .ok_or_else(|| OmniError::manifest(format!("batch missing '{id_col}' column")))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("'{id_col}' column is not Utf8")))?;
-    Ok(ids.value(row).to_string())
 }
 
 fn adopt_advances_head(
@@ -5156,9 +4777,6 @@ impl Session {
             },
             actor_id,
         )?;
-        self.ensure_schema_apply_idle("branch_merge")
-            .await
-            .map_err(OmniError::before_effect)?;
         // Keep the planning/publication future out of the public API's callers;
         // deeply composed loads and merges otherwise retain large debug
         // construction frames throughout execution. Poll it in the same task.
@@ -5167,6 +4785,7 @@ impl Session {
             target,
             actor_id,
             self.settings().merge_lineage(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
         ))
         .await;
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
@@ -5185,101 +4804,26 @@ impl Session {
 }
 
 impl Omnigraph {
-    /// The merge base over the two captured lineages, with the records of
-    /// merged parents that live in other branches read from those branches;
-    /// a record no live branch holds leaves the walk at the base it found.
+    /// Prove a base from captured records, then read only addressed history
+    /// blocks needed by the exact ancestry walk.
     async fn resolve_merge_base(
-        &self,
-        source_commits: &crate::db::commit_graph::CommitGraphSnapshot,
-        target_commits: &crate::db::commit_graph::CommitGraphSnapshot,
+        source: &crate::db::commit_graph::CommitGraph,
+        target: &crate::db::commit_graph::CommitGraph,
         source_commit_id: &str,
         target_commit_id: &str,
-        merging_branches: &[Option<&str>],
     ) -> Result<crate::db::commit_graph::GraphCommit> {
-        let mut resolver = crate::db::commit_graph::MergeBaseResolver::new(
-            source_commits,
-            target_commits,
-            source_commit_id,
-            target_commit_id,
-        );
-        let mut other_branches: Option<Vec<String>> = None;
-        let mut retired_imported = false;
-        loop {
-            let search = resolver.search();
-            let resolved = !search.needs_import();
-            let next_branch = if resolved {
-                None
-            } else {
-                if other_branches.is_none() {
-                    other_branches = Some(
-                        self.branch_list()
-                            .await?
-                            .into_iter()
-                            .filter(|branch| {
-                                !merging_branches.contains(&Some(branch.as_str()))
-                                    && !(branch == "main" && merging_branches.contains(&None))
-                            })
-                            .collect(),
-                    );
-                }
-                other_branches.as_mut().and_then(Vec::pop)
-            };
-            let Some(branch) = next_branch else {
-                if !resolved && !retired_imported {
-                    retired_imported = true;
-                    for (_, graph) in ManifestCoordinator::retired_commit_graphs(self.uri()).await?
-                    {
-                        if !resolver.search().needs_import() {
-                            break;
-                        }
-                        resolver.import(graph.load_commits().await?)?;
-                    }
-                    continue;
-                }
-                let both_sides: Vec<&String> = search
-                    .unresolved_source
-                    .iter()
-                    .filter(|id| search.unresolved_target.contains(id))
-                    .collect();
-                if !both_sides.is_empty() {
-                    tracing::warn!(
-                        commits = ?both_sides,
-                        "merge lineage names commits no live branch holds that both branches \
-                         descend from; the merge base may be older than the true one"
-                    );
-                } else if !resolved {
-                    tracing::debug!(
-                        source = ?search.unresolved_source,
-                        target = ?search.unresolved_target,
-                        "merge lineage names commits no live branch holds; the merge base is \
-                         chosen from the reachable history"
-                    );
-                }
-                return search.base.ok_or_else(|| {
-                    OmniError::manifest(
-                        "captured branch commits are unavailable or have no common ancestor"
-                            .to_string(),
-                    )
-                });
-            };
-            let branch = Some(branch.as_str()).filter(|b| *b != "main");
-            let rows = match ManifestCoordinator::read_graph_lineage_at(self.uri(), branch).await {
-                Ok((rows, _)) => rows,
-                Err(OmniError::BranchNotFound { .. }) => {
-                    tracing::debug!(
-                        branch = ?branch,
-                        "branch listed for merge-base resolution was deleted before its \
-                         lineage was read"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            resolver.import(
-                rows.into_iter()
-                    .map(crate::db::commit_graph::graph_commit_from_manifest_row),
-            )?;
+        if source.head().graph_commit_id != source_commit_id
+            || target.head().graph_commit_id != target_commit_id
+        {
+            return Err(OmniError::manifest_internal(
+                "captured merge heads do not match the accepted inputs",
+            ));
         }
+        source.merge_base(target).await?.ok_or_else(|| {
+            OmniError::manifest(
+                "captured branch commits are unavailable or have no common ancestor".to_string(),
+            )
+        })
     }
 
     async fn branch_merge_impl(
@@ -5288,16 +4832,11 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
         lineage: MergeLineage,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<MergeResult> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
         );
-        if is_internal_system_branch(source) || is_internal_system_branch(target) {
-            return Err(OmniError::manifest(format!(
-                "branch_merge does not allow internal system refs ('{}' -> '{}')",
-                source, target
-            )));
-        }
         let source_branch = Omnigraph::normalize_branch_name(source)?;
         let target_branch = Omnigraph::normalize_branch_name(target)?;
         if source_branch == target_branch {
@@ -5306,29 +4845,11 @@ impl Omnigraph {
             ));
         }
 
-        let relevant_branches = [source_branch.as_deref(), target_branch.as_deref()];
-        // Branch merge is still a legacy per-table publisher, but its graph-ref
-        // authority must be stable for the complete prepare -> publish window.
-        // First install any pending schema contract of this handle, then join the
-        // same root-shared schema -> branch order used by native branch controls.
-        // Holding both branch gates through publication prevents a target
-        // delete/recreate from reusing the branch name underneath a plan (ABA).
-        let completed_prior_work = self.settle_pending_schema_install().await?;
-        let preparation_error = |error: OmniError| {
-            if completed_prior_work {
-                error.without_pre_effect_evidence()
-            } else {
-                error.before_effect()
-            }
-        };
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
         let _branch_guards = self
             .write_queue()
             .acquire_branches(&[source_branch.clone(), target_branch.clone()])
             .await;
-        self.ensure_schema_apply_not_locked("branch_merge")
-            .await
-            .map_err(preparation_error)?;
         // Capture each branch as one coherent RFC-022 authority token plus
         // immutable snapshot. The target token is the coarse publish read set;
         // the source token pins the exact merge input without requiring the
@@ -5336,7 +4857,7 @@ impl Omnigraph {
         let (source_txn, target_txn, source_commits, target_commits) = self
             .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
             .await
-            .map_err(preparation_error)?;
+            .map_err(OmniError::before_effect)?;
         let source_head_commit_id = source_txn
             .effective_graph_head
             .clone()
@@ -5345,16 +4866,14 @@ impl Omnigraph {
             .effective_graph_head
             .clone()
             .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
-        let base_commit = self
-            .resolve_merge_base(
-                &source_commits,
-                &target_commits,
-                &source_head_commit_id,
-                &target_head_commit_id,
-                &relevant_branches,
-            )
-            .await
-            .map_err(preparation_error)?;
+        let base_commit = Self::resolve_merge_base(
+            &source_commits.graph,
+            &target_commits.graph,
+            &source_head_commit_id,
+            &target_head_commit_id,
+        )
+        .await
+        .map_err(OmniError::before_effect)?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
@@ -5364,7 +4883,15 @@ impl Omnigraph {
                 commit: None,
             });
         }
-        let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
+        let head_is_base = base_commit.graph_commit_id == target_head_commit_id;
+        let merged_parent = source_commits.into_records(&base_commit.graph_commit_id);
+        if merged_parent.head.commit.graph_commit_id != source_head_commit_id {
+            return Err(OmniError::manifest_internal(format!(
+                "the captured source head record names commit '{}', and the captured source \
+                 head is '{source_head_commit_id}'",
+                merged_parent.head.commit.graph_commit_id
+            )));
+        }
 
         let witness = target_txn.authority.staging_witness()?;
         let mut input_guard = crate::db::manifest::retention::MergeInputGuard::new(
@@ -5374,7 +4901,7 @@ impl Omnigraph {
         let preparation = async {
             input_guard.pin(source_txn.manifest_probe.dataset()).await?;
             input_guard.pin(target_txn.manifest_probe.dataset()).await?;
-            let base_snapshot = if is_fast_forward {
+            let base_snapshot = if head_is_base {
                 target_txn.base.clone()
             } else {
                 let base =
@@ -5404,6 +4931,7 @@ impl Omnigraph {
                 return Err(error);
             }
         };
+        let is_fast_forward = head_is_base || same_graph_state(&base_snapshot, &target_txn.base);
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;
@@ -5423,10 +4951,11 @@ impl Omnigraph {
             source_branch.as_deref(),
             target_branch.as_deref(),
             &target_head_commit_id,
-            &source_head_commit_id,
+            merged_parent,
             is_fast_forward,
             actor_id,
             lineage,
+            history_release_bytes,
         ))
         .await;
         if !merge_result
@@ -5468,10 +4997,11 @@ impl Omnigraph {
         source_branch: Option<&str>,
         target_branch: Option<&str>,
         target_head_commit_id: &str,
-        source_head_commit_id: &str,
+        merged_parent: crate::db::manifest::BranchRecords,
         is_fast_forward: bool,
         actor_id: Option<&str>,
         lineage: MergeLineage,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5942,9 +5472,9 @@ impl Omnigraph {
             })
             .collect::<crate::db::manifest::ExpectedTableVersions>();
         let mut merge_lineage = self
-            .new_lineage_intent_for_branch(target_branch, actor_id)
+            .new_lineage_intent_for_branch(target_branch, actor_id, history_release_bytes)
             .await?;
-        merge_lineage.merged_parent_commit_id = Some(source_head_commit_id.to_string());
+        merge_lineage.merged_parent = Some(merged_parent);
 
         // RFC 0067: every HEAD-advancing candidate chains its chunks detached
         // from the pin captured before classification, and a first-touch
