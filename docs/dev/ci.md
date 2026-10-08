@@ -131,7 +131,13 @@ resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
 scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
 cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
-`lance_version_columns` and `forbidden_apis`. The script's `--self-test` pins
+`lance_version_columns` and `forbidden_apis`. All four select the
+`Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude
+omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
+graph, the one `Test Workspace` builds, and the engine scopes reuse the
+crossversion scope's build; a scope that selected `-p omnigraph-engine
+--features failpoints` resolved a third graph, about 20 minutes warm. The
+script's `--self-test` pins
 the scopes, the predecessor build and install scripts (compared exactly) and
 the required case names, so removing or altering one fails `Check Workflow Action Pins` and
 this job. The 90-minute budget covers two cold builds into one target
@@ -336,7 +342,10 @@ in a job must not change the dependency graph: it selects packages whose
 graph the first invocation already built, or it rebuilds every crate whose
 features differ (issue #755 was `GQT (ordinary)`
 running the seam guard as an engine integration test, whose
-dev-dependencies resolve a second graph, 49 minutes cold against 45).
+dev-dependencies resolve a second graph, 49 minutes cold against 45; the
+Azurite job ran its owners under six per-crate selections, four of them
+with the Lance stack, 89 minutes on `main`). A job that runs several owners
+names one selection once and passes each owner only its target.
 
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
 pin with a bare `rustup toolchain install`; the rustc version is part of
@@ -363,8 +372,11 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   context, and after merge, on tags, and by manual dispatch: the configured
   Azure owners run nowhere else, so a change that removes or renames one
   reports on the pull request instead of first appearing on `main`; wait for
-  it before clicking Merge when ready. Its 90-minute ceiling is the cold-cache
-  envelope; a warm run takes minutes. A red run on a pull request that touched
+  it before clicking Merge when ready. Every owner runs under the `Test
+  Workspace` selection (`--workspace --exclude omnigraph-gqt --exclude
+  omnigraph-dst --features "$FAILPOINT_FEATURES"`) and names only its
+  target, so the job builds one Lance graph. Its 90-minute ceiling is the
+  cold-cache envelope; a warm run takes minutes. A red run on a pull request that touched
   no object-store code, or one that names no test (the image pull, Azurite
   readiness), is inherited from `main` or from infrastructure: compare with
   the latest `main` run before reading it as the pull request's.
