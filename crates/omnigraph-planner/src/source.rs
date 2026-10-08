@@ -49,6 +49,8 @@ pub struct NodeTypeSpec {
     pub schema: SchemaRef,
     pub key: Vec<String>,
     pub object_columns: Vec<String>,
+    /// The projected node members, with logical names such as `@id`.
+    pub object_fields: arrow_schema::Fields,
     /// The table's manifest-resident row count (`entity_count`); `None` when
     /// the table is absent from the pinned snapshot.
     pub row_count: Option<u64>,
@@ -72,7 +74,6 @@ pub struct ExpandStatistics {
     pub edge_count: u64,
     pub src_node_count: u64,
     pub dst_node_count: u64,
-    pub same_type: bool,
     pub max_frontier_cap: u64,
     pub max_hops_cap: u32,
 }
@@ -174,6 +175,12 @@ pub trait PlanSource {
         Traversal::Auto
     }
 
+    /// The finite query-wide traversal allowance; present only for statements
+    /// using edge selections, including selections inside correlated blocks.
+    fn traversal_work_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// The session's `ann_nprobes` setting, the probe cap a `nearest` scan
     /// carries; `None` is no cap. The plan records the value it read.
     fn ann_nprobes(&self) -> Option<usize> {
@@ -197,6 +204,7 @@ pub struct MemorySource {
     expand_statistics: Vec<(String, Direction, ExpandStatistics)>,
     edge_datasets: HashMap<String, DatasetPin>,
     traversal: Option<Traversal>,
+    traversal_work_limit: Option<u64>,
     ann_nprobes: Option<usize>,
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
@@ -252,6 +260,11 @@ impl MemorySource {
 
     pub fn with_traversal(mut self, traversal: Traversal) -> Self {
         self.traversal = Some(traversal);
+        self
+    }
+
+    pub fn with_traversal_work_limit(mut self, limit: u64) -> Self {
+        self.traversal_work_limit = Some(limit);
         self
     }
 
@@ -316,6 +329,10 @@ impl PlanSource for MemorySource {
 
     fn traversal(&self) -> Traversal {
         self.traversal.unwrap_or(Traversal::Auto)
+    }
+
+    fn traversal_work_limit(&self) -> Option<u64> {
+        self.traversal_work_limit
     }
 
     fn ann_nprobes(&self) -> Option<usize> {

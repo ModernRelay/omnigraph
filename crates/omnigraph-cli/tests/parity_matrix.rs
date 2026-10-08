@@ -323,8 +323,30 @@ fn parity_branch_merge() {
     let p = parity();
     let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"]);
     assert_parity("branch create (merge setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query add() { insert Person { name: \"Receipt\", age: 31 } }",
+        "--json",
+    ]);
+    assert_write_parity("merge source write", &l, &r);
+    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    assert_write_parity("branch merge own publication", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["source"], "feature");
+        assert_eq!(payload["target"], "main");
+        assert_eq!(payload["commit"]["graph_branch"], serde_json::Value::Null);
+    }
     let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_parity("branch merge", &l, &r);
+    assert_eq!(parse_stdout_json(&l)["outcome"], "already_up_to_date");
+    assert_eq!(
+        parse_stdout_json(&l).get("commit"),
+        Some(&serde_json::Value::Null)
+    );
     // `--delete-branch` composes merge + delete at each arm's own boundary
     // (embedded: two engine calls; remote: the server handler) — this row is
     // the referee that keeps the two composition sites from drifting.
@@ -333,15 +355,82 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        "feature2",
+        " feature2 ",
         "--into",
-        "main",
+        " main ",
         "--delete-branch",
         "--json",
     ]);
     assert_parity("branch merge --delete-branch", &l, &r);
+    for output in [&l, &r] {
+        assert!(output.status.success(), "{output:?}");
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["source"], "feature2");
+        assert_eq!(payload["target"], "main");
+        assert_eq!(payload["branch_deleted"], true);
+    }
     let (l, r) = p.run(&["branch", "list", "--json"]);
     assert_parity("branch list (post delete-branch)", &l, &r);
+    assert!(
+        !parse_stdout_json(&l)["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "feature2")
+    );
+
+    let (l, r) = p.run(&["branch", "create", "retained", "--json"]);
+    assert_parity("branch create (deletion refusal setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "-e",
+        "query add() { insert Person { name: \"Retained\", age: 32 } }",
+        "--json",
+    ]);
+    assert_write_parity("refused deletion source write", &l, &r);
+    let (l, r) = p.run(&[
+        "branch",
+        "merge",
+        "main",
+        "--into",
+        "retained",
+        "--delete-branch",
+        "--json",
+    ]);
+    assert_write_parity("merge succeeds despite source deletion refusal", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert_eq!(payload["branch_deleted"], false);
+        assert!(payload["branch_delete_error_details"]["code"].is_string());
+        assert!(payload.get("branch_delete_error").is_none());
+    }
+    let (l, r) = p.run(&["branch", "list", "--json"]);
+    assert_parity("branch list (source retained after refusal)", &l, &r);
+    assert!(
+        parse_stdout_json(&l)["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "main")
+    );
+
+    let before = p.run(&["commit", "list", "--json"]);
+    for (source, target) in [(" ", "main"), ("retained", "\t")] {
+        let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
+        for output in [&l, &r] {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("branch merge source and target must not be empty"),
+                "{output:?}"
+            );
+        }
+    }
+    let after = p.run(&["commit", "list", "--json"]);
+    for (before, after) in [(&before.0, &after.0), (&before.1, &after.1)] {
+        assert!(before.status.success() && after.status.success());
+        assert_eq!(parse_stdout_json(before), parse_stdout_json(after));
+    }
 }
 
 fn listed_statement_names(output: &std::process::Output) -> Vec<String> {
@@ -384,7 +473,7 @@ fn parity_branch_statements() {
     assert_write_parity("mutate on the statement branch", &l, &r);
     let (l, r) = p.run(&["mutate", "-e", "branch merge stmt into main", "--json"]);
     assert_write_parity(
-        "branch merge statement (fast_forward: both arms report the target's new head)",
+        "branch merge statement (fast_forward: both arms report their own publication)",
         &l,
         &r,
     );
@@ -521,6 +610,159 @@ fn parity_load() {
         "bulk Overwrite remote arm failed: {r:?}"
     );
     assert_write_parity("load --mode overwrite above keyed limit", &l, &r);
+
+    // The engine creates --from's branch before parsing the load payload. A
+    // later refusal must describe the whole invocation, never imply that the
+    // branch was not created or that the load can be blindly replayed.
+    std::fs::write(&data, "not valid graph NDJSON\n").unwrap();
+    let (l, r) = p.run(&[
+        "load",
+        "--mode",
+        "append",
+        "--data",
+        data.to_str().unwrap(),
+        "--branch",
+        "partial-load",
+        "--from",
+        "main",
+        "--json",
+    ]);
+    for (arm, output) in [("local", &l), ("remote", &r)] {
+        assert_eq!(output.status.code(), Some(1), "{arm}: {output:?}");
+        let output = parse_stdout_json(output);
+        assert_eq!(output["command_outcome"]["execution"], "unknown", "{arm}");
+        assert_eq!(output["command_outcome"]["effects"], "unknown", "{arm}");
+        assert_ne!(output["command_outcome"]["action"], "retry", "{arm}");
+    }
+    let (l, r) = p.run(&["branch", "list", "--json"]);
+    assert_parity("compound load retained the created branch", &l, &r);
+    for output in [&l, &r] {
+        let payload = parse_stdout_json(output);
+        assert!(
+            payload["branches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "partial-load")
+        );
+    }
+}
+
+#[test]
+fn parity_load_embedding_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("local.omni");
+    let schema = temp.path().join("embeddings.pg");
+    std::fs::write(
+        &schema,
+        format!(
+            "{}\nnode Doc {{ slug: String @key body: String embedding: Vector(2)? @embed(body) }}\n",
+            std::fs::read_to_string(fixture("test.pg")).unwrap(),
+        ),
+    )
+    .unwrap();
+    let cluster_dir = parity_configs_with_schema(temp.path(), &local, &schema);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let p = Parity {
+        _temp: temp,
+        local,
+        server,
+        blob_external_uri: None,
+    };
+    let data = p.local.parent().unwrap().join("embeddings.jsonl");
+    std::fs::write(&data, concat!(
+        r#"{"type":"Doc","data":{"slug":"omitted","body":"missing vector"}}"#,
+        "\n",
+        r#"{"type":"Doc","data":{"slug":"supplied","body":"keep vector","embedding":[0.25,0.75]}}"#,
+    )).unwrap();
+    {
+        let verb = "load";
+        for structured in [true, false] {
+            let mut args = vec![
+                verb,
+                "--branch",
+                "main",
+                "--mode",
+                "merge",
+                "--data",
+                data.to_str().unwrap(),
+            ];
+            if structured {
+                args.push("--json");
+            }
+            let (local, remote) = p.run(&args);
+            for (arm, output) in [("local", &local), ("remote", &remote)] {
+                assert!(output.status.success(), "{verb} {arm}: {output:?}");
+                if structured {
+                    assert_eq!(
+                        parse_stdout_json(output)["embedding_generation"],
+                        "unsupported",
+                        "{verb} {arm}"
+                    );
+                } else {
+                    let human = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        human.contains("Loads do not generate embeddings."),
+                        "{verb} {arm}: {human}"
+                    );
+                    assert!(human.contains("omnigraph embed"), "{verb} {arm}: {human}");
+                }
+            }
+            if structured {
+                assert_write_parity("load embedding diagnostics", &local, &remote);
+            }
+        }
+    }
+    let (local, remote) = p.run(&[
+        "query",
+        "-e",
+        "query docs() { match { $d: Doc } return { $d.slug, $d.embedding } order { $d.slug asc } }",
+        "--json",
+    ]);
+    // Each arm has independently published commits; compare their contents,
+    // not the intentionally different graph-commit identities.
+    for output in [&local, &remote] {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            parse_stdout_json(output)["rows"],
+            serde_json::json!([
+                {"d.slug": "omitted"},
+                {"d.slug": "supplied", "d.embedding": [0.25, 0.75]},
+            ])
+        );
+    }
+
+    std::fs::write(
+        &data,
+        r#"{"type":"Person","data":{"name":"Plain","age":1}}"#,
+    )
+    .unwrap();
+    {
+        let verb = "load";
+        let (local, remote) = p.run(&[
+            verb,
+            "--branch",
+            "main",
+            "--mode",
+            "merge",
+            "--data",
+            data.to_str().unwrap(),
+            "--json",
+        ]);
+        for output in [&local, &remote] {
+            assert!(output.status.success(), "{verb}: {output:?}");
+            assert_eq!(
+                parse_stdout_json(output).get("embedding_generation"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+    }
 }
 
 #[test]
@@ -555,6 +797,176 @@ fn parity_export() {
         local_lines, remote_lines,
         "export: JSONL streams diverge (left=local, right=remote)"
     );
+
+    #[cfg(unix)]
+    assert_slow_export_and_baseline_complete(&p);
+}
+
+/// Exercise the actual Hyper/socket ownership boundary. A Tower body consumer
+/// cannot reproduce a transport retaining yielded chunks behind a full socket.
+#[cfg(unix)]
+fn assert_slow_export_and_baseline_complete(p: &Parity) {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let data = p._temp.path().join("slow-export.jsonl");
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&data).unwrap());
+    for row in 0..4096 {
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "type": "Person",
+                "data": {"name": format!("slow-{row:04}-{}", "x".repeat(2048)), "age": 12}
+            }),
+        )
+        .unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    file.flush().unwrap();
+    let (local, remote) = p.run(&[
+        "load",
+        "--mode",
+        "merge",
+        "--data",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_write_parity("slow export fixture", &local, &remote);
+    let expected = output_success(cli().args(["export", "--store", p.local.to_str().unwrap()]));
+    assert!(
+        expected.stdout.len() > 8 * 1024 * 1024,
+        "fixture must exceed socket buffers"
+    );
+
+    let address = p.server.base_url.strip_prefix("http://").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    for route in ["export", "changes/baseline"] {
+        let mut socket = runtime.block_on(async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            // Negotiate TCP with the small receive buffer. Shrinking it after
+            // connect can throttle Linux loopback even after reads resume.
+            socket.set_recv_buffer_size(16 * 1024).unwrap();
+            socket
+                .connect(address.parse().unwrap())
+                .await
+                .unwrap()
+                .into_std()
+                .unwrap()
+        });
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let request = r#"{"branch":"main"}"#;
+        write!(socket,
+            "POST /graphs/parity/{route} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer parity-tok\r\n{}: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{request}",
+            omnigraph_api_types::HTTP_API_CONTRACT_HEADER,
+            omnigraph_api_types::HTTP_API_CONTRACT,
+            request.len(),
+        ).unwrap();
+        let mut first = [0; 4096];
+        let count = socket.read(&mut first).unwrap();
+        assert!(count > 0);
+        let mut wire = first[..count].to_vec();
+        // A headers-only first read does not prove export production started.
+        // Consume a little body data before holding the receive window closed.
+        let first_body_deadline = Instant::now() + Duration::from_secs(15);
+        while !wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .is_some_and(|offset| wire.len() > offset + 4 + 64)
+        {
+            let remaining = first_body_deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: no response body arrived");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut first).unwrap();
+            assert!(count > 0, "{route}: response closed before body data");
+            wire.extend_from_slice(&first[..count]);
+            assert!(wire.len() < 64 * 1024, "{route}: invalid response headers");
+        }
+        // This is a protocol-deadline regression, not a throughput threshold:
+        // socket backpressure must outlive the 250 ms admission timeout.
+        std::thread::sleep(Duration::from_secs(2));
+        let drain_started = Instant::now();
+        let deadline = drain_started + Duration::from_secs(30);
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{route}: response did not complete");
+            socket.set_read_timeout(Some(remaining)).unwrap();
+            let count = socket.read(&mut buffer).unwrap_or_else(|error| {
+                panic!(
+                    "{route}: response read failed after {:?} and {} bytes: {error}\nserver stderr:\n{}",
+                    drain_started.elapsed(),
+                    wire.len(),
+                    p.server.stderr()
+                )
+            });
+            if count == 0 {
+                break;
+            }
+            wire.extend_from_slice(&buffer[..count]);
+            assert!(
+                wire.len() <= 64 * 1024 * 1024,
+                "{route}: unexpected response growth"
+            );
+        }
+        let header_end = wire
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&wire[..header_end]).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200"), "{route}: {headers}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+        );
+        let mut remaining = &wire[header_end..];
+        let mut body = Vec::new();
+        loop {
+            let end = remaining
+                .windows(2)
+                .position(|part| part == b"\r\n")
+                .unwrap_or_else(|| {
+                    panic!("{route}: truncated response without chunked terminator")
+                });
+            let count =
+                usize::from_str_radix(std::str::from_utf8(&remaining[..end]).unwrap(), 16).unwrap();
+            remaining = &remaining[end + 2..];
+            if count == 0 {
+                assert_eq!(remaining, b"\r\n", "{route}: invalid terminal chunk");
+                break;
+            }
+            assert!(remaining.len() >= count + 2, "{route}: incomplete chunk");
+            body.extend_from_slice(&remaining[..count]);
+            assert_eq!(&remaining[count..count + 2], b"\r\n");
+            remaining = &remaining[count + 2..];
+        }
+        if route == "changes/baseline" {
+            assert!(
+                body.starts_with(&expected.stdout),
+                "baseline snapshot changed"
+            );
+            let terminal: serde_json::Value =
+                serde_json::from_slice(&body[expected.stdout.len()..]).unwrap();
+            assert!(terminal["baseline"]["resume_cursor"].as_str().is_some());
+            assert!(
+                terminal["baseline"]["snapshot_commit_id"]
+                    .as_str()
+                    .is_some()
+            );
+        } else {
+            assert_eq!(body, expected.stdout, "slow export lost or changed rows");
+        }
+    }
 }
 
 #[test]
@@ -753,9 +1165,6 @@ fn parity_errors_share_exit_codes() {
 //
 // - `graphs list`: server-only today; becomes Both-capability when the
 //   embedded arm enumerates the cluster catalog (RFC-009 open Q3, answered).
-// - `ingest`: deprecated permissive loader; its remote arm rides the
-//   deprecated JSON /ingest route. Canonical `load` is strict graph-batch on
-//   both arms; the remote arm sends raw NDJSON to `/load/ndjson`.
 // - `init`, `optimize`, `repair`, `cleanup`, `cluster *`: storage-plane by
 //   design (must work with the server down); Phase 4 declares this.
 #[allow(dead_code)]

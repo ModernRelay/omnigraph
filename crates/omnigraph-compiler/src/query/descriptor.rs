@@ -6,9 +6,10 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::error::{CompilerError, Result};
 
-use super::ast::{Clause, Mutation, QueryDecl};
+use super::ast::{Mutation, QueryDecl};
 use super::typecheck::{
-    CheckedQuery, MutationTarget, infer_query_result_schema, typecheck_query_decl,
+    BoundVariable, CheckedQuery, MutationTarget, TypeContext, projection_field, projection_name,
+    typecheck_query_decl,
 };
 
 /// A compiled query's conservative graph access set and result shape.
@@ -92,11 +93,16 @@ fn describe_checked_query_operation(
 
     let result = match checked {
         CheckedQuery::Read(ctx) => {
-            collect_clause_reads(catalog, &query.match_clause, &mut reads)?;
-            infer_query_result_schema(catalog, query, ctx)?
-                .fields()
+            collect_checked_reads(ctx, &mut reads);
+            let ir = crate::lower_query(catalog, query, ctx)?;
+            ir.return_exprs
                 .iter()
-                .map(result_field_descriptor)
+                .zip(&query.return_clause)
+                .map(|(projection, ast)| {
+                    let name = projection_name(&ast.expr, ast.alias.as_deref());
+                    let field = projection_field(catalog, &name, &projection.ty)?;
+                    result_field_descriptor(&field)
+                })
                 .collect::<Result<Vec<_>>>()?
         }
         CheckedQuery::Mutation(ctx) => {
@@ -146,37 +152,26 @@ fn describe_checked_query_operation(
     })
 }
 
-fn collect_clause_reads(
-    catalog: &Catalog,
-    clauses: &[Clause],
-    reads: &mut BTreeSet<QueryGraphFact>,
-) -> Result<()> {
-    for clause in clauses {
-        match clause {
-            Clause::Binding(binding) => {
-                reads.insert(node_fact(&binding.type_name));
+fn collect_checked_reads(ctx: &TypeContext, reads: &mut BTreeSet<QueryGraphFact>) {
+    let mut pending = vec![ctx];
+    while let Some(scope) = pending.pop() {
+        for binding in scope.bindings.values() {
+            if let BoundVariable::Node { type_name } = binding {
+                reads.insert(node_fact(type_name));
             }
-            Clause::Traversal(traversal) => {
-                let edge = catalog
-                    .lookup_edge_by_name(&traversal.edge_name)
-                    .ok_or_else(|| {
-                        CompilerError::Plan(format!(
-                            "typechecked edge type `{}` is absent from the catalog",
-                            traversal.edge_name
-                        ))
-                    })?;
+        }
+        for traversal in &scope.traversals {
+            reads.insert(node_fact(&traversal.src_type));
+            reads.insert(node_fact(&traversal.dst_type));
+            for member in traversal.edges.members() {
                 reads.insert(QueryGraphFact {
                     kind: QueryGraphFactKind::Edge,
-                    type_name: edge.name.clone(),
+                    type_name: member.edge_type.clone(),
                 });
-                reads.insert(node_fact(&edge.from_type));
-                reads.insert(node_fact(&edge.to_type));
             }
-            Clause::Subquery(subquery) => collect_clause_reads(catalog, &subquery.clauses, reads)?,
-            Clause::Filter(_) => {}
         }
+        pending.extend(scope.subqueries.iter().map(|subquery| &subquery.inner));
     }
-    Ok(())
 }
 
 fn target_fact(target: &MutationTarget) -> QueryGraphFact {
@@ -196,7 +191,7 @@ fn node_fact(type_name: &str) -> QueryGraphFact {
     }
 }
 
-fn result_field_descriptor(field: &arrow_schema::FieldRef) -> Result<QueryResultFieldDescriptor> {
+fn result_field_descriptor(field: &arrow_schema::Field) -> Result<QueryResultFieldDescriptor> {
     let (kind, item_kind, vector_dim) = result_value_shape(field.data_type())?;
     Ok(QueryResultFieldDescriptor {
         name: field.name().clone(),

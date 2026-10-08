@@ -25,13 +25,13 @@ The optional top-level `id` supplies entity identity. `data` holds user properti
 
 The strict parser rejects duplicate members, unknown fields, reserved physical columns, malformed envelopes, and noncanonical supplied entity IDs. It accepts logical type and property names only; callers never select physical datasets, lanes, fragments, or bindings.
 
-The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects.
+The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects. Keyed modes add one 32 MiB sum of the parse estimate and one 32 MiB sum of retained Arrow batches across all touched tables.
 
 ### Compatibility loader
 
 `POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
-`POST /graphs/{graph_id}/ingest`, the CLI `ingest` command, and the engine `ingest*` methods are deprecated compatibility aliases over the same loader. They do not have a separate fast path or durability contract. New integrations use `load` or `/load/ndjson`.
+The engine `ingest*` methods are deprecated aliases over the same loader, with no separate fast path or durability contract. CLI and HTTP integrations use `load` or `/load/ndjson`.
 
 ## Transaction contract
 
@@ -55,7 +55,7 @@ Load modes are shared across the surfaces:
 
 One batch may touch several logical declarations. Cross-table visibility is still atomic: readers see all published table versions or none. An error after recovery is armed returns recovery-required rather than claiming rollback or success.
 
-The write envelope is bounded before arm. Keyed work is limited to 8,192 retained rows and 32 MiB of exact retained Arrow data per table, with operation-wide limits for carried external Blob payloads and other retained plans. The HTTP strict-batch body has its own 32 MiB ceiling. These limits bound one commit; clients split larger imports into explicit batches and accept one graph commit per batch.
+The write envelope is bounded before arm. Keyed work is limited to 8,192 retained rows and 32 MiB of exact retained Arrow data per table, with operation-wide limits for carried external Blob payloads and other retained plans. The retained Arrow batches of all touched tables together are limited to 32 MiB, and so is the keyed parse estimate. An Overwrite load collects the committed IDs absent from its replacement under a separate 32 MiB removed-ID allowance, each ID charged its UTF-8 length plus 24 bytes; see [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own 32 MiB ceiling. These limits bound one commit; clients split larger imports into explicit batches and accept one graph commit per batch.
 
 ## Blob and index behavior
 

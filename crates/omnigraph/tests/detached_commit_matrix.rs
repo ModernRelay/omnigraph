@@ -31,12 +31,13 @@ use helpers::{
     mutate_main, read_table,
 };
 use omnigraph::db::{
-    CleanupPolicyOptions, Omnigraph, ReadTarget, SystemColumnUpgradeOptions,
+    CleanupPolicyOptions, Omnigraph, PreparedSchemaApply, ReadTarget, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
+use omnigraph_core::graph_commit_id::intent_nonce;
 use serial_test::serial;
 
 const CHILD_ENV: &str = "OMNIGRAPH_RFC0067_CHILD";
@@ -47,9 +48,10 @@ const NAME_ENV: &str = "OMNIGRAPH_RFC0067_NAME";
 const PARK_ENV: &str = "OMNIGRAPH_RFC0067_PARK";
 /// Park on the n-th crossing of that seam (1-based).
 const PARK_HIT_ENV: &str = "OMNIGRAPH_RFC0067_PARK_HIT";
+const PREPARED_SCHEMA_FILE: &str = "matrix-prepared-schema.json";
 /// What the child runs: one of the `Writer::child_op` strings (`insert`,
 /// `insert_and_friend`, `cleanup`, `ensure_indices`, `merge`, `schema_apply`,
-/// `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`).
+/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`).
 const OP_ENV: &str = "OMNIGRAPH_RFC0067_OP";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,8 +65,11 @@ enum Writer {
     /// a pointer switch with no table effect, so only its pre-publish window.
     Merge,
     /// Schema apply adding a nullable Person property: one detached rewrite
-    /// of Person, no row change, the contract staged and installed.
+    /// of Person, no row change, the contract row published atomically.
     SchemaApply,
+    /// The same rewrite through an intent persisted before invocation and
+    /// deserialized by the child; recovery never reruns that original intent.
+    PreparedSchemaApply,
     /// Optimize over a Person table with four small fragments: one detached
     /// compaction rewrite, no row change, published with an exact CAS on the
     /// pin it was planned from.
@@ -124,7 +129,7 @@ impl Writer {
             Writer::Cleanup => vec![],
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish],
             Writer::Merge => vec![PrePublish],
-            Writer::SchemaApply => vec![PostDetached(1), PrePublish],
+            Writer::SchemaApply | Writer::PreparedSchemaApply => vec![PostDetached(1), PrePublish],
             Writer::Optimize => vec![PostDetached(1), PrePublish],
             Writer::Load => vec![PostDetached(1), PrePublish],
             Writer::FtsRebuild => vec![PostDetached(1), PrePublish],
@@ -142,6 +147,7 @@ impl Writer {
             Writer::EnsureIndices => "ensure_indices",
             Writer::Merge => "merge",
             Writer::SchemaApply => "schema_apply",
+            Writer::PreparedSchemaApply => "prepared_schema_apply",
             Writer::Optimize => "optimize",
             Writer::Load => "load",
             Writer::FtsRebuild => "fts_rebuild",
@@ -155,7 +161,10 @@ impl Window {
     fn seam(self, writer: Writer) -> (&'static str, u64) {
         let index = matches!(writer, Writer::EnsureIndices | Writer::FtsRebuild);
         let merge = writer == Writer::Merge;
-        let schema = matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade);
+        let schema = matches!(
+            writer,
+            Writer::SchemaApply | Writer::PreparedSchemaApply | Writer::SystemColumnUpgrade
+        );
         let optimize = writer == Writer::Optimize;
         match self {
             Window::PostDetached(n) if optimize => {
@@ -167,7 +176,7 @@ impl Window {
             Window::PostDetached(n) if schema => {
                 (catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.name(), n as u64)
             }
-            Window::PrePublish if schema => (catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.name(), 1),
+            Window::PrePublish if schema => (catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.name(), 1),
             Window::PrePublish if merge => (
                 catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
                 1,
@@ -353,6 +362,14 @@ fn rfc0067_matrix_child_process() {
                     .map(|_| ()),
                 "insert_and_friend" => insert_and_friend(&db, &name).await,
                 "schema_apply" => db.apply_schema(&city_schema()).await.map(|_| ()),
+                "prepared_schema_apply" => {
+                    let intent: PreparedSchemaApply = serde_json::from_slice(
+                        &std::fs::read(std::path::Path::new(&uri).join(PREPARED_SCHEMA_FILE))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    db.apply_prepared_schema_as(&intent, None).await.map(|_| ())
+                }
                 "optimize" => db.optimize().await.map(|_| ()),
                 "load" => load_two(&db, &name).await,
                 "fts_rebuild" => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
@@ -613,6 +630,20 @@ async fn run_cell(
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
     let knows_head_before = linear_head(&knows_uri).await;
+    let prepared = if writer == Writer::PreparedSchemaApply {
+        let intent = db
+            .prepare_schema_apply_as(&city_schema(), None)
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.path().join(PREPARED_SCHEMA_FILE),
+            serde_json::to_vec(&intent).unwrap(),
+        )
+        .unwrap();
+        Some(intent)
+    } else {
+        None
+    };
 
     // The writer under the fault.
     let (seam, hit) = window.seam(writer);
@@ -631,6 +662,10 @@ async fn run_cell(
                     .await
                     .map(|_| ()),
                 Writer::SchemaApply => db.apply_schema(&city_schema()).await.map(|_| ()),
+                Writer::PreparedSchemaApply => db
+                    .apply_prepared_schema_as(prepared.as_ref().unwrap(), None)
+                    .await
+                    .map(|_| ()),
                 Writer::Optimize => db.optimize().await.map(|_| ()),
                 Writer::Load => load_two(&db, &write_name).await,
                 Writer::FtsRebuild => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
@@ -667,22 +702,26 @@ async fn run_cell(
             }
             if fault == Fault::Race {
                 let race_name = format!("m{index}_race");
-                if matches!(writer, Writer::SchemaApply | Writer::SystemColumnUpgrade) {
-                    // The apply's durable sentinel refuses every concurrent
-                    // writer of the graph while it is in flight (the upgrade
-                    // runs through the same sentinel).
-                    let refused = insert(&db, &race_name).await.unwrap_err();
-                    assert!(
-                        refused.to_string().contains("schema apply"),
-                        "{cell}: the sentinel must refuse the racer: {refused}"
-                    );
-                } else {
-                    insert(&db, &race_name).await.unwrap();
-                    model.names.insert(race_name);
-                }
+                insert(&db, &race_name).await.unwrap();
+                model.names.insert(race_name);
                 std::fs::write(barrier.join("go"), b"1").unwrap();
                 let out = child.wait_with_output().unwrap();
                 acknowledged = out.status.success();
+                if matches!(
+                    writer,
+                    Writer::SchemaApply | Writer::PreparedSchemaApply | Writer::SystemColumnUpgrade
+                ) {
+                    assert!(
+                        !acknowledged,
+                        "{cell}: the schema writer must lose to the concurrent publication"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&out.stdout).contains("write authority"),
+                        "{cell}: expected a stale graph-head refusal, stdout: {}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
+                }
+
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 if let Some(err) = stdout.lines().find(|line| line.starts_with("CHILD_ERR")) {
                     note = err.chars().take(90).collect();
@@ -749,7 +788,7 @@ async fn run_cell(
     let (observed, duplicates) = observe_model(&fresh).await;
     assert!(!duplicates, "{cell}: duplicate Person keys");
     assert_eq!(observed, model, "{cell}: row model");
-    if writer == Writer::SchemaApply {
+    if matches!(writer, Writer::SchemaApply | Writer::PreparedSchemaApply) {
         assert_eq!(
             fresh.schema_source().contains("city: String?"),
             visible,
@@ -765,6 +804,28 @@ async fn run_cell(
                 "{cell}: the open retires {staging}"
             );
         }
+    }
+    if let Some(intent) = &prepared {
+        assert_eq!(
+            serde_json::from_slice::<PreparedSchemaApply>(
+                &std::fs::read(dir.path().join(PREPARED_SCHEMA_FILE)).unwrap(),
+            )
+            .unwrap(),
+            *intent,
+            "{cell}: recovery replaced the original intent"
+        );
+        assert!(
+            fresh
+                .list_commits(Some("main"))
+                .await
+                .unwrap()
+                .iter()
+                .all(|commit| {
+                    intent_nonce(&commit.graph_commit_id).ok().as_deref()
+                        != intent.graph_commit_id()
+                }),
+            "{cell}: the interrupted original was published or replayed during recovery"
+        );
     }
     let (same_handle, _) = observe_model(&db).await;
     assert_eq!(
@@ -931,6 +992,7 @@ async fn run_matrix() {
         Writer::EnsureIndices,
         Writer::Merge,
         Writer::SchemaApply,
+        Writer::PreparedSchemaApply,
         Writer::Optimize,
         Writer::Load,
         Writer::FtsRebuild,

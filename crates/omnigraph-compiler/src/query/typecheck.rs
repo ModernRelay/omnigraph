@@ -3,13 +3,18 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SYSTEM_COLUMNS_META, SystemFieldRole};
+use crate::catalog::{Catalog, EdgeType};
 use crate::error::{CompilerError, Result};
-use crate::types::{Direction, PropType, ScalarType};
+use crate::traversal::{EDGE_TYPE_META, EdgeMember, EdgeSelection, common_edge_property};
+use crate::types::{
+    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
+    check_datetime_literal,
+};
 
 use super::ast::*;
 use super::codes::*;
+use super::diagnostic::QueryDiagnostic;
 
 /// A variable in the query's single namespace, tagged by what it binds.
 ///
@@ -21,7 +26,7 @@ use super::codes::*;
 #[derive(Debug, Clone)]
 pub enum BoundVariable {
     Node { type_name: String },
-    Edge { type_name: String },
+    Edge { type_names: Vec<String> },
 }
 
 impl BoundVariable {
@@ -47,16 +52,24 @@ pub struct TypeContext {
     pub bindings: HashMap<String, BoundVariable>,
     pub aliases: HashMap<String, ResolvedType>,
     pub traversals: Vec<ResolvedTraversal>,
+    pub(crate) subqueries: Vec<CheckedSubquery>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedSubquery {
+    pub outer_bindings: HashMap<String, BoundVariable>,
+    pub inner: TypeContext,
 }
 
 impl TypeContext {
     /// No bindings, no aliases: the read context of a mutation scope, where
     /// every name resolves through the scope instead.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             bindings: HashMap::new(),
             aliases: HashMap::new(),
             traversals: Vec::new(),
+            subqueries: Vec::new(),
         }
     }
 }
@@ -65,7 +78,7 @@ impl TypeContext {
 /// `resolve_expr_type`; the scope decides what a bare name means and which
 /// node kinds are refused, one binder per clause over one expression type.
 #[derive(Clone, Copy)]
-enum Scope<'a> {
+pub(crate) enum Scope<'a> {
     /// A read clause over the match bindings.
     Read,
     /// A mutation `where`: a bare name is a property of the target.
@@ -79,7 +92,7 @@ enum Scope<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum ConstantClause {
+pub(crate) enum ConstantClause {
     Assignment,
     BindingMatch,
 }
@@ -159,8 +172,9 @@ fn call_keyword(expr: &Expr) -> Option<String> {
 pub struct ResolvedTraversal {
     pub src: String,
     pub dst: String,
-    pub edge_type: String,
-    pub direction: Direction,
+    pub edges: EdgeSelection,
+    pub src_type: String,
+    pub dst_type: String,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
     /// Variable bound to the matched edge (`$p $w:knows $f`), if any;
@@ -172,7 +186,8 @@ pub struct ResolvedTraversal {
 pub enum ResolvedType {
     Scalar(PropType),
     Node(String),
-    Aggregate,
+    Aggregate(ExprType),
+    ForwardAlias,
 }
 
 impl ResolvedType {
@@ -180,7 +195,8 @@ impl ResolvedType {
         match self {
             Self::Scalar(prop) => prop.display_name(),
             Self::Node(type_name) => format!("node `{}`", type_name),
-            Self::Aggregate => "aggregate".to_string(),
+            Self::Aggregate(_) => "aggregate".to_string(),
+            Self::ForwardAlias => "aggregate".to_string(),
         }
     }
 }
@@ -321,17 +337,19 @@ fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
 }
 
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
-    let mut ctx = TypeContext {
-        bindings: HashMap::new(),
-        aliases: HashMap::new(),
-        traversals: Vec::new(),
-    };
+    let mut ctx = TypeContext::empty();
     let params = parse_declared_param_types(&query.params)?;
 
     refuse_reserved_variable_names(&query.match_clause)?;
 
     // Typecheck match clauses
-    typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
+    typecheck_clauses(
+        catalog,
+        &query.match_clause,
+        &mut ctx,
+        &params,
+        &mut HashSet::new(),
+    )?;
 
     // Typecheck return projections
     let mut result_columns: HashSet<String> = HashSet::new();
@@ -715,19 +733,23 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
     Ok(())
 }
 
-/// The system role a meta-field spelling names (RFC 0040 Query language):
-/// `@id` on any binding, `@src`/`@dst` on an edge; `None` for a bare name.
-fn meta_field_role(property: &str) -> Option<Option<SystemFieldRole>> {
+enum MetaField {
+    System(SystemFieldRole),
+    EdgeType,
+}
+
+/// A query meta-field, including the virtual edge type; `None` for a bare name.
+fn meta_field_role(property: &str) -> Option<Option<MetaField>> {
     property.starts_with('@').then(|| match property {
-        name if name == SYSTEM_COLUMNS_META.id => Some(SystemFieldRole::Id),
-        name if name == SYSTEM_COLUMNS_META.src => Some(SystemFieldRole::Src),
-        name if name == SYSTEM_COLUMNS_META.dst => Some(SystemFieldRole::Dst),
+        name if name == SYSTEM_COLUMNS_META.id => Some(MetaField::System(SystemFieldRole::Id)),
+        name if name == SYSTEM_COLUMNS_META.src => Some(MetaField::System(SystemFieldRole::Src)),
+        name if name == SYSTEM_COLUMNS_META.dst => Some(MetaField::System(SystemFieldRole::Dst)),
+        EDGE_TYPE_META => Some(MetaField::EdgeType),
         _ => None,
     })
 }
 
-/// The type of every meta-field: the system identity and endpoints are
-/// non-null strings on both vintages.
+/// Every metadata value is a non-null string.
 fn meta_field_type() -> PropType {
     PropType::scalar(ScalarType::String, false)
 }
@@ -780,9 +802,9 @@ fn mutation_property_type(
     }
     if let Some(role) = meta_field_role(property) {
         let admitted = match role {
-            Some(SystemFieldRole::Id) => true,
-            Some(SystemFieldRole::Src | SystemFieldRole::Dst) => is_edge,
-            None => false,
+            Some(MetaField::System(SystemFieldRole::Id)) => true,
+            Some(MetaField::System(SystemFieldRole::Src | SystemFieldRole::Dst)) => is_edge,
+            Some(MetaField::EdgeType) | None => false,
         };
         if !admitted {
             let known = if is_edge {
@@ -984,17 +1006,46 @@ fn typecheck_clauses(
     clauses: &[Clause],
     ctx: &mut TypeContext,
     params: &HashMap<String, PropType>,
-    _in_negation: bool,
+    declared_nodes: &mut HashSet<String>,
 ) -> Result<()> {
+    let mut declarations = TypeContext {
+        bindings: ctx.bindings.clone(),
+        ..TypeContext::empty()
+    };
+    let mut local_declared = declared_nodes.clone();
+    for clause in clauses {
+        if let Clause::Binding(binding) = clause {
+            typecheck_binding(catalog, binding, &mut declarations, params)?;
+            if binding.variable != "_" {
+                local_declared.insert(binding.variable.clone());
+            }
+        }
+    }
     for clause in clauses {
         match clause {
-            Clause::Binding(b) => typecheck_binding(catalog, b, ctx, params)?,
-            Clause::Traversal(t) => typecheck_traversal(catalog, t, ctx)?,
+            Clause::Binding(binding) => {
+                bind_node(binding, ctx)?;
+                if binding.variable != "_" {
+                    declared_nodes.insert(binding.variable.clone());
+                }
+            }
+            Clause::Traversal(t) => {
+                typecheck_traversal(catalog, t, ctx, &local_declared, &declarations.bindings)?
+            }
             Clause::Filter(f) => typecheck_filter(catalog, f, ctx, params)?,
             Clause::Subquery(subquery) => {
                 let outer_vars: Vec<String> = ctx.bindings.keys().cloned().collect();
-                let mut inner_ctx = ctx.clone();
-                typecheck_clauses(catalog, &subquery.clauses, &mut inner_ctx, params, true)?;
+                let mut inner_ctx = TypeContext {
+                    bindings: ctx.bindings.clone(),
+                    ..TypeContext::empty()
+                };
+                typecheck_clauses(
+                    catalog,
+                    &subquery.clauses,
+                    &mut inner_ctx,
+                    params,
+                    &mut declared_nodes.clone(),
+                )?;
                 if !block_references_outer(&subquery.clauses, &outer_vars) {
                     let rule = match subquery.keyword {
                         BlockKeyword::Not => T9,
@@ -1009,7 +1060,57 @@ fn typecheck_clauses(
                     ));
                 }
                 typecheck_subquery_predicate(catalog, subquery, &inner_ctx, ctx, params)?;
+                ctx.subqueries.push(CheckedSubquery {
+                    outer_bindings: ctx.bindings.clone(),
+                    inner: inner_ctx,
+                });
             }
+        }
+    }
+    validate_traversal_anchors(clauses, &declarations.bindings)
+}
+
+fn validate_traversal_anchors(
+    clauses: &[Clause],
+    bindings: &HashMap<String, BoundVariable>,
+) -> Result<()> {
+    let mut reachable: HashSet<&str> = bindings
+        .iter()
+        .filter_map(|(name, binding)| {
+            (name != "_" && matches!(binding, BoundVariable::Node { .. })).then_some(name.as_str())
+        })
+        .collect();
+    let mut remaining: Vec<_> = clauses
+        .iter()
+        .filter_map(|clause| match clause {
+            Clause::Traversal(traversal) => Some(traversal),
+            Clause::Binding(_) | Clause::Filter(_) | Clause::Subquery(_) => None,
+        })
+        .collect();
+    while !remaining.is_empty() {
+        let count = remaining.len();
+        remaining.retain(|traversal| {
+            if !reachable.contains(traversal.src.as_str())
+                && !reachable.contains(traversal.dst.as_str())
+            {
+                return true;
+            }
+            for endpoint in [&traversal.src, &traversal.dst] {
+                if endpoint != "_" {
+                    reachable.insert(endpoint.as_str());
+                }
+            }
+            false
+        });
+        if remaining.len() == count {
+            let traversal = remaining[0];
+            return Err(CompilerError::typed(
+                T5,
+                format!(
+                    "traversal from `${}` to `${}` requires an executable source or destination node binding",
+                    traversal.src, traversal.dst
+                ),
+            ));
         }
     }
     Ok(())
@@ -1026,6 +1127,32 @@ fn block_references_outer(clauses: &[Clause], outer_vars: &[String]) -> bool {
     })
 }
 
+/// The checked owner of a block aggregate. Counting a node binding uses the
+/// row-count path; column aggregates retain the ordinary nullable signature.
+pub(crate) fn block_aggregate_signature(
+    catalog: &Catalog,
+    subquery: &Subquery,
+    inner_ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<Option<AggSignature>> {
+    match &subquery.arg {
+        None if subquery.func == AggFunc::Count => Ok(None),
+        None => Err(CompilerError::typed(
+            T40,
+            "a block aggregate without an argument must count rows",
+        )),
+        Some(arg) => {
+            let signature =
+                aggregate_signature(catalog, subquery.func, arg, inner_ctx, params, true)?;
+            if subquery.func == AggFunc::Count && matches!(signature.arg, ExprType::Node { .. }) {
+                Ok(None)
+            } else {
+                Ok(Some(signature))
+            }
+        }
+    }
+}
+
 /// The comparison of a subquery predicate: the aggregate's result type from
 /// the block's scope (the argument rule of a `return` aggregate), the right
 /// operand from the outer scope, compatible under the filter rule.
@@ -1037,29 +1164,39 @@ fn typecheck_subquery_predicate(
     params: &HashMap<String, PropType>,
 ) -> Result<()> {
     let func = subquery.func;
-    let result = match &subquery.arg {
+    if matches!(
+        subquery.op,
+        CompOp::Contains | CompOp::StringContains | CompOp::StartsWith
+    ) {
+        return Err(CompilerError::typed(
+            T40,
+            "a block comparison requires equality or ordering",
+        ));
+    }
+    let result = match block_aggregate_signature(catalog, subquery, inner_ctx, params)? {
         None => PropType::scalar(ScalarType::I64, false),
-        Some(arg) => {
-            let arg_type = resolve_expr_type(catalog, arg, inner_ctx, params, Scope::Read)?;
-            reject_blob_read_value(&arg_type, arg)?;
-            check_aggregate_argument(&func, arg, &arg_type)?;
-            match (func, &arg_type) {
-                (AggFunc::Count, _) => PropType::scalar(ScalarType::I64, false),
-                (AggFunc::Sum | AggFunc::Avg, _) => PropType::scalar(ScalarType::F64, false),
-                (AggFunc::Min | AggFunc::Max, ResolvedType::Scalar(s)) => {
-                    PropType::scalar(s.scalar, false)
-                }
-                (_, other) => {
-                    return Err(CompilerError::typed(
-                        T40,
-                        format!(
-                            "{func} over a block requires a scalar argument, got {}",
-                            other.display_name()
-                        ),
-                    ));
-                }
+        Some(signature) => match signature.result {
+            ExprType::Value {
+                scalar,
+                list,
+                nullable,
+            } => PropType {
+                scalar,
+                nullable,
+                list,
+                enum_values: None,
+            },
+            ExprType::Node { type_name } => {
+                return Err(CompilerError::Plan(format!(
+                    "{func} over a block has node result type `{type_name}`"
+                )));
             }
-        }
+            ExprType::ExactInteger { .. } => {
+                return Err(CompilerError::Plan(
+                    "block aggregate exposes an internal carrier".into(),
+                ));
+            }
+        },
     };
     let bound = match &subquery.right {
         Expr::Literal(_) | Expr::Now => true,
@@ -1073,6 +1210,12 @@ fn typecheck_subquery_predicate(
         ));
     }
     let right = resolve_expr_type(catalog, &subquery.right, ctx, params, Scope::Read)?;
+    let right = contextual_literal_type(
+        &subquery.right,
+        &ResolvedType::Scalar(result.clone()),
+        Some(false),
+    )
+    .unwrap_or(right);
     let ResolvedType::Scalar(r) = &right else {
         return Err(CompilerError::typed(
             T40,
@@ -1153,17 +1296,27 @@ fn typecheck_binding(
         )?;
     }
 
+    bind_node(binding, ctx)
+}
+
+fn bind_node(binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
     // Don't overwrite if already bound to the same node type (re-binding the
     // same node var is OK). Node and edge namespaces are independent, so a
     // matching type name does not make a cross-kind rebind valid.
     if let Some(existing) = ctx.bindings.get(&binding.variable) {
         match existing {
-            BoundVariable::Edge { type_name } => {
+            BoundVariable::Edge { type_names } => {
                 return Err(CompilerError::typed(
                     T23,
                     format!(
-                        "variable `${}` is bound to edge type `{}` and cannot be rebound as node type `{}`",
-                        binding.variable, type_name, binding.type_name
+                        "variable `${}` is an edge binding ({}) and cannot be rebound as node type `{}`",
+                        binding.variable,
+                        if type_names.is_empty() {
+                            "empty selection".to_string()
+                        } else {
+                            type_names.join(" | ")
+                        },
+                        binding.type_name
                     ),
                 ));
             }
@@ -1271,14 +1424,74 @@ fn typecheck_traversal(
     catalog: &Catalog,
     traversal: &Traversal,
     ctx: &mut TypeContext,
+    declared_nodes: &HashSet<String>,
+    declarations: &HashMap<String, BoundVariable>,
 ) -> Result<()> {
-    // T4: edge must exist
-    let edge = catalog
-        .lookup_edge_by_name(&traversal.edge_name)
-        .ok_or_else(|| {
-            CompilerError::typed(T4, format!("unknown edge type `{}`", traversal.edge_name))
-        })?;
+    if matches!(traversal.selector, EdgeSelector::Wildcard)
+        && (!declared_nodes.contains(&traversal.src) || !declared_nodes.contains(&traversal.dst))
+    {
+        return Err(CompilerError::typed(
+            T5,
+            "wildcard traversal requires explicitly declared source and destination node bindings"
+                .to_string(),
+        ));
+    }
+    let resolved = resolve_traversal(catalog, traversal, &ctx.bindings, declarations)?;
+    if let Some(binding) = &resolved.edge_binding {
+        if binding == &traversal.src || binding == &traversal.dst {
+            return Err(CompilerError::typed(
+                T23,
+                format!(
+                    "edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
+                ),
+            ));
+        }
+        if let Some(existing) = ctx.bindings.get(binding) {
+            let kind = match existing {
+                BoundVariable::Node { .. } => "node",
+                BoundVariable::Edge { .. } => "edge",
+            };
+            return Err(CompilerError::typed(
+                T23,
+                format!(
+                    "variable `${binding}` is already a {kind} binding; an edge binding needs a fresh name"
+                ),
+            ));
+        }
+        ctx.bindings.insert(
+            binding.clone(),
+            BoundVariable::Edge {
+                type_names: resolved
+                    .edges
+                    .members()
+                    .iter()
+                    .map(|member| member.edge_type.clone())
+                    .collect(),
+            },
+        );
+    }
+    for (var, type_name) in [
+        (&traversal.src, &resolved.src_type),
+        (&traversal.dst, &resolved.dst_type),
+    ] {
+        if var != "_" {
+            ctx.bindings
+                .entry(var.clone())
+                .or_insert_with(|| BoundVariable::Node {
+                    type_name: type_name.clone(),
+                });
+        }
+    }
+    ctx.traversals.push(resolved);
+    Ok(())
+}
 
+fn resolve_traversal(
+    catalog: &Catalog,
+    traversal: &Traversal,
+    bindings: &HashMap<String, BoundVariable>,
+    declarations: &HashMap<String, BoundVariable>,
+) -> Result<ResolvedTraversal> {
     if traversal.min_hops == 0 {
         return Err(CompilerError::typed(
             T15,
@@ -1301,11 +1514,173 @@ fn typecheck_traversal(
             "unbounded traversal is disabled; use bounded traversal {min,max}".to_string(),
         ));
     }
+    if let Some(binding) = &traversal.edge_binding
+        && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
+    {
+        return Err(CompilerError::typed(
+            T23,
+            format!(
+                "edge binding `${binding}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge"
+            ),
+        ));
+    }
+    let src = bindings
+        .get(&traversal.src)
+        .or_else(|| declarations.get(&traversal.src))
+        .filter(|_| traversal.src != "_")
+        .map(|binding| binding.require_traversal_endpoint(&traversal.src))
+        .transpose()?;
+    let dst = bindings
+        .get(&traversal.dst)
+        .or_else(|| declarations.get(&traversal.dst))
+        .filter(|_| traversal.dst != "_")
+        .map(|binding| binding.require_traversal_endpoint(&traversal.dst))
+        .transpose()?;
+    let (edges, src_type, dst_type) = match &traversal.selector {
+        EdgeSelector::Named(name) => {
+            let edge = lookup_traversal_edge(catalog, name)?;
+            let (member, src_type, dst_type) = resolve_member(edge, traversal, src, dst)?;
+            (EdgeSelection::Named(member), src_type, dst_type)
+        }
+        EdgeSelector::Alternation(names) => {
+            let Some((first, rest)) = names.split_first() else {
+                return Err(CompilerError::typed(
+                    T4,
+                    "edge alternation must name at least one edge type".to_string(),
+                ));
+            };
+            let edge = lookup_traversal_edge(catalog, first)?;
+            if src.is_none() && dst.is_none() {
+                for name in rest {
+                    let other = lookup_traversal_edge(catalog, name)?;
+                    if edge.from_type != other.from_type || edge.to_type != other.to_type {
+                        return Err(CompilerError::typed(T5, "an edge alternation with mixed endpoint orientations requires a declared endpoint type".to_string(),
+                        ));
+                    }
+                }
+            }
+            let (member, src_type, dst_type) = resolve_member(edge, traversal, src, dst)?;
+            let mut seen = HashSet::from([member.edge_type.clone()]);
+            let mut members = vec![member];
+            for name in rest {
+                let edge = lookup_traversal_edge(catalog, name)?;
+                if seen.insert(edge.name.clone()) {
+                    let (member, _, _) =
+                        resolve_member(edge, traversal, Some(&src_type), Some(&dst_type))?;
+                    members.push(member);
+                }
+            }
+            members.sort_by(|left, right| left.edge_type.cmp(&right.edge_type));
+            (EdgeSelection::Alternation(members), src_type, dst_type)
+        }
+        EdgeSelector::Wildcard => {
+            let (Some(src), Some(dst)) = (src, dst) else {
+                return Err(CompilerError::typed(
+                    T5,
+                    "wildcard traversal requires known source and destination node types"
+                        .to_string(),
+                ));
+            };
+            if traversal.undirected && src != dst {
+                return Err(CompilerError::typed(
+                    T22,
+                    "undirected wildcard traversal requires the same node type at both endpoints"
+                        .to_string(),
+                ));
+            }
+            let mut members = Vec::new();
+            for edge in catalog.edge_types.values() {
+                if (edge.from_type == src && edge.to_type == dst)
+                    || (edge.to_type == src && edge.from_type == dst)
+                {
+                    let (member, _, _) = resolve_member(edge, traversal, Some(src), Some(dst))?;
+                    members.push(member);
+                }
+            }
+            members.sort_by(|left, right| left.edge_type.cmp(&right.edge_type));
+            (
+                EdgeSelection::Wildcard(members),
+                src.to_string(),
+                dst.to_string(),
+            )
+        }
+    };
+    if traversal.src == traversal.dst && traversal.src != "_" && src_type != dst_type {
+        return Err(CompilerError::typed(
+            T5,
+            format!(
+                "traversal endpoint `${}` cannot have both type `{src_type}` and type `{dst_type}`",
+                traversal.src
+            ),
+        ));
+    }
+    // A hop ends on the destination type, and the next hop must start on the
+    // source type, so a path across distinct endpoint types never reaches a
+    // second hop; a bound that allows one is refused, not silently capped.
+    if let Some(max_hops) = traversal.max_hops
+        && max_hops > 1
+        && src_type != dst_type
+    {
+        let (EdgeSelector::Named(name), Some(member)) = (&traversal.selector, edges.named()) else {
+            return Err(CompilerError::typed(
+                T5,
+                "recursive edge selection requires the same node type at both endpoints"
+                    .to_string(),
+            ));
+        };
+        let edge = lookup_traversal_edge(catalog, &member.edge_type)?;
+        // Dropping the bound keeps the rows of a range that includes hop one;
+        // a range starting past it matched nothing, so that rewrite would not.
+        let fix = if traversal.min_hops == 1 {
+            format!(
+                "follow one hop without a bound: `${} {name} ${}`",
+                traversal.src, traversal.dst
+            )
+        } else {
+            format!(
+                "no `{}` path reaches hop {}, so this pattern matches nothing; to go further, start another traversal at the `{dst_type}` endpoint",
+                edge.name, traversal.min_hops
+            )
+        };
+        return Err(CompilerError::query(
+            QueryDiagnostic::typecheck(
+                T5,
+                format!(
+                    "multi-hop traversal `{name}{{{},{max_hops}}}` requires the same node type at both endpoints, but `{}: {} -> {}` connects different types, so no path continues past one hop",
+                    traversal.min_hops, edge.name, edge.from_type, edge.to_type
+                ),
+            )
+            .with_fix(fix),
+        ));
+    }
+    Ok(ResolvedTraversal {
+        src: traversal.src.clone(),
+        dst: traversal.dst.clone(),
+        edges,
+        src_type,
+        dst_type,
+        min_hops: traversal.min_hops,
+        max_hops: traversal.max_hops,
+        edge_binding: traversal
+            .edge_binding
+            .as_deref()
+            .filter(|name| *name != "_")
+            .map(str::to_string),
+    })
+}
 
-    // Undirected (`$a <edge> $b`): only meaningful when both orientations
-    // carry the same endpoint types — for an asymmetric edge the pattern is
-    // well-typed in at most one direction, so the undirected form is either
-    // pointless or a type error; require the directional form instead.
+fn lookup_traversal_edge<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a EdgeType> {
+    catalog
+        .lookup_edge_by_name(name)
+        .ok_or_else(|| CompilerError::typed(T4, format!("unknown edge type `{name}`")))
+}
+
+fn resolve_member(
+    edge: &EdgeType,
+    traversal: &Traversal,
+    src: Option<&str>,
+    dst: Option<&str>,
+) -> Result<(EdgeMember, String, String)> {
     if traversal.undirected && edge.from_type != edge.to_type {
         return Err(CompilerError::typed(
             T22,
@@ -1315,150 +1690,62 @@ fn typecheck_traversal(
             ),
         ));
     }
-
-    // T23: a {min,max} traversal matches a path of edges; there is no single
-    // row for a binding to name.
-    let edge_binding = traversal
-        .edge_binding
-        .as_deref()
-        .filter(|binding| *binding != "_")
-        .map(str::to_string);
-    if traversal.edge_binding.is_some()
-        && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
+    let direction = if let Some(src) = src {
+        if src == edge.from_type {
+            Direction::Out
+        } else if src == edge.to_type {
+            Direction::In
+        } else {
+            return Err(endpoint_type_error(&traversal.src, src, edge));
+        }
+    } else if let Some(dst) = dst {
+        if dst == edge.to_type {
+            Direction::Out
+        } else if dst == edge.from_type {
+            Direction::In
+        } else {
+            return Err(endpoint_type_error(&traversal.dst, dst, edge));
+        }
+    } else {
+        Direction::Out
+    };
+    let (src_type, dst_type) = match direction {
+        Direction::Out | Direction::Both => (&edge.from_type, &edge.to_type),
+        Direction::In => (&edge.to_type, &edge.from_type),
+    };
+    if let Some(dst) = dst
+        && dst != dst_type
     {
         return Err(CompilerError::typed(
-            T23,
+            T5,
             format!(
-                "edge binding `${}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge",
-                traversal.edge_binding.as_deref().unwrap_or("_")
+                "endpoint `${}` resolves to type `{dst}` but edge `{}` expects `{dst_type}`",
+                traversal.dst, edge.name
             ),
         ));
     }
-    if let Some(binding) = &edge_binding {
-        if binding == &traversal.src || binding == &traversal.dst {
-            return Err(CompilerError::typed(
-                T23,
-                format!(
-                    "edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
-                ),
-            ));
-        }
-        if ctx.bindings.contains_key(binding) {
-            return Err(CompilerError::typed(
-                T23,
-                format!(
-                    "variable `${}` is already bound; an edge binding needs a fresh name",
-                    binding
-                ),
-            ));
-        }
-        ctx.bindings.insert(
-            binding.clone(),
-            BoundVariable::Edge {
-                type_name: edge.name.clone(),
+    Ok((
+        EdgeMember {
+            edge_type: edge.name.clone(),
+            direction: if traversal.undirected {
+                Direction::Both
+            } else {
+                direction
             },
-        );
-    }
-
-    // Determine direction based on bound variables and edge endpoints
-    let src_bound = ctx.bindings.get(&traversal.src);
-    let dst_bound = ctx.bindings.get(&traversal.dst);
-
-    let mut direction;
-
-    if let Some(src_bv) = src_bound {
-        let src_type = src_bv.require_traversal_endpoint(&traversal.src)?;
-        // T5: src type must match one endpoint of the edge
-        if src_type == edge.from_type {
-            direction = Direction::Out;
-            // dst should be edge.to_type
-            bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
-        } else if src_type == edge.to_type {
-            direction = Direction::In;
-            // dst should be edge.from_type
-            bind_traversal_endpoint(ctx, &traversal.dst, &edge.from_type, edge)?;
-        } else {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                    traversal.src, src_type, edge.name, edge.from_type, edge.to_type
-                ),
-            ));
-        }
-    } else if let Some(dst_bv) = dst_bound {
-        let dst_type = dst_bv.require_traversal_endpoint(&traversal.dst)?;
-        // dst is bound, infer direction from it
-        if dst_type == edge.to_type {
-            direction = Direction::Out;
-            bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
-        } else if dst_type == edge.from_type {
-            direction = Direction::In;
-            bind_traversal_endpoint(ctx, &traversal.src, &edge.to_type, edge)?;
-        } else {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                    traversal.dst, dst_type, edge.name, edge.from_type, edge.to_type
-                ),
-            ));
-        }
-    } else {
-        // Neither bound — default Out direction, bind both
-        direction = Direction::Out;
-        bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
-        bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
-    }
-
-    if traversal.undirected {
-        // The orientation inference above is a no-op for a same-type edge
-        // (both arms resolve identically); the user asked for both ways.
-        direction = Direction::Both;
-    }
-
-    ctx.traversals.push(ResolvedTraversal {
-        src: traversal.src.clone(),
-        dst: traversal.dst.clone(),
-        edge_type: edge.name.clone(),
-        direction,
-        min_hops: traversal.min_hops,
-        max_hops: traversal.max_hops,
-        edge_binding,
-    });
-
-    Ok(())
+        },
+        src_type.clone(),
+        dst_type.clone(),
+    ))
 }
 
-fn bind_traversal_endpoint(
-    ctx: &mut TypeContext,
-    var: &str,
-    expected_type: &str,
-    edge: &crate::catalog::EdgeType,
-) -> Result<()> {
-    if var == "_" {
-        return Ok(()); // anonymous variable
-    }
-    if let Some(existing) = ctx.bindings.get(var) {
-        let existing_type = existing.require_traversal_endpoint(var)?;
-        if existing_type != expected_type {
-            return Err(CompilerError::typed(
-                T5,
-                format!(
-                    "variable `${}` has type `{}` but edge `{}` expects `{}`",
-                    var, existing_type, edge.name, expected_type
-                ),
-            ));
-        }
-    } else {
-        ctx.bindings.insert(
-            var.to_string(),
-            BoundVariable::Node {
-                type_name: expected_type.to_string(),
-            },
-        );
-    }
-    Ok(())
+fn endpoint_type_error(var: &str, type_name: &str, edge: &EdgeType) -> CompilerError {
+    CompilerError::typed(
+        T5,
+        format!(
+            "endpoint `${var}` resolves to type `{type_name}`, which is not an endpoint of edge `{}: {} -> {}`",
+            edge.name, edge.from_type, edge.to_type
+        ),
+    )
 }
 
 /// A match filter is an expression the checker proves Boolean; a search
@@ -1532,6 +1819,39 @@ fn boolean_scalar(resolved: &ResolvedType) -> Option<&PropType> {
     }
 }
 
+/// Infer a type for direct nulls and empty/all-null literal lists from another operand.
+fn contextual_literal_type(
+    expr: &Expr,
+    other: &ResolvedType,
+    list: Option<bool>,
+) -> Option<ResolvedType> {
+    let nullable = match expr {
+        Expr::Literal(Literal::Null) => true,
+        Expr::Literal(Literal::List(items))
+            if items.iter().all(|item| matches!(item, Literal::Null)) =>
+        {
+            false
+        }
+        _ => return None,
+    };
+    let ResolvedType::Scalar(other) = other else {
+        return None;
+    };
+    let mut prop = other.clone();
+    prop.nullable = nullable;
+    prop.list = matches!(expr, Expr::Literal(Literal::List(_))) || list.unwrap_or(other.list);
+    prop.enum_values = None;
+    Some(ResolvedType::Scalar(prop))
+}
+
+fn contextual_boolean(expr: &Expr, resolved: ResolvedType, scope: Scope<'_>) -> ResolvedType {
+    if matches!(scope, Scope::Read) && matches!(expr, Expr::Literal(Literal::Null)) {
+        ResolvedType::Scalar(PropType::scalar(ScalarType::Bool, true))
+    } else {
+        resolved
+    }
+}
+
 /// `left <op> right`: the operand rules of a comparison (T7, T38) and its
 /// type, `Bool`, nullable when an operand is; in a mutation `where`, a target
 /// property against a literal, a parameter or `now()` keeps the T3/T7 texts.
@@ -1544,8 +1864,23 @@ fn typecheck_comparison(
     params: &HashMap<String, PropType>,
     scope: Scope<'_>,
 ) -> Result<PropType> {
-    let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
-    let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+    let mut left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
+    let mut right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+    if matches!(scope, Scope::Read) {
+        let member = op == CompOp::Contains
+            && !matches!(&left_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })
+                if !matches!(left, Expr::Literal(Literal::Null))
+                    || matches!(&right_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })));
+        if let Some(contextual) = contextual_literal_type(left, &right_type, member.then_some(true))
+        {
+            left_type = contextual;
+        }
+        if let Some(contextual) =
+            contextual_literal_type(right, &left_type, member.then_some(false))
+        {
+            right_type = contextual;
+        }
+    }
 
     if (left.is_search_call() || right.is_search_call())
         && !(left.is_search_call()
@@ -1754,14 +2089,14 @@ fn read_property_type(
 
     if let Some(role) = meta_field_role(property) {
         let admitted = match (bv, role) {
-            (_, Some(SystemFieldRole::Id)) => true,
+            (_, Some(MetaField::System(SystemFieldRole::Id))) => true,
             (BoundVariable::Edge { .. }, Some(_)) => true,
             (BoundVariable::Node { .. }, Some(_)) | (_, None) => false,
         };
         if !admitted {
             let known = match bv {
-                BoundVariable::Node { .. } => "`@id`",
-                BoundVariable::Edge { .. } => "`@id`, `@src`, `@dst`",
+                BoundVariable::Node { .. } => "`@id`".to_string(),
+                BoundVariable::Edge { .. } => format!("`@id`, `@src`, `@dst`, `{EDGE_TYPE_META}`"),
             };
             return Err(CompilerError::typed(
                 T6,
@@ -1790,27 +2125,61 @@ fn read_property_type(
                 )
             })?
         }
-        BoundVariable::Edge { type_name } => {
-            let edge_type = catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
-                CompilerError::typed(
-                    T6,
-                    format!("edge type `{}` not found in catalog", type_name),
-                )
-            })?;
-            edge_type.properties.get(property).ok_or_else(|| {
-                CompilerError::typed(
-                    T6,
-                    format!(
-                        "edge `{}` has no property `{}`{}",
-                        type_name,
-                        property,
-                        system_field_hint(property, Some(variable), true)
-                    ),
-                )
-            })?
+        BoundVariable::Edge { type_names } => {
+            return common_edge_property(catalog, type_names, property).ok_or_else(|| {
+                let detail = if let [type_name] = type_names.as_slice() {
+                    format!("edge `{type_name}` has no property `{property}`")
+                } else if type_names.is_empty() {
+                    format!("empty wildcard has no inferable property `{property}`")
+                } else {
+                    format!("property `{property}` must exist with compatible types on every selected edge ({})", type_names.join(" | "))
+                };
+                CompilerError::typed(T6, format!("{detail}{}", system_field_hint(property, Some(variable), true)))
+            });
         }
     };
     Ok(prop.clone())
+}
+
+pub(crate) fn aggregate_signature(
+    catalog: &Catalog,
+    func: AggFunc,
+    arg: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+    nullable: bool,
+) -> Result<AggSignature> {
+    let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
+    reject_blob_read_value(&resolved_arg, arg)?;
+    let arg = check_aggregate_argument(&func, arg, &resolved_arg)?;
+    let scalar = func.result_type(&arg).ok_or_else(|| {
+        CompilerError::Plan(format!(
+            "{func} has no result type for argument {}",
+            arg.spelling()
+        ))
+    })?;
+    Ok(AggSignature {
+        arg,
+        result: ExprType::from_prop(&PropType::scalar(scalar, nullable)),
+    })
+}
+
+/// The checked expression type consumed by lowering in its original scope.
+pub(crate) fn expression_type(
+    catalog: &Catalog,
+    expr: &Expr,
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+    scope: Scope<'_>,
+) -> Result<ExprType> {
+    match resolve_expr_type(catalog, expr, ctx, params, scope)? {
+        ResolvedType::Scalar(prop) => Ok(ExprType::from_prop(&prop)),
+        ResolvedType::Node(type_name) => Ok(ExprType::Node { type_name }),
+        ResolvedType::Aggregate(ty) => Ok(ty),
+        ResolvedType::ForwardAlias => Err(CompilerError::Plan(
+            "unresolved forward alias during lowering".into(),
+        )),
+    }
 }
 
 fn resolve_expr_type(
@@ -2281,18 +2650,15 @@ fn resolve_expr_type(
         }
         Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
-            let arg_type = resolve_expr_type(catalog, arg, ctx, params, scope)?;
-            reject_blob_read_value(&arg_type, arg)?;
-            check_aggregate_argument(func, arg, &arg_type)?;
-
-            Ok(ResolvedType::Aggregate)
+            let signature = aggregate_signature(catalog, *func, arg, ctx, params, true)?;
+            Ok(ResolvedType::Aggregate(signature.result))
         }
         Expr::AliasRef(name) => match scope {
             Scope::Read => Ok(ctx
                 .aliases
                 .get(name)
                 .cloned()
-                .unwrap_or(ResolvedType::Aggregate)),
+                .unwrap_or(ResolvedType::ForwardAlias)),
             Scope::MutationWhere(target) => {
                 mutation_property_type(catalog, target, target.type_name(), name)
                     .map(ResolvedType::Scalar)
@@ -2313,7 +2679,10 @@ fn resolve_expr_type(
                 return Err(refusal);
             }
             let list_type = resolve_expr_type(catalog, list, ctx, params, scope)?;
-            if !matches!(&list_type, ResolvedType::Scalar(list) if list.list) {
+            if !matches!(&list_type, ResolvedType::Scalar(list) if list.list)
+                && !(matches!(scope, Scope::Read)
+                    && matches!(list.as_ref(), Expr::Literal(Literal::Null)))
+            {
                 return Err(CompilerError::typed(
                     T7,
                     format!(
@@ -2333,8 +2702,16 @@ fn resolve_expr_type(
             )?))
         }
         Expr::Binary { left, op, right } => {
-            let left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
-            let right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+            let left_type = contextual_boolean(
+                left,
+                resolve_expr_type(catalog, left, ctx, params, scope)?,
+                scope,
+            );
+            let right_type = contextual_boolean(
+                right,
+                resolve_expr_type(catalog, right, ctx, params, scope)?,
+                scope,
+            );
             let (Some(l), Some(r)) = (boolean_scalar(&left_type), boolean_scalar(&right_type))
             else {
                 return Err(CompilerError::typed(
@@ -2352,7 +2729,11 @@ fn resolve_expr_type(
             )))
         }
         Expr::Not(inner) => {
-            let inner_type = resolve_expr_type(catalog, inner, ctx, params, scope)?;
+            let inner_type = contextual_boolean(
+                inner,
+                resolve_expr_type(catalog, inner, ctx, params, scope)?,
+                scope,
+            );
             let Some(b) = boolean_scalar(&inner_type) else {
                 return Err(CompilerError::typed(
                     T41,
@@ -2533,40 +2914,44 @@ fn infer_projection_field(
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
 ) -> Result<Field> {
-    let name = projection_name(expr, alias);
-    match expr {
+    let ty = projection_type(catalog, expr, alias, order_clause, ctx, params)?;
+    projection_field(catalog, &projection_name(expr, alias), &ty)
+}
+
+/// The declared type of a return item, shared by inference and IR lowering.
+pub(crate) fn projection_type(
+    catalog: &Catalog,
+    expr: &Expr,
+    alias: Option<&str>,
+    order_clause: &[Ordering],
+    ctx: &TypeContext,
+    params: &HashMap<String, PropType>,
+) -> Result<ExprType> {
+    let ty = match expr {
         Expr::Aggregate { func, arg } => {
-            // Keep result-schema inference fail-closed even when a caller has
-            // not first passed through `typecheck_read_query`. In particular,
-            // Count's output shape is fixed, but its argument may still be an
-            // unsupported Blob value.
-            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
-            reject_blob_read_value(&resolved_arg, arg)?;
-            check_aggregate_argument(func, arg, &resolved_arg)?;
-            check_projection(expr, alias, order_clause)?;
-            let (data_type, nullable) = match func {
-                AggFunc::Count => (DataType::Int64, true),
-                AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
-                AggFunc::Min | AggFunc::Max => {
-                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved_arg)?;
-                    (data_type, true)
-                }
-            };
-            Ok(Field::new(name, data_type, nullable))
+            aggregate_signature(catalog, *func, arg, ctx, params, true)?.result
         }
         Expr::Nearest { .. } | Expr::Bm25 { .. } => {
             resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
-            check_projection(expr, alias, order_clause)?;
-            Ok(Field::new(name, DataType::Float32, false))
+            ExprType::from_prop(&PropType::scalar(ScalarType::F32, false))
         }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
             reject_blob_read_value(&resolved, expr)?;
-            check_projection(expr, alias, order_clause)?;
-            let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
-            Ok(Field::new(name, data_type, nullable))
+            match resolved {
+                ResolvedType::Scalar(prop) => ExprType::from_prop(&prop),
+                ResolvedType::Node(type_name) => ExprType::Node { type_name },
+                ResolvedType::Aggregate(ty) => ty,
+                ResolvedType::ForwardAlias => {
+                    return Err(CompilerError::Plan(
+                        "unresolved forward alias in projection".into(),
+                    ));
+                }
+            }
         }
-    }
+    };
+    check_projection(expr, alias, order_clause)?;
+    Ok(ty)
 }
 
 /// The column name a projection carries in the executed result batch
@@ -2593,7 +2978,7 @@ pub fn executed_column_name(expr: &Expr, alias: Option<&str>) -> String {
     }
 }
 
-fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
+pub(crate) fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
     if let Some(alias) = alias {
         return alias.to_string();
     }
@@ -2620,13 +3005,19 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
 
 /// T8: `count` takes a scalar or a node, `sum`/`avg` a numeric, `min`/`max` an
 /// orderable scalar; none takes an aggregate.
-fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType) -> Result<()> {
+fn check_aggregate_argument(
+    func: &AggFunc,
+    arg: &Expr,
+    arg_type: &ResolvedType,
+) -> Result<ExprType> {
     match (func, arg_type) {
-        (_, ResolvedType::Aggregate) => Err(CompilerError::typed(
+        (_, ResolvedType::Aggregate(_) | ResolvedType::ForwardAlias) => Err(CompilerError::typed(
             T8,
             format!("{func} cannot take an aggregate or a forward alias reference as its argument"),
         )),
-        (AggFunc::Count, _) => Ok(()),
+        (AggFunc::Count, ResolvedType::Node(type_name)) => Ok(ExprType::Node {
+            type_name: type_name.clone(),
+        }),
         (_, ResolvedType::Node(_)) => {
             let subject = match arg {
                 Expr::Variable(name) => format!("node binding `${name}`"),
@@ -2660,17 +3051,24 @@ fn check_aggregate_argument(func: &AggFunc, arg: &Expr, arg_type: &ResolvedType)
                 ),
             ))
         }
-        _ => Ok(()),
+        (_, ResolvedType::Scalar(prop)) => Ok(ExprType::from_prop(prop)),
     }
 }
 
-fn resolved_type_to_field_shape(
-    catalog: &Catalog,
-    resolved: &ResolvedType,
-) -> Result<(DataType, bool)> {
-    match resolved {
-        ResolvedType::Scalar(prop_type) => Ok((prop_type.to_arrow(), prop_type.nullable)),
-        ResolvedType::Node(type_name) => {
+/// Convert a stored return type to a field without inferring its expression again.
+pub(crate) fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> Result<Field> {
+    let (data_type, nullable) = match ty {
+        ExprType::Value { nullable, .. } => (
+            ty.to_arrow()
+                .ok_or_else(|| CompilerError::Plan("value has no Arrow type".into()))?,
+            *nullable,
+        ),
+        ExprType::ExactInteger { .. } => {
+            return Err(CompilerError::Plan(
+                "internal exact integer cannot be a result column".into(),
+            ));
+        }
+        ExprType::Node { type_name } => {
             let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
                 CompilerError::typed(T51, format!("type `{}` not found in catalog", type_name))
             })?;
@@ -2680,10 +3078,10 @@ fn resolved_type_to_field_shape(
                     Field::new(member, field.data_type().clone(), field.is_nullable())
                 })
                 .collect();
-            Ok((DataType::Struct(fields.into()), false))
+            (DataType::Struct(fields.into()), false)
         }
-        ResolvedType::Aggregate => Ok((DataType::Int64, true)),
-    }
+    };
+    Ok(Field::new(name, data_type, nullable))
 }
 
 /// The refusal of `$a in $b` where `$a` is a node binding, the shape of a
@@ -2715,7 +3113,7 @@ fn membership_over_a_node(
     ))
 }
 
-fn literal_type(lit: &Literal) -> Result<PropType> {
+pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
     match lit {
         // Null is compatible with any nullable type; default to String for inference.
         Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
@@ -2724,32 +3122,48 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
         Literal::Date(value) => {
-            crate::types::check_date_literal(value)
+            check_date_literal(value)
                 .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
             Ok(PropType::scalar(ScalarType::Date, false))
         }
-        Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
+        Literal::DateTime(value) => {
+            check_datetime_literal(value)
+                .map_err(|reason| CompilerError::typed(T3, reason.to_string()))?;
+            Ok(PropType::scalar(ScalarType::DateTime, false))
+        }
         Literal::List(items) => {
-            if items.is_empty() {
-                return Ok(PropType::list_of(ScalarType::String, false));
-            }
-            let first = literal_type(&items[0])?;
-            if first.list {
-                return Err(CompilerError::typed(
-                    T52,
-                    "nested list literals are not supported".to_string(),
-                ));
-            }
-            for item in items.iter().skip(1) {
+            let mut scalar = None;
+            for item in items {
+                if matches!(item, Literal::Null) {
+                    continue;
+                }
                 let item_type = literal_type(item)?;
-                if item_type.list || !types_compatible(&first, &item_type) {
+                if item_type.list {
                     return Err(CompilerError::typed(
-                        T53,
-                        "list literal elements must share a compatible scalar type".to_string(),
+                        T52,
+                        "nested list literals are not supported".to_string(),
                     ));
                 }
+                scalar = Some(match scalar {
+                    None => item_type.scalar,
+                    Some(previous) if previous == item_type.scalar => previous,
+                    Some(ScalarType::I64 | ScalarType::F64)
+                        if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
+                    {
+                        ScalarType::F64
+                    }
+                    Some(_) => {
+                        return Err(CompilerError::typed(
+                            T53,
+                            "list literal elements must share a compatible scalar type".to_string(),
+                        ));
+                    }
+                });
             }
-            Ok(PropType::list_of(first.scalar, false))
+            Ok(PropType::list_of(
+                scalar.unwrap_or(ScalarType::String),
+                false,
+            ))
         }
     }
 }

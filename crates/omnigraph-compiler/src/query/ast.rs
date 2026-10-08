@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::settings::{SettingId, SettingValue};
+use crate::types::{ExprType, ScalarType};
 
 pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
@@ -324,7 +325,7 @@ pub struct PropMatch {
 #[derive(Debug, Clone)]
 pub struct Traversal {
     pub src: String,
-    pub edge_name: String,
+    pub selector: EdgeSelector,
     pub dst: String,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
@@ -334,6 +335,14 @@ pub struct Traversal {
     /// Optional name for the matched edge (`$p $w:knows $f`), making the
     /// edge's own properties addressable as `$w.<prop>`.
     pub edge_binding: Option<String>,
+}
+
+/// The source spelling of the edge types a traversal selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeSelector {
+    Named(String),
+    Alternation(Vec<String>),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -677,6 +686,46 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+}
+
+impl AggFunc {
+    /// The result scalar for an accepted argument; position determines nullability.
+    pub fn result_type(self, arg: &ExprType) -> Option<ScalarType> {
+        if matches!(arg, ExprType::Value { scalar: ScalarType::Vector(dim), .. }
+            if *dim == 0 || i32::try_from(*dim).is_err())
+        {
+            return None;
+        }
+        match (self, arg) {
+            (Self::Count, _) => Some(ScalarType::I64),
+            (
+                Self::Sum | Self::Avg,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_numeric().then_some(ScalarType::F64),
+            (
+                Self::Min | Self::Max,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_orderable().then_some(*scalar),
+            (
+                Self::Sum | Self::Avg | Self::Min | Self::Max,
+                ExprType::Value {
+                    scalar: _,
+                    list: true,
+                    nullable: _,
+                }
+                | ExprType::Node { type_name: _ }
+                | ExprType::ExactInteger { .. },
+            ) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for AggFunc {

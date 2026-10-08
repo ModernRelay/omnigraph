@@ -7,6 +7,7 @@ use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Sn
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
@@ -23,6 +24,12 @@ use utoipa::{IntoParams, ToSchema};
 /// The settings definition every door reads (the Session settings RFC),
 /// re-exported so a wire consumer needs no second dependency for it.
 pub use omnigraph_compiler::settings;
+
+/// The single request/response discriminator for the v0.13 HTTP contract.
+/// This is independent of the package version and graph-storage stamp.
+pub const HTTP_API_CONTRACT_HEADER: &str = "omnigraph-http-api";
+/// Exact header value; consumers must reject missing or repeated values.
+pub const HTTP_API_CONTRACT: &str = "0.13";
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
 /// Documentation presents the canonical spelling
@@ -59,13 +66,6 @@ pub mod branch_statement_refusals {
     pub const NAME_OR_PARAMS: &str = "a branch statement takes no name and no parameters";
     /// An expected head beside a statement.
     pub const COMMIT_PRECONDITION: &str = "a branch statement takes no commit precondition";
-    /// Any branch statement sent to a deprecated route.
-    pub const DEPRECATED_ROUTE: &str =
-        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
-    /// An `explain` statement sent to a deprecated route.
-    pub const EXPLAIN_DEPRECATED_ROUTE: &str =
-        "the explain statement is not served on deprecated routes; use POST /query";
-
     /// Fill the `{statement}` placeholder of the two door refusals.
     pub fn with_statement(template: &str, statement: &str) -> String {
         template.replace("{statement}", statement)
@@ -80,10 +80,6 @@ pub mod query_file_refusals {
     /// step, refused at every HTTP route and CLI verb since nothing follows
     /// the prefix in the same request.
     pub const ONLY_SETTINGS: &str = "a file of only settings lines carries no statement";
-    /// Either carrier — the `settings` field or a `set`/`reset` prefix in the
-    /// source — at either deprecated route, which serve their legacy bodies
-    /// under the process defaults alone.
-    pub const SETTINGS_AT_DEPRECATED_ROUTE: &str = "the deprecated /read and /change routes take no settings, neither a settings field nor a set or reset prefix; use POST /query or POST /mutate";
 }
 
 /// The `settings` field of a request: one optional value per `request`-scope
@@ -109,6 +105,16 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = ann_nprobes_schema)]
     pub ann_nprobes: Option<i64>,
+    /// Positive query-wide traversal row-work cap for statements using edge selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = traversal_work_limit_schema)]
+    pub traversal_work_limit: Option<i64>,
+    /// `history_release_bytes`: the byte budget of a branch's buffer of
+    /// unreleased commits for this request's mutate or merge publishes, `1024..=262144`; an
+    /// `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = history_release_bytes_schema)]
+    pub history_release_bytes: Option<i64>,
 }
 
 impl SettingsRequest {
@@ -130,6 +136,12 @@ impl SettingsRequest {
         }
         if let Some(ann_nprobes) = self.ann_nprobes {
             assignments.push((SettingId::AnnNprobes, SettingValue::Integer(ann_nprobes)));
+        }
+        if let Some(limit) = self.traversal_work_limit {
+            assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(bytes) = self.history_release_bytes {
+            assignments.push((SettingId::HistoryReleaseBytes, SettingValue::Integer(bytes)));
         }
         assignments
     }
@@ -163,6 +175,14 @@ fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
 
 fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::AnnNprobes)
+}
+
+fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::TraversalWorkLimit)
+}
+
+fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::HistoryReleaseBytes)
 }
 
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
@@ -252,8 +272,8 @@ pub struct SnapshotOutput {
     pub graph_branch: String,
     pub graph_manifest_version: u64,
     /// The on-disk internal-schema (storage-format) version this graph's branch
-    /// is stamped at. Branches of one graph can differ (v11 beside v12) while a
-    /// v11 graph converts branch by branch on publish.
+    /// is stamped at. This binary serves only its own storage-format version; a
+    /// graph at any other version is refused until it is upgraded offline or rebuilt.
     pub internal_schema_version: u32,
     pub datasets: Vec<SnapshotDatasetOutput>,
 }
@@ -294,7 +314,7 @@ pub struct BranchMergeRequest {
     pub target: Option<String>,
     /// Delete the source branch after a successful merge. The deletion runs
     /// under its own `branch_delete` policy check; a refusal or failure is
-    /// reported via `branch_deleted` / `branch_delete_error` on the response
+    /// reported via `branch_deleted` / `branch_delete_error_details` on the response
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
@@ -336,17 +356,22 @@ pub struct BranchMergeOutput {
     pub source: String,
     pub target: String,
     pub outcome: BranchMergeOutcome,
+    /// This merge's own publication, including for a fast-forward. Always
+    /// present on the wire; `null` only when already up to date.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub commit: Option<CommitOutput>,
     pub actor_id: Option<String>,
     /// Result of the requested post-merge source-branch deletion. Absent when
     /// `delete_branch` was not requested; `true` when the source branch was
     /// deleted; `false` when the deletion was refused or failed (the merge
-    /// itself still succeeded — see `branch_delete_error`).
+    /// itself still succeeded — see `branch_delete_error_details`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_deleted: Option<bool>,
     /// Why the requested source-branch deletion did not happen. Present iff
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch_delete_error: Option<String>,
+    pub branch_delete_error_details: Option<ErrorOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -435,32 +460,6 @@ pub struct ReadOutput {
     pub graph_commit_id: Option<String>,
 }
 
-/// Indefinitely byte-stable envelope of the deprecated `POST /read` route; cell
-/// spelling follows the JSON writer. The canonical [`ReadOutput`] may grow
-/// additive fields; this legacy envelope deliberately cannot carry them.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LegacyReadOutput {
-    pub query_name: String,
-    pub target: ReadTargetOutput,
-    pub row_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<String>,
-    #[schema(value_type = Value)]
-    pub rows: Box<RawValue>,
-}
-
-impl From<ReadOutput> for LegacyReadOutput {
-    fn from(value: ReadOutput) -> Self {
-        Self {
-            query_name: value.query_name,
-            target: value.target,
-            row_count: value.row_count,
-            columns: value.columns,
-            rows: value.rows,
-        }
-    }
-}
-
 /// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
 /// A merge conflict has no kind: it is the 409 `POST /branches/merge` answers.
 /// The statement grammar is `BranchStmt` in `omnigraph-compiler`.
@@ -495,15 +494,47 @@ pub struct ChangeOutput {
     /// Edges the mutation touched, under the `affected_nodes` rule.
     pub affected_edges: usize,
     pub actor_id: Option<String>,
-    /// The commit this write published, if any. For a branch statement: the
-    /// target's head, read after the merge released its gates, so under a
-    /// concurrent writer it may name a later commit than the merge published.
-    /// `null` for `created`, `deleted`, and `already_up_to_date`, which publish
-    /// nothing, and `null` when that head read fails.
+    /// This write's own publication, including for a fast-forward merge.
+    /// Always present on the wire; `null` for branch creation, deletion, or
+    /// an already-up-to-date merge, which publish no graph content commit.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
     pub commit: Option<CommitOutput>,
     /// Present only when the request was a branch statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<BranchOutcomeOutput>,
+}
+
+/// Load capability for a batch touching a node type with declared `@embed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadEmbeddingGeneration {
+    /// Loads never generate vectors, including with a configured provider.
+    /// Supplied vectors are preserved; omissions follow schema nullability.
+    Unsupported,
+}
+
+impl LoadEmbeddingGeneration {
+    pub fn for_load(catalog: &Catalog, result: &LoadResult) -> Option<Self> {
+        result
+            .nodes_loaded
+            .keys()
+            .any(|name| {
+                catalog
+                    .node_types
+                    .get(name)
+                    .is_some_and(|node| !node.embed_sources.is_empty())
+            })
+            .then_some(Self::Unsupported)
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Unsupported => {
+                "Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -521,6 +552,11 @@ pub struct IngestOutput {
     /// Logical edge declarations touched by this load, sorted by name.
     pub edges: Vec<GraphBatchDeclarationOutput>,
     pub total_entities: usize,
+    /// `unsupported` when a loaded node type declares `@embed`, including
+    /// when all vectors were supplied; `null` otherwise.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
@@ -550,6 +586,11 @@ pub struct GraphBatchLoadOutput {
     /// Logical edge declarations touched by this batch, sorted by name.
     pub edges: Vec<GraphBatchDeclarationOutput>,
     pub total_entities: usize,
+    /// `unsupported` when a loaded node type declares `@embed`, including
+    /// when all vectors were supplied; `null` otherwise.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schema(required = true)]
+    pub embedding_generation: Option<LoadEmbeddingGeneration>,
     pub actor_id: Option<String>,
     pub commit: Option<CommitOutput>,
 }
@@ -818,43 +859,17 @@ pub struct ChangeErrorOutput {
     pub change_diff_refusal: Option<ChangeDiffRefusalOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReadRequest {
-    /// GQ query source. May declare one or more named queries; pick one with
-    /// `query_name` if there is more than one.
-    #[schema(
-        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
-    )]
-    pub query_source: String,
-    /// Name of the query to run when `query_source` declares multiple. Optional
-    /// when only one query is declared.
-    pub query_name: Option<String>,
-    /// JSON object whose keys match the query's declared parameters.
-    pub params: Option<Value>,
-    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
-    pub branch: Option<String>,
-    /// Snapshot id to read from. Mutually exclusive with `branch`.
-    pub snapshot: Option<String>,
-    /// Refused when present: the deprecated route runs under the process
-    /// defaults. Typed as raw JSON so the refusal names the field instead of
-    /// a deserialization error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Value>,
-}
-
 /// Inline read-query request for `POST /query`.
 ///
-/// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
-/// AI-agent integration. Mutations are rejected with 400 — use `POST
-/// /mutate` (or its deprecated alias `POST /change`) for write queries.
+/// Mutations are rejected with 400 — use `POST /mutate` for write queries.
 /// Field names are deliberately short (`query`, `name`) to match the GQ
 /// keyword and the CLI `-e` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
-    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
-    /// deprecated alias `POST /change`) instead. May instead be the branch
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch
     /// statement `branch list`, sent with no `name`, `params`, `branch`, or
     /// `snapshot`; or one `explain` statement (`explain query …`), which
     /// answers the v2 plan instead of
@@ -1013,22 +1028,18 @@ impl BlobStatOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
     /// May declare multiple named mutations; pick one with `name`. May instead
     /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
     /// sent with no `name`, `params`, or `branch`.
-    ///
-    /// Accepts the legacy field name `query_source` as a deserialization alias.
     #[schema(
         example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
     )]
-    #[serde(alias = "query_source")]
     pub query: String,
     /// Name of the mutation to run when `query` declares multiple.
-    ///
-    /// Accepts the legacy field name `query_name` as a deserialization alias.
-    #[serde(default, alias = "query_name")]
+    #[serde(default)]
     pub name: Option<String>,
     /// JSON object whose keys match the mutation's declared parameters.
     #[serde(default)]
@@ -1191,22 +1202,6 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct SchemaApplyRequest {
-    /// Project schema in `.pg` source form. The diff against the current
-    /// schema produces the migration steps that will be applied.
-    #[schema(
-        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
-    )]
-    pub schema_source: String,
-    /// When true, promote every `DropMode::Soft` step in the plan to
-    /// `DropMode::Hard`, making the prior property data unreachable
-    /// after the apply. Matches the CLI's `--allow-data-loss` flag.
-    /// Defaults to `false` (drops remain reversible via time travel).
-    #[serde(default)]
-    pub allow_data_loss: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyOutput {
     pub uri: String,
@@ -1305,10 +1300,9 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The internal-schema (storage-format) version this binary writes, the
-    /// top of the range it serves (v11 and v12 today; a v11 branch converts on
-    /// its next publish); a graph outside that range is refused until an
-    /// explicit upgrade.
+    /// The internal-schema (storage-format) version this binary writes and
+    /// the only one it serves; a graph at any other version is refused until
+    /// it is upgraded offline or rebuilt.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
@@ -1320,9 +1314,9 @@ pub struct HealthOutput {
 /// no graph id: those stay behind `GET /graphs`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadinessOutput {
-    /// False once shutdown has begun; the response is then 503.
+    /// False during shutdown or when a nonempty inventory has no ready graph.
     pub ready: bool,
-    /// `serving` or `draining`.
+    /// `loading`, `serving`, `degraded`, `blocked` or `draining`.
     pub status: String,
     /// The `config_digest` of the applied revision this process booted from.
     /// Fixed for the life of the process: the server never reloads.
@@ -1333,11 +1327,14 @@ pub struct ReadinessOutput {
     /// The ledger CAS (`sha256:<hex>`) the process booted from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_cas: Option<String>,
-    /// How many graphs this process serves.
+    /// Number of registered graphs, including blocked entries.
     pub served_graph_count: usize,
-    /// How many graphs the applied revision names that this process does
-    /// not serve, for any reason. `GET /graphs` names them.
-    pub quarantined_graph_count: usize,
+    /// Registered graphs whose startup completed successfully.
+    pub ready_graph_count: usize,
+    /// Registered graphs waiting for their initial startup admission.
+    pub loading_graph_count: usize,
+    /// Unavailable graphs outside startup, including closed transitions.
+    pub blocked_graph_count: usize,
     /// The bound on graceful shutdown, after which the process exits 2.
     pub shutdown_grace_seconds: u64,
 }
@@ -1348,6 +1345,9 @@ pub enum ErrorCode {
     Unauthorized,
     Forbidden,
     BadRequest,
+    /// 400: the request lacks the exact supported HTTP contract header.
+    /// Authentication and contract admission precede graph access and effects.
+    ApiContractMismatch,
     NotFound,
     /// 405 Method Not Allowed — the route exists but the active server
     /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
@@ -1358,6 +1358,10 @@ pub enum ErrorCode {
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
     TooManyRequests,
+    /// 503: operation admission is closed; reconcile any earlier write.
+    ServiceUnavailable,
+    /// 503: a known graph is unavailable. Does not authorize replay.
+    GraphUnavailable,
     Internal,
 }
 
@@ -1444,9 +1448,8 @@ pub struct PreconditionFailureOutput {
 
 /// A change continuation can no longer be reconstructed from retained history
 /// (HTTP 410). Recovery is the baseline handshake; retrying the same cursor
-/// cannot succeed. `code` stays unset: [`ErrorCode`] is closed and this
-/// additive detail is the machine-readable discriminator (the same rolling
-/// contract as `external_blob_source`).
+/// cannot succeed. `code` stays unset: this structured detail is the
+/// machine-readable discriminator, as with `external_blob_source`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeFeedGapOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1618,8 +1621,7 @@ pub struct ErrorOutput {
     pub blob_range: Option<BlobRangeOutput>,
     /// Set with HTTP 424 when an external Blob URI passed admission policy but
     /// its source could not be probed or read. This optional detail is the
-    /// rolling-safe machine-readable discriminator; `code` is omitted because
-    /// [`ErrorCode`] is a closed compatibility contract.
+    /// machine-readable discriminator; `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_blob_source: Option<ExternalBlobSourceOutput>,
     /// Set when an overlapping durable recovery intent must be resolved before
@@ -1627,8 +1629,8 @@ pub struct ErrorOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_required: Option<RecoveryRequiredOutput>,
     /// Set when a mutation's graph-commit precondition failed
-    /// (HTTP 412). Like `recovery_required`, the meaning rides this additive
-    /// field — `ErrorCode` is a closed rolling wire contract.
+    /// (HTTP 412). Like `recovery_required`, this structured field carries
+    /// the machine-readable meaning and `code` is omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precondition_failure: Option<PreconditionFailureOutput>,
     /// Set with HTTP 410 when retained history can no longer reconstruct a
@@ -1957,6 +1959,7 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
 pub fn ingest_output(
     uri: &str,
     result: &LoadResult,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> IngestOutput {
@@ -1970,6 +1973,7 @@ pub fn ingest_output(
         nodes,
         edges,
         total_entities,
+        embedding_generation: LoadEmbeddingGeneration::for_load(catalog, result),
         actor_id,
         commit: None,
     }
@@ -1978,16 +1982,18 @@ pub fn ingest_output(
 pub fn ingest_receipt_output(
     uri: &str,
     receipt: &LoadReceipt,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> IngestOutput {
-    let mut output = ingest_output(uri, &receipt.result, mode, actor_id);
+    let mut output = ingest_output(uri, &receipt.result, catalog, mode, actor_id);
     output.commit = Some(commit_output(&receipt.commit));
     output
 }
 
 pub fn graph_batch_load_output(
     result: &LoadResult,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> GraphBatchLoadOutput {
@@ -2000,6 +2006,7 @@ pub fn graph_batch_load_output(
         nodes,
         edges,
         total_entities,
+        embedding_generation: LoadEmbeddingGeneration::for_load(catalog, result),
         actor_id,
         commit: None,
     }
@@ -2042,10 +2049,11 @@ fn load_declaration_outputs(
 
 pub fn graph_batch_load_receipt_output(
     receipt: &LoadReceipt,
+    catalog: &Catalog,
     mode: LoadMode,
     actor_id: Option<String>,
 ) -> GraphBatchLoadOutput {
-    let mut output = graph_batch_load_output(&receipt.result, mode, actor_id);
+    let mut output = graph_batch_load_output(&receipt.result, catalog, mode, actor_id);
     output.commit = Some(commit_output(&receipt.commit));
     output
 }
@@ -2073,6 +2081,56 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,
+    pub state: GraphAvailability,
+    /// Runtime availability; actor policy still gates every operation.
+    pub read_available: bool,
+    pub write_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<GraphStartupFailure>,
+    pub action: GraphAvailabilityAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAvailability {
+    Loading,
+    Ready,
+    Transitioning,
+    Blocked,
+    Stopping,
+}
+
+impl std::fmt::Display for GraphAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Loading => "loading",
+            Self::Ready => "ready",
+            Self::Transitioning => "transitioning",
+            Self::Blocked => "blocked",
+            Self::Stopping => "stopping",
+        })
+    }
+}
+
+/// Bounded startup classification, without storage paths or error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphStartupFailure {
+    InvalidConfiguration,
+    InvalidPolicy,
+    InvalidExternalBlobPolicy,
+    OpenFailed,
+    InvalidStoredQueries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphAvailabilityAction {
+    None,
+    WaitForStartup,
+    WaitForTransition,
+    ApplyCorrectionOrRestart,
+    WaitForRestart,
 }
 
 /// Response from `GET /graphs`. Lists every graph registered with the
@@ -2081,11 +2139,6 @@ pub struct GraphInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
-    /// Graphs the applied revision names that this process does not serve,
-    /// for any reason, sorted (RFC 0049). Empty when every applied graph is
-    /// served.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quarantined: Vec<String>,
 }
 
 /// A graph's existence, without storage, schema, data, or serving metadata.
@@ -2155,12 +2208,14 @@ mod tests {
             engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
             ann_nprobes: Some(7),
+            traversal_work_limit: Some(123),
+            history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7}}",
-            request_rows[0], request_rows[1], request_rows[2]
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":2048}}",
+            request_rows[0], request_rows[1], request_rows[2], request_rows[3], request_rows[4]
         );
-        assert_eq!(request_rows.len(), 3);
+        assert_eq!(request_rows.len(), 5);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated
@@ -2202,6 +2257,22 @@ mod tests {
             "a negative cap reaches the settings validation with its own spelling"
         );
         assert!(serde_json::from_str::<SettingsRequest>("{\"traversal\": \"csr\"}").is_err());
+        let parsed: SettingsRequest =
+            serde_json::from_str("{\"traversal_work_limit\": 123}").unwrap();
+        assert_eq!(
+            parsed.assignments(),
+            vec![(SettingId::TraversalWorkLimit, SettingValue::Integer(123))]
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>("{\"traversal_work_limit\": \"many\"}")
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<SettingsRequest>(
+                "{\"traversal_work_limit\": 9223372036854775808}"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2226,6 +2297,39 @@ mod tests {
         for invalid in ["Person", "node:", "edge:", "table:Person"] {
             assert_eq!(entity_type_parts(invalid), Err(EntityTypeMappingError));
         }
+    }
+
+    #[test]
+    fn merge_and_change_receipts_require_commit_even_when_null() {
+        let mut merge = json!({
+            "source": "feature", "target": "main", "outcome": "already_up_to_date",
+            "actor_id": null, "commit": null
+        });
+        let decoded: BranchMergeOutput = serde_json::from_value(merge.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), merge);
+        merge.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<BranchMergeOutput>(merge)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
+        let mut change = json!({
+            "branch": "main", "query_name": "branch merge",
+            "affected_nodes": 0, "affected_edges": 0, "actor_id": null, "commit": null,
+            "outcome": {"kind": "merged", "source": "feature", "target": "main", "merge": "already_up_to_date"}
+        });
+        let decoded: ChangeOutput = serde_json::from_value(change.clone()).unwrap();
+        assert!(decoded.commit.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), change);
+        change.as_object_mut().unwrap().remove("commit");
+        assert!(
+            serde_json::from_value::<ChangeOutput>(change)
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `commit`")
+        );
     }
 
     #[test]

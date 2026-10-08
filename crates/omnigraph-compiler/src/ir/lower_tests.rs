@@ -3,6 +3,7 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use crate::schema::parser::parse_schema;
+use crate::types::{Direction, ExprType, PropType, ScalarType};
 
 fn setup() -> Catalog {
     let schema = parse_schema(
@@ -144,16 +145,36 @@ delete Knows where (@src = "a" and to = "b") or not since is null
 "#,
     )
     .unwrap();
-    typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
-    let MutationOpIR::Delete { predicate, .. } = &ir.ops[0] else {
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
+    let MutationOpIR::Delete { target, predicate } = &ir.ops[0] else {
         panic!("expected a delete");
     };
+    assert_eq!(target, &ctx.targets[0]);
+    assert_eq!(
+        target,
+        &MutationTarget::Edge {
+            type_name: "Knows".into()
+        }
+    );
     let column = |property: &str| IRExpr::PropAccess {
         variable: "Knows".to_string(),
         property: property.to_string(),
+        ty: if [catalog.system_columns.src, catalog.system_columns.dst].contains(&property) {
+            ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+        } else {
+            ExprType::from_prop(&catalog.edge_types["Knows"].properties[property])
+        },
     };
-    let text = |value: &str| IRExpr::Literal(Literal::String(value.to_string()));
+    let text = |value: &str| {
+        IRExpr::Literal(
+            Literal::String(value.to_string()),
+            ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
+        )
+    };
     let endpoints = IRExpr::and_all([
         IRExpr::comparison(column(catalog.system_columns.src), CompOp::Eq, text("a")),
         IRExpr::comparison(column(catalog.system_columns.dst), CompOp::Eq, text("b")),
@@ -161,14 +182,11 @@ delete Knows where (@src = "a" and to = "b") or not since is null
     .unwrap();
     assert_eq!(
         *predicate,
-        IRExpr::Binary {
-            left: Box::new(endpoints),
-            op: BinaryOp::Or,
-            right: Box::new(IRExpr::Not(Box::new(IRExpr::IsNull {
-                expr: Box::new(column("since")),
-                negated: false,
-            }))),
-        }
+        IRExpr::binary(
+            endpoints,
+            BinaryOp::Or,
+            IRExpr::logical_not(IRExpr::null_test(column("since"), false))
+        )
     );
 }
 
@@ -177,9 +195,15 @@ fn test_lower_constants_are_carried_as_expressions() {
     let schema = parse_schema("node Flag { name: String  active: Bool  tags: [String]? }").unwrap();
     let catalog = build_catalog(&schema).unwrap();
     let cut_above_one = IRExpr::comparison(
-        IRExpr::Param("cut".to_string()),
+        IRExpr::Param(
+            "cut".to_string(),
+            ExprType::from_prop(&PropType::scalar(ScalarType::I64, false)),
+        ),
         CompOp::Gt,
-        IRExpr::Literal(Literal::Integer(1)),
+        IRExpr::Literal(
+            Literal::Integer(1),
+            ExprType::from_prop(&PropType::scalar(ScalarType::I64, false)),
+        ),
     );
 
     let ir = lower(
@@ -192,6 +216,7 @@ fn test_lower_constants_are_carried_as_expressions() {
     let property = |name: &str| IRExpr::PropAccess {
         variable: "f".to_string(),
         property: name.to_string(),
+        ty: ExprType::from_prop(&catalog.node_types["Flag"].properties[name]),
     };
     assert_eq!(
         *filters,
@@ -200,7 +225,10 @@ fn test_lower_constants_are_carried_as_expressions() {
             IRExpr::comparison(
                 property("tags"),
                 CompOp::Contains,
-                IRExpr::Literal(Literal::String("rust".to_string()))
+                IRExpr::Literal(
+                    Literal::String("rust".to_string()),
+                    ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+                )
             ),
         ]
     );
@@ -208,12 +236,15 @@ fn test_lower_constants_are_carried_as_expressions() {
     let qf =
         parse_query("query q($cut: I64) { insert Flag { name: \"x\", active: not $cut > 1 } }")
             .unwrap();
-    typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     let MutationOpIR::Insert { assignments, .. } = &ir.ops[0] else {
         panic!("expected an insert");
     };
-    assert_eq!(assignments[1].value, IRExpr::Not(Box::new(cut_above_one)));
+    assert_eq!(assignments[1].value, IRExpr::logical_not(cut_above_one));
 }
 
 fn expand_dsts(ir: &QueryIR) -> Vec<&str> {
@@ -269,7 +300,7 @@ fn test_lower_rebinding_a_scanned_variable_filters_instead_of_rescanning() {
             matches!(
                 op,
                 IROp::Filter(IRExpr::Binary { left, .. })
-                    if matches!(left.as_ref(), IRExpr::PropAccess { variable, property } if variable == "p" && property == "name")
+                    if matches!(left.as_ref(), IRExpr::PropAccess { variable, property, .. } if variable == "p" && property == "name")
             )
         })
         .count();
@@ -290,9 +321,11 @@ fn test_lower_repeated_deferred_binding_keeps_both_filter_sets() {
                 dst_filters
                     .iter()
                     .map(|f| match f.comparison_parts().map(|(left, _, _)| left) {
-                        Some(IRExpr::PropAccess { variable, property }) if variable == "f" => {
-                            property.as_str()
-                        }
+                        Some(IRExpr::PropAccess {
+                            variable,
+                            property,
+                            ty: _,
+                        }) if variable == "f" => property.as_str(),
                         other => panic!("unexpected filter operand {other:?}"),
                     })
                     .collect(),
@@ -343,7 +376,7 @@ fn test_lower_rebinding_an_outer_variable_inside_negation_keeps_its_filter() {
             matches!(
                 op,
                 IROp::Filter(IRExpr::Binary { left, .. })
-                    if matches!(left.as_ref(), IRExpr::PropAccess { variable, property } if variable == "q" && property == "name")
+                    if matches!(left.as_ref(), IRExpr::PropAccess { variable, property, .. } if variable == "q" && property == "name")
             )
         })
         .count();
@@ -385,8 +418,11 @@ update Person set { hit: $t contains "li" } where tags contains "li"
 "#,
     )
     .unwrap();
-    typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     let ops: Vec<(CompOp, CompOp)> = ir
         .ops
         .iter()
@@ -418,7 +454,7 @@ update Person set { hit: $t contains "li" } where tags contains "li"
         ir.return_exprs
             .iter()
             .map(|projection| match &projection.expr {
-                IRExpr::Not(inner) => comparison_op(inner),
+                IRExpr::Not(inner, _) => comparison_op(inner),
                 other => comparison_op(other),
             })
             .collect::<Vec<_>>(),
@@ -437,8 +473,14 @@ fn test_lower_folds_literal_only_constants() {
     let property = |name: &str| IRExpr::PropAccess {
         variable: "f".to_string(),
         property: name.to_string(),
+        ty: ExprType::from_prop(&catalog.node_types["Flag"].properties[name]),
     };
-    let bool_lit = |value: bool| IRExpr::Literal(Literal::Bool(value));
+    let bool_lit = |value: bool| {
+        IRExpr::Literal(
+            Literal::Bool(value),
+            ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
+        )
+    };
 
     let ir = lower(
         &catalog,
@@ -460,15 +502,31 @@ fn test_lower_folds_literal_only_constants() {
     };
     assert_eq!(
         *filter,
-        IRExpr::Binary {
-            left: Box::new(IRExpr::comparison(
+        IRExpr::binary(
+            IRExpr::comparison(
                 property("count"),
                 CompOp::Gt,
-                IRExpr::Literal(Literal::Integer(1))
-            )),
-            op: BinaryOp::And,
-            right: Box::new(bool_lit(false)),
-        }
+                IRExpr::Literal(
+                    Literal::Integer(1),
+                    ExprType::from_prop(&PropType::scalar(ScalarType::I64, false))
+                )
+            ),
+            BinaryOp::And,
+            IRExpr::comparison(
+                IRExpr::Cast {
+                    expr: Box::new(IRExpr::Literal(
+                        Literal::Integer(2),
+                        ExprType::from_prop(&PropType::scalar(ScalarType::I64, false))
+                    )),
+                    ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, false)),
+                },
+                CompOp::Lt,
+                IRExpr::Literal(
+                    Literal::Float(1.5),
+                    ExprType::from_prop(&PropType::scalar(ScalarType::F64, false))
+                ),
+            )
+        )
     );
     assert_eq!(ir.return_exprs[1].expr, bool_lit(true));
     assert_eq!(ir.return_exprs[2].expr, bool_lit(false));
@@ -477,21 +535,27 @@ fn test_lower_folds_literal_only_constants() {
         "query q($cut: I64) { insert Flag { name: \"x\", active: not (1 > 2) and $cut is not null } }",
     )
     .unwrap();
-    typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     let MutationOpIR::Insert { assignments, .. } = &ir.ops[0] else {
         panic!("expected an insert");
     };
     assert_eq!(
         assignments[1].value,
-        IRExpr::Binary {
-            left: Box::new(bool_lit(true)),
-            op: BinaryOp::And,
-            right: Box::new(IRExpr::IsNull {
-                expr: Box::new(IRExpr::Param("cut".to_string())),
-                negated: true,
-            }),
-        }
+        IRExpr::binary(
+            bool_lit(true),
+            BinaryOp::And,
+            IRExpr::null_test(
+                IRExpr::Param(
+                    "cut".to_string(),
+                    ExprType::from_prop(&PropType::scalar(ScalarType::I64, false))
+                ),
+                true
+            )
+        )
     );
 }
 
@@ -504,6 +568,7 @@ fn test_lower_rewrites_nested_rank_projections_to_score_columns() {
     let score = |column: &str| IRExpr::PropAccess {
         variable: "d".to_string(),
         property: column.to_string(),
+        ty: ExprType::from_prop(&PropType::scalar(ScalarType::F32, false)),
     };
 
     let ir = lower(
@@ -513,12 +578,18 @@ fn test_lower_rewrites_nested_rank_projections_to_score_columns() {
     let threshold = IRExpr::comparison(
         score(SCORE_COLUMN),
         CompOp::Gt,
-        IRExpr::Literal(Literal::Float(0.5)),
+        IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Float(0.5),
+                ExprType::from_prop(&PropType::scalar(ScalarType::F64, false)),
+            )),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::F32, false)),
+        },
     );
     assert_eq!(ir.return_exprs[0].expr, threshold);
     assert_eq!(
         ir.return_exprs[1].expr,
-        IRExpr::Not(Box::new(threshold.clone()))
+        IRExpr::logical_not(threshold.clone())
     );
 
     let ir = lower(
@@ -530,7 +601,13 @@ fn test_lower_rewrites_nested_rank_projections_to_score_columns() {
         IRExpr::comparison(
             score(DISTANCE_COLUMN),
             CompOp::Lt,
-            IRExpr::Literal(Literal::Float(1.0))
+            IRExpr::Cast {
+                expr: Box::new(IRExpr::Literal(
+                    Literal::Float(1.0),
+                    ExprType::from_prop(&PropType::scalar(ScalarType::F64, false))
+                )),
+                ty: ExprType::from_prop(&PropType::scalar(ScalarType::F32, false))
+            }
         )
     );
 }
@@ -651,15 +728,11 @@ return { $f.name }
     let tc = typecheck_query(&catalog, qf.single_decl()).unwrap();
     let ir = lower_query(&catalog, qf.single_decl(), &tc).unwrap();
     match &ir.pipeline[1] {
-        IROp::Expand { direction, .. } => assert_eq!(*direction, Direction::Both),
+        IROp::Expand { edges, .. } => assert_eq!(edges.named().unwrap().direction, Direction::Both),
         op => panic!("expected Expand, got {op:?}"),
     }
 }
 
-// The discarded-context-clone regression: negation inners are typechecked into
-// a clone that never reaches lowering's ResolvedTraversal lookup, so direction
-// used to silently fall back to Out inside not{}. Undirectedness now travels
-// on the AST node; this pins Both surviving into the AntiJoin's inner Expand.
 #[test]
 fn test_lower_undirected_inside_negation_keeps_direction_both() {
     let catalog = setup();
@@ -681,8 +754,8 @@ return { $p.name }
         panic!("expected AntiJoin, got {:?}", ir.pipeline[1]);
     };
     match &inner[0] {
-        IROp::Expand { direction, .. } => assert_eq!(
-            *direction,
+        IROp::Expand { edges, .. } => assert_eq!(
+            edges.named().unwrap().direction,
             Direction::Both,
             "negation inner must not fall back to Out"
         ),
@@ -723,17 +796,24 @@ update Person set { age: $age } where name = $name
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    assert!(matches!(checked, CheckedQuery::Mutation(_)));
-
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     match &ir.ops[0] {
         MutationOpIR::Update {
-            type_name,
+            target,
             assignments,
             predicate,
         } => {
-            assert_eq!(type_name, "Person");
+            assert_eq!(target, &ctx.targets[0]);
+            assert_eq!(
+                target,
+                &MutationTarget::Node {
+                    type_name: "Person".into()
+                }
+            );
             assert_eq!(assignments.len(), 1);
             assert_eq!(assignments[0].property, "age");
             assert_eq!(
@@ -742,9 +822,13 @@ update Person set { age: $age } where name = $name
                     IRExpr::PropAccess {
                         variable: "Person".to_string(),
                         property: "name".to_string(),
+                        ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
                     },
                     CompOp::Eq,
-                    IRExpr::Param("name".to_string()),
+                    IRExpr::Param(
+                        "name".to_string(),
+                        ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+                    ),
                 )
             );
         }
@@ -800,7 +884,7 @@ return { now() as ts }
 
     assert!(matches!(
         ir.return_exprs[0].expr,
-        IRExpr::Param(ref name) if name == NOW_PARAM_NAME
+        IRExpr::Param(ref name, _) if name == NOW_PARAM_NAME
     ));
 }
 
@@ -826,10 +910,11 @@ update Event set { updated_at: now() } where updated_at = now()
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    assert!(matches!(checked, CheckedQuery::Mutation(_)));
-
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     match &ir.ops[0] {
         MutationOpIR::Update {
             assignments,
@@ -838,10 +923,10 @@ update Event set { updated_at: now() } where updated_at = now()
         } => {
             assert!(matches!(
                 assignments[0].value,
-                IRExpr::Param(ref name) if name == NOW_PARAM_NAME
+                IRExpr::Param(ref name, _) if name == NOW_PARAM_NAME
             ));
             let (_, _, value) = predicate.comparison_parts().expect("a comparison");
-            assert!(matches!(value, IRExpr::Param(name) if name == NOW_PARAM_NAME));
+            assert!(matches!(value, IRExpr::Param(name, _) if name == NOW_PARAM_NAME));
         }
         _ => panic!("expected update mutation op"),
     }
@@ -859,13 +944,57 @@ insert Knows { from: $name, to: $friend }
 "#,
     )
     .unwrap();
-    let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
-    assert!(matches!(checked, CheckedQuery::Mutation(_)));
-
-    let ir = lower_mutation_query(&catalog, qf.single_decl()).unwrap();
+    let CheckedQuery::Mutation(ctx) = typecheck_query_decl(&catalog, qf.single_decl()).unwrap()
+    else {
+        panic!("expected a mutation context");
+    };
+    let ir = lower_mutation_query(&catalog, qf.single_decl(), &ctx).unwrap();
     assert_eq!(ir.ops.len(), 2);
-    assert!(matches!(&ir.ops[0], MutationOpIR::Insert { type_name, .. } if type_name == "Person"));
-    assert!(matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows"));
+    assert_eq!(
+        ctx.targets,
+        [
+            MutationTarget::Node {
+                type_name: "Person".into()
+            },
+            MutationTarget::Edge {
+                type_name: "Knows".into()
+            },
+        ]
+    );
+    for (op, expected) in ir.ops.iter().zip(&ctx.targets) {
+        let MutationOpIR::Insert {
+            target,
+            assignments: _,
+        } = op
+        else {
+            panic!("expected an insert");
+        };
+        assert_eq!(target, expected);
+    }
+
+    let mut extra_targets = ctx.targets.clone();
+    extra_targets.push(ctx.targets[0].clone());
+    for targets in [Vec::new(), ctx.targets[..1].to_vec(), extra_targets] {
+        let error =
+            lower_mutation_query(&catalog, qf.single_decl(), &MutationTypeContext { targets })
+                .expect_err("each statement requires exactly one checked target");
+        assert!(
+            error
+                .to_string()
+                .contains("mutation statements and checked targets differ"),
+            "{error}"
+        );
+    }
+    let mut reordered = ctx.clone();
+    reordered.targets.swap(0, 1);
+    let error = lower_mutation_query(&catalog, qf.single_decl(), &reordered)
+        .expect_err("each checked target must name its own statement");
+    assert!(
+        error
+            .to_string()
+            .contains("checked mutation target 'Knows' differs from statement target 'Person'"),
+        "{error}"
+    );
 }
 
 /// Destination binding is deferred: NodeScan + Expand + Filter (no cross-join).
@@ -1274,7 +1403,7 @@ return { $p.name }
     // The filter's right-hand side should be a Param, not a Literal
     if let IROp::Expand { dst_filters, .. } = &ir.pipeline[1] {
         let (_, _, right) = dst_filters[0].comparison_parts().expect("a comparison");
-        assert!(matches!(right, IRExpr::Param(name) if name == "company"));
+        assert!(matches!(right, IRExpr::Param(name, _) if name == "company"));
     }
 }
 
@@ -1323,6 +1452,495 @@ return { $p.name }
     let (left, _, _) = dst_filters[0].comparison_parts().expect("a comparison");
     assert!(matches!(
         left,
-        IRExpr::PropAccess { variable, property } if variable == "c" && property == "name"
+        IRExpr::PropAccess { variable, property, .. } if variable == "c" && property == "name"
     ));
+}
+
+#[test]
+fn test_edge_selection_nested_lowering_issue_659() {
+    let catalog = setup();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $c: Company not { $c: Company exists { $c (worksAt | worksAt) $p } } } return { $c.name } }",
+    );
+    assert!(ir.has_edge_selections());
+    assert!(!ir.has_wildcard_traversal());
+    let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
+        panic!("expected outer block");
+    };
+    let IROp::AntiJoin { inner, .. } = &inner[0] else {
+        panic!("expected nested block");
+    };
+    let IROp::Expand {
+        edges,
+        src_type,
+        dst_type,
+        ..
+    } = &inner[0]
+    else {
+        panic!("expected expand");
+    };
+    assert_eq!(edges.members().len(), 1);
+    assert!(edges.named().is_none());
+    assert_eq!(edges.members()[0].direction, Direction::In);
+    assert_eq!(src_type, "Company");
+    assert_eq!(dst_type, "Person");
+
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person $f: Person exists { $p: Person not { $p * $f } } } return { $p.name } }",
+    );
+    assert!(ir.has_edge_selections());
+    assert!(ir.has_wildcard_traversal());
+}
+
+#[test]
+fn test_edge_type_projection_is_virtual_issue_659() {
+    let schema = parse_schema(
+        "node Person { name: String } edge Knows: Person -> Person edge Likes: Person -> Person",
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person $p $e:(knows | likes) $f } return { $e.@type } }",
+    );
+    assert_eq!(
+        ir.return_exprs[0].expr,
+        IRExpr::PropAccess {
+            variable: "e".into(),
+            property: EDGE_TYPE_COLUMN.into(),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
+        }
+    );
+    assert_eq!(ir.return_exprs[0].alias.as_deref(), Some("e.@type"));
+    assert_eq!(ir.return_exprs[0].column, "e.@type");
+    assert_eq!(ir.return_exprs[0].ty.spelling(), "String");
+}
+
+#[test]
+fn test_edge_selection_block_predicate_uses_child_scope_issue_659() {
+    let schema = parse_schema("node Person { name: String } edge Knows: Person -> Person { label: String } edge Likes: Person -> Person { label: String }").unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    for selector in ["knows", "(knows | likes)"] {
+        let ir = lower(
+            &catalog,
+            &format!(
+                r#"query q() {{ match {{ $p: Person count($e.label contains "x") {{ $p $e:{selector} $q }} > 0 }} return {{ $p.name }} }}"#
+            ),
+        );
+        let IROp::AntiJoin { predicate, .. } = &ir.pipeline[1] else {
+            panic!("expected block");
+        };
+        assert!(matches!(
+            predicate.left.arg(),
+            Some(IRExpr::Binary {
+                op: BinaryOp::Compare(CompOp::StringContains),
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn test_singleton_edge_type_is_constant_everywhere_issue_659() {
+    let catalog = setup();
+    for selector in ["knows", "(knows | knows)"] {
+        let ir = lower(
+            &catalog,
+            &format!(
+                "query q() {{ match {{ $p: Person $p $e:{selector} $f $e.@type = \"Knows\" }} return {{ $e.@type }} order {{ $e.@type }} }}"
+            ),
+        );
+        assert_eq!(
+            ir.return_exprs[0].expr,
+            IRExpr::Literal(
+                Literal::String("Knows".into()),
+                ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+            )
+        );
+        assert_eq!(ir.return_exprs[0].column, "e.@type");
+        assert_eq!(ir.return_exprs[0].ty.spelling(), "String");
+        assert_eq!(
+            ir.order_by[0].expr,
+            IRExpr::Literal(
+                Literal::String("Knows".into()),
+                ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+            )
+        );
+        assert!(
+            ir.pipeline
+                .iter()
+                .any(|op| matches!(op, IROp::Filter(IRExpr::Literal(Literal::Bool(true), _))))
+        );
+        let ir = lower(
+            &catalog,
+            &format!(
+                "query q() {{ match {{ $p: Person $p $e:{selector} $f }} return {{ count($e.@type) }} }}"
+            ),
+        );
+        assert!(
+            matches!(&ir.return_exprs[0].expr, IRExpr::Aggregate { arg, .. }
+            if **arg == IRExpr::Literal(Literal::String("Knows".into()), ExprType::from_prop(&PropType::scalar(ScalarType::String, false))))
+        );
+    }
+}
+
+#[test]
+fn future_outer_column_does_not_capture_inner_binding_issue_659() {
+    let catalog = setup();
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person count($x.name contains \"x\") { $p knows $x } > 0 $x: Company } return { $p.name, $x.name } }",
+    );
+    let IROp::AntiJoin {
+        inner, predicate, ..
+    } = ir.pipeline.last().unwrap()
+    else {
+        panic!("expected block");
+    };
+    let IROp::Expand { dst_var, .. } = &inner[0] else {
+        panic!("expected expand");
+    };
+    assert_ne!(dst_var, "x");
+    let Some(IRExpr::Binary {
+        left,
+        op: BinaryOp::Compare(CompOp::StringContains),
+        ..
+    }) = predicate.left.arg()
+    else {
+        panic!("expected a StringContains argument");
+    };
+    assert!(matches!(left.as_ref(), IRExpr::PropAccess { variable, .. } if variable == dst_var));
+}
+
+#[test]
+fn return_declarations_share_types_and_preserve_descriptor_names() {
+    use crate::query::descriptor::describe_query_operation;
+    use crate::query::typecheck::infer_query_result_schema;
+
+    let catalog = build_catalog(&parse_schema(
+        "node Person { name: String @key age: I32? tags: [String]? payload: Blob? embedding: Vector(2)? }"
+    ).unwrap()).unwrap();
+    for (source, columns, names, types) in [
+        (
+            "query q() { match { $p: Person } return { $p.name, $p.age, $p.@id, now(), $p, $p.tags, $p.embedding } }",
+            vec![
+                "p.name",
+                "p.age",
+                "p.@id",
+                NOW_PARAM_NAME,
+                "p",
+                "p.tags",
+                "p.embedding",
+            ],
+            vec!["name", "age", "@id", "now", "p", "tags", "embedding"],
+            vec![
+                "String",
+                "I32?",
+                "String",
+                "DateTime",
+                "Person",
+                "[String]?",
+                "Vector(2)?",
+            ],
+        ),
+        (
+            "query q() { match { $p: Person } return { sum($p.age) as total, count($p) } }",
+            vec!["total", "p"],
+            vec!["total", "count"],
+            vec!["F64?", "I64?"],
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name as label, now() as instant, $p as person } }",
+            vec!["label", "instant", "person"],
+            vec!["label", "instant", "person"],
+            vec!["String", "DateTime", "Person"],
+        ),
+    ] {
+        let parsed = parse_query(source).unwrap();
+        let query = parsed.single_decl();
+        let ctx = typecheck_query(&catalog, query).unwrap();
+        let ir = lower_query(&catalog, query, &ctx).unwrap();
+        assert_eq!(
+            ir.return_exprs
+                .iter()
+                .map(|p| p.column.as_str())
+                .collect::<Vec<_>>(),
+            columns
+        );
+        assert_eq!(
+            ir.return_exprs
+                .iter()
+                .map(|p| p.ty.spelling())
+                .collect::<Vec<_>>(),
+            types
+        );
+        let inferred = infer_query_result_schema(&catalog, query, &ctx).unwrap();
+        for (projection, field) in ir.return_exprs.iter().zip(inferred.fields()) {
+            let lowered =
+                crate::query::typecheck::projection_field(&catalog, field.name(), &projection.ty)
+                    .unwrap();
+            assert_eq!(&lowered, field.as_ref());
+        }
+        let descriptor = describe_query_operation(&catalog, query).unwrap();
+        assert_eq!(
+            descriptor
+                .result
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(
+            descriptor
+                .result
+                .iter()
+                .map(|f| f.nullable)
+                .collect::<Vec<_>>(),
+            inferred
+                .fields()
+                .iter()
+                .map(|f| f.is_nullable())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn read_ast_nulls_acquire_context_and_keep_result_schema_nullable() {
+    use crate::query::typecheck::infer_query_result_schema;
+    let catalog = setup();
+    let base = parse_query("query q($flag: Bool, $needle: I32, $values: [I32], $text: String) { match { $p: Person } return { true as result } }").unwrap();
+    let null = || Expr::Literal(Literal::Null);
+    let var = |name: &str| Expr::Variable(name.into());
+    let binary = |left: Expr, op: BinaryOp, right: Expr| Expr::Binary {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    };
+    for (expr, nullable) in [
+        (binary(null(), BinaryOp::And, var("flag")), true),
+        (binary(var("flag"), BinaryOp::Or, null()), true),
+        (Expr::Not(Box::new(null())), true),
+        (
+            binary(var("needle"), BinaryOp::Compare(CompOp::Eq), null()),
+            true,
+        ),
+        (
+            binary(null(), BinaryOp::Compare(CompOp::Lt), var("needle")),
+            true,
+        ),
+        (
+            binary(var("values"), BinaryOp::Compare(CompOp::Contains), null()),
+            true,
+        ),
+        (
+            binary(
+                Expr::Literal(Literal::List(vec![])),
+                BinaryOp::Compare(CompOp::Contains),
+                var("needle"),
+            ),
+            false,
+        ),
+        (
+            binary(
+                Expr::Literal(Literal::List(vec![Literal::Null, Literal::Null])),
+                BinaryOp::Compare(CompOp::Contains),
+                var("needle"),
+            ),
+            false,
+        ),
+        (
+            Expr::In {
+                needle: Box::new(var("text")),
+                list: Box::new(null()),
+            },
+            true,
+        ),
+        (
+            Expr::In {
+                needle: Box::new(null()),
+                list: Box::new(var("values")),
+            },
+            true,
+        ),
+    ] {
+        let mut query = base.single_decl().clone();
+        query.return_clause[0].expr = expr;
+        let checked = typecheck_query(&catalog, &query).unwrap();
+        let schema = infer_query_result_schema(&catalog, &query, &checked).unwrap();
+        let ir = lower_query(&catalog, &query, &checked).unwrap();
+        let result = &ir.return_exprs[0];
+        assert_eq!(
+            result.ty,
+            ExprType::from_prop(&PropType::scalar(ScalarType::Bool, nullable))
+        );
+        assert_eq!(result.expr.ty(), &result.ty);
+        assert_eq!(schema.field(0).is_nullable(), nullable);
+        assert_eq!(
+            result.ty.to_arrow().as_ref(),
+            Some(schema.field(0).data_type())
+        );
+        result.expr.check_types().unwrap();
+        if let Expr::In { list, .. } = &query.return_clause[0].expr
+            && matches!(list.as_ref(), Expr::Literal(Literal::Null))
+        {
+            let (list, op, _) = result.expr.comparison_parts().unwrap();
+            assert_eq!(op, CompOp::Contains);
+            assert_eq!(
+                list.ty(),
+                &ExprType::from_prop(&PropType::list_of(ScalarType::String, true))
+            );
+        }
+    }
+}
+
+#[test]
+fn contextual_read_nulls_do_not_expand_mutation_assignment_admission() {
+    let schema = parse_schema("node Flag { name: String active: Bool? }").unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let base = parse_query("query q() { insert Flag { name: \"x\", active: true } }").unwrap();
+    let mut query = base.single_decl().clone();
+    let Mutation::Insert(insert) = &mut query.mutations[0] else {
+        unreachable!()
+    };
+    insert.assignments[1].value = Expr::Not(Box::new(Expr::Literal(Literal::Null)));
+    assert!(typecheck_query_decl(&catalog, &query).is_err());
+}
+
+#[test]
+fn inferred_comparison_type_matches_casted_nullable_operands() {
+    let catalog = setup();
+    let ir = lower(
+        &catalog,
+        "query q($wide: U64, $narrow: I32?, $value: F32) { match { $p: Person } return { $wide = $narrow as exact, $value = 0.5 as narrow } }",
+    );
+    for result in &ir.return_exprs {
+        assert_eq!(result.expr.ty(), &result.ty);
+        result.expr.check_types().unwrap();
+    }
+    let (left, _, right) = ir.return_exprs[0].expr.comparison_parts().unwrap();
+    assert_eq!(
+        left.ty(),
+        &ExprType::ExactInteger {
+            list: false,
+            nullable: false
+        }
+    );
+    assert_eq!(
+        right.ty(),
+        &ExprType::ExactInteger {
+            list: false,
+            nullable: true
+        }
+    );
+    let (_, _, right) = ir.return_exprs[1].expr.comparison_parts().unwrap();
+    assert!(matches!(
+        right,
+        IRExpr::Cast {
+            ty: ExprType::Value {
+                scalar: ScalarType::F32,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn block_aggregate_signatures_are_stored_before_comparison_conversions() {
+    let catalog = setup();
+    for (func, result) in [
+        ("count", ScalarType::I64),
+        ("sum", ScalarType::F64),
+        ("avg", ScalarType::F64),
+        ("min", ScalarType::I32),
+        ("max", ScalarType::I32),
+    ] {
+        let ir = lower(
+            &catalog,
+            &format!(
+                "query q() {{ match {{ $p: Person {func}($f.age) {{ $p knows $f }} > 0 }} return {{ $p.name }} }}"
+            ),
+        );
+        let predicate = ir
+            .pipeline
+            .iter()
+            .find_map(|op| match op {
+                IROp::AntiJoin { predicate, .. } => Some(predicate),
+                _ => None,
+            })
+            .unwrap();
+        predicate.check_types().unwrap();
+        let BlockAggregateExpr::Aggregate { arg, signature, .. } = predicate.left.leaf() else {
+            panic!("expected column aggregate")
+        };
+        assert_eq!(
+            arg.ty(),
+            &ExprType::from_prop(&PropType::scalar(ScalarType::I32, true))
+        );
+        assert_eq!(signature.arg, *arg.ty());
+        assert_eq!(
+            signature.result,
+            ExprType::from_prop(&PropType::scalar(result, true))
+        );
+        assert_eq!(
+            predicate.right.ty(),
+            &ExprType::from_prop(&PropType::scalar(result, false))
+        );
+    }
+    let ir = lower(
+        &catalog,
+        "query q() { match { $p: Person count($f) { $p knows $f } > 0 } return { $p.name } }",
+    );
+    let IROp::AntiJoin { predicate, .. } = &ir.pipeline[1] else {
+        panic!("expected block")
+    };
+    assert!(matches!(
+        predicate.left,
+        BlockAggregateExpr::CountRows { .. }
+    ));
+    assert!(predicate.is_existence_test());
+
+    let ir = lower(
+        &catalog,
+        "query q($f: I32) { match { $p: Person count($f) { $p knows $f } > 0 } return { $p.name } }",
+    );
+    let IROp::AntiJoin { predicate, .. } = &ir.pipeline[1] else {
+        panic!("expected block")
+    };
+    assert!(matches!(predicate.left.arg(), Some(IRExpr::Param(name, _)) if name == "f"));
+    assert_eq!(
+        predicate.left.ty(),
+        &ExprType::from_prop(&PropType::scalar(ScalarType::I64, true))
+    );
+    assert!(!predicate.is_row_count());
+}
+
+#[test]
+fn block_ast_null_bound_uses_the_aggregate_domain() {
+    let catalog = setup();
+    let parsed = parse_query(
+        "query q() { match { $p: Person max($f.age) { $p knows $f } > 0 } return { $p.name } }",
+    )
+    .unwrap();
+    let mut query = parsed.single_decl().clone();
+    let Clause::Subquery(block) = &mut query.match_clause[1] else {
+        panic!("expected block")
+    };
+    block.right = Expr::Literal(Literal::Null);
+    let checked = typecheck_query(&catalog, &query).unwrap();
+    let ir = lower_query(&catalog, &query, &checked).unwrap();
+    let IROp::AntiJoin { predicate, .. } = &ir.pipeline[1] else {
+        panic!("expected block")
+    };
+    assert_eq!(
+        predicate.right,
+        IRExpr::Literal(
+            Literal::Null,
+            ExprType::from_prop(&PropType::scalar(ScalarType::I32, true))
+        )
+    );
+    predicate.check_types().unwrap();
 }

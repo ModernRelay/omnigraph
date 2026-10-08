@@ -1,6 +1,7 @@
 //! Object-store-backed serving, gated independently for S3 and Azure.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;
 
 use axum::body::Body;
@@ -8,7 +9,7 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobCell, BlobContent, EntityKind};
-use omnigraph_server::api::{IngestRequest, ReadRequest};
+use omnigraph_server::api::{IngestRequest, QueryRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
@@ -84,6 +85,7 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot"))
             .method(Method::GET)
             .header("authorization", "Bearer object-store-token")
@@ -94,9 +96,9 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     assert_eq!(snapshot_status, StatusCode::OK);
     assert!(snapshot_body["datasets"].is_array());
 
-    let read = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Alice" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -105,7 +107,8 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/read"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/query"))
             .method(Method::POST)
             .header("authorization", "Bearer object-store-token")
             .header("content-type", "application/json")
@@ -169,10 +172,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(dir.path()).await;
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
         let db = session(Omnigraph::open(&graph_uri).await.unwrap());
@@ -184,7 +184,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
     }
 
-    let settings = omnigraph_server::load_server_settings(
+    let mut settings = omnigraph_server::load_server_settings(
         Some(&std::path::PathBuf::from(&root)),
         None,
         true,
@@ -192,6 +192,17 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     )
     .await
     .unwrap();
+    // This fixture calls the settings loader and opener independently. No
+    // engine has opened or issued work yet; settle the read-only settings owner
+    // before the independent opener takes its own exact admission. Production
+    // `serve` transfers that owner directly instead.
+    settings
+        .cluster_admission
+        .take()
+        .expect("v2 settings retain admission")
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -228,6 +239,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let (load_status, load_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/load")
             .header("content-type", "application/json")
@@ -265,6 +277,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/load")
             .header("content-type", "application/json")
@@ -295,6 +308,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     let response = tower::ServiceExt::oneshot(
         app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")
@@ -348,10 +362,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
             ),
         )
         .unwrap();
-        let import = omnigraph_cluster::import_config_dir(dir.path()).await;
-        assert!(import.ok, "{:?}", import.diagnostics);
-        let apply = omnigraph_cluster::apply_config_dir(dir.path()).await;
-        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        support::apply_cluster_fixture(dir.path()).await;
 
         let graph_uri = format!("{root}/graphs/knowledge.omni");
         let db = session(Omnigraph::open(&graph_uri).await.unwrap());
@@ -363,7 +374,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
     }
 
-    let settings = omnigraph_server::load_server_settings(
+    let mut settings = omnigraph_server::load_server_settings(
         Some(&std::path::PathBuf::from(&root)),
         None,
         true,
@@ -371,6 +382,17 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
     )
     .await
     .unwrap();
+    // This fixture calls the settings loader and opener independently. No
+    // engine has opened or issued work yet; settle the read-only settings owner
+    // before the independent opener takes its own exact admission. Production
+    // `serve` transfers that owner directly instead.
+    settings
+        .cluster_admission
+        .take()
+        .expect("v2 settings retain admission")
+        .release_after_settlement()
+        .await
+        .unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -388,6 +410,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
     let response = tower::ServiceExt::oneshot(
         build_app(state),
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri("/graphs/knowledge/queries/find_person")
             .header("content-type", "application/json")

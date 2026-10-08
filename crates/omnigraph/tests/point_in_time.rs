@@ -2,9 +2,164 @@ mod helpers;
 
 use arrow_array::{Array, Int32Array};
 use helpers::*;
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
+
+#[tokio::test]
+async fn wildcard_reads_refuse_historical_targets_issue_659() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let version = version_main(&db).await.unwrap();
+    let snapshot = snapshot_id(&db, "main").await.unwrap();
+    let source = r#"query neighbors() {
+        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        return { $f.name }
+    }"#;
+    assert_eq!(
+        query_main(&db, source, "neighbors", &ParamMap::new())
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+    let explicit = source.replace("$p * $f", "$p (knows | knows) $f");
+    assert_eq!(
+        db.run_query_at(version, &explicit, "neighbors", &ParamMap::new())
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+    let errors = [
+        db.run_query_at(version, source, "neighbors", &ParamMap::new())
+            .await
+            .expect_err("historical wildcard"),
+        db.query(
+            ReadTarget::Snapshot(snapshot.clone()),
+            source,
+            "neighbors",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("snapshot wildcard"),
+        db.explain_query(
+            ReadTarget::Snapshot(snapshot.clone()),
+            source,
+            "neighbors",
+            &ParamMap::new(),
+        )
+        .await
+        .expect_err("historical explain"),
+        db.query_inspected(
+            ReadTarget::Snapshot(snapshot),
+            source,
+            "neighbors",
+            &ParamMap::new(),
+        )
+        .await
+        .err()
+        .expect("historical inspection"),
+    ];
+    for error in errors {
+        let text = error.to_string();
+        assert!(
+            text.contains("wildcard") && text.contains("historical"),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_at_capture_issue_659()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = version_main(&db).await.unwrap();
+    db.apply_schema(&format!("{TEST_SCHEMA}\nedge Likes: Person -> Person\n"))
+        .await
+        .unwrap();
+    db.load_jsonl(
+        r#"{"edge":"Likes","from":"Alice","to":"Charlie"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let captured = version_main(&db).await.unwrap();
+    let selected = r#"query neighbors() {
+        match { $p: Person { name: "Alice" } $p $e:(knows | likes) $f }
+        return { $e.@type as edge_type, $f.name }
+    }"#;
+    assert_eq!(
+        db.run_query_at(captured, selected, "neighbors", &ParamMap::new())
+            .await
+            .unwrap()
+            .num_rows(),
+        3
+    );
+    db.load_jsonl(
+        r#"{"edge":"Likes","from":"Alice","to":"Bob"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.run_query_at(captured, selected, "neighbors", &ParamMap::new())
+            .await
+            .unwrap()
+            .num_rows(),
+        3
+    );
+    assert_eq!(
+        query_main(&db, selected, "neighbors", &ParamMap::new())
+            .await
+            .unwrap()
+            .num_rows(),
+        4
+    );
+    use omnigraph_compiler::settings::Traversal;
+    for (pattern, routes) in [
+        (
+            "likes",
+            vec![Traversal::Auto, Traversal::Indexed, Traversal::Csr],
+        ),
+        (
+            "$e:likes",
+            vec![Traversal::Auto, Traversal::Indexed, Traversal::Csr],
+        ),
+        ("(knows | likes)", vec![Traversal::Auto, Traversal::Indexed]),
+        (
+            "$e:(knows | likes)",
+            vec![Traversal::Auto, Traversal::Indexed],
+        ),
+    ] {
+        for route in routes {
+            let db = with_traversal(&db, route);
+            let query = format!(
+                "query missing() {{ match {{ $p: Person {{ name: \"Alice\" }} $p {pattern} $f }} return {{ $f.@id }} }}"
+            );
+            let error = db
+                .run_query_at(before, &query, "missing", &ParamMap::new())
+                .await
+                .expect_err(
+                    "a historical member without a captured dataset is refused consistently",
+                );
+            assert!(
+                error.to_string().contains("Likes"),
+                "{pattern} / {route:?}: {error}"
+            );
+            let empty = query.replace("Alice", "absent-source");
+            assert_eq!(
+                db.run_query_at(before, &empty, "missing", &ParamMap::new())
+                    .await
+                    .unwrap()
+                    .num_rows(),
+                0,
+                "{pattern} / {route:?}"
+            );
+        }
+    }
+}
 
 // ─── Inline queries for point-in-time tests ─────────────────────────────────
 
@@ -154,6 +309,9 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     .await
     .unwrap();
     let before_rename = version_main(&db).await.unwrap();
+    let stale_handle = session(Omnigraph::open(uri).await.unwrap());
+    let stale_snapshot_handle = session(Omnigraph::open(uri).await.unwrap());
+    let snapshot_before_rename = db.resolve_snapshot("main").await.unwrap();
 
     db.apply_schema(
         "node Human @rename_from(\"Person\") { name: String @key }\n\
@@ -173,6 +331,32 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     assert_eq!(
         collect_column_strings(renamed_view.batches(), "p.name"),
         vec!["Alice".to_string()]
+    );
+    let stale_view = stale_handle
+        .run_query_at(
+            before_rename,
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(stale_view.batches(), "p.name"),
+        vec!["Alice"]
+    );
+    let stale_snapshot_view = stale_snapshot_handle
+        .query(
+            omnigraph::db::ReadTarget::Snapshot(snapshot_before_rename),
+            ALL_HUMANS_QUERY,
+            "all_humans",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(stale_snapshot_view.batches(), "p.name"),
+        vec!["Alice"]
     );
 
     db.apply_schema(

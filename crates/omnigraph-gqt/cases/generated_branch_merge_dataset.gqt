@@ -1,0 +1,126 @@
+# issue: none
+# notes: Deterministic keyed edge divergence with one publication per explicit load batch.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node BenchN000 { name: String @key cohort: String? val: I32? payload: String? }
+edge BenchE000: BenchN000 -> BenchN000 { cohort: String? val: I32? payload: String? }
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: "node"
+    name: "BenchN000"
+    rows: 32
+    commits: 1
+    batch_rows: 4096
+    columns:
+      name: {"kind": "key", "prefix": "n000_r", "width": 7}
+      cohort: {"kind": "literal", "value": "keep"}
+      val: {"kind": "ordinal", "start": 0, "step": 1}
+      payload: {"kind": "repeat", "text": "x", "count": 64}
+  - kind: "edge"
+    name: "BenchE000"
+    rows: 32
+    commits: 1
+    batch_rows: 4096
+    start: 0
+    id: {"kind": "key", "prefix": "e000_r", "width": 7}
+    from: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    to: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    columns:
+      cohort: {"kind": "ranges", "ranges": [{"end": 1, "value": "d3_src_upd"}, {"end": 2, "value": "d3_src_del"}, {"end": 3, "value": "d3_tgt_upd"}, {"end": 4, "value": "d3_tgt_del"}], "fallback": "keep"}
+      val: {"kind": "ordinal", "start": 0, "step": 1}
+      payload: {"kind": "repeat", "text": "x", "count": 64}
+
+--- mutate
+branch create "bench-source" from main
+--- expect ok
+
+--- mutate
+branch create "bench-target" from main
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: merge branch: bench-source
+tables:
+  - kind: "edge"
+    name: "BenchE000"
+    rows: 1
+    commits: 1
+    batch_rows: 4096
+    start: 0
+    id: {"kind": "key", "prefix": "e000_r", "width": 7}
+    from: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    to: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    columns:
+      cohort: {"kind": "literal", "value": "d3_src_upd"}
+      val: {"kind": "literal", "value": 2147483647}
+      payload: {"kind": "repeat", "text": "x", "count": 64}
+--- expect ok
+
+--- mutate branch: bench-source
+query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+--- params
+{"c": "d3_src_del"}
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: append branch: bench-source
+tables:
+  - kind: "edge"
+    name: "BenchE000"
+    rows: 1
+    commits: 1
+    batch_rows: 4096
+    start: 0
+    id: {"kind": "key", "prefix": "src_e000_n", "width": 7}
+    from: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    to: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    columns:
+      cohort: {"kind": "literal", "value": "new"}
+      val: {"kind": "ordinal", "start": 0, "step": 1}
+      payload: {"kind": "repeat", "text": "y", "count": 64}
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: merge branch: bench-target
+tables:
+  - kind: "edge"
+    name: "BenchE000"
+    rows: 1
+    commits: 1
+    batch_rows: 4096
+    start: 2
+    id: {"kind": "key", "prefix": "e000_r", "width": 7}
+    from: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    to: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    columns:
+      cohort: {"kind": "literal", "value": "d3_tgt_upd"}
+      val: {"kind": "literal", "value": 2147483647}
+      payload: {"kind": "repeat", "text": "x", "count": 64}
+--- expect ok
+
+--- mutate branch: bench-target
+query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+--- params
+{"c": "d3_tgt_del"}
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: append branch: bench-target
+tables:
+  - kind: "edge"
+    name: "BenchE000"
+    rows: 1
+    commits: 1
+    batch_rows: 4096
+    start: 0
+    id: {"kind": "key", "prefix": "tgt_e000_n", "width": 7}
+    from: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    to: {"kind": "endpoint", "prefix": "n000_r", "width": 7, "population": 32, "distribution": {"kind": "ordinal"}}
+    columns:
+      cohort: {"kind": "literal", "value": "new"}
+      val: {"kind": "ordinal", "start": 0, "step": 1}
+      payload: {"kind": "repeat", "text": "y", "count": 64}
+--- expect ok

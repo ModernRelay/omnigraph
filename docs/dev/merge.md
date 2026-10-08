@@ -9,6 +9,12 @@ source branch into a target branch. The merge base, source, and target are
 resolved once; final publication revalidates their exact graph and native-ref
 identities.
 
+Merge first tries to prove the same merge base from the captured recent commits
+and already cached history, within a fixed visit budget. An inconclusive proof
+uses the full lineage reader. A successful proof does not validate unread
+history: missing, malformed, or conflicting settled records outside the proof
+may remain undetected until a history read reaches them.
+
 ## Per-table decision
 
 For every table lifetime present in the accepted catalogs, merge compares:
@@ -41,12 +47,22 @@ table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or
 payload copy, and external blob descriptors stay external. Numeric table
 versions are not compared across refs: the publication's manifest version
-orders the registration within the graph branch (RFC 0062).
+orders the registration within the graph branch (RFC 0062). Main is the
+exception twice: after an empty source delta it keeps its own registration
+(see Publication and recovery), and for a source table on a pre-v11 fork it
+applies the delta at a new version of its own lineage.
 
 The source's registration metadata stays with an adopted pointer. A later
 target write stages detached on that same dataset from the adopted pin; no
 table fork is created. Pointer adoption still computes any required
-validation delta and runs the shared constraint evaluator.
+validation delta and runs the shared constraint evaluator, except for a
+`FastForward` whose candidates are all proven pure inserts into node types
+with no `@unique`, `@range`, `@check` or enum property
+(`proven_fast_forward_needs_no_validation`). For that delta the evaluator reads
+nothing from the target; it would only check that no two new rows share a key,
+which the source's certified exact-`id` inserts already rule out. The skip
+follows the outcome, so it also bypasses the 32 MiB validation budget: such a
+`FastForward` can publish a delta larger than a `Merged` merge accepts.
 
 ## Proven insertion route
 
@@ -86,7 +102,8 @@ compares their results.
 
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
-a SortExec input:
+a SortExec input. The change feed and export's `id` order walk tables through
+the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
 
 - a narrow ordered scan sorts only `id` + `_rowid` + `_rowaddr` (8,192 rows
   and 32 MiB per decoded batch as targets — a few dozen bytes per sorted row);
@@ -154,16 +171,22 @@ chunks publish sequentially inside the one recovery envelope, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four, five for a non-bound target. Every publish rewrites the live
+merges at four, five for a non-bound target. A `FastForward` whose target head
+is not the merge base, such as a second merge from the same source, opens the
+base like a diverged merge and compares the two states in memory. Every
+publish rewrites the live
 `__manifest` rows into new files, normally one fragment (Lance splits a write
 at 1,048,576 rows per file), so a scan no longer pays per-fragment and
 per-deletion-file requests. Pages within a file are still read separately; the
 local history curve measured 40-41 requests per write from 1 to 1,024 prior
-publications, which is a measurement, not a guarantee. The rows still include history (`graph_commit` and every
-`table_version` registration), so the bytes decoded grow with retained
-history. Read-only scans reduce one Arrow batch at a time; the publish scan
-retains every batch, because the copy-on-write publish rewrites them, so
-publication memory grows with retained history. Each `__manifest` version
+publications, which is a measurement, not a guarantee. The rows hold the
+`table` rows, the head `graph_commit` row and the buffered `settled_commit`
+and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
+`history_release_bytes` a session set) bounds, so the bytes
+decoded per scan no longer grow with retained history; older commits live in
+`__history` and are read only when a history read needs them. Read-only scans
+reduce one Arrow batch at a time; the publish scan retains every batch,
+because the copy-on-write publish rewrites them. Each `__manifest` version
 keeps its own copy of the rows and no path prunes `__manifest` versions yet.
 
 Successful local publication preserves the existing coherent projection after
@@ -267,12 +290,27 @@ the CAS the merge is complete; nothing follows the publication.
 
 ## Outcomes
 
-`MergeOutcome` is one of:
+The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
 
 - `AlreadyUpToDate` — source adds no target-visible change;
-- `FastForward` — the target adopts source state without a divergent
-  three-way result;
+- `FastForward` — the target's state equals the merge base's: equal
+  `schema_contract` and `same_manifest_state` for every table
+  (`same_graph_state`). A target head that is the base needs no comparison
+  (`head_is_base`). Every publishing merge, a fast forward included, writes its
+  own commit, so after a fast forward the target head is no longer the base of
+  the next merge from the same source, and the state comparison decides it.
+  The comparison is by registration, so it can answer `Merged` when an earlier
+  fast forward left main on its own registration for a table: after an empty
+  source delta (see Publication and recovery), or for a source table on a
+  pre-v11 fork, whose delta main applies at a new version of its own lineage;
 - `Merged` — a productive three-way merge publishes a new graph commit.
+
+Both publishing outcomes carry their own `GraphCommit`; `AlreadyUpToDate`
+carries `None`. Return this value through the server and CLI without rereading
+HEAD or history: a concurrent writer may have advanced the target already.
+Optional source deletion is a subsequent action with its own authorization and
+structured error; it cannot replace the successful merge receipt. See
+[Exact merge receipts](../rfcs/2026-09-30-exact-merge-receipts.md).
 
 ## Owners
 

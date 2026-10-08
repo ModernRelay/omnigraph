@@ -12,15 +12,11 @@ use omnigraph_compiler::settings::{SettingId, SettingRow};
 
 /// The HTTP entry a GQ source arrived through. A statement is served only at
 /// its own door: `Query` serves `branch list` and `explain`, `Mutate` serves
-/// `branch create`, `branch delete`, and `branch merge`, and the deprecated
-/// `Read` and `Change` serve none. `Read` is also the one door that runs a
-/// mutation body.
+/// `branch create`, `branch delete`, and `branch merge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Door {
     Query,
-    Read,
     Mutate,
-    Change,
 }
 
 /// What [`run_query`] answered: a declared query's rows, the branch names
@@ -65,21 +61,6 @@ pub(super) fn refuse_process_settings(
     for id in settings.iter().filter_map(SettingStmt::id) {
         id.refuse_from_request()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    }
-    Ok(())
-}
-
-/// A `set` or `reset` prefix at a deprecated door: `/read` and `/change`
-/// serve their legacy bodies under the process defaults alone, so the prefix
-/// is refused exactly as their `settings` field is.
-pub(super) fn refuse_settings_at_deprecated_route(
-    door: Door,
-    settings: &[SettingStmt],
-) -> std::result::Result<(), ApiError> {
-    if matches!(door, Door::Read | Door::Change) && !settings.is_empty() {
-        return Err(ApiError::bad_request(
-            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
-        ));
     }
     Ok(())
 }
@@ -139,15 +120,12 @@ pub(super) fn show_at_write_door(id: Option<SettingId>) -> ApiError {
     ))
 }
 
-/// A branch statement is refused at every door that does not serve it: the two
-/// deprecated routes serve none, `Query` serves only the read, `Mutate` only
-/// the control writes.
+/// `Query` serves only branch reads; `Mutate` serves only control writes.
 pub(super) fn refuse_wrong_door(
     door: Door,
     stmt: &BranchStmt,
 ) -> std::result::Result<(), ApiError> {
     match (door, stmt) {
-        (Door::Read | Door::Change, _) => Err(ApiError::bad_request(refusals::DEPRECATED_ROUTE)),
         (Door::Query, BranchStmt::Write(write)) => Err(control_write_at_read_door(write)),
         (Door::Mutate, BranchStmt::List) => Err(read_at_write_door()),
         (Door::Query, BranchStmt::List) | (Door::Mutate, BranchStmt::Write(_)) => Ok(()),
@@ -155,12 +133,10 @@ pub(super) fn refuse_wrong_door(
 }
 
 /// An `explain` statement is served at `Query` alone: a read refused at
-/// `Mutate` as `branch list` is, and at the deprecated routes as every
-/// statement is.
+/// `Mutate` as `branch list` is.
 pub(super) fn refuse_explain(door: Door) -> std::result::Result<(), ApiError> {
     match door {
         Door::Query => Ok(()),
-        Door::Read | Door::Change => Err(ApiError::bad_request(refusals::EXPLAIN_DEPRECATED_ROUTE)),
         Door::Mutate => Err(explain_at_write_door()),
     }
 }
@@ -195,12 +171,13 @@ pub(super) fn refuse_statement_envelope(
 
 /// Run one control write through its `/branches` route body and answer the
 /// `ChangeOutput` of a mutation body: `branch` received the effect, both
-/// counts are `0`, `commit` is the target's head after a publishing merge.
+/// counts are `0`, `commit` is this merge's own publication, or null for a no-op.
 pub(super) async fn run_branch_statement(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
     write: BranchWrite,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let query_name = write.statement_name().to_string();
@@ -208,7 +185,7 @@ pub(super) async fn run_branch_statement(
     let (branch, commit, outcome) = match write {
         BranchWrite::Create { name, from } => {
             let from = from.unwrap_or_else(|| "main".to_string());
-            branch_create_body(state, handle, actor, &from, &name).await?;
+            branch_create_body(state, handle, actor, ingress, &from, &name).await?;
             (
                 name.clone(),
                 None,
@@ -216,7 +193,7 @@ pub(super) async fn run_branch_statement(
             )
         }
         BranchWrite::Delete { name } => {
-            branch_delete_body(state, handle, actor, &name).await?;
+            branch_delete_body(state, handle, actor, ingress, &name).await?;
             (
                 name.clone(),
                 None,
@@ -225,19 +202,10 @@ pub(super) async fn run_branch_statement(
         }
         BranchWrite::Merge { source, into } => {
             let target = into.unwrap_or_else(|| "main".to_string());
-            let merge: api::BranchMergeOutcome =
-                branch_merge_body(state, handle, session, actor, &source, &target)
-                    .await?
-                    .into();
-            let commit = match merge {
-                api::BranchMergeOutcome::AlreadyUpToDate => None,
-                api::BranchMergeOutcome::FastForward | api::BranchMergeOutcome::Merged => handle
-                    .engine
-                    .list_commits(Some(&target))
-                    .await
-                    .ok()
-                    .and_then(|commits| commits.first().map(api::commit_output)),
-            };
+            let result =
+                branch_merge_body(state, handle, session, actor, ingress, &source, &target).await?;
+            let merge = result.outcome.into();
+            let commit = result.commit.as_ref().map(api::commit_output);
             (
                 target.clone(),
                 commit,

@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>Lakehouse graph database for context assembly &amp; multi-agent coordination</strong><br>
-  <sub>Multimodal retrieval · Git-style branching · object-storage native</sub>
+  <strong>Object-storage native graph database with branching and typed ontology.</strong><br>
+  <sub>Unified retrieval engine (vector/bm25/graph) · Git-style workflows · Open data format (Lance)</sub>
 </p>
 
 <p align="center">
@@ -15,6 +15,7 @@
   <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
   <a href="docs/user/cli/reference.md">CLI</a>
+  <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
 <p align="center">
@@ -24,22 +25,26 @@
 
 <hr>
 
-Omnigraph is the operational state and coordination layer for fleets of agents.\
-Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
+Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of a durable state.
+
+## Key Capabilities
+
+**Multi-Modal retrieval**: agents retrieve high precision/recall context by combining vector/fts search, graph traversal and filtering <br>
+**Branching**: agents propose reviewable changes rather than writing directly. <br>
+**Typed ontology**: agents have a shared enforceable model of the domain.<br>
+**Object-storage**: scales at the lowest cost.
+
+
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero.png">
+    <img alt="One dark terminal window: four agents write to the same Omnigraph company graph at once, each in its own pane and on its own branch; three merge into main, and main refuses the fourth, a decision that contradicts one already merged; beside them, the graph grows as each write lands and marks the refused one" src="assets/readme/hero.webp">
+  </picture>
+</p>
 
 Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 to ask questions, share feedback, and follow development.
 
-## Key capabilities
-
-| Capability | What it gives you |
-|---|---|
-| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies; `cluster apply` converges it and `omnigraph-server` brings every graph online at `/graphs/{id}/…`. |
-| **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
-| **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
-| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
-| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
-| **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## What you can build
 
@@ -50,6 +55,17 @@ to ask questions, share feedback, and follow development.
 | **Context graph** | Decision traces and codified tribal knowledge for retrieval |
 | **Dev graph** | Issues & dependency model that coding agents read and write |
 | **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
+
+
+## All features
+
+| Capability | What it gives you |
+|---|---|
+| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies|
+| **Multimodal query engine** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
+| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
+| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
+| **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## Install
 
@@ -259,18 +275,6 @@ Notes:
 - CI runs the same excluded command with `--locked` and the failpoint features
 - Full CI and some local test flows require `protobuf-compiler`
 - S3 integration tests expect an S3-compatible endpoint such as RustFS
-
-## Workspace Crates
-
-- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
-- `crates/omnigraph-storage`: shared local/S3/Azure control-object storage implementation and concrete backend handle
-- `crates/omnigraph-azure-admission`: narrow Azure Blob lease wrapper for the single-writer reference deployment
-- `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
-- `crates/omnigraph-policy`: Cedar policy compilation and enforcement
-- `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI
-- `crates/omnigraph-cluster`: cluster config validation, planning, and apply (the control plane)
-- `crates/omnigraph-server`: Axum HTTP server, cluster-first, runs N graphs under `/graphs/{id}/…`
-- `crates/omnigraph-cli`: CLI for graph lifecycle, query/mutate, branch/commit/merge, schema/lint, snapshot/export, cluster control, policy/queries, profiles, and maintenance
 
 ## Contributing
 

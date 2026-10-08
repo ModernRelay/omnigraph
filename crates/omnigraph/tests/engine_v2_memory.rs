@@ -1,5 +1,6 @@
 //! Pool and concurrency acceptance for engine v2. GQT cannot select a per-query
 //! pool, inspect native spill metrics, or drop an in-flight query future.
+#![recursion_limit = "256"]
 
 mod helpers;
 
@@ -15,6 +16,115 @@ use serial_test::serial;
 use helpers::*;
 
 const MIB: u64 = 1024 * 1024;
+
+#[tokio::test]
+#[serial]
+async fn selected_fanout_obeys_work_and_memory_limits_issue_659() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph_fixture(&dir, 4096, 32).await;
+    db.apply_schema(&format!("{GRAPH_SCHEMA}\nedge Likes: Person -> Person\n"))
+        .await
+        .unwrap();
+    let extra = (0..4096)
+        .map(|leaf| {
+            serde_json::json!({"edge":"Likes", "from":"hub", "to":format!("leaf{leaf:05}")})
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&extra, LoadMode::Append).await.unwrap();
+    let selected = EXPAND.replace("knows", "(knows | likes)");
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        query_main(&db, &selected, "friends", &params(&[])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.num_rows(), 4096);
+    assert_released(&probes);
+    let recursive = selected.replace("(knows | likes)", "(knows | likes){1,3}");
+    assert_eq!(
+        query_main(&db, &recursive, "friends", &params(&[]))
+            .await
+            .unwrap()
+            .num_rows(),
+        4096
+    );
+    for (query, work) in [(&selected, 16_385_u64), (&recursive, 24_577)] {
+        let below = format!("set traversal_work_limit = {};\n{query}", work - 1);
+        let error = query_main(&db, &below, "friends", &params(&[]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ResourceLimitExceeded { ref resource, limit, actual }
+                if resource == "traversal_work_limit" && limit == work - 1 && actual == work),
+            "{error:?}"
+        );
+        let exact = format!("set traversal_work_limit = {work};\n{query}");
+        assert_eq!(
+            query_main(&db, &exact, "friends", &params(&[]))
+                .await
+                .unwrap()
+                .num_rows(),
+            4096
+        );
+    }
+    for tail in ["", " limit 1"] {
+        let limited = format!(
+            "set traversal_work_limit = 1000;\n{}",
+            selected.trim_end().strip_suffix('}').unwrap().to_owned() + tail + " }"
+        );
+        let probes = QueryMemoryProbes::default();
+        let error = with_query_memory_probes(
+            probes.clone(),
+            query_main(&db, &limited, "friends", &params(&[])),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ResourceLimitExceeded { ref resource, limit: 1000, actual } if resource == "traversal_work_limit" && actual > 1000),
+            "{error:?}"
+        );
+        assert_released(&probes);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn selected_traversal_owned_state_refuses_a_realistic_pool_and_releases_issue_659() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph_fixture(&dir, 32_768, 0).await;
+    let query = r#"query friends() {
+        match { $a: Person { name: "hub" } $a (knows | knows){1,3} $b }
+        return { $b.@id }
+    }"#;
+    let limit = 2 * MIB;
+    let probes = QueryMemoryProbes::default();
+    let error = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&db, query, "friends", &params(&[]))),
+    )
+    .await
+    .unwrap_err();
+    assert_memory_refusal(error, limit);
+    assert!(
+        probes.refusals().iter().any(|owner| matches!(
+            owner.as_str(),
+            "execute_expand_bfs" | "expand hop" | "expand frontier"
+        )),
+        "the selected traversal must refuse its own work allocation: {:?}",
+        probes.refusals()
+    );
+    assert_released(&probes);
+    assert_eq!(
+        query_main(&db, query, "friends", &params(&[]))
+            .await
+            .unwrap()
+            .num_rows(),
+        32_768
+    );
+}
 
 fn assert_released(probes: &QueryMemoryProbes) {
     assert!(
@@ -241,13 +351,19 @@ async fn graph_fixture(dir: &tempfile::TempDir, leaves: usize, payload_bytes: us
 async fn cancellation_during_charged_expand_releases_pool_and_worker() {
     let dir = tempfile::tempdir().unwrap();
     let v2 = graph_fixture(&dir, 3_000, 32).await;
+    for source in [
+        EXPAND.to_string(),
+        EXPAND.replace("knows", "(knows | knows){1,3}"),
+        r#"query friends() { match { $a: Person { name: "hub" } $b: Person $a $e:* $b } return { $e.@id } }"#.to_string(),
+    ] {
+        let v2 = v2.clone();
     let probes = QueryMemoryProbes::default();
     let pause = probes.pause_blocking_work();
     let worker_probes = probes.clone();
     let query = tokio::spawn(async move {
         with_query_memory_probes(
             worker_probes,
-            query_main(&v2, EXPAND, "friends", &params(&[])),
+            query_main(&v2, &source, "friends", &params(&[])),
         )
         .await
     });
@@ -287,6 +403,7 @@ async fn cancellation_during_charged_expand_releases_pool_and_worker() {
     .await
     .expect("cancelled expand must stop and release every reservation");
     assert_released(&probes);
+    }
 }
 
 /// A small pool selects bounded destination lookup instead of a wide build.

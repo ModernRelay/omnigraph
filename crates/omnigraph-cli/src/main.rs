@@ -6,14 +6,13 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
-    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
-    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOptions,
-    PlanOutput, StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
-    approve_config_dir, force_unlock_config_dir, import_config_dir, observe_config_dir,
-    plan_config_dir_with_options, refresh_config_dir, status_config_dir, validate_config_dir,
+    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
+    ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
+    validate_config_dir,
 };
 use omnigraph_compiler::query::ast::{
     BranchStmt, BranchWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
@@ -35,7 +34,6 @@ use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -47,9 +45,13 @@ mod read_format;
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
+mod admission;
 mod blob_cli;
 mod cli;
 mod client;
+mod cluster_remote;
+mod command_outcome;
+mod graph_http;
 mod helpers;
 mod managed;
 #[cfg(test)]
@@ -64,9 +66,8 @@ use cli::*;
 use helpers::*;
 use output::*;
 
-/// Exit code for a lost `--if-commit` compare-and-swap (HTTP 412): distinct
-/// from the generic failure exit (1) so scripts can branch on "someone else
-/// wrote first — re-read and retry" without matching message text.
+/// Exit code for a verified remote `--if-commit` refusal (HTTP 412) with
+/// no earlier whole-command effects. Scripts must refresh before retrying.
 const EXIT_PRECONDITION_FAILED: i32 = 4;
 
 /// fsync the directory holding a just-atomically-persisted file so the rename
@@ -147,7 +148,6 @@ async fn main() -> Result<()> {
         .display_location_section(false)
         .install()?;
     let (cli, machine) = {
-        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches_from(raw_args);
+            .get_matches();
         let mut command_matches = &matches;
         while let Some((_, child)) = command_matches.subcommand() {
             command_matches = child;
@@ -180,10 +180,53 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        (Cli::from_arg_matches(&matches)?, machine)
+        let cli = Cli::from_arg_matches(&matches)?;
+        if let Err(error) = validate_cluster_arguments(&cli, command_matches) {
+            error.exit();
+        }
+        (cli, machine)
     };
-    match run(cli).await {
+    let (result, evidence) = if command_outcome::applies(&cli) {
+        let (result, evidence) = admission::scope(command_outcome::observe(run(cli))).await;
+        (result, Some(evidence))
+    } else {
+        (admission::scope(run(cli)).await, None)
+    };
+    match result {
         Err(error) => {
+            if error
+                .downcast_ref::<cluster_remote::WaitTimeout>()
+                .is_some()
+            {
+                std::io::stdout().flush()?;
+                std::process::exit(5);
+            }
+            if let Some(evidence) = evidence {
+                let failure = command_outcome::Failure::classify(error, evidence);
+                match machine {
+                    Some(MachineErrors::Json) => print_json(&failure)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(&failure)?),
+                    None => {
+                        let message = match &failure.output.diagnostic {
+                            Some(diagnostic) => render_diagnostic(&failure.output, diagnostic),
+                            None => failure.output.error.clone(),
+                        };
+                        eprintln!("{message}");
+                        if let Some(status) = failure.http_status {
+                            eprintln!("HTTP {status}");
+                        }
+                        if let Some(backoff) = &failure.retry_after {
+                            eprintln!("Retry-After: {backoff}");
+                        }
+                        eprintln!(
+                            "command_outcome: {}",
+                            serde_json::to_string(&failure.command_outcome)?
+                        );
+                    }
+                }
+                std::io::stdout().flush()?;
+                std::process::exit(failure.exit);
+            }
             if let Some(output) = error_output_of(&error) {
                 match machine {
                     Some(MachineErrors::Json) => print_json(&output)?,
@@ -196,10 +239,163 @@ async fn main() -> Result<()> {
                 std::io::stdout().flush()?;
                 std::process::exit(1);
             }
+            if let Some(contract) = error.downcast_ref::<graph_http::ApiContractError>() {
+                match machine {
+                    Some(MachineErrors::Json) => print_json(contract)?,
+                    Some(MachineErrors::Jsonl) => println!("{}", serde_json::to_string(contract)?),
+                    None => return Err(error),
+                }
+                std::io::stdout().flush()?;
+                std::process::exit(1);
+            }
             Err(error)
         }
         result => result,
     }
+}
+
+/// Cross-level argument relations must be checked after Clap propagates global
+/// values: subcommand validation cannot see `--cluster` given before `cluster`.
+fn validate_cluster_arguments(
+    cli: &Cli,
+    command_matches: &clap::ArgMatches,
+) -> std::result::Result<(), clap::Error> {
+    let Command::Cluster { managed, command } = &cli.command else {
+        return Ok(());
+    };
+    let conflict =
+        |message| Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+    if *managed {
+        match command {
+            ClusterCommand::Validate { .. }
+            | ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::UpgradeLedger { .. } => {
+                return Err(conflict("this command cannot be used with --managed"));
+            }
+            ClusterCommand::Apply {
+                deployment_id,
+                writers_stopped,
+                plan,
+                ..
+            } => {
+                if deployment_id.is_some() || *writers_stopped {
+                    return Err(conflict(
+                        "--deployment-id and --writers-stopped cannot be used with --managed",
+                    ));
+                }
+                if plan.is_none() {
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "cluster apply --managed requires --plan <PLAN_ID>",
+                    ));
+                }
+            }
+            ClusterCommand::Status {
+                deployment_id,
+                wait,
+                timeout,
+                ..
+            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+                return Err(conflict(
+                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                ));
+            }
+            _ => {}
+        }
+        // The managed dispatcher rejects competing target selectors before
+        // reading context, preserving its structured scope diagnostics.
+        return Ok(());
+    }
+    match command {
+        ClusterCommand::Create { .. }
+        | ClusterCommand::Push { .. }
+        | ClusterCommand::Delete { .. }
+        | ClusterCommand::UndoDelete { .. }
+        | ClusterCommand::Token { .. }
+        | ClusterCommand::Operation { .. }
+        | ClusterCommand::History { .. }
+        | ClusterCommand::Cancel { .. } => {
+            return Err(conflict("this command requires --managed"));
+        }
+        ClusterCommand::Plan { revision, run, .. }
+            if revision.is_some()
+                || run.no_wait
+                || run.timeout.is_some()
+                || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict(
+                "plan options --rev, --no-wait, --timeout and --idempotency-key require --managed",
+            ));
+        }
+        ClusterCommand::Apply { plan, run, .. }
+            if plan.is_some() || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict("--plan and --idempotency-key require --managed"));
+        }
+        ClusterCommand::Status {
+            run_id: Some(_), ..
+        } => {
+            return Err(conflict(
+                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+            ));
+        }
+        _ => {}
+    }
+    if cli.server.is_none()
+        && matches!(
+            command,
+            ClusterCommand::Apply {
+                run: ClusterRunArgs { no_wait: true, .. },
+                ..
+            } | ClusterCommand::Apply {
+                run: ClusterRunArgs {
+                    timeout: Some(_),
+                    ..
+                },
+                ..
+            } | ClusterCommand::Status { wait: true, .. }
+        )
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "deployment wait options require --server <SERVER>",
+        ));
+    }
+    if cli.cluster.is_some()
+        && command_matches
+            .try_get_one::<PathBuf>("config")
+            .ok()
+            .flatten()
+            .is_some()
+        && command_matches.value_source("config") == Some(clap::parser::ValueSource::CommandLine)
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--cluster and explicit --config cannot be used together",
+        ));
+    }
+    if cli.cluster.is_none()
+        && cli.server.is_none()
+        && matches!(
+            command,
+            ClusterCommand::UpgradeLedger { .. }
+                | ClusterCommand::Apply {
+                    writers_stopped: true,
+                    ..
+                }
+                | ClusterCommand::Status {
+                    deployment_id: Some(_),
+                    ..
+                }
+        )
+    {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "this deployment operation requires --cluster <ROOT>",
+        ));
+    }
+    Ok(())
 }
 
 /// The machine error format a run's output format asks for: `--json` (and
@@ -243,6 +439,9 @@ fn render_diagnostic(
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if cluster_remote::dispatch(&cli).await? {
+        return Ok(());
+    }
     if let Some(result) = managed::dispatch(&cli).await {
         let code = result.emit()?;
         if code != 0 {
@@ -257,7 +456,6 @@ async fn run(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
     };
-    let http_client = build_http_client()?;
     // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
     // from one declared flag × capability matrix — before any per-command
     // dispatch.
@@ -430,7 +628,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Init { schema, uri, force } => {
             // RFC-010 Slice 3: graphs inside an established cluster are created
-            // by `cluster apply` (which records ledger/recovery/approvals), not
+            // by `cluster apply` (which records deployment ledger), not
             // by hand-running `init` into the cluster's storage layout.
             if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
                 .await
@@ -444,7 +642,7 @@ async fn run(cli: Cli) -> Result<()> {
             {
                 bail!(
                     "`{uri}` is inside cluster `{root}`. Graphs in a cluster are created by \
-                     `cluster apply` (which records ledger, recovery, and approvals), not `init`. \
+                     `cluster apply` (which records the deployment ledger), not `init`. \
                      Declare the graph in cluster.yaml and run `cluster apply`."
                 );
             }
@@ -500,44 +698,6 @@ async fn run(cli: Cli) -> Result<()> {
                 print_json(&payload)?;
             } else {
                 print_load_human(&payload);
-            }
-        }
-        Command::Ingest {
-            uri,
-            data,
-            branch,
-            from,
-            mode,
-            settings,
-            json,
-        } => {
-            let settings = client::parse_set_flags(&settings)?;
-            // stderr so `--json` consumers reading stdout are unaffected.
-            eprintln!(
-                "warning: `omnigraph ingest` is a deprecated loader command; \
-                 use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
-                 (ingest retains its permissive parser and defaults: --from main --mode merge; output uses current canonical vocabulary)"
-            );
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
-            let branch = resolve_branch(branch, None, "main");
-            let from = resolve_branch(from, None, "main");
-            echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
-            let payload = client
-                .ingest(&branch, &from, &data.to_string_lossy(), mode, &settings)
-                .await?;
-            if json {
-                print_json(&payload)?;
-            } else {
-                print_ingest_human(&payload);
             }
         }
         Command::Branch { command } => match command {
@@ -629,27 +789,13 @@ async fn run(cli: Cli) -> Result<()> {
                 let payload = client
                     .branch_merge(&source, &into, delete_branch, &settings)
                     .await?;
-                // Warnings go to stderr so `--json` consumers reading stdout
-                // are unaffected. `branch_deleted: None` after requesting
-                // deletion means an older server ignored the unknown request
-                // field — surface that instead of silently leaving the branch.
-                if delete_branch {
-                    match payload.branch_deleted {
-                        Some(true) => {}
-                        Some(false) => eprintln!(
-                            "warning: merged, but could not delete branch '{}': {}",
-                            payload.source,
-                            payload
-                                .branch_delete_error
-                                .as_deref()
-                                .unwrap_or("unknown error")
-                        ),
-                        None => eprintln!(
-                            "warning: merged, but the server does not support --delete-branch; \
-                             branch '{}' was not deleted",
-                            payload.source
-                        ),
-                    }
+                // Keep the successful merge receipt on stdout; optional
+                // deletion has its own structured result and human warning.
+                if let Some(error) = &payload.branch_delete_error_details {
+                    eprintln!(
+                        "warning: merged, but could not delete branch '{}': {}",
+                        payload.source, error.error
+                    );
                 }
                 if json {
                     print_json(&payload)?;
@@ -991,12 +1137,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Schema { command } => match command {
-            SchemaCommand::Plan {
-                uri,
-                schema,
-                json,
-                allow_data_loss,
-            } => {
+            SchemaCommand::Plan { uri, schema, json } => {
                 let uri = resolve_maintenance_uri(
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -1007,13 +1148,8 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
-                let db = Omnigraph::open(&uri).await?;
-                let plan = db
-                    .plan_schema_with_options(
-                        &schema_source,
-                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
-                    )
-                    .await?;
+                let db = crate::admission::open_read_only(&uri, None).await?;
+                let plan = db.plan_schema(&schema_source).await?;
                 let output = SchemaPlanOutput {
                     uri: &uri,
                     supported: plan.supported,
@@ -1026,12 +1162,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_schema_plan_human(&uri, &plan);
                 }
             }
-            SchemaCommand::Apply {
-                uri,
-                schema,
-                json,
-                allow_data_loss,
-            } => {
+            SchemaCommand::Apply { uri, schema, json } => {
                 let client = client::GraphClient::resolve_with_policy(
                     capability,
                     cli.server.as_deref(),
@@ -1043,11 +1174,10 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 // RFC-011 Decision 10: a graph managed by a cluster evolves via
-                // `cluster apply` (ledger/recovery/approvals), not a direct
+                // `cluster apply` (deployment ledger), not a direct
                 // `schema apply` against its storage root — that would bypass the
-                // ledger. Mirrors `init`'s refusal. Only the embedded path can
-                // address a storage root; a served apply (`--server`) is the
-                // server's concern.
+                // ledger. Mirrors `init`'s refusal. This command addresses
+                // standalone storage only.
                 if !client.is_remote() {
                     if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
                         .await
@@ -1061,7 +1191,7 @@ async fn run(cli: Cli) -> Result<()> {
                     {
                         bail!(
                             "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \
-                             `cluster apply` (which records ledger, recovery, and approvals), not \
+                             `cluster apply` (which records the deployment ledger), not \
                              `schema apply`. Update the schema in cluster.yaml and run `cluster apply`.",
                             client.uri()
                         );
@@ -1070,12 +1200,10 @@ async fn run(cli: Cli) -> Result<()> {
                 let schema_source = fs::read_to_string(&schema)?;
                 // The embedded (direct-store) arm carries no stored-query
                 // registry — the registry is cluster-owned (RFC-011), so a
-                // direct apply has nothing to validate against. The served arm
-                // runs the server's own catalog check. So the validator is a
-                // no-op here on both arms.
+                // standalone apply has nothing to validate against.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
+                    .apply_schema(&schema_source, |_catalog| Ok(()))
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -1170,7 +1298,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Export {
             uri,
             branch,
-            jsonl,
             type_names,
         } => {
             let client = client::GraphClient::resolve(
@@ -1183,9 +1310,6 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             let branch = resolve_branch(branch, None, "main");
-            if jsonl {
-                eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
-            }
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
@@ -1462,24 +1586,7 @@ async fn run(cli: Cli) -> Result<()> {
                     )
                     .await
             };
-            let output = match result {
-                Ok(output) => output,
-                // A lost --if-commit CAS is an expected outcome, not a failure:
-                // emit the structured body or message, then exit
-                // EXIT_PRECONDITION_FAILED.
-                Err(err) => match err.downcast::<helpers::PreconditionFailedCli>() {
-                    Ok(precondition) => {
-                        if json {
-                            print_json(&precondition.output)?;
-                        } else {
-                            eprintln!("{precondition}");
-                        }
-                        std::io::stdout().flush()?;
-                        std::process::exit(EXIT_PRECONDITION_FAILED);
-                    }
-                    Err(err) => return Err(err),
-                },
-            };
+            let output = result?;
             if json {
                 print_json(&output)?;
             } else {
@@ -1503,14 +1610,9 @@ async fn run(cli: Cli) -> Result<()> {
                     defined.join(", ")
                 );
             };
-            let output = execute_operator_alias(
-                &http_client,
-                &name,
-                operator_alias,
-                &args,
-                load_params_json(&params)?,
-            )
-            .await?;
+            let output =
+                execute_operator_alias(&name, operator_alias, &args, load_params_json(&params)?)
+                    .await?;
             let format = resolve_read_format(format, json, operator_alias.format);
             print_read_output(&output, format)?;
         }
@@ -1589,6 +1691,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             echo_write_target(cli.quiet, "optimize", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -1644,6 +1747,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref())?;
             echo_write_target(cli.quiet, "rebuild-full-text-indexes", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let result = db
                 .rebuild_full_text_indices_on_as(&branch, actor.as_deref())
@@ -1692,12 +1796,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Repair {
-            uri,
-            confirm,
-            force,
-            json,
-        } => {
+        Command::Repair { uri, json } => {
             let uri = resolve_maintenance_uri(
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -1708,31 +1807,17 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             echo_write_target(cli.quiet, "repair", &uri, false);
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
-            let stats = db
-                .repair(omnigraph::db::RepairOptions { confirm, force })
-                .await?;
+            let stats = db.repair(omnigraph::db::RepairOptions::default()).await?;
             let refused_count = stats
                 .datasets
                 .iter()
                 .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
                 .count();
-            let blocked_count = stats
-                .datasets
-                .iter()
-                .filter(|s| {
-                    matches!(s.action, omnigraph::db::RepairAction::Refused)
-                        && matches!(
-                            s.classification,
-                            omnigraph::db::RepairClassification::BlockedPromotion
-                        )
-                })
-                .count();
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
-                    "confirm": confirm,
-                    "force": force,
                     "graph_manifest_version": stats.graph_manifest_version,
                     "datasets": stats.datasets.iter().map(|s| serde_json::json!({
                         "type_key": s.type_key,
@@ -1746,13 +1831,7 @@ async fn run(cli: Cli) -> Result<()> {
                 });
                 print_json(&value)?;
             } else {
-                let mode = if confirm { "confirm" } else { "preview" };
-                println!(
-                    "repair {} — {} mode, {} datasets",
-                    uri,
-                    mode,
-                    stats.datasets.len()
-                );
+                println!("repair {} — {} datasets", uri, stats.datasets.len());
                 for s in &stats.datasets {
                     let drift = if s.published_dataset_version == s.lance_head_version {
                         format!("{}", s.published_dataset_version)
@@ -1779,34 +1858,11 @@ async fn run(cli: Cli) -> Result<()> {
                         err
                     );
                 }
-                if !confirm {
-                    println!("rerun with --confirm to publish verified maintenance drift");
-                }
             }
-            let drift_refused = refused_count - blocked_count;
-            if blocked_count > 0 && drift_refused == 0 {
+            if refused_count > 0 {
                 bail!(
-                    "repair reports {} blocked promotion(s), one per table and branch; nothing resolves a \
-                     blocked pin yet and --force --confirm refuses the same way; reads, mutations \
-                     and loads on those tables continue",
-                    blocked_count
-                );
-            }
-            if drift_refused > 0 {
-                let blocked_note = if blocked_count > 0 {
-                    format!(
-                        "; {} more blocked promotion(s), which --force does not resolve",
-                        blocked_count
-                    )
-                } else {
-                    String::new()
-                };
-                bail!(
-                    "repair refused {} suspicious or unverifiable dataset(s); review the preview \
-                     output and rerun with --force --confirm only if publishing that drift is \
-                     intentional{}",
-                    drift_refused,
-                    blocked_note
+                    "repair could not diagnose {} dataset(s); inspect the reported errors",
+                    refused_count
                 );
             }
         }
@@ -1860,6 +1916,7 @@ async fn run(cli: Cli) -> Result<()> {
                 older_than: older_than_dur,
             };
 
+            crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.cleanup(options).await?;
             if json {
@@ -1910,69 +1967,118 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
             }
-            ClusterCommand::Plan {
-                config,
-                json,
-                observe,
-                ..
-            } => {
-                let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
+            ClusterCommand::Plan { config, json, .. } => {
+                let output = omnigraph_cluster::plan_config_dir_as(
+                    config,
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                )
+                .await;
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Observe { config, json } => {
                 let output = observe_config_dir(config).await;
                 finish_cluster_state_sync(&output, json)?;
             }
-            ClusterCommand::Apply { config, json, .. } => {
-                // The actor attributes graph-moving operations (sidecars,
-                // audit entries, engine schema-apply commits). Cluster FACTS
-                // stay unlayered; the operator's identity resolves --as flag
-                // first, then per-operator config `operator.actor`.
-                let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
-                let output = apply_config_dir_with_options(config, ApplyOptions { actor }).await;
-                finish_cluster_apply(&output, json)?;
-            }
-            ClusterCommand::Approve {
-                resource,
+            ClusterCommand::Apply {
                 config,
                 json,
+                deployment_id,
+                writers_stopped,
+                ..
             } => {
-                let Some(approver) = resolve_cluster_actor(cli.as_actor.as_deref())? else {
-                    bail!(
-                        "`cluster approve` requires an approver: pass the global --as <ACTOR> flag or set `operator.actor` in ~/.omnigraph/config.yaml — an approval without an approver is meaningless"
-                    );
-                };
-                let output = approve_config_dir(config, &resource, &approver).await;
-                finish_cluster_approve(&output, json)?;
+                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                );
+                if let Some(root) = cli.cluster.as_deref() {
+                    let id = deployment_id.as_deref().ok_or_else(|| color_eyre::eyre::eyre!("root-addressed apply requires --deployment-id; it only reconciles the original deployment"))?;
+                    let result =
+                        omnigraph_cluster::reconcile_deployment(root, id, writers_stopped, &caller)
+                            .await;
+                    let status = omnigraph_cluster::deployment_status(root, None, &caller).await;
+                    if let Ok(status) = status {
+                        report_deployment_lock(&status);
+                    }
+                    finish_core_deployment(result, json)?;
+                } else {
+                    let result = omnigraph_cluster::apply_deployment(
+                        &config, deployment_id.as_deref(), &caller,
+                        |id, root, lock| {
+                            let root = omnigraph::storage::redacted_storage_uri(root);
+                            eprintln!(
+                                "Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; retain until prior work is quiescent, then exact-ID force-unlock"
+                            );
+                        },
+                    )
+                    .await;
+                    finish_core_deployment(result, json)?;
+                }
             }
-            ClusterCommand::Status { config, json, .. } => {
-                let output = status_config_dir(config).await;
-                finish_cluster_status(&output, json)?;
+            ClusterCommand::UpgradeLedger {
+                writers_stopped,
+                json,
+            } => {
+                let root = cli.cluster.as_deref().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("upgrade-ledger requires --cluster ROOT")
+                })?;
+                let caller = omnigraph_cluster::DeploymentCaller::storage_owner(
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                );
+                let status = core_deployment_result(
+                    omnigraph_cluster::upgrade_deployment_ledger(root, writers_stopped, &caller)
+                        .await,
+                    json,
+                )?;
+                print_json(&status)?;
+                report_deployment_lock(&status);
             }
-            ClusterCommand::Refresh { config, json } => {
-                let output = refresh_config_dir(config).await;
-                finish_cluster_state_sync(&output, json)?;
-            }
-            ClusterCommand::Import { config, json } => {
-                let output = import_config_dir(config).await;
-                finish_cluster_state_sync(&output, json)?;
+            ClusterCommand::Status {
+                config,
+                json,
+                deployment_id,
+                ..
+            } => {
+                if let Some(root) = cli.cluster.as_deref() {
+                    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+                    let status = core_deployment_result(
+                        omnigraph_cluster::deployment_status(
+                            root,
+                            deployment_id.as_deref(),
+                            &caller,
+                        )
+                        .await,
+                        json,
+                    )?;
+                    print_json(&status)?;
+                } else {
+                    let output = status_config_dir(config).await;
+                    finish_cluster_status(&output, json)?;
+                }
             }
             ClusterCommand::ForceUnlock {
                 lock_id,
                 config,
                 json,
             } => {
-                let output = force_unlock_config_dir(config, lock_id).await;
-                finish_cluster_force_unlock(&output, json)?;
+                if let Some(root) = cli.cluster.as_deref() {
+                    core_deployment_result(
+                        omnigraph_cluster::force_unlock_storage_root(root, &lock_id).await,
+                        json,
+                    )?;
+                    print_json(&serde_json::json!({"unlocked": true, "lock_id": lock_id}))?;
+                } else {
+                    let output = force_unlock_config_dir(config, lock_id).await;
+                    finish_cluster_force_unlock(&output, json)?;
+                }
             }
-            ClusterCommand::History { .. }
-            | ClusterCommand::Cancel { .. }
-            | ClusterCommand::Token { .. }
-            | ClusterCommand::Create { .. }
+            ClusterCommand::Create { .. }
+            | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
-            | ClusterCommand::Push { .. } => {
-                unreachable!("managed dispatch refuses managed-only verbs without context")
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Operation { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => {
+                unreachable!("managed cluster commands dispatch first")
             }
         },
         Command::Graphs { command } => match command {
@@ -2011,7 +2117,7 @@ async fn run(cli: Cli) -> Result<()> {
                     print_json(&payload)?;
                 } else {
                     for entry in payload.graphs {
-                        println!("{}\t{}", entry.graph_id, entry.uri);
+                        println!("{}\t{}\t{}", entry.graph_id, entry.state, entry.uri);
                     }
                 }
             }
@@ -2111,3 +2217,44 @@ async fn run_branch_statement_cli(
 #[cfg(test)]
 #[path = "main_tests.rs"]
 mod tests;
+
+fn core_deployment_result<T>(
+    result: std::result::Result<T, omnigraph_cluster::Diagnostic>,
+    json: bool,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if json {
+                print_json(&serde_json::json!({"ok": false, "diagnostics": [&error]}))?;
+            } else {
+                print_cluster_diagnostics(std::slice::from_ref(&error));
+            }
+            bail!("{} {}: {}", error.code, error.path, error.message)
+        }
+    }
+}
+
+fn finish_core_deployment(
+    result: std::result::Result<omnigraph_cluster::DeploymentLookup, omnigraph_cluster::Diagnostic>,
+    json: bool,
+) -> Result<()> {
+    let result = core_deployment_result(result, json)?;
+    print_json(&result)?;
+    if !matches!(result, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged)
+    {
+        bail!(
+            "deployment has not fully converged; inspect the original identity, never replay unknown work"
+        );
+    }
+    Ok(())
+}
+
+fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
+    if let Some(lock) = &status.lock_id {
+        eprintln!(
+            "Admission lock retained: {lock} ({}); establish prior-work quiescence before exact-ID force-unlock",
+            omnigraph::storage::redacted_storage_uri(&status.canonical_root)
+        );
+    }
+}

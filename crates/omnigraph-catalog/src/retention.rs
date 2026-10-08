@@ -13,42 +13,95 @@ use sha2::{Digest, Sha256};
 use super::{CapturedManifestProbe, ManifestCoordinator, Snapshot};
 use crate::branch_names::{MERGE_INPUT_PREFIX, encode_head, is_merge_input_tag};
 pub use crate::branch_names::{MergeInputOwner, merge_input_owner};
-use crate::commit_graph::{CommitGraph, GraphCommit};
+use crate::commit_graph::{CommitGraph, GraphCommit, HistoryCache};
 use crate::error::{OmniError, Result};
+use crate::history::{ExtentCache, HistoryRecord};
+use crate::legacy::{LegacyAt, RetiredHead};
 use crate::staging::StagingWitness;
 
 pub fn incarnation_digest(incarnation: &str) -> String {
     format!("{:x}", Sha256::digest(incarnation.as_bytes()))
 }
 
+/// Where the head of a pinned manifest version is read: the rows of the
+/// version, or the record the legacy history of an upgraded root holds for it.
+enum PinnedHead {
+    Manifest,
+    Legacy(Box<HistoryRecord>),
+}
+
 /// Exact native manifest coordinates and their reduced graph snapshot.
 pub struct PinnedGraphManifest {
     pub dataset: Dataset,
     pub snapshot: Snapshot,
+    head: PinnedHead,
 }
 
 impl PinnedGraphManifest {
-    pub async fn commit_graph(&self, root_uri: &str) -> Result<CommitGraph> {
-        let (rows, _) = super::read_graph_lineage(&self.dataset).await?;
-        Ok(CommitGraph::from_manifest_rows(
+    /// The commit graph of the head this manifest version holds, over the
+    /// settled commits `history` has read.
+    pub async fn commit_graph(
+        &self,
+        root_uri: &str,
+        history: &HistoryCache,
+    ) -> Result<CommitGraph> {
+        let (head, buffer) = match &self.head {
+            PinnedHead::Manifest => {
+                let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
+                (rows.head, rows.buffer)
+            }
+            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default()),
+        };
+        Ok(CommitGraph::from_head(
             root_uri,
-            self.snapshot.graph_branch.as_deref(),
-            rows,
+            self.dataset.session(),
+            head,
+            buffer.commits(),
+            history.clone(),
         ))
     }
 
     async fn from_dataset(root_uri: &str, dataset: Dataset) -> Result<Self> {
-        let native = dataset.manifest().branch.clone();
-        let mut snapshot = ManifestCoordinator::snapshot_from_state(
+        let located = crate::legacy::at_version(
             root_uri,
-            super::read_manifest_state(&dataset).await?,
-        );
-        snapshot.graph_branch = native
-            .as_deref()
-            .map(crate::branch_names::logical_branch_name)
-            .map(str::to_string);
-        snapshot.native_branch = native;
-        Ok(Self { dataset, snapshot })
+            &dataset.session(),
+            &ExtentCache::default(),
+            &dataset,
+        )
+        .await?;
+        let Some(located) = located else {
+            let native = dataset.manifest().branch.clone();
+            let mut snapshot = ManifestCoordinator::snapshot_from_state(
+                root_uri,
+                super::read_manifest_state(&dataset).await?,
+            );
+            snapshot.graph_branch = native
+                .as_deref()
+                .map(crate::branch_names::logical_branch_name)
+                .map(str::to_string);
+            snapshot.native_branch = native;
+            return Ok(Self {
+                dataset,
+                snapshot,
+                head: PinnedHead::Manifest,
+            });
+        };
+        let version = dataset.version().version;
+        let record = located.served(dataset.manifest().branch.as_deref(), version)?;
+        Self::legacy(root_uri, dataset, record)
+    }
+
+    fn legacy(root_uri: &str, dataset: Dataset, record: HistoryRecord) -> Result<Self> {
+        let snapshot = record.snapshot_as(
+            root_uri,
+            dataset.version().version,
+            dataset.manifest().branch.as_deref(),
+        )?;
+        Ok(Self {
+            dataset,
+            snapshot,
+            head: PinnedHead::Legacy(Box::new(record)),
+        })
     }
 }
 
@@ -211,6 +264,7 @@ impl ManifestCoordinator {
             &crate::lance_access::control_session(),
         )
         .await?;
+        let legacy = ExtentCache::default();
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
             None | Some("main") => candidates.push(None),
@@ -235,22 +289,30 @@ impl ManifestCoordinator {
                 .await
             {
                 Ok(dataset) => dataset,
+                Err(lance::Error::DatasetNotFound { .. }) => continue,
                 Err(error) if error.is_not_found() => continue,
                 Err(error) => return Err(OmniError::storage(error)),
             };
-            let (rows, heads) = super::read_graph_lineage(&dataset).await?;
-            let graph =
-                CommitGraph::from_manifest_rows(root_uri, commit.graph_branch.as_deref(), rows);
-            let head = heads
-                .get(commit.graph_branch.as_deref().unwrap_or("main"))
-                .cloned()
-                .or(graph.head_commit_id().await?);
-            if head.as_deref() != Some(commit.graph_commit_id.as_str())
-                || graph.get_commit(&commit.graph_commit_id).as_ref() != Some(commit)
-            {
+            let located =
+                crate::legacy::at_version(root_uri, &dataset.session(), &legacy, &dataset).await?;
+            let head = match &located {
+                None => {
+                    crate::state::read_manifest_rows_projected(&dataset)
+                        .await?
+                        .head
+                }
+                Some(LegacyAt::Exact(record)) => record.commit.clone(),
+                Some(LegacyAt::Nearest(_) | LegacyAt::PreGenesis) => continue,
+            };
+            if crate::commit_graph::graph_commit_from_manifest_row(head) != *commit {
                 continue;
             }
-            return PinnedGraphManifest::from_dataset(root_uri, dataset).await;
+            return match located {
+                Some(LegacyAt::Exact(record)) => {
+                    PinnedGraphManifest::legacy(root_uri, dataset, record)
+                }
+                _ => PinnedGraphManifest::from_dataset(root_uri, dataset).await,
+            };
         }
         Err(OmniError::manifest_not_found(format!(
             "merge base '{}' has no matching retained native manifest at version {}",
@@ -258,7 +320,12 @@ impl ManifestCoordinator {
         )))
     }
 
-    pub async fn retired_commit_graphs(root_uri: &str) -> Result<Vec<(String, CommitGraph)>> {
+    /// The commit graph of every retired branch incarnation by native ref,
+    /// over the settled commits `history` has read.
+    pub async fn retired_commit_graphs(
+        root_uri: &str,
+        history: &HistoryCache,
+    ) -> Result<Vec<(String, CommitGraph)>> {
         let main = super::open_manifest_dataset_native_with_session(
             root_uri,
             None,
@@ -276,12 +343,20 @@ impl ManifestCoordinator {
                 .checkout_version(Ref::Version(Some(native.clone()), None))
                 .await
                 .map_err(OmniError::storage)?;
-            let (rows, _) = super::read_graph_lineage(&dataset).await?;
-            let graph = CommitGraph::from_manifest_rows(
-                root_uri,
-                Some(crate::branch_names::logical_branch_name(&native)),
-                rows,
-            );
+            let session = dataset.session();
+            let (head, buffer) =
+                match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)
+                    .await?
+                {
+                    RetiredHead::Rows => {
+                        let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
+                        (rows.head, rows.buffer)
+                    }
+                    RetiredHead::Commit(head) => (*head, Default::default()),
+                    RetiredHead::Commitless => continue,
+                };
+            let graph =
+                CommitGraph::from_head(root_uri, session, head, buffer.commits(), history.clone());
             graphs.push((native, graph));
         }
         Ok(graphs)
@@ -291,6 +366,7 @@ impl ManifestCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnigraph_core::graph_commit_id::HISTORY_BLOCK_SLOTS;
 
     #[test]
     fn merge_input_tags_require_canonical_authority() {
@@ -309,7 +385,24 @@ mod tests {
                 .as_deref(),
             Some(head)
         );
+        let block_head = format!("hb1.{head}.15.{nonce}");
+        let block_tag = format!(
+            "{MERGE_INPUT_PREFIX}{digest}_{}_{nonce}",
+            encode_head(Some(&block_head))
+        );
+        assert_eq!(
+            merge_input_owner(&block_tag)
+                .unwrap()
+                .unwrap()
+                .graph_head
+                .as_deref(),
+            Some(block_head.as_str())
+        );
         for bad in [
+            format!(
+                "{MERGE_INPUT_PREFIX}{digest}_{}_{nonce}",
+                encode_head(Some(&format!("hb1.{head}.{HISTORY_BLOCK_SLOTS}.{nonce}")))
+            ),
             valid.replacen(&digest, &digest.to_uppercase(), 1),
             valid.replace(nonce, &nonce.to_lowercase()),
             format!(

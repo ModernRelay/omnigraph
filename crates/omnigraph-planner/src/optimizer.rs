@@ -2,14 +2,14 @@
 //! selection, property derivation. The order is written once here with its
 //! reason; a pass runs only when its trigger is present in the plan.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::settings::Traversal;
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 
 use crate::cost::{
     AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, IndexCoverage,
@@ -18,15 +18,17 @@ use crate::cost::{
 };
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode,
-    LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
-    ordering_text,
+    ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
+    LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
+    ordering_text, tiebreak_text,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
+use crate::output::{node_object_types, return_schema};
 use crate::physical::{
-    Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties,
-    RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource, TextContains,
+    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
+    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
+    TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 
@@ -159,6 +161,25 @@ fn resolve_query(
     ir: &QueryIR,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
+    if ir.has_edge_selections() {
+        let limit = source
+            .traversal_work_limit()
+            .ok_or_else(|| PlanError::Unsupported {
+                detail: "edge selections require a finite traversal_work_limit".to_string(),
+            })?;
+        let assumptions = Assumptions {
+            traversal_work_limit: Some(limit),
+            ..Default::default()
+        };
+        assumptions.validated_traversal_work_limit()?;
+        plan.set_traversal_work_limit(Some(limit));
+        if source.traversal() == Traversal::Csr {
+            return Err(PlanError::Unsupported {
+                detail: "edge selections do not support traversal = csr; use auto or indexed"
+                    .to_string(),
+            });
+        }
+    }
     let QueryIR {
         name: _,
         params: _,
@@ -172,20 +193,31 @@ fn resolve_query(
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
     let mut ranked = false;
+    let has_aggregates = return_exprs
+        .iter()
+        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
     if let Some(leading) = orderings.first() {
-        if let Some(node) = search_node(current, &leading.expr, *limit) {
+        if let Some(mut node) = search_node(current, &leading.expr, *limit) {
+            if let LogicalNode::RankFuse {
+                arms, row_tiebreak, ..
+            } = &mut node
+            {
+                *row_tiebreak = scope_tiebreaks(plan, current, source)?
+                    .into_iter()
+                    .map(|(column, _)| column)
+                    .filter(|column| column.binding != arms[0].binding)
+                    .collect();
+            }
             current = plan.add(node, schema.clone());
             orderings = &orderings[1..];
             ranked = true;
         }
     }
     let mut reads = Vec::new();
-    for IRProjection { expr, alias: _ } in return_exprs {
+    for IRProjection { expr, .. } in return_exprs {
         reads_of_expr(expr, &mut reads);
     }
-    let has_aggregates = return_exprs
-        .iter()
-        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+    let schema = return_schema(return_exprs, &node_object_types(return_exprs, source)?)?;
     current = if has_aggregates {
         plan.add(
             LogicalNode::Aggregate {
@@ -208,6 +240,7 @@ fn resolve_query(
     if ranked || !orderings.is_empty() {
         let bound: Vec<IROrdering> = orderings
             .iter()
+            .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_, _)))
             .map(|ordering| IROrdering {
                 expr: bind_order_key(&ordering.expr, return_exprs),
                 descending: ordering.descending,
@@ -218,7 +251,7 @@ fn resolve_query(
             order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
-            &scope_bindings(plan, current),
+            &scope_tiebreaks(plan, current, source)?,
             order_by,
             return_exprs,
             has_aggregates,
@@ -319,8 +352,8 @@ fn resolve_pipeline(
             IROp::Expand {
                 src_var,
                 dst_var,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -342,8 +375,8 @@ fn resolve_pipeline(
                         input,
                         src: src_var.clone(),
                         dst: dst_var.clone(),
-                        edge_type: edge_type.clone(),
-                        direction: *direction,
+                        edges: edges.clone(),
+                        src_type: src_type.clone(),
                         dst_type: dst_type.clone(),
                         min_hops: *min_hops,
                         max_hops: *max_hops,
@@ -460,6 +493,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
             variable,
             property,
             query,
+            ..
         } => {
             let mut reads = Vec::new();
             reads_of_expr(query, &mut reads);
@@ -472,8 +506,13 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 reads,
             })
         }
-        IRExpr::Bm25 { field, query } => {
-            let IRExpr::PropAccess { variable, property } = field.as_ref() else {
+        IRExpr::Bm25 { field, query, .. } => {
+            let IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } = field.as_ref()
+            else {
                 return None;
             };
             let mut reads = Vec::new();
@@ -490,6 +529,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
             primary,
             secondary,
             k,
+            ..
         } => {
             let arms = [search_target(primary)?, search_target(secondary)?];
             let mut reads = Vec::new();
@@ -501,10 +541,11 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
             }
             Some(LogicalNode::RankFuse {
                 input,
-                arms,
+                arms: Box::new(arms),
                 k: k.as_deref().cloned(),
                 limit,
                 reads,
+                row_tiebreak: Vec::new(),
             })
         }
         _ => None,
@@ -517,14 +558,19 @@ fn search_target(expr: &IRExpr) -> Option<SearchArm> {
             variable,
             property,
             query,
+            ..
         } => Some(SearchArm {
             binding: variable.clone(),
             property: property.clone(),
             kind: RankKind::Nearest,
             query: query.as_ref().clone(),
         }),
-        IRExpr::Bm25 { field, query } => match field.as_ref() {
-            IRExpr::PropAccess { variable, property } => Some(SearchArm {
+        IRExpr::Bm25 { field, query, .. } => match field.as_ref() {
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } => Some(SearchArm {
                 binding: variable.clone(),
                 property: property.clone(),
                 kind: RankKind::Bm25,
@@ -545,42 +591,43 @@ fn search_arm_reads(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
     }
 }
 
+fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
+    IRExpr::PropAccess {
+        variable: binding.to_string(),
+        property: kind.score().0.to_string(),
+        ty: omnigraph_compiler::types::ExprType::from_prop(
+            &omnigraph_compiler::types::PropType::scalar(
+                omnigraph_compiler::types::ScalarType::F32,
+                false,
+            ),
+        ),
+    }
+}
+
 /// A key the type checker bound to a `return` item (T42, RFC
 /// 2026-09-24-shared-expression-model, "Order key binding") as the `AliasRef`
 /// of that item's column; a property or alias key as written.
 fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection]) -> IRExpr {
-    if matches!(key, IRExpr::PropAccess { .. } | IRExpr::AliasRef(_)) {
+    if matches!(key, IRExpr::PropAccess { .. } | IRExpr::AliasRef(_, _)) {
         return key.clone();
     }
     return_exprs
         .iter()
         .find(|projection| projection.expr == *key)
-        .and_then(result_column)
-        .map_or_else(|| key.clone(), IRExpr::AliasRef)
+        .map_or_else(
+            || key.clone(),
+            |projection| IRExpr::AliasRef(result_column(projection), projection.ty.clone()),
+        )
 }
 
-/// The column a `return` item lands under, as `engine/lower.rs` `return_name`
-/// spells it: the alias, else the expression's own name, an aggregate its
-/// argument's; `None` for the shapes the engine has no name for.
-fn result_column(projection: &IRProjection) -> Option<String> {
-    fn column(expr: &IRExpr) -> Option<String> {
-        match expr {
-            IRExpr::PropAccess { variable, property } => Some(format!("{variable}.{property}")),
-            IRExpr::Variable(name) | IRExpr::Param(name) => Some(name.clone()),
-            IRExpr::Literal(_) => Some("literal".to_string()),
-            IRExpr::Aggregate { arg, .. } => column(arg),
-            _ => None,
-        }
-    }
-    projection
-        .alias
-        .clone()
-        .or_else(|| column(&projection.expr))
+/// The compiler-owned executed name of a return item.
+pub(crate) fn result_column(projection: &IRProjection) -> String {
+    projection.column.clone()
 }
 
 fn order_keys(expr: &IRExpr, out: &mut Vec<String>) {
     match expr {
-        IRExpr::AliasRef(alias) => out.push(format!("{ALIAS_KEY}{alias}")),
+        IRExpr::AliasRef(alias, _) => out.push(format!("{ALIAS_KEY}{alias}")),
         other => {
             let mut reads = Vec::new();
             reads_of_expr(other, &mut reads);
@@ -592,62 +639,102 @@ fn order_keys(expr: &IRExpr, out: &mut Vec<String>) {
 /// Prefix of a `Sort` key that names a `return` alias, not a column.
 pub const ALIAS_KEY: &str = "alias:";
 
-/// The bindings whose rows a sort above `id` sees: every scan, traversal
-/// destination and edge binding of the pipeline under it, an anti-join's
-/// inner scope excluded, name-sorted and deduplicated.
-fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
-    fn walk(plan: &LogicalPlan, id: LogicalId, out: &mut Vec<String>) {
-        let Some(node) = plan.node(id) else {
-            return;
-        };
-        match node {
-            LogicalNode::TableScan { input, spec } => {
-                out.extend(spec.binding.iter().cloned());
-                if let Some(input) = input {
-                    walk(plan, *input, out);
-                }
-            }
-            LogicalNode::Expand {
-                input,
-                dst,
-                edge_binding,
-                ..
-            } => {
-                out.push(dst.clone());
-                out.extend(edge_binding.iter().cloned());
-                walk(plan, *input, out);
-            }
-            LogicalNode::AntiJoin { input, .. } => walk(plan, *input, out),
-            other => {
-                for input in other.inputs() {
-                    walk(plan, input, out);
-                }
+/// Nodes visible in this scope. Correlated inner plans own separate bindings.
+fn visible_scope(plan: &LogicalPlan, id: LogicalId) -> Vec<&LogicalNode> {
+    fn walk<'a>(plan: &'a LogicalPlan, id: LogicalId, out: &mut Vec<&'a LogicalNode>) {
+        let Some(node) = plan.node(id) else { return };
+        out.push(node);
+        if let LogicalNode::AntiJoin { input, .. } = node {
+            walk(plan, *input, out);
+        } else {
+            for input in node.inputs() {
+                walk(plan, input, out);
             }
         }
     }
-    let mut out = Vec::new();
-    walk(plan, id, &mut out);
-    out.sort();
-    out.dedup();
-    out
+    let mut nodes = Vec::new();
+    walk(plan, id, &mut nodes);
+    nodes
 }
 
-/// The bindings whose ids a sort appends after `keys` so its order is total;
+/// Candidate identity keys in binding order. Physical spellings are used
+/// only to recognize user order keys; the plan retains logical metadata.
+fn scope_tiebreaks(
+    plan: &LogicalPlan,
+    id: LogicalId,
+    source: &dyn PlanSource,
+) -> Result<Vec<(ColumnRef, &'static str)>, PlanError> {
+    let mut bindings = BTreeMap::new();
+    for node in visible_scope(plan, id) {
+        match node {
+            LogicalNode::TableScan { spec, .. } => {
+                if let Some(binding) = &spec.binding {
+                    bindings.insert(binding.clone(), (spec.columns.id, false));
+                }
+            }
+            LogicalNode::Expand {
+                dst,
+                dst_type,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                let id_column = source.node_type(dst_type)?.columns.id;
+                bindings.insert(dst.clone(), (id_column, false));
+                if let Some(binding) = edge_binding {
+                    bindings.insert(binding.clone(), (id_column, edges.named().is_none()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (binding, (id_column, selected_edge)) in bindings {
+        if selected_edge {
+            out.push((
+                ColumnRef::property(&binding, EDGE_TYPE_MEMBER),
+                EDGE_TYPE_COLUMN,
+            ));
+        }
+        out.push((ColumnRef::property(&binding, IDENTITY_MEMBER), id_column));
+    }
+    Ok(out)
+}
+
+/// Bindings visible to a filter, excluding correlated inner scopes.
+fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
+    let mut bindings = BTreeSet::new();
+    for node in visible_scope(plan, id) {
+        match node {
+            LogicalNode::TableScan { spec, .. } => bindings.extend(spec.binding.iter().cloned()),
+            LogicalNode::Expand {
+                dst, edge_binding, ..
+            } => {
+                bindings.insert(dst.clone());
+                bindings.extend(edge_binding.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+    bindings.into_iter().collect()
+}
+
+/// The metadata columns a sort appends after `keys` so its order is total;
 /// none for group rows, when every returned expression is a key (equal rows
-/// are indistinguishable), and never a binding whose `@id` is a key.
+/// are indistinguishable), or for an individual column already used as a key.
 fn sort_tiebreak(
-    bindings: &[String],
+    candidates: &[(ColumnRef, &'static str)],
     keys: &[IROrdering],
     returns: &[IRProjection],
     aggregate: bool,
-) -> Vec<String> {
+) -> Vec<ColumnRef> {
     if aggregate {
         return Vec::new();
     }
     let key_texts: Vec<String> = keys
         .iter()
         .map(|key| match &key.expr {
-            IRExpr::AliasRef(alias) => returns
+            IRExpr::AliasRef(alias, _) => returns
                 .iter()
                 .find(|projection| projection.alias.as_deref() == Some(alias))
                 .map_or_else(|| alias.clone(), |projection| projection.expr.to_string()),
@@ -660,18 +747,25 @@ fn sort_tiebreak(
     if covered {
         return Vec::new();
     }
-    bindings
+    candidates
         .iter()
-        .filter(|binding| {
+        .filter(|(column, physical)| {
             !keys.iter().any(|key| {
+                let expr = match &key.expr {
+                    IRExpr::AliasRef(alias, _) => returns
+                        .iter()
+                        .find(|projection| projection.alias.as_deref() == Some(alias))
+                        .map_or(&key.expr, |projection| &projection.expr),
+                    expr => expr,
+                };
                 matches!(
-                    &key.expr,
-                    IRExpr::PropAccess { variable, property }
-                        if variable == *binding && property == IDENTITY_MEMBER
+                    expr,
+                    IRExpr::PropAccess { variable, property , ty: _}
+                        if variable == &column.binding && property.as_str() == *physical
                 )
             })
         })
-        .cloned()
+        .map(|(column, _)| column.clone())
         .collect()
 }
 
@@ -683,22 +777,29 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             reads_of_expr(left, out);
             reads_of_expr(right, out);
         }
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => reads_of_expr(inner, out),
-        IRExpr::PropAccess { variable, property } => {
+        IRExpr::Not(inner, _)
+        | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+        IRExpr::PropAccess {
+            variable,
+            property,
+            ty: _,
+        } => {
             out.push(ColumnRef::property(variable, property));
         }
-        IRExpr::Variable(variable) => out.push(ColumnRef::entity(variable)),
+        IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
         IRExpr::Nearest {
             variable,
             property,
             query,
+            ..
         } => {
             out.push(ColumnRef::property(variable, property));
             reads_of_expr(query, out);
         }
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => {
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
             reads_of_expr(field, out);
             reads_of_expr(query, out);
         }
@@ -706,6 +807,7 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             field,
             max_edits,
             query,
+            ..
         } => {
             reads_of_expr(field, out);
             reads_of_expr(query, out);
@@ -717,6 +819,7 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
             primary,
             secondary,
             k,
+            ..
         } => {
             reads_of_expr(primary, out);
             reads_of_expr(secondary, out);
@@ -724,13 +827,13 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
                 reads_of_expr(k, out);
             }
         }
-        IRExpr::Aggregate { func, arg } => match (func, arg.as_ref()) {
-            (AggFunc::Count, IRExpr::Variable(variable)) => {
+        IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
+            (AggFunc::Count, IRExpr::Variable(variable, _)) => {
                 out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
             }
             _ => reads_of_expr(arg, out),
         },
-        IRExpr::AliasRef(_) | IRExpr::Param(_) | IRExpr::Literal(_) => {}
+        IRExpr::AliasRef(_, _) | IRExpr::Param(_, _) | IRExpr::Literal(_, _) => {}
     }
 }
 
@@ -971,7 +1074,6 @@ pub fn physical_plan(
     bounds: &Bounds,
     mut fired: Vec<&'static str>,
 ) -> Result<Optimized, PlanError> {
-    let query = is_query_plan(plan);
     let before = plan
         .schema(plan.root())
         .cloned()
@@ -1028,9 +1130,9 @@ pub fn physical_plan(
         .properties(physical.root())
         .map(|properties| properties.schema.clone())
         .ok_or_else(|| PlanError::Internal("physical root has no properties".to_string()))?;
-    if !query {
-        root_shape_kept(&before, &after)?;
-    }
+    root_shape_kept(&before, &after)?;
+    crate::validate_aggregate_specs(&physical)?;
+    crate::validate_output_schemas(&physical)?;
     Ok(Optimized {
         physical,
         fired,
@@ -1056,9 +1158,82 @@ fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
     nodes
 }
 
-/// Diff lowering keeps the root schema; a merge derives both sides from
-/// `classify_schema`, so the check binds diff plans only. A query plan's
-/// schemas are the engine's to derive at run time, so the caller skips it.
+/// Validate every fusion's canonical downstream identity keys against both arms.
+///
+/// # Errors
+/// Returns an error for a missing arm root or a key list that differs from
+/// either arm's visible identities, excluding the primary fused binding.
+pub fn validate_rank_fuse_row_tiebreaks(plan: &PhysicalPlan) -> Result<(), PlanError> {
+    for (id, node) in plan.live() {
+        let PhysicalNode::RankFuse {
+            arms, row_tiebreak, ..
+        } = node
+        else {
+            continue;
+        };
+        for (arm_index, arm) in arms.iter().enumerate() {
+            let expected = expected_rank_fuse_row_tiebreaks(plan, arm.input, &arms[0].binding)?;
+            if row_tiebreak != &expected {
+                return Err(PlanError::Internal(format!(
+                    "rank fuse {id} arm {arm_index}: incomplete or noncanonical row_tiebreak; expected {:?}, found {:?}",
+                    tiebreak_text(&expected),
+                    tiebreak_text(row_tiebreak),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_rank_fuse_row_tiebreaks(
+    plan: &PhysicalPlan,
+    arm_root: NodeId,
+    fused_binding: &str,
+) -> Result<Vec<ColumnRef>, PlanError> {
+    if plan.node(arm_root).is_none() {
+        return Err(PlanError::Internal(format!(
+            "rank fuse arm root {arm_root} is missing"
+        )));
+    }
+    let mut bindings = BTreeMap::<String, bool>::new();
+    for id in top_level(plan, arm_root) {
+        match plan.node(id) {
+            Some(PhysicalNode::Scan { spec, .. }) => {
+                if let Some(binding) = &spec.binding {
+                    bindings.entry(binding.clone()).or_insert(false);
+                }
+            }
+            Some(PhysicalNode::Expand {
+                dst,
+                edges,
+                edge_binding,
+                ..
+            }) => {
+                bindings.entry(dst.clone()).or_insert(false);
+                if let Some(binding) = edge_binding {
+                    let selected = edges.named().is_none();
+                    bindings
+                        .entry(binding.clone())
+                        .and_modify(|prior| *prior |= selected)
+                        .or_insert(selected);
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings.remove(fused_binding);
+    let mut keys = Vec::new();
+    for (binding, selected) in bindings {
+        if selected {
+            keys.push(ColumnRef::property(&binding, EDGE_TYPE_MEMBER));
+        }
+        keys.push(ColumnRef::property(&binding, IDENTITY_MEMBER));
+    }
+    Ok(keys)
+}
+
+/// Query and diff lowering preserve the declared root schema. Merge roots
+/// already derive their shape from the three-way classification.
 fn root_shape_kept(before: &SchemaRef, after: &SchemaRef) -> Result<(), PlanError> {
     if !same_shape(before, after) {
         return Err(PlanError::Internal(
@@ -1070,11 +1245,11 @@ fn root_shape_kept(before: &SchemaRef, after: &SchemaRef) -> Result<(), PlanErro
 
 fn same_shape(left: &SchemaRef, right: &SchemaRef) -> bool {
     left.fields().len() == right.fields().len()
-        && left
-            .fields()
-            .iter()
-            .zip(right.fields())
-            .all(|(l, r)| l.name() == r.name() && l.data_type() == r.data_type())
+        && left.fields().iter().zip(right.fields()).all(|(l, r)| {
+            l.name() == r.name()
+                && l.data_type() == r.data_type()
+                && l.is_nullable() == r.is_nullable()
+        })
 }
 
 /// Stage 1, pass 2 on a diff plan: a `Limit`'s resume key becomes an
@@ -1430,8 +1605,8 @@ fn aggregate_pushdown(plan: &mut LogicalPlan) -> Result<bool, PlanError> {
             let eligible = return_exprs.iter().all(|projection| {
                 matches!(
                     &projection.expr,
-                    IRExpr::Aggregate { func: AggFunc::Count, arg }
-                        if matches!(arg.as_ref(), IRExpr::Variable(variable) if variable == binding)
+                    IRExpr::Aggregate { func: AggFunc::Count, arg, .. }
+                        if matches!(arg.as_ref(), IRExpr::Variable(variable, _) if variable == binding)
                 )
             });
             eligible.then(|| (id, *input, spec.clone(), return_exprs.clone()))
@@ -1448,31 +1623,7 @@ fn aggregate_pushdown(plan: &mut LogicalPlan) -> Result<bool, PlanError> {
 }
 
 fn metadata_count_schema(return_exprs: &[IRProjection]) -> Result<SchemaRef, PlanError> {
-    let fields = return_exprs
-        .iter()
-        .map(|projection| {
-            let IRExpr::Aggregate {
-                func: AggFunc::Count,
-                arg,
-            } = &projection.expr
-            else {
-                return Err(PlanError::Internal(
-                    "metadata count requires count aggregates".to_string(),
-                ));
-            };
-            let IRExpr::Variable(variable) = arg.as_ref() else {
-                return Err(PlanError::Internal(
-                    "metadata count requires a node binding".to_string(),
-                ));
-            };
-            Ok(Field::new(
-                projection.alias.as_ref().unwrap_or(variable),
-                DataType::Int64,
-                false,
-            ))
-        })
-        .collect::<Result<Vec<_>, PlanError>>()?;
-    Ok(Arc::new(Schema::new(fields)))
+    return_schema(return_exprs, &[])
 }
 
 /// Project independent and dependent query scans from binding demand; the id
@@ -1556,8 +1707,7 @@ struct Demand {
 }
 
 /// The bindings whose id a node reads beside any column: a traversal's ends,
-/// a dependent scan, an anti-join's outer rows, a ranked scan's binding, and
-/// a sort's declared tie-breaks.
+/// a dependent scan, an anti-join's outer rows, and a ranked scan's binding.
 fn identity_reads(node: &LogicalNode) -> Vec<String> {
     match node {
         LogicalNode::TableScan {
@@ -1569,7 +1719,6 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
         LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
             vec![binding.clone()]
         }
-        LogicalNode::Sort { tiebreak, .. } => tiebreak.clone(),
         _ => Vec::new(),
     }
 }
@@ -1616,12 +1765,15 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             keys,
             order_by: _,
             fetch: _,
-            tiebreak: _,
-        } => out.extend(
-            keys.iter()
-                .filter(|key| !key.starts_with(ALIAS_KEY))
-                .map(|key| ColumnRef::parse(key)),
-        ),
+            tiebreak,
+        } => {
+            out.extend(
+                keys.iter()
+                    .filter(|key| !key.starts_with(ALIAS_KEY))
+                    .map(|key| ColumnRef::parse(key)),
+            );
+            out.extend(tiebreak.iter().cloned());
+        }
         LogicalNode::Nearest {
             input: _,
             binding: _,
@@ -1648,9 +1800,11 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             k: _,
             limit: _,
             reads,
+            row_tiebreak,
         } => {
             out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
             out.extend(reads.iter().cloned());
+            out.extend(row_tiebreak.iter().cloned());
         }
         LogicalNode::AntiJoin {
             input: _,
@@ -1658,7 +1812,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             outer_var: _,
             predicate,
         } => {
-            if let Some(arg) = &predicate.arg {
+            if let Some(arg) = predicate.left.arg() {
                 reads_of_expr(arg, &mut out);
             }
             reads_of_expr(&predicate.right, &mut out);
@@ -1671,8 +1825,8 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             input: _,
             src: _,
             dst: _,
-            edge_type: _,
-            direction: _,
+            edges: _,
+            src_type: _,
             dst_type: _,
             min_hops: _,
             max_hops: _,
@@ -1889,6 +2043,7 @@ impl Lowering<'_> {
             right,
             haystack,
             needle,
+            conjunct,
             residual,
         }) = self.physical.node(join).cloned()
         else {
@@ -1897,6 +2052,7 @@ impl Lowering<'_> {
         let fields = ContainsJoinFields {
             haystack: (&haystack.0, &haystack.1),
             needle: (&needle.0, &needle.1),
+            conjunct: &conjunct,
             residual: &residual,
         };
         let mut filters = Vec::with_capacity(residual.len() + 1);
@@ -1953,6 +2109,13 @@ impl Lowering<'_> {
             ))
         })?
         .to_string();
+        if self.logical.traversal_work_limit().is_some() {
+            return Ok(Prefilter {
+                ranked_type,
+                hops: Vec::new(),
+                feeds,
+            });
+        }
         let mut introduced_by_scan = false;
         let mut hops = Vec::new();
         for &id in top {
@@ -1969,14 +2132,20 @@ impl Lowering<'_> {
                 }
                 Some(PhysicalNode::Expand {
                     src,
-                    edge_type,
-                    direction,
+                    edges,
                     min_hops,
                     ..
-                }) if src == binding && *min_hops > 0 => hops.push(Hop {
-                    edge_type: edge_type.clone(),
-                    direction: *direction,
-                }),
+                }) if src == binding && *min_hops > 0 => {
+                    let Some(member) = edges.named() else {
+                        return Err(PlanError::Internal(
+                            "an unbudgeted prefilter contains an edge selection".to_string(),
+                        ));
+                    };
+                    hops.push(Hop {
+                        edge_type: member.edge_type.clone(),
+                        direction: member.direction,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2038,6 +2207,7 @@ impl Lowering<'_> {
             right,
             haystack,
             needle,
+            conjunct: conjuncts[index].clone(),
             residual,
         }))
     }
@@ -2208,6 +2378,7 @@ impl Lowering<'_> {
                 Ok(self.physical.add(PhysicalNode::Projection {
                     input: lowered,
                     return_exprs: return_exprs.clone(),
+                    node_objects: node_object_types(return_exprs, self.source)?,
                 }))
             }
             LogicalNode::Aggregate {
@@ -2216,17 +2387,28 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
+                let aggregates = return_exprs
+                    .iter()
+                    .map(|projection| match &projection.expr {
+                        IRExpr::Aggregate {
+                            func, signature, ..
+                        } => crate::plan_aggregate(*func, signature).map(Some),
+                        _ => Ok(None),
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?;
                 Ok(self.physical.add(PhysicalNode::Aggregate {
                     input: lowered,
                     return_exprs: return_exprs.clone(),
+                    aggregates,
+                    node_objects: node_object_types(return_exprs, self.source)?,
                 }))
             }
             LogicalNode::Expand {
                 input,
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -2235,13 +2417,25 @@ impl Lowering<'_> {
             } => {
                 let lowered = self.lower(*input)?;
                 let (mode, frontier_estimate, policy) =
-                    self.expand_mode(*input, edge_type, *direction, *min_hops, *max_hops);
+                    self.expand_mode(*input, edges, *min_hops, *max_hops)?;
+                let versions = edges
+                    .members()
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.edge_type.clone(),
+                            self.source
+                                .edge_dataset(&member.edge_type)
+                                .map(|pin| pin.version),
+                        )
+                    })
+                    .collect();
                 Ok(self.physical.add(PhysicalNode::Expand {
                     input: lowered,
                     src: src.clone(),
                     dst: dst.clone(),
-                    edge_type: edge_type.clone(),
-                    direction: *direction,
+                    edges: edges.clone(),
+                    src_type: src_type.clone(),
                     dst_type: dst_type.clone(),
                     min_hops: *min_hops,
                     max_hops: *max_hops,
@@ -2249,7 +2443,7 @@ impl Lowering<'_> {
                     mode,
                     frontier_estimate,
                     policy,
-                    version: self.source.edge_dataset(edge_type).map(|pin| pin.version),
+                    versions,
                 }))
             }
             LogicalNode::AntiJoin {
@@ -2266,6 +2460,7 @@ impl Lowering<'_> {
                     inner: inner_lowered,
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
+                    aggregate: crate::plan_block_aggregate(&predicate.left)?,
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {
@@ -2285,6 +2480,7 @@ impl Lowering<'_> {
                 let fetch = k.and_then(|k| usize::try_from(k).ok());
                 let access = RankedAccess {
                     kind: RankKind::Nearest,
+                    score: rank_score(binding, RankKind::Nearest),
                     property: property.clone(),
                     query: query.clone(),
                     fetch,
@@ -2321,6 +2517,7 @@ impl Lowering<'_> {
                 let lowered = self.lower(*input)?;
                 let access = RankedAccess {
                     kind: RankKind::Bm25,
+                    score: rank_score(binding, RankKind::Bm25),
                     property: property.clone(),
                     query: query.clone(),
                     fetch: None,
@@ -2338,6 +2535,7 @@ impl Lowering<'_> {
                 arms,
                 k,
                 limit,
+                row_tiebreak,
                 ..
             } => {
                 let primary = self.lower(*input)?;
@@ -2345,7 +2543,7 @@ impl Lowering<'_> {
                     PlanError::Internal("the rrf arm subtree has a tombstone".to_string())
                 })?;
                 let limit = limit.and_then(|limit| usize::try_from(limit).ok());
-                let [primary_arm, secondary_arm] = arms;
+                let [primary_arm, secondary_arm] = arms.as_ref();
                 let mut lowered_arms = Vec::with_capacity(2);
                 let mut bm25_scans = Vec::new();
                 let mut primary_scan = None;
@@ -2355,6 +2553,7 @@ impl Lowering<'_> {
                 ] {
                     let access = RankedAccess {
                         kind: arm.kind,
+                        score: rank_score(&arm.binding, arm.kind),
                         property: arm.property.clone(),
                         query: arm.query.clone(),
                         fetch: match arm.kind {
@@ -2401,6 +2600,7 @@ impl Lowering<'_> {
                     k: k.clone(),
                     limit,
                     prefilter,
+                    row_tiebreak: row_tiebreak.clone(),
                 }))
             }
             LogicalNode::Ordered { input, keys } => {
@@ -2553,11 +2753,22 @@ impl Lowering<'_> {
     fn expand_mode(
         &mut self,
         input: LogicalId,
-        edge_type: &str,
-        direction: Direction,
+        edges: &EdgeSelection,
         min_hops: u32,
         max_hops: Option<u32>,
-    ) -> (ExpandMode, Option<u64>, ExpandPolicy) {
+    ) -> Result<(ExpandMode, Option<u64>, ExpandPolicy), PlanError> {
+        if self.logical.traversal_work_limit().is_some() {
+            return Ok((
+                ExpandMode::IndexedScan,
+                estimate_rows(self.logical, input, self.source),
+                ExpandPolicy::Budgeted,
+            ));
+        }
+        let member = edges.named().ok_or_else(|| PlanError::Unsupported {
+            detail: "edge selections require a finite traversal_work_limit".to_string(),
+        })?;
+        let edge_type = &member.edge_type;
+        let direction = member.direction;
         let forced = match self.source.traversal() {
             Traversal::Indexed => Some(ExpandMode::IndexedScan),
             Traversal::Csr => Some(ExpandMode::Csr),
@@ -2571,7 +2782,7 @@ impl Lowering<'_> {
                 frontier_rows: input_rows.unwrap_or(u64::MAX),
                 edge_count: statistics.edge_count,
                 src_node_count: statistics.src_node_count,
-                effective_max_hops: executed_hops(min_hops, max_hops, statistics.same_type),
+                effective_max_hops: executed_hops(min_hops, max_hops),
                 max_hops_cap: statistics.max_hops_cap,
                 max_frontier_cap: statistics.max_frontier_cap,
                 coverage: IndexCoverage::Indexed,
@@ -2590,7 +2801,7 @@ impl Lowering<'_> {
         if mode == ExpandMode::Csr {
             self.csr_cached = true;
         }
-        (mode, frontier_estimate, policy)
+        Ok((mode, frontier_estimate, policy))
     }
 
     /// Pass 9, the access path of a dependent scan: the cost model over the
@@ -3200,8 +3411,7 @@ fn derive_properties(
             }
             PhysicalNode::Filter { input, .. }
             | PhysicalNode::Expand { input, .. }
-            | PhysicalNode::AntiJoin { input, .. }
-            | PhysicalNode::Aggregate { input, .. } => {
+            | PhysicalNode::AntiJoin { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
@@ -3212,10 +3422,26 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::Projection { input, .. } => {
+            PhysicalNode::Aggregate {
+                return_exprs,
+                node_objects,
+                ..
+            } => Properties {
+                schema: return_schema(return_exprs, node_objects)?,
+                ordering: None,
+                rows: Estimate::Unknown,
+                work_bytes: Estimate::Unknown,
+                retained_limit: None,
+                sources: Vec::new(),
+            },
+            PhysicalNode::Projection {
+                input,
+                return_exprs,
+                node_objects,
+            } => {
                 let input = props(plan, *input)?;
                 Properties {
-                    schema: input.schema.clone(),
+                    schema: return_schema(return_exprs, node_objects)?,
                     ordering: input.ordering.clone(),
                     rows: input.rows,
                     work_bytes: Estimate::Unknown,
@@ -3828,5 +4054,26 @@ mod tests {
         };
         let unpaged = resolve(&snapshot, &source).expect("resolves");
         assert_ne!(plan.structural_hash(), unpaged.structural_hash());
+    }
+}
+
+#[cfg(test)]
+mod cast_reads_tests {
+    use super::*;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    #[test]
+    fn a_cast_keeps_its_property_dependency() {
+        let expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::PropAccess {
+                variable: "p".into(),
+                property: "age".into(),
+                ty: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+            }),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, true)),
+        };
+        let mut reads = Vec::new();
+        reads_of_expr(&expr, &mut reads);
+        assert_eq!(reads, vec![ColumnRef::property("p", "age")]);
     }
 }

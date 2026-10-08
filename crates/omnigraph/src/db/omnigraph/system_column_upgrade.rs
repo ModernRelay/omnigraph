@@ -1,19 +1,7 @@
-//! RFC 0040 Rollout step 3: the explicit system-column upgrade of one
-//! legacy-vintage graph. Renames `id`/`src`/`dst` to `__id`/`__src`/`__dst`
-//! in every node and edge table and installs the current-vintage schema
-//! contract. Since RFC 0067 it has schema apply's shape: each rename-only
-//! `Project` commits detached from the table's pin, the staged contract
-//! names the graph commit that publishes it, and one manifest CAS publishes
-//! every pin. It writes no
-//! recovery record: a failure before the CAS leaves only reclaimable detached
-//! versions and a staging the next read-write open discards; one after it
-//! leaves published detached pins and a contract the next read-write
-//! open (or this handle's next write) installs. Since v10 both vintages share
-//! one `__manifest` stamp, so the upgrade moves no stamp; the vintage is the
-//! contract's `system-columns` feature.
+//! Upgrade system-column names with detached table renames and one manifest
+//! publication containing every table pin and the schema contract row.
 
 use super::*;
-use crate::db::schema_state::SchemaState;
 use crate::db::upgrade::UpgradeMode;
 use crate::seams::{catalog, fail};
 use omnigraph_compiler::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_V3};
@@ -170,9 +158,6 @@ pub(super) async fn upgrade_system_columns(
         graph_manifest_version: None,
     };
 
-    if !options.check {
-        db.settle_pending_schema_install().await?;
-    }
     let (_shared_gate, _exclusive_gate): (
         Option<crate::db::write_queue::SchemaSharedPermit>,
         Option<crate::db::write_queue::SchemaExclusivePermit>,
@@ -190,14 +175,20 @@ pub(super) async fn upgrade_system_columns(
         .ok_or_else(|| OmniError::manifest_internal("opened graph has no internal-schema stamp"))?;
     report.stamp_before = stamp;
     report.stamp_after = stamp;
-    let (accepted_ir, accepted_schema_state) =
-        load_validated_schema_contract(db.uri(), Arc::clone(&db.storage)).await?;
+    let (accepted, accepted_identity) = {
+        let snapshot = db.coordinator.read().await.snapshot();
+        (
+            db.read_schema_contract_row_for(&snapshot).await?,
+            snapshot_contract_identity(&snapshot)?,
+        )
+    };
+    let (accepted_ir, _) = validate_schema_contract_row(&accepted)?;
     if accepted_ir.system_columns() == SYSTEM_COLUMNS_V3 {
         report.outcome = SystemColumnUpgradeOutcome::AlreadyCurrent;
         return Ok(report);
     }
 
-    preflight(db, &accepted_ir, stamp, &mut report).await?;
+    preflight(db, &accepted_ir, &accepted.source, stamp, &mut report).await?;
     if !report.findings.is_empty() {
         return Ok(report);
     }
@@ -207,18 +198,14 @@ pub(super) async fn upgrade_system_columns(
     }
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
-    super::schema_apply::acquire_schema_apply_lock(db).await?;
-    let result = execute_with_lock(db, actor, &accepted_ir, &accepted_schema_state).await;
-    let release_result = super::schema_apply::release_schema_apply_lock(db).await;
-    if release_result.is_err() {
-        // Liveness: the next write entry on this handle retries the release
-        // before the sentinel gate, so the failed delete never wedges it.
-        db.note_failed_sentinel_release();
-    }
-    let graph_manifest_version = match (result, release_result) {
-        (Ok(version), Ok(())) => version,
-        (Ok(_), Err(err)) | (Err(err), _) => return Err(err),
-    };
+    let graph_manifest_version = execute_with_lock(
+        db,
+        actor,
+        &accepted_ir,
+        &accepted.source,
+        &accepted_identity,
+    )
+    .await?;
     report.outcome = SystemColumnUpgradeOutcome::Completed;
     report.stamp_after = crate::db::manifest::internal_schema_stamp_at(db.uri(), None)
         .await?
@@ -230,6 +217,7 @@ pub(super) async fn upgrade_system_columns(
 async fn preflight(
     db: &Omnigraph,
     accepted_ir: &SchemaIR,
+    accepted_source: &str,
     stamp: u32,
     report: &mut SystemColumnUpgradeReport,
 ) -> Result<()> {
@@ -238,7 +226,7 @@ async fn preflight(
         .all_branches()
         .await?
         .into_iter()
-        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
+        .filter(|branch| branch != "main")
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
         report.refuse(format!(
@@ -263,40 +251,33 @@ async fn preflight(
     }
     if !crate::db::manifest::is_served_stamp(stamp) {
         report.refuse(format!(
-            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), so run `omnigraph upgrade` for the storage conversions first",
+            "__manifest is stamped at v{stamp}; the system-column upgrade respells a served graph (v{} to v{}), and this binary does not serve that storage format",
             crate::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
             crate::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
         ));
     }
-    if report.findings.is_empty() {
-        let source = db
-            .storage
-            .read_text(&schema_source_uri(&db.root_uri))
-            .await?;
-        if let Err(error) = render_system_column_upgrade_target(accepted_ir, &source) {
-            report.refuse(error.to_string());
-        }
+    if report.findings.is_empty()
+        && let Err(error) = render_system_column_upgrade_target(accepted_ir, accepted_source)
+    {
+        report.refuse(error.to_string());
     }
     Ok(())
 }
 
-/// Stage, publish and install the upgrade under the schema-apply sentinel.
+/// Publish the table renames and schema contract under the exclusive schema permit.
 /// Returns the published graph manifest version.
 async fn execute_with_lock(
     db: &Omnigraph,
     actor: Option<&str>,
     accepted_ir: &SchemaIR,
-    accepted_schema_state: &SchemaState,
+    accepted_source: &str,
+    accepted_identity: &SchemaContractIdentity,
 ) -> Result<u64> {
     db.refresh_coordinator_only().await?;
-    let accepted_source = db
-        .storage
-        .read_text(&schema_source_uri(&db.root_uri))
-        .await?;
     let SystemColumnUpgradeTarget {
         desired_ir,
         desired_source,
-    } = render_system_column_upgrade_target(accepted_ir, &accepted_source)?;
+    } = render_system_column_upgrade_target(accepted_ir, accepted_source)?;
     let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
     fixup_physical_schemas(&mut desired_catalog)?;
 
@@ -351,17 +332,20 @@ async fn execute_with_lock(
             current_graph_head,
         ));
     }
-    let current_schema_state = read_schema_state_identity(db.uri(), db.storage.as_ref()).await?;
-    if &current_schema_state != accepted_schema_state {
+    let current_snapshot = db.coordinator.read().await.snapshot();
+    let (current_catalog, current_identity) =
+        db.accepted_catalog_for_snapshot(&current_snapshot).await?;
+    validate_bound_catalog_against_snapshot(&current_catalog, &current_snapshot)?;
+    if &current_identity != accepted_identity {
         return Err(OmniError::manifest_read_set_changed(
             "schema_identity",
             Some(format!(
                 "{}:{}",
-                accepted_schema_state.schema_identity_version, accepted_schema_state.schema_ir_hash
+                accepted_identity.schema_identity_version, accepted_identity.schema_ir_hash
             )),
             Some(format!(
                 "{}:{}",
-                current_schema_state.schema_identity_version, current_schema_state.schema_ir_hash
+                current_identity.schema_identity_version, current_identity.schema_ir_hash
             )),
         ));
     }
@@ -379,14 +363,6 @@ async fn execute_with_lock(
             })?;
         existing_heads.insert(entry.type_key.clone(), head);
     }
-
-    // The staged contract is bound to this upgrade's graph commit (RFC 0067):
-    // a read-write open installs it once that commit is in lineage and
-    // discards it otherwise.
-    let publication = crate::db::schema_state::SchemaPublication {
-        graph_commit_id: lineage_intent.graph_commit_id.clone(),
-        parent_commit_id: base_graph_head.clone(),
-    };
 
     let mut published_commit: Option<String> = None;
     let effects = async {
@@ -438,30 +414,10 @@ async fn execute_with_lock(
             fail(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
-        // The state file is written last, so a complete staging is exactly
-        // one whose state file exists; the install pass reads the marker from
-        // it.
-        fail(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE)?;
-        let (_, ir_json, state_json) = crate::db::schema_state::render_schema_contract(
+        manifest_changes.push(ManifestChange::SchemaContract(render_schema_contract(
             &desired_ir,
-            Some(publication.clone()),
-        )?;
-        db.storage
-            .write_text(&schema_source_staging_uri(&db.root_uri), &desired_source)
-            .await?;
-        db.storage
-            .write_text(
-                &crate::db::schema_state::schema_ir_staging_uri(&db.root_uri),
-                &ir_json,
-            )
-            .await?;
-        db.storage
-            .write_text(
-                &crate::db::schema_state::schema_state_staging_uri(&db.root_uri),
-                &state_json,
-            )
-            .await?;
-        fail(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE)?;
+            &desired_source,
+        )?));
 
         let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(
             crate::db::manifest::GraphHeadExpectation::new(
@@ -472,6 +428,7 @@ async fn execute_with_lock(
         );
         let PublishedSnapshot {
             graph_manifest_version,
+            commit,
             ..
         } = db
             .coordinator
@@ -484,47 +441,20 @@ async fn execute_with_lock(
                 &precondition,
             )
             .await?;
-        published_commit = Some(publication.graph_commit_id.clone());
-
-        fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
-        // Install the contract from memory rather than by renaming the
-        // staging (another process's open may have discarded it), then retire
-        // the staging. Every write is idempotent; a crash here leaves the
-        // staged copy for the next open to install the same way.
-        db.storage
-            .write_text(&schema_source_uri(&db.root_uri), &desired_source)
-            .await?;
-        crate::db::schema_state::write_schema_contract(
-            &db.root_uri,
-            db.storage.as_ref(),
-            &crate::db::schema_state::SchemaContractText {
-                source: desired_source.clone(),
-                ir_json,
-                state_json,
-            },
-        )
-        .await?;
-        crate::db::schema_state::cleanup_staging_files(&db.root_uri, db.storage.as_ref()).await?;
+        published_commit = Some(commit.graph_commit_id);
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
-        db.coordinator.write().await.refresh().await?;
         db.runtime_cache.invalidate_all().await;
         db.invalidate_graph_index().await;
+        fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         Ok::<u64, OmniError>(graph_manifest_version)
     }
     .await;
 
     match effects {
         Ok(version) => Ok(version),
-        // Before publication nothing referenced is durable: the detached
-        // renames and the staged contract are garbage the next open and
-        // cleanup retire. After it the manifest is authoritative and only the
-        // contract installation is pending, which the next read-write open or
-        // this handle's next write entry completes from the staged copy.
         Err(error) => Err(match published_commit {
             Some(graph_commit_id) => {
-                db.pending_schema_install
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 OmniError::recovery_required(graph_commit_id, error.to_string())
             }
             None => error,

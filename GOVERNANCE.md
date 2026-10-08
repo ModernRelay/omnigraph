@@ -20,8 +20,11 @@ everyone, maintainers included.
 
 ## One channel in
 
-**Issues are the only inbound channel.** Bugs and feature proposals each have
-an issue form; GitHub Discussions are not used. The one exception is
+**Issues are the only inbound channel.** Use the bug form for broken existing
+functionality and the feature or design proposal form for new capabilities or
+changes to intended behavior or architecture. Maintainers decide whether the
+same issue needs an RFC; there is no separate RFC intake form.
+GitHub Discussions are not used. The one exception is
 security: report vulnerabilities privately per [SECURITY.md](SECURITY.md),
 never as a public issue — a public security issue is closed on sight and
 re-routed.

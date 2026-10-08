@@ -1,0 +1,49 @@
+# issue: none
+# notes: One query is measured on a fresh handle with prepared traversal indexes; a restart and exact result check follow. This bounded topology and preparation differ from the former Rust timing loop.
+# traversal: indexed
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query sel($name: String) {
+    match {
+        $a: Person { name: $name }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+--- params
+{"name":"p0"}
+--- expect unordered
+{"b.name":"p1"}
+{"b.name":"p2"}
+{"b.name":"p4"}
+{"b.name":"p5"}
+{"b.name":"p8"}
+--- expect shape
+b.name: String
+
+--- restart
+
+--- query
+query sel($name: String) {
+    match {
+        $a: Person { name: $name }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+--- params
+{"name":"p0"}
+--- expect unordered
+{"b.name":"p1"}
+{"b.name":"p2"}
+{"b.name":"p4"}
+{"b.name":"p5"}
+{"b.name":"p8"}
+--- expect shape
+b.name: String

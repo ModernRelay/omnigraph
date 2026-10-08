@@ -257,6 +257,146 @@ query touch_born($d: Date) { update Metric set { active: false } where born = $d
     );
 }
 
+/// The Rust `ParamMap` door: a `.gqt` binds params only through JSON, whose `DateTime`
+/// arm refuses first, so no case reaches these refusals (a sub-millisecond
+/// `Literal::DateTime`, a `Literal::String`, `Null` on a non-nullable parameter).
+#[tokio::test]
+async fn datetime_param_with_sub_millisecond_digits_is_refused_from_a_rust_param_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    let datetime = |value: &str| omnigraph_compiler::Literal::DateTime(value.to_string());
+    let q = r#"
+query seen_eq_param($t: DateTime) { match { $m: Metric  $m.seen = $t } return { $m.name } }
+query seen_in_param($ts: [DateTime]) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
+query seen_opt_param($t: DateTime?) { match { $m: Metric  $m.seen = $t } return { $m.name } }
+query seen_in_opt_param($ts: [DateTime]?) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
+"#;
+    let m = r#"
+query touch_seen($t: DateTime) { update Metric set { active: false } where seen = $t }
+"#;
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), datetime("2024-06-01T12:00:00.000500Z"));
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("a DateTime param finer than a millisecond is refused on read");
+    assert!(
+        err.to_string().contains(
+            "param 't': invalid DateTime literal '2024-06-01T12:00:00.000500Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+        ),
+        "{err}"
+    );
+    let err = db
+        .mutate("main", m, "touch_seen", &params)
+        .await
+        .expect_err("the same param is refused in a mutation predicate");
+    assert!(
+        err.to_string()
+            .contains("param 't': invalid DateTime literal '2024-06-01T12:00:00.000500Z'"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![
+            datetime("2024-06-01T12:00:00Z"),
+            datetime("2024-06-01T12:00:00.000000001Z"),
+        ]),
+    );
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a list item with a non-zero ninth fractional digit is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': invalid DateTime literal '2024-06-01T12:00:00.000000001Z'"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "t".to_string(),
+        omnigraph_compiler::Literal::String("2024-06-01T12:00:00.000500Z".to_string()),
+    );
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("a String literal bound to a DateTime parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 't': expected DateTime, got String(\"2024-06-01T12:00:00.000500Z\")"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![omnigraph_compiler::Literal::String(
+            "2024-06-01T12:00:00Z".to_string(),
+        )]),
+    );
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a String item in a [DateTime] list is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got List("),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert("ts".to_string(), datetime("2024-06-01T12:00:00Z"));
+    let err = query_main(&db, q, "seen_in_param", &params)
+        .await
+        .expect_err("a scalar DateTime bound to a [DateTime] parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got DateTime("),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "ts".to_string(),
+        omnigraph_compiler::Literal::List(vec![omnigraph_compiler::Literal::Null]),
+    );
+    let err = query_main(&db, q, "seen_in_opt_param", &params)
+        .await
+        .expect_err("a Null item in a nullable [DateTime] list is refused");
+    assert!(
+        err.to_string()
+            .contains("param 'ts': expected [DateTime], got List([Null])"),
+        "{err}"
+    );
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), omnigraph_compiler::Literal::Null);
+    let err = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect_err("Null on a non-nullable DateTime parameter is refused");
+    assert!(
+        err.to_string()
+            .contains("param 't': expected DateTime, got Null"),
+        "{err}"
+    );
+    let rows = query_main(&db, q, "seen_opt_param", &params)
+        .await
+        .expect("Null on a nullable DateTime parameter passes the check");
+    assert_eq!(rows.num_rows(), 0);
+
+    let mut params = ParamMap::new();
+    params.insert("t".to_string(), datetime("2024-06-01T12:00:00.000000Z"));
+    let rows = query_main(&db, q, "seen_eq_param", &params)
+        .await
+        .expect("zero padding past the millisecond names the same instant");
+    assert_eq!(rows.num_rows(), 1);
+    let affected = db
+        .mutate("main", m, "touch_seen", &params)
+        .await
+        .expect("the zero-padded param and the now() every mutation binds both pass")
+        .affected_nodes;
+    assert_eq!(affected, 1);
+}
+
 // Exact string predicates: `starts_with` and the String overload of
 // `contains`. Standalone filters on a scanned variable are hoisted into the
 // NodeScan (the pushdown arm — Lance probes a covering BTREE/NGRAM index when
@@ -521,5 +661,149 @@ async fn camelcase_property_filter_executes() {
         r.num_rows(),
         1,
         "expected exactly the d1 row for repoName=acme"
+    );
+}
+
+#[tokio::test]
+async fn unused_mutation_parameters_are_checked_before_a_noop() {
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    for (type_name, invalid, valid) in [
+        (
+            "I32",
+            Literal::Integer(i64::from(i32::MAX) + 1),
+            Literal::Integer(1),
+        ),
+        (
+            "[F32]",
+            Literal::List(vec![Literal::Float(f64::MAX)]),
+            Literal::List(vec![Literal::Float(0.5)]),
+        ),
+        ("F64", Literal::Float(f64::NAN), Literal::Float(1.25)),
+    ] {
+        let source = format!(
+            "query unused($value: {type_name}) {{ update Metric set {{ active: false }} where name = \"missing\" }}"
+        );
+        let error = db
+            .mutate(
+                "main",
+                &source,
+                "unused",
+                &ParamMap::from([("value".into(), invalid)]),
+            )
+            .await
+            .expect_err("an unused declared parameter is validated even when no row matches");
+        assert!(
+            error.to_string().contains("param 'value':"),
+            "{type_name}: {error}"
+        );
+        let receipt = db
+            .mutate_with_receipt(
+                "main",
+                &source,
+                "unused",
+                &ParamMap::from([("value".into(), valid)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.result.affected_nodes, 0, "{type_name}");
+        assert_eq!(receipt.result.affected_edges, 0, "{type_name}");
+        assert!(
+            receipt.commit.is_none(),
+            "{type_name}: a no-op does not publish"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_head_check() {
+    use omnigraph::error::OmniError;
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    let source = r#"query assigned($value: I32) {
+        update Metric set { count: $value } where name = "missing"
+    }"#;
+    let params = ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX) + 1))]);
+    let error = db
+        .mutate_as_with_expected_head(
+            "main",
+            source,
+            "assigned",
+            &params,
+            None,
+            Some("not-the-current-head"),
+        )
+        .await
+        .expect_err("caller expected-head refusal precedes parameter validation");
+    assert!(
+        matches!(error, OmniError::PreconditionFailed { .. }),
+        "{error}"
+    );
+    let error = db
+        .mutate("main", source, "assigned", &params)
+        .await
+        .expect_err("zero matched rows must not hide an invalid assignment parameter");
+    let text = error.to_string();
+    assert!(
+        text.contains("param 'value':") && text.contains("exceeds I32 range"),
+        "{text}"
+    );
+    let receipt = db
+        .mutate_with_receipt(
+            "main",
+            source,
+            "assigned",
+            &ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX)))]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 0);
+    assert_eq!(receipt.result.affected_edges, 0);
+    assert!(receipt.commit.is_none());
+}
+
+#[tokio::test]
+async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let predicate = r#"query optional_predicate($name: String?) {
+        update Metric set { active: false } where name = $name
+    }"#;
+    for params in [
+        ParamMap::new(),
+        ParamMap::from([("name".into(), Literal::Null)]),
+    ] {
+        let receipt = db
+            .mutate_with_receipt("main", predicate, "optional_predicate", &params)
+            .await
+            .unwrap();
+        assert_eq!(receipt.result.affected_nodes, 0);
+        assert_eq!(receipt.result.affected_edges, 0);
+        assert!(receipt.commit.is_none());
+    }
+
+    let assignment = r#"query optional_assignment($count: I32?) {
+        update Metric set { count: $count } where name = "m1"
+    }"#;
+    let receipt = db
+        .mutate_with_receipt("main", assignment, "optional_assignment", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 1);
+    assert_eq!(receipt.result.affected_edges, 0);
+    assert!(receipt.commit.is_some());
+    let cleared = r#"query cleared() {
+        match { $m: Metric $m.count is null }
+        return { $m.name }
+    }"#;
+    assert_eq!(
+        sorted_metric_names(&mut db, cleared, "cleared").await,
+        ["m1"]
     );
 }

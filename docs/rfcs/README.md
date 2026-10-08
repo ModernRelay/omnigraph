@@ -48,7 +48,8 @@ RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
 closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
-when the namespace closed (0047 and 0048 by PR #606; 0050 by the
+when the namespace closed (0047 and 0048 by PR #606, carried on by PR #791
+and PR #793; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
 0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
 reserved numbers. Every other gap
@@ -152,6 +153,9 @@ dependencies do.
 6. Implementation PRs link the accepted RFC and update `implementation` plus
    any durable evidence or support boundary in the canonical file.
 7. A later incompatible decision gets a new RFC and supersedes the old one.
+8. An accepted RFC that replaces only part of an earlier RFC keeps that RFC's
+   status. Its PR adds a `> **RFC NNNN disposition:**` note under the earlier
+   RFC's title: what changed, `Historical:` sections, `Current:` remainder.
 
 For Lance-dependent work, follow [the Lance reading protocol](../dev/lance.md)
 and record the exact upstream version and surfaces reviewed. For test planning,
@@ -207,6 +211,7 @@ then dated RFCs by date.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
+| [0047](0047-search-plan-truth.md) | Search plan validation and result guarantees | public | draft | in-progress |
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | partial |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
@@ -231,4 +236,10 @@ then dated RFCs by date.
 | [2026-09-21](2026-09-21-detached-only-tables.md) | Detached-only tables | maintainer | accepted | in-progress |
 | [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |
 | [2026-09-26](2026-09-26-self-contained-server-testing.md) | Self-contained server testing with GQT and DST | maintainer | draft | not-started |
-| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | draft | not-started |
+| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | accepted | in-progress |
+| [2026-09-30](2026-09-30-typed-edge-alternation.md) | Typed edge alternation and bounded wildcard traversal | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-v012-http-admission.md) | HTTP contract admission | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-exact-merge-receipts.md) | Exact merge receipts | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-owned-server-operations.md) | Owned server operations | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |
+| [2026-10-01](2026-10-01-engine-settlement-and-resource-bounds.md) | Engine settlement and resource bounds | maintainer | accepted | partial |

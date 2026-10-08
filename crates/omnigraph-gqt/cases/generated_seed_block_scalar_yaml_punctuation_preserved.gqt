@@ -1,0 +1,36 @@
+# issue: none
+# notes: Anchor, alias, tag, merge-key and `#` punctuation inside a block scalar of a generated seed is literal text; the token-level admission refuses only real YAML syntax, and no line-based scan strips or refuses a line of the scalar.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Note { slug: String @key text: String }
+
+--- seed generate: v1 seed: 7
+tables:
+  - kind: node
+    name: Note
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: literal, value: n-1}
+      text:
+        kind: literal
+        value: |-
+          &anchor value
+          *alias
+          !tag
+          <<: {merged: true}
+          # not a comment
+
+--- query
+query notes() { match { $n: Note } return { $n.slug, $n.text } }
+--- expect unordered
+{"n.slug":"n-1","n.text":"&anchor value\n*alias\n!tag\n<<: {merged: true}\n# not a comment"}
+--- expect shape
+n.slug: String
+n.text: String

@@ -17,11 +17,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::branch_merge::{BranchMergePlan, TARGET_BRANCH};
-use crate::case::{
+use crate::counting::LogicalCallCounts;
+use crate::legacy::case::validate_case;
+use crate::legacy::case::{
     Backend, CaseV1, LocalFilesystem, LocalStorageClass, PointIdentityV1, S3Implementation,
     S3Versioning,
 };
-use crate::counting::LogicalCallCounts;
+use crate::legacy::suite::MAX_REPETITIONS_PER_CASE;
+use crate::legacy::suite::ResolvedRun;
 use crate::machine::MachineIdentityV1;
 use crate::model::typed_sha256;
 use crate::reset::PHYSICAL_TREE_DIGEST_ALGORITHM;
@@ -30,8 +33,7 @@ use crate::runner::{
     MergeRouteObservation, PhaseObservation, RepObservation, RunExecution, VerificationObservation,
     validate_successful_merge_phase_topology,
 };
-use crate::suite::MAX_REPETITIONS_PER_CASE;
-use crate::{CASE_FORMAT_VERSION, POINT_IDENTITY_VERSION, ResolvedRun, validate_case};
+use crate::{CASE_FORMAT_VERSION, POINT_IDENTITY_VERSION};
 
 pub use crate::runner::{
     FIXTURE_MANIFEST_FORMAT_VERSION, FIXTURE_VALIDATOR_VERSION, FixtureManifestV1,
@@ -75,6 +77,12 @@ pub struct RunRecordV1 {
 }
 
 impl RunRecordV1 {
+    pub fn invocation(&self) -> &InvocationIdentityV1 {
+        &self.invocation
+    }
+    pub fn point_id(&self) -> &str {
+        &self.run.point_id
+    }
     /// A performance claim requires both a complete acquisition and proof of
     /// the effective build settings that produced the measured executable.
     /// Current local records deliberately lack the latter proof and therefore
@@ -409,7 +417,11 @@ pub struct RecordError {
 }
 
 impl RecordError {
-    fn new(code: &'static str, path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        code: &'static str,
+        path: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             code,
             path: path.into(),
@@ -434,41 +446,41 @@ pub type RecordResult<T> = Result<T, RecordError>;
 
 /// Bind durable SUT identity to the exact worker build attested by the runner.
 pub fn sut_identity_for_execution(execution: &RunExecution) -> RecordResult<SutIdentityV1> {
-    let worker_executable_sha256 = execution
-        .build
-        .worker_executable_sha256
-        .clone()
-        .ok_or_else(|| {
-            RecordError::new(
-                "missing_worker_attestation",
-                "execution.build.worker_executable_sha256",
-                "a durable timing record requires an attested worker executable",
-            )
-        })?;
+    sut_identity_for_build(&execution.build)
+}
+pub(crate) fn sut_identity_for_build(
+    build: &crate::runner::BuildEvidence,
+) -> RecordResult<SutIdentityV1> {
+    let worker_executable_sha256 = build.worker_executable_sha256.clone().ok_or_else(|| {
+        RecordError::new(
+            "missing_worker_attestation",
+            "build.worker_executable_sha256",
+            "a durable timing record requires an attested worker executable",
+        )
+    })?;
     let sut = SutIdentityV1 {
         package_version: env!("CARGO_PKG_VERSION").to_string(),
-        source_commit: execution.build.source_commit.clone(),
-        source_tree_dirty: execution.build.source_tree_dirty,
+        source_commit: build.source_commit.clone(),
+        source_tree_dirty: build.source_tree_dirty,
         build: BuildIdentityV1 {
-            profile: execution.build.cargo_profile.clone(),
-            cargo_opt_level: execution.build.cargo_opt_level.clone(),
-            debug_assertions: execution.build.debug_assertions,
-            target_triple: execution.build.target_triple.clone(),
-            rustc_version: execution.build.rustc_version.clone(),
-            declared_release_lto: execution.build.declared_release_lto.clone(),
-            declared_release_codegen_units: execution.build.declared_release_codegen_units,
-            declared_release_strip: execution.build.declared_release_strip,
-            cargo_encoded_rustflags_present: execution.build.cargo_encoded_rustflags_present,
-            release_profile_environment_overrides_supported: execution
-                .build
+            profile: build.cargo_profile.clone(),
+            cargo_opt_level: build.cargo_opt_level.clone(),
+            debug_assertions: build.debug_assertions,
+            target_triple: build.target_triple.clone(),
+            rustc_version: build.rustc_version.clone(),
+            declared_release_lto: build.declared_release_lto.clone(),
+            declared_release_codegen_units: build.declared_release_codegen_units,
+            declared_release_strip: build.declared_release_strip,
+            cargo_encoded_rustflags_present: build.cargo_encoded_rustflags_present,
+            release_profile_environment_overrides_supported: build
                 .release_profile_environment_overrides_supported,
-            effective_codegen_options_proved: execution.build.effective_codegen_options_proved,
+            effective_codegen_options_proved: build.effective_codegen_options_proved,
             worker_executable_sha256,
         },
         engine: EngineConfigurationV1 {
-            feature_flags: execution.build.engine_feature_flags.clone(),
-            enabled_techniques: execution.build.enabled_techniques.clone(),
-            lance_mem_pool_size: execution.build.effective_lance_mem_pool_size.clone(),
+            feature_flags: build.engine_feature_flags.clone(),
+            enabled_techniques: build.enabled_techniques.clone(),
+            lance_mem_pool_size: build.effective_lance_mem_pool_size.clone(),
         },
     };
     validate_sut(&sut)?;
@@ -857,7 +869,7 @@ fn local_storage_name(storage: LocalStorageClass) -> &'static str {
 
 fn validate_recorded_run_identity(
     recorded: &ResolvedRunIdentityV1,
-) -> RecordResult<crate::case::ValidatedCase> {
+) -> RecordResult<crate::legacy::case::ValidatedCase> {
     if recorded.point_identity_version != POINT_IDENTITY_VERSION
         || recorded.run_spec.identity_version != POINT_IDENTITY_VERSION
         || recorded.point_identity_version != recorded.run_spec.identity_version
@@ -926,7 +938,7 @@ fn validate_recorded_run_identity(
     Ok(sealed)
 }
 
-fn validate_invocation(invocation: &InvocationIdentityV1) -> RecordResult<()> {
+pub(crate) fn validate_invocation(invocation: &InvocationIdentityV1) -> RecordResult<()> {
     let invocation_time = ulid_timestamp_ms(&invocation.invocation_id).ok_or_else(|| {
         RecordError::new(
             "invalid_invocation_id",
@@ -968,7 +980,7 @@ fn validate_invocation(invocation: &InvocationIdentityV1) -> RecordResult<()> {
     Ok(())
 }
 
-fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
+pub(crate) fn validate_sut(sut: &SutIdentityV1) -> RecordResult<()> {
     validate_text(&sut.package_version, "sut.package_version")?;
     if !valid_lower_hex(&sut.source_commit, &[40, 64]) {
         return Err(RecordError::new(
@@ -1044,7 +1056,10 @@ fn validate_effective_environment_value(
     }
 }
 
-fn validate_backend(declared: &Backend, observed: &ObservedBackendV1) -> RecordResult<()> {
+pub(crate) fn validate_backend(
+    declared: &Backend,
+    observed: &ObservedBackendV1,
+) -> RecordResult<()> {
     match (declared, observed) {
         (
             Backend::LocalFs {
@@ -1126,11 +1141,12 @@ fn validate_stamped_fixture(
     if logical.builder != run_spec.fixture.builder
         || logical.data != run_spec.fixture.data
         || logical.state != run_spec.fixture.state
+        || logical.preparation != run_spec.fixture.preparation
     {
         return Err(RecordError::new(
             "logical_fixture_identity_mismatch",
             "fixture.manifest.logical",
-            "fixture builder, Data, or State differs from the canonical run spec",
+            "fixture builder, Data, State, or preparation differs from the canonical run spec",
         ));
     }
     Ok(())
@@ -1195,7 +1211,7 @@ fn validate_fixture_manifest(manifest: &FixtureManifestV1) -> RecordResult<()> {
 
 fn validate_measurements(
     record: &RunRecordV1,
-    sealed: &crate::case::ValidatedCase,
+    sealed: &crate::legacy::case::ValidatedCase,
 ) -> RecordResult<()> {
     let requested = record.acquisition.requested_repetitions;
     let observed = record.acquisition.observed_repetitions;
@@ -1370,15 +1386,26 @@ fn validate_measurements(
 /// control mutation subcategories must remain a partitioned subset of the
 /// aggregate mutation counter emitted by the engine wrapper.
 fn validate_projected_call_totals(index: usize, sample: &RawSampleV1) -> RecordResult<()> {
+    validate_call_totals(
+        index,
+        sample.logical_store_calls.manifest,
+        sample.logical_store_calls.table,
+        &sample.control_store_calls,
+    )
+}
+pub(crate) fn validate_call_totals(
+    index: usize,
+    manifest: LogicalCallCounts,
+    table: LogicalCallCounts,
+    control: &ControlCallObservation,
+) -> RecordResult<()> {
     let sample_path = format!("measurements.raw_samples[{index}]");
     let manifest = checked_lance_call_total(
-        sample.logical_store_calls.manifest,
+        manifest,
         &format!("{sample_path}.logical_store_calls.manifest"),
     )?;
-    let table = checked_lance_call_total(
-        sample.logical_store_calls.table,
-        &format!("{sample_path}.logical_store_calls.table"),
-    )?;
+    let table =
+        checked_lance_call_total(table, &format!("{sample_path}.logical_store_calls.table"))?;
     manifest.checked_add(table).ok_or_else(|| {
         RecordError::new(
             "logical_call_count_overflow",
@@ -1387,7 +1414,6 @@ fn validate_projected_call_totals(index: usize, sample: &RawSampleV1) -> RecordR
         )
     })?;
 
-    let control = &sample.control_store_calls;
     let classified_mutations = control
         .write_text
         .checked_add(control.delete)
@@ -1489,7 +1515,7 @@ fn evidence_strength(repetitions: usize) -> EvidenceStrengthV1 {
     }
 }
 
-fn v1_layer_presence() -> MeasurementLayerPresenceV1 {
+pub(crate) fn v1_layer_presence() -> MeasurementLayerPresenceV1 {
     MeasurementLayerPresenceV1 {
         logical: LayerMeasurementsV1 {
             counts: MeasurementPresenceV1::Observed,
@@ -1561,7 +1587,7 @@ fn validate_text(value: &str, path: &str) -> RecordResult<()> {
     Ok(())
 }
 
-fn validate_acquisition_error_code(value: &str, path: &str) -> RecordResult<()> {
+pub(crate) fn validate_acquisition_error_code(value: &str, path: &str) -> RecordResult<()> {
     if value.is_empty() || value.len() > MAX_ACQUISITION_ERROR_CODE_BYTES || !value.is_ascii() {
         return Err(RecordError::new(
             "invalid_acquisition_error_code",
@@ -1603,7 +1629,7 @@ fn validate_acquisition_error_code(value: &str, path: &str) -> RecordResult<()> 
     Ok(())
 }
 
-fn validate_sha256(value: &str, path: &str) -> RecordResult<()> {
+pub(crate) fn validate_sha256(value: &str, path: &str) -> RecordResult<()> {
     if !valid_lower_hex(value, &[64]) {
         return Err(RecordError::new(
             "invalid_sha256",
@@ -1689,14 +1715,15 @@ fn crockford_value(byte: u8) -> Option<u8> {
 pub(crate) mod tests {
     use std::path::PathBuf;
 
+    use crate::RUNNER_OUTPUT_VERSION;
     use crate::branch_merge::FixturePreflight;
     use crate::environment::LocalEnvironmentEvidence;
+    use crate::legacy::case::parse_case;
     use crate::machine::MACHINE_IDENTITY_FORMAT_VERSION;
     use crate::runner::{
         BuildEvidence, FixtureObservation, LogicalStoreCallObservation, WallClockSummary,
         test_general_merge_route, test_general_merge_stored_phases,
     };
-    use crate::{RUNNER_OUTPUT_VERSION, parse_case};
 
     use super::*;
 
@@ -1818,6 +1845,8 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                     expected_history_depth: 1,
                     estimated_max_entries: 1_000,
                     required_scratch_bytes: 2_000_000,
+                    preparation_commits: 0,
+                    retained_history_allowance_bytes: 0,
                 },
                 stamp: fixture_stamp(run),
                 base_load_commits: 1,
@@ -1899,6 +1928,7 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
                 data: run.case.definition.fixture.data.clone(),
                 state: run.case.definition.fixture.state.clone(),
                 logical_content_sha256: "1".repeat(64),
+                preparation: run.case.definition.fixture.preparation,
             },
             physical: PhysicalFixtureIdentityV1 {
                 digest_algorithm: PHYSICAL_TREE_DIGEST_ALGORITHM.to_string(),
@@ -1936,6 +1966,15 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
     }
 
     /// One fully validated durable record for sibling persistence tests.
+    #[test]
+    fn legacy_archive_wrapper_matches_the_independent_legacy_serializer() {
+        let record = valid_record();
+        let old = canonical_record_bytes(&record).unwrap();
+        let wrapped = crate::gqt_record::AnyRunRecordV1::Legacy(record);
+        assert_eq!(crate::gqt_record::canonical_bytes(&wrapped).unwrap(), old);
+        assert_eq!(crate::gqt_record::parse(&old).unwrap(), wrapped);
+    }
+
     pub(crate) fn valid_record_fixture() -> RunRecordV1 {
         valid_record()
     }
@@ -2048,6 +2087,13 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(record.acquisition.observed_repetitions, 1);
         assert_eq!(record.measurements.raw_samples.len(), 1);
         validate_run_record(&record).unwrap();
+        assert_eq!(
+            canonical_record_bytes(&record).unwrap(),
+            crate::gqt_record::canonical_bytes(&crate::gqt_record::AnyRunRecordV1::Legacy(
+                record.clone()
+            ))
+            .unwrap()
+        );
 
         let mut invalid = record;
         invalid
@@ -2185,6 +2231,43 @@ protocol: { deadline_seconds: 60, attribution: per-phase, schedule: manual, rese
         assert_eq!(
             parse_canonical_record(&non_canonical).unwrap_err().code,
             "non_canonical_record"
+        );
+
+        let mut run = resolved_run();
+        let mut definition = run.case.definition.clone();
+        definition.fixture.preparation = Some(
+            crate::legacy::case::FixturePreparation::ReversibleUpdatesV1 {
+                additional_commits: 64,
+                rows_per_commit: 1,
+                seed: 42,
+                maintenance: crate::legacy::case::PreparationMaintenance::None,
+            },
+        );
+        definition.fixture.state.aging = crate::legacy::case::Aging::SmallCommits;
+        definition.fixture.state.deletion_history =
+            crate::legacy::case::DeletionHistory::ReversibleUpdates;
+        definition.fixture.state.history_depth += 64;
+        run.case = crate::legacy::case::validate_case(definition)
+            .into_result()
+            .unwrap();
+        let execution = execution(&run);
+        let aged = build_run_record(&run, &execution, input(&run, &execution)).unwrap();
+        let encoded = canonical_record_bytes(&aged).unwrap();
+        assert_eq!(
+            encoded,
+            crate::gqt_record::canonical_bytes(&crate::gqt_record::AnyRunRecordV1::Legacy(
+                aged.clone()
+            ))
+            .unwrap()
+        );
+        assert_eq!(parse_canonical_record(&encoded).unwrap(), aged);
+        assert!(!aged.claim_eligible());
+        let mut mismatched = aged.clone();
+        mismatched.fixture.manifest.logical.preparation = None;
+        mismatched.fixture = StampedFixtureManifestV1::stamp(mismatched.fixture.manifest).unwrap();
+        assert_eq!(
+            validate_run_record(&mismatched).unwrap_err().code,
+            "logical_fixture_identity_mismatch"
         );
     }
 

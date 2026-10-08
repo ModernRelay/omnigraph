@@ -1,3 +1,4 @@
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -81,18 +82,19 @@ fn openapi_json() -> Value {
     serde_json::to_value(openapi_doc()).unwrap()
 }
 
-fn assert_optional_commit_field(doc: &Value, schema_name: &str) {
+fn assert_commit_field(doc: &Value, schema_name: &str, required_on_wire: bool) {
     let schema = &doc["components"]["schemas"][schema_name];
     let properties = schema["properties"].as_object().unwrap();
     let commit = properties
         .get("commit")
         .unwrap_or_else(|| panic!("{schema_name} must expose a commit receipt"));
     let required = schema["required"].as_array().unwrap();
-    assert!(
+    assert_eq!(
         required
             .iter()
-            .all(|field| field.as_str() != Some("commit")),
-        "{schema_name}.commit must remain optional for successful no-op mutations"
+            .any(|field| field.as_str() == Some("commit")),
+        required_on_wire,
+        "{schema_name}.commit presence is independent of its nullable no-op value"
     );
     let commit_ref = commit["$ref"].as_str().or_else(|| {
         commit["oneOf"]
@@ -110,6 +112,7 @@ fn assert_optional_commit_field(doc: &Value, schema_name: &str) {
 async fn openapi_endpoint_returns_200_with_valid_json() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -123,6 +126,7 @@ async fn openapi_endpoint_returns_200_with_valid_json() {
 async fn openapi_endpoint_returns_openapi_31_version() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -148,6 +152,7 @@ async fn openapi_endpoint_does_not_require_auth() {
     let app = build_app(state);
 
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -191,22 +196,21 @@ const EXPECTED_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/plan",
+    "/cluster/deployments",
+    "/cluster/deployments/{id}",
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
-    "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/query",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate",
     "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/queries",
     "/graphs/{graph_id}/queries/{name}",
     "/graphs/{graph_id}/queries/{name}/if-graph-commit",
     "/graphs/{graph_id}/schema",
-    "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
     "/graphs/{graph_id}/load/ndjson",
-    "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
@@ -222,6 +226,9 @@ fn openapi_contains_all_expected_paths() {
     let doc = openapi_json();
     let paths = doc["paths"].as_object().expect("paths must be an object");
     let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for retired in ["read", "change", "ingest", "schema/apply"] {
+        assert!(!path_keys.contains(format!("/graphs/{{graph_id}}/{retired}").as_str()));
+    }
 
     for expected in EXPECTED_PATHS {
         assert!(
@@ -535,12 +542,6 @@ fn openapi_healthz_is_get() {
 }
 
 #[test]
-fn openapi_read_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/read"]["post"].is_object());
-}
-
-#[test]
 fn openapi_blob_supports_get_and_explicit_head() {
     let doc = openapi_json();
     let path = &doc["paths"]["/graphs/{graph_id}/blob"];
@@ -645,10 +646,10 @@ fn openapi_blob_documents_binary_redirect_conditional_and_range_contracts() {
     }
     assert!(head["responses"].get("206").is_none());
     assert!(head["responses"].get("416").is_none());
-    for status in ["400", "401", "403", "404", "412", "500"] {
+    for (status, response) in head["responses"].as_object().unwrap() {
         assert!(
-            head["responses"][status].get("content").is_none(),
-            "HEAD /blob {status} must not promise a JSON body that Axum strips"
+            response.get("content").is_none(),
+            "HEAD /blob {status} must not promise a body that Axum strips"
         );
     }
 
@@ -724,12 +725,6 @@ fn export_documents_pre_header_failures() {
 }
 
 #[test]
-fn openapi_change_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/change"]["post"].is_object());
-}
-
-#[test]
 fn openapi_mutate_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/mutate"]["post"].is_object());
@@ -766,32 +761,6 @@ fn openapi_conditional_mutation_routes_are_post() {
     }
 }
 
-// Deprecation flagging — `/read` and `/change` are kept indefinitely for
-// back-compat but are flagged so OpenAPI codegens (typescript-fetch,
-// openapi-generator, oapi-codegen, etc.) emit @deprecated on the generated
-// SDK methods. The canonical successors `/query` and `/mutate` are not
-// flagged. See `deprecation_headers` in `omnigraph-server/src/lib.rs` for
-// the matching runtime signal (RFC 9745 + RFC 8288 headers).
-#[test]
-fn openapi_read_is_deprecated() {
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/read"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/read must be flagged deprecated in OpenAPI; use /query instead"
-    );
-}
-
-#[test]
-fn openapi_change_is_deprecated() {
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/change"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/change must be flagged deprecated in OpenAPI; use /mutate instead"
-    );
-}
-
 #[test]
 fn openapi_query_is_not_deprecated() {
     let doc = openapi_json();
@@ -816,12 +785,6 @@ fn openapi_mutate_is_not_deprecated() {
         !deprecated,
         "/mutate is the canonical mutation endpoint and must not be deprecated"
     );
-}
-
-#[test]
-fn openapi_ingest_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/graphs/{graph_id}/ingest"]["post"].is_object());
 }
 
 #[test]
@@ -863,7 +826,7 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     for field in ["branch", "nodes", "edges", "total_entities"] {
         assert!(props.contains_key(field));
     }
-    assert_optional_commit_field(&doc, "GraphBatchLoadOutput");
+    assert_commit_field(&doc, "GraphBatchLoadOutput", false);
     assert!(!props.contains_key("tables"));
     assert!(!props.contains_key("table_key"));
 
@@ -874,17 +837,6 @@ fn openapi_raw_graph_batch_has_ndjson_body_and_logical_result() {
     assert_eq!(declaration_props.len(), 2);
     assert!(declaration_props.contains_key("name"));
     assert!(declaration_props.contains_key("entities_loaded"));
-}
-
-#[test]
-fn openapi_ingest_is_deprecated() {
-    // RFC-009 Phase 5: /ingest is now the deprecated alias of /load.
-    let doc = openapi_json();
-    assert_eq!(
-        doc["paths"]["/graphs/{graph_id}/ingest"]["post"]["deprecated"],
-        serde_json::Value::Bool(true),
-        "/ingest must be flagged deprecated now that /load is canonical"
-    );
 }
 
 #[test]
@@ -904,6 +856,31 @@ fn openapi_branch_delete_is_delete() {
 fn openapi_branch_merge_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/graphs/{graph_id}/branches/merge"]["post"].is_object());
+    for name in ["BranchMergeOutput", "ChangeOutput"] {
+        let schema = &doc["components"]["schemas"][name];
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("commit"))
+        );
+        let variants = schema["properties"]["commit"]["oneOf"].as_array().unwrap();
+        assert!(variants.iter().any(|variant| variant["type"] == "null"));
+        assert!(
+            variants
+                .iter()
+                .any(|variant| variant["$ref"] == "#/components/schemas/CommitOutput")
+        );
+    }
+    let properties = &doc["components"]["schemas"]["BranchMergeOutput"]["properties"];
+    assert!(properties.get("branch_delete_error").is_none());
+    assert!(
+        properties["branch_delete_error_details"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|variant| variant["$ref"] == "#/components/schemas/ErrorOutput")
+    );
 }
 
 #[test]
@@ -974,15 +951,12 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "MergeConflictKindOutput",
     "MergeConflictOutput",
     "ReadOutput",
-    "ReadRequest",
     "ReadSetConflictOutput",
     "ReadTargetOutput",
     "PreconditionFailureOutput",
     "RecoveryRequiredOutput",
     "ResourceLimitOutput",
     "PublishedDatasetVersionConflictOutput",
-    "SchemaApplyOutput",
-    "SchemaApplyRequest",
     "SnapshotDatasetOutput",
     "SnapshotOutput",
 ];
@@ -1008,6 +982,10 @@ fn openapi_omits_retired_vocabulary_components() {
     let doc = openapi_json();
     let schemas = doc["components"]["schemas"].as_object().unwrap();
     for retired in [
+        "ReadRequest",
+        "LegacyReadOutput",
+        "SchemaApplyRequest",
+        "SchemaApplyOutput",
         "IngestTableOutput",
         "ChangeEntityKind",
         "ManifestConflictOutput",
@@ -1036,31 +1014,6 @@ fn health_output_schema_has_expected_fields() {
 }
 
 #[test]
-fn read_request_schema_has_expected_fields() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["ReadRequest"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_source"));
-    assert!(props.contains_key("query_name"));
-    assert!(props.contains_key("params"));
-    assert!(props.contains_key("branch"));
-    assert!(props.contains_key("snapshot"));
-}
-
-#[test]
-fn read_request_query_source_is_required() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["ReadRequest"];
-    let required: Vec<&str> = schema["required"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(required.contains(&"query_source"));
-}
-
-#[test]
 fn read_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ReadOutput"];
@@ -1073,9 +1026,6 @@ fn read_output_schema_has_expected_fields() {
 
 #[test]
 fn change_request_schema_has_expected_fields() {
-    // Canonical field names on the wire are now `query` and `name`. The
-    // schema descriptions document `query_source` and `query_name` as
-    // legacy deserialization aliases for backward compatibility.
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ChangeRequest"];
     let props = schema["properties"].as_object().unwrap();
@@ -1083,13 +1033,8 @@ fn change_request_schema_has_expected_fields() {
     assert!(props.contains_key("name"));
     assert!(props.contains_key("params"));
     assert!(props.contains_key("branch"));
-    let query_desc = schema["properties"]["query"]["description"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        query_desc.contains("query_source"),
-        "expected `query` description to mention the legacy `query_source` alias, got: {query_desc}"
-    );
+    assert!(!props.contains_key("query_source"));
+    assert!(!props.contains_key("query_name"));
 }
 
 #[test]
@@ -1143,7 +1088,7 @@ fn change_output_schema_has_expected_fields() {
     assert!(props.contains_key("query_name"));
     assert!(props.contains_key("affected_nodes"));
     assert!(props.contains_key("affected_edges"));
-    assert_optional_commit_field(&doc, "ChangeOutput");
+    assert_commit_field(&doc, "ChangeOutput", true);
 
     let outcome = props
         .get("outcome")
@@ -1255,7 +1200,7 @@ fn ingest_output_schema_has_expected_fields() {
     assert!(props.contains_key("nodes"));
     assert!(props.contains_key("edges"));
     assert!(props.contains_key("total_entities"));
-    assert_optional_commit_field(&doc, "IngestOutput");
+    assert_commit_field(&doc, "IngestOutput", false);
     assert!(!props.contains_key("tables"));
 }
 
@@ -1381,7 +1326,6 @@ fn error_output_schema_has_expected_fields() {
     );
     for path in [
         "/graphs/{graph_id}/query",
-        "/graphs/{graph_id}/read",
         "/graphs/{graph_id}/queries/{name}",
     ] {
         let response = &doc["paths"][path]["post"]["responses"]["409"];
@@ -1503,15 +1447,6 @@ fn commit_output_schema_has_expected_fields() {
 }
 
 #[test]
-fn schema_apply_output_uses_graph_manifest_version() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["SchemaApplyOutput"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("graph_manifest_version"));
-    assert!(!props.contains_key("manifest_version"));
-}
-
-#[test]
 fn snapshot_output_schema_has_expected_fields() {
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["SnapshotOutput"];
@@ -1589,14 +1524,17 @@ fn error_code_schema_has_expected_variants() {
             "unauthorized",
             "forbidden",
             "bad_request",
+            "api_contract_mismatch",
             "not_found",
             "method_not_allowed",
             "conflict",
             "too_many_requests",
+            "service_unavailable",
+            "graph_unavailable",
             "internal",
         ]),
-        "ErrorCode is a rolling wire contract: new meanings belong in optional \
-         structured fields, not new closed-enum values",
+        "ErrorCode must match the closed HTTP contract, including its \
+         explicit API admission and graph availability refusals",
     );
 }
 
@@ -1620,14 +1558,12 @@ fn external_blob_source_error_is_structured_and_declared_on_write_routes() {
     assert_eq!(output_ref, "#/components/schemas/ExternalBlobSourceOutput");
 
     for path in [
-        "/graphs/{graph_id}/change",
         "/graphs/{graph_id}/mutate",
         "/graphs/{graph_id}/mutate/if-graph-commit",
         "/graphs/{graph_id}/queries/{name}",
         "/graphs/{graph_id}/queries/{name}/if-graph-commit",
         "/graphs/{graph_id}/load",
         "/graphs/{graph_id}/load/ndjson",
-        "/graphs/{graph_id}/ingest",
         "/graphs/{graph_id}/branches/merge",
     ] {
         assert_eq!(
@@ -1708,18 +1644,14 @@ fn openapi_defines_bearer_token_security_scheme() {
 fn protected_endpoints_reference_bearer_token_security() {
     let doc = openapi_json();
     let protected_paths = [
-        ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/blob", "get"),
         ("/graphs/{graph_id}/blob", "head"),
-        ("/graphs/{graph_id}/change", "post"),
-        ("/graphs/{graph_id}/schema/apply", "post"),
         ("/graphs/{graph_id}/queries", "get"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/export", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
@@ -1845,38 +1777,14 @@ fn openapi_operations_have_tags() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn read_endpoint_200_references_legacy_read_output_schema() {
+fn mutate_endpoint_200_references_change_output_schema() {
     let doc = openapi_json();
-    let content = &doc["paths"]["/graphs/{graph_id}/read"]["post"]["responses"]["200"]["content"];
-    let schema = &content["application/json"]["schema"];
-    let ref_path = schema["$ref"].as_str().unwrap();
-    assert!(
-        ref_path.contains("LegacyReadOutput"),
-        "POST /read 200 should reference LegacyReadOutput, got {ref_path}"
-    );
-}
-
-#[test]
-fn legacy_read_output_schema_cannot_carry_graph_commit_id() {
-    let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["LegacyReadOutput"];
-    let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_name"));
-    assert!(props.contains_key("target"));
-    assert!(props.contains_key("row_count"));
-    assert!(props.contains_key("rows"));
-    assert!(!props.contains_key("graph_commit_id"));
-}
-
-#[test]
-fn change_endpoint_200_references_change_output_schema() {
-    let doc = openapi_json();
-    let content = &doc["paths"]["/graphs/{graph_id}/change"]["post"]["responses"]["200"]["content"];
+    let content = &doc["paths"]["/graphs/{graph_id}/mutate"]["post"]["responses"]["200"]["content"];
     let schema = &content["application/json"]["schema"];
     let ref_path = schema["$ref"].as_str().unwrap();
     assert!(
         ref_path.contains("ChangeOutput"),
-        "POST /change 200 should reference ChangeOutput, got {ref_path}"
+        "POST /mutate 200 should reference ChangeOutput, got {ref_path}"
     );
 }
 
@@ -1896,10 +1804,10 @@ fn healthz_200_references_health_output_schema() {
 fn error_responses_reference_error_output_schema() {
     let doc = openapi_json();
     let paths_with_errors = [
-        ("/graphs/{graph_id}/read", "post", "400"),
-        ("/graphs/{graph_id}/read", "post", "401"),
-        ("/graphs/{graph_id}/change", "post", "400"),
-        ("/graphs/{graph_id}/change", "post", "409"),
+        ("/graphs/{graph_id}/query", "post", "400"),
+        ("/graphs/{graph_id}/query", "post", "401"),
+        ("/graphs/{graph_id}/mutate", "post", "400"),
+        ("/graphs/{graph_id}/mutate", "post", "409"),
         ("/graphs/{graph_id}/branches", "post", "409"),
     ];
 
@@ -1918,14 +1826,12 @@ fn error_responses_reference_error_output_schema() {
 fn recovery_barrier_write_endpoints_document_recovery_required() {
     let doc = openapi_json();
     for (path, method) in [
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches", "post"),
         ("/graphs/{graph_id}/branches/{branch}", "delete"),
         ("/graphs/{graph_id}/branches/merge", "post"),
@@ -1947,14 +1853,12 @@ fn recovery_barrier_write_endpoints_document_recovery_required() {
 fn bounded_keyed_write_endpoints_document_resource_limit() {
     let doc = openapi_json();
     for (path, method) in [
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/mutate", "post"),
         ("/graphs/{graph_id}/mutate/if-graph-commit", "post"),
         ("/graphs/{graph_id}/queries/{name}", "post"),
         ("/graphs/{graph_id}/queries/{name}/if-graph-commit", "post"),
         ("/graphs/{graph_id}/load", "post"),
         ("/graphs/{graph_id}/load/ndjson", "post"),
-        ("/graphs/{graph_id}/ingest", "post"),
         ("/graphs/{graph_id}/branches/merge", "post"),
     ] {
         let response = &doc["paths"][path][method]["responses"]["413"];
@@ -1978,10 +1882,9 @@ fn bounded_keyed_write_endpoints_document_resource_limit() {
 fn post_endpoints_have_request_body() {
     let doc = openapi_json();
     let post_paths = [
-        ("/graphs/{graph_id}/read", "ReadRequest"),
-        ("/graphs/{graph_id}/change", "ChangeRequest"),
-        ("/graphs/{graph_id}/schema/apply", "SchemaApplyRequest"),
-        ("/graphs/{graph_id}/ingest", "IngestRequest"),
+        ("/graphs/{graph_id}/query", "QueryRequest"),
+        ("/graphs/{graph_id}/mutate", "ChangeRequest"),
+        ("/graphs/{graph_id}/load", "IngestRequest"),
         ("/graphs/{graph_id}/export", "ExportRequest"),
         ("/graphs/{graph_id}/branches", "BranchCreateRequest"),
         ("/graphs/{graph_id}/branches/merge", "BranchMergeRequest"),
@@ -2051,6 +1954,7 @@ fn openapi_spec_round_trips_through_json() {
 async fn open_mode_spec_has_no_security_schemes() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2067,6 +1971,7 @@ async fn open_mode_spec_has_no_security_schemes() {
 async fn open_mode_spec_has_no_operation_security() {
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2088,6 +1993,7 @@ async fn open_mode_spec_has_no_operation_security() {
 async fn auth_mode_spec_includes_bearer_token_security_scheme() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2102,6 +2008,7 @@ async fn auth_mode_spec_includes_bearer_token_security_scheme() {
 async fn auth_mode_spec_has_security_on_protected_operations() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2110,10 +2017,8 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
     // RFC-011 cluster-only: the served spec always nests protected
     // routes under `/graphs/{graph_id}/...`.
     let protected_paths = [
-        ("/graphs/{graph_id}/read", "post"),
         ("/graphs/{graph_id}/blob", "get"),
         ("/graphs/{graph_id}/blob", "head"),
-        ("/graphs/{graph_id}/change", "post"),
         ("/graphs/{graph_id}/snapshot", "get"),
         ("/graphs/{graph_id}/branches", "get"),
         ("/graphs/{graph_id}/commits", "get"),
@@ -2137,6 +2042,7 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
 async fn auth_mode_healthz_still_has_no_security() {
     let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2194,16 +2100,12 @@ fn openapi_spec_is_up_to_date() {
 const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/snapshot",
     "/graphs/{graph_id}/blob",
-    "/graphs/{graph_id}/read",
     "/graphs/{graph_id}/export",
-    "/graphs/{graph_id}/change",
     "/graphs/{graph_id}/mutate/if-graph-commit",
     "/graphs/{graph_id}/schema",
     "/graphs/{graph_id}/queries/{name}/if-graph-commit",
-    "/graphs/{graph_id}/schema/apply",
     "/graphs/{graph_id}/load",
     "/graphs/{graph_id}/load/ndjson",
-    "/graphs/{graph_id}/ingest",
     "/graphs/{graph_id}/branches",
     "/graphs/{graph_id}/branches/{branch}",
     "/graphs/{graph_id}/branches/merge",
@@ -2245,6 +2147,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
 async fn multi_mode_openapi_lists_cluster_paths() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2266,6 +2169,7 @@ async fn multi_mode_openapi_lists_cluster_paths() {
 async fn multi_mode_openapi_drops_flat_protected_paths() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2276,14 +2180,10 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
     let flat_protected = [
         "/snapshot",
         "/blob",
-        "/read",
         "/export",
-        "/change",
         "/schema",
-        "/schema/apply",
         "/load",
         "/load/ndjson",
-        "/ingest",
         "/branches",
         "/branches/{branch}",
         "/branches/merge",
@@ -2303,6 +2203,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
 async fn multi_mode_openapi_keeps_management_paths_flat() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2313,6 +2214,9 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/plan",
+        "/cluster/deployments",
+        "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
     ] {
         assert!(
@@ -2331,6 +2235,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
 async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2348,6 +2253,9 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
                 | "/readyz"
                 | "/graphs"
                 | "/graphs/discovery"
+                | "/cluster/plan"
+                | "/cluster/deployments"
+                | "/cluster/deployments/{id}"
                 | "/.well-known/oauth-protected-resource"
         ) {
             continue;
@@ -2375,6 +2283,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
 async fn multi_mode_openapi_declares_graph_id_path_parameter() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2416,6 +2325,9 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/healthz",
         "/graphs",
         "/graphs/discovery",
+        "/cluster/plan",
+        "/cluster/deployments",
+        "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
     ] {
         let item = paths.get(flat).unwrap();
@@ -2446,6 +2358,7 @@ async fn multi_mode_operation_ids_are_unique() {
     // spec is unique.
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2473,6 +2386,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     // nested cluster surface and never the flat protected routes.
     let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
@@ -2491,20 +2405,16 @@ async fn served_spec_always_nests_under_cluster_prefix() {
     let flat_protected = [
         "/snapshot",
         "/blob",
-        "/read",
         "/query",
         "/export",
-        "/change",
         "/mutate",
         "/mutate/if-graph-commit",
         "/queries",
         "/queries/{name}",
         "/queries/{name}/if-graph-commit",
         "/schema",
-        "/schema/apply",
         "/load",
         "/load/ndjson",
-        "/ingest",
         "/branches",
         "/branches/{branch}",
         "/branches/merge",
@@ -2517,4 +2427,102 @@ async fn served_spec_always_nests_under_cluster_prefix() {
             "served spec must NOT emit flat protected path: {flat}"
         );
     }
+}
+
+#[test]
+fn openapi_describes_api_contract_admission_and_response_identity() {
+    let doc = openapi_json();
+    assert!(
+        doc["components"]["schemas"]["ErrorCode"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|code| code == "api_contract_mismatch")
+    );
+    for (path, item) in doc["paths"].as_object().unwrap() {
+        for (method, operation) in item.as_object().unwrap() {
+            if ![
+                "get", "post", "put", "delete", "options", "head", "patch", "trace",
+            ]
+            .contains(&method.as_str())
+            {
+                continue;
+            }
+            let parameters = operation["parameters"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let contract_parameters: Vec<_> = parameters
+                .iter()
+                .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
+                .collect();
+            let oauth = path == "/.well-known/oauth-protected-resource";
+            let protected =
+                path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
+            if protected {
+                assert_eq!(contract_parameters.len(), 1, "{method} {path}");
+                let parameter = contract_parameters[0];
+                assert_eq!(parameter["in"], "header");
+                assert_eq!(parameter["required"], true);
+                assert_eq!(
+                    parameter["schema"]["enum"],
+                    serde_json::json!([HTTP_API_CONTRACT])
+                );
+                assert!(
+                    operation["responses"]["400"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("api_contract_mismatch"),
+                    "{method} {path}"
+                );
+                if method == "head" {
+                    assert!(operation["responses"]["400"]["content"].is_null());
+                } else {
+                    // The admission envelope is {error, code}, also valid under
+                    // the change feed's narrower graph-vocabulary projection.
+                    let error_schema = if path.contains("/changes") {
+                        "#/components/schemas/ChangeErrorOutput"
+                    } else {
+                        "#/components/schemas/ErrorOutput"
+                    };
+                    assert_eq!(
+                        operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+                        error_schema,
+                        "{method} {path}"
+                    );
+                }
+            } else {
+                assert!(contract_parameters.is_empty(), "{method} {path}");
+            }
+            for (status, response) in operation["responses"].as_object().unwrap() {
+                if method == "head" {
+                    assert!(
+                        response.get("content").is_none(),
+                        "HEAD {path} {status} must not promise a response body"
+                    );
+                }
+                let contract = &response["headers"][HTTP_API_CONTRACT_HEADER];
+                if oauth {
+                    assert!(contract.is_null(), "{method} {path} {status}");
+                } else {
+                    assert_eq!(
+                        contract["schema"]["enum"],
+                        serde_json::json!([HTTP_API_CONTRACT]),
+                        "{method} {path} {status}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        doc["paths"]["/healthz"]["get"]["responses"]["200"]["headers"]["Cache-Control"]["schema"]["enum"],
+        serde_json::json!(["no-store"])
+    );
+    let head = &doc["paths"]["/healthz"]["head"];
+    assert_eq!(head["operationId"], "health_head");
+    assert!(head["responses"]["200"]["content"].is_null());
+    assert_eq!(
+        head["responses"]["200"]["headers"],
+        doc["paths"]["/healthz"]["get"]["responses"]["200"]["headers"]
+    );
 }

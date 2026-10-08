@@ -8,15 +8,21 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
             IROp::Expand {
                 src_var: "a".to_string(),
                 dst_var: "b".to_string(),
-                edge_type: "knows".to_string(),
-                direction: Direction::Out,
+                edges: EdgeSelection::Named(EdgeMember {
+                    edge_type: "knows".to_string(),
+                    direction: Direction::Out,
+                }),
+                src_type: "T".to_string(),
                 dst_type: "T".to_string(),
                 min_hops: 1,
                 max_hops: Some(1),
                 dst_filters: vec![IRExpr::comparison(
                     prop("b", "state"),
                     CompOp::Eq,
-                    IRExpr::Literal(Literal::String("open".into())),
+                    IRExpr::Literal(
+                        Literal::String("open".into()),
+                        value_type(ScalarType::String, false),
+                    ),
                 )],
                 edge_binding: None,
             },
@@ -137,14 +143,14 @@ fn physical_expand_carries_its_pinned_edge_version() {
     assert!(physical.live().any(|(_, node)| matches!(
         node,
         PhysicalNode::Expand {
-            version: Some(5),
+            versions,
             ..
-        }
+        } if versions.get("knows") == Some(&Some(5))
     )));
     let json = physical.to_json();
     let expand = &json["inputs"][0]["inputs"][0]["inputs"][0];
     assert_eq!(expand["node"], "Expand");
-    assert_eq!(expand["version"], 5);
+    assert_eq!(expand["versions"]["knows"], 5);
     let bound = omnigraph_planner::BoundPlan {
         plan: physical,
         values: omnigraph_planner::ValueTable {
@@ -164,10 +170,16 @@ fn physical_expand_carries_its_pinned_edge_version() {
 #[test]
 fn physical_anti_join_predicate_reads_back_equal() {
     let predicate = omnigraph_compiler::ir::SubqueryPredicate {
-        func: AggFunc::Max,
-        arg: Some(prop("x", "rank")),
+        left: omnigraph_compiler::ir::BlockAggregateExpr::Aggregate {
+            func: AggFunc::Max,
+            arg: Box::new(prop("x", "rank")),
+            signature: omnigraph_compiler::AggSignature {
+                arg: value_type(ScalarType::String, true),
+                result: value_type(ScalarType::String, true),
+            },
+        },
         op: CompOp::Gt,
-        right: IRExpr::Param("since".to_string()),
+        right: IRExpr::Param("since".to_string(), value_type(ScalarType::String, false)),
     };
     let op = ir(
         vec![
@@ -194,7 +206,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
         plan: physical,
         values: omnigraph_planner::ValueTable {
             params: Arc::new(
-                [("since".to_string(), Literal::Integer(3))]
+                [("since".to_string(), Literal::String("3".into()))]
                     .into_iter()
                     .collect(),
             ),
@@ -225,16 +237,17 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         name: "q".to_string(),
         params: vec![],
         pipeline: vec![scan("c")],
-        return_exprs: vec![IRProjection {
-            expr: prop("c", "slug"),
-            alias: None,
-        }],
+        return_exprs: vec![projection(prop("c", "slug"), &[scan("c")])],
         order_by: vec![
             IROrdering {
                 expr: IRExpr::Nearest {
                     variable: "c".to_string(),
                     property: "embedding".to_string(),
-                    query: Box::new(IRExpr::Param("q".to_string())),
+                    query: Box::new(IRExpr::Param(
+                        "q".to_string(),
+                        value_type(ScalarType::String, false),
+                    )),
+                    ty: value_type(ScalarType::F32, false),
                 },
                 descending: false,
             },
@@ -288,6 +301,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
             "kind": "nearest",
             "property": "embedding",
             "query": "$q",
+            "typed_query": {"op":"param", "gq":"$q", "type":"String", "args":[]},
+            "typed_score": {"op":"property", "gq":"$c._distance", "type":"F32", "args":[]},
             "fetch": 10,
             "nprobes": null,
             "scope": "order",
@@ -307,7 +322,11 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
 fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     let bm25 = IRExpr::Bm25 {
         field: Box::new(prop("c", "text")),
-        query: Box::new(IRExpr::Param("t".to_string())),
+        query: Box::new(IRExpr::Param(
+            "t".to_string(),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     let (plan, _) = physical(
         &ir(vec![scan("c")], vec![prop("c", "slug")], vec![bm25.clone()]),
@@ -329,10 +348,15 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
         primary: Box::new(IRExpr::Nearest {
             variable: "c".to_string(),
             property: "embedding".to_string(),
-            query: Box::new(IRExpr::Param("q".to_string())),
+            query: Box::new(IRExpr::Param(
+                "q".to_string(),
+                value_type(ScalarType::String, false),
+            )),
+            ty: value_type(ScalarType::F32, false),
         }),
         secondary: Box::new(bm25),
         k: None,
+        ty: value_type(ScalarType::F64, false),
     };
     let contains = IRExpr::comparison(prop("c", "text"), CompOp::StringContains, prop("n", "slug"));
     let residual = IRExpr::comparison(prop("n", "slug"), CompOp::Ne, prop("c", "slug"));

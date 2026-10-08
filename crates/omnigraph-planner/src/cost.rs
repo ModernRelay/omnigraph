@@ -35,8 +35,8 @@ impl ExpandMode {
 }
 
 /// What an `Expand` may do at run time beside the mode the plan recorded:
-/// nothing when the session pinned the mode or the source held no edge
-/// statistics, or re-decide with the recorded cost inputs (before the first
+/// nothing when budget admission or the session pinned the mode, or the source
+/// held no edge statistics, or re-decide with the recorded cost inputs (before the first
 /// hop against the probed index coverage, the observed frontier and a warm
 /// CSR; between input batches and at every later hop with
 /// `should_switch_to_csr`).
@@ -45,6 +45,8 @@ impl ExpandMode {
 pub enum ExpandPolicy {
     /// The session's traversal pin chose the mode; the run takes no other.
     Pinned,
+    /// A query-wide work budget admits only indexed scans; no CSR fallback.
+    Budgeted,
     /// No edge statistics: the mode is `Csr` and the run takes no other.
     Uncosted,
     /// The cost model chose the mode from `inputs`; the run may take the
@@ -56,7 +58,7 @@ impl ExpandPolicy {
     /// The modes the run may switch to from `mode`.
     pub fn alternatives(&self, mode: ExpandMode) -> Vec<ExpandMode> {
         match self {
-            Self::Pinned | Self::Uncosted => Vec::new(),
+            Self::Pinned | Self::Uncosted | Self::Budgeted => Vec::new(),
             Self::Costed { .. } => vec![match mode {
                 ExpandMode::IndexedScan => ExpandMode::Csr,
                 ExpandMode::Csr => ExpandMode::IndexedScan,
@@ -68,7 +70,7 @@ impl ExpandPolicy {
     pub fn cost(&self) -> Option<&ExpandCostInputs> {
         match self {
             Self::Costed { inputs } => Some(inputs),
-            Self::Pinned | Self::Uncosted => None,
+            Self::Pinned | Self::Uncosted | Self::Budgeted => None,
         }
     }
 }
@@ -141,7 +143,7 @@ pub struct ExpandCostInputs {
     pub edge_count: u64,
     /// |V_src|, the node count of the keyed endpoint type.
     pub src_node_count: u64,
-    /// Effective max hop count for this Expand (`cost_effective_hops`).
+    /// Effective max hop count for this Expand (`executed_hops`).
     pub effective_max_hops: u32,
     /// Hard ceiling above which the indexed path is never used (resolved
     /// `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`).
@@ -245,22 +247,12 @@ pub fn should_switch_to_csr(
     remaining_cost > csr_cost
 }
 
-/// Hops the indexed path will actually run. A cross-type edge cannot chain, so
-/// the engine caps it at one hop regardless of the requested range; the cost
-/// model must use that, or it over-estimates the indexed cost of a cross-type
-/// variable-length expand and skews toward CSR.
-pub fn cost_effective_hops(requested_max_hops: u32, same_type: bool) -> u32 {
-    if same_type {
-        requested_max_hops
-    } else {
-        requested_max_hops.min(1)
-    }
-}
-
 /// The hops an `Expand` runs for the cost model: its `max_hops`, or its
-/// `min_hops` (at least one) when unbounded, through `cost_effective_hops`.
-pub fn executed_hops(min_hops: u32, max_hops: Option<u32>, same_type: bool) -> u32 {
-    cost_effective_hops(max_hops.unwrap_or(min_hops.max(1)), same_type)
+/// `min_hops` (at least one) when unbounded. A cross-type expand never asks
+/// for more than one: the type checker and the engine's plan validation both
+/// refuse it.
+pub fn executed_hops(min_hops: u32, max_hops: Option<u32>) -> u32 {
+    max_hops.unwrap_or(min_hops.max(1))
 }
 
 /// Per-hop probe multiplier for the indexed path: one scan for a directed
@@ -324,20 +316,34 @@ fn bounded_property<'a>(
     source: &dyn PlanSource,
 ) -> Option<(&'a str, u64)> {
     let (left, op, right) = filter.comparison_parts()?;
-    let constant = |expr: &IRExpr| matches!(expr, IRExpr::Literal(_) | IRExpr::Param(_));
+    fn constant(expr: &IRExpr) -> bool {
+        match expr {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            IRExpr::Cast { expr, .. } => constant(expr),
+            _ => false,
+        }
+    }
+    fn list_len(expr: &IRExpr, source: &dyn PlanSource) -> Option<usize> {
+        match expr {
+            IRExpr::Literal(Literal::List(items), _) => Some(items.len()),
+            IRExpr::Param(name, _) => source.list_parameter_len(name),
+            IRExpr::Cast { expr, .. } => list_len(expr, source),
+            _ => None,
+        }
+    }
     let of_binding = |expr: &'a IRExpr| match expr {
-        IRExpr::PropAccess { variable, property } if variable == binding => Some(property.as_str()),
+        IRExpr::PropAccess {
+            variable,
+            property,
+            ty: _,
+        } if variable == binding => Some(property.as_str()),
         _ => None,
     };
     match op {
         CompOp::Eq if constant(right) => Some((of_binding(left)?, 1)),
         CompOp::Eq if constant(left) => Some((of_binding(right)?, 1)),
         CompOp::Contains => {
-            let members = match left {
-                IRExpr::Literal(Literal::List(items)) => items.len(),
-                IRExpr::Param(name) => source.list_parameter_len(name)?,
-                _ => return None,
-            };
+            let members = list_len(left, source)?;
             Some((of_binding(right)?, members.max(1) as u64))
         }
         _ => None,
@@ -361,22 +367,26 @@ pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSourc
         LogicalNode::MetadataCount { .. } => Some(1),
         LogicalNode::Expand {
             input,
-            edge_type,
-            direction,
+            edges,
             min_hops,
             max_hops,
             ..
         } => {
             let input_rows = estimate_rows(plan, *input, source)?;
-            let stats = source.expand_statistics(edge_type, *direction)?;
+            let member = edges.named()?;
+            let stats = source.expand_statistics(&member.edge_type, member.direction)?;
             let fanout = stats
                 .edge_count
                 .div_ceil(stats.src_node_count.max(1))
                 .max(1);
-            let hops = executed_hops(*min_hops, *max_hops, stats.same_type);
+            let hops = executed_hops(*min_hops, *max_hops);
             let mut rows = input_rows;
             for _ in 0..hops.max(1) {
-                rows = rows.saturating_mul(fanout).min(stats.dst_node_count);
+                let next = rows.saturating_mul(fanout).min(stats.dst_node_count);
+                if next == rows {
+                    break;
+                }
+                rows = next;
             }
             Some(rows)
         }
@@ -542,7 +552,11 @@ mod tests {
             [ExpandMode::IndexedScan]
         );
         assert!(costed.cost().is_some());
-        for policy in [ExpandPolicy::Pinned, ExpandPolicy::Uncosted] {
+        for policy in [
+            ExpandPolicy::Pinned,
+            ExpandPolicy::Uncosted,
+            ExpandPolicy::Budgeted,
+        ] {
             assert!(policy.alternatives(ExpandMode::Csr).is_empty());
             assert!(policy.cost().is_none());
         }
@@ -588,5 +602,50 @@ mod tests {
         let i = inputs(1, 10_000_000, 1_000_000, 4, IndexCoverage::Indexed);
         assert!(!should_switch_to_csr(40, 20, 2, false, &i));
         assert!(should_switch_to_csr(40, 20, 2, true, &i));
+    }
+}
+
+#[cfg(test)]
+mod cast_bound_tests {
+    use super::*;
+    use crate::MemorySource;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    fn ty(scalar: ScalarType) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(scalar, false))
+    }
+
+    #[test]
+    fn constant_casts_keep_bounds_but_cast_columns_do_not_claim_direct_lookup() {
+        let source = MemorySource::default();
+        let property = IRExpr::PropAccess {
+            variable: "p".into(),
+            property: "age".into(),
+            ty: ty(ScalarType::I64),
+        };
+        let constant = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(Literal::Float(1.0), ty(ScalarType::F64))),
+            ty: ty(ScalarType::I64),
+        };
+        let filter = IRExpr::comparison(property.clone(), CompOp::Eq, constant);
+        assert_eq!(bounded_property(&filter, "p", &source), Some(("age", 1)));
+        let filter = IRExpr::comparison(
+            IRExpr::Cast {
+                expr: Box::new(property.clone()),
+                ty: ty(ScalarType::F64),
+            },
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Float(1.5), ty(ScalarType::F64)),
+        );
+        assert_eq!(bounded_property(&filter, "p", &source), None);
+        let items = IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::List(vec![Literal::Float(1.0), Literal::Float(2.0)]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+            )),
+            ty: ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+        };
+        let filter = IRExpr::comparison(items, CompOp::Contains, property);
+        assert_eq!(bounded_property(&filter, "p", &source), Some(("age", 2)));
     }
 }

@@ -11,7 +11,8 @@ use omnigraph_compiler::SYSTEM_COLUMNS_V3;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
+use omnigraph_compiler::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 use omnigraph_planner::optimizer::resolve;
 use omnigraph_planner::{
     AccessPath, AdjacencyProof, Bounds, ExpandMode, ExpandPolicy, ExpandStatistics, FragmentStat,
@@ -65,6 +66,22 @@ fn node_type(type_name: &str, row_count: Option<u64>) -> NodeTypeSpec {
         schema: schema(),
         key: vec!["slug".to_string()],
         object_columns,
+        object_fields: schema()
+            .fields()
+            .iter()
+            .filter(|field| field.name() != "embedding")
+            .map(|field| {
+                Field::new(
+                    if field.name() == SYSTEM_COLUMNS_V3.id {
+                        "@id"
+                    } else {
+                        field.name()
+                    },
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect(),
         row_count,
     }
 }
@@ -81,10 +98,75 @@ fn scan_of(variable: &str, type_name: &str) -> IROp {
     }
 }
 
+fn property_type(property: &str) -> ExprType {
+    let (scalar, nullable) = match property {
+        "__id" | "__src" | "__dst" | "~edge_type" => (ScalarType::String, false),
+        "_score" | "_distance" => (ScalarType::F32, false),
+        "embedding" => (ScalarType::Vector(4), true),
+        name if PROPERTIES.contains(&name) => (ScalarType::String, true),
+        name => panic!("untyped fixture property {name}"),
+    };
+    ExprType::from_prop(&PropType::scalar(scalar, nullable))
+}
+
+fn value_type(scalar: ScalarType, nullable: bool) -> ExprType {
+    ExprType::from_prop(&PropType::scalar(scalar, nullable))
+}
+
 fn prop(variable: &str, property: &str) -> IRExpr {
     IRExpr::PropAccess {
         variable: variable.to_string(),
         property: property.to_string(),
+        ty: property_type(property),
+    }
+}
+
+fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
+    let ty = match &expr {
+        IRExpr::Aggregate { signature, .. } => signature.result.clone(),
+        IRExpr::Literal(Literal::String(_), _) => {
+            ExprType::from_prop(&PropType::scalar(ScalarType::String, false))
+        }
+        IRExpr::Variable(variable, _) => {
+            let name = pipeline
+                .iter()
+                .find_map(|op| match op {
+                    IROp::NodeScan {
+                        variable: bound,
+                        type_name,
+                        ..
+                    } if bound == variable => Some(type_name),
+                    IROp::Expand {
+                        dst_var, dst_type, ..
+                    } if dst_var == variable => Some(dst_type),
+                    _ => None,
+                })
+                .expect("fixture return variable is bound");
+            ExprType::Node {
+                type_name: name.clone(),
+            }
+        }
+        IRExpr::PropAccess { property, .. } => property_type(property),
+        other => panic!("untyped fixture return {other:?}"),
+    };
+    fn name(expr: &IRExpr) -> String {
+        match expr {
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } => format!("{variable}.{property}"),
+            IRExpr::Variable(variable, _) => variable.clone(),
+            IRExpr::Literal(Literal::String(_), _) => "literal".into(),
+            IRExpr::Aggregate { arg, .. } => name(arg),
+            other => panic!("unnamed fixture return {other:?}"),
+        }
+    }
+    IRProjection {
+        column: name(&expr),
+        expr,
+        alias: None,
+        ty,
     }
 }
 
@@ -92,11 +174,11 @@ fn ir(pipeline: Vec<IROp>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Opera
     Operation::Query(Box::new(QueryIR {
         name: "q".to_string(),
         params: vec![],
-        pipeline,
         return_exprs: returns
             .into_iter()
-            .map(|expr| IRProjection { expr, alias: None })
+            .map(|expr| projection(expr, &pipeline))
             .collect(),
+        pipeline,
         order_by: order_by
             .into_iter()
             .map(|expr| IROrdering {
@@ -146,8 +228,11 @@ fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
     IROp::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),
-        edge_type: "knows".to_string(),
-        direction: Direction::Out,
+        edges: EdgeSelection::Named(EdgeMember {
+            edge_type: "knows".to_string(),
+            direction: Direction::Out,
+        }),
+        src_type: "T".to_string(),
         dst_type: "T".to_string(),
         min_hops: 1,
         max_hops: Some(1),
@@ -178,7 +263,6 @@ fn knows_statistics(rows: u64) -> ExpandStatistics {
         edge_count: rows * 10,
         src_node_count: rows,
         dst_node_count: rows,
-        same_type: true,
         max_frontier_cap: 1024,
         max_hops_cap: 6,
     }
@@ -253,3 +337,6 @@ mod cost;
 mod explain;
 #[path = "query_plan/logical.rs"]
 mod logical;
+
+#[path = "query_plan/edge_selections.rs"]
+mod edge_selections;

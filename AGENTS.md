@@ -29,7 +29,7 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.11.0
+- Version surveyed: 0.13.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
 - Workspace: compiler, planner (logical/physical plans and optimizer), storage,
@@ -104,8 +104,8 @@ working memory:
    fresh rather than mixing old and new authority.
 3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
 4. Pre-publication durable effects stay unreachable (detached commits, staged
-   files); what is published carries the identity that finishes it (pins,
-   the staged contract's publishing commit); ambiguity fails closed.
+   files). Table pins and the accepted schema contract are complete in one
+   manifest publication; ambiguity fails closed.
 5. Stable schema identity survives supported renames, not drop/re-add. Never
    infer identity from names, paths, versions, field IDs, or branch refs.
 6. Indexes, caches, topology, fragment layout, and compaction are derived
@@ -142,6 +142,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -W clippy::dbg_macro
 
+# Activate the documentation environment first; see docs/dev/documentation.md.
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
@@ -185,8 +186,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
   assertions; when the reported symptom additionally needs scale to
-  manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
-  guards it, and the two cross-reference each other in comments.
+  manifest, a second test guards it, a `.gqt` case under
+  `crates/omnigraph-gqt/cases_slow/` when the format can express the symptom
+  and an `#[ignore]`d test in a `tests/repro_issue_*.rs` target otherwise,
+  and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
   (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
   expensive regression repros use `heavy-repro:` and thereby enroll in the
@@ -202,8 +205,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
-- Add release notes for user-visible release changes; keep private tickets and
-  planning shorthand out of public history.
+- Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
+  follow [release-note authoring](docs/dev/documentation.md#release-notes).
+  Keep private tickets and planning shorthand out of public history.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

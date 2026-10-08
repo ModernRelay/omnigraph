@@ -1,19 +1,20 @@
 //! Bearer auth, actor resolution, Cedar policy decisions, admission.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::env;
 use std::fs;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    ReadRequest, SchemaApplyRequest,
+    QueryRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -34,16 +35,51 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         vec![("breakglass".into(), "static-token".into())],
     )
     .await
-    .unwrap()
-    .with_data_token_trust(tokens.trust.clone())
-    .with_boot_witness(
-        omnigraph_server::BootWitness {
-            applied_graphs: vec!["default".into(), "unavailable".into()],
-            ..Default::default()
+    .unwrap();
+    let mut entries = state.routing().registry.entries();
+    entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+        omnigraph_server::registry::BlockedGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("unavailable").unwrap(),
+            ),
+            uri: temp
+                .path()
+                .join("unavailable")
+                .to_string_lossy()
+                .into_owned(),
+            policy: None,
+            failure: omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
         },
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        std::time::Duration::from_secs(30),
+    )));
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![("breakglass".into(), "static-token".into())],
+        None,
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    // An unknown refused configuration cannot reveal its availability through
+    // open-mode read defaults, and does not disable healthy public graphs.
+    let open = build_app(
+        AppState::new_multi_entries(
+            state.routing().registry.entries(),
+            vec![],
+            None,
+            omnigraph_server::workload::WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap(),
     );
+    for (path, expected) in [
+        ("/graphs/default/snapshot", StatusCode::OK),
+        ("/graphs/unavailable/snapshot", StatusCode::NOT_FOUND),
+        ("/graphs", StatusCode::FORBIDDEN),
+    ] {
+        let (status, _) = json_response(&open, get_request(path, "")).await;
+        assert_eq!(status, expected);
+    }
     let app = build_app(state);
     let (status, catalog) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
     assert_eq!(status, StatusCode::OK);
@@ -54,12 +90,14 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             {"graph_id":"unavailable","display_name":"unavailable"}
         ]})
     );
-    for token in [&restricted, "static-token"] {
+    for (token, expected) in [
+        (&restricted[..], StatusCode::UNAUTHORIZED),
+        ("static-token", StatusCode::FORBIDDEN),
+    ] {
         let (status, _) = json_response(&app, get_request("/graphs/discovery", token)).await;
         assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "legacy credentials cannot escape their catalog contract"
+            status, expected,
+            "retired signed credentials are rejected; static credentials cannot discover"
         );
     }
     for path in [
@@ -107,38 +145,23 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         let (status, _) =
             json_response(&app, get_request("/graphs/default/schema", &identity)).await;
         assert_eq!(status, expected, "the same token follows activated policy");
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(g("/schema/apply"))
-            .header("authorization", format!("Bearer {identity}"))
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&SchemaApplyRequest {
-                    schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
-                    ..Default::default()
-                })
-                .unwrap(),
-            ))
-            .unwrap();
-        let (status, _) = json_response(&app, request).await;
-        assert_eq!(
-            status, expected,
-            "identity credentials neither grant nor ban schema apply"
-        );
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
+async fn signed_identities_obey_current_policy_and_attribute_writes() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
-    fs::write(
-        &policy_path,
-        permit_all_policy_yaml(&[&tokens.actor, "breakglass"]),
-    )
-    .unwrap();
+    let writer = "01M00000000000000000000005";
+    let creator = "01M00000000000000000000006";
+    let loader = "01M00000000000000000000007";
+    let policy = format!(
+        "version: 1\ngroups:\n  readers: [{}, principal:{writer}, principal:{creator}, principal:{loader}, breakglass]\n  writers: [principal:{writer}, principal:{loader}, breakglass]\n  creators: [principal:{creator}, principal:{loader}, breakglass]\nrules:\n  - id: read\n    allow: {{actors: {{group: readers}}, actions: [read], branch_scope: any}}\n  - id: write\n    allow: {{actors: {{group: writers}}, actions: [change], branch_scope: any}}\n  - id: create\n    allow: {{actors: {{group: creators}}, actions: [branch_create], target_branch_scope: any}}\n",
+        tokens.actor,
+    );
+    fs::write(&policy_path, policy).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
         vec![("breakglass".into(), "explicit.static.credential".into())],
@@ -148,11 +171,8 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = build_app(state);
-    let read = tokens.token(json!([
-        {"graph_id":"default","actions":["read"]},
-        {"graph_id":"reports","actions":["change"]}
-    ]));
-    let wider = tokens.token(json!([{"graph_id":"default","actions":["change"]}]));
+    let read = tokens.identity_token();
+    let wider = tokens.identity_token_for(writer);
     let unrelated_authentication = tokens
         .trust
         .verify_authenticated_at(
@@ -165,6 +185,7 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         .unwrap();
     let request = || {
         Request::builder().uri(g("/mutate")).method(Method::POST)
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .header("authorization",format!("Bearer {read}"))
         .header("x-actor-id","breakglass")
         .extension(omnigraph_server::ResolvedActor {
@@ -184,7 +205,7 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "neither another graph's grant nor a forged public actor may widen signed authority"
+        "neither another authenticated extension nor a forged public actor may bypass current policy"
     );
     let (_, after) = json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(after, before, "denial must not publish a commit");
@@ -195,8 +216,8 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "no graph existence probe outside the token grant"
+        StatusCode::NOT_FOUND,
+        "an authenticated unknown graph is still absent"
     );
     let (status, _) = json_response(
         &app,
@@ -208,23 +229,22 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         StatusCode::OK,
         "explicit static dot credentials still work"
     );
-    let write = tokens.token(json!([{"graph_id":"default","actions":["read","change"]}]));
+    let write = tokens.identity_token_for(writer);
     let mut allowed = request();
     allowed
         .headers_mut()
         .insert("authorization", format!("Bearer {write}").parse().unwrap());
     let (status, body) = json_response(&app, allowed).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor_id"], tokens.actor);
+    assert_eq!(body["actor_id"], format!("principal:{writer}"));
     let (_, commits) = json_response(&app, get_request(&g("/commits?branch=main"), &write)).await;
-    assert_eq!(commits["commits"][0]["actor_id"], tokens.actor);
+    assert_eq!(
+        commits["commits"][0]["actor_id"],
+        format!("principal:{writer}")
+    );
     assert_ne!(commits, before);
     let (_, before_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
-    let other_graph_create = tokens.token(json!([
-        {"graph_id":"default","actions":["read"]},
-        {"graph_id":"reports","actions":["branch_create"]}
-    ]));
-    for token in [&read, &wider, &other_graph_create] {
+    for token in [&read, &wider] {
         let (status, body) = json_response(
             &app,
             statement_request("/mutate", token, "branch create signed_branch"),
@@ -233,7 +253,7 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         assert_forbidden(
             status,
             body,
-            "branch statements retain the selected graph's action ceiling",
+            "branch statements require current branch_create permission",
         );
     }
     let (_, after_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
@@ -242,14 +262,14 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         "denied branch statements have no effect"
     );
 
-    let create = tokens.token(json!([{"graph_id":"default","actions":["branch_create"]}]));
+    let create = tokens.identity_token_for(creator);
     let (status, body) = json_response(
         &app,
         statement_request("/mutate", &create, "branch create signed_branch"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["actor_id"], tokens.actor);
+    assert_eq!(body["actor_id"], format!("principal:{creator}"));
     let (status, body) = json_response(
         &app,
         statement_request("/mutate", &create, "branch delete signed_branch"),
@@ -271,22 +291,14 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
     let mut hidden = statement_request("/query", &read, "branch list");
     *hidden.uri_mut() = "/graphs/hidden/query".parse().unwrap();
     let (status, body) = json_response(&app, hidden).await;
-    assert_forbidden(
-        status,
-        body,
-        "branch list cannot probe a graph outside the signed grant",
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-    // Version-1 signed-grant compatibility on the existing load route. Failed
-    // fork+load admission must leave the branch registry and graph head alone.
+    // Current policy must grant both change and branch creation for fork+load.
+    // Failed admission leaves the branch registry and graph head alone.
     let (_, before_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
     let (_, before_load_commits) =
         json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
-    let split_load_grant = tokens.token(json!([
-        {"graph_id":"default","actions":["change"]},
-        {"graph_id":"reports","actions":["branch_create"]}
-    ]));
-    for token in [&read, &write, &create, &split_load_grant] {
+    for token in [&read, &write, &create] {
         let (status, body) = json_response(&app, signed_load_request(token, true)).await;
         assert_forbidden(
             status,
@@ -299,13 +311,12 @@ async fn signed_data_tokens_narrow_policy_and_attribute_writes() {
         json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
     assert_eq!(before_load_branches, after_load_branches);
     assert_eq!(before_load_commits, after_load_commits);
-    let load_token =
-        tokens.token(json!([{"graph_id":"default","actions":["read","change","branch_create"]}]));
+    let load_token = tokens.identity_token_for(loader);
     let (status, loaded) = json_response(&app, signed_load_request(&load_token, true)).await;
     assert_eq!(status, StatusCode::OK, "{loaded}");
     assert_eq!(loaded["branch_created"], true);
-    assert_eq!(loaded["actor_id"], tokens.actor);
-    assert_eq!(loaded["commit"]["actor_id"], tokens.actor);
+    assert_eq!(loaded["actor_id"], format!("principal:{loader}"));
+    assert_eq!(loaded["commit"]["actor_id"], format!("principal:{loader}"));
     let (_, branch_commits) =
         json_response(&app, get_request(&g("/commits?branch=load_review"), &read)).await;
     assert_eq!(loaded["commit"], branch_commits["commits"][0]);
@@ -328,6 +339,7 @@ fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
         "/load/ndjson?branch=load_review&mode=merge"
     };
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(path))
         .method(Method::POST)
         .header("authorization", format!("Bearer {token}"))
@@ -351,7 +363,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = build_app(state);
-    let token = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+    let token = tokens.identity_token();
     let (status, _) = json_response(&app, get_request(&g("/snapshot?branch=main"), &token)).await;
     assert_eq!(
         status,
@@ -386,8 +398,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         StatusCode::FORBIDDEN,
         "a valid token must not enroll its actor in Cedar"
     );
-    let load_token =
-        tokens.token(json!([{"graph_id":"default","actions":["change","branch_create"]}]));
+    let load_token = tokens.identity_token();
     let (_, before_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
     for denied_app in [&app, &unknown_actor_app] {
         let (status, body) =
@@ -403,6 +414,8 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         before_load, after_load,
         "Cedar denial cannot create the load branch"
     );
+    let retired =
+        tokens.token(json!([{"graph_id":"default","actions":["read","change","branch_create"]}]));
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap()
@@ -413,19 +426,15 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/blob"),
         (Method::HEAD, "/blob"),
         (Method::POST, "/export"),
-        (Method::POST, "/read"),
         (Method::POST, "/query"),
-        (Method::POST, "/change"),
         (Method::POST, "/mutate"),
         (Method::POST, "/mutate/if-graph-commit"),
         (Method::GET, "/queries"),
         (Method::POST, "/queries/find_person"),
         (Method::POST, "/queries/find_person/if-graph-commit"),
         (Method::GET, "/schema"),
-        (Method::POST, "/schema/apply"),
         (Method::POST, "/load"),
         (Method::POST, "/load/ndjson"),
-        (Method::POST, "/ingest"),
         (Method::GET, "/branches"),
         (Method::POST, "/branches"),
         (Method::DELETE, "/branches/feature"),
@@ -436,21 +445,25 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/changes"),
         (Method::POST, "/changes/baseline"),
     ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(g(path))
-                    .header("authorization", "Bearer invalid.jwt.signature")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        for rejected in ["invalid.jwt.signature", &retired] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .method(method.clone())
+                        .uri(g(path))
+                        .header("authorization", format!("Bearer {rejected}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
     for path in ["/graphs", "/graphs/default/snapshot"] {
+        // No contract header either: authentication must reject first.
         let response = app
             .clone()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -467,7 +480,7 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
+async fn signed_merge_requires_separate_policy_permission_to_delete_source() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -477,7 +490,14 @@ async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
         .unwrap();
     drop(db);
     let policy_path = temp.path().join("policy.yaml");
-    fs::write(&policy_path, permit_all_policy_yaml(&[&tokens.actor])).unwrap();
+    fs::write(
+        &policy_path,
+        permit_all_policy_yaml(&[&tokens.actor]).replace(
+            "schema_apply, branch_create, branch_delete, branch_merge",
+            "schema_apply, branch_create, branch_merge",
+        ),
+    )
+    .unwrap();
     let app = build_app(
         AppState::open_with_bearer_tokens_and_policy(
             graph.to_string_lossy().to_string(),
@@ -488,10 +508,11 @@ async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
         .unwrap()
         .with_data_token_trust(tokens.trust.clone()),
     );
-    let token = tokens.token(json!([{"graph_id":"default","actions":["read","branch_merge"]}]));
+    let token = tokens.identity_token();
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .method(Method::POST)
             .uri(g("/branches/merge"))
             .header("authorization", format!("Bearer {token}"))
@@ -505,12 +526,9 @@ async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["outcome"], "already_up_to_date");
     assert_eq!(body["branch_deleted"], false);
-    assert!(
-        body["branch_delete_error"]
-            .as_str()
-            .unwrap()
-            .contains("credential does not permit")
-    );
+    assert_eq!(body["commit"], Value::Null);
+    assert!(body.get("branch_delete_error").is_none());
+    assert_eq!(body["branch_delete_error_details"]["code"], "forbidden");
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     assert!(
         db.branch_list()
@@ -522,18 +540,21 @@ async fn signed_merge_cannot_smuggle_source_deletion_through_merge_grant() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn healthz_succeeds_after_startup() {
-    let (_temp, app) = app_for_loaded_graph().await;
-    let (status, body) = json_response(
-        &app,
-        Request::builder()
-            .uri("/healthz")
-            .method(Method::GET)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    // Discovery requires neither credentials nor an API contract header.
+    let response = app
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
@@ -544,6 +565,213 @@ async fn healthz_succeeds_after_startup() {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),
     }
+
+    for path in ["/healthz", "/readyz", "/openapi.json"] {
+        for method in [Method::GET, Method::HEAD] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+            assert_eq!(
+                response.headers()[HTTP_API_CONTRACT_HEADER],
+                HTTP_API_CONTRACT
+            );
+            if path == "/healthz" {
+                assert_eq!(response.headers()["cache-control"], "no-store");
+            }
+            if method == Method::HEAD {
+                assert!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
+    let response = app
+        .oneshot(
+            Request::head("/healthz")
+                .header(HTTP_API_CONTRACT_HEADER, "unsupported")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_contract_refuses_before_graph_resolution_body_or_mutation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let graph = graph_path(temp.path());
+    let before = manifest_dataset_version(&graph).await;
+    let payload = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": {"name": "contract-write", "age": 27}
+    })
+    .to_string();
+    let expected_message = format!(
+        "exactly one {HTTP_API_CONTRACT_HEADER} header with value {HTTP_API_CONTRACT} is required"
+    );
+    let cases = [
+        Vec::new(),
+        vec![HeaderValue::from_static("0.11")],
+        vec![HeaderValue::from_static("0.12")],
+        vec![HeaderValue::from_static("0.14")],
+        vec![HeaderValue::from_str(&format!("{HTTP_API_CONTRACT}, {HTTP_API_CONTRACT}")).unwrap()],
+        vec![
+            HeaderValue::from_static(HTTP_API_CONTRACT),
+            HeaderValue::from_static(HTTP_API_CONTRACT),
+        ],
+        vec![HeaderValue::from_static("")],
+        vec![HeaderValue::from_bytes(&[0xff]).unwrap()],
+    ];
+    for values in cases {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body_polls = polls.clone();
+        let body = payload.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            body_polls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(body))
+        }));
+        // Raw builder intentionally bypasses the valid-request helpers.
+        let mut request = Request::post(g("/mutate"))
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json");
+        for value in values {
+            request = request.header(HTTP_API_CONTRACT_HEADER, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT
+        );
+        let error: ErrorOutput =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            error.code,
+            Some(omnigraph_server::api::ErrorCode::ApiContractMismatch)
+        );
+        assert_eq!(error.error, expected_message);
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "refusal must not poll the body"
+        );
+        assert_eq!(manifest_dataset_version(&graph).await, before);
+    }
+
+    for path in ["/graphs/missing/schema", "/graphs", "/graphs/discovery"] {
+        let (status, body) = json_response(
+            &app,
+            Request::get(path)
+                .header("authorization", "Bearer demo-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(body["code"], "api_contract_mismatch", "{path}");
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::head(g("/blob"))
+                .header("authorization", "Bearer demo-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(g("/schema"))
+                .header("authorization", "Bearer invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "authentication runs first"
+    );
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(g("/mutate"))
+                .header("Omnigraph-Http-Api", "0.13")
+                .header("authorization", "Bearer demo-token")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+    assert!(manifest_dataset_version(&graph).await > before);
+
+    for request in [
+        Request::post(g("/mutate"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("authorization", "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from("{"))
+            .unwrap(),
+        Request::get("/no-such-route").body(Body::empty()).unwrap(),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert!(response.status().is_client_error());
+        assert_eq!(
+            response.headers()[HTTP_API_CONTRACT_HEADER],
+            HTTP_API_CONTRACT
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -552,6 +780,7 @@ async fn protected_routes_require_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .body(Body::empty())
@@ -575,6 +804,7 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri("/healthz")
                 .method(Method::GET)
                 .body(Body::empty())
@@ -587,6 +817,7 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
@@ -610,6 +841,7 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::GET)
             .header("authorization", "Bearer token-two")
@@ -660,6 +892,7 @@ rules:
     let (ok_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
@@ -674,6 +907,7 @@ rules:
     let (denied_status, denied_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
@@ -692,6 +926,7 @@ rules:
     let (bad_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer wrong-token")
@@ -747,6 +982,7 @@ rules:
     let (spoof_up_status, spoof_up_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
@@ -772,6 +1008,7 @@ rules:
     let (spoof_down_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
@@ -792,6 +1029,7 @@ rules:
     let (empty_spoof_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-b")
@@ -818,6 +1056,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
@@ -834,6 +1073,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -851,6 +1091,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (forbidden_status, forbidden_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/export"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -870,6 +1111,7 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/export"))
                 .method(Method::POST)
                 .header("authorization", "Bearer admin-token")
@@ -912,9 +1154,9 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
     .unwrap();
     let app = build_app(state);
 
-    let read = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Alice" })),
         branch: None,
         snapshot: Some(snapshot_id.clone()),
@@ -923,7 +1165,8 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/read"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/query"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -948,6 +1191,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&blob_uri)
                 .method(Method::GET)
                 .body(Body::empty())
@@ -961,6 +1205,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&blob_uri)
                 .method(Method::GET)
                 .header("authorization", "Bearer denied-token")
@@ -975,6 +1220,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(&blob_uri)
                 .method(Method::GET)
                 .header("authorization", "Bearer team-token")
@@ -1017,6 +1263,7 @@ async fn policy_authorizes_omitted_commit_list_branch_as_main() {
     let (explicit_status, explicit_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1029,6 +1276,7 @@ async fn policy_authorizes_omitted_commit_list_branch_as_main() {
     let (omitted_status, omitted_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/commits"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1083,6 +1331,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
     let (forbidden_status, forbidden_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/commits/{feature_commit}/changes")))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1095,6 +1344,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
     let (unknown_status, unknown_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/commits/{unknown_id}/changes")))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1148,7 +1398,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let (main_status, main_body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -1173,7 +1424,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let (feature_status, feature_body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -1226,6 +1478,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let (deny_status, deny_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1244,6 +1497,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let (allow_status, allow_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer admin-token")
@@ -1277,6 +1531,7 @@ rules:
 
 fn statement_request(path: &str, token: &str, source: &str) -> Request<Body> {
     Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .uri(g(path))
         .method(Method::POST)
         .header("authorization", format!("Bearer {token}"))
@@ -1316,6 +1571,7 @@ async fn branch_statements_take_their_routes_policy_decision() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("authorization", "Bearer reader-token")
@@ -1395,6 +1651,7 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
     let (status, body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/query"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1461,12 +1718,17 @@ async fn show_takes_the_scope_free_read_decision_as_branch_list_does() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_change_only_credential_cannot_show_settings() {
+async fn signed_identity_with_change_only_policy_cannot_show_settings() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
-    fs::write(&policy_path, permit_all_policy_yaml(&[&tokens.actor])).unwrap();
+    let reader = "01M00000000000000000000005";
+    let policy = format!(
+        "version: 1\ngroups:\n  readers: [principal:{reader}]\n  changers: [{}]\nrules:\n  - id: read\n    allow: {{actors: {{group: readers}}, actions: [read], branch_scope: any}}\n  - id: change\n    allow: {{actors: {{group: changers}}, actions: [change], branch_scope: any}}\n",
+        tokens.actor
+    );
+    fs::write(&policy_path, policy).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
         vec![("breakglass".into(), "explicit.static.credential".into())],
@@ -1476,8 +1738,8 @@ async fn signed_change_only_credential_cannot_show_settings() {
     .unwrap()
     .with_data_token_trust(tokens.trust.clone());
     let app = build_app(state);
-    let change_only = tokens.token(json!([{"graph_id":"default","actions":["change"]}]));
-    let read = tokens.token(json!([{"graph_id":"default","actions":["read"]}]));
+    let change_only = tokens.identity_token();
+    let read = tokens.identity_token_for(reader);
 
     for source in SHOW_SOURCES {
         let (status, body) =
@@ -1505,7 +1767,8 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -1519,6 +1782,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let (commits_status, commits_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-one")
@@ -1550,6 +1814,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (create_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
@@ -1570,7 +1835,8 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (change_status, _) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -1589,6 +1855,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer token-two")
@@ -1603,6 +1870,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let (commit_status, commit_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/commits?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-two")
@@ -1617,6 +1885,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-ragnor");
+    assert_eq!(&merge_body["commit"], head);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1634,10 +1903,19 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     .await;
     let graph = graph_path(temp.path());
 
-    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
+    db.mutate(
+        "feature",
+        r#"query add() { insert Person { name: "Zoe", age: 33 } }"#,
+        "add",
+        &Default::default(),
+    )
+    .await
+    .unwrap();
+    let source_head = db.list_commits(Some("feature")).await.unwrap().remove(0);
     drop(db);
 
     let merge = BranchMergeRequest {
@@ -1649,6 +1927,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     let (merge_status, merge_body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/branches/merge"))
             .method(Method::POST)
             .header("authorization", "Bearer token-admin")
@@ -1658,10 +1937,20 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     )
     .await;
     assert_eq!(merge_status, StatusCode::OK);
-    assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_eq!(merge_body["commit"]["actor_id"], "act-ragnor");
+    assert_eq!(
+        merge_body["commit"]["merged_parent_commit_id"],
+        source_head.graph_commit_id
+    );
     assert_eq!(merge_body["branch_deleted"], false);
+    assert!(merge_body.get("branch_delete_error").is_none());
+    assert_eq!(
+        merge_body["branch_delete_error_details"]["code"],
+        "forbidden"
+    );
     assert!(
-        merge_body["branch_delete_error"]
+        merge_body["branch_delete_error_details"]["error"]
             .as_str()
             .unwrap()
             .contains("policy denied action 'branch_delete'")
@@ -1670,6 +1959,12 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let branches = db.branch_list().await.unwrap();
     assert!(branches.iter().any(|branch| branch == "feature"));
+    let head = db.list_commits(Some("main")).await.unwrap().remove(0);
+    assert_eq!(
+        merge_body["commit"],
+        serde_json::to_value(omnigraph_server::api::commit_output(&head)).unwrap(),
+        "deletion denial must retain the already-published merge receipt"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1706,7 +2001,12 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     );
     let handle = match state.routing().registry.get(&key) {
         omnigraph_server::RegistryLookup::Ready(handle) => handle,
-        omnigraph_server::RegistryLookup::Gone => panic!("default graph must be registered"),
+        omnigraph_server::RegistryLookup::Gone
+        | omnigraph_server::RegistryLookup::Loading(_)
+        | omnigraph_server::RegistryLookup::Blocked(_)
+        | omnigraph_server::RegistryLookup::Transitioning(_) => {
+            panic!("default graph must be registered")
+        }
     };
     let engine = omnigraph::Session::from_defaults(
         Arc::clone(&handle.engine),
@@ -1748,7 +2048,8 @@ async fn oversized_request_body_returns_payload_too_large() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(g("/read"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/query"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(oversized))
@@ -1771,6 +2072,7 @@ async fn default_deny_mode_allows_read_for_authenticated_actor() {
     let (status, _body) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/snapshot"))
             .method(Method::GET)
             .header(AUTHORIZATION, "Bearer demo-token")
@@ -1799,43 +2101,12 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri(g("/change"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header(AUTHORIZATION, "Bearer demo-token")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    assert!(
-        error.error.contains("default-deny"),
-        "expected default-deny in error message, got: {}",
-        error.error
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
-    let (_temp, app) = app_for_graph_with_auth_tokens_only(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
-        &[("act-andrew", "demo-token")],
-    )
-    .await;
-
-    let req = SchemaApplyRequest {
-        schema_source: additive_schema_with_nickname(),
-        ..Default::default()
-    };
-    let (status, body) = json_response(
-        &app,
-        Request::builder()
-            .uri(g("/schema/apply"))
-            .method(Method::POST)
-            .header(AUTHORIZATION, "Bearer demo-token")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&req).unwrap()))
             .unwrap(),
     )
     .await;
@@ -1919,6 +2190,7 @@ async fn change_routes_enforce_bearer_and_policy() {
         (g("/changes/baseline"), Method::POST),
     ] {
         let request = Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(uri)
             .method(method)
             .header("content-type", "application/json")
@@ -1932,6 +2204,7 @@ async fn change_routes_enforce_bearer_and_policy() {
     let (status, feed) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/changes?start=beginning"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1953,6 +2226,7 @@ async fn change_routes_enforce_bearer_and_policy() {
     let (status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g(&format!("/commits/{commit_id}/changes")))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
@@ -1966,6 +2240,7 @@ async fn change_routes_enforce_bearer_and_policy() {
     let (status, forbidden) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/changes/baseline"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
@@ -1985,6 +2260,7 @@ async fn change_routes_enforce_bearer_and_policy() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .uri(g("/changes/baseline"))
                 .method(Method::POST)
                 .header("authorization", "Bearer admin-token")
@@ -2037,6 +2313,7 @@ rules:
     let (plain_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/changes?branch=main"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
@@ -2052,6 +2329,7 @@ rules:
     let (padded_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/changes?branch=%20main%20"))
             .method(Method::GET)
             .header("authorization", "Bearer token-a")
@@ -2070,6 +2348,7 @@ rules:
     let (baseline_status, _) = json_response(
         &app,
         Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
             .uri(g("/changes/baseline"))
             .method(Method::POST)
             .header("authorization", "Bearer token-a")

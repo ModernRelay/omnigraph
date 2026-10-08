@@ -44,41 +44,10 @@ as tools.
 
 ## Match patterns
 
-Inside `match { ... }`:
-
-| Pattern | Meaning |
-|---|---|
-| `$p: Person { name: $name }` | Bind nodes and filter properties. |
-| `$person worksAt $company` | Follow a directed edge. |
-| `$a knows{1,3} $b` | Follow a path from one to three hops. |
-| `$a <related> $b` | Match the edge in either direction. The edge must connect the same node type at both ends. |
-| `$a $rel:related $b` | Bind a single-hop edge instance so its properties can be used. |
-| `$p.age >= 18` | Apply a filter expression. |
-| `not { $p Blocked $other }` | Keep rows for which the inner pattern has no match. |
-| `exists { $p Blocked $other }` | Keep rows for which the inner pattern has at least one match. |
-| `count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
-| `sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
-
-Hop counts are shortest-path distances from the start node: `{2,2}` returns the
-nodes exactly two hops away. A node is never re-reached through its own
-self-loop or through a cycle back to it. The start node is returned only
-through its own self-loop, which counts as one hop, never through a cycle.
-
-An unbound traversal has set semantics for endpoint pairs. Binding the edge
-returns one result per matching edge, so parallel edges remain distinct. Edge
-bindings are available only for a single hop.
-
-Each `$_` is a distinct anonymous node: two anonymous traversals from one
-variable are independent, so a source with two neighbours matches two by two
-rows. Binding a variable a second time (`$p: Person` after `$p` is already
-bound, at the top level or inside `not { }`) adds the second binding's
-property matches as constraints on the same rows; it never introduces a
-second `$p`. Variable names beginning with `__` are reserved.
-
-Traversal spelling begins with a lowercase letter (`worksAt` for the declared
-edge `WorksAt`); edge lookup itself is case-insensitive.
-
-Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
+A match binds nodes and follows typed relationships. For edge alternatives,
+wildcard, bounded hops, direction and edge identity, see
+[Traversal and match patterns](traversal.md). Omitted bounds always mean
+exactly `{1,1}`; multiple hops require an explicit finite range.
 
 ### Boolean expressions and nulls
 
@@ -93,6 +62,15 @@ A comparison (`contains` and `starts_with` included) with a null operand is
 null, and `not null` is null. A filter or mutation `where` keeps only rows
 whose expression is true, so `not ($p.age > 30)` skips rows whose `age` is
 null.
+
+Numeric comparisons choose their types before execution. A literal may use a
+property's type when its value is exactly representable in that type; otherwise
+both operands use a common numeric type. Parameters use their declared type,
+regardless of the supplied value. An `F32` property storing `0.1` therefore
+differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
+also apply to list membership and mutation predicates, whether a filter runs
+in a scan or in memory. Mixed signed and `U64` values compare without losing
+integer precision.
 
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|
@@ -124,17 +102,29 @@ matches take constants evaluated once per invocation, such as
 ### Correlated blocks
 
 `not { ... }`, `exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) each hold a pattern
-that is matched once per outer row. The block must read at least one variable
-bound outside it; that variable correlates the block with the row. The row is
-kept when the aggregate over the block's matches satisfies the comparison:
-`not` is `count = 0`, `exists` is `count > 0`. The comparison's right side is a
-literal, `now()` or a parameter of the aggregate's type. The aggregate's
-argument is a scalar expression over the block's scope, usually a property of
-a variable bound inside it: numeric for `sum` and `avg`;
-numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and `max`, as in a
-`return`. A row with no match has no `sum`, `min`, `max` or `avg`, so it
-satisfies no comparison on them; its `count` is `0`.
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once per
+outer row. Each block must read a variable bound outside it. The row is kept
+when the aggregate comparison is true: `not` means `count = 0`, and `exists`
+means `count > 0`. The right side is a literal, `now()` or typed parameter;
+numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
+for the aggregate's result type. Its argument is a scalar expression in the
+block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
+or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,
+`min`, `max` and `avg` satisfy no comparison; `count` is `0`.
+
+Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
+range, and rounds the total once to `F64` before comparison. For example,
+`9007199254740993` and `-9007199254740992` sum to `1`, while a single value
+`9007199254740993` rounds to `9007199254740992` and does not satisfy
+`sum(...) { ... } > 9007199254740992`.
+
+As in `return`, `avg` converts each non-null input to `F64` before summing
+and dividing by the count. For those same two values, the average is `0`,
+because the first value rounds before accumulation. `min` and `max` retain
+the column's declared type, including the full `U64` range; comparing a `U64`
+extremum with an `I64` parameter preserves both integer ranges. Row count and
+column `count` use `I64` and refuse a count beyond its range; column `count`
+skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
@@ -193,6 +183,11 @@ always names a user property called `id`; where none is declared it is the
 unknown-property error, which names the meta-field. Edge inserts keep
 addressing endpoints as `from` and `to`.
 
+`$e.@type` returns the bound edge's canonical schema type name as a non-null
+`String`, including on ordinary named traversals. It is synthesized query
+metadata and cannot be written. `@src` and `@dst` preserve stored orientation,
+including when the query traverses in reverse.
+
 ## Return, order, and limit
 
 ```gq
@@ -203,6 +198,8 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
+In the return clause, integer `sum` accumulates exactly in 128 bits and rounds
+the total once to `F64`; `avg` uses a floating-point accumulator.
 `min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
 column and return the column's own type; `Bool` orders `false` before `true`,
 dates and datetimes chronologically. When no row matches, a query whose
@@ -248,10 +245,9 @@ repeats the leading `order` key (`T33`); without an alias the column is
 the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
 (`T35`, they belong in `match`) are refused at compile time. Aggregated
 queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). One bound on the tie-break: a `bm25()` ordering
-with no secondary keys reads a bounded set of top-scoring matches, so among
-rows tied exactly at that bound's cut, which rows enter the result follows
-the scan bound rather than entity ids.
+results are not score-ranked and cannot project a score (`T9`). A `bm25()`
+ordering reads every matching entity before the final limit, so rows tied on
+score are ordered by entity id.
 
 ## Blobs
 
@@ -296,10 +292,15 @@ its own. The spellings a consumer sees:
   (`1.0e20`, `1.0e-7`); a non-finite computed value is `null`.
 - `Vector(N)` and list properties are JSON arrays.
 
-On input, a `Date` string is a calendar day, `"2024-01-01"`; a string that
-carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is refused as a
-load value, a param, or a `date(...)` literal, and an instant belongs in a
-`DateTime` property.
+On input, a JSON number for an `F64` parses to the nearest `F64` value, the one
+a GQ literal with the same digits names, so an `F64` value read from `rows`
+loads back unchanged. A `Date` string is a calendar day, `"2024-01-01"`; a
+string that carries a time of day, such as `"2024-01-01T02:00:00+05:00"`, is
+refused as a load value, a param, or a `date(...)` literal, and an instant
+belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string
+with a non-zero digit past the third fractional digit, such as
+`"2024-01-01T00:00:00.123456Z"`, is refused as a load value, a param, or a
+`datetime(...)` literal; trailing zeros, as in `.123000`, are accepted.
 
 A `Date` or `DateTime` count outside the range the writer can format is refused
 on load. A read that meets one fails with status 500; the error names the

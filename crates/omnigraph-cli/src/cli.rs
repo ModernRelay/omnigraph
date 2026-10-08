@@ -15,20 +15,20 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY CAPABILITY:\n  \
 any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
+URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show.\n  \
 served — require a server: graphs (registry scope).\n  \
 direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
-repair, cleanup, schema plan, lint).\n  \
-control — manage or inspect a cluster (cluster via --config; policy & queries via \
---cluster).\n  \
+repair, cleanup, schema plan/apply, lint).\n  \
+control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
+self-hosted deployment/recovery; --managed for the managed service; policy & queries via --cluster).\n  \
 local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
-MANAGED FOLDERS: cluster commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
+MANAGED FOLDERS: cluster --managed uses .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
 --direct selects ordinary addressing, including operator profiles and defaults.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Explicitly use legacy addressing and credentials, ignoring folder context.
+    /// Use ordinary addressing and operator credentials, ignoring folder context.
     #[arg(long, global = true)]
     pub(crate) direct: bool,
 
@@ -49,8 +49,7 @@ pub(crate) struct Cli {
     /// Select a graph within a multi-graph scope: on a `--server` it appends
     /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
     /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed queries, mutations, loads, commit reads,
-    /// and legacy restricted token issuance with `--actions`.
+    /// `--store`). Required for managed queries, mutations, loads, and commit reads.
     #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
@@ -72,14 +71,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
-    /// Address a cluster-managed graph's storage for maintenance:
-    /// a cluster directory or storage-root URI — named via `clusters:` in
-    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://`/`az://` root. Pair
-    /// with `--graph <id>` to select the graph. Used by optimize /
-    /// rebuild-full-text-indexes / repair / cleanup. Azure is a qualification
-    /// preview pending adversarial live qualification, and its maintenance still
-    /// requires the cluster-root external admission wrapper. Exclusive with a
-    /// positional URI / `--store` / `--server`.
+    /// Address a cluster. Cluster apply/status/force-unlock/upgrade-ledger accept
+    /// a literal file://, s3:// or az:// storage root independently of local
+    /// bundle files. Root-addressed apply reconciles an exact --deployment-id.
+    /// Maintenance also accepts a cluster directory or a `clusters:` name from
+    /// ~/.omnigraph/config.yaml; pair it with --graph to select the graph.
+    /// Azure writes still require the cluster-root external admission wrapper
+    /// and remain a qualification preview. Exclusive with a positional URI,
+    /// --store or --server; root-addressed cluster commands also reject explicit --config.
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
@@ -104,8 +103,7 @@ pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
     /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
     ///
-    /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
-    #[command(visible_alias = "read")]
+    /// Run a read query.
     Query {
         /// Query name. With no `--query`/`-e`, the stored query to invoke from
         /// the catalog (served — addressed via --server/--profile). With
@@ -144,8 +142,7 @@ pub(crate) enum Command {
     },
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
-    /// Canonical mutation endpoint, paired with `query`; `change` is a visible alias that warns.
-    #[command(visible_alias = "change")]
+    /// Run a mutation.
     Mutate {
         /// Query name. With no `--query`/`-e`, the stored mutation to invoke
         /// from the catalog (served — addressed via --server/--profile). With
@@ -169,11 +166,9 @@ pub(crate) enum Command {
         params: ParamsArgs,
         #[arg(long)]
         branch: Option<String>,
-        /// Compare-and-swap precondition: run only if the branch's head
-        /// commit id (from `omnigraph query --json` or `omnigraph commit list`)
-        /// still equals this value.
-        /// A lost race exits with code 4 and, with --json, the structured
-        /// `precondition_failure` body — re-read the branch and decide again.
+        /// Compare-and-swap: run only while the branch head still equals this commit id
+        /// (from `omnigraph query --json` or `omnigraph commit list`). A lost race exits
+        /// 4 against a server, 1 embedded; --json prints `precondition_failure`.
         #[arg(long = "if-commit", value_name = "COMMIT_ID")]
         if_commit: Option<String>,
         /// Session setting for this invocation (repeatable): `name=value` in
@@ -229,27 +224,6 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Deprecated permissive loader (defaults: --mode merge, --from main; canonical current output)
-    #[command(hide = true)]
-    Ingest {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        data: PathBuf,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long, default_value = "merge")]
-        mode: CliLoadMode,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
-        /// stores only: no served load route carries a `settings` field.
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
     /// Branch operations
     Branch {
         #[command(subcommand)]
@@ -270,8 +244,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
-        #[arg(long, hide = true)]
-        jsonl: bool,
         #[arg(long = "type")]
         type_names: Vec<String>,
     },
@@ -317,14 +289,15 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Upgrade graph storage offline using registered migration handlers
+    /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
+    /// the format this binary serves (v14); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
-        /// Run read-only preflight without conversion or recovery writes
+        /// Report whether the conversion can run; writes nothing
         #[arg(long)]
         check: bool,
-        /// Requested storage format (defaults to the binary's declared target)
+        /// Requested storage format (defaults to the format this binary serves)
         #[arg(long, value_name = "N")]
         to_format: Option<u32>,
         #[arg(long)]
@@ -349,18 +322,10 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Classify and explicitly repair graph-manifest/Lance-HEAD drift
+    /// Diagnose foreign Lance HEAD movement without adopting it.
     Repair {
         /// Graph URI
         uri: Option<String>,
-        /// Publish verified maintenance drift. Without this flag, repair only
-        /// previews what it would do.
-        #[arg(long)]
-        confirm: bool,
-        /// Also publish suspicious or unverifiable drift. Requires
-        /// `--confirm`; use only after operator review.
-        #[arg(long, requires = "confirm")]
-        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -368,8 +333,8 @@ pub(crate) enum Command {
     Cleanup {
         /// Graph URI
         uri: Option<String>,
-        /// Number of recent versions to keep per dataset. Either `--keep` or
-        /// `--older-than` (or both) must be set.
+        /// Number of recent graph commits to keep on every live branch. Either
+        /// `--keep` or `--older-than` (or both) must be set.
         #[arg(long)]
         keep: Option<u32>,
         /// Only remove versions older than this duration. Accepts Go-style
@@ -383,15 +348,6 @@ pub(crate) enum Command {
         json: bool,
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
-    ///
-    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
-    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
-    /// deprecated `omnigraph query lint` / `omnigraph query check` /
-    /// `omnigraph check` invocations — each is kept as an argv-level
-    /// shim that prints a one-line stderr warning and rewrites to
-    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
-    /// clap's `visible_alias` because that would advertise two
-    /// equivalent canonical names, which agents emit interchangeably.
     Lint {
         /// Graph URI
         uri: Option<String>,
@@ -409,8 +365,12 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Manage cluster configuration or the folder's selected managed cluster.
+    /// Deploy and inspect a cluster; --managed selects its managed service API.
     Cluster {
+        /// Use the managed service and the selected folder's .omnigraph/context.
+        /// Never inferred from context; incompatible with other target selectors.
+        #[arg(long, global = true)]
+        managed: bool,
         #[command(subcommand)]
         command: ClusterCommand,
     },
@@ -560,64 +520,170 @@ pub(crate) enum BlobCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
-    /// Create an empty managed cluster and bind an unbound folder to its identity.
+    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
+    Validate {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview local configuration against storage or --server; with --managed,
+    /// plan a pushed revision (--rev, or the bound head).
+    Plan {
+        /// Directory containing cluster.yaml or the managed folder context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+        /// With --managed, select an exact pushed revision.
+        #[arg(long = "rev")]
+        revision: Option<String>,
+        #[command(flatten)]
+        run: ClusterRunArgs,
+    },
+    /// Apply a captured bundle. --server submits and waits for live activation;
+    /// direct storage apply requires stopped serving. With --cluster ROOT and
+    /// --deployment-id, reconcile the original deployment without source files.
+    /// With --managed, apply an exact saved --plan instead.
+    Apply {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+        /// Original durable deployment identity; never allocates a retry.
+        #[arg(long)]
+        deployment_id: Option<String>,
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, requires = "deployment_id")]
+        writers_stopped: bool,
+        /// With --managed, the exact saved plan run to apply (required).
+        #[arg(long)]
+        plan: Option<String>,
+        #[command(flatten)]
+        run: ClusterRunArgs,
+    },
+    /// Read deployment status without scanning graphs. --deployment-id selects
+    /// an exact durable receipt through --server or --cluster ROOT.
+    /// With --managed, read cluster projections or a positional RUN_ID.
+    Status {
+        /// With --managed, inspect this exact run instead of cluster projections.
+        run_id: Option<String>,
+        #[arg(long)]
+        deployment_id: Option<String>,
+        /// With --server, wait for this deployment's outcome.
+        #[arg(long, requires = "deployment_id")]
+        wait: bool,
+        /// Bound the local wait (default 300s, maximum 3600s); never cancels work.
+        #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: Option<u64>,
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect declared graphs and catalog payloads without acquiring writer
+    /// admission. Reports observed state with the exact ledger CAS it read.
+    Observe {
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an exact persisted lock after stopping the owner and establishing
+    /// graph/control I/O quiescence, with admissions and other unlocks excluded.
+    ForceUnlock {
+        /// Exact lock id from cluster status or a state_lock_held diagnostic.
+        lock_id: String,
+        /// Directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Convert the stopped cluster ledger without resetting graphs or history.
+    UpgradeLedger {
+        /// Attest prior writers and accepted graph/control I/O are quiescent.
+        #[arg(long, required = true)]
+        writers_stopped: bool,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// With --managed, create an empty cluster and bind an unbound folder to its identity.
     Create {
         name: String,
         #[arg(long)]
         api: String,
+        /// Unbound configuration folder to bind after creation.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Upload only referenced configuration files to the managed repository.
+    /// With --managed, upload only referenced configuration files to the managed repository.
     Push {
         #[arg(long)]
         expected_revision: String,
         #[arg(long)]
         message: String,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
-    /// Delete this exact managed incarnation; nonzero retention waits to tombstone.
+    /// With --managed, delete this exact incarnation; nonzero retention waits to tombstone.
     Delete {
         #[arg(long)]
         incarnation: String,
         #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u32).range(0..=2592000))]
         retention_seconds: u32,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Undo an exact retained deletion through the ordinary managed bootstrap.
+    /// With --managed, undo an exact retained deletion through the ordinary managed bootstrap.
     UndoDelete {
         #[arg(long)]
         incarnation: String,
         #[arg(long)]
         deletion_id: String,
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[command(flatten)]
-        managed: ManagedRunArgs,
+        run: ClusterRunArgs,
     },
-    /// Cache an identity credential for this cluster, or forget it locally.
+    /// With --managed, cache an identity credential for this cluster, or forget it locally.
     Token {
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        /// Legacy restricted profile: exact comma-separated actions; requires --graph.
-        #[arg(long, conflicts_with = "clear")]
-        actions: Option<String>,
         /// Credential lifetime, 60 seconds to 24 hours (default 1h).
         #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
         ttl: Option<u64>,
@@ -625,90 +691,32 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
-    Validate {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
+    /// With --managed, inspect or wait for a service lifecycle operation.
+    Operation {
+        /// Exact service lifecycle operation.
+        operation_id: String,
+        /// API origin for recovery before a folder context exists.
         #[arg(long)]
-        json: bool,
-    },
-    /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
-    Plan {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Plan without taking the cluster lock: read the ledger once, report
-        /// any lock instead of refusing, and label the output `observed`.
-        #[arg(long)]
-        observe: bool,
-        /// Managed: select a pushed revision; omission uses the bound head.
-        #[arg(long = "rev", alias = "revision")]
-        revision: Option<String>,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Converge the cluster to its config: create graphs, apply schema updates
-    /// (soft drops), write stored-query/policy catalog resources, and execute
-    /// approved graph deletes, in one ordered run. Serving picks up the applied
-    /// revision after an `omnigraph-server --cluster` restart.
-    Apply {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Managed: apply this exact saved plan run. Required in managed mode.
-        #[arg(long)]
-        plan: Option<String>,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Record a digest-bound approval for a gated (irreversible) change,
-    /// e.g. a graph delete. Requires the global --as actor.
-    Approve {
-        /// Typed resource address of the gated change (e.g. graph.scratch).
-        resource: String,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read the local JSON state ledger without scanning live graph resources.
-    Status {
-        /// Managed: inspect a run instead of the cluster projections.
-        #[arg(conflicts_with = "operation")]
-        run_id: Option<String>,
-        /// Managed: inspect a service lifecycle operation instead of a run.
-        #[arg(long)]
-        operation: Option<String>,
-        /// Managed operation recovery before a folder context exists.
-        #[arg(long, requires = "operation")]
         api: Option<String>,
-        /// Poll a lifecycle operation to its canonical outcome.
-        #[arg(long, requires = "operation")]
+        /// Poll until the operation reaches its canonical outcome.
+        #[arg(long)]
         wait: bool,
-        /// Managed operation wait deadline (default 300, maximum 3600 seconds).
+        /// Local wait deadline in seconds (default 300, maximum 3600).
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: Option<u64>,
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
-    /// Read managed run history with its provenance and outcomes.
+    /// With --managed, read run history with its provenance and outcomes.
     History {
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
+        /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
         #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
@@ -717,48 +725,10 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Cancel a pending managed run, or abandon an unused saved plan.
+    /// With --managed, cancel a pending run, or abandon an unused saved plan.
     Cancel {
         run_id: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Observe declared graphs and catalog payloads without the lock, the
-    /// recovery sweep, or a write: what `refresh` would record, labeled
-    /// `observed`, with the exact ledger CAS it read.
-    Observe {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh existing local JSON state from declared graph observations.
-    Refresh {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import initial local JSON state from declared graph observations.
-    Import {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a held local JSON state lock after operator confirmation.
-    ForceUnlock {
-        /// Exact lock id from cluster status or a state_lock_held diagnostic.
-        lock_id: String,
-        /// Cluster config directory containing cluster.yaml.
+        /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
@@ -768,14 +738,15 @@ pub(crate) enum ClusterCommand {
 }
 
 #[derive(Debug, Default, Args)]
-pub(crate) struct ManagedRunArgs {
-    /// Return the accepted managed run without waiting for its outcome.
+pub(crate) struct ClusterRunArgs {
+    /// For served apply or managed operations, return after acceptance without waiting for completion.
     #[arg(long)]
     pub(crate) no_wait: bool,
-    /// Managed wait deadline in seconds (default 300, maximum 3600).
+    /// For served apply or managed operations, bound the local wait in seconds (default 300, maximum 3600).
+    /// Expiry does not cancel accepted work.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub(crate) timeout: Option<u64>,
-    /// Reuse this key to safely replay the same managed request.
+    /// With --managed, reuse this key to safely replay the same request.
     #[arg(long)]
     pub(crate) idempotency_key: Option<String>,
 }
@@ -785,8 +756,7 @@ pub(crate) struct ManagedRunArgs {
 /// Registry scope (RFC-011): these address the server itself, not a graph
 /// within it — `--server <name|url>` / `--profile <name>` apply, while
 /// `--graph`, `--store`, and `--as` are rejected by the addressing guard.
-/// To add or remove graphs, operators run `cluster apply` and restart the
-/// server — runtime mutation is not exposed.
+/// Use `cluster apply --server` to deploy graph additions and schema/query changes.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
     /// List every graph registered with the multi-graph server.
@@ -862,13 +832,14 @@ pub(crate) enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Show the plan as it would execute with `--allow-data-loss`.
-        /// Promotes every `DropMode::Soft` step to `DropMode::Hard`
-        /// so the plan output reflects the destructive intent.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
     },
-    /// Apply a supported schema migration
+    /// Apply a supported schema migration to a standalone graph.
+    /// Deploy served schemas with `cluster apply --server URL --config DIR`.
+    ///
+    /// A drop removes the property or type from the current graph-manifest
+    /// version and reclaims nothing at apply: older commits still read the
+    /// dropped data until `omnigraph cleanup` stops retaining them, after
+    /// which it cannot be recovered.
     Apply {
         /// Graph URI
         uri: Option<String>,
@@ -876,17 +847,6 @@ pub(crate) enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
-        /// Allow destructive (data-loss) schema changes.
-        ///
-        /// Without this flag, drops are "soft": the property or type
-        /// is removed from the current graph-manifest version but prior
-        /// versions are retained, so `snapshot_at_graph_manifest_version(pre_drop)`
-        /// can still read the dropped data until `omnigraph cleanup`
-        /// runs. With this flag, drops are "hard": `cleanup_old_versions`
-        /// runs on the affected datasets immediately after the apply,
-        /// making the prior data unreachable.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
     },
     /// Show the current accepted schema source
     #[command(alias = "get")]
@@ -897,7 +857,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`, storage format v8 to v9; RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store

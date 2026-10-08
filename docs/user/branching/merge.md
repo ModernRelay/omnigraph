@@ -21,7 +21,8 @@ branch merge "review/2026-04-25" into main
 identifier such as `main` is not. The answer is a `ChangeOutput` with
 `outcome.kind = "merged"` and `outcome.merge` one of `already_up_to_date`,
 `fast_forward`, or `merged`; after a `fast_forward` or `merged` result,
-`commit` is the target's newest commit. The statement has no `--delete-branch`
+`commit` identifies that merge's own publication, even if another writer has
+since advanced the target. The statement has no `--delete-branch`
 composition: follow it with `branch delete <source>`. A merge statement takes
 no commit precondition -- `POST /mutate/if-graph-commit` and `--if-commit`
 refuse one beside it -- and no front offers a conditional merge today.
@@ -36,9 +37,27 @@ it with a `table version … already exists` error.
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
-- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Fast-forward**: the target still has the merge base's schema and table
+  versions, so it takes the source's state. The check reads state, not
+  history: a target merged again from a branch it fast-forwarded before, with
+  no write in between, fast-forwards again. One exception: when a
+  fast-forward into `main` carried a table whose changes cancel out on the
+  branch, or a table on a fork left by a branch created before storage format
+  v11, `main` ends on its own version of that table, so a later merge from
+  that branch can report **Merged**. The merged data is the same.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
+
+`branch merge --json`, the HTTP merge route and the GQ merge statement all
+return `commit` with the exact commit id, manifest version, parents, branch,
+actor and creation timestamp (Unix microseconds). Fast-forward returns the new
+target commit; its merged parent identifies the source head. An already-up-to-date
+merge publishes nothing and returns `commit: null`.
+
+If a remote response is lost or incomplete, the merge may have committed. The
+CLI does not resubmit it automatically. Inspect the intended target changes and
+relevant history before deciding what to do next; a later head alone cannot
+identify the missing merge receipt.
 
 When only the source changed a table since the merge base, a merge into a
 named branch can adopt that exact table snapshot without copying its rows.
@@ -62,8 +81,12 @@ omnigraph branch merge review/2026-04-25 --into main --delete-branch \
 
 Deletion happens after a successful merge and has its own authorization check.
 If deletion is denied or the source still has descendants, the merge remains
-successful and durable; the CLI prints a warning and the HTTP response reports
-the deletion failure. You can delete the branch later.
+successful and durable. The CLI exits 0 and warns in human output; HTTP and CLI
+JSON preserve `commit`, report `branch_deleted: false` and include the structured
+`branch_delete_error_details` (`error`, plus typed `code` and details where available).
+Successful deletion reports `branch_deleted: true`; without `--delete-branch`,
+both deletion fields are absent. v0.12 removes the old `branch_delete_error`
+string. Inspect and retry deletion separately; do not replay a successful merge.
 
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.
@@ -154,5 +177,8 @@ Indexes do not define merge correctness. Newly merged entities remain queryable 
 when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
+
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

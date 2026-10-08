@@ -26,7 +26,9 @@ Load and mutation input use one String representation:
 New external references are denied by default. A cluster-served graph must list
 allowed URI bases in its graph configuration. Direct `--store` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
-external references. Credentials must not appear in stored URIs.
+external references. Credentials must not appear in stored URIs. An allowed
+base must lie outside the cluster's storage root and every graph root; see
+[External Blob references](clusters/config.md#external-blob-references).
 
 Write mode determines ownership:
 
@@ -34,8 +36,27 @@ Write mode determines ownership:
   reference;
 - incremental inserts, upserts, updates, append/merge loads, and branch merges
   that write entities copy allowed source bytes into graph-managed storage;
-- an existing external reference remains readable and exportable even when new
-  external ingress is disabled.
+- an existing external reference remains readable even when new external
+  ingress is disabled, and exportable when it names its whole object (see
+  below).
+
+An `update` never reads the old value of a Blob it assigns. It carries every
+other Blob cell of a matched row: it reads the cell and rewrites it as managed
+bytes. Carrying a stored external reference therefore needs the graph's
+external Blob policy to admit the reference's source. Otherwise the update
+fails with a 400 that names the type, id, and property; assign that property in
+the same update, to a new value or to null, to replace or clear the reference
+without reading it.
+
+Only a graph written outside OmniGraph can hold a stored reference to a byte
+range of an object. Export writes an external reference as a bare URI, which
+reloads as the whole object, so export refuses a ranged reference instead of
+widening it. Change-feed images, the change-feed baseline and entity reads by
+id describe it exactly, as `{"uri": …, "offset": …, "length": …}` with a
+positive `length`, without reading the object. The feed passes the commit that
+holds it like any other, and a baseline taken while the row exists succeeds;
+that baseline does not reload with `load`. A stored descriptor with an offset
+but no length is refused as a Blob integrity error.
 
 OmniGraph never deletes the object named by an external reference.
 
@@ -94,8 +115,11 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
+Omnigraph-Http-Api: 0.13
 ```
 
+Both methods follow the [HTTP contract](operations/server.md#http-contract),
+including checking the response header before consuming bytes.
 Use `snapshot=<commit-id>` instead of `branch` for an immutable historical read.
 
 For managed values:
@@ -114,11 +138,43 @@ in `Location`. The server does not fetch, sign, authorize, or proxy that object
 and does not claim its size or ETag. A persisted ranged external descriptor
 fails loudly instead of redirecting to a wider value.
 
-## Limits and lifecycle
+## Limits
 
-One embedded managed range read returns at most 4 MiB. Read larger values in
-consecutive ranges; the CLI and HTTP server stream them without requiring one
-whole-value buffer.
+Blob limits bound the memory one operation needs. An operation over a limit
+fails before it changes the graph. Over HTTP it returns `413` with a
+`resource_limit` detail naming the `resource`, its `limit` and the `actual`
+value observed. For a write, the CLI reports the same three fields; the
+`omnigraph blob` commands report an over-limit range read as
+`Blob read range exceeds the limit`. Split the work into smaller operations
+and retry.
+
+| Limit | Applies to | Reported resource |
+|---|---|---|
+| 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
+| 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
+| 32 MiB per touched type, and 32 MiB across all touched types, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
+| 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
+| 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
+| 8,192 external references | One write operation or merge | `external Blob reference cells` |
+| 32 MiB of retained URI metadata | One write operation or merge. Every copy of a URI the operation keeps counts, plus 24 bytes per copy: admission keeps each reference's text twice and each distinct object's normalized URI twice, so distinct URIs reach the limit at about 8 MiB of text | `external Blob URI metadata bytes` |
+| 64 KiB | One external URI | `external Blob URI bytes` |
+| 4 MiB | One embedded managed range read | `Blob read range bytes` |
+
+`<table>` names the type as `node:<Type>` or `edge:<Type>`, for example
+`keyed entity bytes for node:Document`.
+
+The HTTP load request body is also capped at 32 MiB. That cap counts the
+encoded request, so one request carries about 24 MiB of decoded `base64:`
+data. Every HTTP request other than a load (`/load` and `/load/ndjson`) is bounded by the default 1 MiB request body limit, so a `base64:`
+literal in an HTTP mutation hits that limit first.
+
+Values larger than these limits stay readable. The CLI and the HTTP server
+read managed values in 4 MiB ranges, so a large value streams without a
+whole-value buffer, and one HTTP response holds at most two ranges at a time.
+`omnigraph optimize` bounds the Blob payload of each compaction batch
+separately; see [Optimize](operations/maintenance.md#optimize).
+
+## Lifecycle
 
 Blob readers stay pinned to the snapshot selected when they were opened. They
 never switch to newer bytes when a branch advances. Branch deletion and

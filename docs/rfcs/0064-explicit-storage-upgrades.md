@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Azim Afroozeh
 created: 2026-09-09
-updated: 2026-09-13
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -460,4 +460,42 @@ Release maintainer verifies production qualification before shipping.
 
 ## Decision log
 
-No maintainer decision recorded yet.
+No maintainer decision on the questions above is recorded yet.
+
+- 2026-10-04: the route `history-lance-files-v13-to-v14` (intent protocol 6)
+  is the one route the binary registers, for local standalone roots. It
+  follows this RFC's contract: a read-only `--check` that reports its work,
+  an intent on main before any effect, create-only objects and zero-retry
+  commits, per-ref receipts, validation before activation, and a rerun that
+  resumes its own attempt and refuses another's. Its fence is the early
+  format fence: it stamps main with the target format, so the source
+  executable refuses a fenced root. Its legacy area is argued in
+  [RFC 0068](0068-graph-commit-record.md#amendment-legacy-commits-of-the-stamp-13-upgrade).
+  The v6 to v9 routes described above were removed with their source
+  decoders; those stamps are rebuilt. Cluster entry and object-store
+  qualification stay open.
+- 2026-10-04: the same protocol (intent protocol 6) also admits stamps 8 and
+  9, the two formats of release v0.11.0, for local standalone roots. This
+  replaces the last sentence but one of the entry above for those two
+  stamps: they are converted, not rebuilt. `UpgradeIntent.source_format`
+  chooses the route, and the report names one handler per source:
+  `history-lance-files-v8-to-v14`, `history-lance-files-v9-to-v14` and
+  `history-lance-files-v13-to-v14`, with `history-lance-files-to-v14` as the
+  failed handler of a stop before any route is chosen. A stamp-8 or stamp-9
+  `__manifest` holds no contract row, so the schema contract is read from
+  `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph
+  root and is the contract of every pre-upgrade commit. The upgrade leaves
+  the three objects in place: its write set equals the stamp-13 route's, no
+  stamp-14 reader opens them, and they go stale at the next schema apply.
+  Removing them is not part of this protocol. The contract's columns are
+  compared with each registered table's Lance columns before any write, so
+  root objects that no longer match the tables are refused. An unfinished
+  v0.11.0 schema apply (a `.staging` root object, or a recovery sidecar, with
+  or without a live `__schema_apply_lock__` ref) is refused before the fence;
+  a live `__schema_apply_lock__` ref alone, on an otherwise clean root, is
+  handled by the upgrade and is not a live ref of the converted graph. Once
+  fenced, the rerun reads the contract from the archive under
+  `__history/schemas/`, not from the root objects. The genuine predecessor is the released v0.11.0
+  CLI, with v0.10.0 and the v0.11.0 `upgrade --to-format 8` for the stamp-8
+  source. Stamps 10 to 12 and every stamp below 8 stay rebuild-only, and so
+  does every cluster-managed graph.

@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
 use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::error::PlanError;
 use crate::logical::{
-    KeyJoinKind, ScanSpec, direction_word, filters_json, metadata_count_json, ordering_text,
-    scan_json,
+    ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
+    tiebreak_text,
 };
+use crate::mirror::EdgeSelectionMirror;
 use crate::source::SideId;
 
 /// The index of a node in a [`PhysicalPlan`].
@@ -61,7 +66,7 @@ pub struct GatePolicy {
 
 /// Prefilter admission ratio: the gate's selective plan runs when
 /// |eligible| / corpus is at or below this. It is the conservative crossover
-/// of the `rrf-gate` bench (`benches/scenarios.rs`) across both corpora.
+/// of the historical `rrf-gate` corpora retained under `benchmarks/deferred/`.
 pub const DEFAULT_GATE_RATIO: f64 = 0.10;
 
 /// Absolute ceiling on the eligible-id in-list: the in-list probe cost
@@ -113,6 +118,42 @@ pub struct Assumptions {
     pub datasets: BTreeMap<String, Option<DatasetPin>>,
     pub gate_policy: GatePolicy,
     pub memory_limit: u64,
+    /// One shared traversal-work allowance, present for statements using edge selections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traversal_work_limit: Option<u64>,
+    /// Retained even when rewrites remove an expansion, for historical replay admission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_wildcard_traversal: bool,
+}
+
+impl Assumptions {
+    /// Validate the single captured traversal allowance before execution.
+    /// Wildcard provenance survives rewrites, including an eliminated Expand.
+    ///
+    /// # Errors
+    /// Returns an error for a duplicate settings entry, a limit outside
+    /// `1..=i64::MAX`, or wildcard provenance without a captured limit.
+    pub fn validated_traversal_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
+        if self.settings.contains_key("traversal_work_limit") {
+            return Err(PlanError::Unsupported {
+                detail: "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry".to_string(),
+            });
+        }
+        match self.traversal_work_limit {
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::Unsupported {
+                detail: "traversal_work_limit must be in 1..=i64::MAX".to_string(),
+            }),
+            Some(limit) => Ok(NonZeroU64::new(limit)),
+            None if self.has_wildcard_traversal => Err(PlanError::Unsupported {
+                detail: "wildcard traversal requires a finite traversal_work_limit".to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One required first hop from a ranked binding: a top-level `Expand` that
@@ -186,6 +227,7 @@ pub struct RankedAccess {
     pub kind: RankKind,
     pub property: String,
     pub query: IRExpr,
+    pub score: IRExpr,
     /// Candidates the scan asks the index for; `None` is every match.
     pub fetch: Option<usize>,
     /// The IVF partitions a `nearest` scan may probe per index delta, the
@@ -204,13 +246,10 @@ pub struct RankedAccess {
 
 impl RankedAccess {
     /// The score ordering this ranking imposes on `binding`'s rows.
-    pub fn ordering(&self, binding: &str) -> IROrdering {
-        let (property, descending) = self.kind.score();
+    pub fn ordering(&self, _binding: &str) -> IROrdering {
+        let (_, descending) = self.kind.score();
         IROrdering {
-            expr: IRExpr::PropAccess {
-                variable: binding.to_string(),
-                property: property.to_string(),
-            },
+            expr: self.score.clone(),
             descending,
         }
     }
@@ -220,6 +259,8 @@ impl RankedAccess {
             "kind": self.kind,
             "property": self.property,
             "query": self.query.to_string(),
+            "typed_query": crate::typed::expr(&self.query),
+            "typed_score": crate::typed::expr(&self.score),
             "fetch": self.fetch,
             "scope": self.scope,
         });
@@ -318,8 +359,8 @@ pub struct Properties {
 }
 
 impl Properties {
-    /// A query plan prints no `schema`: its run-time schemas are the
-    /// engine's to derive, and the planner's are conservative input schemas.
+    /// Result nodes declare their typed columns separately. Pipeline schemas
+    /// remain conservative input schemas and are omitted for query plans.
     fn to_json(&self, query: bool) -> Value {
         let mut value = json!({
             "ordering": self.ordering,
@@ -425,6 +466,7 @@ pub enum PhysicalNode {
         right: NodeId,
         haystack: (String, String),
         needle: (String, String),
+        conjunct: IRExpr,
         residual: Vec<IRExpr>,
     },
     /// The in-memory arm of a GQ filter: the conjuncts the placement pass
@@ -433,15 +475,15 @@ pub enum PhysicalNode {
         input: NodeId,
         filters: Vec<IRExpr>,
     },
-    /// A traversal: the mode the cost model chose (or the session pinned), the
-    /// estimate it was chosen for, the policy for taking the other mode, and
-    /// the pinned dataset version of the edge table it reads.
+    /// A traversal: its declared mode and fallback policy, input row estimate,
+    /// and pinned member datasets. A budgeted plan uses the input estimate only
+    /// for diagnostics; costed plans also use it to choose their mode.
     Expand {
         input: NodeId,
         src: String,
         dst: String,
-        edge_type: String,
-        direction: Direction,
+        edges: EdgeSelection,
+        src_type: String,
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
@@ -449,13 +491,14 @@ pub enum PhysicalNode {
         mode: ExpandMode,
         frontier_estimate: Option<u64>,
         policy: ExpandPolicy,
-        version: Option<u64>,
+        versions: BTreeMap<String, Option<u64>>,
     },
     AntiJoin {
         input: NodeId,
         inner: NodeId,
         outer_var: String,
         predicate: SubqueryPredicate,
+        aggregate: Option<AggregateSpec>,
     },
     /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
     OuterReference {
@@ -469,23 +512,27 @@ pub enum PhysicalNode {
         k: Option<IRExpr>,
         limit: Option<usize>,
         prefilter: Prefilter,
+        /// Downstream row keys after the arm score and fused node identity.
+        row_tiebreak: Vec<ColumnRef>,
     },
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Aggregate {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        aggregates: Vec<Option<AggregateSpec>>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Sort {
         input: NodeId,
         order_by: Vec<IROrdering>,
         fetch: Option<usize>,
-        /// The bindings whose ids follow `order_by`, ascending nulls first,
-        /// so the order is total; empty where ids cannot change the visible
-        /// order.
-        tiebreak: Vec<String>,
+        /// The metadata columns following `order_by`, ascending nulls first,
+        /// so the order is total; empty where they cannot change visible order.
+        tiebreak: Vec<ColumnRef>,
     },
 }
 
@@ -599,6 +646,7 @@ impl<'a> TextContains<'a> {
             left,
             op: BinaryOp::Compare(CompOp::StringContains),
             right,
+            ..
         } = conjunct
         else {
             return None;
@@ -607,10 +655,12 @@ impl<'a> TextContains<'a> {
             IRExpr::PropAccess {
                 variable: haystack,
                 property: searched,
+                ty: _,
             },
             IRExpr::PropAccess {
                 variable: needle,
                 property: sought,
+                ty: _,
             },
         ) = (left.as_ref(), right.as_ref())
         else {
@@ -855,12 +905,13 @@ impl PhysicalPlan {
             PhysicalNode::Filter { filters, .. } => json!({
                 "node": "Filter",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::Expand {
                 src,
                 dst,
-                edge_type,
-                direction,
+                edges,
+                src_type,
                 dst_type,
                 min_hops,
                 max_hops,
@@ -868,14 +919,14 @@ impl PhysicalPlan {
                 mode,
                 frontier_estimate,
                 policy,
-                version,
+                versions,
                 ..
             } => json!({
                 "node": "Expand",
                 "src": src,
                 "dst": dst,
-                "edge_type": edge_type,
-                "direction": direction_word(direction),
+                "edges": EdgeSelectionMirror::from(edges),
+                "src_type": src_type,
                 "dst_type": dst_type,
                 "min_hops": min_hops,
                 "max_hops": max_hops,
@@ -883,33 +934,69 @@ impl PhysicalPlan {
                 "mode": mode,
                 "alternatives": policy.alternatives(*mode),
                 "frontier_estimate": frontier_estimate,
-                "version": version,
+                "versions": versions,
             }),
             PhysicalNode::AntiJoin {
                 outer_var,
                 predicate,
+                aggregate,
                 ..
             } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
                 "predicate": predicate.to_string(),
+                "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
+                "typed_left": crate::typed::block(&predicate.left),
+                "typed_right": crate::typed::expr(&predicate.right),
             }),
             PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
             }),
-            PhysicalNode::RankFuse { arms, k, limit, .. } => json!({
+            PhysicalNode::RankFuse {
+                arms,
+                k,
+                limit,
+                row_tiebreak,
+                ..
+            } => json!({
                 "node": "RankFuse",
                 "arms": arms
                     .iter()
                     .map(|arm| json!({ "binding": arm.binding, "kind": arm.kind }))
                     .collect::<Vec<Value>>(),
                 "k": k.as_ref().map(ToString::to_string),
+                "typed_k": k.as_ref().map(crate::typed::expr),
                 "limit": limit,
+                "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
-            PhysicalNode::Projection { return_exprs, .. }
-            | PhysicalNode::Aggregate { return_exprs, .. } => json!({
+            PhysicalNode::Aggregate {
+                return_exprs,
+                aggregates,
+                ..
+            } => json!({
                 "node": node.name(),
+                "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
+                "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
+                    match (&projection.expr, spec) {
+                        (IRExpr::Aggregate { func, signature, .. }, Some(spec)) => json!({
+                            "column": crate::optimizer::result_column(projection),
+                            "func": func.to_string(),
+                            "input": signature.arg.spelling(),
+                            "accumulator": spec.accumulator,
+                            "overflow": spec.overflow,
+                            "result": signature.result.spelling(),
+                        }),
+                        _ => Value::Null,
+                    }
+                }).collect::<Vec<_>>(),
+            }),
+            PhysicalNode::Projection { return_exprs, .. } => json!({
+                "node": node.name(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
                 "exprs": return_exprs
                     .iter()
                     .map(|projection| projection.expr.to_string())
@@ -923,16 +1010,19 @@ impl PhysicalPlan {
             } => json!({
                 "node": "Sort",
                 "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
                 "fetch": fetch,
-                "tiebreak": crate::logical::tiebreak_text(tiebreak),
+                "tiebreak": tiebreak_text(tiebreak),
             }),
             PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
                 "node": "CrossJoin",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::ContainsJoin {
                 haystack,
                 needle,
+                conjunct,
                 residual,
                 ..
             } => json!({
@@ -940,6 +1030,8 @@ impl PhysicalPlan {
                 "haystack": column_text(haystack),
                 "needle": column_text(needle),
                 "residual": filters_json(residual),
+                "typed_residual": crate::typed::exprs(residual),
+                "typed_conjunct": crate::typed::expr(conjunct),
             }),
             other => json!({ "node": other.name() }),
         };

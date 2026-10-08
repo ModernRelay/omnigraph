@@ -57,6 +57,7 @@ FIXTURES = [
     ("cases + docs", "pull_request", ["crates/omnigraph-gqt/cases/a.gqt", "docs/dev/ci.md", "README.md"], CASES_ONLY),
     ("case in a subdirectory", "pull_request", ["crates/omnigraph-gqt/cases/drafts/a.gqt"], CASES_ONLY),
     ("docs only", "pull_request", ["docs/user/index.md", "LICENSE", "LICENSE.md"], DOCS_ONLY),
+    ("release notes", "pull_request", ["changelog.d/camelcase.fixed.md", "changelog.d/release.json"], DOCS_ONLY),
     ("docs with a non-ASCII name", "pull_request", ["docs/user/café.md"], DOCS_ONLY),
     ("deployment only", "pull_request", ["deploy/azure/foundation.bicep", "Dockerfile", ".dockerignore", "docker/entrypoint.sh"], ("false", "false", "true")),
     ("cases + deployment", "pull_request", ["crates/omnigraph-gqt/cases/a.gqt", "deploy/azure/runtime.bicep"], ("false", "true", "true")),
@@ -88,6 +89,9 @@ CLASSES = {
             # `GQT (ordinary)` runs this test on `run_gqt` beside
             # `Test Workspace`'s engine-input run.
             "crates/omnigraph-seams/tests/failpoint_names_guard.rs": "GQ Logic Tests (ordinary) + Test Workspace",
+            # The benchmark fixture parity test executes a generated corpus
+            # case; `GQT (ordinary)` covers it on cases-only changes too.
+            "crates/omnigraph-bench/src/branch_merge.rs": "GQ Logic Tests (ordinary) + Test Workspace",
         },
     ),
     "deployment": (
@@ -326,10 +330,12 @@ def self_test() -> int:
             "crates/e/src/lib.rs": 'let p = r#"Dockerfile"#;\n',
             "crates/f/Cargo.toml": '[package]\nname = "f"\n[[bin]]\nname = "x"\npath = "../deploy/x.rs"\n',
             "crates/omnigraph-seams/tests/failpoint_names_guard.rs.extra.rs": 'let d = "../omnigraph-gqt/cases";\n',
+            "crates/omnigraph-bench/src/branch_merge.rs.extra.rs": 'const CASE: &str = include_str!("../../omnigraph-gqt/cases/a.gqt");\n',
         }
         green = {
             "crates/omnigraph-gqt/src/lib.rs": 'const DIR: &str = "crates/omnigraph-gqt/cases";\n',
             "crates/omnigraph-seams/tests/failpoint_names_guard.rs": 'let d = "../omnigraph-gqt/cases";\n',
+            "crates/omnigraph-bench/src/branch_merge.rs": 'const CASE: &str = include_str!("../../omnigraph-gqt/cases/a.gqt");\n',
             "crates/g/src/lib.rs": '// Deployment setup is documented in deploy/azure/README.md.\n/// Cases live in crates/omnigraph-gqt/cases.\n/* see docker/entrypoint.sh */\nfn noop() {}\n',
             "crates/h/src/lib.rs": 'let url = "https://example.invalid/deploy/azure"; let seg = "crates/x/deploy/y"; let dev = "Dockerfile.dev"; let boot = "bootstrap.Dockerfile";\n',
             "crates/i/Cargo.toml": '[package]\nname = "i" # built from deploy/azure, see docker/\n',

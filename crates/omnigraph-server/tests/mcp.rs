@@ -1,12 +1,16 @@
 //! MCP is another authenticated read transport over the native policy handlers.
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures::StreamExt as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use omnigraph_server::AppState;
+use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::oidc_identity::OidcIdentityTrust;
 use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey as _, traits::PublicKeyParts as _};
 use serde_json::{Value, json};
@@ -56,7 +60,7 @@ fn trust(root: &std::path::Path) -> Arc<OidcIdentityTrust> {
     OidcIdentityTrust::read(&path, &canonical_root).unwrap()
 }
 
-async fn fixture_app() -> (tempfile::TempDir, Router) {
+async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy = temp.path().join("policy.yaml");
@@ -85,9 +89,59 @@ async fn fixture_app() -> (tempfile::TempDir, Router) {
         queries,
     )
     .await
+    .unwrap();
+    let handle = state.routing().registry.list().pop().unwrap();
+    let mut entries = vec![omnigraph_server::registry::GraphEntry::ready(Arc::clone(
+        handle.handle(),
+    ))];
+    entries.push(omnigraph_server::GraphEntry::Loading(Arc::new(
+        omnigraph_server::LoadingGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("loading").unwrap(),
+            ),
+            uri: temp.path().join("loading").to_string_lossy().into_owned(),
+            policy: handle.policy.clone(),
+        },
+    )));
+    for (id, failure) in [
+        (
+            "blocked",
+            omnigraph_server::api::GraphStartupFailure::OpenFailed,
+        ),
+        (
+            "invalid-policy",
+            omnigraph_server::api::GraphStartupFailure::InvalidPolicy,
+        ),
+        (
+            "invalid-config",
+            omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
+        ),
+    ] {
+        entries.push(omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+            omnigraph_server::registry::BlockedGraph {
+                key: omnigraph_server::GraphKey::cluster(
+                    omnigraph_server::GraphId::try_from(id).unwrap(),
+                ),
+                uri: temp.path().join(id).to_string_lossy().into_owned(),
+                policy: if id == "blocked" {
+                    handle.policy.clone()
+                } else {
+                    None
+                },
+                failure,
+            },
+        )));
+    }
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![],
+        None,
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
     .unwrap()
     .with_oidc_identity_trust(trust(temp.path()));
-    (temp, omnigraph_server::build_app(state))
+    (temp, omnigraph_server::build_app(state.clone()), state)
 }
 
 fn rpc(token: Option<&str>, method: &str, params: Value) -> Request<Body> {
@@ -118,6 +172,7 @@ async fn call(app: &Router, token: &str, tool: &str, arguments: Value) -> Value 
         .unwrap();
     let status = response.status();
     assert!(!response.headers().contains_key("mcp-session-id"));
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -126,12 +181,13 @@ async fn call(app: &Router, token: &str, tool: &str, arguments: Value) -> Value 
 
 #[tokio::test]
 async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutations() {
-    let (temp, app) = fixture_app().await;
+    let (temp, app, state) = fixture_app().await;
     let alice = token("alice", RESOURCE);
     let bob = token("bob", RESOURCE);
     let response=app.clone().oneshot(rpc(Some(&alice),"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}))).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key("mcp-session-id"));
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
     let (status, list) = json_response(&app, rpc(Some(&alice), "tools/list", json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{list}");
     let names: Vec<_> = list["result"]["tools"]
@@ -144,11 +200,52 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     for tool in list["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
     }
+    let key = omnigraph_server::GraphKey::cluster(
+        omnigraph_server::GraphId::try_from("default").unwrap(),
+    );
+    let transition = state
+        .prepare_same_view(
+            &key,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"graphs":[{"graph_id":"default","display_name":"default"}]})
+        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
     );
+    for (credential, graph, expected) in [
+        (&alice, "blocked", 503),
+        (&bob, "blocked", 404),
+        (&alice, "loading", 503),
+        (&bob, "loading", 404),
+        (&alice, "default", 503),
+        (&bob, "default", 404),
+        (&alice, "invalid-policy", 404),
+        (&alice, "invalid-config", 404),
+        (&alice, "unknown", 404),
+    ] {
+        let result = call(&app, credential, "queries", json!({"graph":graph})).await;
+        assert_eq!(result["result"]["isError"], true);
+        assert_eq!(
+            result["result"]["structuredContent"]["status"], expected,
+            "{result}"
+        );
+        let (status, native) = json_response(
+            &app,
+            get_request(&format!("/graphs/{graph}/snapshot"), credential),
+        )
+        .await;
+        assert_eq!(status.as_u16(), expected);
+        if expected == 503 {
+            assert_eq!(native["code"], "graph_unavailable");
+            assert_eq!(result["result"]["structuredContent"]["error"], native);
+        }
+    }
+    transition.wait_requests().await.unwrap();
+    transition.resume_same_view().unwrap();
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
     let queries = catalog["result"]["structuredContent"]["queries"]
         .as_array()
@@ -221,27 +318,56 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
 
 #[tokio::test]
 async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds() {
-    let (_temp, app) = fixture_app().await;
+    let (_temp, app, _state) = fixture_app().await;
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&polls);
+    let (parts, _) = rpc(None, "tools/list", json!({})).into_parts();
+    let untrusted_body = Body::from_stream(futures::stream::poll_fn(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(None::<Result<Bytes, std::io::Error>>)
+    }));
     let response = app
         .clone()
-        .oneshot(rpc(None, "tools/list", json!({})))
+        .oneshot(Request::from_parts(parts, untrusted_body))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "authentication must precede collection"
+    );
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    assert_eq!(
         response.headers()["www-authenticate"],
         "Bearer resource_metadata=\"https://data.example/.well-known/oauth-protected-resource/clusters/A/incarnations/one\""
     );
-    let (status, metadata) = json_response(
-        &app,
-        Request::get("/.well-known/oauth-protected-resource")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/.well-known/oauth-protected-resource")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    let metadata: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(metadata["resource"], RESOURCE);
     assert!(!metadata.to_string().contains("stable_alice"));
+    let response = app
+        .clone()
+        .oneshot(Request::get("/no-such-route").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers()[HTTP_API_CONTRACT_HEADER],
+        HTTP_API_CONTRACT
+    );
+
     let alice = token("alice", RESOURCE);
     for wrong in [
         token("alice", "https://data.example/clusters/B/incarnations/one"),
@@ -307,6 +433,103 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
             .unwrap()
             .status(),
         StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
+    let (_temp, app, state) = fixture_app().await;
+    let alice = token("alice", RESOURCE);
+    let runtime = state.operation_runtime();
+    let response = app
+        .clone()
+        .oneshot(rpc(
+            Some(&alice),
+            "tools/call",
+            json!({
+                "name":"query", "arguments":{"graph":"default","name":"people"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(runtime.snapshot().active_reads, 1);
+    // Even after the HTTP body is gone, its yielded bytes retain the observer.
+    let mut body = response.into_body().into_data_stream();
+    let bytes = body.next().await.unwrap().unwrap();
+    assert!(!bytes.is_empty());
+    drop(body);
+    assert_eq!(runtime.snapshot().active_reads, 1);
+    let held = (1..omnigraph_server::operations::DEFAULT_READ_OBSERVERS)
+        .map(|_| runtime.try_observe().unwrap())
+        .collect::<Vec<_>>();
+    let refused = app
+        .clone()
+        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(!refused.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    let (status, ready) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "saturated data admission must leave loading readiness observable"
+    );
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["status"], "loading");
+    assert_eq!(ready["ready_graph_count"], 1);
+    assert_eq!(ready["loading_graph_count"], 1);
+    drop(held);
+    let view = state.routing().registry.list().pop().unwrap();
+    let transition = state
+        .prepare_same_view(
+            &view.key,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+    {
+        let wait = transition.wait_requests();
+        tokio::pin!(wait);
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "MCP yielded bytes must retain the selected graph after body drop"
+        );
+    }
+    drop(bytes);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.wait_logical_owners()
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(runtime.snapshot().active_reads, 0);
+    transition.wait_requests().await.unwrap();
+    assert_ne!(transition.resume_same_view().unwrap(), view.epoch());
+    runtime.close();
+    let response = app
+        .clone()
+        .oneshot(rpc(Some(&alice), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(runtime.snapshot().active_reads, 0);
+    let (status, ready) =
+        json_response(&app, Request::get("/readyz").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["status"], "draining");
+    assert_eq!(
+        app.oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
     );
 }
 

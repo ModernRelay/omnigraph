@@ -1,114 +1,113 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage formats v11 and v12; nothing migrates on open, but
-a v11 branch becomes v12 on its next publish. A v8, v9 or v10 graph from the
-0.11.x line takes one explicit `omnigraph upgrade` (below), which keeps its
-branches and spellings; use export/import with a source-compatible binary when
-no route exists. Storage formats, release versions and full-text index formats
-are separate; check the [release notes](../../releases/) before upgrading.
+Normal open accepts storage format v14 and never migrates a graph. A
+standalone graph at v8 or v9 (release 0.11.x) or at v13 is converted in place
+by the offline [storage upgrade](#storage-upgrade). A graph at any other
+format, and every cluster-managed graph below v14, is refused and takes the
+[export/import rebuild](#rebuild) with the binary that wrote the graph.
+Check the [release notes](../../releases/) for storage and index compatibility.
 
-## Explicit storage migration
+## Storage upgrade
 
-`omnigraph upgrade` defaults to v11: the conversions to v8 where the source
-needs them, the v10 stamp step, then the v11 step, which promotes every pending
-table pin once, reaps proven copies oldest link first, records the last linear version on
-every registration of every live branch and restamps. Qualified standalone v6
-graphs run v6 → v7 registration conversion, then metadata-only v7 → v8;
-qualified v7 development graphs run only the latter. Both reuse table data and
-preserve branch ancestry, IDs, property values, schema identity, retained
-commit IDs and numeric snapshots. Historical v6 snapshots keep their original
-metadata and use an explicit legacy decoder after root admission; historical
-v7 snapshots keep their registration-clock interpretation.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v14 in place.
+Branches, commit ids, commit history and table data are kept; no table row is
+rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
-1. Stop every server, embedded writer, maintenance process and cluster apply
-   that could touch the graph or its shared dependencies. A process-local lock
-   cannot stop an already-open old binary in another process.
-2. Preserve and verify a restorable backup of the entire root, including branch
-   references and historical data. Keep the source-compatible executable.
-3. Run preflight with the new binary:
+The upgrade is offline, and it cannot verify that itself:
 
-   ```bash
-   omnigraph upgrade ./graph.omni --check --json
-   ```
+1. Stop every server, embedded reader or writer and maintenance process that
+   has the graph open, and keep them stopped until the upgrade reports
+   `completed`. An old process opened earlier can still write to a branch; the
+   upgrade then stops and the root is restored from the backup.
+2. Take and verify a backup of the whole graph root. There is no reverse
+   conversion: rollback is restoring that backup with the old binary.
+3. Check, then convert, then verify with the new binary:
 
-4. Inspect `outcome`, `findings`, `route` and `work`. A passing check is advisory;
-   execution repeats validation. For v6 → v8, `work.deferred_checks` identifies
-   checks requiring the intermediate v7 output. Execution validates these before
-   the v7 → v8 handler has effects; a passing check does not pre-approve them.
-   Resolve source recovery with the compatible source executable before retrying.
-   Shared Lance files outside the root refuse.
-   `work.external_blob_exclusions` lists external URI bytes whose immutability
-   and backup are outside the migration guarantee; their descriptors are retained.
-   `work.historical_blob_identity_limits` lists pre-0.10 Blob fields without
-   stable property IDs. Their bytes are preserved, but existing historical
-   delivery restrictions remain after their current physical entry changes;
-   migration cannot invent missing property-lifetime evidence. See
-   [Blob identity](../../releases/v0.10.0.md#blob-identity-and-rollback).
-   Validation-read bytes may be unknown and are reported as JSON `null`.
-5. Execute while the graph remains offline:
+```bash
+omnigraph upgrade ./graph.omni --check --json
+omnigraph upgrade ./graph.omni --json
+omnigraph commit list ./graph.omni --json
+```
 
-   ```bash
-   omnigraph upgrade ./graph.omni --json
-   ```
+`--check` writes nothing. A run without `--check` first marks the graph as
+pending, which every normal open refuses, writes the pre-upgrade commits as
+immutable objects under `__history/legacy/`, converts each live branch,
+validates what it wrote and only then removes the marker. A run that stops
+after the marker is resumed by running the same command again with the same
+executable. Never delete the marker or anything under `__history/`.
 
-6. Verify reads on every branch and retained snapshot, then start only the new
-   fleet. Keep the backup for rollback. Restore the complete pre-upgrade backup
-   with the old executable; old bytes remaining in the upgraded root do not
-   make downgrading safe. Post-upgrade writes are absent from that backup.
+| `outcome` | Meaning | Exit |
+|---|---|---|
+| `check_passed` | v8, v9 or v13 graph, every check passed, nothing written | 0 |
+| `already_current` | v14 graph, nothing to do | 0 |
+| `completed` | converted, validated and served as v14 | 0 |
+| `check_failed` | a finding below; nothing was written | 1 |
+| `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
-`--to-format` defaults to 11. Explicit `--to-format 7`, `8` or `10` stops there
-for a compatible older executable; the current binary refuses each result. v9
-is not a target: the respelling it marked is a separate operation on a served
-graph (below). A v11 or v12 graph, mixed or not, reports `already_current` for
-the default and `--to-format 11`; a lower target is refused as a downgrade,
-`--to-format 12` as unsupported. The v11 step refuses, before any write, a pin
-whose linear target a foreign commit occupies (`blocked_promotion`, reported by
-`--check` too); after the switch no pin can reach that state. Unsupported
-sources and targets refuse; there is no automatic data-moving fallback. Check
-and execution return zero only for success (`check_passed`, `completed` or
-`already_current`); a repeated success is a no-write no-op. A source with a
-pending recovery sidecar refuses until the executable that wrote it resolves it.
+The report's `work` object counts what the run read and writes: `live_refs`,
+`retired_refs` (deleted branches whose commits are kept), `orphan_writers`,
+`legacy_commits`, `bookkeeping_versions`, `absent_parents`, `data_files`,
+`id_shards`, `writer_shards`, `schema_contents`, `census_reads`,
+`census_cells`, `legacy_bytes` and `table_opens` (the tables of a v8 or v9
+graph opened to compare their columns with the root schema objects). A
+resumed run that finds the legacy objects complete reads no history again and
+reports `retired_refs`, `orphan_writers`, `bookkeeping_versions`,
+`schema_contents`, `census_reads`, `census_cells`, `legacy_bytes` and
+`table_opens` as zero.
 
-After each handler's early fence, ordinary opens refuse until every branch is
-converted and validated and main activates that handler's target. If interrupted,
-retain the backup and rerun the same requested target without `--check`, using
-this upgrade-capable executable. An earlier pending v6 → v7 attempt keeps its
-exact original protocol, target and attempt identity; requesting v8 first
-finishes that attempt, then runs v7 → v8. Requesting v7 cannot downgrade or
-resume a pending v7 → v8 attempt. The report identifies the last durable boundary
-and required recovery action. Unknown ownership or foreign branch movement
-requires investigation; never delete the pending marker to force serving or
-point the source executable at it.
+| Finding | Names | What to do |
+|---|---|---|
+| `unsupported_target` | the target | `--to-format` accepts 14 only |
+| `newer_than_binary` | the format | upgrade the binary |
+| `unsupported_source` | the format, layout, over-budget branch, or the unreadable, over-bound or table-mismatched root schema objects of a v8 or v9 graph | [rebuild](#rebuild) with the build that wrote the graph. For a retired branch, instead of rebuilding run `cleanup --keep <N> --confirm` with that build, then `upgrade --check` again; rebuild only when the retired branch stays. For root schema objects, restore the whole root from one backup, objects and tables together, then check again; the objects alone, from an older backup, no longer match the tables and are refused. An unreadable contract refuses the 0.11.x open too, so export with 0.11.x is no way out of it |
+| `source_recovery_required` | leftover recovery files, or a `.staging` root schema object of a v8 or v9 graph, each with or without a live `__schema_apply_lock__` branch | stop every writer, then open the graph read-write with 0.11.x: `omnigraph snapshot <graph>` is such an open (`upgrade --check` is not). The open removes the recovery files and finishes or rolls back a schema apply that changed the table set; a property-only `.staging` it refuses and names the manual choice between the live and the staging schema. The lock stays live after the open; the upgrade handles it (next row). Then check again |
+| `schema_apply_lock_retired` | a live `__schema_apply_lock__` branch on a root with no `.staging` object and no recovery files: the lock of a v8 or v9 schema apply killed before it released it | nothing: the upgrade handles it, and the converted graph does not hold it as a live branch; `--check` reports it, the run handles it |
+| `history_objects_present` | object keys | restore the whole root, `__history/` included, from the backup of the earlier attempt |
+| `legacy_lineage_incomplete`, `legacy_lineage_corrupt` | up to 20 commit ids or branches | rebuild |
+| `legacy_record_over_bound`, `legacy_census_over_bound`, `legacy_directory_over_bound` | the measured value and its limit | rebuild |
+| `legacy_uncommitted_change`, `legacy_head_record_mismatch` | the branch, version and field | report it; rebuild meanwhile |
+| `preflight_failed` | the error | fix the cause and check again; nothing was written. Above the live-branch limit: rebuild |
+| `pending_upgrade`, `upgrade_interrupted` | the attempt | rerun without `--check` with the same executable |
+| `unknown_upgrade_ownership`, `fence_publication_attempted` | the marker state | keep the root, run `--check`, finish with the executable that started the attempt |
+| `legacy_plan_changed`, `legacy_objects_differ` | digests | finish with the executable that marked the graph; restore the backup if an object under `__history/legacy/`, or the schema archive under `__history/schemas/` that a fenced v8 or v9 rerun reads instead of the root schema objects, was changed |
 
-Source v6/v7 graphs containing reserved native-ref retirement metadata refuse
-conversion. On a v8 graph, admission validates that metadata and excludes
-valid retired refs from logical branch enumeration while retaining their physical
-ancestry. Upgrade neither retires branches nor reclaims their storage. Branch
-naming must also be unambiguous: a native name ending in a ULID-shaped suffix
-could be either a v0.9 logical name or a newer branch incarnation, so the
-handler requires a logical-head commit written after that native branch's fork
-to prove the interpretation and otherwise refuses before writing, including
-unused suffixed branches without that evidence. Duplicate logical names and
-incarnation-shaped inner path segments also refuse. Resolve the branch naming
-with the source executable or use the export/rebuild fallback; do not rename
-native Lance refs or edit their metadata manually.
+Limits, checked before anything is written: 1,024 live branches including
+main and 1,024 retired branches; 1,000,000 catalog rows or 64 MiB per branch
+head, live or retired, and 64 MiB per root schema object of a v8 or v9 graph;
+256 KiB of commit fields and 16 MiB per commit record; a history-read budget
+that refuses a single v13 branch line above about 75,000 commits; and a
+history-memory budget of 1 GiB that admits about 3.8 million table entries,
+counted for each branch as its commits plus its head, times the tables of its
+head (10,000 commits over 383 tables, or 1,000 commits over 3,800). That count
+multiplies every commit of a branch by the tables of its head, so a graph
+whose tables were added late is over-counted. The budget counts only the
+fixed-size part of each table entry: table names and paths are not counted
+and planning holds a second copy, so the process needs several times 1 GiB of
+memory. A graph over a limit is rebuilt. A retired branch over a limit cannot
+shrink; 0.11.x `cleanup --keep <N> --confirm` removes it when no live branch,
+merge base or tag needs it (without `--confirm` it is a dry run), then run
+`upgrade --check` again.
 
-Upgrade admission bounds each retained manifest to 1,000,000 rows and 64 MiB
-of decoded batch metadata, 1,024 native branches and 100,000 retained versions
-per branch. Version references are counted before historical manifests are
-loaded. Exceeding a bound refuses before conversion. Payload bytes copied
-and rewritten are zero; managed Blob validation can still read substantial data.
-Server and cluster selectors, cluster profiles and recognized cluster-layout
-roots refuse until a cluster upgrade protocol is qualified. Local paths, file
-URIs and symlink aliases are resolved before the cluster ownership check. Direct path access
-is an operator interface; it cannot prove that an arbitrary root is unmanaged.
-Embedded callers must supply exclusive control and, where installed, the policy
-checker to `upgrade_storage_as`, which checks `SchemaApply` for every branch.
-The genuine predecessor CI journeys cover local standalone roots. Other backend
-qualification is separate; see the [support matrix](../../dev/versioning.md#storage-upgrade-support-matrix).
-Storage migration does not rebuild full-text indexes. Use the procedure below
-when old index analyzers are incompatible. Formats without a registered route
-still use the export/import rebuild procedure later in this guide.
+After the upgrade, commit ids from before it resolve as before, and commit
+listing, the change feed, merges and `cleanup` read across the upgrade. A
+snapshot addressed by a catalog version below the upgrade serves the commit
+at that version, or the nearest commit below it. A v14 development build
+older than this upgrade reports pre-upgrade commit ids as not found and
+refuses full-history reads on an upgraded graph: upgrade every binary first.
+
+A graph written by 0.11.x (v8 or v9) has limits of its own. Its checks read every catalog version since `init`, so a long history is slow to check.
+
+| Subject | After the upgrade |
+|---|---|
+| Root schema objects | `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph root are read as the graph's schema and must be present and consistent. The upgrade leaves them in place. v14 never reads them, and they go stale at the next schema apply. `_graph_commit_recoveries.lance/` also stays, as an unreferenced dataset |
+| Unfinished schema apply | A `.staging` copy of a root schema object, or a leftover recovery file, is refused as `source_recovery_required`, with or without a live `__schema_apply_lock__` branch: open the graph read-write with 0.11.x (`omnigraph snapshot <graph>`), which removes the recovery file and finishes or rolls back an apply that changed the table set. An apply that changed properties only leaves a `.staging` that 0.11.x refuses as well; its message names the manual choice between the live and the staging schema. 0.11.x releases the lock only inside the process that took it, so the lock stays live after that open. A live lock on an otherwise clean root is handled by the upgrade: the converted graph does not hold it as a live branch, and the next schema apply is not refused as already in progress |
+| Schema of old commits | 0.11.x kept only the latest schema, so every commit from before the upgrade is recorded under the one schema live at the upgrade. The tables and rows of an old commit are exact. A read at an old commit id is planned against the live schema, as in 0.11.x: a type added later is absent there, and a type dropped later cannot be queried |
+| Table versions above a commit | An interrupted 0.11.x write can leave them. The upgrade opens each table only at the version main's head pins and does not report them. Reads and writes ignore them, `repair` reports `foreign_drift` and `cleanup` lists them as foreign versions |
+| `cleanup` after a 0.11.x `cleanup` or `schema apply --allow-data-loss` | Both removed table versions that old catalog versions still name. `cleanup` deletes no catalog version of a live branch, so a catalog version can outlive the table versions it names, after these 0.11.x runs and after any earlier `cleanup` whose policy was narrower. A `cleanup` whose policy retains such a catalog version reports `is absent from the listing` for its tables, deletes nothing from them and still exits 0. `--older-than D` passes once those versions are older than `D`, and `--keep N` once they fall outside the newest `N`. A branch base, a merge base and a tag are retained under every policy: while one of them is such a version, every policy refuses its tables, and deleting that branch or tag releases it. `omnigraph cleanup --keep 1 --confirm` retains only those and each branch head, so it passes unless one of them is such a version. A read at a commit id whose table version 0.11.x removed fails as it did before |
+
+Server and cluster selectors, cluster profiles and cluster-layout roots are
+refused: a cluster-managed graph is exported with the build that wrote it and
+[rebuilt](#rebuild). Paths, file URIs and symlinks resolve before that check.
 
 ## v0.9 to v0.10
 
@@ -239,35 +238,37 @@ mapping is:
 | v5 | the exact unreleased development build that wrote it |
 | v6 | latest 0.10.x (the refusal names 0.9.x or 0.10.x) |
 | v7 | the exact unreleased development build that wrote it |
-| v8, v9, v10 | the 0.11.x line (v8: development builds before the system-column namespace change and conversions completed with `omnigraph upgrade --to-format 8`; v10: detached table commits); `omnigraph upgrade` takes each to v11 without export/import |
-| v11, v12 | current line: fresh graphs are born v12 and a v11 branch converts on its next publish, so a graph may mix the two until every branch has published; entity export/import normally not required within this generation |
+| v8, v9 | latest 0.11.x (v8: legacy system column spellings). A standalone graph takes the [storage upgrade](#storage-upgrade) instead |
+| v10 to v13 | the main development build that wrote it; the refusal names its build dates. A standalone v13 graph takes the [storage upgrade](#storage-upgrade) instead |
+| v14 | current binary; entity export/import is not required within this storage generation |
 
 If the graph's generation is newer than the binary, upgrade the binary instead.
 
 ## System-column upgrade (legacy spellings)
 
 `omnigraph schema upgrade-system-columns <graph>` respells a served graph's
-legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`);
-a v11 main becomes v12. Columns are renamed by field id: no table rows are
-rewritten, indexes survive, and data, history, and commit ids are unchanged;
+legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`).
+It needs a graph that normal open accepts. The respelling
+keeps v14 and publishes the replacement contract with the renamed table
+references in one new graph commit. Columns are renamed by field id: no table
+rows are rewritten, indexes survive, and data and existing history/commit IDs are preserved;
 `--check` runs the preflight and writes nothing; `--json` prints the report.
 The preflight refuses a graph with any non-main branch (merge what you need,
 then delete the branches: a merge alone leaves the source live) and a
 property whose name starts with `_` (rename it with `@rename_from` first),
 naming every offender under `system_columns_preflight`. Edge constraints
 such as `@unique(src, dst)` become `@unique(@src, @dst)`. Stop every server
-serving the graph and retain a verified backup first: a write from a server
-still running lands the graph in a refusal only a restore clears, and there
-is no reverse operation. A run interrupted before it publishes changes nothing: rerun
-it. One interrupted after is completed by the next read-write open (any CLI command but
-`--check`; a rerun reports `already_current`); a read-only handle refuses until then. A graph that
+serving the graph and retain a verified backup first. Concurrent graph movement
+can refuse the attempt; stop writers and rerun from a fresh capture.
+There is no reverse operation. A run interrupted before it publishes changes nothing: rerun
+it. Once publication succeeds, fresh read-only and read-write opens use the
+accepted schema; a rerun reports `already_current`. A graph that
 already spells `__id`/`__src`/`__dst` reports `already_current`;
 cluster-managed graphs are refused.
 
 ## Rebuild
 
-Keep the old and new executables separate. Use a different target URI so the
-source remains recoverable throughout verification.
+Keep separate executables and target URIs so the source remains recoverable.
 
 When an export already carries top-level `id`, the rewrite preserves it and any user property named `id`. For predecessor schemas, change endpoint constraint references from `src`/`dst` to `@src`/`@dst` before the new `init`. See [ingestion](../../dev/ingestion.md#strict-graph-batch) for the envelope contract.
 
@@ -291,7 +292,6 @@ omnigraph schema show s3://bucket/graph-new.omni
 ```
 
 For another branch:
-
 ```bash
 old-omnigraph export --branch review s3://bucket/graph.omni \
   > review.jsonl
@@ -331,10 +331,10 @@ these cutovers:
 
 - **New graph ID in the same cluster.** Add (for example)
   `knowledge_next` with the desired schema, query, provider, and policy
-  bindings. Validate, plan, and apply so the cluster creates its derived root.
-  Load the export into `<cluster-root>/graphs/knowledge_next.omni`, restart,
-  verify the new ID, and move clients to it. Remove the old declaration only
-  after the retention window, using the normal approved-delete workflow.
+  bindings. Validate, plan, and submit `cluster apply --server` so the running
+  owner creates and activates its derived root. Load through that server, verify
+  the new ID, back up what you need, and move clients. Removing the old declaration
+  and applying deletes its managed storage and all retained history.
 - **Same graph ID in a parallel cluster root.** Copy the source bundle, set a
   new `storage` root, and keep the original cluster untouched. Validate, plan,
   and apply the new bundle; load the export into its derived graph root; then

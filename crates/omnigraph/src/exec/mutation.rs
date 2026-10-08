@@ -1,12 +1,16 @@
 use super::*;
 
+use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
-    check_param_date_literals, evaluate_constant, id_in_list_expr, ir_expr_to_df_expr,
+    evaluate_constant, fill_declared_params, id_in_list_expr, ir_expr_to_df_expr, validate_params,
 };
+use crate::instrumentation::record_mutation_table_open;
+use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::PendingScanBudget;
+use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
 use datafusion::prelude::Expr;
+use futures::TryStreamExt;
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -340,14 +344,16 @@ fn typed_list_literal_to_array(
 /// Build a single-element blob array from a URI or base64 value string.
 fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    crate::loader::append_blob_value(&mut builder, value)?;
+    append_blob_value(&mut builder, value)?;
     builder.finish().map_err(OmniError::lance_internal)
 }
 
-/// Build a null blob array with one element.
-fn build_null_blob_array() -> Result<ArrayRef> {
-    let mut builder = BlobArrayBuilder::new(1);
-    builder.push_null().map_err(OmniError::lance_internal)?;
+/// Build a null blob array with `num_rows` elements.
+fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(num_rows);
+    for _ in 0..num_rows {
+        builder.push_null().map_err(OmniError::lance_internal)?;
+    }
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -368,7 +374,7 @@ fn build_insert_batch(
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
                 columns.push(build_blob_array_from_value(uri)?);
             } else if field.is_nullable() {
-                columns.push(build_null_blob_array()?);
+                columns.push(build_null_blob_array(1)?);
             } else {
                 return Err(OmniError::manifest(format!(
                     "missing required blob property '{}'",
@@ -421,25 +427,31 @@ fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schem
 /// from an inexpressible shape, so the name is checked before lowering.
 fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a str> {
     match expr {
-        IRExpr::Param(name) => (!params.contains_key(name)).then_some(name.as_str()),
+        IRExpr::Param(name, _) => (!params.contains_key(name)).then_some(name.as_str()),
         IRExpr::Binary { left, right, .. } => {
             first_unbound_param(left, params).or_else(|| first_unbound_param(right, params))
         }
-        IRExpr::Not(inner) => first_unbound_param(inner, params),
+        IRExpr::Not(inner, _) | IRExpr::Cast { expr: inner, .. } => {
+            first_unbound_param(inner, params)
+        }
         IRExpr::IsNull { expr, .. } => first_unbound_param(expr, params),
-        _ => None,
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => None,
     }
 }
 
-/// Replace specific columns in a RecordBatch with new literal values.
-///
-/// Blob-bearing updates always arrive with the full logical schema. Committed
-/// blob payloads were materialized by the caller and rebuilt as logical
-/// `Struct<data,uri>` arrays; pending batches already have that shape. An
-/// unassigned blob is copied through, while an assigned string URI is rebuilt
-/// with the same blob writer used by inserts. Consequently every update batch
-/// has the catalog schema and can safely share one pending merge stream with
-/// inserts and earlier updates.
+/// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
+/// with the assigned values, so every update batch shares one pending merge
+/// stream with inserts and earlier updates.
 fn apply_assignments(
     full_schema: &SchemaRef,
     batch: &RecordBatch,
@@ -449,26 +461,36 @@ fn apply_assignments(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
-            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
-                // Assigned: build a single blob column from the URI.
-                let mut builder = BlobArrayBuilder::new(batch.num_rows());
-                for _ in 0..batch.num_rows() {
-                    crate::loader::append_blob_value(&mut builder, uri)?;
+            let column = match assignments.get(field.name()) {
+                Some(Literal::String(uri)) => {
+                    let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                    for _ in 0..batch.num_rows() {
+                        append_blob_value(&mut builder, uri)?;
+                    }
+                    builder.finish().map_err(OmniError::lance_internal)?
                 }
-                columns.push(builder.finish().map_err(OmniError::lance_internal)?);
-            } else {
+                Some(Literal::Null) => build_null_blob_array(batch.num_rows())?,
+                Some(other) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "Blob property '{}' assigned non-string constant {other:?}",
+                        field.name()
+                    )));
+                }
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
                 // schema, so copying it preserves both bytes and full-schema
                 // merge compatibility.
-                let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "blob column '{}' not found in full-schema mutation scan",
-                        field.name()
-                    ))
-                })?;
-                columns.push(col.clone());
-            }
+                None => batch
+                    .column_by_name(field.name())
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "blob column '{}' not found in full-schema mutation scan",
+                            field.name()
+                        ))
+                    })?
+                    .clone(),
+            };
+            columns.push(column);
         } else if let Some(lit) = assignments.get(field.name()) {
             columns.push(literal_to_typed_array(
                 lit,
@@ -523,6 +545,7 @@ async fn open_table_for_mutation(
     op_kind: crate::db::MutationOpKind,
     txn: Option<&crate::db::WriteTxn>,
 ) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
+    record_mutation_table_open();
     // `open_for_mutation_on_branch` returns the expected version even when it
     // skips the open (collapse #1, the non-strict insert/merge path): the version
     // is the pinned base's, identical to the opened handle's `.version()`. Use it
@@ -808,6 +831,7 @@ impl Session {
             actor_id,
             expected_head,
             settings.stage_write_concurrency(),
+            HistoryReleaseBytes(settings.history_release_bytes()),
         )
         .await
     }
@@ -849,6 +873,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -866,6 +891,8 @@ impl Omnigraph {
                     actor_id,
                     expected_head,
                     stage_write_concurrency,
+                    history_release_bytes,
+                    attempt == 0,
                     &mut retryable,
                 )
                 .await
@@ -881,7 +908,7 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_for_reprepare().await?;
+                    self.refresh_coordinator_only().await?;
                 }
                 result => return result,
             }
@@ -898,27 +925,27 @@ impl Omnigraph {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
+        first_attempt: bool,
         retryable: &mut bool,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Direct-publish paths assert this
-        // explicitly so a caller can't write to legacy or system
-        // staging branches by passing the prefix verbatim.
-        if let Some(name) = requested.as_deref() {
-            crate::db::ensure_public_branch_ref(name, "mutate")?;
-        }
-        // Install this handle's published-but-uninstalled schema contract, if
-        // any. This MUST run before `open_write_txn`, which captures the
-        // accepted schema identity and catalog.
-        self.settle_pending_schema_install().await?;
         // Capture one branch-wide write authority: native branch identity,
         // exact optional graph head, accepted schema identity/catalog, and the
         // base table snapshot. Execution, validation, staging, and publication
         // all use this immutable attempt. `commit_all` revalidates the complete
         // token under the root-shared schema → branch → sorted-table gates
         // before its first detached commit.
-        let mut txn = self.open_write_txn(requested.as_deref()).await?;
+        let mut txn = self
+            .open_write_txn(requested.as_deref())
+            .await
+            .map_err(|error| {
+                if first_attempt {
+                    error.before_effect()
+                } else {
+                    error.without_pre_effect_evidence()
+                }
+            })?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
         // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
@@ -933,7 +960,7 @@ impl Omnigraph {
             }
             txn.caller_expected_graph_head = Some(expected.to_string());
         }
-        let resolved_params = params.clone();
+        let mut resolved_params = params.clone();
 
         // Per-query staging accumulator. Inserts and updates push batches into
         // `pending`; deletes push predicates into `delete_predicates`. At the
@@ -948,7 +975,8 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
-        check_param_date_literals(params, &ir.params)?;
+        fill_declared_params(&mut resolved_params, &ir.params)?;
+        validate_params(&resolved_params, &ir.params)?;
         // Only an insert-only mutation is safe to replay automatically after a
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be
@@ -998,7 +1026,11 @@ impl Omnigraph {
                     .await?;
                 fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
                 let lineage_intent = self
-                    .new_lineage_intent_for_branch(requested.as_deref(), actor_id)
+                    .new_lineage_intent_for_branch(
+                        requested.as_deref(),
+                        actor_id,
+                        history_release_bytes,
+                    )
                     .await?;
                 // `_held_gates` holds the shared schema permit, branch
                 // effect gate, and sorted table gates acquired by `commit_all`.
@@ -1057,16 +1089,16 @@ impl Omnigraph {
             .map_err(query_lookup_error)?;
 
         let checked = typecheck_query_decl(catalog, &query_decl)?;
-        match checked {
-            CheckedQuery::Mutation(_) => {}
+        let mutation_ctx = match checked {
+            CheckedQuery::Mutation(ctx) => ctx,
             CheckedQuery::Read(_) => {
                 return Err(OmniError::manifest(
                     "mutation execution called on a read query; use query instead".to_string(),
                 ));
             }
-        }
+        };
 
-        let ir = lower_mutation_query(catalog, &query_decl)?;
+        let ir = lower_mutation_query(catalog, &query_decl, &mutation_ctx)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
         Ok(ir)
@@ -1084,19 +1116,19 @@ impl Omnigraph {
         for op in &ir.ops {
             let result = match op {
                 MutationOpIR::Insert {
-                    type_name,
+                    target,
                     assignments,
                 } => {
-                    self.execute_insert(type_name, assignments, params, branch, staging, txn)
+                    self.execute_insert(target, assignments, params, branch, staging, txn)
                         .await?
                 }
                 MutationOpIR::Update {
-                    type_name,
+                    target,
                     assignments,
                     predicate,
                 } => {
                     self.execute_update(
-                        type_name,
+                        target,
                         assignments,
                         predicate,
                         params,
@@ -1106,11 +1138,8 @@ impl Omnigraph {
                     )
                     .await?
                 }
-                MutationOpIR::Delete {
-                    type_name,
-                    predicate,
-                } => {
-                    self.execute_delete(type_name, predicate, params, branch, staging, txn)
+                MutationOpIR::Delete { target, predicate } => {
+                    self.execute_delete(target, predicate, params, branch, staging, txn)
                         .await?
                 }
             };
@@ -1122,7 +1151,7 @@ impl Omnigraph {
 
     async fn execute_insert(
         &self,
-        type_name: &str,
+        target: &MutationTarget,
         assignments: &[IRAssignment],
         params: &ParamMap,
         branch: Option<&str>,
@@ -1130,169 +1159,179 @@ impl Omnigraph {
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
-        let is_node = catalog.node_types.contains_key(type_name);
-        let is_edge = catalog.edge_types.contains_key(type_name);
-
-        if is_node {
-            let node_type = &catalog.node_types[type_name];
-            let schema = node_type.arrow_schema.clone();
-            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
-            let blob_props = node_type.blob_properties.clone();
-            let id = if let Some(key_properties) = node_type.key.as_ref() {
-                let mut typed_keys = Vec::with_capacity(key_properties.len());
-                for key_prop in key_properties {
-                    let key_literal = resolved.get(key_prop).ok_or_else(|| {
-                        OmniError::manifest(format!("insert missing @key property '{}'", key_prop))
-                    })?;
-                    let key_field = schema.field_with_name(key_prop).map_err(|_| {
-                        OmniError::manifest_internal(format!(
-                            "@key property '{}' is missing from node {} Arrow schema",
-                            key_prop, node_type.name
-                        ))
-                    })?;
-                    typed_keys.push(literal_to_typed_array(
-                        key_literal,
-                        key_field.data_type(),
-                        1,
-                    )?);
-                }
-                crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
-                    let key_description = match key_properties.as_slice() {
-                        [key] => format!("@key property '{key}'"),
-                        _ => format!("@key properties ({})", key_properties.join(", ")),
-                    };
-                    OmniError::manifest(format!("insert {key_description} cannot contain null"))
-                })?
-            } else {
-                crate::dst_ids::new_ulid().to_string()
-            };
-
-            let batch =
-                build_insert_batch(&schema, &id, &resolved, &blob_props, catalog.system_columns)?;
-            // Validation (value/enum/unique) runs end-of-query via the evaluator.
-            let has_key = node_type.key.is_some();
-            let table_key = format!("node:{}", type_name);
-            // Capture pre-write metadata on first touch (no Lance write).
-            let insert_kind = if has_key {
-                crate::db::MutationOpKind::Merge
-            } else {
-                crate::db::MutationOpKind::Insert
-            };
-            // Node inserts are non-strict (Insert/Merge), so with a `WriteTxn`
-            // this opens NOTHING (collapse #1) — the handle is discarded anyway;
-            // only `ensure_path`'s captured version (read inside
-            // `open_table_for_mutation`) is used downstream.
-            let (_ds, _full_path, _table_branch) =
-                open_table_for_mutation(self, staging, branch, &table_key, insert_kind, Some(txn))
-                    .await?;
-            // Accumulate. @key inserts go into the Merge stream (so a
-            // later update on the same id coalesces correctly); no-key
-            // inserts go into the Append stream.
-            let mode = if has_key {
-                PendingMode::Upsert
-            } else {
-                PendingMode::StrictInsert
-            };
-            staging.append_batch(&table_key, schema, mode, batch)?;
-
-            Ok(MutationResult {
-                affected_nodes: 1,
-                affected_edges: 0,
-            })
-        } else if is_edge {
-            let edge_type = &catalog.edge_types[type_name];
-            let schema = edge_type.arrow_schema.clone();
-            let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
-            let blob_props = edge_type.blob_properties.clone();
-            let id = if let Some(key_columns) = edge_type.key.as_ref() {
-                let system_columns = catalog.system_columns;
-                let mut typed_keys = Vec::with_capacity(key_columns.len());
-                for key_col in key_columns {
-                    let (assignment, is_endpoint) = match key_col.as_str() {
-                        column if column == system_columns.src => ("from", true),
-                        column if column == system_columns.dst => ("to", true),
-                        other => (other, false),
-                    };
-                    let key_literal = resolved.get(assignment).ok_or_else(|| {
-                        if is_endpoint {
-                            OmniError::manifest(format!(
-                                "missing required edge endpoint '{}'",
-                                assignment
-                            ))
-                        } else {
+        match target {
+            MutationTarget::Node { type_name } => {
+                let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "checked mutation node type '{type_name}' is missing from catalog"
+                    ))
+                })?;
+                let schema = node_type.arrow_schema.clone();
+                let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+                let blob_props = node_type.blob_properties.clone();
+                let id = if let Some(key_properties) = node_type.key.as_ref() {
+                    let mut typed_keys = Vec::with_capacity(key_properties.len());
+                    for key_prop in key_properties {
+                        let key_literal = resolved.get(key_prop).ok_or_else(|| {
                             OmniError::manifest(format!(
                                 "insert missing @key property '{}'",
-                                assignment
+                                key_prop
                             ))
-                        }
-                    })?;
-                    let key_field = schema.field_with_name(key_col).map_err(|_| {
-                        OmniError::manifest_internal(format!(
-                            "@key property '{}' is missing from edge {} Arrow schema",
-                            key_col, edge_type.name
-                        ))
-                    })?;
-                    typed_keys.push(literal_to_typed_array(
-                        key_literal,
-                        key_field.data_type(),
-                        1,
-                    )?);
-                }
-                crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
-                    OmniError::manifest(format!(
-                        "insert @key properties ({}) cannot contain null",
-                        key_columns.join(", ")
+                        })?;
+                        let key_field = schema.field_with_name(key_prop).map_err(|_| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{}' is missing from node {} Arrow schema",
+                                key_prop, node_type.name
+                            ))
+                        })?;
+                        typed_keys.push(literal_to_typed_array(
+                            key_literal,
+                            key_field.data_type(),
+                            1,
+                        )?);
+                    }
+                    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
+                        let key_description = match key_properties.as_slice() {
+                            [key] => format!("@key property '{key}'"),
+                            _ => format!("@key properties ({})", key_properties.join(", ")),
+                        };
+                        OmniError::manifest(format!("insert {key_description} cannot contain null"))
+                    })?
+                } else {
+                    crate::dst_ids::new_ulid().to_string()
+                };
+
+                let batch = build_insert_batch(
+                    &schema,
+                    &id,
+                    &resolved,
+                    &blob_props,
+                    catalog.system_columns,
+                )?;
+                let has_key = node_type.key.is_some();
+                let table_key = format!("node:{}", type_name);
+                let insert_kind = if has_key {
+                    crate::db::MutationOpKind::Merge
+                } else {
+                    crate::db::MutationOpKind::Insert
+                };
+                let (_ds, _full_path, _table_branch) = open_table_for_mutation(
+                    self,
+                    staging,
+                    branch,
+                    &table_key,
+                    insert_kind,
+                    Some(txn),
+                )
+                .await?;
+                let mode = if has_key {
+                    PendingMode::Upsert
+                } else {
+                    PendingMode::StrictInsert
+                };
+                staging.append_batch(&table_key, schema, mode, batch)?;
+
+                Ok(MutationResult {
+                    affected_nodes: 1,
+                    affected_edges: 0,
+                })
+            }
+            MutationTarget::Edge { type_name } => {
+                let edge_type = catalog.edge_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "checked mutation edge type '{type_name}' is missing from catalog"
                     ))
-                })?
-            } else {
-                crate::dst_ids::new_ulid().to_string()
-            };
+                })?;
+                let schema = edge_type.arrow_schema.clone();
+                let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+                let blob_props = edge_type.blob_properties.clone();
+                let id = if let Some(key_columns) = edge_type.key.as_ref() {
+                    let system_columns = catalog.system_columns;
+                    let mut typed_keys = Vec::with_capacity(key_columns.len());
+                    for key_col in key_columns {
+                        let (assignment, is_endpoint) = match key_col.as_str() {
+                            column if column == system_columns.src => ("from", true),
+                            column if column == system_columns.dst => ("to", true),
+                            other => (other, false),
+                        };
+                        let key_literal = resolved.get(assignment).ok_or_else(|| {
+                            if is_endpoint {
+                                OmniError::manifest(format!(
+                                    "missing required edge endpoint '{}'",
+                                    assignment
+                                ))
+                            } else {
+                                OmniError::manifest(format!(
+                                    "insert missing @key property '{}'",
+                                    assignment
+                                ))
+                            }
+                        })?;
+                        let key_field = schema.field_with_name(key_col).map_err(|_| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{}' is missing from edge {} Arrow schema",
+                                key_col, edge_type.name
+                            ))
+                        })?;
+                        typed_keys.push(literal_to_typed_array(
+                            key_literal,
+                            key_field.data_type(),
+                            1,
+                        )?);
+                    }
+                    crate::loader::canonical_key_id(&typed_keys, 0)?.ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "insert @key properties ({}) cannot contain null",
+                            key_columns.join(", ")
+                        ))
+                    })?
+                } else {
+                    crate::dst_ids::new_ulid().to_string()
+                };
 
-            let batch =
-                build_insert_batch(&schema, &id, &resolved, &blob_props, catalog.system_columns)?;
-            // Validation (edge-RI, enum, unique, @card against the live
-            // manifest-visible branch snapshot) runs
-            // end-of-query via the evaluator.
-            let has_key = edge_type.key.is_some();
-            let table_key = format!("edge:{}", type_name);
-            let insert_kind = if has_key {
-                crate::db::MutationOpKind::Merge
-            } else {
-                crate::db::MutationOpKind::Insert
-            };
-            // Capture pre-write metadata on first touch (ensure_path). Edge
-            // inserts are non-strict, so with a `WriteTxn` this opens NOTHING
-            // (collapse #1) and the handle is discarded — validation, including
-            // `@card` against the live committed branch snapshot, runs
-            // end-of-query via the evaluator.
-            let (_handle, _full_path, _table_branch) =
-                open_table_for_mutation(self, staging, branch, &table_key, insert_kind, Some(txn))
-                    .await?;
-            // Accumulate. @key inserts go into the Merge stream (so a
-            // later update on the same derived id coalesces correctly);
-            // no-key inserts keep ULID-generated ids, where Append mode is
-            // correct (no key-based dedup needed).
-            let mode = if has_key {
-                PendingMode::Upsert
-            } else {
-                PendingMode::StrictInsert
-            };
-            staging.append_batch(&table_key, schema, mode, batch)?;
+                let batch = build_insert_batch(
+                    &schema,
+                    &id,
+                    &resolved,
+                    &blob_props,
+                    catalog.system_columns,
+                )?;
+                let has_key = edge_type.key.is_some();
+                let table_key = format!("edge:{}", type_name);
+                let insert_kind = if has_key {
+                    crate::db::MutationOpKind::Merge
+                } else {
+                    crate::db::MutationOpKind::Insert
+                };
+                let (_handle, _full_path, _table_branch) = open_table_for_mutation(
+                    self,
+                    staging,
+                    branch,
+                    &table_key,
+                    insert_kind,
+                    Some(txn),
+                )
+                .await?;
+                let mode = if has_key {
+                    PendingMode::Upsert
+                } else {
+                    PendingMode::StrictInsert
+                };
+                staging.append_batch(&table_key, schema, mode, batch)?;
 
-            self.invalidate_graph_index().await;
+                self.invalidate_graph_index().await;
 
-            Ok(MutationResult {
-                affected_nodes: 0,
-                affected_edges: 1,
-            })
-        } else {
-            Err(OmniError::manifest(format!("unknown type '{}'", type_name)))
+                Ok(MutationResult {
+                    affected_nodes: 0,
+                    affected_edges: 1,
+                })
+            }
         }
     }
 
     async fn execute_update(
         &self,
-        type_name: &str,
+        target: &MutationTarget,
         assignments: &[IRAssignment],
         predicate: &IRExpr,
         params: &ParamMap,
@@ -1301,18 +1340,25 @@ impl Omnigraph {
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
-        // Defense in depth: ensure this is a node type
-        if !catalog.node_types.contains_key(type_name) {
-            return Err(OmniError::manifest(format!(
-                "update is only supported for node types, not '{}'",
-                type_name
-            )));
-        }
+        let type_name = match target {
+            MutationTarget::Node { type_name } => type_name,
+            MutationTarget::Edge { type_name } => {
+                return Err(OmniError::manifest(format!(
+                    "update is only supported for node types, not '{}'",
+                    type_name
+                )));
+            }
+        };
+        let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "checked mutation node type '{type_name}' is missing from catalog"
+            ))
+        })?;
 
         // Reject updates to every @key component — physical identity is the
         // canonical typed tuple, so changing even a non-leading component
         // without changing `id` would make the row unreachable by its key.
-        if let Some(key_properties) = catalog.node_types[type_name].key.as_ref() {
+        if let Some(key_properties) = node_type.key.as_ref() {
             if let Some(key_prop) = key_properties
                 .iter()
                 .find(|key_prop| assignments.iter().any(|a| a.property == key_prop.as_str()))
@@ -1324,9 +1370,37 @@ impl Omnigraph {
             }
         }
 
-        let schema = catalog.node_types[type_name].arrow_schema.clone();
+        let schema = node_type.arrow_schema.clone();
         let pred_expr = mutation_predicate_expr(predicate, params, &schema)?;
-        let blob_props = catalog.node_types[type_name].blob_properties.clone();
+        // Resolved before the table is opened, so a null on a non-nullable
+        // property is refused even when the predicate matches no row.
+        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+        let blob_props = node_type.blob_properties.clone();
+        // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
+        let assigned_blobs = schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                blob_props.contains(field.name()) && resolved.contains_key(field.name())
+            })
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let scan_schema: SchemaRef = if assigned_blobs.is_empty() {
+            schema.clone()
+        } else {
+            let indices = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !assigned_blobs.contains(&field.name().as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            Arc::new(
+                schema
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            )
+        };
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1382,6 +1456,7 @@ impl Omnigraph {
                     pending_schema,
                     Some(pred_expr),
                     Some(catalog.system_columns.id),
+                    &assigned_blobs,
                     scan_budget,
                 )
                 .await?
@@ -1394,14 +1469,10 @@ impl Omnigraph {
             });
         }
 
-        // Concat the matched batches (committed + pending) into one. The
-        // helper binds both sides to the catalog's full logical schema. Any
-        // divergence here is an internal scan/staging contract violation.
-        let matched = concat_match_batches_to_schema(&schema, batches)?;
+        let matched = concat_match_batches_to_schema(&scan_schema, batches)?;
 
         let affected_count = matched.num_rows();
 
-        let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
@@ -1421,20 +1492,22 @@ impl Omnigraph {
 
     async fn execute_delete(
         &self,
-        type_name: &str,
+        target: &MutationTarget,
         predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let is_node = txn.catalog.node_types.contains_key(type_name);
-        if is_node {
-            self.execute_delete_node(type_name, predicate, params, branch, staging, txn)
-                .await
-        } else {
-            self.execute_delete_edge(type_name, predicate, params, branch, staging, txn)
-                .await
+        match target {
+            MutationTarget::Node { type_name } => {
+                self.execute_delete_node(type_name, predicate, params, branch, staging, txn)
+                    .await
+            }
+            MutationTarget::Edge { type_name } => {
+                self.execute_delete_edge(type_name, predicate, params, branch, staging, txn)
+                    .await
+            }
         }
     }
 
@@ -1447,11 +1520,12 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_expr = mutation_predicate_expr(
-            predicate,
-            params,
-            &txn.catalog.node_types[type_name].arrow_schema,
-        )?;
+        let node_type = txn.catalog.node_types.get(type_name).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "checked mutation node type '{type_name}' is missing from catalog"
+            ))
+        })?;
+        let pred_expr = mutation_predicate_expr(predicate, params, &node_type.arrow_schema)?;
 
         let table_key = format!("node:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1468,12 +1542,14 @@ impl Omnigraph {
 
         let scan_filter =
             dedup_delete_filter(&pred_expr, staging.recorded_delete_predicates(&table_key));
-        let batches = self
-            .storage()
-            .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), scan_filter)
-            .await?;
-
-        let deleted_ids: Vec<String> = ids_from_batches(&batches);
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            scan_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1492,7 +1568,6 @@ impl Omnigraph {
         // `open_table_for_mutation` above already captured the table's
         // path/version/op-kind via `ensure_path`.
         fail(&MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
-        staging.record_deleted_ids(&table_key, &deleted_ids);
         staging.record_delete(&table_key, pred_expr.clone());
 
         let mut affected_edges = 0usize;
@@ -1552,24 +1627,24 @@ impl Omnigraph {
             // Scan (not count) the cascade-removed edge ids so validation
             // recounts the OTHER endpoint's @card after the cascade; `len()` is
             // the affected count.
-            let matched_ids = ids_from_batches(
-                &self
-                    .storage()
-                    .scan_filtered(
-                        &edge_ds,
-                        Some(&[txn.catalog.system_columns.id]),
-                        count_filter,
-                    )
-                    .await?,
-            );
+            let matched_ids = scan_deleted_ids(
+                self,
+                &edge_ds,
+                txn.catalog.system_columns.id,
+                count_filter,
+                &mut staging.deleted_id_budget,
+            )
+            .await?;
             let matched = matched_ids.len();
             affected_edges += matched;
 
             if matched > 0 {
-                staging.record_deleted_ids(&edge_table_key, &matched_ids);
+                staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
+
+        staging.record_deleted_ids(&table_key, deleted_ids);
 
         if affected_edges > 0 {
             self.invalidate_graph_index().await;
@@ -1590,11 +1665,12 @@ impl Omnigraph {
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
-        let pred_expr = mutation_predicate_expr(
-            predicate,
-            params,
-            &txn.catalog.edge_types[type_name].arrow_schema,
-        )?;
+        let edge_type = txn.catalog.edge_types.get(type_name).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "checked mutation edge type '{type_name}' is missing from catalog"
+            ))
+        })?;
+        let pred_expr = mutation_predicate_expr(predicate, params, &edge_type.arrow_schema)?;
 
         let table_key = format!("edge:{}", type_name);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
@@ -1621,16 +1697,18 @@ impl Omnigraph {
         // a delete emptying a src below @card min is rejected; `len()` is the
         // affected count. One scan replaces the former count-here + resolve-at-
         // validation re-scan.
-        let deleted_ids = ids_from_batches(
-            &self
-                .storage()
-                .scan_filtered(&ds, Some(&[txn.catalog.system_columns.id]), count_filter)
-                .await?,
-        );
+        let deleted_ids = scan_deleted_ids(
+            self,
+            &ds,
+            txn.catalog.system_columns.id,
+            count_filter,
+            &mut staging.deleted_id_budget,
+        )
+        .await?;
         let affected = deleted_ids.len();
 
         if affected > 0 {
-            staging.record_deleted_ids(&table_key, &deleted_ids);
+            staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             self.invalidate_graph_index().await;
         }
@@ -1642,23 +1720,33 @@ impl Omnigraph {
     }
 }
 
-/// Extract the `id` column (projection index 0) from scanned batches. Used by
-/// the delete paths to capture the rows they remove, so validation recounts a
-/// src a delete empties without re-resolving the predicate.
-fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            (0..ids.len())
-                .map(|i| ids.value(i).to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+/// Walk the exact typed predicate a batch at a time, admitting each id against
+/// `budget` before copying it.
+async fn scan_deleted_ids(
+    db: &Omnigraph,
+    snapshot: &SnapshotHandle,
+    id_column: &str,
+    filter: Expr,
+    budget: &mut DeletedIdBudget,
+) -> Result<Vec<String>> {
+    let mut stream = db
+        .storage()
+        .scan_filtered(snapshot, Some(&[id_column]), filter)
+        .await?;
+    let mut removed = Vec::new();
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| OmniError::manifest_internal("delete id scan did not return Utf8"))?;
+        for i in 0..ids.len() {
+            let id = ids.value(i);
+            budget.retain(id)?;
+            removed.push(id.to_owned());
+        }
+    }
+    Ok(removed)
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -1686,12 +1774,16 @@ fn concat_match_batches_to_schema(
 
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     let mut resolved = params.clone();
-    if !resolved.contains_key(NOW_PARAM_NAME) {
-        let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
-            .format(&Rfc3339)
-            .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
-        resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
+    if resolved.contains_key(NOW_PARAM_NAME) {
+        return Err(OmniError::manifest(format!(
+            "param '{NOW_PARAM_NAME}': reserved for now() and cannot be bound"
+        )));
     }
+    let now = OffsetDateTime::from(crate::dst_clock::system_time_now())
+        .truncate_to_millisecond()
+        .format(&Rfc3339)
+        .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
+    resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
     Ok(resolved)
 }
 
@@ -1751,5 +1843,122 @@ mod literal_narrowing_tests {
                 .is_err()
         );
         assert!(literal_to_typed_array(&Literal::Float(f64::NAN), &DataType::Float64, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use crate::loader::LoadMode;
+    use omnigraph_compiler::query::typecheck::MutationTypeContext;
+    use omnigraph_compiler::settings::SessionSettings;
+
+    #[tokio::test]
+    async fn retained_edge_target_selects_edge_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    r#"
+node Endpoint { name: String @key }
+node Shared { label: String }
+edge Shared: Endpoint -> Endpoint { label: String }
+"#,
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        db.load_jsonl(
+            r#"{"type":"Endpoint","data":{"name":"a"}}
+{"type":"Endpoint","data":{"name":"b"}}
+{"type":"Shared","id":"node-existing","data":{"label":"existing"}}
+{"edge":"Shared","id":"edge-existing","from":"a","to":"b","data":{"label":"existing"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        let txn = db.open_write_txn(None).await.unwrap();
+        assert!(txn.catalog.node_types.contains_key("Shared"));
+        assert!(txn.catalog.edge_types.contains_key("Shared"));
+        let target = MutationTarget::Edge {
+            type_name: "Shared".into(),
+        };
+        let ctx = MutationTypeContext {
+            targets: vec![target.clone()],
+        };
+        for (source, is_insert) in [
+            (
+                r#"query q() { insert Shared { from: "a", to: "b", label: "new" } }"#,
+                true,
+            ),
+            (
+                r#"query q() { delete Shared where label = "existing" }"#,
+                false,
+            ),
+        ] {
+            let decl = omnigraph_compiler::find_named_query(source, "q").unwrap();
+            let ir = lower_mutation_query(&txn.catalog, &decl, &ctx).unwrap();
+            let retained = match &ir.ops[0] {
+                MutationOpIR::Insert { target, .. } | MutationOpIR::Delete { target, .. } => target,
+                other => panic!("unexpected operation: {other:?}"),
+            };
+            assert_eq!(retained, &target);
+            let mut staging = MutationStaging::default();
+            let result = db
+                .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn)
+                .await
+                .unwrap();
+            assert_eq!((result.affected_nodes, result.affected_edges), (0, 1));
+            assert_eq!(staging.paths.len(), 1);
+            assert!(staging.paths.contains_key("edge:Shared"));
+            if is_insert {
+                assert_eq!(
+                    staging
+                        .pending_batches("edge:Shared")
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    1
+                );
+                assert!(staging.pending_batches("node:Shared").is_empty());
+                assert!(staging.deleted_ids.is_empty());
+            } else {
+                assert!(staging.pending.is_empty());
+                assert_eq!(staging.deleted_ids.len(), 1);
+                assert_eq!(staging.deleted_ids["edge:Shared"], ["edge-existing"]);
+            }
+        }
+
+        let decl = omnigraph_compiler::find_named_query(
+            r#"query q() { update Shared set { label: "changed" } where label = "existing" }"#,
+            "q",
+        )
+        .unwrap();
+        let ir = lower_mutation_query(&txn.catalog, &decl, &ctx).unwrap();
+        let MutationOpIR::Update {
+            target: retained, ..
+        } = &ir.ops[0]
+        else {
+            panic!("expected update");
+        };
+        assert_eq!(retained, &target);
+        let mut staging = MutationStaging::default();
+        let error = db
+            .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("update is only supported for node types"),
+            "{error}"
+        );
+        assert!(staging.is_empty());
+        assert!(staging.paths.is_empty());
+        assert!(staging.deleted_ids.is_empty());
     }
 }

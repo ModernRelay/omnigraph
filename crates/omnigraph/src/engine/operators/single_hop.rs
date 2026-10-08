@@ -1,5 +1,5 @@
-//! The single-hop `ExpandExec`: one vectorized walk per input batch, streamed
-//! in batch-size slices. Multi-hop stays on the BFS breaker in `graph.rs`.
+//! Legacy named single-hop execution walks each input batch in bounded slices.
+//! Budgeted windows and legacy multi-hop enter shared BFS through `expand_stream`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge};
 use futures::StreamExt;
 use omnigraph_planner::should_switch_to_csr;
 
-use super::expand::{ExpandStep, GraphEnv};
+use super::expand::{ExpandStep, GraphEnv, NamedExpand};
 use super::expand_stream::{align_sources, output_rows};
 use super::memory::WorkMemory;
 use super::producer::{BatchSender, producer_stream};
@@ -29,6 +29,7 @@ pub(super) fn execute(
     input: SendableRecordBatchStream,
     schema: SchemaRef,
     step: ExpandStep,
+    named: NamedExpand,
     env: Arc<GraphEnv>,
     ctx: Arc<TaskContext>,
     metrics: &ExecutionPlanMetricsSet,
@@ -44,7 +45,10 @@ pub(super) fn execute(
         memory,
         Some(metrics),
         move |memory, sender| async move {
-            run(input, &declared, &step, &env, &switch, &memory, &sender).await
+            run(
+                input, &declared, &step, &named, &env, &switch, &memory, &sender,
+            )
+            .await
         },
     ))
 }
@@ -53,20 +57,22 @@ async fn run(
     mut input: SendableRecordBatchStream,
     schema: &SchemaRef,
     step: &ExpandStep,
+    named: &NamedExpand,
     env: &GraphEnv,
     switch: &Gauge,
     memory: &Arc<WorkMemory>,
     sender: &BatchSender,
 ) -> Result<()> {
     let catalog = &env.catalog;
-    let edge_def = catalog.edge_types.get(&step.edge_type).ok_or_else(|| {
+    let member = &named.member;
+    let edge_def = catalog.edge_types.get(&member.edge_type).ok_or_else(|| {
         external(OmniError::manifest(format!(
             "unknown edge type '{}'",
-            step.edge_type
+            member.edge_type
         )))
     })?;
     let src_column = format!("{}.{}", step.src, catalog.system_columns.id);
-    let probes = endpoint_probes(step.direction, catalog.system_columns);
+    let probes = endpoint_probes(member.direction, catalog.system_columns);
     let walk_memory = memory.child("expand walk")?;
     let first = loop {
         match input.next().await.transpose()? {
@@ -81,6 +87,7 @@ async fn run(
         &env.snapshot,
         catalog,
         step,
+        named,
         memory,
     )
     .await
@@ -88,7 +95,7 @@ async fn run(
     let mut source = match start {
         ExpandStart::Csr => {
             Switch::Csr.record(switch);
-            Source::csr(env, edge_def, step).await?
+            Source::csr(env, edge_def, named).await?
         }
         ExpandStart::Indexed {
             edge_ds,
@@ -119,14 +126,14 @@ async fn run(
             memory.metric("expand_csr", 1);
             tracing::debug!(
                 target: "omnigraph::traverse",
-                edge = %step.edge_type,
+                edge = %member.edge_type,
                 frontier = observed,
                 mode = "csr",
                 reason = "frontier outgrew the indexed path",
                 "expand mode switched between input batches",
             );
             Switch::Csr.record(switch);
-            source = Source::csr(env, edge_def, step).await?;
+            source = Source::csr(env, edge_def, named).await?;
         }
         let input_memory = memory.child("expand input batch")?;
         input_memory.hold(&batch)?;
@@ -202,8 +209,9 @@ impl<'g> Source<'g> {
     async fn csr(
         env: &'g GraphEnv,
         edge_def: &omnigraph_compiler::catalog::EdgeType,
-        step: &ExpandStep,
+        named: &NamedExpand,
     ) -> Result<Self> {
+        let member = &named.member;
         let gi = env
             .graph_index
             .get()
@@ -214,7 +222,8 @@ impl<'g> Source<'g> {
                     "graph index required for CSR traversal".to_string(),
                 ))
             })?;
-        let csr = resolve_csr(gi, edge_def, &step.edge_type, step.direction).map_err(external)?;
+        let csr =
+            resolve_csr(gi, edge_def, &member.edge_type, member.direction).map_err(external)?;
         Ok(Self::Csr { csr })
     }
 

@@ -33,10 +33,14 @@ struct Recorded<'s> {
 }
 
 impl<'s> Recorded<'s> {
-    fn new(source: &'s dyn PlanSource) -> Self {
+    fn new(source: &'s dyn PlanSource, has_wildcard_traversal: bool) -> Self {
+        let read = Assumptions {
+            has_wildcard_traversal,
+            ..Assumptions::default()
+        };
         Self {
             source,
-            read: RefCell::new(Assumptions::default()),
+            read: RefCell::new(read),
         }
     }
 
@@ -136,6 +140,12 @@ impl PlanSource for Recorded<'_> {
         traversal
     }
 
+    fn traversal_work_limit(&self) -> Option<u64> {
+        let limit = self.source.traversal_work_limit();
+        self.read.borrow_mut().traversal_work_limit = limit;
+        limit
+    }
+
     /// Recorded as the setting spells it: `0` is no cap.
     fn ann_nprobes(&self) -> Option<usize> {
         let nprobes = self.source.ann_nprobes();
@@ -154,13 +164,13 @@ impl PlanSource for Recorded<'_> {
 /// Every parameter name `expr` names.
 fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
     match expr {
-        IRExpr::Param(name) => {
+        IRExpr::Param(name, _) => {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => {
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
         }
@@ -168,6 +178,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             field,
             query,
             max_edits,
+            ..
         } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
@@ -179,6 +190,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             primary,
             secondary,
             k,
+            ..
         } => {
             params_of_expr(primary, out);
             params_of_expr(secondary, out);
@@ -191,11 +203,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             params_of_expr(left, out);
             params_of_expr(right, out);
         }
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Not(inner, _)
+        | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
         IRExpr::PropAccess { .. }
-        | IRExpr::Variable(_)
-        | IRExpr::Literal(_)
-        | IRExpr::AliasRef(_) => {}
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::AliasRef(_, _) => {}
     }
 }
 
@@ -305,7 +319,7 @@ pub fn plan_query(
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source);
+    let recorded = Recorded::new(source, query.has_wildcard_traversal());
     let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
     crate::optimizer::optimize(&mut logical, &recorded, bounds)
         .map(|mut optimized| {
@@ -329,7 +343,8 @@ pub fn route(
     bounds: &Bounds,
 ) -> Decision {
     let operation = OperationSummary::of(op);
-    let recorded = Recorded::new(source);
+    let wildcard = matches!(op, Operation::Query(query) if query.has_wildcard_traversal());
+    let recorded = Recorded::new(source, wildcard);
     let source = &recorded;
     let mut plan = match resolve(op, source) {
         Ok(plan) => plan,
@@ -541,6 +556,7 @@ mod tests {
                 schema: Arc::new(Schema::new(vec![Field::new("__id", DataType::Utf8, false)])),
                 key: vec![],
                 object_columns: vec!["__id".into()],
+                object_fields: vec![Field::new("@id", DataType::Utf8, false)].into(),
                 row_count: None,
             },
         );
@@ -553,8 +569,17 @@ mod tests {
                 filters: vec![],
             }],
             return_exprs: vec![IRProjection {
-                expr: IRExpr::Variable("d".into()),
+                expr: IRExpr::Variable(
+                    "d".into(),
+                    omnigraph_compiler::ExprType::Node {
+                        type_name: "Doc".into(),
+                    },
+                ),
                 alias: None,
+                column: "d".into(),
+                ty: omnigraph_compiler::ExprType::Node {
+                    type_name: "Doc".into(),
+                },
             }],
             order_by: vec![],
             limit: None,
@@ -592,5 +617,25 @@ mod tests {
             panic!("missing type must fail planning")
         };
         assert_eq!(plan_query(&query, &missing, &BOUNDS).unwrap_err(), reason);
+    }
+}
+
+#[cfg(test)]
+mod cast_parameter_tests {
+    use super::*;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    #[test]
+    fn a_cast_keeps_its_parameter_dependency() {
+        let expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::Param(
+                "age".into(),
+                ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+            )),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, true)),
+        };
+        let mut names = BTreeSet::new();
+        params_of_expr(&expr, &mut names);
+        assert_eq!(names, BTreeSet::from(["age".to_string()]));
     }
 }

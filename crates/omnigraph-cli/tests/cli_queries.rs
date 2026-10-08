@@ -282,10 +282,22 @@ fn branch_statements_remote_round_trip_and_delete_needs_consent() {
             .arg("branch delete b0")
             .arg("--json"),
     );
+    let refusal = parse_stdout_json(&refused_json);
     assert!(
-        stderr_string(&refused_json).contains("pass --yes to confirm"),
-        "--json fails closed too"
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("pass --yes to confirm"),
+        "--json fails closed too: {refusal}"
     );
+    assert_eq!(
+        refusal["command_outcome"],
+        serde_json::json!({
+            "execution":"not_started", "effects":"none", "action":"refresh"
+        })
+    );
+    assert!(refusal.get("http_status").is_none());
+    assert!(refused_json.stderr.is_empty());
     let listed = output_success(
         served("query", &server)
             .arg("-e")
@@ -533,27 +545,60 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
 
 #[test]
 fn a_source_this_cli_cannot_parse_is_sent_to_the_server_verbatim() {
-    let unreachable = "http://127.0.0.1:9";
-    let sent_verbatim = |verb: &str| -> String {
-        let mut command = cli();
-        command
-            .arg(verb)
-            .arg("-e")
-            .arg("not gq at all {")
-            .arg("--server")
-            .arg(unreachable)
-            .arg("--graph")
-            .arg("g");
-        stderr_string(&output_failure(&mut command))
-    };
-    for verb in ["query", "mutate"] {
-        let stderr = sent_verbatim(verb);
-        assert!(
-            stderr.contains("error sending request") || stderr.contains("Connection refused"),
-            "{verb}: a source this CLI's grammar cannot parse is the server's to judge, so it \
-             goes over the wire rather than failing locally (an older CLI never gates a newer \
-             server's grammar); got: {stderr}"
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
+    // After contract admission, remote source validation belongs to the server.
+    // Local statement classification must not replace its error or alter input.
+    const SOURCE: &str = "not gq at all {";
+    let refusal = serde_json::json!({
+        "error": "server rejected malformed source", "code": "bad_request",
+    });
+    for (verb, route, source_field) in [
+        ("query", "/graphs/g/query", "query"),
+        ("mutate", "/graphs/g/mutate", "query"),
+    ] {
+        let server = IntentApiFixture::graph(vec![IntentReply::json(400, refusal.clone())]);
+        let output = output_failure(
+            cli()
+                .arg(verb)
+                .arg("-e")
+                .arg(SOURCE)
+                .arg("--server")
+                .arg(&server.origin)
+                .arg("--graph")
+                .arg("g")
+                .arg("--json"),
         );
+        let mut actual = parse_stdout_json(&output);
+        if verb == "mutate" {
+            assert_eq!(actual["http_status"], 400);
+            assert_eq!(
+                actual["command_outcome"],
+                serde_json::json!({
+                    "execution":"unknown", "effects":"unknown", "action":"reconcile"
+                })
+            );
+            let fields = actual.as_object_mut().unwrap();
+            fields.remove("http_status");
+            fields.remove("command_outcome");
+        }
+        assert_eq!(
+            actual, refusal,
+            "{verb} must preserve every original server field"
+        );
+        assert!(output.stderr.is_empty(), "{verb}: {output:?}");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "one discovery and one data request");
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, route);
+        assert_eq!(requests[1].body[source_field], SOURCE);
+        assert_eq!(
+            requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+            omnigraph_api_types::HTTP_API_CONTRACT
+        );
+        server.assert_complete();
     }
 }
 
@@ -799,53 +844,6 @@ fn set_flag_refusals_happen_before_any_open_or_round_trip() {
     }
 }
 
-#[test]
-fn query_check_alias_matches_lint_output() {
-    let temp = tempdir().unwrap();
-    let schema_path = temp.path().join("schema.pg");
-    let query_path = temp.path().join("queries.gq");
-    write_file(
-        &schema_path,
-        r#"
-node Person {
-    name: String
-}
-"#,
-    );
-    write_query_file(
-        &query_path,
-        r#"
-query list_people() {
-    match { $p: Person }
-    return { $p.name }
-}
-"#,
-    );
-
-    let lint_output = output_success(
-        cli()
-            .arg("query")
-            .arg("lint")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-    let check_output = output_success(
-        cli()
-            .arg("query")
-            .arg("check")
-            .arg("--query")
-            .arg(&query_path)
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    );
-
-    assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
-}
-
 // Legacy `omnigraph.yaml` `aliases:` invoked via the `--alias` flag were
 // removed in RFC-011 D4 — operator aliases now live under `omnigraph alias
 // <name>` (the happy path is covered by system_local's operator-alias e2e).
@@ -928,7 +926,7 @@ fn queries_list_with_store_flag_errors() {
 #[test]
 fn queries_list_with_as_flag_errors() {
     // Read-only control verbs (`queries`, `policy`, `cluster status`, …) never
-    // read the actor; only `cluster apply`/`cluster approve` do. `--as` on a
+    // read the actor; only actor-bound `cluster apply` does. `--as` on a
     // non-attributing control verb must be a loud guard error, not a silently
     // dropped identity (PR #377 review follow-up).
     let output = output_failure(
@@ -992,8 +990,7 @@ fn converged_cluster_with_query(
         ),
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     temp
 }
 
@@ -1016,11 +1013,11 @@ fn queries_validate_exits_zero_on_clean_registry() {
 }
 
 #[test]
-fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
+fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
     // In the cluster model a stored query is checked at the cluster boundary
-    // (import/apply), so a broken query can never reach the applied state
+    // (apply), so a broken query can never reach the applied state
     // `queries validate` reads — the gate is upstream. `Widget` is not in the
-    // fixture schema, so import must reject `ghost`, naming it; `broken` does
+    // fixture schema, so apply must reject `ghost`, naming it; `broken` does
     // not parse, and the human report also says where, from the diagnostic.
     let cases: [(&str, &str, &[&str]); 2] = [
         (
@@ -1050,7 +1047,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
             ),
         )
         .unwrap();
-        let output = output_failure(cli().arg("cluster").arg("import").arg("--config").arg(dir));
+        let output = output_failure(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
         let combined = format!(
             "{}{}",
             stdout_string(&output),
@@ -1059,7 +1056,7 @@ fn cluster_import_rejects_a_broken_query_naming_it_and_where() {
         for needle in expected {
             assert!(
                 combined.contains(needle),
-                "cluster import must reject `{name}` with {needle:?}; got:\n{combined}"
+                "cluster apply must reject `{name}` with {needle:?}; got:\n{combined}"
             );
         }
     }
@@ -1237,8 +1234,7 @@ fn queries_validate_graph_filter_selects_one_graph() {
     let temp = tempdir().unwrap();
     let dir = temp.path();
     write_multi_graph_cluster_fixture(dir);
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(dir));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(dir));
+    apply_cluster_fixture(dir);
     let output = output_success(
         cli()
             .arg("queries")

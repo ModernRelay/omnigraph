@@ -7,14 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
-    builder::{
-        BooleanBuilder, Date32Builder, Date64Builder, Float64Builder, Int32Builder, Int64Builder,
-        ListBuilder, StringBuilder,
-    },
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    UInt32Array,
 };
-use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
@@ -26,8 +21,8 @@ use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_planner::{
-    BoundPlan, DatasetPin, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankKind,
-    RankScope,
+    BoundPlan, DatasetPin, ExpandMode, ExpandPolicy, NodeId, OverfetchRung, PhysicalNode,
+    PhysicalPlan, Prefilter, RankKind, RankScope,
 };
 
 use crate::db::{DatasetEntry, Omnigraph, Snapshot};
@@ -43,6 +38,7 @@ mod adapters;
 mod bind;
 mod constant;
 mod context;
+mod exact_aggregate;
 mod explain;
 mod expr;
 mod graph;
@@ -60,10 +56,13 @@ mod report;
 mod run;
 mod scan;
 mod search;
+mod typed_value;
 
 use expr::*;
 use scan::*;
 use search::*;
+use typed_value::{check_array_type, typed_literal_to_array};
+pub(crate) use typed_value::{fill_declared_params, validate_params};
 
 use bind::bind;
 pub(crate) use constant::evaluate_constant;
@@ -76,7 +75,7 @@ pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
 pub(crate) use scan::{id_in_list_expr, ir_expr_to_df_expr};
-pub(crate) use search::{check_param_date_literals, referenced_edge_types};
+pub(crate) use search::referenced_edge_types;
 
 /// What `execute` takes beside the bound plan, each member data and not a
 /// decision: the read-consistency unit, the type metadata the lowered
@@ -149,10 +148,11 @@ pub(crate) fn plan_edge_types(
     catalog: &Catalog,
 ) -> HashMap<String, (String, String)> {
     plan.live()
-        .filter_map(|(_, node)| match node {
-            PhysicalNode::Expand { edge_type, .. } => Some(edge_type),
-            _ => None,
+        .flat_map(|(_, node)| match node {
+            PhysicalNode::Expand { edges, .. } => edges.members(),
+            _ => &[],
         })
+        .map(|member| &member.edge_type)
         .filter_map(|name| {
             catalog
                 .edge_types
@@ -326,11 +326,106 @@ pub(crate) async fn execute_query_inspected(
     })
 }
 
+/// Replayed plans must keep the statement's admission contract intact.
+/// Refuse inconsistent policy before any shortcut can materialize a CSR.
+fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::NonZeroU64>> {
+    let cap = plan
+        .assumptions()
+        .validated_traversal_work_limit()
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    for (_, node) in plan.live() {
+        match node {
+            PhysicalNode::Expand {
+                edges,
+                policy,
+                mode,
+                versions,
+                src_type,
+                dst_type,
+                min_hops,
+                max_hops,
+                edge_binding,
+                ..
+            } => {
+                let budgeted = matches!(policy, ExpandPolicy::Budgeted);
+                if (edges.named().is_none() || budgeted) && cap.is_none()
+                    || cap.is_some() && (!budgeted || *mode != ExpandMode::IndexedScan)
+                {
+                    return Err(OmniError::manifest_internal(
+                        "inconsistent traversal budget, selection and execution policy",
+                    ));
+                }
+                operators::validate_expand_structure(
+                    edges.members(),
+                    matches!(
+                        edges,
+                        omnigraph_compiler::traversal::EdgeSelection::Alternation(_)
+                    ),
+                    src_type != dst_type,
+                    *min_hops,
+                    *max_hops,
+                    edge_binding.is_some(),
+                )?;
+                let members = edges.members();
+                if members.len() != versions.len()
+                    || members.iter().any(|member| {
+                        let name = member.edge_type.as_str();
+                        let version = versions.get(name).copied();
+                        version.is_none()
+                            || plan
+                                .assumptions()
+                                .datasets
+                                .get(&edge_table_key(name))
+                                .map(|pin| pin.as_ref().map(|pin| pin.version))
+                                != version
+                    })
+                {
+                    return Err(OmniError::manifest_internal(
+                        "traversal members do not match captured dataset versions",
+                    ));
+                }
+            }
+            PhysicalNode::RankFuse { prefilter, .. } if cap.is_some() && prefilter.admits() => {
+                return Err(OmniError::manifest_internal(
+                    "budgeted traversal cannot use the CSR prefilter",
+                ));
+            }
+            PhysicalNode::Scan {
+                ranked: Some(ranked),
+                ..
+            } if cap.is_some() && ranked.prefilter.as_ref().is_some_and(Prefilter::admits) => {
+                return Err(OmniError::manifest_internal(
+                    "budgeted traversal cannot use the CSR prefilter",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(cap)
+}
+
 /// Run `bound` under `context` and report what each of its nodes did, every
 /// pass of the overfetch ladder folded into one report.
 pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Result<PlanRun> {
+    omnigraph_planner::validate_aggregate_specs(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    omnigraph_planner::validate_output_schemas(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let traversal_limit = validate_traversal_admission(&bound.plan)?;
+    omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    let ctx =
+        QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
+    ctx.run_owned(execute_with_context(bound, context, &ctx))
+        .await
+}
+
+async fn execute_with_context(
+    bound: BoundPlan,
+    context: &EngineContext<'_>,
+    ctx: &QueryContext,
+) -> Result<PlanRun> {
     let mut executed = ExecutionReport::default();
-    let ctx = QueryContext::new(bound.plan.assumptions().memory_limit)?;
     let policy = bound.plan.assumptions().gate_policy;
     let lowering = Lowering::new(&bound, context);
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
@@ -344,7 +439,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         }
         let lowered = lowering.lower_query(&pass)?;
         lowered.record_in_memory_filters();
-        let fused = Box::pin(run_plan(&lowered, &bound.plan, &ctx)).await?;
+        let fused = Box::pin(run_plan(&lowered, &bound.plan, ctx)).await?;
         executed.record(pass_rows(&lowered, &bound.plan, 0)?);
         return Ok(PlanRun {
             result: QueryResult::new(fused.schema(), vec![fused]),
@@ -367,7 +462,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         };
     }
 
-    let (result_batch, report, rows) = Box::pin(run_once(&lowering, &ctx, &pass, 0)).await?;
+    let (result_batch, report, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
     let mut result_batch = result_batch;
     let mut report = report;
@@ -432,7 +527,7 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
                     }
                 };
                 let (retried, retried_report, rows) =
-                    Box::pin(run_once(&lowering, &ctx, &wider, rung)).await?;
+                    Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
                 executed.record(rows);
                 result_batch = retried;
                 report = retried_report;
@@ -463,4 +558,273 @@ pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Re
         plan: bound,
         report: executed,
     })
+}
+
+#[cfg(test)]
+mod traversal_admission_tests {
+    use super::*;
+    use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
+    use omnigraph_planner::{ExpandMode, ExpandPolicy};
+
+    fn selected_plan() -> PhysicalPlan {
+        let mut plan = PhysicalPlan::new();
+        let input = plan.add(PhysicalNode::OuterReference {
+            outer_var: "p".into(),
+        });
+        let root = plan.add(PhysicalNode::Expand {
+            input,
+            src: "p".into(),
+            dst: "q".into(),
+            edges: EdgeSelection::Alternation(vec![EdgeMember {
+                edge_type: "Knows".into(),
+                direction: Direction::Out,
+            }]),
+            src_type: "Person".into(),
+            dst_type: "Person".into(),
+            min_hops: 1,
+            max_hops: Some(1),
+            edge_binding: None,
+            mode: ExpandMode::IndexedScan,
+            frontier_estimate: None,
+            policy: ExpandPolicy::Budgeted,
+            versions: [("Knows".into(), None)].into(),
+        });
+        plan.set_root(root);
+        let mut assumptions = plan.assumptions().clone();
+        assumptions.traversal_work_limit = Some(100);
+        assumptions.datasets.insert("edge:Knows".into(), None);
+        plan.set_assumptions(assumptions);
+        plan
+    }
+
+    #[test]
+    fn replay_refuses_missing_or_zero_selector_budget_issue_659() {
+        let mut plan = selected_plan();
+        validate_traversal_admission(&plan).unwrap();
+        for cap in [None, Some(0), Some(i64::MAX as u64 + 1)] {
+            let mut assumptions = plan.assumptions().clone();
+            assumptions.traversal_work_limit = cap;
+            plan.set_assumptions(assumptions);
+            assert!(validate_traversal_admission(&plan).is_err());
+        }
+    }
+
+    #[test]
+    fn replay_refuses_duplicate_cap_authorities_and_noncanonical_members_issue_659() {
+        let mut plan = selected_plan();
+        let mut assumptions = plan.assumptions().clone();
+        assumptions
+            .settings
+            .insert("traversal_work_limit".into(), "100".into());
+        plan.set_assumptions(assumptions);
+        assert!(validate_traversal_admission(&plan).is_err());
+        let member = |name: &str| EdgeMember {
+            edge_type: name.into(),
+            direction: Direction::Out,
+        };
+        for members in [
+            vec![],
+            vec![member("Knows"), member("Knows")],
+            vec![member("Likes"), member("Knows")],
+        ] {
+            let mut plan = selected_plan();
+            let root = plan.root();
+            let Some(PhysicalNode::Expand {
+                edges, versions, ..
+            }) = plan.node_mut(root)
+            else {
+                unreachable!()
+            };
+            *versions = members
+                .iter()
+                .map(|member| (member.edge_type.clone(), None))
+                .collect();
+            *edges = EdgeSelection::Alternation(members);
+            let mut assumptions = plan.assumptions().clone();
+            assumptions.datasets.insert("edge:Likes".into(), None);
+            plan.set_assumptions(assumptions);
+            assert!(validate_traversal_admission(&plan).is_err());
+        }
+    }
+
+    #[test]
+    fn replay_refuses_csr_mode_and_missing_member_pin_issue_659() {
+        let mut plan = selected_plan();
+        let root = plan.root();
+        let Some(PhysicalNode::Expand { mode, .. }) = plan.node_mut(root) else {
+            unreachable!()
+        };
+        *mode = ExpandMode::Csr;
+        assert!(validate_traversal_admission(&plan).is_err());
+        let mut plan = selected_plan();
+        let mut assumptions = plan.assumptions().clone();
+        assumptions.datasets.clear();
+        plan.set_assumptions(assumptions);
+        assert!(validate_traversal_admission(&plan).is_err());
+    }
+
+    #[test]
+    fn replay_refuses_capped_pinned_policy_and_mismatched_version_issue_659() {
+        for named in [false, true] {
+            let mut plan = selected_plan();
+            validate_traversal_admission(&plan).unwrap();
+            let root = plan.root();
+            let Some(PhysicalNode::Expand { edges, policy, .. }) = plan.node_mut(root) else {
+                unreachable!()
+            };
+            if named {
+                *edges = EdgeSelection::Named(edges.members()[0].clone());
+            }
+            *policy = ExpandPolicy::Pinned;
+            let error = validate_traversal_admission(&plan).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("inconsistent traversal budget, selection and execution policy"),
+                "{error}"
+            );
+        }
+
+        let mut plan = selected_plan();
+        let root = plan.root();
+        let Some(PhysicalNode::Expand { versions, .. }) = plan.node_mut(root) else {
+            unreachable!()
+        };
+        versions.insert("Knows".into(), Some(7));
+        let error = validate_traversal_admission(&plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("members do not match captured dataset versions"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_refuses_ranked_topology_prefilter_bypasses_issue_659() {
+        use omnigraph_planner::{
+            ColumnRef, Hop, RankArm, RankedAccess, ScanInput, ScanSpec, SideId, TableRef,
+        };
+        let prefilter = |feeds| Prefilter {
+            ranked_type: "Person".into(),
+            hops: vec![Hop {
+                edge_type: "Knows".into(),
+                direction: Direction::Out,
+            }],
+            feeds,
+        };
+        let mut plan = selected_plan();
+        let input = 0;
+        *plan.node_mut(input).unwrap() = PhysicalNode::Scan {
+            source: ScanInput::Table,
+            spec: Box::new(ScanSpec {
+                side: SideId::Base,
+                table: TableRef {
+                    type_key: "node:Person".into(),
+                    dataset_path: "node_Person".into(),
+                    native_branch: None,
+                },
+                version: None,
+                columns: SystemColumns {
+                    id: "__id",
+                    src: "__src",
+                    dst: "__dst",
+                },
+                fragments: None,
+                projection: None,
+                filter: None,
+                binding: Some("p".into()),
+                runtime_filter: None,
+            }),
+            ordered: false,
+            keys_only: false,
+            ranked: Some(RankedAccess {
+                kind: RankKind::Nearest,
+                score: IRExpr::PropAccess {
+                    variable: "p".into(),
+                    property: "_distance".into(),
+                    ty: omnigraph_compiler::types::ExprType::from_prop(
+                        &omnigraph_compiler::types::PropType::scalar(ScalarType::F32, false),
+                    ),
+                },
+                property: "embedding".into(),
+                query: IRExpr::Literal(
+                    Literal::String("query".into()),
+                    omnigraph_compiler::types::ExprType::from_prop(
+                        &omnigraph_compiler::types::PropType::scalar(
+                            omnigraph_compiler::types::ScalarType::String,
+                            false,
+                        ),
+                    ),
+                ),
+                fetch: Some(1),
+                nprobes: None,
+                scope: RankScope::Order,
+                overfetch: vec![],
+                prefilter: None,
+            }),
+        };
+        validate_traversal_admission(&plan).unwrap();
+        let Some(PhysicalNode::Scan {
+            ranked: Some(ranked),
+            ..
+        }) = plan.node_mut(input)
+        else {
+            unreachable!()
+        };
+        ranked.prefilter = Some(prefilter(vec![input]));
+        let error = validate_traversal_admission(&plan).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot use the CSR prefilter"),
+            "{error}"
+        );
+
+        let mut plan = selected_plan();
+        let input = plan.root();
+        let arm = |kind| RankArm {
+            input,
+            binding: "p".into(),
+            kind,
+        };
+        let root = plan.add(PhysicalNode::RankFuse {
+            arms: [arm(RankKind::Nearest), arm(RankKind::Bm25)],
+            k: None,
+            limit: Some(1),
+            prefilter: prefilter(vec![]),
+            row_tiebreak: vec![ColumnRef::property("q", "@id")],
+        });
+        plan.set_root(root);
+        validate_traversal_admission(&plan).unwrap();
+        let Some(PhysicalNode::RankFuse { prefilter, .. }) = plan.node_mut(root) else {
+            unreachable!()
+        };
+        prefilter.feeds.push(0);
+        let error = validate_traversal_admission(&plan).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot use the CSR prefilter"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replay_refuses_unbounded_and_multi_hop_edge_bindings_issue_659() {
+        let mut plan = selected_plan();
+        let root = plan.root();
+        let Some(PhysicalNode::Expand { max_hops, .. }) = plan.node_mut(root) else {
+            unreachable!()
+        };
+        *max_hops = None;
+        assert!(validate_traversal_admission(&plan).is_err());
+        let Some(PhysicalNode::Expand {
+            max_hops,
+            edge_binding,
+            ..
+        }) = plan.node_mut(root)
+        else {
+            unreachable!()
+        };
+        *max_hops = Some(2);
+        *edge_binding = Some("e".into());
+        assert!(validate_traversal_admission(&plan).is_err());
+    }
 }

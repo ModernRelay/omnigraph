@@ -1,118 +1,135 @@
 # OmniGraph benchmark harness
 
-`omnigraph-bench` owns benchmark definitions, planning, execution, durable run
-records, and the rebuildable result projection. It parses strict, versioned
-YAML case and suite documents, validates their semantics, computes stable
-experiment identities, and can execute supported local `branch-merge-v1`
-points. Run wall-clock measurements from a clean, flag-free release build only
-(the workspace `.cargo/config.toml` sets `--cfg tokio_unstable` for
-development builds; the empty `RUSTFLAGS` clears it, and the runner refuses a
-build whose build script saw any encoded Rust flags):
+`omnigraph-bench run tiny-read` runs a named GQT benchmark in a supervised
+release worker. One [`benchmarks.yaml`](../../benchmarks/benchmarks.yaml)
+selects fixtures, workloads and run settings. `run --config FILE` accepts the
+same format for custom experiments; [custom.example.yaml](../../benchmarks/custom.example.yaml)
+is a complete starting point. The measured operation is selected by ordinal
+plus exact header/body echo. GQT remains the language for data,
+operations, and expectations; it has no benchmark timing or cache labels.
+The production parser/executor comes from `omnigraph-gqt-core`, which has no
+build script or normal `test-util` requirement. The GQT binary separately owns
+correctness/DST execution and never supplies these wall-clock measurements.
+
+The [catalog guide](../../benchmarks/README.md) contains complete examples. The
+[`local-regression` group](../../benchmarks/benchmarks.yaml)
+contains bounded history, idle-registration, multi-table, branch-identity,
+churn, configured history-release, and equal-current/different-history pairs.
+The larger [history recipes](../../benchmarks/README.md#opt-in-history-scale) are opt-in.
+For a qualified flag-free release build, the existing build command is
+`RUSTFLAGS= cargo build --release --locked -p omnigraph-bench`; this clears the
+workspace's development `--cfg tokio_unstable`. Neither that flag nor debug
+assertions may remain in a measured worker. Then run a small suite:
 
 ```bash
-RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
-  suite run benchmarks/suites/local-smoke.suite-v1.yaml \
-  --archive .bench/archive
+target/release/omnigraph-bench run local-fast \
+  --dataset-cache /qualified/cache --json
 ```
 
-The checked-in catalog and command examples are in
-[`../../benchmarks/README.md`](../../benchmarks/README.md). RFC 0039 owns the
-measurement protocol and identity vocabulary.
+Use `list fixtures`, `list workloads` and `list scenarios` to discover inputs;
+`show NAME` reports effective settings and `show --workload FILE` lists operation
+ordinals. `init --help` explains config generation. All support JSON output.
+`cache status NAME` and paginated `cache list` are read-only: `present` validates
+published evidence, while `--verify` audits bytes before reporting `cached`.
+Missing sources and absent cache entries remain distinct. See `help config`,
+`help cache`, or the versioned `help --json` schema. Inspection/help do not need
+a release build or a dataset cache.
 
-## Boundaries
+## Execution and identity boundaries
 
-- A case describes exactly one benchmark point.
-- A suite references cases and sets repetition counts. Repetitions acquire more
-  evidence for a point; they do not change its identity.
-- `point_id` is the full SHA-256 of the canonical typed experiment identity.
-  The readable `point_name` is display text, never a key.
-- Process lifecycle, engine preparation, OS page-cache treatment, and the
-  named warm-up program are separate cache-condition fields in point identity.
-  Process-cold explicitly leaves the OS page cache uncontrolled. Neither
-  page-cache-cold nor storage-cold is representable without stronger controls.
-- The engine does not depend on this crate. The runner depends on the public
-  engine surface and consumes the plans produced here.
-- Runner-v1 builds one already-diverged fixture at a stable `active` path,
-  verifies it, closes it, and freezes its complete physical tree by SHA-256.
-  Public execution performs construction in a dedicated process group under a
-  bounded watchdog. That child byte-digests the completed tree, makes a
-  never-opened reset template, and removes `active` before returning an
-  identity-checked handoff. APFS uses forced clonefile; Linux XFS uses a full
-  verified copy only for process-fresh points with an uncontrolled page cache.
-  The parent accepts it only after the direct child
-  has been reaped and the process group is gone. Any failed, partial, or
-  panicked fixture build quarantines its disposable workspace instead of
-  deleting possibly active state. Every repetition restores the template
-  to that same `active` path, so Lance shallow
-  branches retain valid absolute base paths and samples do not accumulate
-  branch, manifest, or deletion history. Clonefile never falls back to copying;
-  plain-copy reset reads and verifies all bytes outside timing.
-- Every repetition runs in a fresh worker process whose executable SHA-256,
-  source commit/dirty state, Cargo's
-  release/opt-level observations, compiler-effective debug assertions, the
-  checked-in release-profile declaration, build-script-visible flag/override
-  state, Cargo features reported by `omnigraph-engine` itself, and a versioned
-  allowlist of effective engine environment. Fixture and repetition children
-  start from a cleared environment with fixed locale. The fixture child gets a
-  protocol-owned empty `fixture-scratch-v1` directory as `TMPDIR`; each measured
-  worker gets its own empty `worker-scratch-N` directory as both `TMPDIR` and
-  `OMNIGRAPH_MERGE_STAGING_DIR`. The child validates that these absolute paths
-  are real siblings of the active store on the verified backend. They are
-  removed only after process containment is proved; an uncontained failure
-  quarantines the whole workspace. The only inherited engine setting is
-  `LANCE_MEM_POOL_SIZE`, admitted only when it is the canonical decimal `u64`
-  byte count Lance actually parses; that applied byte count becomes typed SUT
-  identity. Non-UTF-8, unit-suffixed, noncanonical, and overflowing values are
-  refused before execution. Parent-side
-  `TOKIO_WORKER_THREADS`/`RAYON_NUM_THREADS` and unknown `LANCE_*` or
-  engine-facing `OMNIGRAPH_*` overrides are refused without serializing their
-  values. Cargo does not expose the final target rustc invocation to
-  `build.rs`, so effective LTO/codegen-unit/strip settings remain explicitly
-  unproved until later controlled infrastructure supplies a digest-bound build
-  receipt.
-  Its complete cache condition is part of point identity. When declared, its
-  read-only warm-up program runs before measured counters and the monotonic
-  merge timer begin. A storage firewall permits only the engine's one balanced,
-  empty create-if-absent capability probe during each read-write open; every
-  other pre-measurement write is rejected. The worker also proves the restored
-  tree's complete metadata shape before it declares itself ready. Each timed
-  repetition performs exactly one branch merge. `reopened-after-program`
-  additionally drops and reopens the engine handle after the warm-up while the
-  firewall remains closed; it makes no cache-invalidation claim.
-  `preparation-only` is executable as process-cold: it has no declared warm-up,
-  while ordinary engine open and protected-head capture still occur and the OS
-  page cache remains explicitly uncontrolled.
-- After the measured window closes, the worker reads and verifies the exact
-  expected rows and values across every table on target, source, and main,
-  including untouched tables, and proves that source and main branch heads did
-  not move. The parent does not independently read those content bytes. It
-  independently derives and validates the point/case identities, merge route,
-  and declared table/total-row count attestations returned by the worker. The
-  run also requires a real three-way merge and one `TableWalk` interval per
-  diverged edge table, so a fast-forward or otherwise vacuous sample fails
-  loudly. This runner-v1 verification is deliberately O(store), outside the
-  measured window. Receipt-based O(delta) certification begins with the future
-  versioned-S3 reset slice. A future DST oracle may add an independent check,
-  but never replaces the per-repetition content probes.
-- The supervisor starts the declared hard deadline immediately before sending
-  `Begin`. If the worker has not sent `Settled` by that deadline, the supervisor
-  sends `SIGKILL` to its process group, waits for and reaps the child, and proves
-  the group is gone. Every repetition failure, including a trailing protocol
-  frame after `Complete`, rejects the sample. Cleanup is permitted only when
-  the direct child was reaped, its process group is gone, and bounded
-  stdout/stderr capture reached clean EOF; otherwise the disposable workspace
-  is quarantined. Thus a contained failure may be cleaned up, while an unproved
-  containment state is preserved for inspection. A killed or partial mutation
-  never becomes a sample.
-  Preparation and exact verification use separate bounded watchdogs, each with
-  a 300-second minimum allowance.
-- Store counts are **logical store calls** made by the engine. They do not
-  observe retries, pagination, multipart fan-out, or other physical attempts,
-  and therefore are not network-request or cloud-cost measurements.
-- Fixture validation covers the exact schema, empty index inventory, and every
-  row on `main`, `bench-source`, and `bench-target`. Its logical-content digest
-  is stable across rebuilt Lance ids, timestamps, and encodings; a separate
-  physical tree digest pins the exact bytes restored for every repetition.
+A scenario is one selected operation on a fixture. Groups select scenario
+IDs, while the config's explicit `run` list supplies default selections. The
+runner expands these into the existing validated-case representation before
+execution; legacy case/suite file readers remain supported. File paths and source text are resolved/frozen before workers start.
+Workers receive bounded immutable text and never reread authored files.
+Selected ordinals must have matching exact echoes and cannot occur in loops.
+Generated selected loads must make one loader call. Prefix writes are refused,
+and at least one following step must carry an explicit verification
+expectation. A restart alone does not meet that requirement.
+
+The prefix derives process-cold, warmed-by-program, or reopened-after-program
+treatment. Settings/show are neutral. Warming requires observed engine-read
+callbacks, not merely a syntactic query whose parameters fail before execution.
+Every repetition uses a fresh process. OS page-cache state is uncontrolled or
+conditioned by the named `gqt-read-set-v1` program; neither page-cache-cold nor
+storage-cold is representable.
+
+The engine operation timer and logical counters close before expectations and
+verification. Reads materialize results within the interval. A selected
+restart installs fresh counting storage before timing, measures the engine
+open, and validates its preparation gate after the interval. Generated load
+rows are prepared outside a single-call measurement. Optional merge probes
+exist only for selected merges with per-phase attribution. The result carries
+operation-kind/ordinal/occurrence receipts, selected elapsed time, verification
+facts, and optional applicable merge evidence. Physical retries, pagination,
+multipart fan-out, cloud costs, calibration, and concurrency witnesses remain
+absent unless the record explicitly says otherwise.
+
+A later assertion, timeout, protocol, or process-exit failure rejects the
+repetition. Accepted Settled timing can survive as diagnostic evidence without
+becoming a valid sample. The parent enforces a separate measured-operation
+watchdog and preparation/verification bounds; the authored whole-file GQT
+budget also applies. The operation alone owns the benchmark clock. Parsing,
+building, restore, warm-up, assertions, archival work, and cleanup are excluded.
+
+Dataset construction runs in a bounded child process. The cache builds at its
+final `<key>/active` path, closes every engine handle, freezes a never-opened
+`root/` template, retires active, and publishes `fixture-source.json` followed
+by `dataset-build.json`. The parent accepts only after reap, process-group
+exit, and clean bounded output capture. The exclusive cache lease remains
+held through all repetitions and final cleanup. APFS requires forced clonefile;
+qualified XFS uses verified plain copies. Both restore the exact original
+active path so Lance shallow-branch references remain valid. Relocatable
+entries also use this conservative stable-path policy.
+
+`dataset build <dataset.gqt>` builds without a measured workload. Optional
+`--queries <queries.gqt>` contributes index requirements; `dataset build
+<case.yaml>` uses that case's exact union. Indexes are prepared with the seed
+before authored updates/deletes. Dataset-only and query-required index variants
+use different cache keys. `dataset validate` and `run --no-build` require
+a published hit. A hit validates descriptor, logical receipt, and template
+bytes once; APFS repetition preflight uses metadata/clone witnesses rather
+than rehashing the whole template. Plain-copy reset necessarily reads bytes
+outside timing.
+
+Cache keys bind recipe, engine/builder source digest, backend/reset, index
+needs, canonical cache location, and registered physical source identity where
+applicable. `GQT_ENGINE_DIGEST` covers production engine/core dependencies and
+benchmark build/observer/reset code, plus manifests, lockfile, toolchain and
+configuration. Authored inputs use separate text digests. Cache hit status and
+physical tree digest are durable audit facts outside point identity. Missing
+or changed published evidence is corruption, never a silent rebuild. Unknown
+unpublished state and uncertain process containment are preserved/quarantined;
+operator inspection must establish quiescence before removing such state.
+
+Final `point_id` binds recipe/query contents, verified dataset logical witness,
+selected ordinal/echo, derived cache treatment, backend, and protocol. It is
+unavailable during syntax-only planning; `planned_sha256` detects duplicate
+content experiments before build. Paths, human case IDs, repetitions, physical
+tree bytes, and cache hits do not change the point. Dataset identity covers
+all live branches' keyed-node properties, edge endpoints/properties and
+multiplicity, schema/index inventory, and normalized two-parent commit DAGs.
+Generated unkeyed edge IDs, commit ULIDs/timestamps, and physical manifest
+versions are excluded. Explicit IDs authored in a recipe remain bound by its
+text digest. Historical row images are not attested. Both parent links must
+resolve within bounded traversal, and parent generations must be smaller.
+
+Historical `branch-merge-v1` records retain their original field ordering and
+canonical bytes and remain readable beside GQT records. Their old authored
+execution and Rust fixture builder are retired; the legacy builder is a test
+oracle only. D50 fixture parity covers construction equivalence. Its new warm
+prefix consists of 24 authored aggregate queries and is not comparable as the
+same cache program to the retired Rust scans.
+
+Children use a cleared environment, fixed locale, and protocol-owned scratch
+siblings for `TMPDIR`; measured workers also use that scratch for
+`OMNIGRAPH_MERGE_STAGING_DIR`. Only modeled canonical `LANCE_MEM_POOL_SIZE`
+values are inherited. Unknown engine/Lance settings and Tokio/Rayon thread
+count overrides are refused. Each child attests executable digest, source,
+release/compiler facts, engine features, and machine identity. Effective
+LTO/codegen/strip options remain unproved without a controlled build receipt.
+Cleanup requires direct-child reap, process-group exit, and clean stdio;
+uncertain containment cannot release a cache entry for safe reuse.
 
 ## Logical references for real graphs
 
@@ -129,7 +146,7 @@ An externally built graph first needs a strict logical declaration. A
   against a byte-verified disposable copy.
 
 The checked-in FinGraph declaration is
-`benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
+`benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
 Its implemented algorithms are `omnigraph-schema-shape-v1`,
 `omnigraph-logical-properties-v1`, and
 `omnigraph-logical-graph-multiset-v1`. The document remains deliberately
@@ -147,7 +164,7 @@ Validate the declaration with:
 
 ```bash
 target/release/omnigraph-bench fixture reference validate \
-  benchmarks/fixtures/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
+  benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml \
   --json
 ```
 
@@ -245,27 +262,16 @@ observations and relocation safety, recheck its physical bytes, and then clean
 it up. They neither download from S3 nor open or mutate the registered source
 as an OmniGraph database.
 
-`fixture run-graph` is the narrow runnable adapter for the checked-in FinGraph
-reference and strict real-graph run YAML. From a release binary, it validates
-the copied graph, prepares a deterministic disjoint node-and-edge delta on two
-branches, freezes that prepared state, and restores identical inputs at the
-same path for fresh-process merge repetitions. macOS uses forced APFS
-clonefiles. Linux requires XFS on a directly mounted EC2 instance-store NVMe
-namespace and uses complete verified plain copies; it reserves one additional
-prepared-tree copy plus 1 GiB before freezing. On a dedicated benchmark mount,
-it waits for filesystem-wide writeback with `syncfs` after freezing and after
-each restore, outside timing. The result records
-`xfs-plain-copy-syncfs-same-active-path`, backend evidence, and machine evidence
-captured in each measured worker; differing worker identities fail the run.
-
-This path is deliberately diagnostic: its output always records
-`claim_eligible: false` and `durable_record: false`, has no warm-up, leaves the
-OS page cache uncontrolled, and cannot publish through `--archive`. Plain-copy
-reset reads the complete tree outside timing and can warm that cache. The
-command still does not download a fixture, dispatch through AWS, or publish
-durable telemetry. See the
-[FinGraph diagnostic instructions](../../benchmarks/README.md#fingraph-diagnostic-runner)
-for the declarative run shape and exact command.
+Registered datasets use the same `gqt-v1` case/suite/cache/archive path. A
+logical reference and schema-less GQT preparation are part of the recipe;
+`--fixture ID=BUNDLE` supplies only the current source location. The source is
+never opened directly as a database. Current imports require a main-only,
+relocation-self-contained graph with deterministic node `@key` columns;
+unkeyed nodes and named source branches are explicit scope refusals. An
+identity-aware export digest binds the fixed source's original IDs before
+preparation. Prepared generated edge IDs use the documented logical-equivalence
+domain. See the [registered FinBench recipe](../../benchmarks/README.md#registered-finbench-merge).
+The former `fixture run-graph` command and run YAML are retired.
 
 The local source namespace is a trusted-input boundary: the operator must keep
 it quiescent for the command. Digest/copy verification detects ordinary drift
@@ -299,8 +305,7 @@ compiler/build/engine facts. Build after committing the intended source, then
 verify the resulting archive:
 
 ```bash
-target/release/omnigraph-bench suite run \
-  benchmarks/suites/local-smoke.suite-v1.yaml \
+target/release/omnigraph-bench run local-smoke \
   --archive .bench/archive
 
 target/release/omnigraph-bench archive verify .bench/archive
@@ -405,35 +410,27 @@ Query callers choose fixed, parameterized names; arbitrary GQ text is not
 accepted. The projection may be deleted at any time and rebuilt without losing
 evidence.
 
-## Runner-v1 support envelope
+## Local support envelope
 
-Execution currently supports only synthetic builder v3 with seed `0`. Its even
-total table count is split equally between immutable node endpoint tables and
-uniform-ring edge tables; declared divergence applies to edge tables. It uses
-scalar uniform bulk-loaded data, no indexes or pre-existing deletion history,
-local filesystem storage, same-host embedded execution, one client, distinct-key
-write-heavy divergence, manual scheduling, per-phase attribution, and a
-monotonic timer. APFS uses local-clonefile reset and supports process-cold,
-warmed-by-program, and reopened-after-program engine preparation. Linux/XFS
-admits only verified plain-copy reset with the exact process-fresh,
-preparation-only, uncontrolled-page-cache, no-program contract described below.
+The adapter accepts direct-engine, local-filesystem GQT environments without
+DST seams or concurrent actor blocks. The admitted tuples are APFS with
+local-clonefile or qualified XFS with plain-copy, on the declared NVMe SSD
+backend. The platform probe remains authoritative. Cloud stores, remote
+servers, unproved backend declarations, and OS page-cache eviction claims are
+refused; unsupported diagnostic sources are retained under `benchmarks/deferred/`.
 
-The host probe proves APFS on an internal macOS NVMe or SATA SSD, or XFS on a
-direct EC2 instance-store NVMe namespace (and distinguishes EBS). A debug
-build, S3 or Azure backend, server execution, unproved
-host declaration, unsupported scenario axis, deadline breach, reset witness
-mismatch, non-general merge route, or content mismatch is refused instead of
-being approximated. A true OS-page-cache-cold claim is not representable yet;
-it requires a named platform/backend control and a post-control eviction
-witness. Storage-cold is likewise unsupported and unrepresentable.
-
-Before initialization, runner-v1 derives the exact builder publication recipe
-and refuses an emergent history depth. Its local construction envelope is at
-most 256 tables, 10 million base rows, 4 GiB of conservatively estimated
-generated bytes, 100,000 commits per branch, and 750,000 estimated fixture
-entries. It also requires free scratch capacity for a 16x byte-amplification
-allowance plus 1 GiB and the exact staged worker executable before writing the
-fixture. These are runner safety limits, not case-schema or engine limits.
+A frozen source is bounded at 512 KiB, the combined plan at 256 KiB, the bound
+request reservation at 512 KiB, and the actual framed request at 1 MiB. The
+selected echo is at most 16 KiB and must fit the projection's serialized row
+budget. Query programs are limited to 4096 expanded steps. Before acquiring or
+building a dataset, the runner bounds all repetitions' canonical receipts plus
+2 MiB reserved for the record envelope against the 64 MiB archive limit. Reduce
+repetitions when this bound is exceeded; the final record size is also checked.
+Dataset manifests are bounded at 1 MiB. Dataset history
+observation is bounded at 1024 live branches and one million reachable commits
+per branch; both parent links must be available. Generator-specific bounds
+remain in the core GQT grammar. These limits are explicit refusals, not silent
+truncation or fallback execution.
 
 Without `--archive`, `suite run --json` still emits a versioned diagnostic
 execution projection whose runs have `durable_record: false`; it must not be
@@ -453,64 +450,22 @@ print the same complete recovery JSON envelope, not only a timing summary. If
 acquisition fails and publishing its censored prefix also fails, that envelope
 retains the recording error and the complete structured acquisition error as
 separate fields.
-Fixture caching and controlled cloud orchestration belong to later, separately reviewed
-slices.
+Controlled cloud orchestration remains a later, separately reviewed slice.
 
 Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline
 contributes structured process-containment evidence, but never a partial
 sample.
 
-## Diagnostic engine comparison
+## End-to-end query and traversal workloads
 
-`examples/compare_engines.rs` times engine v2 through `Session::query` on a
-synthetic graph (engine v1 is the frozen test reference and has no production
-door to time). It checks row counts and records each shape's complete result
-before timing, then checks every measured result against it outside the
-timer. The ten shapes cover lookup, narrow
-and whole-node scans, filtering, counting, grouped aggregation, ordered top-k,
-traversal, filtered traversal and negation.
+The shared [catalog](../../benchmarks/benchmarks.yaml) owns the `end-to-end`,
+`query-shapes` and `traversal` groups. They execute complete public graph
+operations with expected rows authored in GQT. Each case identifies its own
+fixture size and cache treatment; bounded replacements have new experiment
+identities and do not preserve the historical Rust timing series.
 
-```bash
-RUSTFLAGS= cargo run --release --locked -p omnigraph-bench --example compare_engines -- \
-  --rows 10000 --iterations 20 --warmups 5
-```
-
-Setup, index construction, JSON conversion and verification are outside the
-measured window. Five warm-up passes precede 20 measured rounds; query order
-rotates. The timer includes query compilation/cache
-lookup, planning and execution through materialized result batches. Tokio uses
-four workers. The fixture has one edge per two nodes, a 1,080-byte biography
-and a 32-dimensional vector per node. Run sizes must be multiples of 100,
-from 1,000 through 100,000.
-
-Output is diagnostic JSON lines, not durable suite records. This measures warm
-local latency with shared engine caches and an uncontrolled OS page cache; it
-does not qualify cold reads, cloud storage, concurrent throughput or search.
-Repeat in fresh processes and record the executable/source hashes, machine,
-profile and effective Lance thread/pool settings alongside the raw samples.
-
-### Traversal and aggregation memory diagnostic
-
-`examples/issue_shapes.rs` measures `count_bare`, `destination_projection`,
-`grouped_fanout` and `destination_search` with 200 hubs and 500 edges per hub.
-Each person has a biography and a 1,024-dimensional vector; every tenth
-person matches the text search. The default fixture holds 20,000 people.
-
-```bash
-RUSTFLAGS= cargo run --release --locked -p omnigraph-bench --example issue_shapes -- \
-  --out /tmp/omnigraph-issue-shapes-run --rows 20000 --repeats 4
-```
-
-Both diagnostics refuse builds carrying encoded Rust flags. Build-time
-commit, dirty-state and compiler facts identify the compiled code; the memory
-diagnostic additionally hashes its executable and embedded source before
-measurement. Output is diagnostic evidence, never a qualified performance claim.
-
-Before timing, engine v2 is checked against complete fixture-derived
-results; a mismatch refuses the run. Every timed answer is checked outside
-the timer. Each shape/repeat uses a fresh child, so peak RSS cannot inherit
-another shape's high-water mark. `ru_maxrss` includes opening, warmups and result
-verification: it is a process upper bound, not operator live memory. The OS
-page cache is uncontrolled. `--out` is required and existing output files are refused. `--store`,
-when supplied, must be empty; an old fixture is not trusted from its row count.
+The [deferred inventory](../../benchmarks/deferred/README.md) preserves unsupported
+maintenance, concurrency, transport and scale experiments outside Cargo target
+discovery. GQ must expose maintenance operations before those scenarios return;
+GQT adds no separate cleanup or optimization command.

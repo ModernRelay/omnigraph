@@ -1,0 +1,43 @@
+# issue: none
+# notes: Known gap: a same-value Company update in the first fast forward keeps main's Company registration, so the repeat merge is merged.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+node Company { name: String @key size: I32 }
+
+--- seed
+{"type":"Company","data":{"name":"c0","size":5}}
+
+--- mutate
+branch create b0
+--- expect ok
+
+--- mutate branch: b0
+query insert_a_same_size() { insert Person { name: "a" } update Company set { size: 5 } where name = "c0" }
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+branch merge b0
+--- expect outcome: fast_forward
+
+--- mutate branch: b0
+query insert_b() { insert Person { name: "b" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+--- expect outcome: merged
+
+--- query
+query main_people() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+--- expect shape
+p.name: String

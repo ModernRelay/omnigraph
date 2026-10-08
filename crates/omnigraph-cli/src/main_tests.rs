@@ -3,8 +3,7 @@
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, legacy_change_request_body, normalize_bearer_token,
-    resolve_remote_bearer_token, sync_dir,
+    branch_statement_query_request, normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -20,53 +19,6 @@ fn embedded_cli_preserves_complete_storage_diagnostic_without_reprefixing() {
 
     assert_eq!(report.to_string(), diagnostic);
     assert!(!report.to_string().contains("storage: storage"));
-}
-
-#[test]
-fn legacy_change_request_body_uses_legacy_field_names() {
-    // `mutate`'s remote arm hits `POST /change`, which old
-    // `omnigraph-server` builds deserialize as `ChangeRequest` with
-    // **required** `query_source` and optional `query_name` keys.
-    // Newer servers accept both spellings via serde alias, but a
-    // newer CLI must still emit the legacy keys on the wire so it
-    // can talk to an old server during a rolling upgrade.
-    let body = legacy_change_request_body(
-        "query insert_person($n: String) { insert Person { name: $n } }",
-        Some("insert_person"),
-        "main",
-        Some(&json!({ "n": "Alice" })),
-    );
-    assert_eq!(
-        body["query_source"].as_str(),
-        Some("query insert_person($n: String) { insert Person { name: $n } }"),
-    );
-    assert_eq!(body["query_name"].as_str(), Some("insert_person"));
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
-    // Crucially, the **new** field names must NOT appear -- old
-    // servers would silently treat them as unknown fields and then
-    // fail on missing required `query_source`.
-    assert!(
-        body.get("query").is_none(),
-        "legacy /change body must not carry the renamed `query` key; got {body}"
-    );
-    assert!(
-        body.get("name").is_none(),
-        "legacy /change body must not carry the renamed `name` key; got {body}"
-    );
-}
-
-#[test]
-fn legacy_change_request_body_omits_optional_fields_when_unset() {
-    let body = legacy_change_request_body(
-        "query find() { match { $p: Person } return { $p.name } }",
-        None,
-        "main",
-        None,
-    );
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert!(body.get("query_name").is_none());
-    assert!(body.get("params").is_none());
 }
 
 #[test]

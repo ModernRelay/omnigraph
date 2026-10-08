@@ -7,6 +7,7 @@ pub mod expand_projection;
 pub mod failpoint;
 pub mod recovery;
 pub mod transfer_aggregation;
+pub mod wide_rows;
 
 use std::sync::Arc;
 
@@ -332,8 +333,13 @@ pub fn with_traversal(db: &Session, mode: Traversal) -> Session {
 
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
+    init_and_load_with_schema(dir, TEST_SCHEMA).await
+}
+
+/// The standard rows under a compatible schema, for schema-size instruments.
+pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.
@@ -679,4 +685,101 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
         .ok()?
         .as_nanos();
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
+}
+
+/// Append one `Document` row, id and title `ranged`, whose `content` is the
+/// external descriptor `s3://bucket/object` at offset 4, length 8, then
+/// publish that table head. No public write path creates a ranged descriptor,
+/// so the fixture writes it raw. The schema must be exactly
+/// `Document { title: String @key, content: Blob? }`. Returns the table URI.
+#[cfg(feature = "failpoints")]
+pub async fn seed_ranged_external_blob_row(db: &Omnigraph, uri: &str) -> String {
+    write_ranged_external_blob_row(db, uri, 4, 8).await
+}
+
+/// Replace the `ranged` row written by [`seed_ranged_external_blob_row`] with
+/// one naming the same object through another byte range, in one graph
+/// commit. Call it before any engine write to `Document`: it writes the
+/// table's linear head, which is the published version only until then.
+#[cfg(feature = "failpoints")]
+pub async fn replace_ranged_external_blob_range(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    write_ranged_external_blob_row(db, uri, offset, size).await
+}
+
+#[cfg(feature = "failpoints")]
+async fn write_ranged_external_blob_row(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    use arrow_array::ArrayRef;
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.dataset_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    assert_eq!(
+        raw.version().version,
+        entry.published_dataset_version,
+        "the ranged-descriptor fixture writes the linear head, which must be the published version"
+    );
+    raw.delete("__id = 'ranged'").await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset, size }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["__id", "content", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+    table_uri
 }
