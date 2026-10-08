@@ -1582,6 +1582,19 @@ fn resolve_traversal(
             ));
         };
         let edge = lookup_traversal_edge(catalog, &member.edge_type)?;
+        // Dropping the bound keeps the rows of a range that includes hop one;
+        // a range starting past it matched nothing, so that rewrite would not.
+        let fix = if traversal.min_hops == 1 {
+            format!(
+                "follow one hop without a bound: `${} {name} ${}`",
+                traversal.src, traversal.dst
+            )
+        } else {
+            format!(
+                "no `{}` path reaches hop {}, so this pattern matches nothing; to go further, start another traversal at the `{dst_type}` endpoint",
+                edge.name, traversal.min_hops
+            )
+        };
         return Err(CompilerError::query(
             QueryDiagnostic::typecheck(
                 T5,
@@ -1590,10 +1603,7 @@ fn resolve_traversal(
                     traversal.min_hops, edge.name, edge.from_type, edge.to_type
                 ),
             )
-            .with_fix(format!(
-                "follow one hop without a bound: `${} {name} ${}`",
-                traversal.src, traversal.dst
-            )),
+            .with_fix(fix),
         ));
     }
     Ok(ResolvedTraversal {

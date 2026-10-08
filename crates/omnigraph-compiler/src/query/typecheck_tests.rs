@@ -1061,12 +1061,17 @@ fn test_cross_type_multi_hop_bound_is_refused() {
         (
             "$p: Person $p worksAt{2,2} $c",
             "worksAt{2,2}",
-            "`$p worksAt $c`",
+            "no `WorksAt` path reaches hop 2, so this pattern matches nothing; to go further, start another traversal at the `Company` endpoint",
         ),
         (
             "$c: Company $c worksAt{1,3} $p",
             "worksAt{1,3}",
             "`$c worksAt $p`",
+        ),
+        (
+            "$c: Company $c worksAt{3,4} $p",
+            "worksAt{3,4}",
+            "no `WorksAt` path reaches hop 3, so this pattern matches nothing; to go further, start another traversal at the `Person` endpoint",
         ),
         (
             "$p: Person not { $p worksAt{1,2} $_ }",
