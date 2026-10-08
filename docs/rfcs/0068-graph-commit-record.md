@@ -52,8 +52,10 @@ The `__manifest` Lance dataset, its per-branch native refs, its journal fold,
 the registration clock of RFC 0062, and the clone adapter that repairs
 inherited index bases for it are retired. Graph branches become
 ***streams*** of records with a metadata object each. Nothing follows a
-publication (RFC: Detached-only tables), so a content write is staging, one
-detached commit per touched table in parallel, and one conditional create.
+publication: detached-only tables removed table-pin promotion, and a record
+names the schema contract it accepts, as a `__manifest` publication carries
+it since stamp v13. A content write is staging, one detached commit per
+touched table in parallel, and one conditional create.
 
 What does not change: per-type Lance datasets, RFC 0067's detached staging
 as detached-only tables leave it, the query and merge semantics, policy enforcement, the HTTP
@@ -147,7 +149,8 @@ and S3 Express do not, which is why the hint exists.
   "stream": "main",
   "actor": "act-ragnor",
   "created_at": 1757900000000,
-  "schema": {"identity_domain": "...", "ir_hash": "sha256:...", "identity_version": 9},
+  "schema": {"identity_domain": "...", "ir_hash": "sha256:...", "identity_version": 9,
+             "content_hash": "sha256:..."},
   "pins": [
     {"stable_table_id": 12, "incarnation": 3, "table_key": "node:Person",
      "target_version": 1201, "staged_version": 9223372036854775901,
@@ -166,11 +169,18 @@ tables. Unknown fields are ignored on read and preserved on rewrite; a
 recovery sidecar schema is today. `idempotency_key` is the surface issue
 #513 asks for and is out of scope here except for the field.
 
+`schema.content_hash` names the accepted contract's source and IR, archived
+under `__history/schemas/<sha256>.schema` with a conditional create before
+the record, the object a stamp-14 commit names today. Content-addressed and
+immutable, the archive is unreachable until a record names it, so a record
+publishes its schema contract with its pins, and schema acceptance needs no
+step after publication.
+
 ### Checkpoint
 
 A checkpoint is the complete fold at one sequence: every live table's pin,
-its registration and its version metadata, plus the schema identity and the
-head commit id. Probe 14 measured 38 KB for 217 tables. The publisher
+its registration and its version metadata, plus the schema identity, its
+content hash and the head commit id. Probe 14 measured 38 KB for 217 tables. The publisher
 writes a checkpoint after its own record whenever `seq` is a multiple of the
 interval, best effort; a checkpoint is a pure function of the records up to
 its sequence, so a missing or torn one is rebuilt from the previous
@@ -182,7 +192,8 @@ invariant 7 and never publication authority.
 1. Capture authority exactly as RFC 0022 §2 describes, from one
    reconstruction of the stream: hint, probe upward, checkpoint, records.
    The captured token is the latest sequence and its commit id.
-2. Prepare, validate and stage detached effects as RFC 0067 describes.
+2. Prepare, validate and stage detached effects as RFC 0067 describes,
+   and archive a changed schema contract's content (see Record).
 3. Write the record at `seq + 1` with `write_text_if_absent`. Success is
    the graph commit. `Ok(false)` means another writer published `seq + 1`:
    discard the attempt and re-prepare from the new state, exactly as a
@@ -289,8 +300,9 @@ by divergence and is exactly the set it must classify anyway, then hydrates
 current values for those ids; the projection cache and the pure-insert
 history walk collapse into record reads. Retention follows records and
 checkpoints, so a feed gap maps to record retention rather than to Lance
-version pruning. Group commit needs per-commit pins on the record to keep
-the feed per commit inside a batch, and change sets ride the same field.
+version pruning. Group commit publishes a batch as one graph commit (RFC:
+Group commit), so a batch is one record and one feed block, and change sets
+need no per-member split.
 
 Why it is not in scope here. A change set duplicates something derivable
 from Lance, and invariant 12 applies: the exact path must remain as the
@@ -298,9 +310,7 @@ fallback, and a DST instrument should recompute a sample of records from
 physical state and compare before the feed or merge trusts the recorded set
 alone. Record size, the spill threshold, and what a change set means for a
 merge whose classification reads a Blob column also need their own
-evidence. It is the piece that lets step three of RFC 0067's throughput
-path, group commit, keep a per-commit feed, and it belongs in an extension
-of this RFC or a small RFC after it.
+evidence. It belongs in an extension of this RFC or a small RFC after it.
 
 ### Retention
 
@@ -329,8 +339,9 @@ on the local filesystem.
 - 4 (publish once): one record per graph commit.
 - 5 (recovery is part of the commit protocol): publication has no
   pre-publication durable effect of its own; a lost acknowledgement is
-  resolved by read-back; nothing follows the publication (RFC: Detached-only
-  tables).
+  resolved by read-back; nothing follows the publication: no table-pin
+  promotion (RFC: Detached-only tables), and the schema contract is named by
+  the record, its archived content unreachable until a record names it.
 - 7 (physical acceleration is derived): checkpoints and hints are derived,
   rebuildable, and never authority.
 - 11 (bounded, observable): a current-state read is bounded by the
@@ -357,7 +368,8 @@ shadow copy, no process-local lock presented as fencing.
   branch, read from the branch's `__manifest` buffer and its `__history`
   files with the legacy area included, a checkpoint at each branch head,
   stream metadata for each live native ref, and then deletes `__manifest`
-  and `__history`; it runs offline under the same quiescence RFC 0064
+  and the commit files under `__history`, keeping the schema archive the
+  records name; it runs offline under the same quiescence RFC 0064
   requires of explicit upgrades. Export and rebuild remains the alternative.
 - Downgrade: refused by stamp. Reversal to v14 is a fold of the record
   stream into each branch's `__manifest` head and buffer and the `__history`
@@ -581,7 +593,12 @@ this amendment reads no `legacy/` and reports pre-upgrade ids as not found.
     files, the legacy area of the amendment included.
   - The change-set section now starts from the transaction-carried change
     sets detached-only tables ship.
-  - The group-commit question points to RFC: Group commit.
+  - The group-commit question points to RFC: Group commit, and the
+    change-set section follows its one commit per batch instead of a
+    per-member feed.
+  - "Nothing follows a publication" now rests on two facts: no table-pin
+    promotion, and a record that names its accepted schema contract by
+    content hash, archived before the record as stamp 14 archives it.
   - The stale "Number provisional" banner and a self-referential blocker
     ("RFC 0068 accepted") are removed.
 
