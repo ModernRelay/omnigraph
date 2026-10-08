@@ -382,10 +382,10 @@ retains its bounded diagnostic cause.
 V2 admission fails closed on abandonment: dropping a future or guard never
 removes the persisted lock. Explicit release requires proved settlement or
 containment of all work that can still act, including accepted control I/O.
-Generic server native settlement is not qualified, so logical drain or ordinary
-shutdown alone cannot release its v2 lock. Until a narrower release proof is
-qualified, stop the owner and establish quiescence, then use exact-ID unlock.
-There is no automatic takeover. `cluster force-unlock` checks the exact lock ID.
+Logical drain alone cannot release its v2 lock. The bounded clean-server
+release below supplies a narrower proof; other owners still require independently
+established quiescence and exact-ID unlock. There is no expiry-based takeover.
+`cluster force-unlock` checks the exact lock ID.
 This emergency procedure requires operator exclusion of new admissions and other
 unlock/release operations until it finishes, as well as proof that the prior
 owner, graph work and accepted ledger, resource and lock I/O cannot act later.
@@ -724,6 +724,60 @@ policy binding, malformed receipts and refusal of repeated initialization.
 S3-compatible backend tests establish actual conditional-write behavior;
 provider deployment evidence remains separate. General S3 replacement and
 undo retain the existing stopped-writer and accepted-I/O settlement boundary.
+
+### Clean server restart
+
+The server owns clean release of its existing lifetime admission. At shutdown
+it closes request and deployment admission, drains the existing startup,
+operation and response owners, then waits for every accepted storage mutation
+in its explicit process scope. This uses the existing absolute shutdown deadline
+(25 seconds by default), including lock release; no phase renews that deadline.
+Only a successful startup, settled owners, unpoisoned storage scope and unique
+admission permit release and exit zero. A crash, panic, dropped mutation,
+ambiguous storage result or cutoff cannot enter clean release. A terminal
+deployment result alone is insufficient: its activation remains owned work.
+
+The same scope covers native control objects, graph catalog/history, table
+files, indexes and multipart writes, from admission acquisition through release.
+It follows explicitly owned storage adapters and Lance sessions, including new
+graphs and reopened tables. It is process-local accounting, not persisted
+authority, a fence or an engine-reuse protocol. No independent background writer
+may escape it. Mutating transport requests cannot silently retry an uncertain
+attempt into apparent success. A single definitive conditional conflict is a
+settled no-effect result; ambiguous errors and abandoned requests permanently
+poison clean release even if a higher layer subsequently returns success.
+
+On S3, clean release conditionally replaces the exact held lock version with a
+unique released marker **at the same key**. Ordinary acquisition conditionally
+replaces that marker with a fresh owner. The lock key never becomes absent;
+neither release nor acquisition deletes it or falls back after an ambiguous
+response. Concurrent contenders cannot both acquire. A delayed release CAS
+cannot change a successor, and an earlier bootstrap create cannot recreate its
+owner. A lost release acknowledgement produces a nonclean exit; an already
+stored marker remains safe to acquire because release was attempted only after
+the predecessor had closed admission and settled all accepted effects.
+
+Local storage retains its create-exclusive acquisition and awaited exact-owner
+release under the same drain requirements. Azure keeps its existing independent
+admission and qualification boundary. Emergency force-unlock remains a separate
+operator procedure and must not run concurrently with normal admission or
+release. Ordinary startup never reuses a bootstrap receipt: `--bootstrap-handoff`
+belongs to the first process only, followed by ordinary `--cluster` startup.
+
+Held legacy lock records remain readable. The released marker has a new strict
+wire version that older binaries refuse; it must never be mistaken for an absent
+or expired lock. No graph format, deployment ledger or permission semantics
+change. Qualify the complete native build before use; clean restart does not
+qualify upgrades, interrupted-work recovery, automatic failover or arbitrary
+offline mutation.
+
+Extend the existing storage, admission, server lifetime and S3 test owners:
+clean restart of populated graphs after online deployment; disconnected writes
+and activation still pending at shutdown; reused immutable content; cancelled
+or swallowed backend errors; multipart work; concurrent marker claims; delayed
+release and lost acknowledgement; and forced cutoff/crash retaining exclusion.
+Each failure must prove that no successor authority or graph publication was
+invented. Live backend evidence remains separate from deterministic fixtures.
 
 ## Online deployment
 
