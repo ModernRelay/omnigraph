@@ -112,7 +112,8 @@ matters and loosen deliberately when the evidence shows a real need.
 6. Uniqueness, bounds and cardinality.
 7. Search needs: which text gets `@embed`, which properties get `@index`.
 8. Provenance: who asserts what, from which source.
-9. Rules the schema cannot express, as `GraphPolicy` nodes (principle 9).
+9. Rules the schema cannot express, as `GraphPolicy` nodes (principle 9),
+   including an orphan check for every required link.
 10. Shared shape into interfaces.
 11. An evolution plan: what may change in place and what would be a rebuild.
 
@@ -305,14 +306,26 @@ built on it; and an answer can be traced from a conclusion down to the words
 that support it. The layers also differ in what may be rebuilt. Raw material
 and human decisions are primary and are never regenerated. Machine extractions
 are materialized derivations: stored because they are expensive, but
-reproducible from raw plus the extractor, so key them deterministically (span
-plus extractor) and re-runs stay idempotent.
+reproducible from raw plus the extractor, so key them deterministically and
+re-runs stay idempotent.
+
+The key must identify each fact, not the extraction. One span often yields
+several facts, and span plus extractor gives them all one address: a load that
+carries two of them fails on the duplicate key, and separate loads keep only
+the last. Build the key from the span, the extractor and the fact itself, such
+as a digest of the normalized statement. Prefer a digest to the fact's position
+in the extractor's output, which shifts when the output order does. A re-run
+that words a fact differently still gets a new key; the find-before-create
+lookup of [principle 1](#1-design-identity-first) catches it.
 
 **In Omnigraph:** model raw spans as nodes (`TranscriptSegment`, `Chunk`) keyed
 on their source and position; give extracted nodes an edge to their span and
 an `extracted_by` property; link synthesized nodes to what they derive from.
 Drive enrichment from `omnigraph changes poll`, and run a re-extraction on a
-branch so its effect can be reviewed before it replaces the old layer.
+branch so its effect can be reviewed before it replaces the old layer. Declare
+the lineage edges `@card(1..)`, and run an orphan check for each on the branch
+before merging: `@card` does not catch a node written without its edge
+([principle 9](#9-enforce-meaning-and-keep-the-rules-in-the-graph)).
 
 **Example:**
 
@@ -323,17 +336,34 @@ node TranscriptSegment {                    // raw: kept as captured
     start_ms: I64
 }
 node Assertion {                            // extracted
-    slug: String @key                       // span + extractor, so re-runs upsert
+    slug: String @key                       // span + extractor + statement digest: one key per fact
     statement: String
     extracted_by: String                    // model and prompt version
     embedding: Vector(3072)? @embed("statement")
 }
-edge ExtractedFrom: Assertion -> TranscriptSegment @card(1..)
+edge ExtractedFrom: Assertion -> TranscriptSegment @card(1..)   // plus the orphan check below
 node Conclusion {                           // synthesized
     slug: String @key
     statement: String
 }
 edge DerivedFrom: Conclusion -> Assertion @card(1..)
+```
+
+Two facts from segment `call-0412-s17` get the keys
+`call-0412-s17:extract-v3:7f515a68` and `call-0412-s17:extract-v3:fabd835a`,
+so both survive, and a repeat run writes the same two keys and adds nothing.
+The orphan check returns every assertion that lacks its span; `DerivedFrom`
+needs the same query for conclusions:
+
+```gq
+// GraphPolicy pol-assertion-has-span, check_query: assertions_without_span
+query assertions_without_span() {
+    match {
+        $a: Assertion
+        not { $a extractedFrom $s }
+    }
+    return { $a.slug }
+}
 ```
 
 ### 7. Store what was observed or decided; compute the rest
@@ -403,10 +433,12 @@ support", "an observation used as evidence has a source", "our claims avoid
 rejected terms") belong in the graph as data, where every agent can read them,
 not in a document agents never see.
 
-Give every graph that agents share a `GraphPolicy` node type. It is one of the
-most useful node types in any agent-maintained graph: rules become versioned,
-reviewable data that changes without redeploying anything, and agents can
-validate or lint the graph against them.
+When agents share a graph whose rules go beyond what the schema can express,
+give it a `GraphPolicy` node type. Rules become versioned, reviewable data that
+changes without redeploying anything, and agents can validate or lint the graph
+against them. The engine does not run these checks: reading the policies and
+running their queries is each writer's job, and every check query is one more
+query to maintain.
 
 ```pg
 node GraphPolicy
@@ -439,6 +471,15 @@ server's Cedar policy, which governs who may perform which actions (see
 **In Omnigraph:** use `@key`, `@unique`, `@card`, `@range` and `@check` for
 structure, `GraphPolicy` nodes for everything else, and a stored query per
 mechanical rule.
+
+`@card` has a gap to plan for. It counts a source node's edges only when a
+write adds, moves or removes one of them, so a node written with no edge of
+that type is never counted. A non-zero minimum such as `@card(1..)` refuses a
+write that removes a node's last link, but not a node that arrives without
+one, and a traversal along that link silently misses the node. Give every
+required link an orphan check, the same `not { ... }` shape as the example
+below ([principle 6](#6-layer-derived-knowledge-over-raw-sources) shows one for
+extraction lineage).
 
 **Example:** "every strategic customer has an owner" is conditional
 cardinality, which `@card` cannot express, so it becomes a policy with a check
@@ -511,8 +552,10 @@ Design for both halves of retrieval.
   for, so that from any node an agent sees everything that bears on it: the
   assertions about it, the evidence behind them, the objections against them.
   A link written once turns recall into enumeration, and the agent can tell
-  when it has everything. Where a link must exist, require it, so a missing
-  link is a visible gap instead of a silent miss.
+  when it has everything. Where a link must exist, check that it does, so a
+  missing link is a visible gap instead of a silent miss: a traversal never
+  returns a node whose link is missing, and nothing in its result shows the
+  omission.
 - **Precision**: specific edge types and filterable properties (time, status,
   source kind, confidence) let an agent take exactly the part of a
   neighbourhood it needs; a generic `RelatedTo` edge or a hub node returns
@@ -528,10 +571,12 @@ found and what it missed. Search is a schema decision too: decide up front
 which text is embedded and which properties are indexed.
 
 **In Omnigraph:** write the questions first as `.gq` queries and lint them
-against the schema. Use `@card(1..)` for links that must exist. Scope with
-traversal and filters, then rank with `nearest`, `bm25` or `rrf` inside the
-scoped set (see [`search.md`](search.md)), and put `@embed` on the unit you
-want back, not on a whole document.
+against the schema. Declare links that must exist with `@card(1..)` and give
+each an orphan check, because `@card` does not catch a node written without
+any link ([principle 9](#9-enforce-meaning-and-keep-the-rules-in-the-graph)).
+Scope with traversal and filters, then rank with `nearest`, `bm25` or `rrf`
+inside the scoped set (see [`search.md`](search.md)), and put `@embed` on the
+unit you want back, not on a whole document.
 
 **Example:** scope completely by traversal, then rank inside the scope.
 

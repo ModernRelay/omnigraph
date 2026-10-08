@@ -191,7 +191,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@description("...")` — metadata (no migration impact)
 
 **Edge-level:**
-- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`)
+- `@card(min..max)` — edge cardinality (default: unbounded from zero; write an open upper bound as `@card(1..)`). Checked only for source nodes whose edges a write adds, moves or removes: a node written with no edge of the type is never counted, so a non-zero minimum needs an orphan check ([`schema-design.md`](schema-design.md#9-enforce-meaning-and-keep-the-rules-in-the-graph))
 
 **Type-level (nodes/edges):**
 - `@instruction("...")` — semantic hint for LLMs/operators

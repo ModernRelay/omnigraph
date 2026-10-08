@@ -238,11 +238,13 @@ design identity first (`@key`, keyed edges, find before create) · kinds are
 types, roles are edges · put a fact on what determines it · keep attribution,
 justification, confidence and time on separate axes · provenance is structural
 (`Claim` → fact, `Actor`, `Source`), never a free-text `source` field · layer
-extracted and synthesized knowledge over raw spans, with lineage back to them ·
-store decisions, compute derived facts · narrow types and closed vocabularies ·
-constraints in the schema, and every other rule as a `GraphPolicy` node agents
-lint the graph against · compose around shared identities (modules add facets,
-never modify the core) from general primitives that combine · optimize
+extracted and synthesized knowledge over raw spans, with lineage back to them,
+keyed per fact (span + extractor + statement digest) · store decisions, compute
+derived facts · narrow types and closed vocabularies · constraints in the
+schema; rules it cannot express as `GraphPolicy` nodes agents lint the graph
+against, including an orphan check per required link (`@card` never counts a
+node written with no edge) · compose around shared identities (modules add
+facets, never modify the core) from general primitives that combine · optimize
 retrieval: links for recall, specific edges, filters and answer-sized units for
 precision · write names, `@description` and `@instruction` for a reader without
 context · never repurpose a field · measure convergence with two independent
