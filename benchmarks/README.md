@@ -81,7 +81,14 @@ directory and its ancestors for `benchmarks.yaml` or `benchmarks/benchmarks.yaml
 A minimal config inherits five repetitions, a 60-second deadline, per-phase
 attribution, manual scheduling and a monotonic timer. Local defaults are
 APFS/clonefile on macOS or qualified XFS/plain-copy elsewhere. The repository
-config explicitly retains each scenario's original environment and repetitions.
+config retains each scenario's original repetitions and leaves `environment`
+and `reset` out of its defaults, so a scenario without its own environment
+takes that host default and the one file runs on a macOS workstation and on a
+qualified Linux XFS volume alike; `show` reports the resolved value and the
+record carries it. A scenario whose volume is part of its meaning declares it
+explicitly, as `branch-merge-d50-process-cold-xfs` and
+`branch-merge-d50-history64-xfs` do. The resolved backend is part of a
+scenario's point identity, so APFS and XFS runs of one id are distinct points.
 `show` reports all effective settings before a run. `deadline_seconds: null`
 removes the measurement deadline; the supervisor remains bounded. Protocol
 fields are `attribution`, `schedule`, `reset` and `timer`.
@@ -357,10 +364,11 @@ An explicit pair uses the same resolver, cache, worker, and archive pipeline:
 target/release/omnigraph-bench suite run   --dataset benchmarks/fixtures/tiny_graph.gqt   --queries benchmarks/workloads/tiny_restart.gqt   --measured-step 1 --measured-text '--- restart'   --repetitions 5 --deadline-seconds 60 --dataset-cache /qualified/cache
 ```
 
-The full D50 suites are `local-smoke` (warm APFS) and
-`aws-xfs-process-cold` (qualified XFS). They build 800,000
-base rows. The small `local-fast` suite is a separate smoke test, not proof of
-full-scale performance or correctness.
+The full D50 suites are `local-smoke` (warm, using the host-local default),
+`aws-xfs-process-cold` (qualified XFS) and `aws-xfs-history64` (qualified XFS,
+fixture aged by 64 reversible single-row update commits before the branches
+exist). They build 800,000 base rows. The small `local-fast` suite is a separate
+smoke test, not proof of full-scale performance or correctness.
 
 Every build runs in a contained child, at its cache entry's final stable
 `active` path. The engine closes before freezing the never-opened `root/`
