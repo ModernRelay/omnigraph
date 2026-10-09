@@ -55,11 +55,19 @@ fn query_shape_cases() -> impl Iterator<Item = (&'static str, bool)> {
 fn catalog() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks")
 }
+fn recorded_catalog() -> crate::catalog::Catalog {
+    let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    catalog.definition.defaults.environment = Some(GqtEnvironment {
+        backend: crate::case::Backend::LocalFs {
+            filesystem: crate::case::LocalFilesystem::Apfs,
+            storage_class: crate::case::LocalStorageClass::NvmeSsd,
+        },
+    });
+    catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
+    catalog
+}
 fn plan(name: &str) -> PlannedGqt {
-    crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml"))
-        .unwrap()
-        .plan(name)
-        .unwrap()
+    recorded_catalog().plan(name).unwrap()
 }
 #[derive(Debug, Default)]
 struct Signals {
@@ -125,15 +133,7 @@ async fn run_sample_with_logical(
 }
 #[test]
 fn original_pairs_and_groups_preserve_pre_migration_identity() {
-    let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    let recorded_environment = GqtEnvironment {
-        backend: crate::case::Backend::LocalFs {
-            filesystem: crate::case::LocalFilesystem::Apfs,
-            storage_class: crate::case::LocalStorageClass::NvmeSsd,
-        },
-    };
-    catalog.definition.defaults.environment = Some(recorded_environment);
-    catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
+    let catalog = recorded_catalog();
     let baseline: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-identity.json")).unwrap();
     let baseline = baseline.as_object().unwrap();
