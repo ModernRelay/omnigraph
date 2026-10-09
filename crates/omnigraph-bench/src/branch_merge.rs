@@ -1670,9 +1670,16 @@ async fn verify_branch(
                 "table {table} on {branch} has a physical schema that differs from the complete accepted schema for {ty}"
             )));
         }
-        if dataset.has_raw_index_section() {
+        // The engine declares a full-text column's analyzer with an untrained
+        // segment, which indexes no row; any built entry breaks `indexes: []`.
+        let built = dataset.built_index_names().await.map_err(|error| {
+            verification_error(format!(
+                "read the index inventory of node table {table} on {branch}: {error}"
+            ))
+        })?;
+        if !built.is_empty() {
             return Err(verification_error(format!(
-                "node table {table} on {branch} carries a raw Lance index-metadata section, but builder v3 declares indexes: []"
+                "node table {table} on {branch} carries built indexes {built:?}, but builder v3 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
@@ -1740,9 +1747,16 @@ async fn verify_branch(
                 "edge table {table} on {branch} has a physical schema that differs from the complete accepted schema for {ty}"
             )));
         }
-        if dataset.has_raw_index_section() {
+        // The engine declares a full-text column's analyzer with an untrained
+        // segment, which indexes no row; any built entry breaks `indexes: []`.
+        let built = dataset.built_index_names().await.map_err(|error| {
+            verification_error(format!(
+                "read the index inventory of edge table {table} on {branch}: {error}"
+            ))
+        })?;
+        if !built.is_empty() {
             return Err(verification_error(format!(
-                "edge table {table} on {branch} carries a raw Lance index-metadata section, but builder v3 declares indexes: []"
+                "edge table {table} on {branch} carries built indexes {built:?}, but builder v3 declares indexes: []"
             )));
         }
         if let Some(digest) = logical_digest.as_deref_mut() {
@@ -2696,10 +2710,10 @@ mod tests {
             .downcast_ref::<BranchMergeError>()
             .expect("fixture certification must return a classified scenario error");
         assert_eq!(fixture_error.kind(), BranchMergeErrorKind::Verification);
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("raw Lance index-metadata section, but builder v3 declares indexes: []"),
+            message.contains("carries built indexes")
+                && message.contains("but builder v3 declares indexes: []"),
             "unexpected error: {error}"
         );
     }

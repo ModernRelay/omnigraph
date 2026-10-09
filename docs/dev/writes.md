@@ -237,11 +237,17 @@ first rows, an overwrite load and a schema rewrite (an overwrite drops every
 index) produce such a version; when the committed version holds no segment
 for a declared column, the gateway chains an untrained, certified segment (an
 empty fragment bitmap, no postings) in a second detached commit under the same
-witness and returns that version to pin. Schema apply declares a full-text
-`@index` it adds to a table it does not rewrite the same way, beside the
-contract. The index writer builds postings where no segment covers a fragment,
-and the branch-merge insertion proof steps over a declaration link, which
-moves no row. The system-column upgrade keeps every index and declares none.
+witness and returns that version to pin. The gateway decides this before the
+commit from the base version's index metadata and the effect's operation, as
+Lance's manifest build decides (an overwrite keeps no index, an index commit
+swaps the segments it removes for the ones it adds, and any other operation
+keeps a segment of every index whose column remains); Lance's commit loads the
+same metadata, so the check adds no storage request. Schema apply declares
+a full-text `@index` it adds to a table it does not rewrite the same way,
+beside the contract. The index writer builds postings where no segment
+covers a fragment, and the branch-merge insertion proof steps over a
+declaration link, which moves no row. The system-column upgrade keeps every
+index and declares none.
 
 Schema apply stages each existing-table rewrite as a detached Overwrite of
 the table's pin and publishes it one logical version past the published

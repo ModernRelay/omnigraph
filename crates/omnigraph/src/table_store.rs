@@ -67,7 +67,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, user_indices_for_column, validate_full_text_demand,
+    is_full_text_index, is_untrained_full_text, user_indices_for_column, validate_full_text_demand,
     validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
@@ -559,10 +559,7 @@ pub(crate) fn is_full_text_declaration(
             Operation::CreateIndex { new_indices, removed_indices }
                 if removed_indices.is_empty()
                     && !new_indices.is_empty()
-                    && new_indices.iter().all(|index| {
-                        is_full_text_index(index)
-                            && index.fragment_bitmap.as_ref().is_some_and(|bitmap| bitmap.is_empty())
-                    })
+                    && new_indices.iter().all(is_untrained_full_text)
         )
 }
 
@@ -774,6 +771,64 @@ async fn commit_detached(
         .execute(transaction)
         .await
         .map_err(OmniError::storage)
+}
+
+/// The columns of `columns` that hold no full-text segment once `effect`
+/// commits on `base` (or on `base` itself, with no effect). Decided from the
+/// base and the operation as Lance's manifest build decides, never by reading
+/// the new version's index section, so a write that keeps its segments pays
+/// no extra request (Lance's commit loads the base's indexes anyway): an
+/// `Overwrite` keeps no index, a `CreateIndex` replaces the ones it removes
+/// with the ones it adds, and every other operation keeps at least one segment
+/// of an index whose column stays in the schema, empty or not. A base without
+/// an index section holds none.
+async fn full_text_columns_without_segment(
+    base: &Dataset,
+    effect: Option<&Operation>,
+    columns: &[String],
+) -> Result<Vec<String>> {
+    if columns.is_empty() || matches!(effect, Some(Operation::Overwrite { .. })) {
+        return Ok(columns.to_vec());
+    }
+    let (removed, added) = match effect {
+        Some(Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        }) => (
+            removed_indices
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<HashSet<_>>(),
+            new_indices.as_slice(),
+        ),
+        _ => (HashSet::new(), &[][..]),
+    };
+    let mut covered = HashSet::new();
+    if base.manifest.index_section.is_some() {
+        for index in base
+            .load_indices()
+            .await
+            .map_err(OmniError::storage)?
+            .iter()
+            .filter(|index| !removed.contains(&index.uuid))
+        {
+            if is_full_text_index(index) {
+                covered.extend(index.fields.iter().copied());
+            }
+        }
+    }
+    for index in added.iter().filter(|index| is_full_text_index(index)) {
+        covered.extend(index.fields.iter().copied());
+    }
+    Ok(columns
+        .iter()
+        .filter(|column| {
+            base.schema()
+                .field(column)
+                .is_none_or(|field| !covered.contains(&field.id))
+        })
+        .cloned()
+        .collect())
 }
 
 // Sealed storage surface: the `new_fragments`/`removed_fragment_ids`
@@ -3764,10 +3819,16 @@ impl TableStore {
         declared_full_text: &[String],
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         witness.stamp(&mut staged.transaction);
+        let undeclared = full_text_columns_without_segment(
+            &ds,
+            Some(&staged.transaction.operation),
+            declared_full_text,
+        )
+        .await?;
         let mut dataset =
             commit_detached(ds, staged.transaction, staged.commit_metadata.affected_rows).await?;
         if let Some(mut declaration) = self
-            .stage_full_text_declarations(&dataset, declared_full_text)
+            .stage_full_text_declarations(&dataset, &undeclared)
             .await?
         {
             witness.stamp(&mut declaration);
@@ -3788,7 +3849,9 @@ impl TableStore {
         columns: &[String],
         witness: &StagingWitness,
     ) -> Result<Option<(Dataset, StagedTransactionIdentity)>> {
-        let Some(mut declaration) = self.stage_full_text_declarations(&ds, columns).await? else {
+        let undeclared = full_text_columns_without_segment(&ds, None, columns).await?;
+        let Some(mut declaration) = self.stage_full_text_declarations(&ds, &undeclared).await?
+        else {
             return Ok(None);
         };
         witness.stamp(&mut declaration);
@@ -3797,10 +3860,9 @@ impl TableStore {
         Ok(Some((dataset, identity)))
     }
 
-    /// The `CreateIndex` that gives every column of `columns` holding no
-    /// full-text segment on `ds` an untrained, certified one: an empty
-    /// fragment bitmap, no postings, the engine's analyzer. `None` when every
-    /// column already has a segment.
+    /// The `CreateIndex` that gives every column of `columns` an untrained,
+    /// certified full-text segment on `ds`: an empty fragment bitmap, no
+    /// postings, the engine's analyzer. `None` when `columns` is empty.
     pub(crate) async fn stage_full_text_declarations(
         &self,
         ds: &Dataset,
@@ -3808,9 +3870,6 @@ impl TableStore {
     ) -> Result<Option<Transaction>> {
         let mut new_indices = Vec::new();
         for column in columns {
-            if has_fts_index_on(ds, column).await? {
-                continue;
-            }
             let params = InvertedIndexParams::default();
             let mut builder_ds = ds.clone();
             let mut segment = builder_ds

@@ -1175,6 +1175,25 @@ fn measure_counts_schema_contract_requests_issue_817() {
         ],
         "setup measures the init claim, capability probe and two manifest preflights"
     );
+    // `name` is a String `@key`, so Person carries a full-text segment from its
+    // first write, and Lance's detached commit loads the base's indexes. Behind
+    // a strict insert's inline transaction the index section lies outside the
+    // tail block the open read, and Lance opens the manifest again without the
+    // size it already learned: that HEAD is the one read a step may repeat.
+    let repeated_manifest_heads = |step: u64| -> u64 {
+        let group = measurements
+            .iter()
+            .find(|group| group["slot"] == "step" && group["step"] == step)
+            .expect("a measured group");
+        let mut seen = std::collections::BTreeSet::new();
+        group["value"]["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|request| request["class"] == "table_meta" && request["verb"] == "head")
+            .filter(|request| !seen.insert(request["path"].as_str().unwrap().to_string()))
+            .count() as u64
+    };
     for step in [1, 2, 3] {
         let counts = io_counts("step", step);
         assert!(
@@ -1182,8 +1201,15 @@ fn measure_counts_schema_contract_requests_issue_817() {
             "step {step}: the inline contract needs no control-adapter requests"
         );
         assert_eq!(
-            counts["repeat_reads"], 0,
-            "step {step}: neither the inline contract nor table data needs repeated reads"
+            counts["repeat_reads"],
+            repeated_manifest_heads(step),
+            "step {step}: neither the inline contract nor table data repeats a read, \
+             except the reopen of an indexed table's manifest"
         );
     }
+    assert_eq!(
+        repeated_manifest_heads(2),
+        1,
+        "the second insert reopens the first insert's manifest for its index section"
+    );
 }

@@ -2345,6 +2345,27 @@ fn commit_ids(commits: &[crate::db::GraphCommit]) -> Vec<&str> {
 
 /// The `Person` roots of the collector's plan for `options`, with every
 /// branch's retained versions; the plan must find nothing to report as an error.
+/// Every detached `Person` manifest on disk.
+async fn person_detached_versions(
+    graph: &Omnigraph,
+    root: &str,
+) -> std::collections::BTreeSet<u64> {
+    let snapshot = graph
+        .snapshot_of(crate::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let path = &snapshot.dataset(PERSON).unwrap().dataset_path;
+    lance::Dataset::open(&format!("{root}/{path}"))
+        .await
+        .unwrap()
+        .list_detached_manifests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|manifest| manifest.version)
+        .collect()
+}
+
 async fn person_roots(
     graph: &Omnigraph,
     options: crate::db::CleanupPolicyOptions,
@@ -2403,15 +2424,35 @@ async fn cleanup_after_upgrade_with_keep_four_and_older_than() {
         assert_eq!(branches, [main, feature.clone()]);
         assert_eq!(roots, pinned_roots);
     }
-    for options in [week, keep(4)] {
+    // The first write ("a") was Person's first rows, so its effect lies
+    // beneath the full-text declaration commit 2 pins: the one link no
+    // commit pins. The first cleanup reclaims it and nothing else; every
+    // pinned root and every served version stays.
+    let links: std::collections::BTreeSet<u64> = person_detached_versions(&graph, &source.root)
+        .await
+        .difference(&pinned_roots)
+        .copied()
+        .collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    for (round, options) in [week, keep(4)].into_iter().enumerate() {
         let stats = graph.cleanup(options).await.unwrap();
+        let reclaimed = |table_key: &str| {
+            if round == 0 && table_key == PERSON {
+                links.len() as u64
+            } else {
+                0
+            }
+        };
         assert!(
-            stats
-                .iter()
-                .all(|row| row.error.is_none() && row.manifests_removed == 0),
+            stats.iter().all(|row| row.error.is_none()
+                && row.manifests_removed == reclaimed(&row.type_key)),
             "{stats:?}"
         );
     }
+    assert_eq!(
+        person_detached_versions(&graph, &source.root).await,
+        pinned_roots
+    );
     assert_eq!(names(&graph, "main").await, ["a", "c"]);
     assert_eq!(names(&graph, "feature").await, ["a", "b"]);
     for (version, rows) in (1..).zip(counts) {
