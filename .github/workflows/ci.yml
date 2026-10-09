@@ -671,7 +671,7 @@ jobs:
       # The run step reuses these binaries (same flags, features, and env).
       - name: Compile the workspace and failpoint test graph
         run: |
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-run \
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run \
             --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
@@ -710,7 +710,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "merge_group" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
             --features "$FAILPOINT_FEATURES" \
             -- --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
@@ -876,28 +876,28 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
 
       - name: Run required storage upgrade engine tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-lance.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log lance "$test_log"
 
       - name: Run required storage upgrade protocol tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-protocol.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
   v5_v10_format_fence:
@@ -1422,7 +1422,7 @@ jobs:
           # once; a per-owner `-p` resolved six graphs, four with the Lance
           # stack, 89 minutes on main (docs/dev/ci.md, cache rule). An owner
           # names only its target: `--lib`, or `--test <file>`.
-          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
+          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
           require_cell() {
             grep -Eq "test (tests::)?${1} \.\.\. ok" "$test_log" \
               || { echo "::error::required Azure cell '${1}' did not execute normally"; exit 1; }

@@ -129,7 +129,7 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 

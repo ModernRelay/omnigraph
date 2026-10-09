@@ -1,0 +1,21 @@
+# issue: none
+# notes: A bare `show <setting>` travels to POST /query with its `;` (show_stmt requires the terminator,
+# notes: branch statements do not); served before the fix: "parse error: expected kw_all".
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+
+--- seed
+
+--- query
+show merge_lineage;
+
+--- expect unordered
+{"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
