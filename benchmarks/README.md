@@ -167,7 +167,7 @@ suite admission also cover the larger recipes without executing them.
 The `history-1000`, `history-10000` and `history-100000` groups select read,
 next-write and reopen operations over fixed live contents with the named
 number of real updates. Their recipes live in `fixtures/`; nightly names its
-20 ordinary recipes explicitly and does not select these larger inputs.
+21 ordinary recipes explicitly and does not select these larger inputs.
 
 Each fixture retains one `HistoryRow` at `key = "hot"`, `value = 0`,
 `payload = "fixed"`. Updates alternate value 1 and 0, producing 1,002, 10,002
@@ -316,10 +316,11 @@ checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+The checked-in smoke point declares no volume and takes the host default, APFS
+on a macOS workstation or XFS on a qualified Linux volume. The AWS point
 declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
 page cache. Validation is host-independent; runner-v1 probes the actual scratch
-volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
+volume and refuses a resolved or declared backend that does not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
@@ -353,7 +354,7 @@ indexed case's `--no-build` request.
 `dataset validate` takes the same inputs and verifies a published matching
 entry without building. `suite run --no-build` refuses a miss. `--filesystem
 apfs|xfs` applies to raw dataset and explicit-pair commands; case/suite files
-supply their own backend. APFS requires forced clonefile, and qualified Linux
+supply their own backend or inherit the host default. APFS requires forced clonefile, and qualified Linux
 XFS uses verified plain copies. The host probe must establish the declared
 backend. Clonefile has no byte-copy fallback; copies condition the OS page
 cache outside measurement.
@@ -418,7 +419,9 @@ The ordinary case and suite now select a registered reference plus
 target/release/omnigraph-bench run finbench   --fixture finbench-2026-08-21-sf10-v1=/path/to/bundle   --dataset-cache /qualified/cache --json
 ```
 
-This shipped case declares APFS. The source bundle remains quiescent and is
+This shipped case declares no volume: it runs on APFS on a macOS workstation
+and on XFS on a qualified Linux volume, and the two are distinct points. The
+source bundle remains quiescent and is
 never opened as an engine store; a byte-verified disposable copy is validated
 against its logical reference before preparation. Registered imports currently
 require a main-only, relocation-self-contained source and deterministic node
@@ -498,5 +501,6 @@ old authored execution is refused.
 
 Catalog parsing and GQT result assertions are correctness gates. Benchmark
 wall-clock and unpinned measured counters remain report-only. The slow nightly
-GQT route explicitly selects 20 ordinary recipes from `benchmarks/fixtures`, including full-size D50; reduced parity
+GQT route explicitly selects 21 ordinary recipes from `benchmarks/fixtures`, including full-size D50 and its
+64-commit history variant; reduced parity
 tests independently check the generator against the retained legacy test oracle.
