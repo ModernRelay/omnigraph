@@ -10,6 +10,7 @@ mod http_contract;
 mod ingress;
 mod mcp;
 pub mod operations;
+mod redacted_cause;
 mod settings;
 use handlers::*;
 use settings::*;
@@ -2141,6 +2142,52 @@ mod external_blob_startup_tests {
         );
     }
 
+    /// The startup log names a graph that failed to open by its root without
+    /// the userinfo, query or fragment the configured URI may carry.
+    #[tokio::test]
+    async fn blocked_startup_logs_the_root_without_credentials() {
+        let capture = super::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let temp = tempfile::tempdir().unwrap();
+        // A query string carries a presigned signature or SAS token.
+        let uri = format!(
+            "file://{}/missing.omni?token=secret-token#secret-fragment",
+            temp.path().display()
+        );
+        let key = GraphKey::cluster(GraphId::try_from("blocked").unwrap());
+        let prepared = PreparedGraphOpen {
+            cfg: GraphStartupConfig {
+                startup_failure: None,
+                graph_id: "blocked".to_string(),
+                uri: uri.clone(),
+                policy: None,
+                embedding: None,
+                external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
+                queries: QueryRegistry::default(),
+            },
+            pending: Arc::new(LoadingGraph {
+                key: key.clone(),
+                uri: uri.clone(),
+                policy: None,
+            }),
+            expected: None,
+        };
+        let error = match open_prepared_graph(prepared).await {
+            Ok(_) => panic!("a missing root must not open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.failure, StartupFailure::OpenFailed);
+        let entry = blocked_startup_graph(key, uri, error);
+        assert!(matches!(entry, GraphEntry::Blocked(_)));
+
+        let logs = capture.output();
+        assert!(logs.contains("graph blocked during startup"), "{logs}");
+        assert!(logs.contains("missing.omni"), "{logs}");
+        for leaked in ["secret-token", "secret-fragment"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
+
     #[tokio::test]
     async fn startup_policy_and_identity_refuse_before_graph_open() {
         let temp = tempfile::tempdir().unwrap();
@@ -2212,6 +2259,14 @@ mod external_blob_startup_tests {
     }
 }
 
+/// Log targets held to WARN/ERROR whatever RUST_LOG says, with their
+/// `::`-separated children. rmcp logs full protocol requests at DEBUG and
+/// responses at TRACE. Lance logs at INFO every table load, write, commit,
+/// compaction and cleanup with the table's full storage URI, every delete with
+/// its predicate (which names entity IDs), and every file it creates or
+/// deletes.
+const RESTRICTED_LOG_TARGETS: &[&str] = &["rmcp", "lance::dataset_events", "lance::file_audit"];
+
 fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
@@ -2220,19 +2275,26 @@ where
 
     tracing_subscriber::registry()
         .with(filter)
-        // rmcp logs full protocol requests at DEBUG and responses at TRACE.
         // This independent metadata filter cannot be overridden by a more
-        // specific RUST_LOG directive and keeps graph values out of SDK logs.
+        // specific RUST_LOG directive, and keeps graph values, storage URIs
+        // and entity IDs out of dependency logs.
         .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            let sdk = metadata.target() == "rmcp" || metadata.target().starts_with("rmcp::");
-            !sdk || *metadata.level() <= tracing::Level::WARN
+            let target = metadata.target();
+            let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
+                target
+                    .strip_prefix(restricted)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            });
+            !restricted || *metadata.level() <= tracing::Level::WARN
         }))
         .with(tracing_subscriber::fmt::layer().with_writer(writer))
 }
 
-/// Install native server logging with MCP protocol payload logs disabled.
-/// Embedders using their own subscriber must equivalently restrict the `rmcp`
-/// and `rmcp::*` targets to WARN/ERROR even when other targets use DEBUG/TRACE.
+/// Install native server logging with MCP protocol payload logs and Lance's
+/// dataset-event and file-audit logs disabled. Embedders using their own
+/// subscriber must equivalently restrict the `rmcp`, `lance::dataset_events`
+/// and `lance::file_audit` targets, and their `::` children, to WARN/ERROR
+/// even when other targets use DEBUG/TRACE.
 pub fn init_tracing() {
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -2301,8 +2363,16 @@ mod log_filter_tests {
     use super::test_log_capture::Capture;
 
     #[test]
-    fn verbose_sdk_payloads_remain_filtered_under_specific_directives() {
-        for directives in ["trace", "debug,rmcp::service=trace"] {
+    fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
+        // Each directive set, and whether it enables DEBUG on unrestricted targets.
+        for (directives, debug) in [
+            ("trace", true),
+            ("debug,rmcp::service=trace", true),
+            (
+                "info,lance::dataset_events=trace,lance::file_audit=trace",
+                false,
+            ),
+        ] {
             let captured = Capture::default();
             let subscriber = captured.subscriber(directives);
             tracing::subscriber::with_default(subscriber, || {
@@ -2313,24 +2383,87 @@ mod log_filter_tests {
                 tracing::error!(target: "rmcp", "SDK_ERROR_MARKER");
                 tracing::debug!(target: "omnigraph_server", "NATIVE_DEBUG_MARKER");
                 tracing::debug!(target: "rmcp_extension", "UNRELATED_DEBUG_MARKER");
+                tracing::info!(target: "lance::dataset_events", uri = "PRIVATE_URI_MARKER", "loading");
+                tracing::info!(target: "lance::file_audit", path = "PRIVATE_PATH_MARKER", "create");
+                tracing::warn!(target: "lance::dataset_events", "LANCE_WARNING_MARKER");
+                tracing::info!(target: "lance::execution", "LANCE_EXECUTION_MARKER");
             });
             let output = captured.output();
             for private in [
                 "PRIVATE_REQUEST_MARKER",
                 "PRIVATE_RESULT_MARKER",
                 "PRIVATE_ROOT_MARKER",
+                "PRIVATE_URI_MARKER",
+                "PRIVATE_PATH_MARKER",
             ] {
                 assert!(!output.contains(private), "{directives}: {output}");
             }
             for visible in [
                 "SDK_WARNING_MARKER",
                 "SDK_ERROR_MARKER",
-                "NATIVE_DEBUG_MARKER",
-                "UNRELATED_DEBUG_MARKER",
+                "LANCE_WARNING_MARKER",
+                "LANCE_EXECUTION_MARKER",
             ] {
                 assert!(output.contains(visible), "{directives}: {output}");
             }
+            for unrestricted in ["NATIVE_DEBUG_MARKER", "UNRELATED_DEBUG_MARKER"] {
+                assert_eq!(
+                    output.contains(unrestricted),
+                    debug,
+                    "{directives}: {output}"
+                );
+            }
         }
+    }
+
+    /// A request log names the graph by its ID. Its storage root is physical
+    /// placement and can carry credentials an operator wrote into the URI. The
+    /// whole log is checked, so Lance's own events, which the subscriber
+    /// restricts by target name, also prove the root never reaches it.
+    #[tokio::test]
+    async fn stored_query_invocation_logs_the_graph_id_not_its_storage_root() {
+        use tower::ServiceExt as _;
+
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private-storage-root.omni");
+        let uri = root.to_string_lossy().into_owned();
+        super::Omnigraph::init(&uri, "node Doc { slug: String @key }")
+            .await
+            .unwrap();
+        let registry = super::QueryRegistry::from_specs(vec![super::queries::RegistrySpec {
+            name: "docs".to_string(),
+            source: "query docs() { match { $d: Doc } return { $d.slug } }".to_string(),
+            expose: false,
+            tool_name: None,
+        }])
+        .unwrap();
+        let state = super::AppState::open_single_with_queries(uri, Vec::new(), None, registry)
+            .await
+            .unwrap();
+        let response = super::build_app(state)
+            .oneshot(
+                axum::http::Request::post("/graphs/default/queries/docs")
+                    .header(
+                        super::api::HTTP_API_CONTRACT_HEADER,
+                        super::api::HTTP_API_CONTRACT,
+                    )
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let output = capture.output();
+        let invoked = output
+            .lines()
+            .find(|line| line.contains("stored query invoked"))
+            .unwrap_or_else(|| panic!("no invocation log: {output}"));
+        assert!(invoked.contains("graph_id=default"), "{invoked}");
+        assert!(!output.contains("private-storage-root"), "{output}");
     }
 }
 
@@ -3089,7 +3222,11 @@ async fn open_prepared_graph(
     let db = Omnigraph::open(&uri).await.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
-            eyre!("open graph '{}' at {}: {err}", graph_id, uri),
+            eyre!(
+                "open graph '{}' at {}: {err}",
+                graph_id,
+                omnigraph::storage::redacted_storage_uri(&uri)
+            ),
         )
     })?;
     verify_server_schema_contract(&db, expected.as_ref())

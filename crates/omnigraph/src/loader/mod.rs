@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -665,6 +665,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                     account_keyed_json_row(
                         &format!("node:{type_name}"),
                         &data,
+                        &catalog.node_types[&type_name].blob_properties,
                         0,
                         &mut keyed_input_budget,
                     )?;
@@ -716,6 +717,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                     account_keyed_json_row(
                         &format!("edge:{canonical}"),
                         &data,
+                        &edge_type.blob_properties,
                         from.len().saturating_add(to.len()),
                         &mut keyed_input_budget,
                     )?;
@@ -1252,7 +1254,13 @@ fn parse_strict_graph_rows<R: BufRead>(
                 let table_key = format!("node:{type_name}");
                 let row = JsonValue::Object(data);
                 if bounded_keyed_input {
-                    account_keyed_json_row(&table_key, &row, 0, keyed_input_budget)?;
+                    account_keyed_json_row(
+                        &table_key,
+                        &row,
+                        &catalog.node_types[&type_name].blob_properties,
+                        0,
+                        keyed_input_budget,
+                    )?;
                 }
                 rows.nodes.entry(type_name).or_default().push(row);
             }
@@ -1292,6 +1300,7 @@ fn parse_strict_graph_rows<R: BufRead>(
                     account_keyed_json_row(
                         &table_key,
                         &JsonValue::Object(data.clone()),
+                        &edge_type.blob_properties,
                         from.len().saturating_add(to.len()),
                         keyed_input_budget,
                     )?;
@@ -1448,12 +1457,15 @@ struct KeyedTableInput {
 
 /// Charge a keyed JSON record before the parse spool retains it: a lower bound
 /// on its Arrow bytes per table and across tables, taken before base64 is
-/// decoded, split like the later batch check (`KeyedBytes`): a `base64:`
-/// value's decoded length as payload, the rest as framing. Not a JSON DOM
-/// bound; `MutationStaging::append_batch` is the authority.
+/// decoded, split like the later batch check (`KeyedBytes`) by the type's
+/// declared Blob properties: a `base64:` value of a Blob property is payload by its
+/// decoded length, and every other value, a `String` that happens to start
+/// with `base64:` included, is framing. Not a JSON DOM bound;
+/// `MutationStaging::append_batch` is the authority.
 fn account_keyed_json_row(
     table_key: &str,
     data: &JsonValue,
+    blob_properties: &HashSet<String>,
     structural_string_bytes: usize,
     budgets: &mut KeyedInputBudget,
 ) -> Result<()> {
@@ -1471,8 +1483,18 @@ fn account_keyed_json_row(
     }
     let structural = u64::try_from(structural_string_bytes)
         .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?;
-    let row_bytes =
-        estimate_json_keyed_bytes(data)?.checked_add(KeyedBytes::framing(structural))?;
+    let fields = match data {
+        JsonValue::Object(fields) => {
+            fields
+                .iter()
+                .try_fold(KeyedBytes::default(), |bytes, (name, value)| {
+                    let blob = blob_properties.contains(name);
+                    bytes.checked_add(estimate_json_keyed_bytes(value, blob)?)
+                })?
+        }
+        other => estimate_json_keyed_bytes(other, false)?,
+    };
+    let row_bytes = fields.checked_add(KeyedBytes::framing(structural))?;
     entry.bytes = entry
         .bytes
         .checked_add(row_bytes)?
@@ -1484,17 +1506,19 @@ fn account_keyed_json_row(
     Ok(())
 }
 
+/// A lower bound on the Arrow bytes of a Blob property's value.
 fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
-    let bytes = estimate_json_keyed_bytes(value)?;
+    let bytes = estimate_json_keyed_bytes(value, true)?;
     bytes
         .framing
         .checked_add(bytes.payload)
         .ok_or_else(|| OmniError::manifest_internal("JSON value bytes overflow"))
 }
 
-/// A lower bound on the Arrow bytes a JSON value becomes. A `base64:` string
-/// counts its decoded length as payload; everything else is framing.
-fn estimate_json_keyed_bytes(value: &JsonValue) -> Result<KeyedBytes> {
+/// A lower bound on the Arrow bytes a JSON value becomes. When `blob` says the
+/// value is a Blob property's, a `base64:` string counts its decoded length as
+/// payload; everything else, nested values included, is framing.
+fn estimate_json_keyed_bytes(value: &JsonValue, blob: bool) -> Result<KeyedBytes> {
     match value {
         JsonValue::Null => Ok(KeyedBytes::default()),
         JsonValue::Bool(_) => Ok(KeyedBytes::framing(1)),
@@ -1506,7 +1530,7 @@ fn estimate_json_keyed_bytes(value: &JsonValue) -> Result<KeyedBytes> {
                 u64::try_from(bytes)
                     .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64"))
             };
-            match value.strip_prefix("base64:") {
+            match value.strip_prefix("base64:").filter(|_| blob) {
                 Some(encoded) => Ok(KeyedBytes::payload(string_bytes(
                     base64::decoded_len_estimate(encoded.len()).saturating_sub(
                         encoded
@@ -1529,7 +1553,7 @@ fn estimate_json_keyed_bytes(value: &JsonValue) -> Result<KeyedBytes> {
             values
                 .iter()
                 .try_fold(KeyedBytes::framing(offsets), |bytes, value| {
-                    bytes.checked_add(estimate_json_keyed_bytes(value)?)
+                    bytes.checked_add(estimate_json_keyed_bytes(value, false)?)
                 })
         }
         // Property names are schema, not per-row Arrow payload. Count values
@@ -1538,7 +1562,7 @@ fn estimate_json_keyed_bytes(value: &JsonValue) -> Result<KeyedBytes> {
         JsonValue::Object(values) => values
             .values()
             .try_fold(KeyedBytes::default(), |bytes, value| {
-                bytes.checked_add(estimate_json_keyed_bytes(value)?)
+                bytes.checked_add(estimate_json_keyed_bytes(value, false)?)
             }),
     }
 }
@@ -3963,9 +3987,10 @@ edge WorksAt: Person -> Company
             )
         };
 
+        let blobs = HashSet::from(["content".to_string()]);
         let row = serde_json::json!({"title": "exact", "content": encode(limit)});
         let mut budget = KeyedInputBudget::default();
-        account_keyed_json_row("node:Document", &row, 0, &mut budget)
+        account_keyed_json_row("node:Document", &row, &blobs, 0, &mut budget)
             .expect("an exact-limit payload fits beside its row");
         assert_eq!(
             budget.bytes,
@@ -3975,10 +4000,29 @@ edge WorksAt: Person -> Company
             }
         );
 
+        // The declared type decides: the same `base64:` text in a property
+        // that is not a Blob is framing by its full length.
+        let note = encode(1024);
+        let row = serde_json::json!({"title": "typed", "note": note.clone(), "content": encode(8)});
+        let mut budget = KeyedInputBudget::default();
+        account_keyed_json_row("node:Document", &row, &blobs, 0, &mut budget).unwrap();
+        assert_eq!(
+            budget.bytes,
+            KeyedBytes {
+                framing: 5 + note.len() as u64,
+                payload: 8,
+            }
+        );
+
         let row = serde_json::json!({"title": "over", "content": encode(limit + 1)});
-        let error =
-            account_keyed_json_row("node:Document", &row, 0, &mut KeyedInputBudget::default())
-                .expect_err("one decoded byte over must be refused");
+        let error = account_keyed_json_row(
+            "node:Document",
+            &row,
+            &blobs,
+            0,
+            &mut KeyedInputBudget::default(),
+        )
+        .expect_err("one decoded byte over must be refused");
         assert!(matches!(
             error,
             OmniError::ResourceLimitExceeded {
@@ -3994,8 +4038,8 @@ edge WorksAt: Person -> Company
     fn operation_byte_allowances_span_graph_types_and_include_their_ceiling() {
         let row = serde_json::json!({"payload": "x".repeat(17 * 1024 * 1024)});
         let mut budget = KeyedInputBudget::default();
-        account_keyed_json_row("node:Person", &row, 0, &mut budget).unwrap();
-        let error = account_keyed_json_row("node:Company", &row, 0, &mut budget)
+        account_keyed_json_row("node:Person", &row, &HashSet::new(), 0, &mut budget).unwrap();
+        let error = account_keyed_json_row("node:Company", &row, &HashSet::new(), 0, &mut budget)
             .expect_err("keyed parse bytes must be aggregated across types");
         assert!(matches!(error,
             OmniError::ResourceLimitExceeded { ref resource, limit: KEYED_WRITE_MAX_BYTES, actual }

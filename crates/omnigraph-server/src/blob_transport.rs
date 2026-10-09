@@ -22,11 +22,12 @@ use axum::response::{IntoResponse, Response};
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, stream};
 use headers::{ETag as TypedEtag, HeaderMapExt, IfMatch, IfNoneMatch, IfRange};
-use omnigraph::error::{ManifestErrorKind, OmniError, StorageFailureKind};
+use omnigraph::error::OmniError;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, BlobRead, BlobReader, ExternalBlobRef};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ApiError;
+use crate::redacted_cause::RedactedCause;
 
 const SNAPSHOT_ID_HEADER: HeaderName = HeaderName::from_static("omnigraph-snapshot-id");
 
@@ -35,69 +36,6 @@ const SNAPSHOT_ID_HEADER: HeaderName = HeaderName::from_static("omnigraph-snapsh
 pub(crate) const BLOB_BODY_MAX_RETAINED_CHUNKS: usize = 2;
 pub(crate) const BLOB_BODY_MAX_RETAINED_BYTES: u64 =
     BLOB_BODY_MAX_RETAINED_CHUNKS as u64 * BLOB_READ_RANGE_MAX_BYTES;
-
-/// Log-safe class of a redacted engine failure. Never carries message text:
-/// storage and integrity messages can hold object URIs, presigned query
-/// strings or credentials, and `OmniError`'s `Display` and `Debug` both
-/// include them.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RedactedCause {
-    pub variant: &'static str,
-    pub storage_kind: Option<StorageFailureKind>,
-    pub manifest_kind: Option<ManifestErrorKind>,
-}
-
-impl RedactedCause {
-    pub(crate) fn of(error: &OmniError) -> Self {
-        // Completion evidence wraps the typed cause; the log names the cause.
-        let mut error = error;
-        while let OmniError::Completion { source, .. } = error {
-            error = source;
-        }
-        // Exhaustive on purpose: a new variant must choose its log name here.
-        let variant = match error {
-            OmniError::Completion { .. } => "Completion",
-            OmniError::Compiler(_) => "Compiler",
-            OmniError::Storage(_) => "Storage",
-            OmniError::HistoricalVersionReclaimed { .. } => "HistoricalVersionReclaimed",
-            OmniError::FullTextIndexRebuildRequired { .. } => "FullTextIndexRebuildRequired",
-            OmniError::RetryableCommitConflict(_) => "RetryableCommitConflict",
-            OmniError::DataFusion(_) => "DataFusion",
-            OmniError::Io(_) => "Io",
-            OmniError::Manifest(_) => "Manifest",
-            OmniError::MergeConflicts(_) => "MergeConflicts",
-            OmniError::KeyConflict { .. } => "KeyConflict",
-            OmniError::ResourceLimitExceeded { .. } => "ResourceLimitExceeded",
-            OmniError::ChangeCursorRejected { .. } => "ChangeCursorRejected",
-            OmniError::BranchNotFound { .. } => "BranchNotFound",
-            OmniError::ChangeFeedGap { .. } => "ChangeFeedGap",
-            OmniError::CommitHasNoParent { .. } => "CommitHasNoParent",
-            OmniError::ChangeSchemaBoundary { .. } => "ChangeSchemaBoundary",
-            OmniError::ExternalBlobPolicy { .. } => "ExternalBlobPolicy",
-            OmniError::ExternalBlobSource { .. } => "ExternalBlobSource",
-            OmniError::StoredExternalBlobDenied { .. } => "StoredExternalBlobDenied",
-            OmniError::BlobIntegrity { .. } => "BlobIntegrity",
-            OmniError::BlobRangeNotSatisfiable { .. } => "BlobRangeNotSatisfiable",
-            OmniError::RecoveryRequired { .. } => "RecoveryRequired",
-            OmniError::PreconditionFailed { .. } => "PreconditionFailed",
-            OmniError::BlobWritePreconditionFailed { .. } => "BlobWritePreconditionFailed",
-            OmniError::Policy(_) => "Policy",
-            OmniError::AlreadyInitialized { .. } => "AlreadyInitialized",
-            OmniError::InitializationCommitted { .. } => "InitializationCommitted",
-            OmniError::InitializationIndeterminate { .. } => "InitializationIndeterminate",
-            OmniError::InitializationClaimed { .. } => "InitializationClaimed",
-        };
-        let manifest_kind = match error {
-            OmniError::Manifest(manifest) => Some(manifest.kind),
-            _ => None,
-        };
-        Self {
-            variant,
-            storage_kind: error.storage_failure().map(|failure| failure.kind),
-            manifest_kind,
-        }
-    }
-}
 
 trait RangeReader: Send + Sync + 'static {
     fn read_range(&self, range: Range<u64>) -> BoxFuture<'static, Result<Bytes, OmniError>>;
