@@ -3651,9 +3651,12 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
     );
 }
 
-/// Pins the per-file call counts of `read_blobs`, `read_blob_ranges` and
-/// `with_io_buffer_size_bytes` in the production sources of the engine crate and the
-/// `GUARDED_CRATES`.
+/// Pins the per-file call counts of Lance's Blob selection APIs, of
+/// `with_io_buffer_size_bytes`, and of `managed_blob_payloads`, the one batched
+/// managed read, in the production sources of the engine crate and the
+/// `GUARDED_CRATES`. A bulk Blob reader calls the helper and adds its row here;
+/// a second raw `read_blobs` call, or `take_blobs` and one `BlobFile::read` per
+/// row, fails.
 #[test]
 fn lance_batched_blob_read_call_counts_are_pinned() {
     let src = engine_src_root();
@@ -3664,8 +3667,12 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
         let ast = parse_rust_source(&contents, &relative);
         let inventory = call_inventory(&ast);
         for method in [
+            "managed_blob_payloads",
             "read_blobs",
             "read_blob_ranges",
+            "take_blobs",
+            "take_blobs_by_indices",
+            "take_blobs_by_addresses",
             "with_io_buffer_size_bytes",
         ] {
             let count = inventory.counts.get(method).copied().unwrap_or(0);
@@ -3678,11 +3685,24 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     assert_eq!(
         sites,
         vec![
+            (
+                "managed_blob_payloads",
+                "db/omnigraph/export.rs".to_string(),
+                1
+            ),
+            (
+                "managed_blob_payloads",
+                "db/omnigraph/schema_apply.rs".to_string(),
+                1
+            ),
+            ("managed_blob_payloads", "table_store.rs".to_string(), 1),
             ("read_blobs", "table_store.rs".to_string(), 1),
+            ("take_blobs", "blob.rs".to_string(), 1),
             ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
         ],
-        "the per-file call counts of read_blobs, read_blob_ranges and \
-         with_io_buffer_size_bytes changed"
+        "the per-file call counts of the Blob read APIs changed: a bulk Blob \
+         read goes through managed_blob_payloads, and only the single-cell \
+         read facade keeps take_blobs"
     );
 }
 
