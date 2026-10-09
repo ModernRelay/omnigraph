@@ -1265,10 +1265,15 @@ They exist for three reasons:
 - a mutation or load holds its batches in memory until its one publication;
 - Lance writes a Blob value from an in-memory Arrow array.
 
-The ceilings are not a setting. The figure is backed by a measured process-memory
-bound, and a setting without a measured memory multiplier would promise a bound
-it cannot keep. Going beyond them means keeping large data out of the write
-path's memory. There are three separate limits, each with its own dependency
+The ceilings are not a setting. The evidence behind the figure is
+[RFC 0023's cost gate](0023-key-conflict-fencing.md#114-cost-gate): paired
+peak-RSS overhead of bounded fenced transactions under the old combined 32 MiB
+accounting, for the workloads that gate names. It is not a workload-independent
+process-memory bound, and it does not qualify the split envelope of §4.3, up to
+32 MiB of payload plus 32 MiB of framing; qualifying that remains open work for
+the same gate. A setting without such a measured multiplier would promise a
+bound it cannot keep. Going beyond the ceilings means keeping large data out of
+the write path's memory. There are three separate limits, each with its own dependency
 and trigger:
 
 1. **Large objects by reference.** An external reference has no size limit, and
@@ -1288,14 +1293,17 @@ and trigger:
      it, which also removes the denying-policy case in §4.3.
 
    Trigger: the Lance release that ships the write parameters.
-2. **Managed values above 32 MiB.** Lance 12 adds a streaming
-   `DedicatedBlobWriter` and writer-prepared descriptors, so a value can be
-   written without holding it in memory. But a dedicated sidecar's path is bound
-   to the data file it belongs to, and merge-insert names its own data files.
-   Using it therefore means a single-row replacement outside the key-fenced
-   merge-insert that RFC 0023 requires for keyed writes. That needs its own RFC
-   after the Lance 12 bump. The PUT wire shape, a raw body, already allows a
-   higher limit without change.
+2. **Managed values above 32 MiB.** The pinned Lance 11 already exports a
+   streaming `DedicatedBlobWriter`, which takes a value in successive chunks and
+   returns its descriptor, and writer-prepared descriptor columns
+   (`BlobDescriptorArrayBuilder`), so a value can be written without holding it
+   in memory. But a dedicated sidecar's path is bound to the data file it belongs
+   to, and merge-insert names its own data files. Using it therefore means a
+   single-row replacement that writes its own data file outside the key-fenced
+   merge-insert RFC 0023 requires for keyed writes, and that replacement must
+   compose with conflict checks, detached staging, publication and collection.
+   That design, not a Lance version, is the blocker, and it needs its own RFC.
+   The PUT wire shape, a raw body, already allows a higher limit without change.
 3. **Atomic operations above 32 MiB.** Mutation and load would stage a bounded
    chain of Lance transactions under one publication, as branch merge does, and
    validation would have to stream. Deferred until a workload needs an atomic
