@@ -634,6 +634,167 @@ fn measure_requires_a_selected_dst_environment() {
     assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
 }
 
+/// `--server` is refused before any worker or request; without it, a
+/// declared server environment is planned but not selected.
+#[test]
+fn server_target_admission_refuses_before_workers() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/dst_restart_preserves_rows.gqt");
+    let dir = tempfile::tempdir().unwrap();
+    for (args, expected) in [
+        (
+            vec!["--server", "http://127.0.0.1:1"],
+            "--server needs --graph",
+        ),
+        (vec!["--graph", "default"], "--graph needs --server"),
+        (vec!["--token", "t"], "--token needs --server"),
+        (
+            vec![
+                "--server",
+                "http://127.0.0.1:1",
+                "--graph",
+                "default",
+                "--store",
+                "file:///unused",
+            ],
+            "--server and --store are mutually exclusive",
+        ),
+        (
+            vec![
+                "--server",
+                "http://127.0.0.1:1",
+                "--graph",
+                "default",
+                "--target",
+                "omnigraph-engine",
+            ],
+            "--server runs only omnigraph-server environments",
+        ),
+        (
+            vec!["--server", "http://127.0.0.1:1", "--graph", "default"],
+            "--server requires a declared omnigraph-server environment",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .args(&args)
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+        if String::from_utf8_lossy(&output.stdout).contains("GQT report: ") {
+            assert!(
+                report(&output).1["attempts"].as_array().unwrap().is_empty(),
+                "{expected}: a worker ran"
+            );
+        }
+    }
+    let served =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/long_branch_names_first_touch.gqt");
+    for (args, env, expected) in [
+        (
+            vec!["--server", "http://127.0.0.1:1", "--graph", "default"],
+            Some(("OMNIGRAPH_GQ_BLESS", "1")),
+            "bless requires direct engine execution",
+        ),
+        (
+            vec!["--target", "omnigraph-server"],
+            None,
+            "--target omnigraph-server requires --server",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command
+            .arg(&served)
+            .args(&args)
+            .arg("--artifacts")
+            .arg(dir.path());
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+        assert!(
+            report(&output).1["attempts"].as_array().unwrap().is_empty(),
+            "{expected}: a worker ran"
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&served)
+        .args(["--target", "omnigraph-engine"])
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = report(&output).1;
+    assert_eq!(summary["scope"], "partial");
+    assert!(
+        summary["not_run"].as_array().unwrap().iter().any(|row| {
+            row["execution"]["environment"]["target"] == "omnigraph-server"
+                && row["reason"]["kind"] == "unselected"
+        }),
+        "{summary}"
+    );
+    let copy = dir.path().join("long_branch_names_first_touch.gqt");
+    std::fs::copy(&served, &copy).unwrap();
+    let before = std::fs::read(&copy).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&copy)
+        .env("OMNIGRAPH_GQ_BLESS", "1")
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bless counts only the in-process environments, so a server environment beside the one engine environment stays blessable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report(&output).1["scope"], "partial");
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        before,
+        "a green case blessed stays byte-identical"
+    );
+    let server_dst = dir.path().join("server_dst_declared.gqt");
+    std::fs::write(
+        &server_dst,
+        std::fs::read_to_string(&served).unwrap().replace(
+            "  - target: omnigraph-server\n    storage: local-filesystem\n",
+            "  - target: omnigraph-server-dst\n    storage: in-memory-object-store\n    seeds: [0]\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&server_dst)
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "no runner implements omnigraph-server-dst, so declaring it refuses the whole case"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("omnigraph-server-dst") && stderr.contains("unavailable combination"),
+        "{stderr}"
+    );
+    assert!(
+        report(&output).1["attempts"].as_array().unwrap().is_empty(),
+        "an omnigraph-server-dst declaration is refused before any worker"
+    );
+}
+
 #[test]
 fn external_store_missing_root_is_not_initialized() {
     let case =

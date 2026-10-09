@@ -6,6 +6,8 @@ timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- schema
 node BenchN000 { name: String @key cohort: String? val: I32? payload: String? }

@@ -56,8 +56,35 @@ or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and
 automatic index building; ordinary steps may change the supplied store.
 `--store` refuses files with schema and seed, DST and server targets, seams,
-and concurrent blocks. Server targets, direct-engine memory storage and
-cloud fixture initialization fail admission explicitly.
+and concurrent blocks. Direct-engine memory storage and cloud fixture
+initialization fail admission explicitly.
+
+With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
+token-protected deployment), the declared `omnigraph-server` environments run
+against that server and nothing else is selected: each step travels to the
+route that already serves it (`--- query` and `branch list`/`show` to
+`POST /query`, `--- mutate` and the branch statements to `POST /mutate`,
+`--- load` and the seed to `POST /load`) and is judged from the answer the way
+the in-process path judges the engine. The server's graph must already carry
+the case's schema (`GET /schema` is compared; a cluster-backed graph refuses a
+remote schema apply), and the seed loads through `/load`, so the graph should
+be fresh. Without `--server`, an `omnigraph-server` environment is planned
+but not selected (the report says `partial`); the corpus therefore runs
+in-process as before, and the served conformance test in
+`crates/omnigraph-server/tests/gqt_served_conformance.rs` runs every case
+that declares the target against an in-process server and requires a green
+in-process verdict and the same served verdict; `gqt_served_count.rs` totals
+the served and skipped cases and refuses an empty served set. A declared
+`omnigraph-server-dst` environment is refused at admission on every run: no
+runner implements it. The declared `storage` is recorded, not checked: no
+route reports the server's backend. Refused before any request, by name: `--- restart`,
+`--- concurrent`, seam directives, settings steps and settings prefixes on a
+control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`nearest`, `rrf`). The `--- expect shape` section is not judged under a
+server target: it holds the executor's Arrow schema against the compiler's,
+which no wire answer carries. `--server` is exclusive with `--store`, and a
+served run never blesses.
 
 External workers inherit only the selected backend's storage configuration:
 `AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,

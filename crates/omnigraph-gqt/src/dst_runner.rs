@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::runner_config::{Environment, Execution};
-use crate::{CaseOutcome, parse_case, stem_of};
+use crate::{CaseOutcome, ServerTarget, admit_served, parse_case, stem_of};
 
 pub(crate) mod seams;
 mod settings;
@@ -387,6 +387,10 @@ struct Input {
     engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store: Option<String>,
+    /// `--server`: the case runs against this server instead of an engine
+    /// the worker opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server: Option<ServerTarget>,
     bless: bool,
     /// `--measure`: the DST worker records every store request per step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -668,6 +672,7 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
             target: None,
             storage: None,
             store: None,
+            server: None,
             seed: None,
             fast_tier: true,
             trace: false,
@@ -682,6 +687,8 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
 /// `artifacts` holds reports, measurement TSVs and optional diagnostic traces;
 /// `None` uses the build tree's `target/gqt-artifacts/`.
 /// `trace` records each selected DST attempt outside replay comparisons.
+/// `server` runs the declared `omnigraph-server` environments against that
+/// server and selects nothing else.
 pub fn run_selected(
     path: &Path,
     executable: &Path,
@@ -692,6 +699,7 @@ pub fn run_selected(
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
     store: Option<&str>,
+    server: Option<&ServerTarget>,
     trace: bool,
 ) -> CaseOutcome {
     run_with_selection(
@@ -702,6 +710,7 @@ pub fn run_selected(
             target,
             storage,
             store,
+            server,
             seed,
             fast_tier: false,
             trace,
@@ -715,6 +724,7 @@ struct Selection<'a> {
     target: Option<&'a str>,
     storage: Option<&'a str>,
     store: Option<&'a str>,
+    server: Option<&'a ServerTarget>,
     seed: Option<u64>,
     fast_tier: bool,
     trace: bool,
@@ -1475,14 +1485,36 @@ fn run_invocation(
     })?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
+        if matches!(env.execution, Execution::ServerDst { .. }) {
+            env.admit(case.needs_dst())?;
+        }
+    }
+    let served = selection.server.is_some();
+    if served {
+        if selection.store.is_some() {
+            return Err("invalid_case: --server and --store are mutually exclusive".into());
+        }
+        if bless {
+            return Err(
+                "invalid_case: bless requires direct engine execution; a served run cannot rewrite the case".into(),
+            );
+        }
+        if selected.is_some_and(|target| target != "omnigraph-server") {
+            return Err(
+                "invalid_case: --server runs only omnigraph-server environments; --target selects another".into(),
+            );
+        }
+    }
+    let selects =
+        |env: &Environment| env.matches(selected, selected_storage) && env.is_served() == served;
+    for env in &case.runner.environments {
         for seed in env.seeds() {
             for replay in 0..if seed.is_some() { 2 } else { 1 } {
                 summary.planned.push(Planned {
                     environment: env.clone(),
                     seed,
                     replay,
-                    selected: env.matches(selected, selected_storage)
-                        && selected_seed.is_none_or(|s| seed == Some(s)),
+                    selected: selects(env) && selected_seed.is_none_or(|s| seed == Some(s)),
                 });
             }
         }
@@ -1505,14 +1537,25 @@ fn run_invocation(
         .environments
         .iter()
         .filter(|env| {
-            env.matches(selected, selected_storage)
-                && selected_seed.is_none_or(|seed| env.seeds().contains(&Some(seed)))
+            selects(env) && selected_seed.is_none_or(|seed| env.seeds().contains(&Some(seed)))
         })
         .collect::<Vec<_>>();
     if selected_envs.is_empty() {
-        return Err("invalid_case: environment selector matches no declared environment".into());
+        return Err(if served {
+            "invalid_case: --server requires a declared omnigraph-server environment".into()
+        } else if selected == Some("omnigraph-server")
+            && case.runner.environments.iter().any(Environment::is_served)
+        {
+            "invalid_case: --target omnigraph-server requires --server <URL> --graph <ID>".into()
+        } else {
+            "invalid_case: environment selector matches no declared environment".into()
+        });
     }
-    case.admit_store(selection.store)?;
+    if served {
+        admit_served(&case)?;
+    } else {
+        case.admit_store(selection.store)?;
+    }
     if selection.measure.is_some()
         && !selected_envs.iter().any(|env| {
             matches!(
@@ -1534,7 +1577,11 @@ fn run_invocation(
         return Err("invalid_case: --trace requires a selected DST environment".into());
     }
     for env in &selected_envs {
-        env.admit_store(case.needs_dst(), selection.store)?;
+        if served {
+            env.admit_served()?;
+        } else {
+            env.admit_store(case.needs_dst(), selection.store)?;
+        }
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -1551,8 +1598,14 @@ fn run_invocation(
             .collect::<Result<Vec<_>, _>>()?;
         refuse_two_store_actors(seams, &admitted)?;
     }
+    let in_process_declared = case
+        .runner
+        .environments
+        .iter()
+        .filter(|env| !env.is_served())
+        .count();
     if bless
-        && (case.runner.environments.len() != 1
+        && (in_process_declared != 1
             || !matches!(selected_envs[0].execution, Execution::Engine { .. }))
     {
         return Err("invalid_case: bless requires exactly one direct engine environment".into());
@@ -1601,6 +1654,7 @@ fn run_invocation(
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
                     store: selection.store.map(str::to_owned),
+                    server: selection.server.cloned(),
                     bless,
                     measure: selection.measure.is_some(),
                     model: selection
@@ -1876,6 +1930,23 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
         || !input.environment.seeds().contains(&input.seed)
     {
         return Err("environment_changed: worker selection is not declared".into());
+    }
+    if let Some(server) = &input.server {
+        if input.store.is_some() || input.seed.is_some() || input.bless {
+            return Err(
+                "environment_changed: a served worker takes no store, seed or bless".into(),
+            );
+        }
+        input.environment.admit_served()?;
+        admit_served(&case)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("worker_failed: runtime: {e}"))?;
+        return runtime.block_on(capture(
+            input_digest,
+            crate::execute_case_on_server(&case, server),
+        ));
     }
     case.admit_store(input.store.as_deref())?;
     input
@@ -2327,6 +2398,7 @@ mod action_tests {
             effective_settings: settings::EffectiveSettings::for_seed(Some(0)),
             engine: Engine::V2,
             store: None,
+            server: None,
             bless: false,
             measure: false,
             model: String::new(),

@@ -151,7 +151,7 @@ The released 0.12 cluster-ledger journey is separate
 Current-version live schema and policy deployment remains required by `Test Workspace`.
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
-required context aggregating three qualification jobs. `GQT (ordinary)` checks
+required context aggregating four qualification jobs. `GQT (ordinary)` checks
 unavailable-DST refusal and the unit tests of `omnigraph-gqt`,
 `omnigraph-gqt-core` and `omnigraph-bench` under an empty `RUSTFLAGS`, then
 runs the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`)
@@ -170,8 +170,15 @@ refused there; schema-and-seed datasets with zero steps are admitted.
 `--measure` refuses a selection with no DST environment.
 `GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
 `--- expect same as v1` comparison runs inside it, so no job selects an
-engine. `GQT (dst-clippy)` checks all package targets with Clippy. All
-three run from the repository root under
+engine. `GQT (dst-clippy)` checks all package targets with Clippy.
+`GQT (served)` runs `crates/omnigraph-server/tests/gqt_served_conformance.rs`:
+every corpus case that declares the `omnigraph-server` target runs again
+through an in-process server, its in-process verdict must be green and its
+served verdict must equal it; `gqt_served_count.rs` in the same job totals
+the served and skipped cases and fails when no case is served.
+It selects `omnigraph-server` alone under an empty `RUSTFLAGS`, so it builds
+the server once and shares no engine build with the other three. All
+four run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
 Each job has its own 60-minute budget and cache key. The budget is at least
 twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes

@@ -130,7 +130,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        mode: [ordinary, dst, dst-clippy]
+        mode: [ordinary, dst, dst-clippy, served]
     permissions:
       contents: read
     env:
@@ -214,8 +214,18 @@ jobs:
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'dst-clippy'
         run: cargo clippy -p omnigraph-gqt -p omnigraph-gqt-core --all-targets --locked --timings -- -D warnings -W clippy::dbg_macro
 
+      # Every case that declares the `omnigraph-server` target runs through
+      # an in-process server as well; its verdict must equal the in-process
+      # one (crates/omnigraph-server/tests/gqt_served_conformance.rs), and
+      # the served set is totalled and refused when empty (gqt_served_count.rs).
+      - name: Run the served GQ logic conformance
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'served'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-server --locked --timings --test gqt_served_conformance --test gqt_served_count -- --nocapture
+
       - name: Retain GQT invocation reports
-        if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy'
+        if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy' && matrix.mode != 'served'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gqt-invocation-reports-${{ matrix.mode }}
