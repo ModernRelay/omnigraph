@@ -324,13 +324,10 @@ modes.
 
 ## Deliver Blob values
 
-`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
-`property`. They support managed ranges/ETag conditions and report external
-references without fetching them. `PUT` replaces the cell with a raw
-`application/octet-stream` body of at most 32 MiB and `DELETE` clears it, each
-as one graph commit under `If-Match`; see
-[Replacing one Blob value](../blobs.md#replacing-one-blob-value). See
-[Blob values](../blobs.md) for details and [Blob limits](../blobs.md#limits).
+`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and `property`,
+support managed ranges/ETag conditions, and report external references without fetching
+them. `PUT` and `DELETE` replace or clear the cell; see [Blob values](../blobs.md),
+[Replacing one Blob value](../blobs.md#replacing-one-blob-value) and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 
