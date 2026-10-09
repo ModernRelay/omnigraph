@@ -248,6 +248,11 @@ impl ScanTuning<'_> {
         self
     }
 
+    pub(crate) fn io_buffer_size(&mut self, bytes: u64) -> &mut Self {
+        self.scanner.io_buffer_size(bytes);
+        self
+    }
+
     pub(crate) fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.scanner.prefilter(should_prefilter);
         self

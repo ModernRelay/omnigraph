@@ -366,6 +366,7 @@ hash join $e
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
+hydrate $d: columns [body]
 pass projection_pushdown
 not pass aggregate_pushdown
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
@@ -383,8 +384,11 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
 the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
 none. Dropping a type key or swapping key order fails these assertions.
-`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Projection/read lists are sets; identity keys and selection members
+`hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
+exactly those columns of `$d` by row address above the root limit (pass
+`late_materialization`); the `scan` lines keep reading the logical plan, whose
+projection still lists them. `pass <name>` states that a named optimizer pass
+fired, `not pass <name>` that it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
 `aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
 checks the named output's aggregate function, input type, accumulator,
@@ -498,12 +502,71 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
 cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 ```
 
 `--store` may precede or follow the case paths. External-store reports retain
 the URI and step evidence, but cannot replay: the report does not freeze the
 store contents. `--- restart` reopens that same root.
+
+`--trace` saves diagnostic JSONL for each selected DST attempt, including
+both runs of every seed. It requires at least one selected DST environment;
+direct-engine attempts in a mixed case still run without recording. The flag
+may precede or follow paths and combines with `--measure` and selectors.
+The case format and assertions stay unchanged. Recording is off by default.
+
+Each attempt gets a unique file under `target/gqt-artifacts/trace/`, or
+`<dir>/trace/` with `--artifacts <dir>`. The runner prints each path before
+launching its worker and includes it in the invocation report. Files contain
+GQT operations, observations and assertion evidence, every decision seam
+crossing, plus available `omnigraph` tracing spans and events from all
+worker threads. This is a diagnostic stream, not a complete graph history or
+a lineage oracle.
+
+Every line is one flat JSON object: `idx`, `kind`, the columns of that kind,
+and from the first `operation` on the step the runner began last as `step`,
+`step_line`, `loop_binding` and `generation` (the `truncated` terminator
+excepted: it carries no step columns, so it always fits the bytes reserved
+for it). The schema is
+[`trace_schema.json`](trace_schema.json), one branch per kind; a library
+test serialises one row of every kind against it.
+
+| `kind` | columns | meaning |
+|---|---|---|
+| `start` | `format`, `version`, `invocation_id`, `case_path`, the three digests, `environment`, `seed`, `replay` | the header the supervisor writes before the worker starts; never carries step columns |
+| `operation` | the step columns | the runner began a case operation |
+| `observation` | `text` | one host observation, the lines the report keeps |
+| `evidence` | `record`, `value`, `session` | one assertion evidence record (`record` is `expectation`, `assertion`, `seam_delivered`, ...) with its value |
+| `seam_crossing` | `seam`, `decision` (`pass`, `fire`, `store`), `effect`, `session` | the engine crossed a decision seam and the installed decider answered |
+| `store_request` | `verb`, `class`, `dataset`, `path`, `range`, `bytes`, `session` | one object-store request as the `--measure` ledger notes it, both realms; only with `--measure`; `session` is the ledger's label (`setup`, `step`, `runner` or a block session), never null |
+| `span`, `span_record`, `span_close` | `id`, `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing span opened, recorded fields, closed |
+| `event` | `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing event; `parent` is the enclosing span's `id`, as on `span` rows |
+| `finish` | `code`, `phase` | the worker completed with this result |
+| `truncated` | `reason`, `max_bytes`, `max_records` | recording stopped at the limit; never carries step columns |
+
+Seam crossings come from the runner, not the engine: a pass-through observer
+sits on every catalog seam the step did not arm, and the armed deciders are
+wrapped, so each crossing lands with the decision the decider returned. The
+crossing's position inside the action is not recorded; the seam name and the
+step are. Store requests are the measure ledger's: with `--trace --measure`
+every request of both realms lands as a `store_request` row at the moment
+the ledger notes it (a listing page refused later keeps its `list` verb in
+the trace and is `list_failed` in the ledger), with the ledger's label
+(`setup`, `step`, `runner` or a block session) as its `session`. `--trace`
+alone wraps no store, so a store place that is not armed leaves no row. A
+concurrent block is one step whose sessions interleave on one thread;
+`session` names the session a row belongs to: `null` outside a block on
+evidence, crossing, span and event rows, the ledger's label on store rows.
+
+Recording stops at 16 MiB or 100000 records with a `truncated` record. Trace
+fields may also be shortened to bound capture memory. A killed worker
+retains its written prefix; a missing `finish` means the recording is
+incomplete.
+Recording errors fail the invocation and preserve the original case error.
+Trace paths and bytes do not participate in deterministic replay comparison;
+`--replay <report.json>` replays the case without creating another trace.
+Recording adds host I/O and may consume more of the case's wall-time budget.
 
 `--measure` records, for every step of each DST environment, the object-store
 requests made while the step ran (the engine's, and under a `--- store` rule

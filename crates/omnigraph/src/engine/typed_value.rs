@@ -349,7 +349,13 @@ pub(super) fn check_output_schema(actual: &Schema, declared: &Schema, hidden: bo
     let visible = actual
         .fields()
         .iter()
-        .filter(|field| !hidden || !field.name().starts_with('~'))
+        .filter(|field| {
+            !hidden
+                || !(field.name().starts_with('~')
+                    || field
+                        .name()
+                        .starts_with(omnigraph_planner::ROW_ADDRESS_PREFIX))
+        })
         .count();
     if visible != declared.fields().len() {
         return Err(OmniError::manifest_internal(
@@ -687,6 +693,7 @@ pub(super) fn validate_plan_values(
                 PhysicalNode::SortMergeJoin { .. }
                 | PhysicalNode::HashJoin { .. }
                 | PhysicalNode::HydrateByAddress { .. }
+                | PhysicalNode::HydrateColumns { .. }
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }

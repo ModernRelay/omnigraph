@@ -251,14 +251,14 @@ async fn hydrate_nodes(
 
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open_lance_dataset(&table_key).await?;
-    let consumed = columns
-        .read_projection()
-        .unwrap_or_else(|| columns.non_blob_cols.clone());
     crate::engine::typed_value::check_stored_schema(
         &ds,
         &node_type.arrow_schema,
         &table_key,
-        consumed.into_iter().chain([catalog.system_columns.id]),
+        columns
+            .stored_columns()
+            .into_iter()
+            .chain([catalog.system_columns.id]),
     )?;
     crate::engine::typed_value::check_scan_leaves(&ds, dst_filters)?;
 
