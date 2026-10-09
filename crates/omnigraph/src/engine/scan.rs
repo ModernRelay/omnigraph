@@ -9,6 +9,7 @@ use crate::table_store::{ScanTuning, TableStore};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
+use lance_core::ROW_ADDR;
 use lance_index::scalar::FullTextSearchQuery;
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
@@ -33,6 +34,12 @@ pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
 
 /// Lance batches a pipelined read decodes ahead, which the pool does not see.
 const PIPELINED_READAHEAD: usize = 2;
+
+/// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
+/// which the pool does not see either. Lance's default is 32 MiB per I/O
+/// thread (2 GiB on a cloud store), read ahead of a consumer that may stop
+/// after its first batch; two 32 MiB pages keep its throughput.
+const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One node scan resolved before any Lance read: the dataset, the pushed
 /// filter (the literal filters, a gate's eligible set, a BM25 filter's member
@@ -175,8 +182,9 @@ impl<'n> NodeRead<'n> {
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
-    /// prefilter, the `(rows, bytes)` batch override and bounded readahead of
-    /// a pipelined read, the full-text query, then `configure` (nearest).
+    /// prefilter, the `(rows, bytes)` batch override, bounded readahead and
+    /// I/O buffer of a pipelined read, the full-text query, then `configure`
+    /// (nearest).
     pub(super) fn plan(
         &self,
         pipelined_batch: Option<(usize, usize)>,
@@ -195,6 +203,7 @@ impl<'n> NodeRead<'n> {
                 scanner.batch_size(rows);
                 scanner.batch_size_bytes(bytes as u64);
                 scanner.batch_readahead(PIPELINED_READAHEAD);
+                scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
             }
             if let Some(fts_query) = &self.fts_query {
                 scanner
@@ -206,9 +215,11 @@ impl<'n> NodeRead<'n> {
     }
 }
 
-/// Scan a node type under the supplied projection, filters and search mode.
-/// Apply filters before search ranking, retain score columns, and widen an
-/// underfilled ANN scan according to its reported probe outcomes.
+/// The breaker read of a ranked scan: scan a node type under the supplied
+/// projection, filters and search mode, apply filters before search ranking,
+/// retain score columns, and widen an underfilled ANN scan according to its
+/// reported probe outcomes. An unranked read streams instead
+/// (`operators::scan::pipelined`).
 pub(super) async fn execute_node_scan(
     type_name: &str,
     variable: &str,
@@ -569,7 +580,8 @@ pub(super) fn conjoin_fts_queries(
 pub(super) struct ScanColumns<'n> {
     pub(super) has_blobs: bool,
     pub(super) non_blob_cols: Vec<&'n str>,
-    /// `_distance` under a nearest target, `_score` under a text search.
+    /// `_distance` under a nearest target, `_score` under a text search, then
+    /// `_rowaddr` when the plan defers a return column to `HydrateColumns`.
     pub(super) search_cols: Vec<&'static str>,
     /// The plan's projection (`projection_pushdown`) plus the identity, the
     /// key and the search columns; `None` reads every non-blob column.
@@ -608,12 +620,15 @@ impl<'n> ScanColumns<'n> {
             .filter(|f| !node_type.blob_properties.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let mut search_cols: Vec<&'static str> = Vec::with_capacity(2);
+        let mut search_cols: Vec<&'static str> = Vec::with_capacity(3);
         if search.distance {
             search_cols.push("_distance");
         }
         if search.score {
             search_cols.push("_score");
+        }
+        if binding_columns.is_some_and(|NeededColumns(columns)| columns.contains(ROW_ADDR)) {
+            search_cols.push(ROW_ADDR);
         }
         let pruned_cols: Option<Vec<&'n str>> = binding_columns.map(|NeededColumns(columns)| {
             non_blob_cols
@@ -653,11 +668,14 @@ impl<'n> ScanColumns<'n> {
             })
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.extend(
-            self.search_cols
-                .iter()
-                .map(|col| Field::new(*col, DataType::Float32, true)),
-        );
+        fields.extend(self.search_cols.iter().map(|col| {
+            let data_type = if *col == ROW_ADDR {
+                DataType::UInt64
+            } else {
+                DataType::Float32
+            };
+            Field::new(*col, data_type, true)
+        }));
         RecordBatch::new_empty(Arc::new(Schema::new(fields)))
     }
 }
