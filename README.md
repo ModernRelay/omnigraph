@@ -27,24 +27,16 @@
 
 Omnigraph is engineered for the new workload introduced by long-horizon agents: Multiple agents sharing a typed world model to continuously retrieve and store context and coordinate work. Agents and UIs can become thin stateless consumers of a durable state.
 
-## Key Capabilities
+## Capabilities
 
-**Multi-Modal retrieval**: agents retrieve high precision/recall context by combining vector/fts search, graph traversal and filtering <br>
-**Branching**: agents propose reviewable changes rather than writing directly. <br>
-**Typed ontology**: agents have a shared enforceable model of the domain.<br>
-**Object-storage**: scales at the lowest cost.
-
-
-<p align="center">
-  <picture>
-    <source media="(prefers-reduced-motion: reduce)" srcset="assets/readme/hero.png">
-    <img alt="One dark terminal window: four agents write to the same Omnigraph company graph at once, each in its own pane and on its own branch; three merge into main, and main refuses the fourth, a decision that contradicts one already merged; beside them, the graph grows as each write lands and marks the refused one" src="assets/readme/hero.webp">
-  </picture>
-</p>
-
-Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
-to ask questions, share feedback, and follow development.
-
+| Capability | What it gives you |
+|---|---|
+| **Typed ontology** | Agents share one enforceable model of the domain. `.pg` schemas declare node and edge types, keys and constraints, and the engine enforces them on every write. |
+| **Multimodal retrieval** | Agents assemble high-precision context in one query: graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** runtime, with filtering. |
+| **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
+| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
+| **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
+| **Object-storage native, open format** | Scales at the lowest cost on local disk or any S3-compatible store: RustFS / MinIO, AWS S3 / R2 / GCS, Azure preview. Data lives in open, versioned [Lance](https://github.com/lance-format/lance) with native blob-as-data, and never leaves your store. |
 
 ## What you can build
 
@@ -55,17 +47,6 @@ to ask questions, share feedback, and follow development.
 | **Context graph** | Decision traces and codified tribal knowledge for retrieval |
 | **Dev graph** | Issues & dependency model that coding agents read and write |
 | **R&D / ML data layer** | Experiments and trials written into branches, versioned for training & eval |
-
-
-## All features
-
-| Capability | What it gives you |
-|---|---|
-| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies|
-| **Multimodal query engine** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
-| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
-| **Runs on your infrastructure** | Local storage or any S3-compatible object store (**RustFS / MinIO**, AWS S3 / R2 / GCS, Azure). VPC, on-prem, hybrid; your data never leaves your store. |
-| **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## Install
 
