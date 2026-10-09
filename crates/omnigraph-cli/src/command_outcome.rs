@@ -8,7 +8,7 @@ use omnigraph_api_types::{ErrorCode, ErrorOutput};
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use crate::cli::{BranchCommand, Cli, Command, SchemaCommand};
+use crate::cli::{BlobCommand, BranchCommand, Cli, Command, SchemaCommand};
 use crate::graph_http::ApiContractError;
 use crate::helpers::{PreconditionFailedCli, RemoteErrorCli};
 
@@ -37,6 +37,9 @@ pub(crate) fn applies(cli: &Cli) -> bool {
             }
             | Command::Schema {
                 command: SchemaCommand::Apply { .. }
+            }
+            | Command::Blob {
+                command: BlobCommand::Put { .. } | BlobCommand::Clear { .. }
             }
     )
 }
@@ -212,6 +215,7 @@ impl Failure {
             Action::Recover
         } else if not_started
             || output.precondition_failure.is_some()
+            || output.blob_precondition_failure.is_some()
             || output.read_set_conflict.is_some()
             || output.published_dataset_version_conflict.is_some()
             || output.key_conflict.is_some()
@@ -263,6 +267,7 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
         && output.external_blob_source.is_none()
         && output.recovery_required.is_none()
         && output.precondition_failure.is_none()
+        && output.blob_precondition_failure.is_none()
         && output.change_feed_gap.is_none()
         && output.change_diff_refusal.is_none()
         && output.full_text_index_rebuild_required.is_none()

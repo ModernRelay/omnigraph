@@ -43,7 +43,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `query` | Run a read query, or the `branch list`, `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
-| `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
+| `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
@@ -174,13 +174,13 @@ in [Changes and Change Feeds](../branching/changes.md).
 ## Blob commands
 
 ```text
-omnigraph blob get  <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
-omnigraph blob stat <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
+omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
 ```
 
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
-`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`.
-See [Blob values](../blobs.md).
+`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
+reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
+`--if-match <TAG>`, `--json` and, on `--store`, `--as`. See [Blob values](../blobs.md).
 
 ## Operator configuration
 

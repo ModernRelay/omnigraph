@@ -76,6 +76,21 @@ fn blob_parity() -> Parity {
     }
 }
 
+/// The Blob fixture with an independent byte copy as the local arm, so each
+/// arm's writes land in its own files and never in the hard-linked read twin.
+fn blob_write_parity() -> Parity {
+    let p = blob_parity();
+    let served = p
+        ._temp
+        .path()
+        .join("blob-parity-cluster")
+        .join("graphs")
+        .join(format!("{PARITY_GRAPH_ID}.omni"));
+    std::fs::remove_dir_all(&p.local).unwrap();
+    copy_dir(&served, &p.local);
+    p
+}
+
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
         run_both(&self.local, &self.server.base_url, args)
@@ -1107,6 +1122,121 @@ fn parity_blob_shared_failures_keep_exit_codes_aligned() {
             String::from_utf8_lossy(&remote.stderr),
         );
     }
+}
+
+/// The receipts of a Blob write normalized for comparison: each arm's own
+/// commit identities and the ETag, which hashes its commit's transaction
+/// file, are replaced once they are shown to be present.
+fn normalized_blob_receipt(
+    verb: &str,
+    arm: &str,
+    output: &std::process::Output,
+) -> serde_json::Value {
+    assert!(output.status.success(), "{verb}: {arm} failed: {output:?}");
+    let mut receipt = parse_stdout_json(output);
+    if let Some(etag) = receipt.get_mut("etag") {
+        assert!(
+            etag.as_str().is_some_and(|etag| etag.starts_with('"')),
+            "{verb}: {arm}"
+        );
+        *etag = serde_json::Value::String("<volatile:etag>".into());
+    }
+    if let Some(commit) = receipt
+        .get_mut("commit")
+        .and_then(|commit| commit.as_object_mut())
+    {
+        assert!(commit["graph_commit_id"].is_string(), "{verb}: {arm}");
+        for key in [
+            "graph_commit_id",
+            "parent_commit_id",
+            "merged_parent_commit_id",
+        ] {
+            if let Some(value) = commit.get_mut(key)
+                && !value.is_null()
+            {
+                *value = serde_json::Value::String(format!("<volatile:{key}>"));
+            }
+        }
+    }
+    scrub_volatile(&mut receipt);
+    receipt
+}
+
+/// `blob <verb>` on the fixture's readme content cell, with `--json`.
+fn blob_write_args<'a>(verb: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["blob", verb, "node", "Document", "readme", "content"];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    args
+}
+
+#[test]
+fn parity_blob_put_and_clear_share_receipts_and_refusals() {
+    let p = blob_write_parity();
+    let payload = p._temp.path().join("parity-put.bin");
+    std::fs::write(&payload, b"parity bytes\0\xff").unwrap();
+    let payload = payload.to_str().unwrap();
+    let with = blob_write_args;
+
+    for (verb, args) in [
+        ("blob put", with("put", &["--file", payload])),
+        ("blob clear", with("clear", &[])),
+        ("blob clear of a null cell", with("clear", &[])),
+    ] {
+        let (local, remote) = p.run(&args);
+        assert_eq!(
+            normalized_blob_receipt(verb, "local", &local),
+            normalized_blob_receipt(verb, "remote", &remote),
+            "{verb}: normalized receipts diverge (left=local, right=remote)"
+        );
+        if verb == "blob put" {
+            assert_eq!(parse_stdout_json(&local)["actor_id"], PARITY_ACTOR);
+        }
+        if verb.ends_with("null cell") {
+            assert!(parse_stdout_json(&local)["commit"].is_null());
+        }
+    }
+
+    // A stale validator: the same Blob precondition detail on both arms. As
+    // for a graph-commit precondition, the served arm's verified 412 exits 4
+    // and the embedded arm, which opened storage for writing, exits 1.
+    let (local, remote) = p.run(&with(
+        "put",
+        &["--file", payload, "--if-match", "\"stale\""],
+    ));
+    assert_eq!(
+        (local.status.code(), remote.status.code()),
+        (Some(1), Some(4))
+    );
+    let (local, remote) = (parse_stdout_json(&local), parse_stdout_json(&remote));
+    for (arm, refused) in [("local", &local), ("remote", &remote)] {
+        assert_eq!(refused["code"], "conflict", "{arm}: {refused}");
+        assert!(
+            refused.get("precondition_failure").is_none(),
+            "{arm}: {refused}"
+        );
+        assert_eq!(
+            refused["blob_precondition_failure"],
+            serde_json::json!({}),
+            "{arm}: a null cell has no validator"
+        );
+        assert_eq!(refused["command_outcome"]["action"], "refresh", "{arm}");
+    }
+    assert_eq!(local["error"], remote["error"]);
+
+    // Input over the limit is refused identically before either arm starts.
+    let oversized = p._temp.path().join("parity-oversized.bin");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(32 * 1024 * 1024 + 1)
+        .unwrap();
+    let (local, remote) = p.run(&with("put", &["--file", oversized.to_str().unwrap()]));
+    assert_eq!(local.status.code(), remote.status.code());
+    assert_eq!(parse_stdout_json(&local), parse_stdout_json(&remote));
+    assert_eq!(
+        parse_stdout_json(&local)["command_outcome"]["execution"],
+        "not_started"
+    );
 }
 
 // ---- error parity: exit codes must match for shared failure cases ----

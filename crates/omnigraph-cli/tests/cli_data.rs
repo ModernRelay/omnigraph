@@ -4,7 +4,7 @@
 use std::fs;
 
 use assert_cmd::Command;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::Digest;
 use tempfile::tempdir;
 
@@ -571,6 +571,148 @@ fn blob_commands_reject_positional_and_cluster_scope_addressing() {
             && stderr.contains("does not apply"),
         "Blob reads must reject an actor they cannot consume: {stderr}"
     );
+}
+
+/// `blob put` stores a file's or stdin's raw bytes and `blob clear` nulls the
+/// cell, each answering the exact receipt; `--as` attributes an embedded
+/// write. A stale `--if-match` fails with the Blob precondition detail, and
+/// a malformed one or input over 32 MiB is refused before the graph is
+/// addressed, so an unreachable store is never touched.
+#[test]
+fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+    let blob = |verb: &str, selector: [&str; 4]| {
+        let mut command = cli();
+        command
+            .arg("blob")
+            .arg(verb)
+            .args(selector)
+            .arg("--store")
+            .arg(&graph);
+        command
+    };
+    let readme = ["node", "Document", "readme", "content"];
+    let get = |selector: [&str; 4]| output_success(&mut blob("get", selector)).stdout;
+    let stat_etag = |selector: [&str; 4]| {
+        let output = output_success(blob("stat", selector).arg("--json"));
+        parse_stdout_json(&output)["etag"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let file = temp.path().join("payload.bin");
+    fs::write(&file, b"from a file\0\xff").unwrap();
+    let original = stat_etag(readme);
+    let put = output_success(
+        blob("put", readme)
+            .arg("--file")
+            .arg(&file)
+            .arg("--if-match")
+            .arg(&original)
+            .arg("--as")
+            .arg("act-writer")
+            .arg("--json"),
+    );
+    let receipt = parse_stdout_json(&put);
+    assert_eq!(
+        receipt["selector"],
+        json!({"entity": "node", "type": "Document", "id": "readme", "property": "content"})
+    );
+    assert_eq!(receipt["branch"], "main");
+    assert_eq!(receipt["kind"], "managed");
+    assert_eq!(receipt["size"], 13);
+    assert_eq!(receipt["actor_id"], "act-writer");
+    assert_eq!(receipt["commit"]["actor_id"], "act-writer");
+    assert_eq!(receipt["etag"], stat_etag(readme).as_str());
+    assert_eq!(get(readme), b"from a file\0\xff");
+
+    let edge = ["edge", "Attachment", "attachment-1", "payload"];
+    let human = output_success(blob("put", edge).write_stdin(b"from stdin".to_vec()));
+    let human = stdout_string(&human);
+    assert!(
+        human.contains("kind: managed") && human.contains("size: 10"),
+        "{human}"
+    );
+    assert_eq!(get(edge), b"from stdin");
+
+    let stale = output_failure(
+        blob("put", readme)
+            .arg("--file")
+            .arg(&file)
+            .arg("--if-match")
+            .arg(&original)
+            .arg("--json"),
+    );
+    assert_eq!(stale.status.code(), Some(1), "an embedded mismatch exits 1");
+    let refused = parse_stdout_json(&stale);
+    assert_eq!(
+        refused["blob_precondition_failure"]["current_etag"],
+        stat_etag(readme).as_str()
+    );
+    assert!(refused.get("precondition_failure").is_none(), "{refused}");
+    assert_eq!(refused["command_outcome"]["action"], "refresh");
+
+    let cleared = parse_stdout_json(&output_success(
+        blob("clear", readme)
+            .arg("--if-match")
+            .arg("*")
+            .arg("--json"),
+    ));
+    assert_eq!(cleared["kind"], "null");
+    assert!(
+        cleared["commit"]["graph_commit_id"].is_string(),
+        "{cleared}"
+    );
+    assert!(cleared.get("etag").is_none() && cleared.get("size").is_none());
+    let again = parse_stdout_json(&output_success(blob("clear", readme).arg("--json")));
+    assert!(
+        again["commit"].is_null(),
+        "a no-op clear publishes nothing: {again}"
+    );
+    output_failure(&mut blob("get", readme));
+
+    // Refused before the graph is addressed: the store does not exist.
+    let absent = temp.path().join("absent.omni");
+    let unreachable = |verb: &str| {
+        let mut command = cli();
+        command
+            .arg("blob")
+            .arg(verb)
+            .args(readme)
+            .arg("--store")
+            .arg(&absent);
+        command
+    };
+    let malformed = output_failure(unreachable("clear").arg("--if-match").arg("unquoted"));
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("If-Match"),
+        "{malformed:?}"
+    );
+    let oversized = temp.path().join("oversized.bin");
+    fs::File::create(&oversized)
+        .unwrap()
+        .set_len(32 * 1024 * 1024 + 1)
+        .unwrap();
+    let too_large = output_failure(
+        unreachable("put")
+            .arg("--file")
+            .arg(&oversized)
+            .arg("--json"),
+    );
+    let refused = parse_stdout_json(&too_large);
+    assert_eq!(
+        refused["resource_limit"],
+        json!({
+            "resource": "Blob write payload bytes",
+            "limit": 32 * 1024 * 1024,
+            "actual": 32 * 1024 * 1024 + 1,
+        })
+    );
+    assert_eq!(refused["command_outcome"]["execution"], "not_started");
+    assert!(!absent.exists(), "neither arm opened the store");
 }
 
 #[test]

@@ -247,7 +247,7 @@ pub(crate) enum Command {
         #[arg(long = "type")]
         type_names: Vec<String>,
     },
-    /// Read one logical node or edge Blob cell.
+    /// Read, replace or clear one logical node or edge Blob cell.
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
@@ -513,6 +513,61 @@ pub(crate) enum BlobCommand {
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
         /// Emit stable JSON metadata.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace one Blob value of an existing node or edge with raw bytes from
+    /// a file or stdin, as one graph commit.
+    Put {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Read the bytes from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set one nullable Blob value of an existing node or edge to null, as one
+    /// graph commit; a cell that is already null publishes nothing.
+    Clear {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
         #[arg(long)]
         json: bool,
     },

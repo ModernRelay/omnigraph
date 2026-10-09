@@ -125,8 +125,21 @@ Over HTTP:
   disconnects, so a lost response means the write may have landed: read the
   cell before writing again.
 
-The CLI does not offer these writes yet; through it, change a Blob value with a
-load or a mutation.
+From the CLI, `blob put` stores the bytes of `--file` or stdin and `blob clear`
+nulls the cell. Both take `--branch`, `--if-match` and `--json`, and print the
+receipt the server returns:
+
+```bash
+omnigraph blob put node Document manual content --file manual.pdf \
+  --if-match '"<current ETag>"' --store graph.omni
+omnigraph blob clear node Document manual content --server prod --graph knowledge
+```
+
+The CLI refuses input over 32 MiB and a malformed `--if-match` before it
+addresses the graph. `--as` names the actor of a `--store` write; a served
+write takes its actor from the bearer token. A served Blob `412` exits 4, as a
+graph-commit precondition does; an embedded one exits 1. Each write is sent
+once: after an unknown outcome, read the cell before writing again.
 
 ## Query behavior
 
@@ -135,8 +148,7 @@ filtered, ordered, or aggregated. Write them through load or mutation
 assignment, then read an individual Blob value through the dedicated CLI or
 HTTP surface.
 
-There are no `blob put` or `blob clear` CLI commands yet. Use the normal graph
-write path, or the HTTP and embedded writes in
+To replace or clear one value, use the CLI, HTTP or embedded writes in
 [Replacing one Blob value](#replacing-one-blob-value); each is an atomic graph
 commit.
 

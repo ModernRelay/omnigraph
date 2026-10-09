@@ -2,7 +2,7 @@
 
 OmniGraph treats a Blob as one property cell on an existing node or edge. Lance owns the Blob-v2 physical placement; OmniGraph owns logical identity, snapshot selection, authorization, external-source admission, bounded delivery, and graph-level publication.
 
-This page describes the implemented read, ingestion and cell-write behavior. The CLI put and clear commands proposed by [RFC 0033](../rfcs/0033-blob-management.md) are not implemented yet.
+This page describes the implemented read, ingestion and cell-write behavior proposed by [RFC 0033](../rfcs/0033-blob-management.md).
 
 ## Logical states
 
@@ -84,7 +84,9 @@ An external value produces a `302` redirect with the stored URI; the server neve
 
 The CLI exposes `blob get` and `blob stat` for embedded and remote graphs. `get` streams managed bytes to stdout or `--out`; `stat` returns kind, resolved-view metadata, size/ETag for managed data, or the descriptor for external data. The CLI refuses to follow external references.
 
-`PUT` and `DELETE /graphs/{graph_id}/blob` call the engine cell writes. `PUT` is a raw ingress route like `/load/ndjson`: the ingress middleware reserves the put limit (`BLOB_WRITE_MAX_BYTES`, the engine's own constant) without collecting the body, and the handler authorizes `change` on the branch, checks `Content-Type` (415) and a declared `Content-Length` (413) before it polls a byte, then collects the body under the shared body deadline (408) into one buffer sized from that length, which the engine's value column adopts. The ingress reservation shrinks to the received size. Both verbs admit the actor's workload and submit the engine call through `owned_write`, so a disconnect after admission loses only the response. `omnigraph_api_types::parse_blob_if_match` turns `If-Match` field lines into a `BlobPrecondition` (`*` alone, or the strong tags of a list; weak tags dropped; malformed fields refused), and `blob_write_output` maps the engine outcome to the receipt; the CLI's embedded writes will share both. `BlobWritePreconditionFailed` maps to 412 with `ErrorCode::Conflict`, the `blob_precondition_failure` detail and an `ETag` header, never the graph-commit `precondition_failure`. The CLI has no put or clear yet.
+`PUT` and `DELETE /graphs/{graph_id}/blob` call the engine cell writes. `PUT` is a raw ingress route like `/load/ndjson`: the ingress middleware reserves the put limit (`BLOB_WRITE_MAX_BYTES`, the engine's own constant) without collecting the body, and the handler authorizes `change` on the branch, checks `Content-Type` (415) and a declared `Content-Length` (413) before it polls a byte, then collects the body under the shared body deadline (408) into one buffer sized from that length, which the engine's value column adopts. The ingress reservation shrinks to the received size. Both verbs admit the actor's workload and submit the engine call through `owned_write`, so a disconnect after admission loses only the response. `omnigraph_api_types::parse_blob_if_match` turns `If-Match` field lines into a `BlobPrecondition` (`*` alone, or the strong tags of a list; weak tags dropped; malformed fields refused), and `blob_write_output` maps the engine outcome to the receipt; the CLI shares both. `BlobWritePreconditionFailed` maps to 412 with `ErrorCode::Conflict`, the `blob_precondition_failure` detail and an `ETag` header, never the graph-commit `precondition_failure`.
+
+`blob put` and `blob clear` (`crates/omnigraph-cli`) parse `--if-match` and read `put`'s file or stdin, refusing more than `BLOB_WRITE_MAX_BYTES` without reading past one more byte, before scope resolution, so neither arm starts on bad input. The embedded arm calls the engine writes and renders a precondition failure through `engine_error_output`, the body a server answers; the served arm sends the raw `If-Match` value and the bytes once, with no retry. A served 412 whose only detail is `blob_precondition_failure` is a verified request precondition, so a single-request command exits 4, as for a graph-commit precondition; the embedded arm, which opened storage for writing, exits 1.
 
 ## Maintenance and export
 
@@ -102,6 +104,6 @@ Export emits managed values as base64 and whole-object external values as URI de
 - Lance compatibility: `crates/omnigraph/tests/lance_surface_guards.rs`.
 - Cluster policy persistence and serving projection: `omnigraph-cluster` in-source tests.
 - HTTP transport: `crates/omnigraph-server/tests/data_routes.rs`, `auth_policy.rs`, and `openapi.rs`. The writes: `data_routes.rs::blob_put_and_delete_return_exact_receipts_and_blob_preconditions`, `blob_put_raw_body_bounds_media_type_length_and_deadline`, the Blob doors of `disconnected_writes_keep_admission_until_the_original_operation_finishes`, the `change` cases of `auth_policy.rs::policy_blocks_change_on_protected_main_but_allows_unprotected_branch`, and the `If-Match` parser's tests in `omnigraph-api-types`.
-- CLI and embedded/remote parity: `crates/omnigraph-cli/tests/cli_data.rs` and `parity_matrix.rs`.
+- CLI and embedded/remote parity: `crates/omnigraph-cli/tests/cli_data.rs` and `parity_matrix.rs` (`parity_blob_put_and_clear_share_receipts_and_refusals` for the writes); `system_remote.rs::remote_blob_write_delivery_loss_never_replays_committed_effect` owns lost delivery of a put or clear through the fault proxy.
 
 The user contract and examples live in [Blob values](../user/blobs.md).
