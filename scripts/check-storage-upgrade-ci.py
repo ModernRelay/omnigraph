@@ -2,15 +2,21 @@
 """Require every storage format coverage scope, with no empty or skipped runs."""
 
 import argparse
-import json
+import importlib
 import re
 import sys
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_gate  # noqa: E402  (scripts/ci_gate.py, the CI Gate job table)
+
+workflow_parser = importlib.import_module("check-merge-group-triggers")
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = "Storage Upgrade Compatibility"
+JOB = "storage_upgrade_compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
 STAMP_13_SOURCE_COMMIT = "c0a4519f38d65dc1356728981983da8b096cfbef"
 CASES = (
@@ -142,7 +148,7 @@ v011_dir="$RUNNER_TEMP/omnigraph-v011"
 # The installer downloads the official archive and verifies its
 # SHA256 before extraction. An exact VERSION never falls back to edge.
 # A failed download leaves nothing behind, so each release gets three
-# attempts before this required context goes red.
+# attempts before this blocking job fails.
 install_release() {
   for attempt in 1 2 3; do
     REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \\
@@ -174,7 +180,9 @@ def scope_script(scope: str) -> str:
     )
 
 
-def validate(workflow: str, policy: dict) -> list[str]:
+def validate(workflow: str, table: dict | None = None) -> list[str]:
+    """Failures of the job's shape in `workflow`; `table` is ci_gate.JOBS unless a test substitutes it."""
+    table = ci_gate.JOBS if table is None else table
     failures = []
     match = re.search(
         r"^  storage_upgrade_compatibility:\n(.*?)(?=^  \w+:|\Z)",
@@ -215,9 +223,14 @@ def validate(workflow: str, policy: dict) -> list[str]:
     for scope in SCOPES:
         if scope_script(scope) not in scripts:
             failures.append(f"storage compatibility requires the exact fail-closed {scope} command and log check")
-    contexts = policy.get("required_status_checks", {}).get("contexts", [])
-    if CONTEXT not in contexts:
-        failures.append(f"branch protection must require {CONTEXT}")
+    lines = workflow_parser.strip_comments(workflow)
+    bounds = workflow_parser.job_bounds(lines)
+    gate = workflow_parser.job_keys(lines, *bounds["ci_gate"]) if "ci_gate" in bounds else {}
+    needed = set(workflow_parser.list_values(lines, *gate["needs"])) if "needs" in gate else set()
+    if JOB not in needed:
+        failures.append(f"CI Gate must need {JOB}")
+    if table.get(JOB) != ci_gate.ALWAYS:
+        failures.append(f"scripts/ci_gate.py must list {JOB} as {ci_gate.ALWAYS!r}, never skipped")
     return failures
 
 
@@ -260,10 +273,30 @@ def validate_log(log: str, expected: set[str]) -> list[str]:
 class GuardTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        self.policy = json.loads((ROOT / ".github/branch-protection.json").read_text())
 
     def test_current_configuration(self):
-        self.assertEqual(validate(self.workflow, self.policy), [])
+        self.assertEqual(validate(self.workflow), [])
+
+    def test_gate_needs_list_forms(self):
+        head, separator, gate = self.workflow.partition("  ci_gate:\n")
+        inline = re.search(r"^    needs: \[(.*?)\]$", gate, re.MULTILINE)
+        self.assertIsNotNone(inline)
+        jobs = [job.strip() for job in inline.group(1).split(",")]
+        for needed in (jobs, [job for job in jobs if job != JOB]):
+            for form in (
+                "    needs: [" + ", ".join(needed) + "]",
+                "    needs:\n" + "\n".join(f"      - '{job}' # dependency" for job in needed),
+                "    needs: [\n" + "\n".join(f'      "{job}", # dependency' for job in needed) + "\n    ]",
+                "    needs:\n      [" + ", ".join(needed) + "]",
+                "    needs:\n      [\n" + "\n".join(f'        "{job}", # dependency' for job in needed) + "\n      ]",
+            ):
+                with self.subTest(needed=needed, form=form):
+                    changed = head + separator + gate.replace(inline.group(0), form)
+                    failures = validate(changed)
+                    if JOB in needed:
+                        self.assertEqual(failures, [])
+                    else:
+                        self.assertTrue(any(f"CI Gate must need {JOB}" in failure for failure in failures), failures)
 
     def test_missing_or_changed_execution_fails(self):
         for scope, (command, _, _) in SCOPES.items():
@@ -271,7 +304,7 @@ class GuardTests(unittest.TestCase):
                 with self.subTest(scope=scope, replacement=replacement):
                     changed = self.workflow.replace(command, replacement)
                     self.assertNotEqual(changed, self.workflow)
-                    self.assertTrue(validate(changed, self.policy))
+                    self.assertTrue(validate(changed))
 
     def test_old_package_feature_selection_fails(self):
         changed = self.workflow.replace(
@@ -279,37 +312,37 @@ class GuardTests(unittest.TestCase):
             "cargo test --locked -p omnigraph-cli --test crossversion_upgrade",
         )
         self.assertNotEqual(changed, self.workflow)
-        self.assertTrue(validate(changed, self.policy))
+        self.assertTrue(validate(changed))
         for (command, _, _), old in zip(SCOPES.values(), OLD_SCOPE_COMMANDS):
             with self.subTest(old=old):
                 changed = self.workflow.replace(command, old)
                 self.assertNotEqual(changed, self.workflow)
-                self.assertTrue(validate(changed, self.policy))
+                self.assertTrue(validate(changed))
 
     def test_conditional_job_and_steps_fail(self):
         for line in ("    if: false\n", "    needs: classify_changes\n", "    continue-on-error: true\n"):
             changed = self.workflow.replace("  storage_upgrade_compatibility:\n", "  storage_upgrade_compatibility:\n" + line)
-            self.assertTrue(validate(changed, self.policy))
+            self.assertTrue(validate(changed))
         for line in ("        if: false\n", "        continue-on-error: true\n"):
             changed = self.workflow.replace("      - name: Run required storage upgrade engine tests\n", "      - name: Run required storage upgrade engine tests\n" + line)
             self.assertNotEqual(changed, self.workflow)
-            self.assertTrue(validate(changed, self.policy))
+            self.assertTrue(validate(changed))
 
     def test_missing_log_check_and_failpoints_fail(self):
         for scope in SCOPES:
             changed = self.workflow.replace(f"--check-log {scope}", "--check-log invalid")
-            self.assertTrue(validate(changed, self.policy))
-        self.assertTrue(validate(self.workflow.replace(FEATURES, ""), self.policy))
+            self.assertTrue(validate(changed))
+        self.assertTrue(validate(self.workflow.replace(FEATURES, "")))
 
     def test_missing_predecessor_build_or_requirement_fails(self):
         for token in PREDECESSOR_TOKENS:
             with self.subTest(token=token):
                 changed = self.workflow.replace(token, "")
                 self.assertNotEqual(changed, self.workflow)
-                self.assertTrue(validate(changed, self.policy))
+                self.assertTrue(validate(changed))
         moved = self.workflow.replace(STAMP_13_SOURCE_COMMIT, "0" * 40)
         self.assertNotEqual(moved, self.workflow)
-        self.assertTrue(validate(moved, self.policy))
+        self.assertTrue(validate(moved))
 
     def test_removed_or_altered_predecessor_build_line_fails(self):
         exact = ["storage compatibility requires the exact genuine stamp-13 build script"]
@@ -323,11 +356,11 @@ class GuardTests(unittest.TestCase):
                     changed = self.workflow.replace(
                         block, "".join(f"          {line}\n" for line in altered)
                     )
-                    failures = validate(changed, self.policy)
+                    failures = validate(changed)
                     self.assertTrue(set(exact) <= set(failures), failures)
         swapped = self.workflow.replace("--package omnigraph-cli", "--package omnigraph-server")
         self.assertNotEqual(swapped, self.workflow)
-        self.assertEqual(validate(swapped, self.policy), exact)
+        self.assertEqual(validate(swapped), exact)
 
     def storage_job(self):
         start = self.workflow.index("  storage_upgrade_compatibility:\n")
@@ -340,7 +373,7 @@ class GuardTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertEqual(job.count(token), 1)
                 changed = self.workflow.replace(job, job.replace(token, ""))
-                failures = validate(changed, self.policy)
+                failures = validate(changed)
                 self.assertIn(f"storage compatibility is missing {token!r}", failures)
 
     def test_removed_or_altered_release_install_line_fails(self):
@@ -356,7 +389,7 @@ class GuardTests(unittest.TestCase):
                     changed = self.workflow.replace(job, job.replace(
                         block, "".join(f"          {line}\n" for line in altered)
                     ))
-                    failures = validate(changed, self.policy)
+                    failures = validate(changed)
                     self.assertTrue(set(exact) <= set(failures), failures)
         for before, after in (
             ("install_release v0.11.0", "install_release v0.12.0"),
@@ -366,10 +399,18 @@ class GuardTests(unittest.TestCase):
             with self.subTest(before=before, after=after):
                 moved = self.workflow.replace(job, job.replace(before, after))
                 self.assertNotEqual(moved, self.workflow)
-                self.assertEqual(validate(moved, self.policy), exact)
+                self.assertEqual(validate(moved), exact)
 
-    def test_missing_required_context_fails(self):
-        self.assertTrue(validate(self.workflow, {}))
+    def test_gate_must_need_the_job_and_never_let_it_skip(self):
+        self.assertEqual(validate(self.workflow), [])
+        self.assertIn(f"scripts/ci_gate.py must list {JOB} as 'always', never skipped", validate(self.workflow, {}))
+        self.assertIn(f"scripts/ci_gate.py must list {JOB} as 'always', never skipped", validate(self.workflow, {**ci_gate.JOBS, JOB: ci_gate.FULL_CI}))
+        for dropped in (f"{JOB}, ", f", {JOB}"):
+            with self.subTest(dropped=dropped):
+                changed = re.sub(rf"^(    needs: \[.*?){re.escape(dropped)}(.*?\])$", r"\1\2", self.workflow, count=1, flags=re.MULTILINE)
+                self.assertNotEqual(changed, self.workflow)
+                self.assertIn(f"CI Gate must need {JOB}", validate(changed))
+        self.assertIn(f"CI Gate must need {JOB}", validate(self.workflow.partition("  ci_gate:\n")[0]))
 
     def test_expected_cases_name_the_genuine_journey_and_every_engine_case(self):
         crossversion = expected_cases("crossversion")
@@ -421,10 +462,7 @@ def main() -> int:
             parser.error(f"unknown test scope: {scope}")
         failures = validate_log(Path(path).read_text(), expected_cases(scope))
     else:
-        failures = validate(
-            (ROOT / ".github/workflows/ci.yml").read_text(),
-            json.loads((ROOT / ".github/branch-protection.json").read_text()),
-        )
+        failures = validate((ROOT / ".github/workflows/ci.yml").read_text())
     if failures:
         for failure in failures:
             print(f"Storage upgrade CI: {failure}", file=sys.stderr)
