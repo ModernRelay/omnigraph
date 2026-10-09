@@ -1342,19 +1342,27 @@ query replace_content($c: Blob) {
 
 /// A managed Blob value of exactly the payload ceiling fits beside its row:
 /// payload and framing have separate ceilings, and the compatibility loader's
-/// pre-decode forecast splits like the batch check. One more byte is refused
-/// before any graph or table effect. The strict NDJSON loader bounds its
-/// encoded line instead, so the exact-limit value's 44.7 MB line is refused.
-/// Rust, not GQT: 32 MiB payloads are outside the case format.
+/// pre-decode forecast splits like the batch check, by the declared property
+/// types, so a `String` that starts with `base64:` stays framing. One more
+/// byte is refused before any graph or table effect. The strict NDJSON loader
+/// bounds its encoded line instead, so the exact-limit value's 44.7 MB line
+/// is refused. Rust: this owner reads the stored bytes back, asserts nothing
+/// moved on refusal and probes the compatibility loader, which GQT reaches
+/// only through generated loads capped at 16 MiB per batch; a GQT case would
+/// carry the 44.7 MB parameter as literal text.
 #[tokio::test]
 async fn exact_limit_blob_payload_fits_beside_its_row_and_one_more_byte_is_refused() {
     use base64::Engine;
 
     const LIMIT: usize = 32 * 1024 * 1024;
-    const SCHEMA: &str = "node Document { title: String @key content: Blob? }\n";
+    const SCHEMA: &str = "node Document { title: String @key note: String? content: Blob? }\n";
     const INSERT: &str = r#"
 query put_doc($title: String, $c: Blob) {
     insert Document { title: $title, content: $c }
+}
+
+query put_noted($title: String, $note: String, $c: Blob) {
+    insert Document { title: $title, note: $note, content: $c }
 }
 "#;
     let encode = |bytes: usize| {
@@ -1395,6 +1403,42 @@ query put_doc($title: String, $c: Blob) {
         .await;
         assert_eq!(bytes.len(), LIMIT, "{title}");
         assert!(bytes.iter().all(|&byte| byte == 7), "{title}");
+    }
+
+    // A 24 MiB Blob beside a String whose text starts with `base64:` and holds
+    // 12 MiB more: the String is framing to both the mutation and the
+    // loader's forecast, so each admits the row. Counting the String's
+    // decoded 9 MiB as payload would refuse it at 33 MiB.
+    let blob = encode(24 * 1024 * 1024);
+    let note = format!("base64:{}", "A".repeat(12 * 1024 * 1024));
+    db.mutate(
+        "main",
+        INSERT,
+        "put_noted",
+        &params(&[("$title", "noted"), ("$note", &note), ("$c", &blob)]),
+    )
+    .await
+    .expect("a String that looks like base64 is framing to a mutation");
+    db.load_jsonl(
+        &serde_json::json!({"type": "Document", "data": {
+            "title": "noted-load", "note": note, "content": blob}})
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a String that looks like base64 is framing to the loader's forecast");
+    for title in ["noted", "noted-load"] {
+        assert_eq!(
+            read_managed_blob_bytes(
+                &db,
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", title, "content"),
+            )
+            .await
+            .len(),
+            24 * 1024 * 1024,
+            "{title}"
+        );
     }
 
     let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
