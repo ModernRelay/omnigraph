@@ -82,7 +82,13 @@ GQ spells them, and `residual`, the other conjuncts of the same filter as
 text; its second input is the table `Scan` of `$r`, whose `runtime_filter`
 object names the `column` the join filters at run time (`x`), the `needle`
 as `[binding, property]` and the `kind` (`text_contains_any`). A `Scan` row
-carries no `runtime_filter` key unless a `ContainsJoin` marked it. Then one
+carries no `runtime_filter` key unless a `ContainsJoin` marked it. A physical
+`HydrateColumns` row at the root of a query plan (pass
+`late_materialization`) carries `bindings`: per binding its `binding`,
+`table` and the `columns` the output alone reads, which the scans below no
+longer project (they read the row address instead) and which are fetched by
+row address for the rows the root `limit` kept. Its `properties` carry
+`retained_limit`, the bytes one hydrated chunk may hold. Then one
 `plan` row per optimizer pass that fired (`node` `pass`), and one per
 remaining field of the explain document: `route` (the engine route the plan
 describes), `logical_hash` (the structural hash of the logical plan),
@@ -111,7 +117,7 @@ where equal rows are indistinguishable.
 The `datafusion` tree is the plan the query executes on the `v2` route: the
 physical tree lowered to operators, every read operator omnigraph's own
 (`ScanExec`, `ExpandExec`, `HashJoinExec`, `FilterExec`, `ProjectionExec`,
-`SortExec`, `LimitExec`, `CrossJoinExec`, `ContainsJoinExec`,
+`SortExec`, `LimitExec`, `HydrateExec`, `CrossJoinExec`, `ContainsJoinExec`,
 `AntiJoinMaskExec`, `RankFuseExec`,
 `MetadataCountExec`) except the aggregate, DataFusion's `AggregateExec`, one
 row per operator with `depth` from

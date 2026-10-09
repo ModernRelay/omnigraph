@@ -34,6 +34,7 @@ impl ProjectionContext {
                 PhysicalNode::SortMergeJoin { .. }
                 | PhysicalNode::HashJoin { .. }
                 | PhysicalNode::HydrateByAddress { .. }
+                | PhysicalNode::HydrateColumns { .. }
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
