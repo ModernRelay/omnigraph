@@ -209,6 +209,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
+- Title a pull request `type(scope)!: description` and read the title back
+  after opening it; the `PR Title` check refuses every other shape, and the
+  squash subject on `main` is that title
+  ([CONTRIBUTING.md](CONTRIBUTING.md), Pull Requests).
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.
