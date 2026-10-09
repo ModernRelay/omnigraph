@@ -1,0 +1,43 @@
+# issue: none
+# notes: Automatic two-hop traversal uses the prepared edge BTREE.
+# traversal: auto
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"start"}}
+{"type":"Person","data":{"name":"middle"}}
+{"type":"Person","data":{"name":"end"}}
+{"edge":"Knows","from":"start","to":"middle"}
+{"edge":"Knows","from":"middle","to":"end"}
+
+--- query
+set engine = v2;
+query two_hops() {
+    match {
+        $a: Person { name: "start" }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+
+--- expect unordered
+{"b.name":"middle"}
+{"b.name":"end"}
+
+--- expect shape
+b.name: String
+
+--- expect plan
+expand $a Knows $b: mode indexed_scan ran indexed_scan
+pass expand_mode

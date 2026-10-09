@@ -5881,6 +5881,7 @@ name = "omnigraph-planner"
 version = "0.13.0"
 dependencies = [
  "arrow-schema",
+ "futures",
  "omnigraph-compiler",
  "serde",
  "serde_json",

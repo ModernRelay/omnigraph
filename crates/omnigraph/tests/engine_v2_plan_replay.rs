@@ -709,6 +709,62 @@ async fn a_hash_join_traversal_replays_with_its_switches() {
     );
 }
 
+/// Replay must correct assumed coverage even when the old plan chose indexed scans.
+#[tokio::test]
+async fn legacy_two_hop_plan_corrects_assumed_coverage_before_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let query = r#"query two_hops() {
+        match { $a: Doc { slug: "d00" } $a knows{1,2} $b }
+        return { $b.slug }
+    }"#;
+    let run = db
+        .query_inspected("main", query, "two_hops", &ParamMap::new())
+        .await
+        .unwrap();
+    assert!(
+        sides(&report_rows(&run.report))
+            .iter()
+            .any(|side| side == "csr")
+    );
+    let result = rows_of(&run.result);
+    assert_eq!(result, vec![serde_json::json!({"b.slug":"d01"})]);
+    let mut plan = run.plan;
+    for id in plan.plan.post_order() {
+        if let Some(PhysicalNode::Expand { mode, policy, .. }) = plan.plan.node_mut(id) {
+            *mode = omnigraph_planner::ExpandMode::IndexedScan;
+            let omnigraph_planner::ExpandPolicy::Costed { inputs } = policy else {
+                panic!("automatic traversal must be costed")
+            };
+            inputs.coverage = omnigraph_planner::IndexCoverage::Indexed;
+        }
+    }
+    for legacy in [None, Some("legacy_assumed")] {
+        let mut encoded = serde_json::to_value(&plan).unwrap();
+        let mut changed = 0;
+        edit_objects(&mut encoded, &mut |object| {
+            if object.contains_key("coverage_provenance") {
+                changed += 1;
+                object.insert("coverage".into(), serde_json::json!("Indexed"));
+                if let Some(legacy) = legacy {
+                    object.insert("coverage_provenance".into(), serde_json::json!(legacy));
+                } else {
+                    object.remove("coverage_provenance");
+                }
+            }
+        });
+        assert_eq!(changed, 1);
+        let restored = serde_json::from_value(encoded).unwrap();
+        let replay = db.replay_bound_plan("main", restored).await.unwrap();
+        assert_eq!(rows_of(&replay.result), result);
+        assert!(
+            sides(&report_rows(&replay.report))
+                .iter()
+                .any(|side| side == "csr")
+        );
+    }
+}
+
 /// The plan carries the `ContainsJoin`, its residual and the right scan's
 /// marker; the replay builds the same join over the same filled slot and
 /// answers the same rows (`m1`'s pair with the passage named `m1` drops).

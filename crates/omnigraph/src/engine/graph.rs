@@ -556,11 +556,23 @@ pub(crate) enum ModeOrigin {
     Uncosted,
 }
 
-/// The start the plan recorded on `step`, with the two runtime corrections:
-/// a probed index coverage (or a CSR warmed by an earlier operator) re-runs
-/// the cost model before an indexed start, and the indexed start carries the
-/// per-hop policy that switches mid-flight (issue #533). `frontier_rows` is
-/// the breaker's retained frontier; the streaming single hop has none yet.
+impl ModeOrigin {
+    async fn runtime_coverage(
+        &self,
+        probe: impl Future<Output = Result<crate::table_store::IndexCoverage>>,
+    ) -> Option<Result<crate::table_store::IndexCoverage>> {
+        if matches!(self, Self::Costed(inputs)
+            if inputs.coverage_provenance == omnigraph_planner::CoverageProvenance::PinnedIndexFacts)
+        {
+            None
+        } else {
+            Some(probe.await)
+        }
+    }
+}
+
+/// Correct the recorded mode for the observed frontier and warm CSR, probing
+/// coverage only for legacy plans. The indexed start retains its per-hop policy.
 pub(super) async fn decide_expand_start(
     frontier_rows: Option<usize>,
     graph_index: &GraphIndexHandle,
@@ -616,18 +628,26 @@ pub(super) async fn decide_expand_start(
         &edge_table_key,
         [catalog.system_columns.src, catalog.system_columns.dst],
     )?;
-    let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
-    for orientation in endpoint_probes(direction, catalog.system_columns)
-        .iter()
-        .skip(1)
-    {
-        let extra =
-            crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key).await;
-        coverage = match (coverage, extra) {
-            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        };
-    }
+    let coverage = named
+        .origin
+        .runtime_coverage(async {
+            let mut coverage =
+                crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
+            for orientation in endpoint_probes(direction, catalog.system_columns)
+                .iter()
+                .skip(1)
+            {
+                let extra =
+                    crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key)
+                        .await;
+                coverage = match (coverage, extra) {
+                    (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                };
+            }
+            coverage
+        })
+        .await;
 
     let corrected = match &named.origin {
         ModeOrigin::Costed(inputs) => {
@@ -635,7 +655,9 @@ pub(super) async fn decide_expand_start(
             if let Some(observed) = frontier_rows {
                 inputs.frontier_rows = inputs.frontier_rows.min(observed as u64);
             }
-            inputs.coverage = coverage_for_decision(&coverage);
+            if let Some(coverage) = &coverage {
+                inputs.coverage = coverage_for_decision(coverage);
+            }
             inputs.csr_cached = inputs.csr_cached || graph_index.is_built();
             Some(inputs)
         }
@@ -671,7 +693,9 @@ pub(super) async fn decide_expand_start(
     );
     crate::instrumentation::record_expand_path(true);
     memory.metric("expand_indexed", 1);
-    warn_on_degraded_coverage(&coverage, key_col, edge_type);
+    if let Some(coverage) = &coverage {
+        warn_on_degraded_coverage(coverage, key_col, edge_type);
+    }
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
         None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
@@ -1700,5 +1724,52 @@ mod traversal_scan_admission_tests {
                 .to_string()
                 .contains("physical row count sum overflow")
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use omnigraph_planner::{CoverageProvenance, IndexCoverage};
+
+    /// GQT cannot detect a cached metadata probe; an unpolled future proves its absence.
+    #[tokio::test]
+    async fn pinned_facts_never_poll_the_runtime_probe() {
+        for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+            let mut inputs = ExpandCostInputs {
+                frontier_rows: 1,
+                edge_count: 10,
+                src_node_count: 10,
+                effective_max_hops: 2,
+                max_hops_cap: 10,
+                max_frontier_cap: 100,
+                coverage,
+                coverage_provenance: CoverageProvenance::PinnedIndexFacts,
+                csr_cached: false,
+                probe_factor: 1.0,
+            };
+            assert!(
+                ModeOrigin::Costed(inputs.clone())
+                    .runtime_coverage(async {
+                        panic!("pinned index facts must not trigger a runtime metadata probe")
+                    })
+                    .await
+                    .is_none()
+            );
+            inputs.coverage_provenance = CoverageProvenance::LegacyAssumed;
+            for origin in [
+                ModeOrigin::Costed(inputs),
+                ModeOrigin::Pinned,
+                ModeOrigin::Uncosted,
+            ] {
+                let probe = origin
+                    .runtime_coverage(async { Ok(crate::table_store::IndexCoverage::Indexed) })
+                    .await;
+                assert!(matches!(
+                    probe,
+                    Some(Ok(crate::table_store::IndexCoverage::Indexed))
+                ));
+            }
+        }
     }
 }
