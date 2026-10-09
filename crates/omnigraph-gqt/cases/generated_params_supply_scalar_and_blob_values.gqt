@@ -1,0 +1,56 @@
+# issue: none
+# notes: A `--- params generate` recipe supplies a mutation's parameters: a key
+# notes: and a 4-byte Blob generated from `{kind: blob}`, the same `base64:` text
+# notes: a literal body would carry. The insert lands, and a second insert
+# notes: with the same key under a literal body is refused: the key is taken.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+    body: Blob?
+}
+
+--- seed
+
+--- mutate
+query put($slug: String, $body: Blob) {
+    insert Doc { slug: $slug, body: $body }
+}
+
+--- params generate: v1 seed: 0
+params:
+  slug: {kind: key, prefix: doc-, width: 2}
+  body: {kind: blob, byte: 7, length: 4}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query slugs() {
+    match { $d: Doc }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "doc-00"}
+
+--- expect shape
+d.slug: String
+
+--- mutate
+query put($slug: String, $body: Blob) {
+    insert Doc { slug: $slug, body: $body }
+}
+
+--- params
+{"slug": "doc-00", "body": "base64:BwcHBw=="}
+
+--- expect error: already has this id

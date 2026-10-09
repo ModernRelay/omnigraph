@@ -12,6 +12,13 @@ const MAX_BATCH_ROWS: u64 = 4096;
 const MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GENERATED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ZIPF_POPULATION: u64 = 1_000_000;
+/// The JSON-encoded bound of one generated `--- params` section. It admits a
+/// 32 MiB Blob value, whose `base64:` text is about 44.7 MB.
+const MAX_PARAMS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PARAMS: usize = 256;
+/// The generator's table name for a params recipe: its columns' random
+/// streams are keyed `params` / `param.<name>`, apart from every load table.
+const PARAMS_TABLE: &str = "params";
 
 #[derive(Debug)]
 pub enum Seed {
@@ -29,6 +36,21 @@ pub struct Generated {
 #[serde(deny_unknown_fields)]
 struct Recipe {
     tables: Vec<Table>,
+}
+
+/// A `--- params generate: v1 seed: <u64>` section: each parameter's value is
+/// one generated column evaluated at ordinal zero. The recipe is validated and
+/// bounded when the case parses and generated only when its step runs.
+#[derive(Debug)]
+pub struct GeneratedParams {
+    seed: u64,
+    params: BTreeMap<String, Column>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParamsRecipe {
+    params: BTreeMap<String, Column>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +117,12 @@ enum Column {
         width: usize,
         population: u64,
         distribution: Distribution,
+    },
+    /// The `base64:` input text of a managed Blob of `length` bytes, each
+    /// equal to `byte`.
+    Blob {
+        byte: u8,
+        length: u64,
     },
 }
 
@@ -180,6 +208,54 @@ pub(crate) fn parse_arguments(
         return Err("generated load branch must not be empty".into());
     }
     Ok((seed, mode, branch.to_string()))
+}
+
+impl GeneratedParams {
+    pub(crate) fn parse(arguments: &str, body: &str) -> Result<Self, String> {
+        let (seed, _, _) = parse_arguments(arguments, false)?;
+        let recipe: ParamsRecipe = crate::runner_config::yaml(body, "generated params")?;
+        if recipe.params.is_empty() || recipe.params.len() > MAX_PARAMS {
+            return Err(format!(
+                "generated params name 1..={MAX_PARAMS} parameters, got {}",
+                recipe.params.len()
+            ));
+        }
+        let mut bytes = 2u64;
+        for (name, column) in &recipe.params {
+            let name_bytes = u64::try_from(name.len())
+                .ok()
+                .and_then(|n| n.checked_mul(6))
+                .and_then(|n| n.checked_add(4))
+                .ok_or("generated param name too large")?;
+            bytes = column
+                .validate(0)?
+                .checked_add(name_bytes)
+                .and_then(|value| bytes.checked_add(value))
+                .ok_or("generated params size overflow")?;
+        }
+        if bytes > MAX_PARAMS_BYTES {
+            return Err(format!(
+                "generated params exceed {MAX_PARAMS_BYTES} JSON bytes: bound {bytes}"
+            ));
+        }
+        Ok(Self {
+            seed,
+            params: recipe.params,
+        })
+    }
+
+    /// The parameters as the JSON object a literal `--- params` body holds.
+    pub(crate) fn generate(&self) -> Result<Value, String> {
+        self.params
+            .iter()
+            .map(|(name, column)| {
+                column
+                    .value(self.seed, PARAMS_TABLE, &format!("param.{name}"), 0, None)
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Result<Map<_, _>, _>>()
+            .map(Value::Object)
+    }
 }
 
 impl Generated {
@@ -474,7 +550,9 @@ impl Column {
             Self::Ranges { ranges, fallback } => {
                 fallback.is_string() && ranges.iter().all(|range| range.value.is_string())
             }
-            Self::Repeat { .. } | Self::Key { .. } | Self::Endpoint { .. } => true,
+            Self::Repeat { .. } | Self::Key { .. } | Self::Endpoint { .. } | Self::Blob { .. } => {
+                true
+            }
             Self::Ordinal { .. } | Self::Modulo { .. } | Self::Vector { .. } => false,
         }
     }
@@ -564,6 +642,12 @@ impl Column {
                 }
                 key_bound(prefix, *width)
             }
+            // `base64:`, four characters per started three bytes, and quotes.
+            Self::Blob { length, .. } => length
+                .div_ceil(3)
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(9))
+                .ok_or_else(|| "generated Blob size overflow".into()),
         }
     }
 
@@ -632,6 +716,15 @@ impl Column {
                     }
                 };
                 Ok(Value::String(format!("{prefix}{selected:0width$}")))
+            }
+            Self::Blob { byte, length } => {
+                use base64::Engine as _;
+                let bytes =
+                    vec![*byte; usize::try_from(*length).map_err(|_| "Blob length overflow")?];
+                Ok(Value::String(format!(
+                    "base64:{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )))
             }
         }
     }
@@ -814,6 +907,39 @@ mod tests {
                     .contains("batch_rows")
             );
         }
+    }
+
+    /// A `blob` column is the `base64:` input text of `length` repeated
+    /// bytes, and its bound covers that text, quotes included, so a recipe's
+    /// byte limits hold for the values it generates.
+    #[test]
+    fn blob_columns_generate_base64_input_within_their_bound() {
+        for (byte, length, expected) in [
+            (7, 0, "base64:"),
+            (7, 1, "base64:Bw=="),
+            (7, 4, "base64:BwcHBw=="),
+            (0, 6, "base64:AAAAAAAA"),
+        ] {
+            let column = Column::Blob { byte, length };
+            let value = column.value(0, PARAMS_TABLE, "param.b", 0, None).unwrap();
+            assert_eq!(value, Value::String(expected.to_string()));
+            assert!(
+                column.validate(0).unwrap()
+                    >= u64::try_from(serde_json::to_vec(&value).unwrap().len()).unwrap()
+            );
+        }
+        // A load batch counts the column's bound against its 16 MiB limit.
+        assert!(
+            Generated::parse(
+                0,
+                &RECIPE.replace(
+                    "kind: vector, dimensions: 3",
+                    "kind: blob, byte: 0, length: 16777216"
+                )
+            )
+            .unwrap_err()
+            .contains("16 MiB")
+        );
     }
 
     #[test]
