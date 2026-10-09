@@ -82,15 +82,59 @@ impl EmbedMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawEmbedSpec")]
 struct EmbedSpec {
     dimension: usize,
     types: BTreeMap<String, EmbedTypeSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct EmbedTypeSpec {
     target: String,
+    /// The property the target's `@embed("…")` names. Its value is the text
+    /// embedded.
+    source: String,
+}
+
+/// The spec as written: `fields` is a list, and it must name one property.
+#[derive(Deserialize)]
+struct RawEmbedSpec {
+    dimension: usize,
+    types: BTreeMap<String, RawEmbedTypeSpec>,
+}
+
+#[derive(Deserialize)]
+struct RawEmbedTypeSpec {
+    target: String,
     fields: Vec<String>,
+}
+
+impl TryFrom<RawEmbedSpec> for EmbedSpec {
+    type Error = String;
+
+    fn try_from(raw: RawEmbedSpec) -> Result<Self, Self::Error> {
+        let types = raw
+            .types
+            .into_iter()
+            .map(|(type_name, spec)| match spec.fields.as_slice() {
+                [source] if !source.trim().is_empty() => Ok((
+                    type_name,
+                    EmbedTypeSpec {
+                        target: spec.target,
+                        source: source.clone(),
+                    },
+                )),
+                fields => Err(format!(
+                    "embedding spec for type '{type_name}' must name exactly one field, the \
+                     source property its `@embed(\"…\")` declares, found {fields:?}"
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            dimension: raw.dimension,
+            types,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,34 +289,28 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                         cleaned_records += 1;
                     }
                 }
-                EmbedMode::ReembedAll => {
-                    if selected {
-                        embed_row(
-                            &mut row,
-                            type_spec,
-                            job.spec.dimension,
-                            client.as_ref().unwrap(),
-                        )
-                        .await?;
-                        embedded_records += 1;
-                    }
-                }
-                EmbedMode::FillMissing => {
-                    let reembed_selected = !job.selectors.is_empty();
+                EmbedMode::ReembedAll | EmbedMode::FillMissing => {
+                    let reembed =
+                        matches!(job.mode, EmbedMode::ReembedAll) || !job.selectors.is_empty();
                     if selected
-                        && (reembed_selected
+                        && (reembed
                             || embedding_missing(
                                 row.data().and_then(|data| data.get(&type_spec.target)),
                             ))
                     {
-                        embed_row(
+                        match embed_row(
                             &mut row,
                             type_spec,
                             job.spec.dimension,
                             client.as_ref().unwrap(),
+                            records,
                         )
-                        .await?;
-                        embedded_records += 1;
+                        .await?
+                        {
+                            VectorChange::Embedded => embedded_records += 1,
+                            VectorChange::Removed => cleaned_records += 1,
+                            VectorChange::Unchanged => {}
+                        }
                     }
                 }
             }
@@ -499,45 +537,96 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-fn build_embedding_text(type_name: &str, data: &Map<String, Value>, fields: &[String]) -> String {
-    let mut parts = vec![format!("type: {}", type_name)];
-    for field in fields {
-        if let Some(value) = data.get(field) {
-            let rendered = render_value(value);
-            if !rendered.is_empty() {
-                parts.push(format!("{}: {}", field, rendered));
-            }
-        }
+/// The text an `@embed("source")` vector embeds: the source value exactly as
+/// stored, with no type name, field label or trimming. A text
+/// `nearest($v, $q)` embeds `$q` the same way, so a record whose source equals
+/// the query text embeds the same input. `None` when the source is absent,
+/// null or blank.
+fn embedding_source_text<'a>(
+    type_name: &str,
+    data: &'a Map<String, Value>,
+    source: &str,
+    line_number: usize,
+) -> Result<Option<&'a str>> {
+    match data.get(source) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => bail!(
+            "line {}: {}.{} is not a string; an `@embed` source property is a String",
+            line_number,
+            type_name,
+            source
+        ),
     }
-    parts.join("\n")
 }
 
+/// What embedding a record did to its vector.
+#[derive(Debug, PartialEq, Eq)]
+enum VectorChange {
+    Embedded,
+    /// The record has no source text, so its vector was removed.
+    Removed,
+    /// The record has no source text and had no vector.
+    Unchanged,
+}
+
+/// Set the record's vector to the embedding of its source text. A record
+/// without source text keeps no vector: one derived from anything else would
+/// not answer a `nearest()` query for that text.
 async fn embed_row(
     row: &mut EmbedRow,
     spec: &EmbedTypeSpec,
     dimension: usize,
     client: &EmbeddingClient,
-) -> Result<()> {
-    let type_name = row
-        .type_name()
-        .ok_or_else(|| eyre!("cannot embed non-entity seed records"))?
-        .to_string();
-    let data = row
-        .data_mut()
-        .ok_or_else(|| eyre!("cannot embed non-entity seed records"))?;
-    let text = build_embedding_text(&type_name, data, &spec.fields);
-    if text.trim().is_empty() {
-        return Ok(());
-    }
-    let embedding = client.embed_document_text(&text, dimension).await?;
+    line_number: usize,
+) -> Result<VectorChange> {
+    let EmbedRow::Entity {
+        type_name, data, ..
+    } = row
+    else {
+        bail!("cannot embed non-entity seed records");
+    };
+    let Some(text) = embedding_source_text(type_name, data, &spec.source, line_number)? else {
+        if embedding_missing(data.get(&spec.target)) {
+            return Ok(VectorChange::Unchanged);
+        }
+        data.remove(&spec.target);
+        return Ok(VectorChange::Removed);
+    };
+    let embedding = client.embed_document_text(text, dimension).await?;
     data.insert(spec.target.clone(), json!(embedding));
-    Ok(())
+    Ok(VectorChange::Embedded)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RowSelector, build_embedding_text, render_value};
-    use serde_json::json;
+    use super::{
+        EmbedRow, EmbedSpec, EmbedTypeSpec, RowSelector, VectorChange, embed_row, parse_row,
+        render_value,
+    };
+    use omnigraph::embedding::{EmbeddingClient, EmbeddingConfig};
+    use serde_json::{Value, json};
+
+    fn mock_client() -> EmbeddingClient {
+        let config = EmbeddingConfig::from_parts(Some("mock"), None, None, String::new()).unwrap();
+        EmbeddingClient::new(config).unwrap()
+    }
+
+    fn title_spec() -> EmbedTypeSpec {
+        EmbedTypeSpec {
+            target: "embedding".to_string(),
+            source: "title".to_string(),
+        }
+    }
+
+    fn issue(data: Value) -> EmbedRow {
+        parse_row(&json!({ "type": "Issue", "data": data }).to_string(), 1).unwrap()
+    }
+
+    fn vector(row: EmbedRow) -> Option<Value> {
+        row.into_value()["data"].get("embedding").cloned()
+    }
 
     #[test]
     fn selector_parses_type_and_field_forms() {
@@ -559,20 +648,77 @@ mod tests {
         assert_eq!(render_value(&json!(3)), "3");
     }
 
+    /// A stored vector and a text `nearest()` query embed the same text, the
+    /// source value as stored, so under the mock provider, which ignores the
+    /// retrieval role, the two vectors are equal. A template such as
+    /// `type: Issue\ntitle: …` on one side makes them unrelated.
+    #[tokio::test]
+    async fn document_vector_is_the_query_vector_of_its_source_text() {
+        let client = mock_client();
+        for title in ["Fix login timeout", "  Fix login timeout\n"] {
+            let mut row = issue(json!({ "slug": "i-1", "title": title }));
+            let change = embed_row(&mut row, &title_spec(), 8, &client, 1)
+                .await
+                .unwrap();
+            assert_eq!(change, VectorChange::Embedded);
+            let query = client.embed_query_text(title, 8).await.unwrap();
+            assert_eq!(vector(row), Some(json!(query)), "title {title:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_without_source_text_keeps_no_vector() {
+        let client = mock_client();
+        for data in [
+            json!({ "slug": "i-1" }),
+            json!({ "slug": "i-1", "title": null }),
+            json!({ "slug": "i-1", "title": " " }),
+        ] {
+            let mut row = issue(data.clone());
+            let change = embed_row(&mut row, &title_spec(), 8, &client, 1)
+                .await
+                .unwrap();
+            assert_eq!(change, VectorChange::Unchanged, "{data}");
+            assert_eq!(vector(row), None, "{data}");
+
+            let mut stale = data.clone();
+            stale["embedding"] = json!([0.1, 0.2]);
+            let mut row = issue(stale);
+            let change = embed_row(&mut row, &title_spec(), 8, &client, 1)
+                .await
+                .unwrap();
+            assert_eq!(change, VectorChange::Removed, "{data}");
+            assert_eq!(vector(row), None, "{data}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_string_source_is_refused() {
+        let mut row = issue(json!({ "slug": "i-1", "title": 7 }));
+        let err = embed_row(&mut row, &title_spec(), 8, &mock_client(), 3)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 3: Issue.title is not a string"), "{err}");
+    }
+
     #[test]
-    fn build_embedding_text_prefixes_type_and_fields() {
-        let data = json!({
-            "slug": "dec-1",
-            "intent": "Ship it"
-        });
-        let object = data.as_object().unwrap();
-        let text = build_embedding_text(
-            "Decision",
-            object,
-            &["slug".to_string(), "intent".to_string()],
-        );
-        assert!(text.contains("type: Decision"));
-        assert!(text.contains("slug: dec-1"));
-        assert!(text.contains("intent: Ship it"));
+    fn spec_names_exactly_one_source_field() {
+        let spec = |fields: Value| {
+            serde_json::from_value::<EmbedSpec>(json!({
+                "dimension": 4,
+                "types": { "Issue": { "target": "embedding", "fields": fields } }
+            }))
+        };
+        let resolved = spec(json!(["title"])).unwrap();
+        assert_eq!(resolved.types["Issue"].target, "embedding");
+        assert_eq!(resolved.types["Issue"].source, "title");
+        for fields in [json!([]), json!(["slug", "title"]), json!([" "])] {
+            let err = spec(fields.clone()).unwrap_err().to_string();
+            assert!(
+                err.contains("embedding spec for type 'Issue' must name exactly one field"),
+                "{fields}: {err}"
+            );
+        }
     }
 }

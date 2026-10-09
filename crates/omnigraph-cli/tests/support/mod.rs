@@ -900,7 +900,7 @@ pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
             "  types:\n",
             "    Decision:\n",
             "      target: embedding\n",
-            "      fields: [slug, intent]\n"
+            "      fields: [intent]\n"
         ),
     )
     .unwrap();

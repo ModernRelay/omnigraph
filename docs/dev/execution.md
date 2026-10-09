@@ -779,7 +779,12 @@ admission complete before durable graph movement. See [blob.md](blob.md).
 ## Embeddings
 
 The provider-independent engine client handles query-string embedding and the
-offline `omnigraph embed` workflow. Ordinary Load does not execute `@embed`
+offline `omnigraph embed` workflow. Both pass their text to the provider
+unchanged: the offline workflow a record's `@embed` source value, the query
+path the query string. Only the provider's retrieval role differs between them,
+so a document whose source equals the query text is the query's own input; a
+template on either side would put stored and query vectors in different text
+spaces. Ordinary Load does not execute `@embed`
 at ingestion time; callers supply vectors or precompute them. The annotation
 records and validates embedding identity. Any future ingest-time reconciler is
 a separate design, not a hidden loader behavior.
