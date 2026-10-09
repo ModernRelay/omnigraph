@@ -336,12 +336,40 @@ jobs also save when red (`cache-on-failure`): dependency artifacts are valid
 whatever the test verdict, and a red seed run would otherwise leave every
 pull request cold until `main` is green again.
 
+The active PR-path Rust jobs also install `sccache` through the
+commit-pinned `mozilla-actions/sccache-action`, with the binary version
+pinned to `v0.16.0`. Each job sets `RUSTC_WRAPPER=sccache` and
+`SCCACHE_GHA_ENABLED=true`. `SCCACHE_GHA_RW_MODE` is `READ_WRITE` on
+`refs/heads/main` and `READ_ONLY` on every other ref, including pull requests,
+merge-queue branches and tags. This keeps per-compilation uploads under
+the same main-only policy as the archive cache; `rust-cache`'s `save-if`
+does not control `sccache`. Both caches share the repository's Actions
+cache quota. The vocabulary audit (nightly toolchain, disabled) and the
+release and publish workflows carry no `sccache` step.
+
+`rust-cache` restores an archive keyed on the toolchain, build environment,
+manifests and `Cargo.lock`, with prefix fallback when dependencies change.
+When Cargo still invokes rustc, `sccache` can reuse retained compilations
+whose source, compiler, flags, paths and dependency hashes match.
+`rust-cache` exports `CARGO_INCREMENTAL=0`, so eligible workspace library
+compilations can be cached too. Linking remains uncached, including
+binaries, test executables and proc-macro crates; unchanged source alone
+does not guarantee a hit. Adding `RUSTC_WRAPPER` changes `rust-cache`'s
+environment hash, including its prefix restore key, so existing archives
+do not seed the first run. Changing the pinned `sccache` version also
+changes its cache namespace. Cargo can print `Compiling` on a cache hit:
+use the action's post-step hit/miss counts and build timings to measure
+reuse. The speedup and cache retention need hosted-run evidence.
+
 A cache is derived state, and no job may need one to fit its budget. The
 repository's caches exceed GitHub's cap, so every save evicts the least
 recently used entries: within one `main` run, the jobs that finish first are
 evicted first by the saves of the jobs that finish last. A run cancelled by
-its timeout saves no usable cache either (issue #755: every run after the
-cancelled `main` run restored nothing). Each `GQ Logic Tests` budget
+its timeout does not save a `rust-cache` archive
+([issue #755](https://github.com/ModernRelay/omnigraph/issues/755): every run
+after the cancelled `main` run restored nothing). Completed `sccache`
+uploads can survive a later cancellation, but neither cache is guaranteed.
+Each `GQ Logic Tests` budget
 therefore covers a cold build with margin, and a second `cargo` invocation
 in a job must not change the dependency graph: it selects packages whose
 graph the first invocation already built, or it rebuilds every crate whose
@@ -404,7 +432,7 @@ list):
 
 - **`dst.yml`** (per PR and `main` push that changes engine input, through
   its own `Classify Changes (DST)` copy; a superseded PR run is cancelled,
-  which loses nothing because its cache saves are push-only): the pinned
+  which loses no cache uploads because PRs write neither cache): the pinned
   deterministic suite — every failure line carries the universe seed, so a
   red run is reproducible locally from the log alone. The job also lints the shipped
   engine shape (`-p`, no `dst` feature), which workspace feature

@@ -555,6 +555,9 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -582,6 +585,13 @@ jobs:
           # cold until main is green again.
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro
@@ -621,6 +631,9 @@ jobs:
       # the source with `Box::pin` (see `helpers::cost::cost_harness`); this
       # keeps CI deterministic across runners while that work continues.
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -641,6 +654,13 @@ jobs:
           # Save only from main, red or green (same rule as `lint`).
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # GQ Logic Tests owns GQT in both build shapes, including its DST runtime;
       # dst.yml owns the DST suite (excluded by name: with the workspace
@@ -750,6 +770,9 @@ jobs:
       # A missing predecessor binary fails the genuine journey instead of
       # skipping it: this context is required on every change.
       OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -769,6 +792,13 @@ jobs:
             . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
@@ -886,6 +916,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -906,6 +939,13 @@ jobs:
           key: crossversion-v5-v10
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
@@ -967,6 +1007,9 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Skip when no engine input changed
         if: needs.classify_changes.outputs.run_full_ci != 'true'
@@ -996,6 +1039,14 @@ jobs:
           # Save only from main, red or green (same rule as `lint`).
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Build omnigraph-server with aws feature
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -1047,6 +1098,9 @@ jobs:
       OMNIGRAPH_S3_TEST_PREFIX: github-actions
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1070,6 +1124,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # A red `main` run still seeds the cache pull requests restore.
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 carried hyper's short
@@ -1242,6 +1303,9 @@ jobs:
       OMNIGRAPH_AZURE_TEST_CONTAINER: omnigraph-tests
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1261,6 +1325,13 @@ jobs:
             . -> target
           key: azurite-azure
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Start pinned Azurite Blob service
         # Azurite 3.35.0, pinned to the immutable multi-arch index digest.
