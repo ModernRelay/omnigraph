@@ -138,6 +138,9 @@ jobs:
       # Same floor as the Test Workspace job: unoptimized builds keep every
       # nested async engine frame, deeper than a default 2 MiB thread stack.
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       # Check the classification copies on skipped changes too.
       - name: Checkout source
@@ -174,6 +177,14 @@ jobs:
           # Save only from main, red or green (same rule as ci.yml's `lint`).
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        if: needs.classify_changes.outputs.run_gqt == 'true'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # Every cargo invocation of this job selects the same three packages,
       # so the engine graph resolves one feature set and builds once; a
