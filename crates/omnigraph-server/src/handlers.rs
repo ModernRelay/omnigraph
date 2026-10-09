@@ -1004,9 +1004,9 @@ pub(crate) async fn server_blob_head(
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
             )),
-        (status = 413, description = "The body exceeds 32 MiB, or the row's carried Blob payloads and the new value exceed the write's payload limit", body = ErrorOutput),
+        (status = 413, description = "The body exceeds 32 MiB, or the entity's carried Blob payloads and the new value exceed the write's payload limit", body = ErrorOutput),
         (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source carried from the row could not be read", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),
@@ -1014,7 +1014,7 @@ pub(crate) async fn server_blob_head(
 )]
 /// Replace one Blob value of an existing node or edge with the request body.
 ///
-/// The cell's old value is never read; the row's other cells are carried
+/// The cell's old value is never read; the entity's other cells are carried
 /// unchanged. Authorization of `change` on the branch runs before the body is
 /// read. Once admitted the write is owned by the server: a disconnect loses
 /// only the response, never cancels or replays the write.
@@ -1120,8 +1120,8 @@ pub(crate) async fn server_blob_put(
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
             )),
-        (status = 413, description = "The row's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source carried from the row could not be read", body = ErrorOutput),
+        (status = 413, description = "The entity's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
     ),

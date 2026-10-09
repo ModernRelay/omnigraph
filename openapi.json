@@ -1559,7 +1559,7 @@
           "blobs"
         ],
         "summary": "Replace one Blob value of an existing node or edge with the request body.",
-        "description": "The cell's old value is never read; the row's other cells are carried\nunchanged. Authorization of `change` on the branch runs before the body is\nread. Once admitted the write is owned by the server: a disconnect loses\nonly the response, never cancels or replays the write.",
+        "description": "The cell's old value is never read; the entity's other cells are carried\nunchanged. Authorization of `change` on the branch runs before the body is\nread. Once admitted the write is owned by the server: a disconnect loses\nonly the response, never cancels or replays the write.",
         "operationId": "cluster_putBlob",
         "parameters": [
           {
@@ -1836,7 +1836,7 @@
             }
           },
           "413": {
-            "description": "The body exceeds 32 MiB, or the row's carried Blob payloads and the new value exceed the write's payload limit; Request body exceeds its route limit before operation admission",
+            "description": "The body exceeds 32 MiB, or the entity's carried Blob payloads and the new value exceed the write's payload limit; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -1878,7 +1878,7 @@
             }
           },
           "424": {
-            "description": "An allowed external Blob source carried from the row could not be read",
+            "description": "An allowed external Blob source carried from the entity could not be read",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2195,7 +2195,7 @@
             }
           },
           "413": {
-            "description": "The row's carried Blob payloads exceed the write's payload limit",
+            "description": "The entity's carried Blob payloads exceed the write's payload limit",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -2216,7 +2216,7 @@
             }
           },
           "424": {
-            "description": "An allowed external Blob source carried from the row could not be read",
+            "description": "An allowed external Blob source carried from the entity could not be read",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
