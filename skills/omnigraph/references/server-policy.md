@@ -12,9 +12,9 @@ omnigraph-server --cluster s3://bucket/prefix --bind 0.0.0.0:8080
 ```
 
 The server loads the cluster's applied revision and serves each graph under
-`/graphs/{id}`. `cluster apply --server` activates schema and stored-query
-changes and new graphs without a restart; a direct `cluster apply` needs the
-server stopped. There is no single-graph server mode. A stopped server, even
+`/graphs/{id}`. `cluster apply --server` activates schema, stored-query, policy,
+provider and external-Blob changes, plus graph creation/deletion, without a
+restart. Direct apply requires serving to be stopped. There is no single-graph server mode. A stopped server, even
 after a clean exit, leaves the cluster lock: once its writes have settled,
 clear it with `cluster force-unlock <LOCK_ID>` before the next start (see
 [cluster mode](cluster.md)).
@@ -32,7 +32,8 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `GET /healthz`, `/openapi.json` | Process metadata |
 | `GET /readyz` | Replica readiness, applied revision and served/ready/loading/blocked counts |
 | `GET /graphs` | List graphs with their availability (`graph_list`) |
-| `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Submit and inspect a `cluster apply --server` deployment (`config_manage`) |
+| `POST /cluster/plan` | Preview the submitted configuration without effects (`config_manage`) |
+| `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Submit once and inspect a deployment; exact-ID observation survives caller disconnect |
 | `/graphs/{id}/query`, `/mutate` | Inline GQ reads and writes |
 | `/graphs/{id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
 | `/graphs/{id}/queries` | List/invoke stored queries; `/queries/{name}/if-graph-commit` for conditional writes |
@@ -51,16 +52,15 @@ refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.
 
-`/read`, `/change`, and `/ingest` are deprecated compatibility routes. A
-cluster-only server retains `POST /graphs/{id}/schema/apply` for wire
-compatibility but rejects it with `409`; use `cluster plan`/`cluster apply`.
+Graph schema changes use cluster plan/apply. There is no graph schema-apply
+endpoint and no alias routes for older HTTP contracts. Discover the contract
+with `/healthz` before sending protected requests; redirects and mismatched
+responses are not permission to replay an effectful request.
 
 Canonical `/query` JSON includes the graph commit pinned with its rows when the
 read snapshot has an effective graph head; a fresh pre-commit graph can omit it. Exact
 write receipts and conditional semantics are summarized in
 [commit changes and feeds](changes.md). Blob delivery is in [Blob values](blobs.md).
-The deprecated `/read` response does not carry that commit position; consumers
-that need conditional writes must use `/query`.
 
 Canonical `/query` accepts `branch list`; `/mutate` accepts `branch create`,
 `branch delete` and `branch merge` with no request target, name or params. These
@@ -69,7 +69,7 @@ return branch outcomes, not ordinary data-mutation receipts; see
 physical `system_columns`; GQ uses `@id`/`@src`/`@dst` on either storage vintage.
 
 `/readyz` is unauthenticated and contains no graph names. It identifies the
-applied revision this process booted from, reports `ready: false`/HTTP 503 while
+booted applied revision, reports `ready: false`/HTTP 503 while
 a graph is loading, when a nonempty inventory has no ready graph, and while
 draining, and includes `served_graph_count`, `ready_graph_count`,
 `loading_graph_count` and `blocked_graph_count`. Authorized `GET /graphs`
@@ -100,7 +100,7 @@ actions remain denied.
 Managed signed data credentials are a separate token source, enabled with
 `--data-token-trust <file>`. The trust file binds keys to the exact deployment;
 tokens select an immutable principal actor. An identity credential carries no
-permissions; a legacy restricted one also narrows current Cedar grants.
+permissions; only version-2 identity credentials are accepted.
 That actor (`principal:<immutable-id>`) must itself be permitted by the applied
 Cedar policy, or every graph request is denied; an identity credential can
 still list graph ids through `GET /graphs/discovery`. Trust changes need a
@@ -117,14 +117,15 @@ Graph-scoped actions are:
 | `read` | Queries, snapshots, branches, commits, Blob reads, and change polling |
 | `export` | Export and change-feed baseline capture |
 | `change` | Mutations and loads |
-| `schema_apply` | Schema changes: `cluster apply --server` needs it on each existing graph whose schema changes |
+| `schema_apply` | Served schema changes and graph deletion: required on each affected existing graph |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
 `graph_list` is cluster-scoped and controls `GET /graphs`. `config_manage` is
-cluster-scoped too and authorizes `cluster apply --server`; put it in a rule
-of its own. A stored read needs
+cluster-scoped too and authorizes served cluster planning and deployment; put
+it in a rule of its own. Current policy authorizes configuration changes; a
+proposed policy cannot authorize its own installation. A stored read needs
 `invoke_query` plus `read`; a stored mutation needs `invoke_query` plus
 `change`. A denied and unknown stored-query name both appear as `404` to a
 caller lacking `invoke_query`. A load with `from` also needs `branch_create`
@@ -178,14 +179,16 @@ omnigraph policy explain --cluster . --graph knowledge \
   --actor act-alice --action read --branch main
 ```
 
-The `policy` commands evaluate the cluster's **applied** bundles, not draft
-files: run `cluster validate` on the draft, then `cluster apply`. A bundle is
-installed when the cluster is first applied or when its graph is created; a
-later apply that edits an existing bundle, or changes its bindings other than
-by adding a newly created graph, is refused with `deployment_scope`.
-`--graph <id>` must match exactly one applied
-bundle; with both a graph bundle and a `cluster` bundle applied (as in the
-example above), the command refuses with "matches 2 policy bundles".
+The `policy` commands evaluate applied bundles, not draft files. Validate the
+source with `cluster validate`, preview with `cluster plan --server …`, then
+apply. Live policy changes drain admitted work before later requests use the
+new HTTP and engine permissions. Process token sources and signed-token trust
+remain startup settings.
+
+The CLI policy selector currently requires exactly one matching bundle. With
+both a graph bundle and a `cluster` bundle applied, `--graph <id>` refuses with
+"matches 2 policy bundles"; this inspection limitation does not prevent the
+server from applying or enforcing those bundles.
 
 ## Direct access is a separate trust boundary
 

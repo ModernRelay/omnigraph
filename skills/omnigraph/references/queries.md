@@ -11,17 +11,14 @@
 - Filter operators
 - Mutations
 - Branch statements
-- Naming convention
-- Aliases over raw queries
 
 Writing `.gq` query files in Omnigraph.
 
 ## File Organization
 
-- One `.gq` file per primary node type (`signals.gq`, `patterns.gq`, `elements.gq`)
-- One `mutations.gq` file for all insert/update/delete queries
-- Put query files in `queries/`, then declare `graphs.<id>.queries: queries/` in
-  `cluster.yaml`; cluster mode does not scan an undeclared directory.
+Group related query declarations in `.gq` files and declare them under
+`graphs.<id>.queries` in `cluster.yaml`. The server does not scan undeclared
+directories. See [stored queries](stored-queries.md) for deployment.
 
 ## Linting
 
@@ -197,6 +194,21 @@ query busy_signals($least: I64) {
 }
 ```
 
+### Typed edge selections
+
+GQ 2.1 supports `$a (knows | likes) $b` to select named edge types and `$a * $b`
+to select compatible types from the captured schema. Wildcards require declared
+endpoint node types. Omitted bounds mean `{1,1}`; recursion needs finite bounds
+such as `{1,3}`. `$a $e:(knows | likes) $b` binds one-hop concrete edges and
+exposes `$e.@type` and `$e.@id`. Common properties must exist with compatible
+base types on every member; nullability and enum domains widen.
+
+`set traversal_work_limit = 1000000;` sets the shared traversal row-work cap for
+statements using selections. Selected-table sizes count before scans; a result
+limit does not replace this cap. Exhaustion fails the query, never partial
+success. Historical wildcard targets are refused. Stored-query validation can
+refuse a schema addition that invalidates wildcard common-property references.
+
 ## System Fields and Result Values
 
 Use `$p.@id` for a node's identity and `$w.@id`, `$w.@src`, `$w.@dst` for a
@@ -231,61 +243,10 @@ range fails the read instead of printing.
 
 ## Search Functions
 
-### Text search
-
-```gq
-match {
-    $d: Doc
-    search($d.title, $q)       // full-text on @index'd String
-}
-```
-
-```gq
-match {
-    $d: Doc
-    fuzzy($d.title, $q, 2)     // fuzzy match, max 2 edits
-}
-```
-
-```gq
-match {
-    $d: Doc
-    match_text($d.body, $q)    // regular full-text match (not phrase search)
-}
-```
-
-### Vector/ranking
-
-```gq
-query vector_search($q: Vector(3072)) {
-    match { $d: Doc }
-    return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
-    limit 10
-}
-```
-
-`nearest`, `bm25`, and `rrf` belong in `order`, but they also restrict rows: a
-`bm25` ordering returns only text matches, `nearest` skips rows whose vector is
-null, and `rrf` returns the union of its arms' candidates. `nearest` and `rrf`
-require `limit N`; BM25 alone does not, though a limit is recommended for
-bounded output.
-
-`nearest(...)` and `bm25(...)` can also be projected as scores when the
-expression exactly repeats the leading `order` key; see
-[`search.md`](search.md#projecting-scores). `rrf(...)` and search predicates
-cannot be projected.
-
-### Hybrid (reciprocal rank fusion)
-
-```gq
-query hybrid_search($vq: Vector(3072), $tq: String) {
-    match { $d: Doc }
-    return { $d.slug, $d.title }
-    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
-    limit 10
-}
-```
+`search`, `fuzzy` and `match_text` filter text matches. `nearest`, `bm25` and
+`rrf` lead the `order` clause and also restrict rows; `nearest` and `rrf` need a
+finite `limit N`. Score projection repeats the leading ranking expression.
+Read [search](search.md) for query examples, scoping, providers and exact limits.
 
 ## Aggregations
 
@@ -460,14 +421,3 @@ A statement takes no name, `--params`, `--branch`, `--snapshot`, or
 `branch delete`. `lint` and stored-query registries reject statement files.
 Outcome and receipt semantics differ from data mutations; see
 [`changes.md`](changes.md#branch-statements).
-
-## Naming Convention
-
-`verb_object`:
-- `get_signal`, `recent_signals`, `search_signals`
-- `signal_patterns`, `signal_elements` (traversal queries)
-- `add_signal`, `link_signal_forms_pattern` (mutations)
-
-## Aliases Over Raw Queries
-
-For anything an agent or script will call repeatedly, define an operator alias. See `references/aliases.md`.

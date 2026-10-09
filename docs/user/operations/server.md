@@ -207,6 +207,7 @@ keep their existing routes and do not expose MCP.
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `POST /cluster/plan` | Preview configuration changes and schema migrations without applying them |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
 | `GET /.well-known/oauth-protected-resource` | Public OIDC resource metadata; only when OIDC trust is configured |
