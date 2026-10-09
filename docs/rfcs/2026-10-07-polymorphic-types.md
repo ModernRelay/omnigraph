@@ -195,9 +195,17 @@ Traversal endpoints use the same sets. A traversal's destination set is the
 edge's endpoint set, intersected with any declared type of the destination
 variable. An alternation's destination set is the union of its members'
 destination sets, so the T5 refusal of differing destinations becomes valid
-alternation. Direction is still inferred. When a source's set fits both ends of
-an edge (for example `Mentions: Named -> Note` with `Note implements Named`),
-the traversal is refused unless the other endpoint's declared type decides it.
+alternation. Direction is still inferred:
+
+- When the source's set fits only one end of the edge, that end decides.
+- When it fits both ends and the edge's two endpoint sets are equal (a
+  same-type edge such as `Knows: Person -> Person`, or
+  `RelatedTo: Subject -> Subject`), the traversal is outgoing. That keeps
+  today's rule for same-type edges, which `test_traversal_direction_out` pins.
+- When it fits both ends of unequal, overlapping sets (for example
+  `Mentions: Named -> Note` with `Note implements Named`), the traversal is
+  refused unless the other endpoint's declared type fits only one reading.
+
 Multi-hop selections across a polymorphic edge require each hop's destination
 set to be accepted as the next hop's source set. `RelatedTo: Subject -> Subject`
 recurses across Person and Organization with one shortest-distance search.
@@ -271,6 +279,14 @@ through `satisfies_interface_properties`, as
 [RFC 0028](0028-stable-schema-identity.md) specifies. A member's satisfying
 property always carries the interface property's name, because the parser
 matches by name and open compares the IR with the shape compiled from source.
+
+The catalog also owns one endpoint resolver. For each edge side it records the
+declared type, its member set and its tag column, and it maps a stored row's
+tag to the row's concrete type. Load validation, referential integrity,
+cascade, keyed ids, export, the change feed and traversal all read this one
+resolver, so they cannot disagree about which node a stored endpoint names.
+The prototype grew four separate copies of that mapping (loader, validator,
+cascade, traversal); one resolver removes the chance that they drift apart.
 
 ### SchemaIR and features
 
@@ -357,8 +373,14 @@ callable surface. `add_columns` stays forbidden.
   `ResolvedTraversal` endpoints carry sets.
 - `resolve_member` replaces string equality with assignability: a member is
   outbound when the source set is a subset of the edge's source set. A source
-  set that fits both ends is ambiguous and refused, unless the other endpoint
-  decides it.
+  set that fits both ends is outbound when the edge's endpoint sets are equal,
+  and otherwise refused unless the other endpoint decides it (the rule under
+  Queries).
+- The multi-hop check compares sets, not binding names: a path continues when
+  every type a hop can end on may start the next hop. `$a: Person` over
+  `RelatedTo: Subject -> Subject` recurses although `Person` differs from
+  `Subject`. Typecheck, `ExpandStep` validation and plan admission repeat the
+  name comparison today; all three use one catalog predicate instead.
 - `IROp::NodeScan` carries a `NodeSelection` with provenance, mirroring
   `EdgeSelection`: `Named`, `Interface { name, members }`, `Union(members)`.
   `EdgeMember` gains concrete `src_type` and `dst_type`, so a polymorphic edge
@@ -466,6 +488,12 @@ callable surface. `add_columns` stays forbidden.
   keyed upsert would silently overwrite a different edge. The prototype splices
   each tag into the key after its endpoint; the spelling is an unresolved
   question.
+- A keyed polymorphic edge round-trips through export and load. Export writes
+  the stored id with `from_type`/`to_type`; load recomputes the canonical id
+  from the endpoints and their types and, as today, refuses an explicit id that
+  differs. A spelling that changes on rename (a type name) would make a
+  re-load disagree with ids written before the rename, so it must either be
+  rename-stable or be rewritten by the rename.
 - Generalizing a keyed or `@unique` edge is refused in v1. Existing rows keep
   ids derived without a type, while later keyed writes derive them with one, so
   a Merge load of an existing edge would miss its row and insert a duplicate
@@ -652,8 +680,9 @@ What held as designed:
 - The union scan conformed each member table to the interface's columns plus
   `~node_type` through the existing scan operator, with per-member pushdown.
 - Qualified interner keys kept colliding ids apart in forward, reverse,
-  two-hop and negation traversals, with Lance probes still on raw ids. Facets
-  were not needed.
+  two-hop and negation traversals, and in a `{1,3}` recursion over
+  `RelatedTo: Named -> Named` across Person, Organization and Note, with Lance
+  probes still on raw ids. Facets were not needed.
 - Hydrating abstract destinations per member and joining on `(type, id)`.
 - Referential integrity grouped by tag, and the tag-predicated cascade.
 - Load envelopes: a missing type on a multi-member side, a non-member type, a
@@ -679,6 +708,8 @@ confirms a rule this RFC already stated; the others are new.
 | P7 | migration | The all-null tag forces every read path to interpret null; a constant fill does not. |
 | P8 | engine | An untyped expansion returned wrong rows with no error. |
 | P9 | engine | Forcing CSR names an internal selection in its refusal. |
+| P11 | typecheck | The ambiguity rule refused `Subject -> Subject` recursion; the prototype picked a direction silently for a truly ambiguous edge. |
+| P12 | typecheck, engine | The multi-hop rule compared binding names in three places, refusing recursion from `$a: Person` over a `Named -> Named` edge. |
 
 The cycle-closing fix (P2) and the typed-route requirement (P8) were each
 checked by switching them off: the tests then returned wrong rows. Switching off
@@ -718,6 +749,11 @@ Following [the test map](../dev/testing.md), these existing owners are extended:
   - A plan that expands a polymorphic edge without endpoint types is refused
     by `ExpandStep` validation, built directly rather than through typecheck.
   - Cycle closing and negation over an interface binding with colliding ids.
+  - Direction: one-hop and recursive traversal over an edge with equal
+    endpoint sets (outgoing), and refusal over unequal overlapping sets unless
+    the other endpoint decides.
+  - A keyed polymorphic edge survives typed upsert, export and load, and a
+    restart as one logical row with the same id.
   - Generalizing a keyed or `@unique` edge is refused.
   - Plan-replay tests: every member pin.
 - **GQT:** cases that mirror the issue-659 suite. They cover union scans,
@@ -823,3 +859,8 @@ generalization instead of read as null; the graph index build excludes
 polymorphic edges; the engine refuses an untyped expansion over a polymorphic
 edge; a named polymorphic edge gets its own policy; generalizing a keyed edge is
 refused in v1; tag columns sit after every property.
+
+2026-10-09: addressed review. Equal endpoint sets keep the outgoing direction
+and only unequal overlapping sets are ambiguous; the multi-hop check compares
+endpoint sets; keyed polymorphic edges round-trip through export and load;
+one catalog resolver maps stored tags to concrete types for every consumer.
