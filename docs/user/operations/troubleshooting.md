@@ -32,7 +32,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
-| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
+| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
 | 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
@@ -43,6 +43,16 @@ refusal before headers, logged with `error_variant="unclassified"`. A managed
 Blob body that fails after the headers logs the byte range under one of
 `blob_payload_read` (with the error class), `blob_payload_short_read` (with
 the returned and expected byte counts) or `blob_payload_permit_closed`.
+
+A change route (`GET /changes`, `POST /changes/baseline`,
+`GET /commits/{commit_id}/changes`) answers an internal failure with a fixed
+500 and logs `error_kind="change_route_internal"` with `error_variant`,
+`storage_kind` and `manifest_kind`. A change route that requires recovery logs
+the `operation_id` the 503 reports. An export or change-baseline response that
+fails after its 200 headers ends with an incomplete body and logs
+`error_kind="served_stream_failed"` with `stream` (`export` or
+`change_baseline`) and the same error class. None of these logs carries the
+error's message, which can hold object URIs or credentials.
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
