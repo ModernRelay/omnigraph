@@ -86,6 +86,37 @@ fn public_inventory_is_sorted_complete_and_stable() {
     }
 }
 #[test]
+fn shared_catalog_leaves_the_volume_to_the_host() {
+    let shared =
+        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml"))
+            .unwrap()
+            .definition;
+    assert_eq!(shared.defaults.environment, None);
+    assert_eq!(shared.defaults.protocol.reset, None);
+    let (filesystem, reset) = if cfg!(target_os = "macos") {
+        ("apfs", "local-clonefile")
+    } else {
+        ("xfs", "plain-copy")
+    };
+    let shown = run(&root(), &["show", "tiny-read", "--json"], true);
+    assert_eq!(
+        shown["value"]["environment"]["backend"]["filesystem"],
+        filesystem
+    );
+    assert_eq!(shown["value"]["protocol"]["reset"], reset);
+    for pinned in [
+        "branch-merge-d50-process-cold-xfs",
+        "branch-merge-d50-history64-xfs",
+    ] {
+        let shown = run(&root(), &["show", pinned, "--json"], true);
+        assert_eq!(
+            shown["value"]["environment"]["backend"]["filesystem"],
+            "xfs"
+        );
+        assert_eq!(shown["value"]["protocol"]["reset"], "plain-copy");
+    }
+}
+#[test]
 fn human_and_machine_help_need_no_catalog_or_cache() {
     let directory = tempfile::tempdir().unwrap();
     for args in [

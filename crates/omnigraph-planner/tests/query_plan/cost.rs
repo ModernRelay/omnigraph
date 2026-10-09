@@ -680,3 +680,232 @@ fn find_node<'j>(node: &'j serde_json::Value, name: &str) -> Option<&'j serde_js
         .flatten()
         .find_map(|input| find_node(input, name))
 }
+
+/// The physical scan of `binding`'s projection after every pass.
+fn physical_projection(plan: &PhysicalPlan, binding: &str) -> BTreeSet<String> {
+    plan.live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::Scan { spec, .. } if spec.binding.as_deref() == Some(binding) => {
+                spec.projection.clone()
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no physical scan bound to `{binding}`"))
+        .into_iter()
+        .collect()
+}
+
+/// One hydrated binding: its name and `(return position, property)` per
+/// fetched column.
+type Hydrated = (String, Vec<(usize, String)>);
+
+/// The root `HydrateColumns`: per binding, the properties it fetches with
+/// the return positions they fill.
+fn root_hydration(plan: &PhysicalPlan) -> Option<Vec<Hydrated>> {
+    match plan.node(plan.root()) {
+        Some(PhysicalNode::HydrateColumns { bindings, .. }) => Some(
+            bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.binding.clone(),
+                        binding
+                            .columns
+                            .iter()
+                            .map(|column| (column.position, column.property.clone()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A top-k over a table four times its limit or larger, or of unknown size,
+/// fetches the column only its output reads by row address above the limit;
+/// the scan reads the row address in its place. The logical plan keeps the
+/// column, and a table within four times the limit keeps it on the scan.
+#[test]
+fn a_top_k_fetches_its_return_only_column_by_row_address() {
+    let op = ir(
+        vec![scan("c")],
+        vec![prop("c", "slug"), prop("c", "body"), prop("c", "rank")],
+        vec![prop("c", "rank")],
+    );
+    for rows in [Some(41), None] {
+        let source = source_with_rows(rows);
+        let mut logical = resolve(&op, &source).expect("resolve");
+        let fired = rewrite(&mut logical, &source).expect("rewrite");
+        let optimized = omnigraph_planner::physical_plan(&mut logical, &source, &bounds(), fired)
+            .expect("lower");
+        let plan = optimized.physical;
+        assert!(
+            optimized.fired.contains(&"late_materialization"),
+            "{rows:?}: {:?}",
+            optimized.fired
+        );
+        assert_eq!(
+            root_hydration(&plan),
+            Some(vec![("c".to_string(), vec![(1, "body".to_string())])]),
+            "{rows:?}"
+        );
+        assert_eq!(
+            physical_projection(&plan, "c"),
+            set(&["__id", "slug", "rank", "_rowaddr"])
+        );
+        assert_eq!(
+            projection_of(&logical, "c"),
+            set(&["__id", "slug", "rank", "body"])
+        );
+        let json = plan.to_json();
+        assert_eq!(json["node"], "HydrateColumns");
+        assert_eq!(json["bindings"][0]["columns"], serde_json::json!(["body"]));
+        assert!(json["properties"]["retained_limit"].as_u64().is_some());
+    }
+    let (plan, fired) = physical(&op, &source_with_rows(Some(40)));
+    assert!(!fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(root_hydration(&plan), None);
+    assert_eq!(
+        physical_projection(&plan, "c"),
+        set(&["__id", "slug", "rank", "body"])
+    );
+}
+
+/// A return item typed as its expression, named `column` (the alias when it
+/// has one).
+fn returned(expr: IRExpr, alias: Option<&str>, column: &str) -> IRProjection {
+    IRProjection {
+        ty: expr.ty().clone(),
+        expr,
+        alias: alias.map(str::to_string),
+        column: column.to_string(),
+    }
+}
+
+/// Under a limit, a scan whose row estimate is above four times the limit
+/// hydrates its return-only column, a bare table scan as much as a traversal
+/// destination: Lance reads ahead of a consumer that stops early. A scan a key
+/// equality bounds to one row keeps its column.
+#[test]
+fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
+    let bare = ir(vec![scan("c")], vec![prop("c", "body")], vec![]);
+    let (plan, fired) = physical(&bare, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("c".to_string(), vec![(0, "body".to_string())])])
+    );
+
+    let lookup = ir(
+        vec![IROp::NodeScan {
+            variable: "c".to_string(),
+            type_name: "T".to_string(),
+            filters: vec![IRExpr::comparison(
+                prop("c", "slug"),
+                CompOp::Eq,
+                IRExpr::Literal(
+                    Literal::String("one".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
+            )],
+        }],
+        vec![prop("c", "body")],
+        vec![],
+    );
+    let (plan, fired) = physical(&lookup, &source_with_rows(Some(1_000)));
+    assert!(!fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(root_hydration(&plan), None);
+
+    let traversal = ir(
+        vec![scan("a"), expand("a", "b", vec![])],
+        vec![prop("a", "slug"), prop("b", "body")],
+        vec![],
+    );
+    let (plan, fired) = physical(&traversal, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("b".to_string(), vec![(1, "body".to_string())])])
+    );
+    assert!(physical_projection(&plan, "b").contains("_rowaddr"));
+    assert!(!physical_projection(&plan, "b").contains("body"));
+}
+
+/// Only a bare return-only property is hydrated: the key, a sort key, a
+/// column a filter reads, a computed return (named or not) and a return the
+/// sort orders by alias stay on the scan, and an unnamed computed return does
+/// not keep the others from hydrating.
+#[test]
+fn hydration_keeps_every_column_something_besides_the_output_reads() {
+    let op = Operation::Query(Box::new(QueryIR {
+        name: "q".to_string(),
+        params: vec![],
+        pipeline: vec![IROp::NodeScan {
+            variable: "c".to_string(),
+            type_name: "T".to_string(),
+            filters: vec![IRExpr::comparison(
+                prop("c", "state"),
+                CompOp::Eq,
+                IRExpr::Literal(
+                    Literal::String("open".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
+            )],
+        }],
+        return_exprs: vec![
+            returned(prop("c", "slug"), None, "c.slug"),
+            returned(prop("c", "rank"), None, "c.rank"),
+            returned(prop("c", "state"), None, "c.state"),
+            returned(prop("c", "title"), Some("t"), "t"),
+            returned(
+                IRExpr::comparison(
+                    prop("c", "kind"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("x".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
+                ),
+                Some("is_x"),
+                "is_x",
+            ),
+            returned(
+                IRExpr::comparison(
+                    prop("c", "edits"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("0".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
+                ),
+                None,
+                "edits_eq",
+            ),
+            returned(prop("c", "body"), Some("text"), "text"),
+        ],
+        order_by: vec![
+            IROrdering {
+                expr: prop("c", "rank"),
+                descending: false,
+            },
+            IROrdering {
+                expr: IRExpr::AliasRef("t".to_string(), property_type("title")),
+                descending: true,
+            },
+        ],
+        limit: Some(5),
+    }));
+    let (plan, fired) = physical(&op, &source_with_rows(Some(1_000)));
+    assert!(fired.contains(&"late_materialization"), "{fired:?}");
+    assert_eq!(
+        root_hydration(&plan),
+        Some(vec![("c".to_string(), vec![(6, "body".to_string())])])
+    );
+    assert_eq!(
+        physical_projection(&plan, "c"),
+        set(&[
+            "__id", "slug", "rank", "state", "title", "kind", "edits", "_rowaddr"
+        ])
+    );
+}

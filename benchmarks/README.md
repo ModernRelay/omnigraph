@@ -81,7 +81,14 @@ directory and its ancestors for `benchmarks.yaml` or `benchmarks/benchmarks.yaml
 A minimal config inherits five repetitions, a 60-second deadline, per-phase
 attribution, manual scheduling and a monotonic timer. Local defaults are
 APFS/clonefile on macOS or qualified XFS/plain-copy elsewhere. The repository
-config explicitly retains each scenario's original environment and repetitions.
+config retains each scenario's original repetitions and leaves `environment`
+and `reset` out of its defaults, so a scenario without its own environment
+takes that host default and the one file runs on a macOS workstation and on a
+qualified Linux XFS volume alike; `show` reports the resolved value and the
+record carries it. A scenario whose volume is part of its meaning declares it
+explicitly, as `branch-merge-d50-process-cold-xfs` and
+`branch-merge-d50-history64-xfs` do. The resolved backend is part of a
+scenario's point identity, so APFS and XFS runs of one id are distinct points.
 `show` reports all effective settings before a run. `deadline_seconds: null`
 removes the measurement deadline; the supervisor remains bounded. Protocol
 fields are `attribution`, `schedule`, `reset` and `timer`.
@@ -160,7 +167,7 @@ suite admission also cover the larger recipes without executing them.
 The `history-1000`, `history-10000` and `history-100000` groups select read,
 next-write and reopen operations over fixed live contents with the named
 number of real updates. Their recipes live in `fixtures/`; nightly names its
-20 ordinary recipes explicitly and does not select these larger inputs.
+21 ordinary recipes explicitly and does not select these larger inputs.
 
 Each fixture retains one `HistoryRow` at `key = "hot"`, `value = 0`,
 `payload = "fixed"`. Updates alternate value 1 and 0, producing 1,002, 10,002
@@ -309,10 +316,11 @@ checked scale budgets, table bounds, cache-condition declarations, and
 reset/backend compatibility. Planning expands the suite into ordered run
 entries; it does not execute a benchmark.
 
-The checked-in smoke point declares APFS on local NVMe storage. The AWS point
+The checked-in smoke point declares no volume and takes the host default, APFS
+on a macOS workstation or XFS on a qualified Linux volume. The AWS point
 declares XFS on EC2 instance-store NVMe and a fresh process with an uncontrolled
 page cache. Validation is host-independent; runner-v1 probes the actual scratch
-volume and refuses declarations that do not match. S3-compatible cases carry region, storage class,
+volume and refuses a resolved or declared backend that does not match. S3-compatible cases carry region, storage class,
 implementation/version, bucket-versioning state, and a digest pin for MinIO or
 RustFS images in their point identity, but they are not executable by this
 runner slice.
@@ -346,7 +354,7 @@ indexed case's `--no-build` request.
 `dataset validate` takes the same inputs and verifies a published matching
 entry without building. `suite run --no-build` refuses a miss. `--filesystem
 apfs|xfs` applies to raw dataset and explicit-pair commands; case/suite files
-supply their own backend. APFS requires forced clonefile, and qualified Linux
+supply their own backend or inherit the host default. APFS requires forced clonefile, and qualified Linux
 XFS uses verified plain copies. The host probe must establish the declared
 backend. Clonefile has no byte-copy fallback; copies condition the OS page
 cache outside measurement.
@@ -357,10 +365,11 @@ An explicit pair uses the same resolver, cache, worker, and archive pipeline:
 target/release/omnigraph-bench suite run   --dataset benchmarks/fixtures/tiny_graph.gqt   --queries benchmarks/workloads/tiny_restart.gqt   --measured-step 1 --measured-text '--- restart'   --repetitions 5 --deadline-seconds 60 --dataset-cache /qualified/cache
 ```
 
-The full D50 suites are `local-smoke` (warm APFS) and
-`aws-xfs-process-cold` (qualified XFS). They build 800,000
-base rows. The small `local-fast` suite is a separate smoke test, not proof of
-full-scale performance or correctness.
+The full D50 suites are `local-smoke` (warm, using the host-local default),
+`aws-xfs-process-cold` (qualified XFS) and `aws-xfs-history64` (qualified XFS,
+fixture aged by 64 reversible single-row update commits before the branches
+exist). They build 800,000 base rows. The small `local-fast` suite is a separate
+smoke test, not proof of full-scale performance or correctness.
 
 Every build runs in a contained child, at its cache entry's final stable
 `active` path. The engine closes before freezing the never-opened `root/`
@@ -410,7 +419,9 @@ The ordinary case and suite now select a registered reference plus
 target/release/omnigraph-bench run finbench   --fixture finbench-2026-08-21-sf10-v1=/path/to/bundle   --dataset-cache /qualified/cache --json
 ```
 
-This shipped case declares APFS. The source bundle remains quiescent and is
+This shipped case declares no volume: it runs on APFS on a macOS workstation
+and on XFS on a qualified Linux volume, and the two are distinct points. The
+source bundle remains quiescent and is
 never opened as an engine store; a byte-verified disposable copy is validated
 against its logical reference before preparation. Registered imports currently
 require a main-only, relocation-self-contained source and deterministic node
@@ -490,5 +501,6 @@ old authored execution is refused.
 
 Catalog parsing and GQT result assertions are correctness gates. Benchmark
 wall-clock and unpinned measured counters remain report-only. The slow nightly
-GQT route explicitly selects 20 ordinary recipes from `benchmarks/fixtures`, including full-size D50; reduced parity
+GQT route explicitly selects 21 ordinary recipes from `benchmarks/fixtures`, including full-size D50 and its
+64-commit history variant; reduced parity
 tests independently check the generator against the retained legacy test oracle.
