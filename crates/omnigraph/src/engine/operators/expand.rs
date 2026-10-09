@@ -103,7 +103,6 @@ impl ExpandStep {
     }
 
     /// A one-hop bound; Budgeted multi-hop also streams fixed source windows.
-    /// Legacy cross-type wider bounds use the BFS breaker, capped at one hop.
     pub(crate) fn single_hop(&self) -> bool {
         self.max_hops == 1
     }
@@ -119,7 +118,7 @@ impl ExpandStep {
                 &self.execution,
                 ExpandExecution::Budgeted(EdgeSelection::Alternation(_))
             ),
-            self.has_type_column() && self.src_type != self.dst_type,
+            self.src_type != self.dst_type,
             self.min_hops,
             Some(self.max_hops),
             self.edge_binding.is_some(),
@@ -153,7 +152,7 @@ impl ExpandStep {
 pub(crate) fn validate_expand_structure(
     members: &[EdgeMember],
     alternation: bool,
-    selected_cross_type: bool,
+    cross_type: bool,
     min_hops: u32,
     max_hops: Option<u32>,
     bound_edge: bool,
@@ -175,9 +174,11 @@ pub(crate) fn validate_expand_structure(
             "bound edge traversal requires exactly one hop",
         ));
     }
-    if selected_cross_type && max_hops > 1 {
+    // A hop ends on the destination type and the next must start on the
+    // source type, so a cross-type path never reaches a second hop.
+    if cross_type && max_hops > 1 {
         return Err(OmniError::manifest_internal(
-            "recursive edge selection requires the same endpoint type",
+            "a multi-hop traversal requires the same endpoint type",
         ));
     }
     if alternation && members.is_empty() {
@@ -390,8 +391,10 @@ mod tests {
             &parse_schema(
                 r#"
             node Person { name: String }
+            node Company { name: String }
             edge Knows: Person -> Person { label: String count: I64 only_knows: String }
             edge Likes: Person -> Person { label: String? count: I64 }
+            edge WorksAt: Person -> Company
         "#,
             )
             .unwrap(),
@@ -566,5 +569,28 @@ mod tests {
         step.dst_type = "Person".into();
         step.max_hops = 2;
         assert!(step.validate(&catalog).is_err());
+    }
+
+    #[test]
+    fn replayed_named_cross_type_step_refuses_a_second_hop() {
+        let catalog = catalog();
+        for policy in [ExpandPolicy::Pinned, ExpandPolicy::Budgeted] {
+            let mut step = step(EdgeSelection::Named(member("WorksAt")));
+            step.execution = ExpandExecution::new(
+                EdgeSelection::Named(member("WorksAt")),
+                ExpandMode::IndexedScan,
+                &policy,
+            )
+            .unwrap();
+            step.dst_type = "Company".into();
+            step.edge_binding = None;
+            step.validate(&catalog).unwrap();
+            step.max_hops = 2;
+            let error = step.validate(&catalog).unwrap_err();
+            assert!(
+                error.to_string().contains("same endpoint type"),
+                "{policy:?}: {error}"
+            );
+        }
     }
 }

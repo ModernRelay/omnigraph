@@ -282,8 +282,10 @@ async fn tiny_pool_refuses_a_large_fan_out_expand_with_the_typed_resource_error(
 }
 
 /// 100 hubs sharing 1,000 leaves: 100,000 pairs, about 240 B of accounting
-/// each when retained as `ExpandedPairs` (24 MB, refused by a 16 MiB pool
+/// each when retained as `ExpandedPairs` (24 MB, refused by a 20 MiB pool
 /// before the single hop streamed); per input batch, every output slice fits.
+/// The pool leaves headroom over the hop's own neighbour map for the source
+/// scan's read-ahead batches, which stream beside it.
 #[tokio::test]
 #[serial]
 async fn expand_streams_a_single_hop_under_a_pool_the_pairs_would_not_fit() {
@@ -323,14 +325,14 @@ async fn expand_streams_a_single_hop_under_a_pool_the_pairs_would_not_fit() {
     let answered = with_query_memory_probes(
         probes.clone(),
         with_query_memory_limit(
-            16 * 1024 * 1024,
+            20 * 1024 * 1024,
             query_main(&v2, HOP_QUERIES, "one_hop", &params(&[])),
         ),
     )
     .await
     .unwrap_or_else(|error| {
         panic!(
-            "a streamed single hop fits a 16 MiB pool: {error}; refusals={:?}",
+            "a streamed single hop fits a 20 MiB pool: {error}; refusals={:?}",
             probes.refusals()
         )
     });
@@ -533,6 +535,57 @@ async fn explain_omits_a_dataset_version_absent_from_the_snapshot() {
         }
     }
     assert_eq!(absent_scans, 1);
+}
+
+/// Twenty one-row commits leave twenty fragments, and Lance reads a batch
+/// per fragment: each streamed scan gathers them into one batch before its
+/// consumer sees it, so a per-batch consumer (the hop's index lookup) runs
+/// once whatever the fragment layout.
+#[tokio::test]
+#[serial]
+async fn a_streamed_scan_gathers_small_fragments_into_one_batch() {
+    use omnigraph::instrumentation::{QueryMemoryProbes, with_query_memory_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), FAN_OUT_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    for n in 0..20 {
+        let mut rows = vec![format!(
+            r#"{{"type":"Person","data":{{"name":"p{n:02}"}}}}"#
+        )];
+        if n > 0 {
+            rows.push(format!(
+                r#"{{"edge":"Knows","from":"p{n:02}","to":"p00","data":{{}}}}"#
+            ));
+        }
+        db.load_jsonl(&rows.join("\n"), LoadMode::Append)
+            .await
+            .unwrap();
+    }
+    let v2 = with_setting(&db, "engine", "v2");
+
+    let probes = QueryMemoryProbes::default();
+    let answered = with_query_memory_probes(
+        probes.clone(),
+        query_main(&v2, HOP_QUERIES, "one_hop", &params(&[])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answered.num_rows(), 19);
+    let scans: Vec<usize> = probes
+        .execution_metrics()
+        .into_iter()
+        .filter(|metric| metric.operator == "ScanExec")
+        .map(|metric| metric.values.get("output_batches").copied().unwrap_or(0))
+        .collect();
+    assert!(!scans.is_empty(), "the query scans Person");
+    assert!(
+        scans.iter().all(|batches| *batches <= 1),
+        "a streamed scan sends its twenty fragments as one batch: {scans:?}"
+    );
 }
 
 const HOP_QUERIES: &str = r#"

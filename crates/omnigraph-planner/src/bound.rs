@@ -15,7 +15,7 @@ use crate::mirror::BoundPlanMirror;
 use crate::physical::{NodeId, PhysicalPlan};
 
 /// Saved execution plans use a separate version from rendered explain output.
-pub const BOUND_PLAN_VERSION: u32 = 1;
+pub const BOUND_PLAN_VERSION: u32 = 6;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]
