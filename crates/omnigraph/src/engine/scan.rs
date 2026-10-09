@@ -71,14 +71,12 @@ impl<'n> NodeRead<'n> {
 
         let node_type = &catalog.node_types[type_name];
         let read_columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
-        let consumed = read_columns
-            .read_projection()
-            .unwrap_or_else(|| read_columns.non_blob_cols.clone());
         super::typed_value::check_stored_schema(
             &ds,
             &node_type.arrow_schema,
             &table_key,
-            consumed
+            read_columns
+                .stored_columns()
                 .into_iter()
                 .chain([catalog.system_columns.id])
                 .chain(
@@ -595,6 +593,18 @@ pub(in crate::engine) struct SearchColumns {
 }
 
 impl<'n> ScanColumns<'n> {
+    /// The stored fields this read consumes, which the opened dataset's
+    /// schema must match: its projection, or every non-Blob column when it
+    /// prunes none, without Lance's row address (read for a hydrated
+    /// binding, never a stored field).
+    pub(in crate::engine) fn stored_columns(&self) -> Vec<&'n str> {
+        self.read_projection()
+            .unwrap_or_else(|| self.non_blob_cols.clone())
+            .into_iter()
+            .filter(|column| *column != ROW_ADDR)
+            .collect()
+    }
+
     pub(in crate::engine) fn read_projection(&self) -> Option<Vec<&'n str>> {
         self.pruned_cols.clone().or_else(|| {
             self.has_blobs.then(|| {

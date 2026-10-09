@@ -104,6 +104,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- engine `export.rs` owns export's batched managed Blob read (one read per Blob column per batch, in request order, shared by the change-feed baseline) and `changes.rs` the change images' reads;
 - engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
@@ -507,8 +508,8 @@ operation boundaries and worker admission. `registered_fixture`, `reset`, and
 The retired `real_graph_run` and Rust fixture builder remain test oracles,
 with no production execution route.
 
-The slow nightly GQT workflow also explicitly selects the 20 ordinary `benchmarks/fixtures` recipes, including the
-full 800,000-row D50 dataset with post-build assertions. Reduced legacy parity
+The slow nightly GQT workflow also explicitly selects the 21 ordinary `benchmarks/fixtures` recipes, including the
+full 800,000-row D50 dataset and its 64-commit history variant with post-build assertions. Reduced legacy parity
 cases validate generator equivalence but do not stand in for that scale.
 Dataset/query catalog parsing is a normal correctness test; selected-operation
 wall-clock and unpinned benchmark counters remain report-only. The new D50

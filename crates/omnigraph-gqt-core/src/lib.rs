@@ -3301,15 +3301,15 @@ async fn execute_steps_inner<H: ExecutionHost>(
             let binding = var.zip(value);
             for step in &steps {
                 let ordinal = step.ordinal();
+                host.begin_operation(||
+                    serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
+                );
                 host.observe(|| {
                     format!(
                         "operation: ordinal={ordinal} line={:?} binding={binding:?} generation={generation} expected={step:?}",
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.begin_operation(||
-                    serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
-                );
                 host.record(
                     "expectation",
                     || match step {
