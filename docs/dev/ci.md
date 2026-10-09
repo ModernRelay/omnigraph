@@ -87,20 +87,20 @@ on the queue; the DST pinned suite runs there as a reporting context. Queue
 runs never publish releases or save the main branch's caches. Details:
 [branch-protection.md](branch-protection.md), Merge queue.
 
-Branch protection currently requires these reporting contexts:
-
-- `Classify Changes`
-- `Check AGENTS.md Links`
-- `Check Workflow Action Pins`
-- `Graph Vocabulary Guard`
-- `Test omnigraph-server --features aws`
-- `Format (rustfmt)`
-- `Lint (clippy)`
-- `Test Workspace`
-- `GQ Logic Tests`
-- `Fix Regression Gate`
-- `Storage Upgrade Compatibility`
-- `Dependency Guard (cargo deny)`
+Branch protection requires four contexts: `CI Gate`, `Check Workflow Action
+Pins`, `GQ Logic Tests` and `Fix Regression Gate`. `CI Gate` is the `ci_gate`
+job of `ci.yml`: it needs `classify_changes`, `check_agents_md`,
+`workflow_action_pins`, `cargo_deny`, `graph_vocabulary_guard`, `fmt`,
+`lint`, `test`, `storage_upgrade_compatibility` and `test_aws_feature`, runs
+under `if: always()`, and `scripts/ci_gate.py` turns their results into the
+verdict: `failure` and `cancelled` are red, and `skipped` is accepted only
+where the job's own `if:` was false on that event, as the script's table
+restates it. Those ten jobs are what blocks `main`; a new blocking job joins
+`needs:` and the table in the same pull request, and
+`scripts/check-merge-group-triggers.py` holds the two equal and pins the
+gate's wiring. `Check Workflow Action Pins` is required on its own so a
+malformed gate cannot hide that validator's red. Details and the recovery
+routes: [branch-protection.md](branch-protection.md), CI Gate.
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
 runs on every change and in the merge queue. It builds the genuine stamp-13
@@ -245,7 +245,7 @@ Every exemption lives in that one file: the job refuses a sibling
 `typos.toml` or `_typos.toml`, and CI ignores a config file in a
 subdirectory (a local run inside that subdirectory would not).
 
-`Graph Vocabulary Guard` remains a required reporting context, but its
+`Graph Vocabulary Guard` remains a dependency of `CI Gate`, but its
 substrate-sized audit steps are currently disabled everywhere (decision of
 2026-08-28; the job-level `VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is
 the single switch). The job still
@@ -300,8 +300,8 @@ Repository metadata gates also check:
   `.cargo/config` declares a source replacement or path override.
   Build scripts are outside both checks. An exemption that no longer matches
   anything fails the check, so the bump that clears an advisory or drops a
-  license's last holder also removes its `deny.toml` row. The job is a required
-  context (see [branch-protection.md](branch-protection.md)). The RustSec
+  license's last holder also removes its `deny.toml` row. The job blocks `main`
+  through `CI Gate` (see [branch-protection.md](branch-protection.md)). The RustSec
   database is fetched at run time; `dependency-guard-nightly.yml` runs the same
   check on `main` daily, so an advisory published overnight shows there first
   and then turns every open pull request red at its next push; the fix is a
@@ -319,8 +319,8 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked 
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-On a pull request and on the merge queue's branch it is a required context
-([branch-protection.md](branch-protection.md)) and it fails fast: the queue
+On a pull request and on the merge queue's branch it blocks `main` through
+`CI Gate` ([branch-protection.md](branch-protection.md)) and it fails fast: the queue
 waits for it before merging. On `main`, tags, and
 dispatch it is the post-merge detection channel and keeps `--no-fail-fast`,
 so every independent failure stays attributable; a red run there is
@@ -413,7 +413,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   no object-store code, or one that names no test (the image pull, Azurite
   readiness), is inherited from `main` or from infrastructure: compare with
   the latest `main` run before reading it as the pull request's.
-- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request, as a required context.
+- **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request and blocks `main` through `CI Gate`.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure
@@ -484,6 +484,7 @@ python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-storage-upgrade-ci.py --self-test
 python3 scripts/check-merge-group-triggers.py --self-test
+python3 scripts/ci_gate.py --self-test
 python3 scripts/check-ci-cells.py --self-test
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
@@ -532,7 +533,7 @@ Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, 
 
 ## Changing CI
 
-1. Preserve a reporting path for every branch-protection context on every pull request.
+1. Preserve a reporting path for every branch-protection context on every pull request. A job that blocks `main` is listed in the `ci_gate` job's `needs:` and in the table of `scripts/ci_gate.py` in the same pull request, with a skip rule that restates the job's own `if:`; `scripts/check-merge-group-triggers.py` refuses the two lists apart and any `continue-on-error` on a job the gate needs.
 2. Keep external Actions and reusable workflows pinned to full commit SHAs.
 3. Update the classifier when adding a documentation format or a change class; a class needs a grep-verified closed set of reading jobs, every path outside a class runs every job, and never classify by extension outside the approved paths.
 4. Keep configured object-store jobs fail-closed on accidental skips.
@@ -540,4 +541,4 @@ Every release build sets `RUSTFLAGS` itself (`release.yml`, `release-edge.yml`, 
    exact-SHA vocabulary audit; a skipped pull-request context never authorizes
    publication.
 6. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.
-7. Keep every required context reporting on the merge queue's temporary branch too: a workflow that owns one lists `merge_group` under `on:`; a job condition that admits `pull_request` by name (`== 'pull_request'`) also admits `merge_group`; a negative gate written for post-merge venues (`!= 'pull_request'`) also excludes `merge_group`, so the queue runs only what blocks it. `scripts/check-merge-group-triggers.py` enforces the first two ([branch-protection.md](branch-protection.md), Merge queue).
+7. Keep every required context reporting on the merge queue's temporary branch too: a workflow that owns one lists `merge_group` under `on:`; a job condition that admits `pull_request` by name (`== 'pull_request'`) also admits `merge_group`; a negative gate written for post-merge venues (`!= 'pull_request'`) also excludes `merge_group`, so the queue runs only what blocks it. `scripts/check-merge-group-triggers.py` enforces the first two ([branch-protection.md](branch-protection.md), Merge queue), and a job the gate needs that skips on the queue where its `if:` says it runs makes `CI Gate` red there.
