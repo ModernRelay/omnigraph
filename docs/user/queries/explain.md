@@ -4,7 +4,9 @@
 its rows, regardless of the selected execution engine. It is a statement:
 one per file, never beside a declaration. The query is compiled and planned
 against the target's schema and snapshot without executing it. Planning
-may read dataset metadata for byte estimates; it does not scan query data
+may read metadata for byte estimates and index planning, including row-ID
+and deletion metadata for overlays or index-detail discovery on legacy tables;
+it does not execute query rows
 or invoke the embedding client.
 
 ```gq
@@ -31,6 +33,20 @@ listing prints them:
 | `node` | `String` | the node kind (`TableScan`, `Filter`, `Expand`, `Projection`, …) or the operator (`ScanExec`, `FilterExec`, …); on `plan` rows the field name (`pass`, `route`, `logical_hash`, …) |
 | `detail` | `String` | the node's own fields as JSON, without its children; an operator's own text; on `plan` rows the field's value, a string bare and anything else as JSON |
 
+Every fresh physical `Scan` records `access`. `sequential` disables scalar
+indexing. `index_probe` includes `index` (sorted names), `index_query` (a
+Boolean tree with index name, physical column and Lance-rendered search at
+each leaf), and `residual` (the indexed branch's remaining predicate, or
+null). Uncovered fragments still apply the full filter. `runtime` records a
+`reason`: ranking, search membership, join-generated filters or a dynamic
+expression can add inputs unavailable during planning. Those reads retain
+Lance's default. A dependent `id_lookup` adds `index`, its usable identity
+BTREE name or null. A saved plan predating these fields retains the default.
+
+A bare equality on a single String key can gain an identity predicate when
+its ID index is usable. The written equality remains. Other key types are
+not narrowed because supported historical IDs may use different spellings.
+
 The logical tree comes first, then the physical tree, then the `datafusion`
 tree, each in pre-order, so a node's children are the rows one level deeper
 that follow it and the tree is rebuilt from the rows without loss. Every
@@ -42,7 +58,7 @@ plan: unique within one plan, not stable across plans, and absent on
 `Expand` row's `detail` carries `mode` (`indexed_scan` or `csr`, the
 traversal path the planner chose), `alternatives` (the modes the run may
 switch to: the other mode when the cost model chose and may re-decide from
-the observed frontier, the probed index coverage or a warm CSR; empty when
+the observed frontier or a warm CSR; empty when
 the mode was pinned or chosen without statistics), `frontier_estimate`
 (the row-count estimate it chose from, `null` when the snapshot holds no
 statistics). For budgeted expansion, this is the input row-count estimate.
@@ -106,6 +122,13 @@ retained through rewrites so historical replay can enforce the target rule. Quer
 plans omit `pipelines` and node `properties.schema`: complete pipeline schemas
 are derived when lowering. Result nodes declare their output through `columns`. Every query scan records its pinned `version`, or
 `null` when that type has no dataset in the requested snapshot.
+The explain document's `statistics` includes one `index_facts(<table>)`
+entry per read table, with index names, columns, kinds and fragment coverage.
+Its origin identifies the pinned dataset version. Unknown coverage is `null`.
+Traversal costing uses these facts; absent, unusable or incomplete endpoint
+indexes receive scan cost. Saved plans retain this coverage. Older accepted
+plans without coverage provenance continue to check coverage during execution.
+
 Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by

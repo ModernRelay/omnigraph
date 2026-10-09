@@ -62,8 +62,8 @@ pub struct Case {
     pub seams: BTreeMap<usize, Vec<SeamDirective>>,
     pub source_lines: BTreeMap<usize, usize>,
     pub fixture: Option<Fixture>,
-    /// The `# traversal:` pin: the harness-only traversal field on the case
-    /// session plus the expand-path check; `None` leaves it at `auto`.
+    /// The harness-only traversal setting; any header requests index preparation.
+    /// `auto` retains cost selection, while `indexed` and `csr` check the forced path.
     traversal: Option<&'static str>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
@@ -457,11 +457,12 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "notes" => {}
             "traversal" => {
                 traversal = Some(match value {
+                    "auto" => "auto",
                     "indexed" => "indexed",
                     "csr" => "csr",
                     other => {
                         return Err(format!(
-                            "line {}: `# traversal:` takes `indexed` or `csr`, got `{other}`",
+                            "line {}: `# traversal:` takes `auto`, `indexed` or `csr`, got `{other}`",
                             idx + 1
                         ));
                     }
