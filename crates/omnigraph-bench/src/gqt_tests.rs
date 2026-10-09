@@ -125,7 +125,15 @@ async fn run_sample_with_logical(
 }
 #[test]
 fn original_pairs_and_groups_preserve_pre_migration_identity() {
-    let catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
+    let recorded_environment = GqtEnvironment {
+        backend: crate::case::Backend::LocalFs {
+            filesystem: crate::case::LocalFilesystem::Apfs,
+            storage_class: crate::case::LocalStorageClass::NvmeSsd,
+        },
+    };
+    catalog.definition.defaults.environment = Some(recorded_environment);
+    catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
     let baseline: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/gqt-catalog-identity.json")).unwrap();
     let baseline = baseline.as_object().unwrap();

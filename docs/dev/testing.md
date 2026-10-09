@@ -507,8 +507,8 @@ operation boundaries and worker admission. `registered_fixture`, `reset`, and
 The retired `real_graph_run` and Rust fixture builder remain test oracles,
 with no production execution route.
 
-The slow nightly GQT workflow also explicitly selects the 20 ordinary `benchmarks/fixtures` recipes, including the
-full 800,000-row D50 dataset with post-build assertions. Reduced legacy parity
+The slow nightly GQT workflow also explicitly selects the 21 ordinary `benchmarks/fixtures` recipes, including the
+full 800,000-row D50 dataset and its 64-commit history variant with post-build assertions. Reduced legacy parity
 cases validate generator equivalence but do not stand in for that scale.
 Dataset/query catalog parsing is a normal correctness test; selected-operation
 wall-clock and unpinned benchmark counters remain report-only. The new D50
