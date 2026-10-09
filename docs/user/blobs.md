@@ -62,28 +62,41 @@ OmniGraph never deletes the object named by an external reference.
 
 ### Replacing one Blob value
 
-An embedded `Session` replaces or clears one Blob cell of an existing node or
-edge, addressed by exact id like a Blob read:
+One Blob cell of an existing node or edge, addressed by exact id like a Blob
+read, can be replaced or cleared without a load or a mutation. Over HTTP,
+`PUT` stores the raw request body as a managed value and `DELETE` clears the
+cell:
 
-- `Session::put_blob_at_as` stores the given bytes as a managed value and
-  returns its length, its ETag and the commit;
-- `Session::clear_blob_at_as` sets a nullable cell to null. Clearing a cell that
-  is already null publishes nothing and returns no commit.
+```http
+PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
+Omnigraph-Http-Api: 0.13
+Content-Type: application/octet-stream
+If-Match: "<current ETag>"
 
-Each call that changes the cell is one graph commit and needs the `change`
-action on the branch. Neither call inserts a row: a missing entity is
-`NotFound`. Clearing a property that is not nullable is refused. The write never
-reads the cell's old value. Lance replaces whole rows, so the row's other cells
+<raw bytes>
+```
+
+An embedded `Session` does the same with `put_blob_at_as` and
+`clear_blob_at_as`. A put returns the stored length, its ETag and the commit.
+Clearing a cell that is already null publishes nothing and returns no commit.
+
+Each write that changes the cell is one graph commit and needs the `change`
+action on the branch. Neither verb inserts a row: a missing entity is
+`NotFound` (404). Clearing a property that is not nullable is refused (400).
+The write never reads the cell's old value. Lance replaces whole rows, so the row's other cells
 are carried as an `update` carries them: a stored external reference among
 them needs the external Blob policy to admit its source, and their managed
 payloads count toward the operation's 32 MiB Blob payload limit together with
 the new value.
 
-A precondition makes the write conditional on the cell's current value.
-`BlobPrecondition::Tags` holds when the current ETag is one of the given tags.
-`BlobPrecondition::AnyExisting` holds when the cell is not null. When it fails,
-the write returns `BlobWritePreconditionFailed`, which carries the cell's
-current ETag when it holds a managed value, and changes nothing. A commit that
+A precondition makes the write conditional on the cell's current value: over
+HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
+(`BlobPrecondition::Tags`) holds when the current ETag is one of them; weak tags
+never match. `*` (`BlobPrecondition::AnyExisting`) holds when the cell is not
+null. When it fails, the write changes nothing and returns
+`BlobWritePreconditionFailed`, over HTTP a `412` whose
+`blob_precondition_failure.current_etag` and `ETag` header carry the cell's
+current ETag when it holds a managed value. A malformed `If-Match` is a `400`. A commit that
 lands while the write is in flight makes it start again from the new head and
 check again, so a stale ETag fails instead of overwriting the newer value; a
 write without a precondition replaces whatever is current. A schema apply or a
@@ -95,8 +108,25 @@ fails after its commit became durable, for example because its acknowledgement
 was lost, the value is published once; read the cell for its current ETag
 before retrying with a precondition.
 
-The CLI and the HTTP server do not offer these writes yet. Through them, change
-a Blob value with a load or a mutation.
+Over HTTP:
+
+- `PUT` takes a `Content-Type: application/octet-stream` body of at most 32 MiB,
+  inclusive. Another media type is a `415`. A body over the limit is a `413`,
+  refused before any of it is read when `Content-Length` declares it, and a body
+  that does not arrive before the server's body deadline is a `408`;
+- both verbs take `branch` (default `main`) and refuse `snapshot` or any other
+  unknown parameter with a `400`. A missing branch is a `404`;
+- `change` is authorized before the body is read;
+- success is a `200` with a receipt: `selector`, `branch`, `kind` (`managed` or
+  `null`), `size` and `etag` for a managed value, `actor_id`, and `commit`,
+  which is `null` only for a clear of a cell that was already null. A `PUT` also
+  returns the `ETag` header;
+- once the server admits a write it finishes it even if the client
+  disconnects, so a lost response means the write may have landed: read the
+  cell before writing again.
+
+The CLI does not offer these writes yet; through it, change a Blob value with a
+load or a mutation.
 
 ## Query behavior
 
@@ -106,9 +136,9 @@ assignment, then read an individual Blob value through the dedicated CLI or
 HTTP surface.
 
 There are no `blob put` or `blob clear` CLI commands yet. Use the normal graph
-write path, or the embedded writes in
-[Replacing one Blob value](#replacing-one-blob-value), so Blob changes remain
-part of an atomic graph commit.
+write path, or the HTTP and embedded writes in
+[Replacing one Blob value](#replacing-one-blob-value); each is an atomic graph
+commit.
 
 ## CLI reads
 
@@ -194,7 +224,7 @@ and retry.
 | 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
 | 32 MiB per touched type, and 32 MiB across all touched types, Blob payloads excluded | Incremental writes: `append` and `merge` loads, inserts, updates and branch merges. Every byte of the rows except managed Blob payloads counts, URIs and Blob framing included | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
 | 32 MiB of managed Blob payload per touched type, and 32 MiB across all touched types, inclusive | The same writes. Each Blob value counts its length; external bytes copied in and Blob values carried unchanged by an update count. A single value of exactly 32 MiB fits beside its row | the same names with `Blob payload bytes` in place of `bytes`, for example `keyed entity Blob payload bytes for <table>` |
-| 32 MiB, inclusive | The bytes of one embedded Blob put, checked before the write opens a table | `Blob write payload bytes` |
+| 32 MiB, inclusive | The bytes of one Blob put, embedded or the body of an HTTP `PUT`, checked before the write opens a table | `Blob write payload bytes` |
 | 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
 | 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |
@@ -210,7 +240,9 @@ encoded request, so one request carries about 24 MiB of decoded `base64:`
 data. The NDJSON loader that `omnigraph load` and `/load/ndjson` use caps each
 encoded line at 32 MiB the same way. The embedded `load` API checks each row's
 decoded size instead and has no line cap, so it admits a 32 MiB value; over
-HTTP, `/load` keeps its 32 MiB body cap. Every HTTP request other than a load (`/load` and `/load/ndjson`) is bounded by the default 1 MiB request body limit, so a `base64:`
+HTTP, `/load` keeps its 32 MiB body cap. A Blob `PUT` carries raw bytes, not
+`base64:` text, so its 32 MiB body holds a full 32 MiB value. Every other HTTP
+request is bounded by the default 1 MiB request body limit, so a `base64:`
 literal in an HTTP mutation hits that limit first.
 
 Values larger than these limits stay readable. The CLI and the HTTP server

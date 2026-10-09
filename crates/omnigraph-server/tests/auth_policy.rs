@@ -425,6 +425,8 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/snapshot"),
         (Method::GET, "/blob"),
         (Method::HEAD, "/blob"),
+        (Method::PUT, "/blob"),
+        (Method::DELETE, "/blob"),
         (Method::POST, "/export"),
         (Method::POST, "/query"),
         (Method::POST, "/mutate"),
@@ -1369,7 +1371,13 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
-    let temp = init_loaded_graph().await;
+    let temp = init_graph_with_schema_and_data(
+        &fs::read_to_string(fixture("test.pg"))
+            .unwrap()
+            .replace("    age: I32?", "    age: I32?\n    avatar: Blob?"),
+        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
+    )
+    .await;
     let graph = graph_path(temp.path());
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
@@ -1436,6 +1444,49 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     assert_eq!(feature_status, StatusCode::OK);
     assert_eq!(feature_body["branch"], "feature");
     assert_eq!(feature_body["affected_nodes"], 1);
+
+    // A Blob put or clear is a `change` too: refused on protected main
+    // before its body is polled, and attributed to the actor elsewhere.
+    for (method, branch) in [
+        (Method::PUT, "main"),
+        (Method::DELETE, "main"),
+        (Method::PUT, "feature"),
+        (Method::DELETE, "feature"),
+    ] {
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::once(async move {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"avatar"))
+        }));
+        let (status, output) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g(&format!(
+                    "/blob?entity=node&type=Person&id=Alice&property=avatar&branch={branch}"
+                )))
+                .method(method.clone())
+                .header("authorization", "Bearer team-token")
+                .header("content-type", "application/octet-stream")
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+        if branch == "main" {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {output}");
+            assert!(
+                !polled.load(std::sync::atomic::Ordering::SeqCst),
+                "{method}: Cedar refusal precedes the body"
+            );
+        } else {
+            assert_eq!(status, StatusCode::OK, "{method}: {output}");
+            assert_eq!(output["branch"], "feature");
+            assert_eq!(output["actor_id"], "act-bruno");
+            assert_eq!(output["commit"]["actor_id"], "act-bruno");
+            assert_eq!(output["commit"]["graph_branch"], "feature");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

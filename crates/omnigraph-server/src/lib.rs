@@ -43,12 +43,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    BlobReadQuery, BlobSelectorOutput, BlobWriteOutput, BlobWriteQuery, BranchCreateOutput,
+    BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
+    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
+    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IngestOutput,
+    IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
@@ -121,6 +122,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
+        handlers::server_blob_put,
+        handlers::server_blob_delete,
         handlers::server_query,
         handlers::server_export,
         handlers::server_mutate,
@@ -177,6 +180,8 @@ impl utoipa::Modify for SecurityAddon {
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// A Blob put's raw body: exactly the bytes one put may store, inclusive.
+const BLOB_PUT_REQUEST_BODY_LIMIT_BYTES: usize = omnigraph::BLOB_WRITE_MAX_BYTES as usize;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
@@ -462,6 +467,7 @@ enum ApiErrorDetails {
     ExternalBlobSource(api::ExternalBlobSourceOutput),
     RecoveryRequired(api::RecoveryRequiredOutput),
     PreconditionFailure(api::PreconditionFailureOutput),
+    BlobPreconditionFailure(api::BlobPreconditionFailureOutput),
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
@@ -1080,6 +1086,27 @@ impl ApiError {
         }
     }
 
+    /// HTTP 412 for a Blob write whose `If-Match` did not hold. The
+    /// `blob_precondition_failure` detail carries the cell's current
+    /// validator, and the response repeats it in `ETag` when there is one.
+    /// It keeps the closed [`ErrorCode::Conflict`] signal and never the
+    /// graph-commit `precondition_failure` detail.
+    pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
+        Self {
+            completion_uncertain: false,
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
+            message: format!(
+                "Blob write precondition failed; the cell's current validator is {}",
+                current_etag.as_deref().unwrap_or("<none>")
+            )
+            .into_boxed_str(),
+            details: Some(Box::new(ApiErrorDetails::BlobPreconditionFailure(
+                api::BlobPreconditionFailureOutput { current_etag },
+            ))),
+        }
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: true,
@@ -1471,8 +1498,8 @@ impl ApiError {
                 ),
                 api::PreconditionFailureOutput { expected, actual },
             ),
-            err @ OmniError::BlobWritePreconditionFailed { .. } => {
-                Self::blob_precondition_failed(err.to_string())
+            OmniError::BlobWritePreconditionFailed { current_etag } => {
+                Self::blob_write_precondition_failed(current_etag)
             }
             err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
             err @ OmniError::StoredExternalBlobDenied { .. } => Self::bad_request(err.to_string()),
@@ -1583,6 +1610,14 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
+        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = self.details.as_deref()
+            && let Some(etag) = failure
+                .current_etag
+                .as_deref()
+                .and_then(|etag| axum::http::HeaderValue::from_str(etag).ok())
+        {
+            headers.insert(axum::http::header::ETAG, etag);
+        }
         let status = self.status;
         (status, headers, Json(self.into_output())).into_response()
     }
@@ -1610,6 +1645,9 @@ impl ApiError {
                 ApiErrorDetails::RecoveryRequired(value) => output.recovery_required = Some(value),
                 ApiErrorDetails::PreconditionFailure(value) => {
                     output.precondition_failure = Some(value)
+                }
+                ApiErrorDetails::BlobPreconditionFailure(value) => {
+                    output.blob_precondition_failure = Some(value)
                 }
                 ApiErrorDetails::ChangeFeedGap(value) => output.change_feed_gap = Some(value),
                 ApiErrorDetails::ChangeDiffRefusal(value) => {
@@ -1966,6 +2004,38 @@ mod api_error_tests {
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Internal));
+
+        // A Blob write's failed If-Match: 412 under the closed conflict code,
+        // the current validator in the detail and in `ETag`, and never the
+        // graph-commit precondition detail.
+        for current in [Some("\"current\""), None] {
+            let response = ApiError::from_omni(OmniError::blob_write_precondition_failed(
+                current.map(str::to_string),
+            ))
+            .into_response();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ETAG)
+                    .map(|etag| etag.to_str().unwrap()),
+                current
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, Some(ErrorCode::Conflict));
+            assert!(error.precondition_failure.is_none());
+            assert_eq!(
+                error
+                    .blob_precondition_failure
+                    .expect("structured Blob precondition")
+                    .current_etag
+                    .as_deref(),
+                current
+            );
+        }
     }
 
     #[tokio::test]
@@ -2390,7 +2460,13 @@ pub fn build_app(state: AppState) -> Router {
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
         // handler and could begin payload work before stripping the body; the
         // dedicated handler makes the zero-payload-read contract structural.
-        .route("/blob", get(server_blob_get).head(server_blob_head))
+        .route(
+            "/blob",
+            get(server_blob_get)
+                .head(server_blob_head)
+                .put(server_blob_put)
+                .delete(server_blob_delete),
+        )
         .route("/export", post(server_export))
         .route("/query", post(server_query))
         .route("/mutate", post(server_mutate))

@@ -27,7 +27,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 409 | Concurrent change, duplicate ID, merge conflict, existing resource, or incompatible full-text index | Inspect structured details; not every conflict is retryable |
 | 410 | Required change-feed history was reclaimed | Capture and durably install a new baseline, then resume from its terminal cursor |
-| 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag, or re-read the branch and retry the mutation with its current graph commit |
+| 412 | Blob entity-tag or graph-commit precondition failed | Refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit |
 | 413 | Request or operation exceeded a bounded resource limit | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |

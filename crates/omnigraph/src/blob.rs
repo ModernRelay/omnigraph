@@ -44,6 +44,14 @@ const EXTERNAL_BLOB_URI_BYTES_RESOURCE: &str = "external Blob URI bytes";
 pub const BLOB_READ_RANGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const BLOB_READ_RANGE_BYTES_RESOURCE: &str = "Blob read range bytes";
 
+/// Maximum bytes one Blob put stores, inclusive. A transport that collects a
+/// put's body refuses a larger one before reading past it; the engine refuses
+/// it again before capturing anything, under the resource name
+/// [`BLOB_WRITE_PAYLOAD_RESOURCE`].
+pub const BLOB_WRITE_MAX_BYTES: u64 = crate::storage_layer::KEYED_BLOB_PAYLOAD_MAX_BYTES;
+/// The resource a refused oversized Blob put names.
+pub const BLOB_WRITE_PAYLOAD_RESOURCE: &str = "Blob write payload bytes";
+
 /// One logical Blob cell addressed at graph level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobCell {

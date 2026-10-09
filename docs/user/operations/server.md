@@ -215,7 +215,7 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
-| `/graphs/{id}/blob` | GET/HEAD one Blob cell |
+| `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
 | `/graphs/{id}/branches` | Branch management and merge |
 | `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
 | `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
@@ -313,8 +313,11 @@ modes.
 
 `GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
 `property`. They support managed ranges/ETag conditions and report external
-references without fetching them. See [Blob values](../blobs.md) for details
-and [Blob limits](../blobs.md#limits).
+references without fetching them. `PUT` replaces the cell with a raw
+`application/octet-stream` body of at most 32 MiB and `DELETE` clears it, each
+as one graph commit under `If-Match`; see
+[Replacing one Blob value](../blobs.md#replacing-one-blob-value). See
+[Blob values](../blobs.md) for details and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 

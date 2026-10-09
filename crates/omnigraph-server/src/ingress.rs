@@ -133,9 +133,14 @@ pub(crate) async fn admit(
         AdmissionClass::Write => state.operations.try_observe_write()?,
     };
     let receives_body = parts.method == Method::POST || parts.method == Method::PUT;
-    let raw = receives_body && route == "/load/ndjson";
+    // A raw route authorizes before it polls its body, and collects the body
+    // itself under the deadline and the lease reserved here.
+    let blob_put = parts.method == Method::PUT && route == "/blob";
+    let raw = receives_body && (route == "/load/ndjson" || blob_put);
     let limit = if !receives_body {
         0
+    } else if blob_put {
+        crate::BLOB_PUT_REQUEST_BODY_LIMIT_BYTES
     } else if matches!(route, "/cluster/deployments" | "/cluster/plan") {
         crate::deployment::REQUEST_BYTES
     } else if route == "/mcp" {
@@ -186,8 +191,9 @@ pub(crate) async fn admit(
     } else {
         body
     };
-    // Raw NDJSON authorizes its branch scope before polling any body bytes.
-    // Its collector consumes BodyDeadline and the same retained lease.
+    // Raw NDJSON and a Blob put authorize their branch scope before polling
+    // any body bytes. Their collectors consume BodyDeadline and the same
+    // retained lease.
     let request = Request::from_parts(parts, body);
     match class {
         AdmissionClass::Read => {

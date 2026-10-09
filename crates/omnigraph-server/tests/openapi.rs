@@ -610,6 +610,97 @@ fn openapi_blob_supports_get_and_explicit_head() {
     }
 }
 
+/// PUT and DELETE `/blob` take the selector and a branch, never a snapshot;
+/// PUT's body is raw binary; both answer the exact receipt and document the
+/// Blob 412 apart from the graph-commit one.
+#[test]
+fn openapi_blob_put_and_delete_document_raw_body_receipt_and_blob_precondition() {
+    let doc = openapi_json();
+    let path = &doc["paths"]["/graphs/{graph_id}/blob"];
+    for method in ["put", "delete"] {
+        let operation = &path[method];
+        assert!(operation.is_object(), "{method} /blob is documented");
+        let parameters = operation["parameters"].as_array().unwrap();
+        let parameter = |name: &str| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .cloned()
+        };
+        for required in ["entity", "type", "id", "property"] {
+            let parameter = parameter(required)
+                .unwrap_or_else(|| panic!("{method} /blob is missing `{required}`"));
+            assert_eq!(
+                (&parameter["in"], &parameter["required"]),
+                (&"query".into(), &true.into())
+            );
+        }
+        assert_ne!(parameter("branch").unwrap()["required"], true);
+        assert!(
+            parameter("snapshot").is_none(),
+            "{method} /blob writes a branch"
+        );
+        assert_eq!(parameter("If-Match").unwrap()["in"], "header");
+
+        let ok = &operation["responses"]["200"];
+        assert_eq!(
+            ok["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BlobWriteOutput"
+        );
+        assert!(
+            operation["responses"]["412"]["headers"]["ETag"].is_object(),
+            "{method} /blob 412 names the current validator"
+        );
+        for status in [
+            "400", "401", "403", "404", "409", "412", "413", "424", "429", "503",
+        ] {
+            assert_eq!(
+                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ErrorOutput",
+                "{method} /blob {status}"
+            );
+        }
+    }
+    let put = &path["put"];
+    let body = &put["requestBody"]["content"]["application/octet-stream"]["schema"];
+    assert_eq!(
+        (&body["type"], &body["format"]),
+        (&"string".into(), &"binary".into())
+    );
+    assert!(put["responses"]["200"]["headers"]["ETag"].is_object());
+    for status in ["408", "415"] {
+        assert!(put["responses"][status].is_object(), "PUT /blob {status}");
+    }
+
+    let receipt = &doc["components"]["schemas"]["BlobWriteOutput"];
+    let mut fields = receipt["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.sort();
+    assert_eq!(
+        fields,
+        [
+            "actor_id", "branch", "commit", "etag", "kind", "selector", "size"
+        ],
+        "the receipt carries graph vocabulary only"
+    );
+    assert_commit_field(&doc, "BlobWriteOutput", true);
+    assert_eq!(
+        doc["components"]["schemas"]["BlobWriteStateOutput"]["enum"],
+        serde_json::json!(["managed", "null"])
+    );
+    let error = &doc["components"]["schemas"]["ErrorOutput"]["properties"];
+    assert!(error["precondition_failure"].is_object());
+    let detail = error["blob_precondition_failure"].to_string();
+    assert!(
+        detail.contains("#/components/schemas/BlobPreconditionFailureOutput"),
+        "{detail}"
+    );
+}
+
 #[test]
 fn openapi_blob_documents_binary_redirect_conditional_and_range_contracts() {
     let doc = openapi_json();

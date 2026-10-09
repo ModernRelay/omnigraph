@@ -20,15 +20,16 @@ use super::mutation::{
 };
 use super::staging::{MutationStaging, PendingMode};
 use crate::blob::{
-    BlobCell, BlobDescriptor, BlobEtag, BlobPrecondition, BlobWriteOutcome, entity_label,
-    locate_blob_cell, managed_blob_etag, resolve_blob_cell,
+    BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag,
+    BlobPrecondition, BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag,
+    resolve_blob_cell,
 };
 use crate::changes::EntityKind;
 use crate::db::Omnigraph;
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::error::{OmniError, Result};
 use crate::session::Session;
-use crate::storage_layer::{KEYED_BLOB_PAYLOAD_MAX_BYTES, PendingScanBudget};
+use crate::storage_layer::PendingScanBudget;
 
 /// What one Blob cell write stores.
 enum BlobCellValue {
@@ -78,10 +79,10 @@ impl Session {
     ) -> Result<BlobWriteOutcome> {
         let length = u64::try_from(bytes.len())
             .map_err(|_| OmniError::manifest_internal("Blob write payload length exceeds u64"))?;
-        if length > KEYED_BLOB_PAYLOAD_MAX_BYTES {
+        if length > BLOB_WRITE_MAX_BYTES {
             return Err(OmniError::resource_limit(
-                "Blob write payload bytes",
-                KEYED_BLOB_PAYLOAD_MAX_BYTES,
+                BLOB_WRITE_PAYLOAD_RESOURCE,
+                BLOB_WRITE_MAX_BYTES,
                 length,
             ));
         }

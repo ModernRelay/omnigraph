@@ -2,7 +2,7 @@
 
 OmniGraph treats a Blob as one property cell on an existing node or edge. Lance owns the Blob-v2 physical placement; OmniGraph owns logical identity, snapshot selection, authorization, external-source admission, bounded delivery, and graph-level publication.
 
-This page describes the implemented read, ingestion and embedded cell-write behavior. The HTTP and CLI put and clear surfaces proposed by [RFC 0033](../rfcs/0033-blob-management.md) are not implemented yet.
+This page describes the implemented read, ingestion and cell-write behavior. The CLI put and clear commands proposed by [RFC 0033](../rfcs/0033-blob-management.md) are not implemented yet.
 
 ## Logical states
 
@@ -84,7 +84,7 @@ An external value produces a `302` redirect with the stored URI; the server neve
 
 The CLI exposes `blob get` and `blob stat` for embedded and remote graphs. `get` streams managed bytes to stdout or `--out`; `stat` returns kind, resolved-view metadata, size/ETag for managed data, or the descriptor for external data. The CLI refuses to follow external references.
 
-There is currently no HTTP or CLI Blob put/clear surface; the embedded writes above are the only cell writes.
+`PUT` and `DELETE /graphs/{graph_id}/blob` call the engine cell writes. `PUT` is a raw ingress route like `/load/ndjson`: the ingress middleware reserves the put limit (`BLOB_WRITE_MAX_BYTES`, the engine's own constant) without collecting the body, and the handler authorizes `change` on the branch, checks `Content-Type` (415) and a declared `Content-Length` (413) before it polls a byte, then collects the body under the shared body deadline (408) into one buffer sized from that length, which the engine's value column adopts. The ingress reservation shrinks to the received size. Both verbs admit the actor's workload and submit the engine call through `owned_write`, so a disconnect after admission loses only the response. `omnigraph_api_types::parse_blob_if_match` turns `If-Match` field lines into a `BlobPrecondition` (`*` alone, or the strong tags of a list; weak tags dropped; malformed fields refused), and `blob_write_output` maps the engine outcome to the receipt; the CLI's embedded writes will share both. `BlobWritePreconditionFailed` maps to 412 with `ErrorCode::Conflict`, the `blob_precondition_failure` detail and an `ETag` header, never the graph-commit `precondition_failure`. The CLI has no put or clear yet.
 
 ## Maintenance and export
 
@@ -101,7 +101,7 @@ Export emits managed values as base64 and whole-object external values as URI de
 - Base and storage-root disjointness: in-source `blob.rs` tests (root forms and S3/local overlap), `end_to_end.rs::external_blob_policy_refuses_base_overlapping_graph_root`, and the `omnigraph-cluster` tests `external_blob_config_rejects_bases_overlapping_storage_root`, `external_blob_base_overlapping_storage_root_refuses_apply_over_existing_state`, `external_blob_config_reports_uncomparable_storage_root_under_its_own_code`, `serving_quarantines_applied_policies_overlapping_storage_root` (the classifier), `serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root` (the snapshot reader: quarantine with a healthy sibling, refusal when none is left, ledger unchanged), and `serving_snapshot_refuses_overlapping_policy_its_digest_does_not_bind`.
 - Lance compatibility: `crates/omnigraph/tests/lance_surface_guards.rs`.
 - Cluster policy persistence and serving projection: `omnigraph-cluster` in-source tests.
-- HTTP transport: `crates/omnigraph-server/tests/data_routes.rs`, `auth_policy.rs`, and `openapi.rs`.
+- HTTP transport: `crates/omnigraph-server/tests/data_routes.rs`, `auth_policy.rs`, and `openapi.rs`. The writes: `data_routes.rs::blob_put_and_delete_return_exact_receipts_and_blob_preconditions`, `blob_put_raw_body_bounds_media_type_length_and_deadline`, the Blob doors of `disconnected_writes_keep_admission_until_the_original_operation_finishes`, the `change` cases of `auth_policy.rs::policy_blocks_change_on_protected_main_but_allows_unprotected_branch`, and the `If-Match` parser's tests in `omnigraph-api-types`.
 - CLI and embedded/remote parity: `crates/omnigraph-cli/tests/cli_data.rs` and `parity_matrix.rs`.
 
 The user contract and examples live in [Blob values](../user/blobs.md).
