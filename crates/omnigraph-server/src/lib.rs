@@ -1471,6 +1471,9 @@ impl ApiError {
                 ),
                 api::PreconditionFailureOutput { expected, actual },
             ),
+            err @ OmniError::BlobWritePreconditionFailed { .. } => {
+                Self::blob_precondition_failed(err.to_string())
+            }
             err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
             err @ OmniError::StoredExternalBlobDenied { .. } => Self::bad_request(err.to_string()),
             OmniError::ExternalBlobSource { uri, reason } => {

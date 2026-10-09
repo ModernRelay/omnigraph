@@ -60,6 +60,44 @@ but no length is refused as a Blob integrity error.
 
 OmniGraph never deletes the object named by an external reference.
 
+### Replacing one Blob value
+
+An embedded `Session` replaces or clears one Blob cell of an existing node or
+edge, addressed by exact id like a Blob read:
+
+- `Session::put_blob_at_as` stores the given bytes as a managed value and
+  returns its length, its ETag and the commit;
+- `Session::clear_blob_at_as` sets a nullable cell to null. Clearing a cell that
+  is already null publishes nothing and returns no commit.
+
+Each call that changes the cell is one graph commit and needs the `change`
+action on the branch. Neither call inserts a row: a missing entity is
+`NotFound`. Clearing a property that is not nullable is refused. The write never
+reads the cell's old value. Lance replaces whole rows, so the row's other cells
+are carried as an `update` carries them: a stored external reference among
+them needs the external Blob policy to admit its source, and their managed
+payloads count toward the operation's 32 MiB Blob payload limit together with
+the new value.
+
+A precondition makes the write conditional on the cell's current value.
+`BlobPrecondition::Tags` holds when the current ETag is one of the given tags.
+`BlobPrecondition::AnyExisting` holds when the cell is not null. When it fails,
+the write returns `BlobWritePreconditionFailed`, which carries the cell's
+current ETag when it holds a managed value, and changes nothing. A commit that
+lands while the write is in flight makes it start again from the new head and
+check again, so a stale ETag fails instead of overwriting the newer value; a
+write without a precondition replaces whatever is current. A schema apply or a
+delete and recreate of the branch landing in that window refuses the write
+with a conflict instead.
+
+The returned ETag is the one a read at the returned commit reports. When a call
+fails after its commit became durable, for example because its acknowledgement
+was lost, the value is published once; read the cell for its current ETag
+before retrying with a precondition.
+
+The CLI and the HTTP server do not offer these writes yet. Through them, change
+a Blob value with a load or a mutation.
+
 ## Query behavior
 
 Blob properties are not ordinary `.gq` read values. They cannot be projected,
@@ -67,8 +105,10 @@ filtered, ordered, or aggregated. Write them through load or mutation
 assignment, then read an individual Blob value through the dedicated CLI or
 HTTP surface.
 
-There are no `blob put` or `blob clear` commands. Use the normal graph write
-path so Blob changes remain part of an atomic graph commit.
+There are no `blob put` or `blob clear` CLI commands yet. Use the normal graph
+write path, or the embedded writes in
+[Replacing one Blob value](#replacing-one-blob-value), so Blob changes remain
+part of an atomic graph commit.
 
 ## CLI reads
 
@@ -154,6 +194,7 @@ and retry.
 | 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
 | 32 MiB per touched type, and 32 MiB across all touched types, Blob payloads excluded | Incremental writes: `append` and `merge` loads, inserts, updates and branch merges. Every byte of the rows except managed Blob payloads counts, URIs and Blob framing included | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
 | 32 MiB of managed Blob payload per touched type, and 32 MiB across all touched types, inclusive | The same writes. Each Blob value counts its length; external bytes copied in and Blob values carried unchanged by an update count. A single value of exactly 32 MiB fits beside its row | the same names with `Blob payload bytes` in place of `bytes`, for example `keyed entity Blob payload bytes for <table>` |
+| 32 MiB, inclusive | The bytes of one embedded Blob put, checked before the write opens a table | `Blob write payload bytes` |
 | 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
 | 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |

@@ -25,15 +25,18 @@ mod helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use helpers::recovery::sidecar_operation_ids;
 use helpers::{
-    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load, mixed_params,
-    mutate_main, read_table,
+    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load,
+    init_and_load_with_schema, mixed_params, mutate_main, read_table,
 };
+use omnigraph::BlobCell;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, PreparedSchemaApply, ReadTarget, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
@@ -51,7 +54,8 @@ const PARK_HIT_ENV: &str = "OMNIGRAPH_RFC0067_PARK_HIT";
 const PREPARED_SCHEMA_FILE: &str = "matrix-prepared-schema.json";
 /// What the child runs: one of the `Writer::child_op` strings (`insert`,
 /// `insert_and_friend`, `cleanup`, `ensure_indices`, `merge`, `schema_apply`,
-/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`).
+/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`,
+/// `blob_put`, `blob_clear`).
 const OP_ENV: &str = "OMNIGRAPH_RFC0067_OP";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +90,26 @@ enum Writer {
     /// spellings: one rename-only detached Project per table, staged and
     /// published through the schema-apply seams.
     SystemColumnUpgrade,
+    /// A Blob put replacing Alice's `photo` by exact id: one detached upsert
+    /// of the carried row through the mutation seams.
+    BlobPut,
+    /// A Blob clear of Alice's seeded `photo`: the same single-row upsert
+    /// carrying a null value.
+    BlobClear,
+}
+
+fn photo_schema() -> String {
+    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    photo: Blob?")
+}
+
+/// The Blob cell the Blob writers replace.
+fn alice_photo() -> BlobCell {
+    helpers::node_blob_cell("Person", "Alice", "photo")
+}
+
+/// The bytes a Blob put by `name` stores.
+fn photo_bytes(name: &str) -> Bytes {
+    Bytes::from(format!("{name}-photo").into_bytes())
 }
 
 fn city_schema() -> String {
@@ -136,6 +160,7 @@ impl Writer {
             // The upgrade stages one detached commit per table; park after
             // the first and the second to leave a half-staged tail.
             Writer::SystemColumnUpgrade => vec![PostDetached(1), PostDetached(2), PrePublish],
+            Writer::BlobPut | Writer::BlobClear => vec![PostDetached(1), PrePublish],
         }
     }
 
@@ -152,6 +177,8 @@ impl Writer {
             Writer::Load => "load",
             Writer::FtsRebuild => "fts_rebuild",
             Writer::SystemColumnUpgrade => "system_column_upgrade",
+            Writer::BlobPut => "blob_put",
+            Writer::BlobClear => "blob_clear",
         }
     }
 }
@@ -280,6 +307,34 @@ async fn insert_and_friend(db: &Session, name: &str) -> omnigraph::error::Result
     .map(|_| ())
 }
 
+/// The BlobPut writer's op: replace Alice's photo with `name`'s bytes.
+async fn put_photo(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    db.put_blob_at_as("main", alice_photo(), photo_bytes(name), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// The BlobClear writer's op.
+async fn clear_photo(db: &Session) -> omnigraph::error::Result<()> {
+    db.clear_blob_at_as("main", alice_photo(), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// Alice's photo, `None` when the cell is null.
+async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
+    match db
+        .read_blob_at(ReadTarget::branch("main"), alice_photo())
+        .await
+    {
+        Ok(_) => Some(
+            helpers::read_managed_blob_bytes(db, ReadTarget::branch("main"), alice_photo()).await,
+        ),
+        Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound => None,
+        Err(error) => panic!("reading Alice's photo failed: {error}"),
+    }
+}
+
 /// The Load writer's op: two fresh rows through the loader's staging.
 async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
     let payload = format!(
@@ -377,6 +432,8 @@ fn rfc0067_matrix_child_process() {
                     .upgrade_system_columns(upgrade_execute())
                     .await
                     .map(|_| ()),
+                "blob_put" => put_photo(&db, &name).await,
+                "blob_clear" => clear_photo(&db).await,
                 _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
@@ -574,6 +631,8 @@ async fn run_cell(
             .await
             .unwrap();
         db
+    } else if matches!(writer, Writer::BlobPut | Writer::BlobClear) {
+        init_and_load_with_schema(&dir, &photo_schema()).await
     } else {
         init_and_load(&dir).await
     };
@@ -627,6 +686,11 @@ async fn run_cell(
         .unwrap();
         db.ensure_indices().await.unwrap();
     }
+    // A clear cell clears a photo a put stored first.
+    if writer == Writer::BlobClear {
+        put_photo(&db, &format!("m{index}_seed")).await.unwrap();
+    }
+    let photo_before = observe_photo(&db).await;
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
     let knows_head_before = linear_head(&knows_uri).await;
@@ -673,6 +737,8 @@ async fn run_cell(
                     .upgrade_system_columns(upgrade_execute())
                     .await
                     .map(|_| ()),
+                Writer::BlobPut => put_photo(&db, &write_name).await,
+                Writer::BlobClear => clear_photo(&db).await,
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -832,6 +898,21 @@ async fn run_cell(
         same_handle, model,
         "{cell}: the writer's handle disagrees with a fresh one"
     );
+    if matches!(writer, Writer::BlobPut | Writer::BlobClear) {
+        // The cell holds the written value exactly when the write was
+        // acknowledged, on a fresh handle and on the writer's own.
+        let expected = match writer {
+            Writer::BlobPut if visible => Some(photo_bytes(&write_name).to_vec()),
+            Writer::BlobClear if visible => None,
+            _ => photo_before.clone(),
+        };
+        assert_eq!(observe_photo(&fresh).await, expected, "{cell}: photo");
+        assert_eq!(
+            observe_photo(&db).await,
+            expected,
+            "{cell}: the writer's handle reads a different photo"
+        );
+    }
     let person_pin = table_pin(&fresh, "node:Person").await;
     let knows_pin = table_pin(&fresh, "edge:Knows").await;
     let person_head = linear_head(&person_uri).await;
@@ -997,6 +1078,8 @@ async fn run_matrix() {
         Writer::Load,
         Writer::FtsRebuild,
         Writer::SystemColumnUpgrade,
+        Writer::BlobPut,
+        Writer::BlobClear,
     ];
     let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {

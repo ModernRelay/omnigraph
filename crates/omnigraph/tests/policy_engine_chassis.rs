@@ -371,6 +371,49 @@ async fn mutate_as_allows_when_policy_permits_actor() {
     .expect("act-allowed should be able to Change on main");
 }
 
+/// A Blob put or clear enforces `change` on its branch for the supplied actor
+/// before it opens anything, like every other Mutation-protocol writer.
+#[tokio::test]
+async fn blob_put_and_clear_enforce_change_for_the_actor() {
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? }\n";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    {
+        let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+        db.load_jsonl(
+            r#"{"type":"Document","data":{"title":"doc"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    }
+    let (db, _engine) = install_policy(Omnigraph::open(uri).await.unwrap(), dir.path());
+    let cell = || node_blob_cell("Document", "doc", "content");
+    let bytes = || bytes::Bytes::from_static(b"payload");
+
+    assert_denied(
+        db.put_blob_at_as("main", cell(), bytes(), None, Some("act-denied"))
+            .await,
+        "put_blob_at_as",
+    );
+    assert_denied(
+        db.clear_blob_at_as("main", cell(), None, Some("act-denied"))
+            .await,
+        "clear_blob_at_as",
+    );
+    let no_actor = db.put_blob_at_as("main", cell(), bytes(), None, None).await;
+    assert!(
+        matches!(no_actor, Err(OmniError::Policy(_))),
+        "an installed policy refuses a write without an actor: {no_actor:?}"
+    );
+    db.put_blob_at_as("main", cell(), bytes(), None, Some("act-allowed"))
+        .await
+        .expect("act-allowed may Change on main");
+    db.clear_blob_at_as("main", cell(), None, Some("act-allowed"))
+        .await
+        .expect("act-allowed may Change on main");
+}
+
 #[tokio::test]
 async fn load_as_denies_when_policy_rejects_actor() {
     let dir = tempfile::tempdir().unwrap();

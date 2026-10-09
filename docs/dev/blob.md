@@ -2,7 +2,7 @@
 
 OmniGraph treats a Blob as one property cell on an existing node or edge. Lance owns the Blob-v2 physical placement; OmniGraph owns logical identity, snapshot selection, authorization, external-source admission, bounded delivery, and graph-level publication.
 
-This page describes the implemented read and ingestion behavior. Upload and clear commands proposed by [RFC 0033](../rfcs/0033-blob-management.md) are not implemented yet.
+This page describes the implemented read, ingestion and embedded cell-write behavior. The HTTP and CLI put and clear surfaces proposed by [RFC 0033](../rfcs/0033-blob-management.md) are not implemented yet.
 
 ## Logical states
 
@@ -68,6 +68,14 @@ A materializing rewrite (a carried update or merge cell, the bounded rewrite str
 
 A whole-object surface cannot carry a ranged external descriptor: `ExternalBlobRef::whole_object_uri` returns a `RangedExternalBlob` (whose display never includes the URI) for it, and the HTTP redirect, CLI delivery, schema rewrite and export all refuse it rather than widen it. Surfaces that are not reloaded describe it instead: `export_blob_values` takes `RangedExternalBlobs::{Refuse, Describe}` and returns `LogicalBlobValue::RangedExternal` under `Describe`, which `describe_ranged_blob_cells` writes as `{"uri", "offset", "length"}` with a positive length (the decoder below guarantees one; a missing length there is an internal error) into the row images of `logical_row_image` (change-feed images, entity reads) and the snapshot rows of the change-feed baseline, and change-row comparison compares exactly, so a ranged row never wedges a feed cursor or refuses a baseline. The baseline shares export's table walk and line format and passes `Describe` where export passes `Refuse`: it is the exact state its consumer starts from, and a refusal there would leave the graph with no baseline. The descriptor decoder refuses an external descriptor with an offset but size 0 as a Blob integrity error: Lance reads size 0 as the object's size but keeps the position, which would read past the object's end.
 
+## Engine cell writes
+
+`Session::put_blob_at_as` and `Session::clear_blob_at_as` (`exec/blob_write.rs`) replace one cell of an existing row. They are Mutation-protocol writes, not a writer kind of their own: an attempt captures a `WriteTxn`, stages one `PendingMode::Upsert` row through `MutationStaging`, and runs the Mutation tail, `commit_staged_mutation` (validation, staging, `commit_all`'s detached commit) then `publish_committed_mutation` (the protocol's one publisher call). `forbidden_apis.rs` registers the file under `MUTATION_V9`.
+
+Lance has no single-cell Blob write (`UpdateBuilder` and `RewriteColumns` refuse Blob-v2 columns), so the row is rebuilt: the target column is the new value, and every other column comes from one `scan_with_pending_materialized_blobs` of the exact id with the target omitted, so the target's old payload is never read or charged and the other Blob cells are carried under the update rule above. The new value is a logical `{data, uri}` struct whose `LargeBinary` child adopts the caller's `Bytes` buffer without a copy. A put over `KEYED_BLOB_PAYLOAD_MAX_BYTES` is refused before the write captures anything; the carried cells and the new value then share the keyed payload allowance.
+
+The precondition is evaluated against the attempt's base: the ETag is computed from the base table version the attempt opened, exactly as `read_blob_at` computes it. A pre-effect `ReadSetChanged` re-prepares the whole attempt within the insert-only bound of 32 (re-reading the cell, re-evaluating the precondition, re-carrying the row), because the stored value is the caller's rather than a read-modify-write plan. A re-prepared attempt that sees a different native branch identifier or accepted schema than the first one fails with a conflict. The receipt's ETag is read from the detached version `commit_all` returned, before the manifest CAS, so nothing after publication reads storage and a later write cannot change it.
+
 ## HTTP and CLI delivery
 
 `GET` and `HEAD /graphs/{graph_id}/blob` select one logical cell. Managed delivery supports one bounded range, strong conditional requests, and constant-memory backpressure. `HEAD` does not read payload bytes.
@@ -76,7 +84,7 @@ An external value produces a `302` redirect with the stored URI; the server neve
 
 The CLI exposes `blob get` and `blob stat` for embedded and remote graphs. `get` streams managed bytes to stdout or `--out`; `stat` returns kind, resolved-view metadata, size/ETag for managed data, or the descriptor for external data. The CLI refuses to follow external references.
 
-There is currently no HTTP or CLI Blob put/clear surface.
+There is currently no HTTP or CLI Blob put/clear surface; the embedded writes above are the only cell writes.
 
 ## Maintenance and export
 
@@ -89,6 +97,7 @@ Export emits managed values as base64 and whole-object external values as URI de
 ## Test owners
 
 - Engine logical reads and ingestion: `crates/omnigraph/tests/end_to_end.rs`, `branching.rs`, and in-source Blob/table-store tests.
+- Engine cell writes: `end_to_end.rs::blob_put_and_clear_replace_one_cell_by_exact_id` (node and edge, preconditions, the receipt), `writes.rs` (`blob_put_*` and `blob_write_*`: the inclusive bound, carried siblings, a denied carried reference), `policy_engine_chassis.rs`, the `BlobPut` and `BlobClear` writers of `detached_commit_matrix.rs`, and `failpoints.rs` (a competing write re-evaluates the precondition and re-carries the row, a schema or branch change refuses the retry, a lost acknowledgement publishes once, a write after publication leaves the receipt unchanged).
 - Base and storage-root disjointness: in-source `blob.rs` tests (root forms and S3/local overlap), `end_to_end.rs::external_blob_policy_refuses_base_overlapping_graph_root`, and the `omnigraph-cluster` tests `external_blob_config_rejects_bases_overlapping_storage_root`, `external_blob_base_overlapping_storage_root_refuses_apply_over_existing_state`, `external_blob_config_reports_uncomparable_storage_root_under_its_own_code`, `serving_quarantines_applied_policies_overlapping_storage_root` (the classifier), `serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root` (the snapshot reader: quarantine with a healthy sibling, refusal when none is left, ledger unchanged), and `serving_snapshot_refuses_overlapping_policy_its_digest_does_not_bind`.
 - Lance compatibility: `crates/omnigraph/tests/lance_surface_guards.rs`.
 - Cluster policy persistence and serving projection: `omnigraph-cluster` in-source tests.
