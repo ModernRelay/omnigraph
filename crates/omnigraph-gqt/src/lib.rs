@@ -25,6 +25,7 @@ mod concurrent;
 mod discovery;
 mod dst_runner;
 mod measure;
+mod trace;
 pub use discovery::list_cases;
 pub use dst_runner::{
     MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,
