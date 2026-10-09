@@ -52,6 +52,9 @@ const SEED_ROWS: usize = 4;
 pub(crate) struct HydrateExec {
     input: Arc<dyn ExecutionPlan>,
     bindings: Vec<HydratedBinding>,
+    /// Each binding's declared node schema, which the pinned table's stored
+    /// fields must match for every column taken from it.
+    tables: Vec<SchemaRef>,
     layout: Vec<Slot>,
     snapshot: Snapshot,
     properties: Arc<PlanProperties>,
@@ -81,6 +84,7 @@ impl HydrateExec {
     ) -> Result<Self> {
         let input_schema = input.schema();
         let mut deferred: HashMap<usize, (Slot, Field)> = HashMap::new();
+        let mut tables = Vec::with_capacity(bindings.len());
         for (index, binding) in bindings.iter().enumerate() {
             let address = address_column(&binding.binding);
             if input_schema.column_with_name(&address).is_none() {
@@ -99,6 +103,7 @@ impl HydrateExec {
                         binding.table.type_key
                     ))
                 })?;
+            tables.push(Arc::clone(&node_type.arrow_schema));
             for (column_index, column) in binding.columns.iter().enumerate() {
                 if node_type
                     .arrow_schema
@@ -161,6 +166,7 @@ impl HydrateExec {
         Ok(Self {
             input,
             bindings,
+            tables,
             layout,
             snapshot,
             properties,
@@ -225,6 +231,7 @@ impl ExecutionPlan for HydrateExec {
         Ok(Arc::new(Self {
             input: children.pop().expect("one child"),
             bindings: self.bindings.clone(),
+            tables: self.tables.clone(),
             layout: self.layout.clone(),
             snapshot: self.snapshot.clone(),
             properties: Arc::clone(&self.properties),
@@ -247,6 +254,7 @@ impl ExecutionPlan for HydrateExec {
         let plan = Hydration {
             layout: self.layout.clone(),
             bindings: self.bindings.clone(),
+            tables: self.tables.clone(),
             snapshot: self.snapshot.clone(),
             schema: Arc::clone(&schema),
             peak: MetricBuilder::new(&self.metrics).gauge(PEAK_CHUNK_BYTES, 0),
@@ -265,6 +273,7 @@ impl ExecutionPlan for HydrateExec {
 struct Hydration {
     layout: Vec<Slot>,
     bindings: Vec<HydratedBinding>,
+    tables: Vec<SchemaRef>,
     snapshot: Snapshot,
     schema: SchemaRef,
     peak: Gauge,
@@ -289,7 +298,7 @@ async fn hydrate(
     let hard = usize::try_from(hydrate_chunk_bytes(memory.pool_bytes())).unwrap_or(usize::MAX);
     let target = (hard / 2).max(1);
     let mut sources = Vec::with_capacity(plan.bindings.len());
-    for binding in &plan.bindings {
+    for (binding, declared) in plan.bindings.iter().zip(&plan.tables) {
         let dataset = Arc::new(
             plan.snapshot
                 .open_lance_dataset(&binding.table.type_key)
@@ -302,6 +311,13 @@ async fn hydrate(
                 properties.push(&column.property);
             }
         }
+        crate::engine::typed_value::check_stored_schema(
+            &dataset,
+            declared,
+            &binding.table.type_key,
+            properties.iter().copied(),
+        )
+        .map_err(external)?;
         let projection = dataset
             .schema()
             .project(&properties)

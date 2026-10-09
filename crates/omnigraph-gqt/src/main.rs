@@ -14,6 +14,7 @@ struct Selection {
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
+    trace: bool,
 }
 
 enum Invocation {
@@ -21,7 +22,7 @@ enum Invocation {
     Case(Selection),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI>] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI>] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
@@ -45,6 +46,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         seed: None,
         measure: None,
         artifacts: None,
+        trace: false,
     };
     let mut measure = false;
     let mut model: Option<String> = None;
@@ -61,6 +63,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
                         .into(),
                 );
             }
+            Some("--trace") if !selection.trace => selection.trace = true,
             Some("--measure") if !measure => measure = true,
             Some("--artifacts") if selection.artifacts.is_none() => {
                 selection.artifacts = Some(
@@ -226,6 +229,7 @@ fn run() -> Result<(), String> {
                     selection.measure.clone(),
                     selection.artifacts.clone(),
                     selection.store.as_deref(),
+                    selection.trace,
                 );
                 println!(
                     "{} {} {:.2}s",

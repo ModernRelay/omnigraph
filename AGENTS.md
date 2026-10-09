@@ -148,7 +148,8 @@ python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
 cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
-python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
+python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
@@ -208,6 +209,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
+- Title a pull request `type(scope)!: description` and read the title back
+  after opening it; the `PR Title` check refuses every other shape, and the
+  squash subject on `main` is that title
+  ([CONTRIBUTING.md](CONTRIBUTING.md), Pull Requests).
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.
