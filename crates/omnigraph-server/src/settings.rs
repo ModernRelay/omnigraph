@@ -3,6 +3,7 @@
 //! modularization).
 
 use super::*;
+use std::io::Read;
 use std::path::Path;
 
 /// Build serving settings from a cluster directory's applied revision
@@ -364,6 +365,89 @@ pub async fn load_server_settings_with_identity_trust(
     let bound = omnigraph_cluster::admit_serving_snapshot(&cluster_arg)
         .await
         .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    settings_from_admitted(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        bound,
+        (data_trust_path, oidc_trust_path),
+        SettingsRefusal::ReleaseReadOnlyAdmission,
+    )
+    .await
+}
+
+/// Claim an exact fresh, empty S3 bootstrap receipt before constructing serving
+/// settings. This is an administrator-supplied boot input, never HTTP authority.
+/// Failure does not retry, fall back to ordinary admission, or remove the lock.
+/// Optional identity profiles retain their ordinary canonical-root validation.
+pub async fn load_server_settings_with_bootstrap_handoff(
+    cli_cluster: Option<&PathBuf>,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    receipt_path: &Path,
+    data_trust_path: Option<&Path>,
+    oidc_trust_path: Option<&Path>,
+) -> Result<ManagedServerConfig> {
+    let cluster_dir = required_cluster(cli_cluster)?;
+    let receipt = read_bootstrap_handoff(receipt_path)?;
+    let bound =
+        omnigraph_cluster::claim_bootstrap_serving(&cluster_dir.to_string_lossy(), &receipt)
+            .await
+            .map_err(|diagnostics| serving_snapshot_error(cluster_dir, &diagnostics))?;
+    settings_from_admitted(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        bound,
+        (data_trust_path, oidc_trust_path),
+        SettingsRefusal::RetainClaimedAdmission,
+    )
+    .await
+}
+
+fn read_bootstrap_handoff(path: &Path) -> Result<omnigraph_cluster::BootstrapServingReceipt> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A mistaken FIFO path must not block boot waiting for a writer.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .wrap_err("failed to open bootstrap handoff receipt")?;
+    if !file.metadata()?.is_file() {
+        bail!("bootstrap handoff receipt must be a regular file");
+    }
+    let limit = omnigraph_cluster::MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .wrap_err("failed to read bootstrap handoff receipt")?;
+    if bytes.len() > limit {
+        bail!("bootstrap handoff receipt exceeds {limit} bytes");
+    }
+    serde_json::from_slice(&bytes).wrap_err("invalid bootstrap handoff receipt JSON")
+}
+
+enum SettingsRefusal {
+    ReleaseReadOnlyAdmission,
+    RetainClaimedAdmission,
+}
+
+async fn settings_from_admitted(
+    cluster_dir: &Path,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    bound: omnigraph_cluster::AdmittedServingSnapshot,
+    (data_trust_path, oidc_trust_path): (Option<&Path>, Option<&Path>),
+    refusal: SettingsRefusal,
+) -> Result<ManagedServerConfig> {
     let canonical_root = bound.canonical_root().to_string();
     let (snapshot, _, admission) = bound.into_parts();
     let validated: Result<_> = (|| {
@@ -384,7 +468,16 @@ pub async fn load_server_settings_with_identity_trust(
     })();
     let (mut config, trust, oidc_trust) = match validated {
         Ok(validated) => validated,
-        Err(error) => return Err(release_settings_refusal(error, admission).await),
+        Err(error) => {
+            return Err(match refusal {
+                SettingsRefusal::ReleaseReadOnlyAdmission => {
+                    release_settings_refusal(error, admission).await
+                }
+                // Even a completed settings refusal must retain a claimed lock:
+                // delayed bootstrap attempts rely on this object never vanishing.
+                SettingsRefusal::RetainClaimedAdmission => error,
+            });
+        }
     };
     config.cluster_admission = admission;
     Ok(ManagedServerConfig {
@@ -571,6 +664,344 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
+
+    #[test]
+    fn bootstrap_handoff_reader_is_strict_and_bounded() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("receipt.json");
+        let value = serde_json::json!({
+            "version": 1, "canonical_root": "s3://example/cluster",
+            "bootstrap_lock_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "bootstrap_lock_version": "\"etag\"",
+            "ledger_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW", "state_revision": 3,
+            "state_cas": format!("sha256:{}", "a".repeat(64)),
+            "deployment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW:1:01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            "input_digest": "b".repeat(64), "config_digest": "c".repeat(64),
+            "result_revision": 1
+        });
+        let mut exact = serde_json::to_vec(&value).unwrap();
+        exact.resize(omnigraph_cluster::MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, b' ');
+        fs::write(&path, &exact).unwrap();
+        assert_eq!(
+            super::read_bootstrap_handoff(&path).unwrap().canonical_root,
+            "s3://example/cluster"
+        );
+        exact.push(b' ');
+        fs::write(&path, exact).unwrap();
+        assert!(
+            super::read_bootstrap_handoff(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 16384 bytes")
+        );
+        for invalid in [
+            "{".to_string(),
+            "{}".to_string(),
+            format!("{value} {{}}"),
+            value.to_string().replacen('{', "{\"version\":1,", 1),
+            value
+                .to_string()
+                .replacen('{', "{\"unrecognized\":true,", 1),
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(
+                super::read_bootstrap_handoff(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid bootstrap handoff receipt JSON")
+            );
+        }
+        assert!(super::read_bootstrap_handoff(temp.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_bootstrap_handoff_never_falls_back_to_ordinary_boot() {
+        let temp = tempdir().unwrap();
+        let cluster = temp.path().join("must-not-be-created");
+        let receipt = temp.path().join("receipt.json");
+        fs::write(&receipt, b"{}").unwrap();
+        let error = super::load_server_settings_with_bootstrap_handoff(
+            Some(&cluster),
+            None,
+            true,
+            false,
+            &receipt,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid bootstrap handoff receipt JSON"),
+            "{error}"
+        );
+        assert!(!cluster.exists());
+    }
+
+    /// Uses the same admitted startup and HTTP deployment path as `serve_config`.
+    /// S3 qualification is independently gated from the local settings suite.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn s3_bootstrap_handoff_serves_empty_then_deploys_first_graph() {
+        use crate::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use serde_json::{Value, json};
+        use tower::ServiceExt;
+
+        let Ok(bucket) = env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+            eprintln!("skipping S3 bootstrap serving test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+            return;
+        };
+        async fn response(
+            app: &axum::Router,
+            method: &str,
+            path: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .header("authorization", "Bearer bootstrap-secret")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let code = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            (code, serde_json::from_slice(&bytes).unwrap())
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = format!(
+            "s3://{bucket}/server-bootstrap/{}-{unique}",
+            std::process::id()
+        );
+        let temp = tempdir().unwrap();
+        let source = format!(
+            "version: 1\nstorage: {root}\npolicies:\n  management:\n    file: ./management.yaml\n    applies_to: [cluster]\n"
+        );
+        fs::write(temp.path().join("management.yaml"), "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: manage\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n  - id: discover\n    allow:\n      actors: {group: operators}\n      actions: [graph_list]\n").unwrap();
+        fs::write(temp.path().join("cluster.yaml"), &source).unwrap();
+        let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+        let receipt = omnigraph_cluster::bootstrap_serving(temp.path(), &caller)
+            .await
+            .unwrap();
+        let receipt_path = temp.path().join("receipt.json");
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let root_path = PathBuf::from(&root);
+        let storage = omnigraph::storage::storage_for_uri(&root).unwrap();
+        let lock_uri = format!("{root}/__cluster/lock.json");
+        let bootstrap_lock = storage.read_text(&lock_uri).await.unwrap();
+        // A receipt may not choose a different root than the administrator did.
+        let wrong = PathBuf::from(format!("{root}-wrong"));
+        assert!(
+            super::load_server_settings_with_bootstrap_handoff(
+                Some(&wrong),
+                None,
+                false,
+                false,
+                &receipt_path,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(storage.read_text(&lock_uri).await.unwrap(), bootstrap_lock);
+        for name in ["lock.json", "state.json"] {
+            assert!(
+                storage
+                    .read_text_if_exists(&format!("{root}-wrong/__cluster/{name}"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let settings = super::load_server_settings_with_bootstrap_handoff(
+            Some(&root_path),
+            None,
+            false,
+            false,
+            &receipt_path,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let config = settings.config;
+        let owner = config.cluster_admission.as_ref().unwrap();
+        assert_ne!(owner.lock_id(), receipt.bootstrap_lock_id);
+        assert_eq!(owner.canonical_root(), receipt.canonical_root);
+        assert_eq!(config.witness.state_revision, receipt.state_revision);
+        assert_eq!(
+            config.witness.state_cas.as_deref(),
+            Some(receipt.state_cas.as_str())
+        );
+        let serving_lock = storage.read_text(&lock_uri).await.unwrap();
+        assert!(
+            super::load_server_settings_with_bootstrap_handoff(
+                Some(&root_path),
+                None,
+                false,
+                false,
+                &receipt_path,
+                None,
+                None,
+            )
+            .await
+            .is_err(),
+            "a receipt must be single-claim"
+        );
+        assert_eq!(storage.read_text(&lock_uri).await.unwrap(), serving_lock);
+
+        let ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy,
+        } = config.mode;
+        assert!(graphs.is_empty());
+        let state = super::open_multi_graph_state_admitted(
+            graphs,
+            vec![("operator".into(), "bootstrap-secret".into())],
+            server_policy.as_ref(),
+            config_path,
+            false,
+            config.cluster_admission,
+        )
+        .await
+        .unwrap()
+        .with_boot_witness(
+            config.witness,
+            Arc::new(AtomicBool::new(false)),
+            DEFAULT_SHUTDOWN_GRACE,
+        );
+        super::deployment::initialize_boot_activation(&state);
+        let app = super::build_app(state);
+        let (code, ready) = response(&app, "GET", "/readyz", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{ready}");
+        assert_eq!(ready["ready_graph_count"], 0);
+        let (code, inventory) = response(&app, "GET", "/graphs", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{inventory}");
+        assert!(inventory["graphs"].as_array().unwrap().is_empty());
+        let (code, status) = response(&app, "GET", "/cluster/deployments", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{status}");
+        let status: omnigraph_cluster::DeploymentStatus =
+            serde_json::from_value(status["status"].clone()).unwrap();
+        let id = status.next_deployment_id();
+        fs::write(
+            temp.path().join("people.pg"),
+            "node Person { name: String @key }\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            format!("{source}graphs:\n  people:\n    schema: ./people.pg\n"),
+        )
+        .unwrap();
+        let candidate = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
+        let (code, accepted) = response(
+            &app,
+            "POST",
+            "/cluster/deployments",
+            json!({"deployment_id":id,"deployment":candidate}),
+        )
+        .await;
+        assert!(
+            matches!(code, StatusCode::OK | StatusCode::ACCEPTED),
+            "{code}: {accepted}"
+        );
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let (code, result) = response(
+                    &app,
+                    "GET",
+                    &format!("/cluster/deployments/{id}"),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "{result}");
+                if result["in_progress"] == false {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first graph deployment must complete");
+        assert_eq!(completed["active"], true, "{completed}");
+        assert_eq!(
+            completed["deployment"]["result"]["converged"], true,
+            "{completed}"
+        );
+        let (code, inventory) = response(&app, "GET", "/graphs", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{inventory}");
+        assert_eq!(inventory["graphs"][0]["graph_id"], "people");
+        let (code, snapshot) = response(&app, "GET", "/graphs/people/snapshot", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{snapshot}");
+        assert!(snapshot["datasets"].is_array(), "{snapshot}");
+        assert_eq!(storage.read_text(&lock_uri).await.unwrap(), serving_lock);
+        drop(app);
+        assert_eq!(storage.read_text(&lock_uri).await.unwrap(), serving_lock);
+
+        // Invalid identity trust after a successful claim must retain the fresh
+        // owner too, even though startup never constructs a router/listener.
+        let refused_root = format!("{root}-trust-refused");
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            source.replace(&root, &refused_root),
+        )
+        .unwrap();
+        let receipt = omnigraph_cluster::bootstrap_serving(temp.path(), &caller)
+            .await
+            .unwrap();
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let trust = temp.path().join("bad-trust.json");
+        fs::write(&trust, b"{}").unwrap();
+        let refused_path = PathBuf::from(&refused_root);
+        assert!(
+            super::load_server_settings_with_bootstrap_handoff(
+                Some(&refused_path),
+                None,
+                false,
+                false,
+                &receipt_path,
+                Some(&trust),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        let refused_uri = format!("{refused_root}/__cluster/lock.json");
+        let retained = storage.read_text(&refused_uri).await.unwrap();
+        let retained_json: Value = serde_json::from_str(&retained).unwrap();
+        assert_ne!(retained_json["lock_id"], receipt.bootstrap_lock_id);
+        assert!(
+            super::load_server_settings_with_bootstrap_handoff(
+                Some(&refused_path),
+                None,
+                false,
+                false,
+                &receipt_path,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(storage.read_text(&refused_uri).await.unwrap(), retained);
+    }
 
     /// `authorize` returns the allow/deny **decision** (`Authz`) and reserves
     /// `Err` for operational failures, so the invoke handler can hide a denial

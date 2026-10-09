@@ -5675,6 +5675,7 @@ dependencies = [
 name = "omnigraph-cluster"
 version = "0.13.0"
 dependencies = [
+ "async-trait",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
@@ -5987,6 +5988,7 @@ name = "omnigraph-storage"
 version = "0.13.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "futures",
  "object_store",
  "sha2 0.10.9",

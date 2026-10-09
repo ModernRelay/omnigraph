@@ -15,7 +15,8 @@ use handlers::*;
 use settings::*;
 pub use settings::{
     ServerRuntimeState, classify_server_runtime_state, load_server_settings,
-    load_server_settings_with_data_token_trust, load_server_settings_with_identity_trust,
+    load_server_settings_with_bootstrap_handoff, load_server_settings_with_data_token_trust,
+    load_server_settings_with_identity_trust,
 };
 pub mod auth;
 pub mod data_tokens;
@@ -217,11 +218,11 @@ pub struct ServerConfig {
     pub cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
 }
 
-/// Applied server settings paired with already validated offline token trust.
+/// Applied server settings bound to a root and optional validated identity trust.
 ///
-/// Constructed only by [`load_server_settings_with_data_token_trust`]. The
-/// settings are exposed read-only so their graphs cannot be replaced after the
-/// canonical serving root has been checked against the trust document.
+/// Constructed by the identity-trust and bootstrap-handoff settings loaders. The
+/// settings are exposed read-only so their graphs cannot be replaced after
+/// ownership or identity trust has been bound to the canonical serving root.
 #[derive(Debug, Clone)]
 pub struct ManagedServerConfig {
     config: ServerConfig,
@@ -2488,8 +2489,8 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     serve_config(config, None, None).await
 }
 
-/// Serve settings whose offline data-token trust was validated against their
-/// applied snapshot's canonical root before any graph engine open.
+/// Serve root-bound settings whose enabled identity trust was validated against
+/// the applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
     serve_config(config.config, config.trust, config.oidc_trust).await
 }
@@ -2660,11 +2661,30 @@ async fn serve_config(
     served?;
     startup_result.wrap_err("graph startup owner failed")??;
     if let Some(owner) = retained_admission {
-        warn!(
-            root = %omnigraph::storage::redacted_storage_uri(owner.canonical_root()),
-            lock_id = %owner.lock_id(),
-            "v2 cluster admission retained after shutdown; establish prior graph/control I/O quiescence before exact-ID force-unlock"
-        );
+        if owner.canonical_root().starts_with("az://") {
+            // Azure keeps its existing stopped-process boundary until its
+            // native clean-release path has independent qualification.
+            warn!("Azure cluster admission retained after logical shutdown");
+            return Ok(());
+        }
+        let scope = owner.io_scope().ok_or_else(|| {
+            eyre!("cluster storage lifetime is untracked; retaining its admission")
+        })?;
+        scope.close();
+        scope.wait_idle().await;
+        if scope.is_uncertain() {
+            return Err(eyre!(
+                "storage completion uncertain; retaining cluster admission"
+            ));
+        }
+        // Axum's connection completion notification can precede destruction
+        // of its Hyper service and AppState. Drain those actual owners too;
+        // the original process watchdog still bounds this wait.
+        owner.wait_for_exclusive_owner().await;
+        owner
+            .release_after_settlement()
+            .await
+            .map_err(|error| eyre!("clean cluster release refused: {error:?}"))?;
     }
     Ok(())
 }
@@ -2847,7 +2867,10 @@ async fn prepare_multi_graph_state(
         );
         let uri = cfg.uri.clone();
         match prepare_single_graph(cfg, expected) {
-            Ok(graph) => {
+            Ok(mut graph) => {
+                graph.io_scope = admission
+                    .as_ref()
+                    .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
                 prepared.push(graph);
             }
@@ -2986,6 +3009,7 @@ struct PreparedGraphOpen {
     cfg: GraphStartupConfig,
     pending: Arc<LoadingGraph>,
     expected: Option<omnigraph::db::SchemaContractDigest>,
+    io_scope: Option<omnigraph::storage::StorageIoScope>,
 }
 
 #[cfg(test)]
@@ -3064,6 +3088,7 @@ fn prepare_single_graph(
             policy,
         }),
         expected,
+        io_scope: None,
     })
 }
 
@@ -3074,6 +3099,7 @@ async fn open_prepared_graph(
         cfg,
         pending,
         expected,
+        io_scope,
     } = prepared;
     let graph_id = &pending.key.graph_id;
     let uri = pending.uri.clone();
@@ -3083,7 +3109,11 @@ async fn open_prepared_graph(
         policy: policy.clone(),
         cause,
     };
-    let db = Omnigraph::open(&uri).await.map_err(|err| {
+    let opened = match io_scope {
+        Some(scope) => Omnigraph::open_with_io_scope(&uri, scope).await,
+        None => Omnigraph::open(&uri).await,
+    };
+    let db = opened.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
             eyre!("open graph '{}' at {}: {err}", graph_id, uri),

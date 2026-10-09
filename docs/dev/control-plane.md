@@ -177,14 +177,53 @@ conversion, admission construction or read-only server settings validation
 explicitly release the exact lock. Recovery
 of an accepted invocation retains admission even when its current preparation
 refuses. Other explicit release requires qualified terminal graph and control
-I/O; generic server drain does not establish that proof. Operator
-transfer therefore requires stopped prior processes and accepted-I/O quiescence,
+I/O; generic server drain does not establish that proof. Clean serving release
+adds an explicit storage scope covering native and Lance writes, described below.
+Other operator transfer requires stopped prior processes and accepted-I/O quiescence,
 then exact-ID unlock with all admissions and other unlocks excluded until it
 finishes. The backend has no conditional-delete guarantee; this is not a
 distributed fencing lock. Older/raw/embedded writers outside the participating
 doors remain operator-excluded across outstanding work and recovery. No tags or
 additional retention store protect deployment evidence, and the executor never
 runs cleanup.
+
+Fresh S3 initialization has one narrower exception to exact-ID unlock:
+`bootstrap_serving` executes only the initial cluster-scoped policy deployment
+under a private retained bootstrap lock. It opens no graphs and returns a strict
+16 KiB maximum receipt bound to the exact root, input, native ledger/result,
+state CAS and original lock version. Native authority, graph or recovery
+residue refuses initialization; unrelated opaque metadata grants no authority.
+`claim_bootstrap_serving` validates those bindings and conditionally replaces
+that same lock version with a new process-owned serving lock before capturing
+the empty serving snapshot. It never deletes the lock or adopts an earlier
+claim after an uncertain acknowledgement. Errors, cancellation and lost
+responses retain exclusion. Already-issued bootstrap state updates use spent
+CAS predecessors; immutable payload retries cannot alter achieved input. This
+is only fresh zero-graph bootstrap, not native-I/O settlement or expiry-based
+takeover. Later serving owners use clean release rather than replaying the
+bootstrap receipt. The S3 lock key remains continuously present across normal
+release and acquisition, so an older bootstrap create cannot recreate its owner.
+
+Clean native shutdown closes logical admission, drains its existing operation
+owners, then closes and drains an explicit `StorageIoScope` shared by control
+adapters and graph Lance sessions. The wrappers count actual mutating requests
+and multipart lifetimes; cancellation and ambiguous errors stick even if a
+higher layer consumes the error. Single-attempt conditional conflicts remain
+settled refusals. Scoped clients disable both transport and Lance AIMD retries,
+and local Lance uses its object-store file provider so direct file writes cannot
+bypass the scope. Embedded defaults and Azure serving clients are unchanged;
+the automatic scoped shutdown path applies only to local and S3 roots.
+
+Only unique admission, successful startup and unpoisoned settlement permit final
+release. Original adapters remain permanently closed; a private single-attempt
+client performs only exact-owner lock release under the same shutdown deadline.
+S3 release CAS writes a unique version-2 released marker at the existing key;
+ordinary acquisition CAS replaces it with a fresh held owner. Lost release
+acknowledgement is an error, while its delayed CAS cannot affect a successor.
+Local release uses awaited exact-owner deletion; automatic Azure release remains
+unqualified and its prior retained-lock shutdown behavior is unchanged. Older
+tools refuse the new released record. This supplies neither
+distributed fencing, generic runtime reuse nor crash recovery.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 

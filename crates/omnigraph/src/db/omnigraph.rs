@@ -481,9 +481,10 @@ impl Omnigraph {
         legacy_system_columns: bool,
         prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -638,6 +639,15 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open within a caller-owned storage lifetime, including all Lance writes.
+    pub async fn open_with_io_scope(
+        uri: &str,
+        scope: crate::storage::StorageIoScope,
+    ) -> Result<Self> {
+        let storage = crate::storage::storage_for_uri_scoped(uri, scope)?;
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
@@ -696,9 +706,10 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);

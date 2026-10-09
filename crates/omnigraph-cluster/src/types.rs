@@ -122,6 +122,15 @@ pub struct StateObservations {
 
 impl StateObservations {
     pub(crate) fn observe_lock_metadata(&mut self, lock: &StateLockFile) {
+        if lock.is_released() {
+            self.locked = false;
+            self.lock_id = None;
+            self.lock_operation = None;
+            self.lock_created_at = None;
+            self.lock_pid = None;
+            self.lock_age_seconds = None;
+            return;
+        }
         self.locked = true;
         self.lock_id = Some(lock.lock_id().to_string());
         self.lock_operation = Some(lock.operation().to_string());

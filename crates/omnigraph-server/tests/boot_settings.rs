@@ -1635,7 +1635,40 @@ mod owned_shutdown {
             .await
             .unwrap();
             config.shutdown_grace = Duration::from_secs(5);
-            omnigraph_server::serve(config).await.unwrap();
+            if mode == "v2-swallowed-error" {
+                let scope = config
+                    .cluster_admission
+                    .as_ref()
+                    .unwrap()
+                    .io_scope()
+                    .unwrap();
+                let storage =
+                    omnigraph::storage::storage_for_uri_scoped(root.to_str().unwrap(), scope)
+                        .unwrap();
+                let fault_root = root.clone();
+                tokio::spawn(async move {
+                    while !fault_root.join("inject-error").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    fs::write(fault_root.join("file-blocker"), b"file").unwrap();
+                    // Deliberately swallow a real backend error. Logical owner
+                    // completion cannot erase the storage scope's uncertainty.
+                    assert!(
+                        storage
+                            .write_text(
+                                fault_root.join("file-blocker/child").to_str().unwrap(),
+                                "no",
+                            )
+                            .await
+                            .is_err()
+                    );
+                    fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                });
+            }
+            if let Err(error) = omnigraph_server::serve(config).await {
+                eprintln!("native shutdown refused: {error:?}");
+                std::process::exit(2);
+            }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(0);
         }
@@ -1932,6 +1965,7 @@ mod owned_shutdown {
             "panic-after",
             "v2-finish",
             "v2-crash",
+            "v2-swallowed-error",
         ] {
             let cutoff = mode == "cutoff";
             let panic = mode.starts_with("panic-");
@@ -1968,6 +2002,10 @@ mod owned_shutdown {
             let fault_started = Instant::now();
             let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
             if v2 {
+                if mode == "v2-swallowed-error" {
+                    fs::write(root.join("inject-error"), b"inject").unwrap();
+                    wait_marker(&root.join("fault-reached"), &mut child.0);
+                }
                 let signal = if mode == "v2-crash" {
                     libc::SIGKILL
                 } else {
@@ -2027,21 +2065,48 @@ mod owned_shutdown {
                 if mode == "v2-finish" {
                     assert_eq!(status.code(), Some(0));
                     assert!(root.join("serve-returned").exists());
-                } else {
+                } else if mode == "v2-crash" {
                     use std::os::unix::process::ExitStatusExt;
                     assert_eq!(status.signal(), Some(libc::SIGKILL));
+                } else {
+                    assert_eq!(status.code(), Some(2));
                 }
                 output_thread.join().unwrap();
-                assert_eq!(
-                    fs::read(root.join("__cluster/lock.json")).unwrap(),
-                    retained_lock.unwrap()
-                );
                 assert_eq!(
                     fs::read(root.join("__cluster/state.json")).unwrap(),
                     ledger_before.unwrap()
                 );
-                let refusal = cluster_settings(root).await.unwrap_err();
-                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+                if mode == "v2-finish" {
+                    assert!(!root.join("__cluster/lock.json").exists());
+                    // Ordinary boot, without a repair command, must reopen the
+                    // same populated graph under a newly acquired lifetime.
+                    let (mut successor, address, output_thread) = spawn_owned_child(root, mode);
+                    wait_ready(&address, &mut successor.0, "serving").await;
+                    let successor_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+                    assert_ne!(Some(successor_lock), retained_lock);
+                    assert_eq!(
+                        unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
+                        0
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let status = loop {
+                        if let Some(status) = successor.0.try_wait().unwrap() {
+                            break status;
+                        }
+                        assert!(Instant::now() < deadline, "successor shutdown timed out");
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    assert_eq!(status.code(), Some(0));
+                    output_thread.join().unwrap();
+                    assert!(!root.join("__cluster/lock.json").exists());
+                } else {
+                    assert_eq!(
+                        fs::read(root.join("__cluster/lock.json")).unwrap(),
+                        retained_lock.unwrap()
+                    );
+                    let refusal = cluster_settings(root).await.unwrap_err();
+                    assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+                }
                 continue;
             }
             assert_eq!(

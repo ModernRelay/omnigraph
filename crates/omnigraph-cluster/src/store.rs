@@ -18,7 +18,9 @@ use omnigraph_storage::{
 };
 
 use crate::deployment::{DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state};
-use crate::state_lock::{StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock};
+use crate::state_lock::{
+    StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock, release_settled_lock,
+};
 use crate::{
     CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR, CLUSTER_RESOURCES_DIR, CLUSTER_STATE_FILE,
     ClusterState, Diagnostic, RecoverySidecar, ResourceKind, StateLockFile, StateObservations,
@@ -46,6 +48,10 @@ pub(crate) struct StateSnapshot {
     pub(crate) state: Option<ClusterState>,
     /// Content identity (`sha256:<hex>`) — the public CAS vocabulary.
     pub(crate) state_cas: Option<String>,
+}
+
+fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
+    Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string())
 }
 
 /// Only explicit stopped-ledger conversion may remove obsolete runtime fields.
@@ -151,6 +157,27 @@ fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diag
 }
 
 impl ClusterStore {
+    /// Rebind qualified backends before admission/effects; descendants share
+    /// this scope. Azure retains its existing external-admission boundary.
+    pub(crate) fn with_io_scope(
+        mut self,
+        scope: omnigraph_storage::StorageIoScope,
+    ) -> Result<Self, Diagnostic> {
+        if self.kind() == StorageKind::Azure {
+            return Ok(self);
+        }
+        self.storage = omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope)
+            .map_err(|error| {
+                Diagnostic::error("storage_root_invalid", "storage", error.to_string())
+            })?;
+        self.adapter = self.storage.adapter();
+        Ok(self)
+    }
+
+    pub(crate) fn io_scope(&self) -> Option<omnigraph_storage::StorageIoScope> {
+        self.adapter.io_scope()
+    }
+
     /// The default layout: storage root = the config directory itself
     /// (`file://<abs config dir>`), byte-compatible with every pre-existing
     /// cluster on disk.
@@ -209,6 +236,97 @@ impl ClusterStore {
 
     pub(crate) fn kind(&self) -> StorageKind {
         self.storage.kind()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bootstrap_test_adapter(mut self, adapter: Arc<dyn StorageAdapter>) -> Self {
+        self.adapter = adapter;
+        self
+    }
+
+    async fn require_absent_native_paths(&self, paths: &[&str]) -> Result<(), Diagnostic> {
+        for path in paths {
+            if self
+                .adapter
+                .exists(&self.uri(path))
+                .await
+                .map_err(|error| {
+                    Diagnostic::error("bootstrap_freshness_unknown", *path, error.to_string())
+                })?
+            {
+                return Err(Diagnostic::error(
+                    "bootstrap_root_not_fresh",
+                    *path,
+                    "existing native authority or graph data prevents initial bootstrap",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_fresh_bootstrap(&self, own_lock: bool) -> Result<(), Diagnostic> {
+        self.require_no_bootstrap_graphs_or_recovery().await?;
+        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR])
+            .await?;
+        if !own_lock {
+            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE])
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(&self) -> Result<(), Diagnostic> {
+        self.require_absent_native_paths(&[
+            crate::CLUSTER_GRAPHS_DIR,
+            "__manifest",
+            "__history",
+            CLUSTER_RECOVERIES_DIR,
+            "__cluster/approvals",
+        ])
+        .await
+    }
+
+    pub(crate) async fn acquire_bootstrap_lock(
+        &self,
+    ) -> Result<(StateLockGuard, String), Diagnostic> {
+        crate::state_lock::acquire_bootstrap_lock(
+            self.adapter.clone(),
+            self.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+        )
+        .await
+        .map_err(bootstrap_lock_error)
+    }
+
+    pub(crate) async fn verify_bootstrap_lock(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<(), Diagnostic> {
+        crate::state_lock::verify_bootstrap_lock(
+            &self.adapter,
+            &self.uri(CLUSTER_LOCK_FILE),
+            id,
+            version,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
+    }
+
+    pub(crate) async fn claim_bootstrap_lock(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<StateLockGuard, Diagnostic> {
+        crate::state_lock::claim_bootstrap_lock(
+            self.adapter.clone(),
+            self.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+            id,
+            version,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
     }
 
     /// Canonical identity of the same store used for the serving snapshot.
@@ -938,7 +1056,14 @@ impl ClusterStore {
         observations: &mut StateObservations,
     ) -> Result<StateLockGuard, Diagnostic> {
         let lock_uri = self.uri(CLUSTER_LOCK_FILE);
-        match acquire_state_lock(&self.storage, &lock_uri, operation).await {
+        match acquire_state_lock(
+            self.adapter.clone(),
+            self.storage.kind(),
+            &lock_uri,
+            operation,
+        )
+        .await
+        {
             Ok(StateLockAcquire::Acquired(guard)) => {
                 observations.lock_acquired = true;
                 observations.acquired_lock_id = Some(guard.lock_id().to_string());
@@ -965,6 +1090,65 @@ impl ClusterStore {
         }
     }
 
+    pub(crate) async fn release_settled(&self, lock_id: &str) -> Result<(), Diagnostic> {
+        // Permanently close graph/control adapters before the final lock write.
+        // This private client can only execute the exact-owner release below;
+        // no caller receives a general escape from a closed storage scope.
+        let release_scope = if let Some(scope) = self.io_scope() {
+            scope.close();
+            scope.wait_idle().await;
+            if scope.is_uncertain() {
+                return Err(Diagnostic::error(
+                    "cluster_admission_io_uncertain",
+                    CLUSTER_LOCK_FILE,
+                    "accepted storage work is uncertain; retaining cluster admission",
+                ));
+            }
+            Some(omnigraph_storage::StorageIoScope::new())
+        } else {
+            None
+        };
+        let adapter = if let Some(scope) = &release_scope {
+            omnigraph_storage::storage_handle_for_uri_scoped(&self.root, scope.clone())
+                .map_err(|error| {
+                    Diagnostic::error(
+                        "cluster_admission_release_failed",
+                        CLUSTER_LOCK_FILE,
+                        error.to_string(),
+                    )
+                })?
+                .adapter()
+        } else {
+            self.adapter.clone()
+        };
+        let result = release_settled_lock(
+            &adapter,
+            self.storage.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+            lock_id,
+        )
+        .await
+        .map_err(|error| {
+            Diagnostic::error(
+                "cluster_admission_release_failed",
+                CLUSTER_LOCK_FILE,
+                format!("exact settled lock release was not confirmed: {error}"),
+            )
+        });
+        if let Some(scope) = release_scope {
+            scope.close();
+            scope.wait_idle().await;
+            if scope.is_uncertain() {
+                return Err(Diagnostic::error(
+                    "cluster_admission_release_failed",
+                    CLUSTER_LOCK_FILE,
+                    "final lock release acknowledgement is uncertain; do not replay it",
+                ));
+            }
+        }
+        result
+    }
+
     pub(crate) async fn force_unlock(
         &self,
         lock_id: &str,
@@ -989,6 +1173,13 @@ impl ClusterStore {
             }
         };
         let lock = parse_lock_file_for_unlock(&text)?;
+        if lock.is_released() {
+            return Err(Diagnostic::error(
+                "state_lock_released",
+                CLUSTER_LOCK_FILE,
+                "the native lock is already released; start the next owner normally",
+            ));
+        }
         observations.observe_lock_metadata(&lock);
         observations.locked = true;
         if lock.lock_id() != lock_id {

@@ -114,11 +114,24 @@ not proof that native storage I/O settled or that the engine can be reused.
 A proven pre-effect failure, such as a failed initial schema read or a native-tag
 retirement refusal, releases its reservation and keeps admission open. Error
 status or a transient storage category alone does not establish that proof.
-A clean drain exits 0. Set the orchestrator's own
+A clean native shutdown exits 0. Set the orchestrator's own
 termination grace longer than this value; a cutoff is crash-equivalent for the
 work it interrupts, and the next open recovers it as after any crash.
-For a v2 cluster, even a clean exit retains its cluster lock. Follow the
-[ownership-transfer procedure](#writer-topology) before starting the next owner.
+On local storage and S3, the server also closes its storage scope, waits for
+accepted graph and control writes, and releases its own cluster admission.
+The next server can start normally with the same `--cluster`. An initial
+`--bootstrap-handoff` receipt is only for the first process; omit it on later
+starts. The data, history and applied configuration remain in place.
+
+Uncertain or interrupted work retains admission and exits nonzero. S3 release
+uses a conditional marker, so a lost release response cannot delete a later
+owner's lock. A nonclean exit is still a reason to inspect the original outcome,
+not to replay writes. Azure keeps its existing shutdown behavior: even a clean
+exit retains admission and requires the independent Azure recovery procedure.
+The server's storage clients disable hidden mutation retries; if
+`OBJECT_STORE_CLIENT_MAX_RETRIES` is set, it must be `0`. An ambiguous storage
+failure stops new writes rather than allowing a later success to hide it.
+Other direct writers still follow the [ownership-transfer procedure](#writer-topology).
 
 ## Admission limits
 
@@ -284,8 +297,9 @@ admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.
 
-Admission remains held after an ordinary write command succeeds, a deployment
-completes, or server work ends without settlement proof. A completed read-only
+Admission remains held after an ordinary direct write command succeeds or a
+deployment completes. A clean server shutdown follows the bounded release
+described above; ending work without that proof retains admission. A completed read-only
 preflight refusal during new deployment, conversion or admission construction
 releases its admission. Recovery of accepted work, cancellation and uncertain
 effects retain it. A finished response, zero active HTTP
@@ -296,6 +310,9 @@ Exclude new admissions and other unlock attempts until the exact-ID unlock
 finishes. Then start the next owner. Use the root-addressed
 [status and recovery commands](clusters/index.md#inspect-and-recover-a-deployment)
 to obtain the lock ID; unlocking never resolves an uncertain deployment.
+
+Use the same current toolchain for restart. Older binaries refuse the released
+S3 lock record; do not delete that record to bypass the version check.
 
 A legacy v1 ledger refuses ordinary serving and writes. Stop its previous
 owners and explicitly [convert the ledger](clusters/index.md#direct-deployments-and-conversion)

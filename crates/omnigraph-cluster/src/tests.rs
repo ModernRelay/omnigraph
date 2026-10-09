@@ -1562,7 +1562,7 @@ async fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
             state_dir.join("lock.json"),
-            r#"{"version":2,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
+            r#"{"version":3,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
         )
         .unwrap();
 
