@@ -2455,10 +2455,11 @@ mod log_filter_tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let output = capture.output();
-        assert!(
-            output.contains("stored query invoked") && output.contains("graph_id=default"),
-            "{output}"
-        );
+        let invoked = output
+            .lines()
+            .find(|line| line.contains("stored query invoked"))
+            .unwrap_or_else(|| panic!("no invocation log: {output}"));
+        assert!(invoked.contains("graph_id=default"), "{invoked}");
         assert!(!output.contains("private-storage-root"), "{output}");
     }
 }
