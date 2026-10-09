@@ -5879,6 +5879,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-gqt-served"
+version = "0.13.0"
+dependencies = [
+ "axum",
+ "datatest-stable",
+ "omnigraph-engine",
+ "omnigraph-gqt",
+ "omnigraph-gqt-core",
+ "omnigraph-server",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "omnigraph-planner"
 version = "0.13.0"
 dependencies = [
@@ -5949,7 +5963,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "dashmap",
- "datatest-stable",
  "futures",
  "headers",
  "http-body-util",
@@ -5962,8 +5975,6 @@ dependencies = [
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
- "omnigraph-gqt",
- "omnigraph-gqt-core",
  "omnigraph-policy",
  "p256",
  "regex",

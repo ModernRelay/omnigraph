@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::{Param, show_statement_name};
+use omnigraph_compiler::query::ast::show_statement_name;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,8 +20,8 @@ use std::time::Duration;
 use crate::{
     Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep, MAIN_BRANCH,
     MergeExpect, MutateExpect, MutateStep, QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail,
-    WriteExpect, build_params, check_error_expect, check_rows_json, expectation_evidence,
-    merge_outcome_word, operation, step_kind, step_label, substitute,
+    WriteExpect, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
+    operation, step_kind, step_label, substitute,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -191,6 +191,11 @@ async fn execute_served_inner<H: ExecutionHost>(
     Ok(())
 }
 
+/// The most bytes one answer may carry before the runner stops reading it:
+/// a bounded read, so a large row set or a runaway server fails the step
+/// instead of the process.
+const RESPONSE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The requests one served run sends: every one under `/graphs/{id}`, with
 /// the contract header and, when given, the bearer token.
 struct ServerClient {
@@ -238,15 +243,31 @@ impl ServerClient {
             Some(token) => builder.bearer_auth(token),
             None => builder,
         };
-        let response = builder
+        let mut response = builder
             .send()
             .await
             .map_err(|e| format!("server request failed: {e}"))?;
         let status = response.status();
-        let body = response
-            .bytes()
+        if let Some(length) = response.content_length()
+            && length > RESPONSE_LIMIT_BYTES
+        {
+            return Err(format!(
+                "server answered {status} with {length} bytes, over the {RESPONSE_LIMIT_BYTES}-byte response bound"
+            ));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| format!("server response failed: {e}"))?;
+            .map_err(|e| format!("server response failed: {e}"))?
+        {
+            if body.len() + chunk.len() > RESPONSE_LIMIT_BYTES as usize {
+                return Err(format!(
+                    "server answered {status} with more than {RESPONSE_LIMIT_BYTES} bytes, over the response bound"
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
         if status.is_success() {
             return serde_json::from_slice(&body).map(Ok).map_err(|e| {
                 format!(
@@ -354,14 +375,13 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     }
 }
 
-/// The `--- params` body as it goes on the wire: validated against the
-/// declaration exactly as the in-process path does, then sent as JSON.
+/// The `--- params` body as it goes on the wire: the JSON the case spells,
+/// bindings substituted; the server holds it against the declaration, so a
+/// parameter error is the server's answer, never a local verdict.
 fn wire_params(
     params_raw: Option<&String>,
-    ast_params: &[Param],
     binding: Option<(&str, &str)>,
 ) -> Result<Option<Value>, String> {
-    build_params(params_raw, ast_params, binding)?;
     params_raw
         .map(|raw| {
             serde_json::from_str::<Value>(&substitute(raw, binding))
@@ -422,7 +442,7 @@ async fn query(
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "query", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let params = match wire_params(step.params_raw.as_ref(), &step.decl.params, binding) {
+    let params = match wire_params(step.params_raw.as_ref(), binding) {
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
@@ -472,7 +492,7 @@ async fn mutate(
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "mutate", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let params = match wire_params(step.params_raw.as_ref(), &step.ast_params, binding) {
+    let params = match wire_params(step.params_raw.as_ref(), binding) {
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {

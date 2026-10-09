@@ -227,13 +227,14 @@ jobs:
 
       # Every case that declares the `omnigraph-server` target runs through
       # an in-process server as well; its verdict must equal the in-process
-      # one (crates/omnigraph-server/tests/gqt_served_conformance.rs), and
+      # one (crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs), and
       # the served set is totalled and refused when empty (gqt_served_count.rs).
+      # The crate is tests only, so this cell is the one job that builds it.
       - name: Run the served GQ logic conformance
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'served'
         env:
           RUSTFLAGS: ""
-        run: cargo test -p omnigraph-server --locked --timings --test gqt_served_conformance --test gqt_served_count -- --nocapture
+        run: cargo test -p omnigraph-gqt-served --locked --timings -- --nocapture
 
       - name: Retain GQT invocation reports
         if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy' && matrix.mode != 'served'

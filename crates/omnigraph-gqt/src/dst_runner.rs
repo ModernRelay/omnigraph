@@ -1336,6 +1336,21 @@ fn report_measurements(
     }
 }
 
+/// The worker input as the report keeps it: the bearer token travels to the
+/// worker and no further, so a shared report never carries a credential.
+fn persisted(mut input: Input) -> Input {
+    if let Some(server) = &mut input.server {
+        server.token = None;
+    }
+    input
+}
+
+/// An attempt whose state lives outside the report: an external `--store`
+/// or a `--server` graph, neither frozen by the report, so neither replays.
+fn external_attempt(attempt: &Attempt) -> bool {
+    attempt.input.store.is_some() || attempt.input.server.is_some()
+}
+
 fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), String> {
     let root = artifacts_root(artifacts);
     std::fs::create_dir_all(&root).map_err(|e| {
@@ -1356,12 +1371,8 @@ fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), Strin
         .keep()
         .map_err(|e| format!("report_failed: retain summary: {e}"))?;
     println!("GQT report: {}", path.display());
-    if summary
-        .attempts
-        .iter()
-        .any(|attempt| attempt.input.store.is_some())
-    {
-        println!("GQT replay unavailable: external store contents are not frozen");
+    if summary.attempts.iter().any(external_attempt) {
+        println!("GQT replay unavailable: external store or server contents are not frozen");
     } else {
         println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
     }
@@ -1553,6 +1564,12 @@ fn run_invocation(
     }
     if served {
         admit_served(&case)?;
+        if selected_envs.len() > 1 {
+            return Err(format!(
+                "invalid_case: --server selects {} omnigraph-server environments against one graph, whose state no run resets; pass --storage to select one",
+                selected_envs.len()
+            ));
+        }
     } else {
         case.admit_store(selection.store)?;
     }
@@ -1724,7 +1741,7 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     replay,
-                    input,
+                    input: persisted(input),
                     outcome,
                     trace,
                 });
@@ -2224,12 +2241,8 @@ fn replay_attempts(
 ) -> Result<(), String> {
     refuse_ambient()?;
     crate::engine_from_env()?;
-    if summary
-        .attempts
-        .iter()
-        .any(|attempt| attempt.input.store.is_some())
-    {
-        return Err("invalid_case: external-store invocations cannot replay; the report does not freeze store contents".into());
+    if summary.attempts.iter().any(external_attempt) {
+        return Err("invalid_case: external-store invocations cannot replay, nor served ones; the report does not freeze store or server contents".into());
     }
     for attempt in &summary.attempts {
         attempt

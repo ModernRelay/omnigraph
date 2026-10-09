@@ -793,6 +793,32 @@ fn server_target_admission_refuses_before_workers() {
         report(&output).1["attempts"].as_array().unwrap().is_empty(),
         "an omnigraph-server-dst declaration is refused before any worker"
     );
+    let two_servers = dir.path().join("two_server_environments.gqt");
+    std::fs::write(
+        &two_servers,
+        std::fs::read_to_string(&served).unwrap().replace(
+            "  - target: omnigraph-server\n    storage: local-filesystem\n",
+            "  - target: omnigraph-server\n    storage: local-filesystem\n  - target: omnigraph-server\n    storage: s3-compatible\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&two_servers)
+        .args(["--server", "http://127.0.0.1:1", "--graph", "default"])
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "two server environments would share one graph: --server selects exactly one"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("selects 2 omnigraph-server environments"),
+        "{stderr}"
+    );
+    assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
 }
 
 #[test]

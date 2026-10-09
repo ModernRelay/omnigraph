@@ -71,7 +71,7 @@ remote schema apply), and the seed loads through `/load`, so the graph should
 be fresh. Without `--server`, an `omnigraph-server` environment is planned
 but not selected (the report says `partial`); the corpus therefore runs
 in-process as before, and the served conformance test in
-`crates/omnigraph-server/tests/gqt_served_conformance.rs` runs every case
+`crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs` runs every case
 that declares the target against an in-process server and requires a green
 in-process verdict and the same served verdict; `gqt_served_count.rs` totals
 the served and skipped cases and refuses an empty served set. A declared
@@ -84,7 +84,12 @@ control or `show` step, `--- expect plan`, `--- expect same as v1`, the
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
 which no wire answer carries. `--server` is exclusive with `--store`, and a
-served run never blesses.
+served run never blesses. `--server` selects exactly one `omnigraph-server`
+environment (`--storage` picks when several are declared), since every pass
+would share the one graph. Parameters travel as the case spells them and the
+server judges them, so a parameter error is the server's text. A served report
+carries no bearer token and does not replay: the server's state is not frozen
+in it, as an external `--store`'s is not.
 
 External workers inherit only the selected backend's storage configuration:
 `AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,
