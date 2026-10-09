@@ -63,6 +63,15 @@ null, and `not null` is null. A filter or mutation `where` keeps only rows
 whose expression is true, so `not ($p.age > 30)` skips rows whose `age` is
 null.
 
+Numeric comparisons choose their types before execution. A literal may use a
+property's type when its value is exactly representable in that type; otherwise
+both operands use a common numeric type. Parameters use their declared type,
+regardless of the supplied value. An `F32` property storing `0.1` therefore
+differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
+also apply to list membership and mutation predicates, whether a filter runs
+in a scan or in memory. Mixed signed and `U64` values compare without losing
+integer precision.
+
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|
 | `true` | null | null | `true` |
@@ -93,17 +102,29 @@ matches take constants evaluated once per invocation, such as
 ### Correlated blocks
 
 `not { ... }`, `exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) each hold a pattern
-that is matched once per outer row. The block must read at least one variable
-bound outside it; that variable correlates the block with the row. The row is
-kept when the aggregate over the block's matches satisfies the comparison:
-`not` is `count = 0`, `exists` is `count > 0`. The comparison's right side is a
-literal, `now()` or a parameter of the aggregate's type. The aggregate's
-argument is a scalar expression over the block's scope, usually a property of
-a variable bound inside it: numeric for `sum` and `avg`;
-numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and `max`, as in a
-`return`. A row with no match has no `sum`, `min`, `max` or `avg`, so it
-satisfies no comparison on them; its `count` is `0`.
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once per
+outer row. Each block must read a variable bound outside it. The row is kept
+when the aggregate comparison is true: `not` means `count = 0`, and `exists`
+means `count > 0`. The right side is a literal, `now()` or typed parameter;
+numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
+for the aggregate's result type. Its argument is a scalar expression in the
+block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
+or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,
+`min`, `max` and `avg` satisfy no comparison; `count` is `0`.
+
+Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
+range, and rounds the total once to `F64` before comparison. For example,
+`9007199254740993` and `-9007199254740992` sum to `1`, while a single value
+`9007199254740993` rounds to `9007199254740992` and does not satisfy
+`sum(...) { ... } > 9007199254740992`.
+
+As in `return`, `avg` converts each non-null input to `F64` before summing
+and dividing by the count. For those same two values, the average is `0`,
+because the first value rounds before accumulation. `min` and `max` retain
+the column's declared type, including the full `U64` range; comparing a `U64`
+extremum with an `I64` parameter preserves both integer ranges. Row count and
+column `count` use `I64` and refuse a count beyond its range; column `count`
+skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
@@ -177,6 +198,8 @@ limit 20
 
 Return expressions include variables, properties, literals, `now()`, earlier
 projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
+In the return clause, integer `sum` accumulates exactly in 128 bits and rounds
+the total once to `F64`; `avg` uses a floating-point accumulator.
 `min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
 column and return the column's own type; `Bool` orders `false` before `true`,
 dates and datetimes chronologically. When no row matches, a query whose

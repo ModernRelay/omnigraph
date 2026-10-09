@@ -439,11 +439,19 @@ pub(super) async fn prepare_selected_edges(
         .map_err(|error| memory.error(error))?;
     let mut prepared = Vec::with_capacity(step.members().len());
     for member in step.members() {
+        let table = format!("edge:{}", member.edge_type);
+        let dataset = env.snapshot.open_lance_dataset(&table).await?;
+        super::typed_value::check_stored_schema(
+            &dataset,
+            &env.catalog.edge_types[&member.edge_type].arrow_schema,
+            &table,
+            [
+                env.catalog.system_columns.src,
+                env.catalog.system_columns.dst,
+            ],
+        )?;
         prepared.push(PreparedEdge {
-            dataset: env
-                .snapshot
-                .open_lance_dataset(&format!("edge:{}", member.edge_type))
-                .await?,
+            dataset,
             probes: endpoint_probes(member.direction, env.catalog.system_columns),
         });
     }
@@ -602,6 +610,12 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
+    super::typed_value::check_stored_schema(
+        &edge_ds,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        [catalog.system_columns.src, catalog.system_columns.dst],
+    )?;
     let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
     for orientation in endpoint_probes(direction, catalog.system_columns)
         .iter()
@@ -794,6 +808,14 @@ where
                 .await?
         }
     };
+    super::typed_value::check_stored_schema(
+        &dataset,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &format!("edge:{edge_type}"),
+        [catalog.system_columns.src, catalog.system_columns.dst]
+            .into_iter()
+            .chain(attach_columns.iter().copied()),
+    )?;
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
@@ -1035,7 +1057,7 @@ pub(super) fn resolve_csr<'g>(
 
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
-/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
+/// Only legacy Named can switch to CSR.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
@@ -1083,7 +1105,7 @@ where
         ExpandExecution::Budgeted(_) => None,
     };
     let budgeted = step.budgeted();
-    let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
+    let max = step.max_hops;
 
     let mut active = match start_indexed {
         Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1467,8 +1489,9 @@ pub(super) fn bulk_anti_join_mask(
 /// state across the swap instead of restarting.
 ///
 /// Id spaces differ per source: Indexed owns a per-traversal interner (both
-/// endpoint types in ONE dense space — see the cross-type single-hop guard in
-/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// endpoint types in ONE dense space, which is sound because
+/// `validate_expand_structure` refuses a cross-type expand a second hop), Csr
+/// borrows the graph index's per-type dictionaries.
 /// A swap therefore translates all live state through the id strings once.
 pub(super) enum ActiveExpandSource<'g> {
     Indexed(Box<IndexedExpandSource>),

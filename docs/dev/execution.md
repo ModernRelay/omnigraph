@@ -159,15 +159,18 @@ query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
 Engine v1, the executor v2 replaced, is the crate
-`omnigraph-reference-engine` (`publish = false`). Its source is frozen and
-pinned by the crate's `tests/frozen.rs`; it depends on `omnigraph-compiler`,
-`omnigraph-core`, `omnigraph-catalog` and third-party crates only, so it is
+`omnigraph-reference-engine` (`publish = false`). Its source and the compiler's
+`ir::untyped` read IR are frozen and pinned by the crate's `tests/frozen.rs`;
+it depends on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and
+third-party crates only, so it is
 independent of the production engine and planner in either direction; the
 compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
 installs `ReferenceEngine` on a session copy through
 `Session::with_read_executor` (the `ReadExecutor` trait in
 `omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
-a step's `--- expect same as v1` comparison. It answers `not { ... }` blocks
+a step's `--- expect same as v1` comparison. Only this reference door converts
+the compiled query with `QueryIR::erase` into `ir::untyped`; erasure is one-way,
+and engine v2 keeps the compiler's normal IR. It answers `not { ... }` blocks
 only among the correlated blocks, and refuses count predicates and a string
 `nearest` argument. A defect is fixed on v2, never in the reference.
 
@@ -286,7 +289,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `HydrateColumns` | `HydrateExec` (`operators/hydrate.rs`): per input batch, in chunks planned from the costliest output row seen (its share of the fetched rows and its copy; four rows first), the distinct `^binding` addresses of each binding, sorted, taken from its pinned table with Lance's `TakeBuilder::try_new_from_addresses` and the deferred columns' projection (an address the table does not hold is an integrity error), then copied to every output row that names them through `WorkMemory::take_once`, which admits each copy (one per output row, so a row a join repeats is copied per repetition; a null address costs a null row) as `hydrate output` before Arrow builds it. The chunk bound is `hydrate_chunk_bytes(pool)` (an eighth of the query pool, the node's declared `retained_limit`) over the fetched rows and their copies: fetched rows over it are retaken at half the rows, and a chunk whose copies would exceed it keeps a prefix halved until they fit, the rest starting the next chunk. A chunk is charged as `hydrate chunk`, keeps only its output once built, and is sent as it is built; `hydrated_rows` counts the rows and the `peak_chunk_bytes` gauge records the most one chunk held | omnigraph |
 | `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the metadata columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares identity columns in binding-name order, with selected bound-edge type before its ID. Each metadata key already explicitly ordered is omitted independently; group rows and a `return` whose every expression is an order key need no hidden ties; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans no `Sort`, and an aggregate under a search order plans none | omnigraph |
 | `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |
-| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (an integer `sum`/`avg` argument cast to `Float64`, the result type); `count($v)` counts the identity column; DataFusion emits the group keys before the aggregates, and `run_plan` puts the collected result back in return order (`lower::in_order`) | DataFusion |
+| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (the compiler stores `AggSignature`, the planner selects `AggregateSpec`, and lowering executes it; integer `sum` uses a `Decimal128(38,0)` accumulator and converts the total once to `Float64`; `avg` and floating-point `sum` use `Float64`); `count($v)` counts the identity column; DataFusion emits the group keys before the aggregates, and `run_plan` puts the collected result back in return order (`lower::in_order`) | DataFusion |
 
 A traversal's destination is reached one of two ways, chosen when the
 planner lowers a `TableScan` with an input (pass `access_path`). `id_lookup`
@@ -513,6 +516,34 @@ variable reaches execution. `execute_query` is gather, plan, bind, execute,
 with the IR and the `SessionSettings` used by the first two only. Every
 run-time choice the run makes is data the planner wrote:
 
+- Compiler return items store their executed column name and declared type.
+  Aggregate, Projection and MetadataCount own exact output schemas; Sort,
+  Limit and HydrateColumns preserve those schemas. Under HydrateColumns the
+  projection's operator carries every declared column but the deferred ones,
+  plus a hidden row address per hydrated binding, and HydrateExec emits the
+  deferred columns with their declared fields, so the root again matches the
+  projection's declared schema. Projection and Aggregate capture named node
+  object declarations from catalog members, including logical `@id`, member
+  types and nullability. Fresh and replayed plans validate their result schemas
+  using these stored declarations. Pipeline-node schemas remain conservative.
+  GQT compares declared results with inference and execution. Production
+  projection, aggregate and final-root checks compare declared Arrow types,
+  result order and observed non-null guarantees.
+
+- Every expression stores its declared type; explicit `Cast` nodes carry the
+  compiler's numeric comparison conversions. Execution and scan pushdown apply
+  those conversions, including declared F32 rounding and the Decimal128 carrier
+  for mixed signed/U64 comparisons. Parameter values cannot select another
+  comparison domain. Fresh and replayed plans validate local expression rules
+  before empty paths can skip evaluation. The separate final block comparator
+  remains the next stage's boundary; its ordinary child expressions are typed.
+
+- Each `Aggregate` stores an aligned `AggregateSpec` for every aggregate return
+  expression, with no spec on group keys. Its `AggSignature` records input and
+  result types including nullability. Fresh and replayed plans validate these
+  contracts before execution; lowering checks property input and result types.
+  Decimal integer-sum state stays exact through grouping and spilling.
+
 - `plan.assumptions()` (`Assumptions` in `omnigraph-planner/src/physical.rs`)
   records what the planner read: the parameter names it asked
   `filter_pushable` about, every setting it read by name and spelling
@@ -678,8 +709,15 @@ path. The compatibility guard is owned by `lance_surface_guards.rs` and
 ## Mutations
 
 A named mutation is parsed, checked, and lowered against one captured
-`WriteTxn`. Statement execution accumulates logical changes in
-`MutationStaging`:
+`WriteTxn`. Each lowered statement retains the compiler-selected node or edge
+`MutationTarget`; execution reads that namespace directly. Binding completes
+and validates every stored parameter declaration before any statement runs,
+including unused declarations and mutations matching no rows. Missing required
+parameters are refused; omitted nullable parameters bind to null. Expected-head
+checks run before parameter validation, and the request clock is sampled once
+across retries.
+
+Statement execution accumulates logical changes in `MutationStaging`:
 
 - insert and update append pending row batches;
 - update reads the committed snapshot plus prior pending batches;

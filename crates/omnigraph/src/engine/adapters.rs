@@ -13,10 +13,11 @@ use datafusion::common::Result as DfResult;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ColumnarValue;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::types::ExprType;
 
 use super::expr::{ProjectionContext, evaluate_projection, identity_column};
 use super::operators::external;
-use crate::error::{OmniError, Result};
+use crate::error::Result;
 
 static NEXT_LOWERING: AtomicU64 = AtomicU64::new(0);
 
@@ -34,35 +35,15 @@ impl LoweringId {
 /// binding's identity column for `count($v)`.
 #[derive(Debug, Clone)]
 pub(super) enum Projected {
-    Expression(IRExpr),
+    Expression(IRExpr, ExprType),
     Identity(String),
 }
 
 impl Projected {
-    /// The column name `evaluate_projection` gives the value.
-    pub(super) fn name(&self) -> Result<String> {
-        match self {
-            Self::Identity(variable) => Ok(variable.clone()),
-            Self::Expression(expr) => match expr {
-                IRExpr::PropAccess { variable, property } => Ok(format!("{variable}.{property}")),
-                IRExpr::Literal(_) => Ok("literal".to_string()),
-                IRExpr::Param(name) => Ok(name.clone()),
-                IRExpr::Variable(name) => Ok(name.clone()),
-                IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
-                    Ok(expr.to_string())
-                }
-                _ => Err(OmniError::manifest(format!(
-                    "unsupported projection expression: {:?}",
-                    expr
-                ))),
-            },
-        }
-    }
-
     fn text(&self) -> String {
         match self {
             Self::Identity(variable) => format!("count(${variable})"),
-            Self::Expression(expr) => expr.to_string(),
+            Self::Expression(expr, _) => expr.to_string(),
         }
     }
 }
@@ -96,7 +77,7 @@ impl GqProjectionExpr {
     fn project(&self, batch: &RecordBatch) -> Result<(String, arrow_array::ArrayRef)> {
         match &self.projected {
             Projected::Identity(variable) => identity_column(batch, variable, &self.ctx),
-            Projected::Expression(expr) => {
+            Projected::Expression(expr, _) => {
                 evaluate_projection(batch, expr, &self.params, &self.ctx)
             }
         }
@@ -131,28 +112,52 @@ impl Hash for GqProjectionExpr {
 }
 
 impl PhysicalExpr for GqProjectionExpr {
-    /// The type comes from projecting an empty batch of the input schema,
-    /// the same code path as the evaluation, so the two cannot disagree.
+    /// The compiler's stored projection type, independent of bound values and
+    /// of whether the input happens to contain any rows.
     fn return_field(&self, input_schema: &Schema) -> DfResult<FieldRef> {
-        let empty = RecordBatch::new_empty(Arc::new(input_schema.clone()));
-        let (name, array) = self.project(&empty).map_err(external)?;
-        let nullable = match &self.projected {
-            Projected::Expression(IRExpr::PropAccess { .. }) | Projected::Identity(_) => {
-                input_schema
-                    .column_with_name(&name)
-                    .is_none_or(|(_, field)| field.is_nullable())
+        let field = match &self.projected {
+            Projected::Identity(variable) => {
+                Field::new(variable, arrow_schema::DataType::Utf8, false)
             }
-            _ => true,
+            Projected::Expression(_, ty) => {
+                self.ctx.declared_field(&self.text, ty).map_err(external)?
+            }
         };
-        Ok(Arc::new(Field::new(
-            name,
-            array.data_type().clone(),
-            nullable,
-        )))
+        if let Projected::Expression(
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            },
+            _,
+        ) = &self.projected
+        {
+            let name = format!("{variable}.{property}");
+            let actual = input_schema
+                .field_with_name(&name)
+                .map_err(|error| external(crate::error::OmniError::arrow_internal(error)))?;
+            if actual.data_type() != field.data_type() {
+                return Err(external(crate::error::OmniError::manifest_internal(
+                    format!("property {name} disagrees with its input field"),
+                )));
+            }
+        }
+        Ok(Arc::new(field))
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> DfResult<ColumnarValue> {
         let (_, array) = self.project(batch).map_err(external)?;
+        let expected = self.return_field(batch.schema().as_ref())?;
+        if array.data_type() != expected.data_type()
+            || !expected.is_nullable() && array.null_count() != 0
+        {
+            return Err(external(crate::error::OmniError::manifest_internal(
+                format!(
+                    "projection {} violates declared field {expected:?}",
+                    self.text
+                ),
+            )));
+        }
         Ok(ColumnarValue::Array(array))
     }
 

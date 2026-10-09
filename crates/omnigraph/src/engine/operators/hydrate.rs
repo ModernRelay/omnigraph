@@ -68,14 +68,16 @@ enum Slot {
 
 impl HydrateExec {
     /// The output is the return order: a deferred column sits at its return
-    /// position under its return name with its catalog field, as the
-    /// projection would have carried it; the input's other columns fill the
-    /// remaining positions in their order, and the row addresses leave.
+    /// position under its return name with the field `declared` gives it,
+    /// as the projection would have carried it; the input's other columns
+    /// fill the remaining positions in their order, and the row addresses
+    /// leave.
     pub(crate) fn try_new(
         input: Arc<dyn ExecutionPlan>,
         bindings: Vec<HydratedBinding>,
         snapshot: Snapshot,
         catalog: &Catalog,
+        declared: &Schema,
     ) -> Result<Self> {
         let input_schema = input.schema();
         let mut deferred: HashMap<usize, (Slot, Field)> = HashMap::new();
@@ -98,24 +100,27 @@ impl HydrateExec {
                     ))
                 })?;
             for (column_index, column) in binding.columns.iter().enumerate() {
-                let field = node_type
+                if node_type
                     .arrow_schema
                     .field_with_name(&column.property)
-                    .map_err(|_| {
-                        OmniError::manifest_internal(format!(
-                            "`{}` has no property `{}` to hydrate",
-                            binding.table.type_key, column.property
-                        ))
-                    })?;
+                    .is_err()
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "`{}` has no property `{}` to hydrate",
+                        binding.table.type_key, column.property
+                    )));
+                }
+                let field = declared.field_with_name(&column.output).map_err(|_| {
+                    OmniError::manifest_internal(format!(
+                        "`HydrateColumns` declares no return column `{}`",
+                        column.output
+                    ))
+                })?;
                 let slot = Slot::Hydrated {
                     binding: index,
                     column: column_index,
                 };
-                let field = Field::new(
-                    &column.output,
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                );
+                let field = field.clone();
                 if deferred.insert(column.position, (slot, field)).is_some() {
                     return Err(OmniError::manifest_internal(format!(
                         "two hydrated columns fill return position {}",

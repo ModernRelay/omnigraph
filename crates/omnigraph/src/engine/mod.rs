@@ -7,14 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
-    builder::{
-        BooleanBuilder, Date32Builder, Date64Builder, Float64Builder, Int32Builder, Int64Builder,
-        ListBuilder, StringBuilder,
-    },
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    UInt32Array,
 };
-use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
@@ -43,6 +38,7 @@ mod adapters;
 mod bind;
 mod constant;
 mod context;
+mod exact_aggregate;
 mod explain;
 mod expr;
 mod graph;
@@ -60,10 +56,13 @@ mod report;
 mod run;
 mod scan;
 mod search;
+mod typed_value;
 
 use expr::*;
 use scan::*;
 use search::*;
+use typed_value::{check_array_type, typed_literal_to_array};
+pub(crate) use typed_value::{fill_declared_params, validate_params};
 
 use bind::bind;
 pub(crate) use constant::evaluate_constant;
@@ -76,7 +75,7 @@ pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
 pub(crate) use scan::{id_in_list_expr, ir_expr_to_df_expr};
-pub(crate) use search::{check_param_date_literals, referenced_edge_types};
+pub(crate) use search::referenced_edge_types;
 
 /// What `execute` takes beside the bound plan, each member data and not a
 /// decision: the read-consistency unit, the type metadata the lowered
@@ -362,7 +361,7 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
                         edges,
                         omnigraph_compiler::traversal::EdgeSelection::Alternation(_)
                     ),
-                    edges.named().is_none() && src_type != dst_type,
+                    src_type != dst_type,
                     *min_hops,
                     *max_hops,
                     edge_binding.is_some(),
@@ -408,6 +407,10 @@ fn validate_traversal_admission(plan: &PhysicalPlan) -> Result<Option<std::num::
 /// Run `bound` under `context` and report what each of its nodes did, every
 /// pass of the overfetch ladder folded into one report.
 pub(crate) async fn execute(bound: BoundPlan, context: &EngineContext<'_>) -> Result<PlanRun> {
+    omnigraph_planner::validate_aggregate_specs(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+    omnigraph_planner::validate_output_schemas(&bound.plan)
+        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
     omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
         .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
@@ -737,8 +740,23 @@ mod traversal_admission_tests {
             keys_only: false,
             ranked: Some(RankedAccess {
                 kind: RankKind::Nearest,
+                score: IRExpr::PropAccess {
+                    variable: "p".into(),
+                    property: "_distance".into(),
+                    ty: omnigraph_compiler::types::ExprType::from_prop(
+                        &omnigraph_compiler::types::PropType::scalar(ScalarType::F32, false),
+                    ),
+                },
                 property: "embedding".into(),
-                query: IRExpr::Literal(Literal::String("query".into())),
+                query: IRExpr::Literal(
+                    Literal::String("query".into()),
+                    omnigraph_compiler::types::ExprType::from_prop(
+                        &omnigraph_compiler::types::PropType::scalar(
+                            omnigraph_compiler::types::ScalarType::String,
+                            false,
+                        ),
+                    ),
+                ),
                 fetch: Some(1),
                 nprobes: None,
                 scope: RankScope::Order,

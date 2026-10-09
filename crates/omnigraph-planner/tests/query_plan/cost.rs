@@ -131,7 +131,6 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
         edge_count,
         src_node_count,
         dst_node_count,
-        same_type: src_node_count == dst_node_count,
         max_frontier_cap: 1 << 20,
         max_hops_cap: 6,
     };
@@ -197,7 +196,6 @@ fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },
@@ -281,7 +279,6 @@ fn access_path_sizes_only_projected_columns() {
                 edge_count: 100_000,
                 src_node_count: 20_000,
                 dst_node_count: 20_000,
-                same_type: true,
                 max_frontier_cap: 1 << 20,
                 max_hops_cap: 6,
             },
@@ -368,7 +365,10 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
                     filters: vec![IRExpr::comparison(
                         prop("a", property),
                         CompOp::Eq,
-                        IRExpr::Literal(Literal::String("x".into())),
+                        IRExpr::Literal(
+                            Literal::String("x".into()),
+                            value_type(ScalarType::String, false),
+                        ),
                     )],
                 },
                 expand("a", "b", vec![]),
@@ -772,6 +772,17 @@ fn a_top_k_fetches_its_return_only_column_by_row_address() {
     );
 }
 
+/// A return item typed as its expression, named `column` (the alias when it
+/// has one).
+fn returned(expr: IRExpr, alias: Option<&str>, column: &str) -> IRProjection {
+    IRProjection {
+        ty: expr.ty().clone(),
+        expr,
+        alias: alias.map(str::to_string),
+        column: column.to_string(),
+    }
+}
+
 /// Under a limit, a scan whose row estimate is above four times the limit
 /// hydrates its return-only column, a bare table scan as much as a traversal
 /// destination: Lance reads ahead of a consumer that stops early. A scan a key
@@ -793,7 +804,10 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
             filters: vec![IRExpr::comparison(
                 prop("c", "slug"),
                 CompOp::Eq,
-                IRExpr::Literal(Literal::String("one".to_string())),
+                IRExpr::Literal(
+                    Literal::String("one".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
             )],
         }],
         vec![prop("c", "body")],
@@ -833,46 +847,42 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             filters: vec![IRExpr::comparison(
                 prop("c", "state"),
                 CompOp::Eq,
-                IRExpr::Literal(Literal::String("open".to_string())),
+                IRExpr::Literal(
+                    Literal::String("open".to_string()),
+                    value_type(ScalarType::String, false),
+                ),
             )],
         }],
         return_exprs: vec![
-            IRProjection {
-                expr: prop("c", "slug"),
-                alias: None,
-            },
-            IRProjection {
-                expr: prop("c", "rank"),
-                alias: None,
-            },
-            IRProjection {
-                expr: prop("c", "state"),
-                alias: None,
-            },
-            IRProjection {
-                expr: prop("c", "title"),
-                alias: Some("t".to_string()),
-            },
-            IRProjection {
-                expr: IRExpr::comparison(
+            returned(prop("c", "slug"), None, "c.slug"),
+            returned(prop("c", "rank"), None, "c.rank"),
+            returned(prop("c", "state"), None, "c.state"),
+            returned(prop("c", "title"), Some("t"), "t"),
+            returned(
+                IRExpr::comparison(
                     prop("c", "kind"),
                     CompOp::Eq,
-                    IRExpr::Literal(Literal::String("x".to_string())),
+                    IRExpr::Literal(
+                        Literal::String("x".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-                alias: Some("is_x".to_string()),
-            },
-            IRProjection {
-                expr: IRExpr::comparison(
+                Some("is_x"),
+                "is_x",
+            ),
+            returned(
+                IRExpr::comparison(
                     prop("c", "edits"),
                     CompOp::Eq,
-                    IRExpr::Literal(Literal::String("0".to_string())),
+                    IRExpr::Literal(
+                        Literal::String("0".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-                alias: None,
-            },
-            IRProjection {
-                expr: prop("c", "body"),
-                alias: Some("text".to_string()),
-            },
+                None,
+                "edits_eq",
+            ),
+            returned(prop("c", "body"), Some("text"), "text"),
         ],
         order_by: vec![
             IROrdering {
@@ -880,7 +890,7 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
                 descending: false,
             },
             IROrdering {
-                expr: IRExpr::AliasRef("t".to_string()),
+                expr: IRExpr::AliasRef("t".to_string(), property_type("title")),
                 descending: true,
             },
         ],
