@@ -6,7 +6,10 @@
 # notes: whose scan step 3's key lookup on $a does not bound). Steps 4-6 do not: a
 # notes: sorted alias, 12 is not above 4 x 3, a key lookup reads one row. Step 2
 # notes: reaches $b through a hash join, step 3 by id lookup: both destination paths
-# notes: carry the row address. Every rows step is compared with engine v1.
+# notes: carry the row address. Steps 7-9 insert d12 on a branch and read the
+# notes: top two there: d12 from the fragment the branch wrote, d11 from the one
+# notes: it shares with main, both in the table's own base. Every rows step on
+# notes: main is compared with engine v1.
 
 --- runner
 timeout_ms: 10000
@@ -178,3 +181,36 @@ d.body: String?
 not pass late_materialization
 
 --- expect same as v1
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query add_doc() {
+    insert Doc { slug: "d12", rank: 12, title: "t-12", body: "body 12", embedding: [12.0, 0.0] }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: feature
+query top_two_on_feature() {
+    match { $d: Doc }
+    return { $d.slug, $d.body, $d.title }
+    order { $d.rank desc }
+    limit 2
+}
+
+--- expect ordered
+{"d.body":"body 12","d.slug":"d12","d.title":"t-12"}
+{"d.body":"body 11","d.slug":"d11","d.title":"t-11"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+d.title: String
+
+--- expect plan
+pass late_materialization
+hydrate $d: columns [body, title]

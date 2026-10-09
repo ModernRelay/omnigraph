@@ -906,6 +906,78 @@ async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRef
     }
 }
 
+/// A fragment reader reads a data file in the dataset's own base through the
+/// scan scheduler `FragReadConfig` passes, and a file the dataset reaches
+/// through a `base_id` (the files a branch inherits) through a
+/// maximum-bandwidth scheduler Lance 11 opens for it, ignoring the one
+/// passed: the passed scheduler reads that file's rows without a byte.
+/// `HydrateExec` bounds Lance's read-ahead with the scheduler it passes, and
+/// for this reason reads a fragment holding an inherited file (a table fork
+/// created before v11) one row per request (`fragment_rows` in
+/// `engine/operators/hydrate.rs`). When this goes
+/// red, Lance honors the passed scheduler for every base: drop that fallback
+/// and this guard together.
+#[tokio::test]
+async fn fragment_reads_bypass_the_passed_scheduler_for_inherited_files() {
+    use lance::dataset::fragment::FragReadConfig;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("inherited.lance");
+    let mut main = fresh_dataset(uri.to_str().unwrap()).await;
+    let mut branch = main
+        .create_branch("inherits", main.version().version, None)
+        .await
+        .unwrap();
+    append_guard_row(&mut branch, "carol", 3).await;
+    let store = branch.object_store(None).await.unwrap();
+    let schema = branch.schema().project(&["value"]).unwrap();
+    let mut seen = (false, false);
+    for fragment in branch.get_fragments() {
+        let inherited = fragment
+            .metadata()
+            .files
+            .iter()
+            .any(|file| file.base_id.is_some());
+        let scheduler = ScanScheduler::new(Arc::clone(&store), SchedulerConfig::new(1 << 20));
+        let reader = fragment
+            .open(
+                &schema,
+                FragReadConfig::default()
+                    .with_row_address(true)
+                    .with_scan_scheduler(Arc::clone(&scheduler)),
+            )
+            .await
+            .unwrap();
+        let mut rows = 0;
+        let mut tasks = reader.take(&[0], 1, None).await.unwrap();
+        while let Some(task) = futures::StreamExt::next(&mut tasks).await {
+            rows += task.await.unwrap().num_rows();
+        }
+        assert_eq!(rows, 1);
+        let read = scheduler.stats().bytes_read;
+        if inherited {
+            seen.0 = true;
+            assert_eq!(
+                read, 0,
+                "Lance read an inherited file through the passed scheduler: \
+                 drop hydration's one-row fallback for inherited files"
+            );
+        } else {
+            seen.1 = true;
+            assert!(
+                read > 0,
+                "an own-base file must read through the passed scheduler"
+            );
+        }
+    }
+    assert_eq!(
+        seen,
+        (true, true),
+        "the branch must hold an inherited and an own fragment"
+    );
+}
+
 async fn recreate_named_branch_and_assert_token_changes(main: &mut Dataset, require_etag: bool) {
     let base_version = main.version().version;
     let first = main
