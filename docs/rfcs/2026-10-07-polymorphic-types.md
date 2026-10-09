@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-07
-updated: 2026-10-07
+updated: 2026-10-08
 discussion: null
 supersedes: []
 superseded_by: []
@@ -29,9 +29,10 @@ a query-only column.
 
 Only polymorphic edges get a new physical column, and only on their polymorphic
 sides. `__src_type` and `__dst_type` hold the concrete endpoint's
-`StableTypeId`. Generalizing an existing concrete endpoint is metadata-only:
-the column is added by a staged Lance `Operation::Merge` that rewrites no data
-file, and a null tag means the endpoint's original concrete type.
+`StableTypeId`. Every stored row of a polymorphic side carries a tag.
+Generalizing an existing concrete endpoint fills the new column with the
+endpoint's original type through a staged Lance `Operation::Merge` that adds one
+constant column file per fragment and rewrites no existing data file.
 
 The boundary that does not change: node tables, the one-table-per-type manifest
 invariant, keyed-node identity, the graph-write protocol, merge, and every
@@ -276,7 +277,7 @@ matches by name and open compares the IR with the shape compiled from source.
 | Addition | Shape | Feature |
 |---|---|---|
 | Interface inheritance and annotations | `InterfaceIR.implements: Vec<TypeRefIR>`, `annotations`, `constraints` | `interface-inheritance` |
-| Abstract endpoints | An edge endpoint names a node or interface `TypeRefIR`, or a non-empty id-sorted union of them, plus `implicit_type: Option<TypeRefIR>` for an endpoint generalized from a concrete type | `polymorphic-endpoints` |
+| Abstract endpoints | An edge endpoint names a node or interface `TypeRefIR`, or a non-empty id-sorted union of them, plus `generalized_from: Option<TypeRefIR>` for an endpoint generalized from a concrete type (read only for table images that predate the tag column) | `polymorphic-endpoints` |
 | Interface rename | rename hint on `InterfaceIR`, preserving `type_id` | none (an old binary misreads nothing) |
 
 Each addition uses `serde(default, skip_serializing_if)`, so a graph that uses
@@ -293,17 +294,20 @@ admit interfaces and unions, and it never derives an identity from a name.
 - Node tables do not change. One Lance dataset per concrete node or edge type
   remains, at its identity-derived path.
 - A polymorphic side of an edge gets one system column: `__src_type` or
-  `__dst_type`, a nullable `UInt64` holding the concrete endpoint's
-  `StableTypeId`. It carries no stable property id. `physical_table_schema`
-  admits it through new `SystemFieldRole` values `SrcType` and `DstType`.
-- On an edge created polymorphic, every row has a tag, and validation refuses a
-  missing one. On an endpoint generalized from concrete type `C`, the IR records
-  `implicit_type = C` and a null tag means `C`. Within the version that adds
-  the column, older fragments read it as null through Lance's missing-field null
-  synthesis. Table versions from before the change lack the field in their
-  schema. Historical reads apply the current contract to those images, so the
-  reader must not project an absent tag column; it must synthesize the implicit
-  type instead. This is a required test.
+  `__dst_type`, a `UInt64` holding the concrete endpoint's `StableTypeId`. It
+  carries no stable property id. `physical_table_schema` admits it through new
+  `SystemFieldRole` values `SrcType` and `DstType`.
+- Tag columns come after every user property. Edge batch builders treat schema
+  positions 0 to 2 as id, src and dst and fill every later field from row
+  JSON, so each builder and projection must treat a tag as a system field, and
+  a load must refuse a user-supplied tag key. (Prototype finding P1.)
+- Every stored row of a polymorphic side has a tag, and validation refuses a
+  missing one. Generalization fills existing rows with the original type (see
+  the next section), so no live read or write path interprets a null tag.
+- Table versions from before a generalization lack the tag column. Historical
+  reads apply the current contract to those images, so the reader must not
+  project the absent column; it synthesizes the tag from the side's
+  `generalized_from`. This is a required test.
 - `ensure_indices` declares a scalar index on each tag column. Lance 11 builds
   BTREE and Bitmap indexes on `UInt64` and uses them for `=` and `IN`.
 - Storage cost is small. Measured in Lance v2.2 on one million rows, a tag that
@@ -315,15 +319,25 @@ admit interfaces and unions, and it never derives an identity from a name.
 
 Lance's `Dataset::add_columns` commits inline, which would move a graph table's
 linear HEAD outside the write protocol. `tests/forbidden_apis.rs` forbids it.
-The table store therefore gains one staged primitive. It builds the transaction
-Lance's `AllNulls` path would commit:
+The table store therefore gains one staged primitive. Per fragment, it writes a
+data file holding only the new column, filled with the constant original type,
+through Lance's per-fragment add-columns path (the distributed schema-evolution
+path, which writes files without committing). It then builds:
 
 ```text
-schema = dataset.schema.merge(new nullable fields)
+schema = dataset.schema.merge(new fields)
 schema.set_field_id(dataset.manifest.max_field_id)
-Operation::Merge { fragments: unchanged manifest fragments, schema,
-                   preserves_nullability: true }
+Operation::Merge { fragments: each manifest fragment plus its new column file,
+                   schema }
 ```
+
+A constant column takes Lance v2.2's constant layout, so each new file costs
+about nothing per row. The investigation's probe staged the `AllNulls` variant
+of this transaction (no new files) detached against Lance 11; the constant
+variant needs the same probe before implementation. If it fails, the fallback
+is the existing full rewrite that add-property uses today, which the prototype
+ran end to end (finding P7): correct, but it rewrites the table, assigns fresh
+row ids and drops index coverage.
 
 It is staged and committed detached like every other effect
 ([RFC 0067](0067-detached-table-commits.md),
@@ -359,7 +373,14 @@ callable surface. `add_columns` stays forbidden.
   dispatch, and `is_scalar_string`.
 - Identity is `(type, id)` wherever a binding's set has more than one member:
   sort tie-break, deduplication, cycle closing, `AntiJoin` keys and `RankFuse`
-  identity. A concrete binding keeps its plain id.
+  identity. A concrete binding keeps its plain id. The prototype confirmed cycle
+  closing breaks without it: lowering compares `temp.id = dst.id`, and
+  `not { $e identifies $x }` over an interface `$x` silently dropped the
+  Organization row that shares Person "alice"'s id (finding P2).
+- Narrowing has one source of truth. Today typecheck binds each binding into
+  two contexts and resolves traversals against the declared type while lowering
+  scans the checked type. Narrowing is one intersection at bind time, and
+  traversal resolution reads it (finding P3).
 - The frozen reference engine refuses the new IR, as it refuses selections.
 
 ### Planning and execution
@@ -386,14 +407,33 @@ callable surface. `add_columns` stays forbidden.
   rows once per probe window, not once per facet. `ExpandExec` emits
   `{dst}.~node_type` beside `{dst}.__id`. The interner, frontier and visited set
   are keyed by `(type, id)`, which makes mixed-type recursion correct where
-  colliding id strings would otherwise merge distinct nodes.
+  colliding id strings would otherwise merge distinct nodes. The prototype
+  qualifies interner keys as `type`, U+001F, `id`; Lance probes still filter raw
+  ids, and the tag columns are read alongside. One probe per edge table served
+  forward, reverse, two-hop and negation queries, with no per-pair facets.
+- **The engine refuses an untyped plan.** `ExpandStep` validation refuses any
+  expansion that touches a polymorphic edge or an abstract endpoint unless it
+  runs on the typed route. In the prototype, an untyped named expansion on the
+  indexed route returned four rows for a two-row answer and dropped a node from
+  a negation, with no error (finding P8). The typechecker's routing is an
+  optimisation; this check is the safety mechanism.
+- **A named polymorphic edge has its own policy.** It declares the budgeted
+  policy directly instead of posing as a one-member alternation, so a refusal
+  names the edge the user wrote: "edge Identifies has an interface endpoint and
+  cannot use traversal = csr" (finding P9).
 - **Hydration.** `id_lookup` groups each slice's ids by type and probes each
   member table. `hash_join` builds per member type, or on a `(type, id)` key.
 - **Search.** `nearest` runs per arm with `k` and merges by `_distance`. The
   merge preserves each arm's accuracy, because the global top k is a subset of
   the union of per-arm top-k results. The overfetch ladder runs per arm.
   OmniGraph's vector indexes use L2 on every table, so distances are comparable.
-- **Graph index.** Until phase 3, polymorphic expansions never use CSR. Phase 3
+- **Graph index.** Until phase 3, polymorphic expansions never use CSR, and the
+  graph index build excludes polymorphic edges. `GraphIndex::build` gives each
+  declared endpoint name one dense id space filled from bare ids, so a
+  polymorphic edge would produce an interface-named space in which Person
+  "acme" and Organization "acme" are one node. The bulk anti-join reads that
+  index without going through an expansion (finding P4). Five call sites build
+  the edge map today; they become one catalog function. Phase 3
   moves `GraphIndex` to one global ordinal space: each node type's dense
   dictionary sits at a fixed offset, a node's type is recovered from its range,
   and a polymorphic edge has one CSR, built by interning each endpoint in the
@@ -412,9 +452,8 @@ callable surface. `add_columns` stays forbidden.
   for a moved `src`.
 - **Cascade.** Deleting nodes of type `T` scans every edge table whose endpoint
   set contains `T`. On a tagged side the filter is
-  `tag = id(T) AND id IN (…)`, or `(tag IS NULL OR tag = id(T))` when the
-  implicit type is `T`. Without the tag predicate, deleting `Person "alice"`
-  would also delete edges to `Organization "alice"`.
+  `tag = id(T) AND id IN (…)`. Without the tag predicate, deleting
+  `Person "alice"` would also delete edges to `Organization "alice"`.
 
 ### Uniqueness, cardinality and keyed edges
 
@@ -424,8 +463,16 @@ callable surface. `add_columns` stays forbidden.
 - `@unique` tuples that include a polymorphic `@src` or `@dst` include its tag.
 - A keyed edge's canonical id tuple includes the tag of each polymorphic
   endpoint member. Otherwise `[src, dst]` would collide across types, and the
-  keyed upsert would silently overwrite a different edge. The spelling is an
-  unresolved question.
+  keyed upsert would silently overwrite a different edge. The prototype splices
+  each tag into the key after its endpoint; the spelling is an unresolved
+  question.
+- Generalizing a keyed or `@unique` edge is refused in v1. Existing rows keep
+  ids derived without a type, while later keyed writes derive them with one, so
+  a Merge load of an existing edge would miss its row and insert a duplicate
+  (finding P5).
+- Today's `@card` validator groups by the bare source id and reads deletions
+  from `node:{from_type}`. Both change for a polymorphic source; until they do,
+  `@card` on an interface source is refused (finding P6).
 - An interface body constraint `@unique(p, …)` is an opt-in validation across
   all members. It probes every member table, inside a write and on merge
   deltas, and the proven fast-forward skip accounts for it. Lance key fencing
@@ -441,7 +488,7 @@ callable surface. `add_columns` stays forbidden.
 | Rename interface (`@rename_from`) | supported | none |
 | Add `implements` when the node already declares every inherited property compatibly | supported | none; satisfaction links change |
 | Add `implements` with missing nullable properties | supported | today's add-property path for those properties |
-| Generalize an endpoint from `C` to an interface or union containing `C` | supported | staged `Operation::Merge` adds the tag column; `implicit_type = C` |
+| Generalize an endpoint from `C` to an interface or union containing `C` | supported for unkeyed edges | staged `Operation::Merge` adds the tag column filled with `C`; `generalized_from = C` |
 | Remove `implements`, remove an interface, narrow an endpoint | validated (the OG-MF-104 tier) | refused while any tagged row reaches a removed member, or a registered stored query depends on it |
 | Fold an edge family into one polymorphic edge | explicit copy | rows of the named source edge types are copied with tags into the new edge; the sources are tombstoned |
 
@@ -478,7 +525,8 @@ type is denied as filtered, never as a dangling id.
 ## Invariants
 
 - **1, respect the substrate.** Tag columns are ordinary Lance columns, added
-  by a Lance `Operation::Merge` and indexed by Lance scalar indexes. Scans and
+  by a Lance `Operation::Merge` with per-fragment column files and indexed by
+  Lance scalar indexes. Scans and
   searches use Lance plans per dataset. Nothing duplicates a Lance primitive.
 - **2, one publication door.** The tag-column change, member-table effects of
   interface-wide mutations and fold copies are staged as detached versions and
@@ -496,8 +544,9 @@ type is denied as filtered, never as a dangling id.
   tags and any later interface projection change cost, never membership or
   results.
 - **8, loud integrity failures.** Ambiguous direction, an unknown or non-member
-  endpoint type, an untyped polymorphic endpoint and cross-member cardinality
-  violations are typed refusals.
+  endpoint type, an untyped polymorphic endpoint, cross-member cardinality
+  violations and an untyped expansion over a polymorphic edge are typed
+  refusals.
 - **9, typed semantics.** Type sets, selections, facets, type tests and pruning
   live in AST, IR and plan structures. Type filters are structured predicates.
 - **11, bounded resources.** Union arms run within the query's memory and
@@ -538,7 +587,8 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 | Read properties missing on some members as null (Kùzu) | Wider, but makes absent and null indistinguishable in JSON and widens the static contract. The strict rule matches alternation; narrowing covers the rest. |
 | Concrete supertypes (`node Employee extends Person`) | Raises key-scope and reclassification questions. Knowledge graphs model this by composition. Deferred. |
 | Named unions as a declaration kind | Marker interfaces cover reuse. Inline unions cover closed endpoint sets. Deferred. |
-| Call Lance `add_columns`, or rewrite the table, to add a tag | `add_columns` commits inline and is forbidden. A rewrite drops index coverage and assigns fresh row ids for a change that touches no data. |
+| Call Lance `add_columns`, or rewrite the table, to add a tag | `add_columns` commits inline and is forbidden. A rewrite works (the prototype used it) but drops index coverage and assigns fresh row ids; it stays the fallback. |
+| Add the tag column as all nulls, reading null as the original type | Every live read and write path (validation, cascade, traversal) would interpret null. The constant fill costs about the same under Lance's constant layout and leaves no null tag. |
 | Store type names in tags | A rename would rewrite every row, or tags would go stale. |
 | Resolve untyped polymorphic endpoints by probing every member table | Hides an N-table cost in every write, and turns colliding ids into errors at write time. Typed endpoints are the default, and probing is an unresolved question. |
 
@@ -587,6 +637,59 @@ all at version 11.0.0:
 - Inverted-index BM25 statistics.
 - `Scanner::create_plan`.
 
+### Prototype
+
+An end-to-end prototype on branch `proto/polymorphic-types` implemented
+interface bindings, polymorphic edge endpoints and endpoint generalization
+through every layer: schema IR and feature derivation, catalog, typecheck and
+lowering, planner scan members, union scan, typed traversal, per-member
+hydration, loader envelopes, referential integrity, cascade and schema apply.
+Its tests use a Person "alice" and an Organization "alice" that share an id,
+so any layer that matches endpoints on the id alone fails them.
+
+What held as designed:
+
+- The union scan conformed each member table to the interface's columns plus
+  `~node_type` through the existing scan operator, with per-member pushdown.
+- Qualified interner keys kept colliding ids apart in forward, reverse,
+  two-hop and negation traversals, with Lance probes still on raw ids. Facets
+  were not needed.
+- Hydrating abstract destinations per member and joining on `(type, id)`.
+- Referential integrity grouped by tag, and the tag-predicated cascade.
+- Load envelopes: a missing type on a multi-member side, a non-member type, a
+  type on a concrete side and a smuggled tag field are refused, and a
+  one-member interface infers the type.
+- Keyed polymorphic edges with the tag in the key: the same edge to Person
+  "alice" and to Organization "alice" are two rows, and re-loading both is two
+  upserts.
+- Generalizing an unkeyed endpoint through the rewrite path: the old row read as
+  Person and new rows could name Organization.
+
+What the prototype found, each now folded into the sections above. P2
+confirms a rule this RFC already stated; the others are new.
+
+| Finding | Layer | Effect without the fix |
+|---|---|---|
+| P1 | loader | A tag among the properties is filled from user JSON. |
+| P2 | lowering | Cycle closing on an interface silently dropped a row. |
+| P3 | typecheck | Narrowing had two sources of truth. |
+| P4 | graph index | The index build collapses colliding ids into one node (latent in the prototype). |
+| P5 | migration | Generalizing a keyed edge would duplicate edges on the next keyed write. |
+| P6 | validation | `@card` on an interface source groups different nodes and reads a nonexistent table. |
+| P7 | migration | The all-null tag forces every read path to interpret null; a constant fill does not. |
+| P8 | engine | An untyped expansion returned wrong rows with no error. |
+| P9 | engine | Forcing CSR names an internal selection in its refusal. |
+
+The cycle-closing fix (P2) and the typed-route requirement (P8) were each
+checked by switching them off: the tests then returned wrong rows. Switching off
+the graph-index exclusion (P4) changed no result, because the budgeted route
+never reads the index; it guards the latent case.
+
+With the prototype's changes, the existing suites still pass: 465 compiler
+tests, the planner suites, 706 engine tests (the library and ten integration
+suites, including schema apply, change feed, traversal, export and the
+forbidden-API registry), and all 275 GQT cases.
+
 ### Tests to extend
 
 Following [the test map](../dev/testing.md), these existing owners are extended:
@@ -609,8 +712,13 @@ Following [the test map](../dev/testing.md), these existing owners are extended:
     forbidden.
   - `tests/failpoints.rs`: a crash between staging the tag column and
     publication.
-  - Historical reads: a query on an image from before generalization resolves
-    every row to the implicit type and never projects the absent column.
+  - Historical reads: a query on an image from before generalization
+    synthesizes each row's tag from `generalized_from` and never projects the
+    absent column.
+  - A plan that expands a polymorphic edge without endpoint types is refused
+    by `ExpandStep` validation, built directly rather than through typecheck.
+  - Cycle closing and negation over an interface binding with colliding ids.
+  - Generalizing a keyed or `@unique` edge is refused.
   - Plan-replay tests: every member pin.
 - **GQT:** cases that mirror the issue-659 suite. They cover union scans,
   narrowing, type tests, `@type` ordering with colliding ids, mixed-type
@@ -628,7 +736,8 @@ Acceptance thresholds:
 - A fixture of one hub with leaves across three member types pins exact
   traversal-work units for one hop and for `{1,3}`, with one-unit-below refusal,
   as the alternation suite does.
-- Generalizing an endpoint on a table of one million edges writes no data file.
+- Generalizing an endpoint on a table of one million edges rewrites no existing
+  data file and adds one constant column file per fragment.
 
 ### Defects found during the investigation
 
@@ -659,7 +768,7 @@ valid.
      route.
    - No storage change.
 3. **Phase 2, polymorphic edges.**
-   - Endpoint declarations, tag columns and implicit types behind
+   - Endpoint declarations, tag columns and `generalized_from` behind
      `polymorphic-endpoints`.
    - Typed endpoint writes, validation, cascade, loads, export and change-feed
      endpoint types.
@@ -691,6 +800,12 @@ valid.
 - **Wide projection.** Should `return { $x }` offer a wide nullable struct for
   multi-member sets, and what rule handles same-named properties of different
   types?
+- **Constant-column staging.** Does the per-fragment constant-column
+  `Operation::Merge` commit detached against Lance 11, as the `AllNulls`
+  variant did? If not, generalization uses the full rewrite.
+- **Generalizing keyed edges.** Rewrite every keyed id (breaking external
+  references to edge ids) or keep legacy ids for rows of the original type (a
+  permanent special case in id derivation)? v1 refuses.
 - **Historical abstract bindings.** When can they be admitted? That needs
   historical membership, which the captured contract does not reconstruct today.
 - **Interface-named policy rules.** Should they exist under per-type
@@ -702,3 +817,9 @@ valid.
 2026-10-07: drafted from a code-level investigation of the compiler, planner,
 engine, storage, migration, policy and Tower consumers, and from 134 claims
 validated against OmniGraph, Lance 11 and DataFusion 54 sources.
+
+2026-10-08: amended from an end-to-end prototype. Tags are filled at
+generalization instead of read as null; the graph index build excludes
+polymorphic edges; the engine refuses an untyped expansion over a polymorphic
+edge; a named polymorphic edge gets its own policy; generalizing a keyed edge is
+refused in v1; tag columns sit after every property.
