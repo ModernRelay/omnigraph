@@ -526,11 +526,9 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .strip_prefix("${")
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
+        // Never echo the value: an inline one is the secret itself.
         .ok_or_else(|| {
-            format!(
-                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
-                value.trim()
-            )
+            "embedding api_key must be a ${NAME} env reference, not an inline secret".to_string()
         })
 }
 
@@ -697,6 +695,10 @@ mod embedding_provider_config_tests {
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("${NAME}"), "got: {err}");
+        assert!(
+            !err.contains("sk-inline"),
+            "the refusal echoed the key: {err}"
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ use omnigraph_compiler::settings::{Engine, SessionSettings, SettingId, SettingRo
 use omnigraph_compiler::{
     JsonParamMode, PropType, QueryResult, ScalarType, json_params_to_param_map,
 };
+use omnigraph_planner::{BoundPlan, PhysicalNode};
 use serde_json::Value;
 
 pub mod concurrent;
@@ -2384,11 +2385,7 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
             ));
         }
         if got.data_type() != want.data_type() {
-            let hint = if matches!(want.data_type(), DataType::Struct(_)) {
-                "; a bare node projection executes as the id column today and has no green shape until the engine returns the node object"
-            } else {
-                "; the compiler and the executor disagree: an engine defect to file, not a case error"
-            };
+            let hint = "; the compiler and the executor disagree: an engine defect to file, not a case error";
             return Some(format!(
                 "result schema mismatch at column {i} `{name}`: the compiler inferred {:?}, the executor returned {:?}{hint}",
                 want.data_type(),
@@ -2407,10 +2404,168 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
     None
 }
 
-/// What a v2 query step's `Executed` holds beyond its result: the explain
-/// document rendered from the bound plan the run executed, and its report
-/// rows.
+fn check_bound_plan_round_trip(bound: &BoundPlan) -> Result<(), String> {
+    let encoded = serde_json::to_vec(bound)
+        .map_err(|error| format!("bound plan serialization failed: {error}"))?;
+    let restored: BoundPlan = serde_json::from_slice(&encoded)
+        .map_err(|error| format!("bound plan deserialization failed: {error}"))?;
+    check_restored_plan(bound, &restored)
+}
+
+fn check_restored_plan(bound: &BoundPlan, restored: &BoundPlan) -> Result<(), String> {
+    omnigraph_planner::validate_aggregate_specs(&bound.plan).map_err(|error| error.to_string())?;
+    omnigraph_planner::validate_aggregate_specs(&restored.plan)
+        .map_err(|error| error.to_string())?;
+    plan::validate_typed_plan(&bound.plan.to_json())?;
+    plan::validate_typed_plan(&restored.plan.to_json())?;
+    if bound.plan.to_json() != restored.plan.to_json() {
+        return Err("bound plan round trip changed its physical explain document".to_string());
+    }
+    for (id, node) in bound.plan.live() {
+        let original_schema = bound
+            .plan
+            .properties(id)
+            .map(|properties| &properties.schema);
+        let restored_schema = restored
+            .plan
+            .properties(id)
+            .map(|properties| &properties.schema);
+        if original_schema != restored_schema {
+            return Err(format!("bound plan round trip changed node {id}'s schema"));
+        }
+        let equal = match (node, restored.plan.node(id)) {
+            (
+                PhysicalNode::Projection {
+                    return_exprs,
+                    node_objects,
+                    ..
+                },
+                Some(PhysicalNode::Projection {
+                    return_exprs: back,
+                    node_objects: back_objects,
+                    ..
+                }),
+            )
+            | (
+                PhysicalNode::Aggregate {
+                    return_exprs,
+                    node_objects,
+                    ..
+                },
+                Some(PhysicalNode::Aggregate {
+                    return_exprs: back,
+                    node_objects: back_objects,
+                    ..
+                }),
+            ) => return_exprs == back && node_objects == back_objects,
+            (
+                PhysicalNode::MetadataCount { return_exprs, .. },
+                Some(PhysicalNode::MetadataCount {
+                    return_exprs: back, ..
+                }),
+            ) => return_exprs == back,
+            (
+                PhysicalNode::AntiJoin {
+                    predicate,
+                    aggregate,
+                    ..
+                },
+                Some(PhysicalNode::AntiJoin {
+                    predicate: back,
+                    aggregate: back_spec,
+                    ..
+                }),
+            ) => predicate == back && aggregate == back_spec,
+            (
+                PhysicalNode::Projection { .. }
+                | PhysicalNode::Aggregate { .. }
+                | PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::MetadataCount { .. },
+                _,
+            ) => false,
+            _ => true,
+        };
+        if !equal {
+            return Err(format!(
+                "bound plan round trip changed node {id}'s typed declarations"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn declared_result_schema(bound: &BoundPlan) -> Result<&Schema, String> {
+    bound
+        .plan
+        .properties(bound.plan.root())
+        .map(|properties| properties.schema.as_ref())
+        .ok_or_else(|| "result schema mismatch: the plan root has no declared schema".to_string())
+}
+
+fn check_inferred_results(
+    decl: &QueryDecl,
+    inferred: &Schema,
+    bound: &BoundPlan,
+) -> Result<(), String> {
+    let declared = declared_result_schema(bound)?;
+    if declared.fields().len() != inferred.fields().len()
+        || declared.fields().len() != decl.return_clause.len()
+    {
+        return Err(
+            "result schema mismatch: planned and inferred column counts differ".to_string(),
+        );
+    }
+    for (i, ((planned, inferred), item)) in declared
+        .fields()
+        .iter()
+        .zip(inferred.fields())
+        .zip(&decl.return_clause)
+        .enumerate()
+    {
+        let name = executed_column_name(&item.expr, item.alias.as_deref());
+        if planned.name() != &name
+            || planned.data_type() != inferred.data_type()
+            || planned.is_nullable() != inferred.is_nullable()
+        {
+            return Err(format!(
+                "result schema mismatch at column {i} `{name}`: the plan declares {planned:?}, the compiler inferred {inferred:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), String> {
+    let declared = declared_result_schema(bound)?;
+    let executed = result.schema();
+    if declared.fields().len() != executed.fields().len() {
+        return Err(
+            "result schema mismatch: planned and executed column counts differ".to_string(),
+        );
+    }
+    for (i, (want, got)) in declared.fields().iter().zip(executed.fields()).enumerate() {
+        if want.name() != got.name() || want.data_type() != got.data_type() {
+            return Err(format!(
+                "result schema mismatch at column {i} `{}`: the plan declares {want:?}, the executor returned {got:?}",
+                want.name()
+            ));
+        }
+        if !want.is_nullable() {
+            let nulls = shape::null_cells(result, i);
+            if nulls > 0 {
+                return Err(format!(
+                    "result schema mismatch at column {i} `{}`: the plan declares it non-nullable, the executor returned {nulls} null(s)",
+                    want.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The executed plan, its explain document and the same run's report rows.
 struct Inspection {
+    plan: BoundPlan,
     explain: Value,
     rows: Result<Vec<report::Row>, String>,
 }
@@ -2458,6 +2613,7 @@ async fn run_query_step(
         match outcome {
             Ok(run) => {
                 let inspection = Inspection {
+                    plan: run.plan,
                     explain: run.explain.to_value(),
                     rows: report::report_rows(&run.report),
                 };
@@ -2491,7 +2647,11 @@ async fn run_query_step(
             shape,
         } => {
             let result = outcome.map_err(|e| fail(format!("query failed: {e}")))?;
-            if let (Some(plan), Some(Inspection { explain, rows })) = (&step.plan, &inspection) {
+            if let Some(run) = &inspection {
+                check_bound_plan_round_trip(&run.plan).map_err(&fail)?;
+            }
+            if let (Some(plan), Some(Inspection { explain, rows, .. })) = (&step.plan, &inspection)
+            {
                 validate_plan_columns(&plan.lines, &session.catalog()).map_err(&fail)?;
                 let report = rows.as_ref().ok().map(Vec::as_slice);
                 if let Some(mismatch) = plan_mismatch(&plan.lines, explain, report) {
@@ -2505,6 +2665,10 @@ async fn run_query_step(
             let inferred = typecheck_query(&catalog, &step.decl)
                 .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
+            if let Some(run) = &inspection {
+                check_inferred_results(&step.decl, &inferred, &run.plan).map_err(&fail)?;
+                check_planned_results(&run.plan, &result).map_err(&fail)?;
+            }
             let drift = schema_drift(&step.decl, &inferred, &result);
             if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred, &catalog) {
                 let (message, bless_lines) = match (&drift, bless_shape_lines(&result, &catalog)) {
@@ -3137,15 +3301,15 @@ async fn execute_steps_inner<H: ExecutionHost>(
             let binding = var.zip(value);
             for step in &steps {
                 let ordinal = step.ordinal();
+                host.begin_operation(||
+                    serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
+                );
                 host.observe(|| {
                     format!(
                         "operation: ordinal={ordinal} line={:?} binding={binding:?} generation={generation} expected={step:?}",
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.begin_operation(||
-                    serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
-                );
                 host.record(
                     "expectation",
                     || match step {

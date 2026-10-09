@@ -8,6 +8,8 @@ use crate::instrumentation::record_node_scan_projection;
 use crate::table_store::{ScanTuning, TableStore};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
+use datafusion::scalar::ScalarValue;
+use lance_core::ROW_ADDR;
 use lance_index::scalar::FullTextSearchQuery;
 
 /// `id IN (ids)` as one structured DataFusion `Expr` — the scan-pushdown
@@ -32,6 +34,12 @@ pub(crate) fn id_in_list_expr(ids: &[String], id_col: &str) -> datafusion::prelu
 
 /// Lance batches a pipelined read decodes ahead, which the pool does not see.
 const PIPELINED_READAHEAD: usize = 2;
+
+/// Bytes Lance may hold fetched and not yet decoded for one pipelined read,
+/// which the pool does not see either. Lance's default is 32 MiB per I/O
+/// thread (2 GiB on a cloud store), read ahead of a consumer that may stop
+/// after its first batch; two 32 MiB pages keep its throughput.
+const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One node scan resolved before any Lance read: the dataset, the pushed
 /// filter (the literal filters, a gate's eligible set, a BM25 filter's member
@@ -62,6 +70,29 @@ impl<'n> NodeRead<'n> {
         let ds = snapshot.open_lance_dataset(&table_key).await?;
 
         let node_type = &catalog.node_types[type_name];
+        let read_columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
+        super::typed_value::check_stored_schema(
+            &ds,
+            &node_type.arrow_schema,
+            &table_key,
+            read_columns
+                .stored_columns()
+                .into_iter()
+                .chain([catalog.system_columns.id])
+                .chain(
+                    search_mode
+                        .nearest
+                        .iter()
+                        .map(|target| target.property.as_str()),
+                )
+                .chain(
+                    search_mode
+                        .bm25
+                        .iter()
+                        .map(|target| target.property.as_str()),
+                ),
+        )?;
+        super::typed_value::check_scan_leaves(&ds, filters)?;
 
         let mut filter_expr =
             build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
@@ -80,9 +111,12 @@ impl<'n> NodeRead<'n> {
             let Some(query) = search_filter_query(filter, params)? else {
                 continue;
             };
-            let ranked_matches_only = ranking.is_some_and(|target| {
-                search_filter_is_ranking(filter, &target.property, &target.text, params)
-            });
+            let ranked_matches_only = match ranking {
+                Some(target) => {
+                    search_filter_is_ranking(filter, &target.property, &target.text, params)?
+                }
+                None => false,
+            };
             if !ranked_matches_only {
                 hoisted_fts_queries.push(query);
             }
@@ -146,8 +180,9 @@ impl<'n> NodeRead<'n> {
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
-    /// prefilter, the `(rows, bytes)` batch override and bounded readahead of
-    /// a pipelined read, the full-text query, then `configure` (nearest).
+    /// prefilter, the `(rows, bytes)` batch override, bounded readahead and
+    /// I/O buffer of a pipelined read, the full-text query, then `configure`
+    /// (nearest).
     pub(super) fn plan(
         &self,
         pipelined_batch: Option<(usize, usize)>,
@@ -166,6 +201,7 @@ impl<'n> NodeRead<'n> {
                 scanner.batch_size(rows);
                 scanner.batch_size_bytes(bytes as u64);
                 scanner.batch_readahead(PIPELINED_READAHEAD);
+                scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
             }
             if let Some(fts_query) = &self.fts_query {
                 scanner
@@ -177,9 +213,11 @@ impl<'n> NodeRead<'n> {
     }
 }
 
-/// Scan a node type under the supplied projection, filters and search mode.
-/// Apply filters before search ranking, retain score columns, and widen an
-/// underfilled ANN scan according to its reported probe outcomes.
+/// The breaker read of a ranked scan: scan a node type under the supplied
+/// projection, filters and search mode, apply filters before search ranking,
+/// retain score columns, and widen an underfilled ANN scan according to its
+/// reported probe outcomes. An unranked read streams instead
+/// (`operators::scan::pipelined`).
 pub(super) async fn execute_node_scan(
     type_name: &str,
     variable: &str,
@@ -437,14 +475,30 @@ fn search_filter_is_ranking(
     property: &str,
     text: &str,
     params: &ParamMap,
-) -> bool {
-    match search_call(filter) {
-        Some(IRExpr::Search { field, query } | IRExpr::MatchText { field, query }) => {
+) -> Result<bool> {
+    Ok(match search_call(filter) {
+        Some(IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. }) => {
             extract_property(field).as_deref() == Some(property)
-                && resolve_to_string(query, params).as_deref() == Some(text)
+                && resolve_to_string(query, params)? == text
         }
-        _ => false,
-    }
+        Some(
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _)
+            | IRExpr::Binary { .. }
+            | IRExpr::Not(_, _)
+            | IRExpr::Cast { .. }
+            | IRExpr::IsNull { .. },
+        )
+        | None => false,
+    })
 }
 
 /// Filter membership without adding the filter's score to the BM25 ranking.
@@ -524,7 +578,8 @@ pub(super) fn conjoin_fts_queries(
 pub(super) struct ScanColumns<'n> {
     pub(super) has_blobs: bool,
     pub(super) non_blob_cols: Vec<&'n str>,
-    /// `_distance` under a nearest target, `_score` under a text search.
+    /// `_distance` under a nearest target, `_score` under a text search, then
+    /// `_rowaddr` when the plan defers a return column to `HydrateColumns`.
     pub(super) search_cols: Vec<&'static str>,
     /// The plan's projection (`projection_pushdown`) plus the identity, the
     /// key and the search columns; `None` reads every non-blob column.
@@ -538,6 +593,18 @@ pub(in crate::engine) struct SearchColumns {
 }
 
 impl<'n> ScanColumns<'n> {
+    /// The stored fields this read consumes, which the opened dataset's
+    /// schema must match: its projection, or every non-Blob column when it
+    /// prunes none, without Lance's row address (read for a hydrated
+    /// binding, never a stored field).
+    pub(in crate::engine) fn stored_columns(&self) -> Vec<&'n str> {
+        self.read_projection()
+            .unwrap_or_else(|| self.non_blob_cols.clone())
+            .into_iter()
+            .filter(|column| *column != ROW_ADDR)
+            .collect()
+    }
+
     pub(in crate::engine) fn read_projection(&self) -> Option<Vec<&'n str>> {
         self.pruned_cols.clone().or_else(|| {
             self.has_blobs.then(|| {
@@ -563,12 +630,15 @@ impl<'n> ScanColumns<'n> {
             .filter(|f| !node_type.blob_properties.contains(f.name()))
             .map(|f| f.name().as_str())
             .collect();
-        let mut search_cols: Vec<&'static str> = Vec::with_capacity(2);
+        let mut search_cols: Vec<&'static str> = Vec::with_capacity(3);
         if search.distance {
             search_cols.push("_distance");
         }
         if search.score {
             search_cols.push("_score");
+        }
+        if binding_columns.is_some_and(|NeededColumns(columns)| columns.contains(ROW_ADDR)) {
+            search_cols.push(ROW_ADDR);
         }
         let pruned_cols: Option<Vec<&'n str>> = binding_columns.map(|NeededColumns(columns)| {
             non_blob_cols
@@ -608,11 +678,14 @@ impl<'n> ScanColumns<'n> {
             })
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.extend(
-            self.search_cols
-                .iter()
-                .map(|col| Field::new(*col, DataType::Float32, true)),
-        );
+        fields.extend(self.search_cols.iter().map(|col| {
+            let data_type = if *col == ROW_ADDR {
+                DataType::UInt64
+            } else {
+                DataType::Float32
+            };
+            Field::new(*col, data_type, true)
+        }));
         RecordBatch::new_empty(Arc::new(Schema::new(fields)))
     }
 }
@@ -633,11 +706,10 @@ pub(super) fn scan_output_schema(
         .get(type_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
     let nearest = search_mode.nearest.is_some();
-    let scores_fts = search_mode.bm25.is_some()
-        || filters
-            .iter()
-            .filter_map(search_call)
-            .any(|call| build_fts_query(call, params).is_some());
+    let mut scores_fts = search_mode.bm25.is_some();
+    for filter in filters {
+        scores_fts |= search_filter_query(filter, params)?.is_some();
+    }
     let columns = ScanColumns::new(
         node_type,
         SearchColumns {
@@ -703,74 +775,103 @@ pub(super) fn add_null_blob_columns(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(OmniError::arrow_internal)
 }
 
-/// Build a FullTextSearchQuery from a search IR expression.
+/// Build a full-text query, refusing invalid supplied constant values.
 pub(super) fn build_fts_query(
     expr: &IRExpr,
     params: &ParamMap,
-) -> Option<lance_index::scalar::FullTextSearchQuery> {
-    match expr {
-        IRExpr::Search { field, query } => {
-            let prop = extract_property(field)?;
+) -> Result<Option<lance_index::scalar::FullTextSearchQuery>> {
+    let (prop, query) = match expr {
+        IRExpr::Search { field, query, .. } | IRExpr::MatchText { field, query, .. } => {
+            let Some(prop) = extract_property(field) else {
+                return Ok(None);
+            };
             let q = resolve_to_string(query, params)?;
-            lance_index::scalar::FullTextSearchQuery::new(q)
-                .with_column(prop)
-                .ok()
+            (prop, lance_index::scalar::FullTextSearchQuery::new(q))
         }
         IRExpr::Fuzzy {
             field,
             query,
             max_edits,
+            ty: _,
         } => {
-            let prop = extract_property(field)?;
+            let Some(prop) = extract_property(field) else {
+                return Ok(None);
+            };
             let q = resolve_to_string(query, params)?;
-            let edits = max_edits
-                .as_ref()
-                .and_then(|e| resolve_to_int(e, params))
-                .unwrap_or(2) as u32;
-            lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits))
-                .with_column(prop)
-                .ok()
+            let edits = match max_edits.as_deref() {
+                Some(expr) => u32::try_from(resolve_to_int(expr, params)?)
+                    .map_err(|_| OmniError::manifest("fuzzy max_edits must fit U32"))?,
+                None => 2,
+            };
+            (
+                prop,
+                lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits)),
+            )
         }
-        IRExpr::MatchText { field, query } => {
-            let prop = extract_property(field)?;
-            let q = resolve_to_string(query, params)?;
-            lance_index::scalar::FullTextSearchQuery::new(q)
-                .with_column(prop)
-                .ok()
-        }
-        _ => None,
-    }
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::Cast { .. }
+        | IRExpr::IsNull { .. } => return Ok(None),
+    };
+    query
+        .with_column(prop)
+        .map(Some)
+        .map_err(|error| OmniError::storage_context("full_text_search", error))
 }
 
 /// Extract the property name from a PropAccess expression.
 pub(super) fn extract_property(expr: &IRExpr) -> Option<String> {
     match expr {
         IRExpr::PropAccess { property, .. } => Some(property.clone()),
-        _ => None,
+        IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::Cast { .. }
+        | IRExpr::IsNull { .. } => None,
     }
 }
 
-/// Resolve an expression to a string value (literal or param).
-pub(super) fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Option<String> {
-    match expr {
-        IRExpr::Literal(Literal::String(s)) => Some(s.clone()),
-        IRExpr::Param(name) => match params.get(name)? {
-            Literal::String(s) => Some(s.clone()),
-            _ => None,
-        },
-        _ => None,
+/// Evaluate a constant in its stored type and require a non-null String.
+pub(super) fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Result<String> {
+    let array = super::constant::evaluate_constant_array(expr, params)?;
+    match ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)? {
+        ScalarValue::Utf8(Some(value)) => Ok(value),
+        _ => Err(OmniError::manifest(
+            "search query must resolve to a non-null String",
+        )),
     }
 }
 
-/// Resolve an expression to an integer value (literal or param).
-pub(super) fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
-    match expr {
-        IRExpr::Literal(Literal::Integer(n)) => Some(*n),
-        IRExpr::Param(name) => match params.get(name)? {
-            Literal::Integer(n) => Some(*n),
-            _ => None,
-        },
-        _ => None,
+/// Evaluate a public integer constant without losing its stored width or unsigned range.
+pub(super) fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Result<i128> {
+    let array = super::constant::evaluate_constant_array(expr, params)?;
+    match ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)? {
+        ScalarValue::Int32(Some(value)) => Ok(i128::from(value)),
+        ScalarValue::Int64(Some(value)) => Ok(i128::from(value)),
+        ScalarValue::UInt32(Some(value)) => Ok(i128::from(value)),
+        ScalarValue::UInt64(Some(value)) => Ok(i128::from(value)),
+        _ => Err(OmniError::manifest(
+            "search option must resolve to a non-null integer",
+        )),
     }
 }
 
@@ -804,92 +905,98 @@ pub(super) fn build_lance_filter_expr(
     acc
 }
 
-/// Lower a pushable Boolean expression to a DataFusion `Expr`: `and`, `or`
-/// and `not` structurally, a null test to `IS [NOT] NULL`, a comparison
-/// through `comparison_to_df_expr`, any other node as a Boolean column. The
-/// schema affects literal types only; `None` for a search conjunct and for
-/// every shape the scan cannot express, anywhere in the tree.
+/// Lower recorded expression types and casts; the schema never selects a domain.
 pub(crate) fn ir_expr_to_df_expr(
     expr: &IRExpr,
     params: &ParamMap,
-    schema: Option<&Schema>,
+    _schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
     if is_search_filter(expr) {
         return None;
     }
+    expr.check_types().ok()?;
+    typed_expr_to_df_expr(expr, params)
+}
+
+fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion::prelude::Expr> {
     match expr {
         IRExpr::Binary {
             left,
             op: BinaryOp::Compare(op),
             right,
-        } => comparison_to_df_expr(left, *op, right, params, schema),
+            ty: _,
+        } => comparison_to_df_expr(left, *op, right, params),
         IRExpr::Binary {
             left,
             op: BinaryOp::And,
             right,
-        } => {
-            let left = ir_expr_to_df_expr(left, params, schema)?;
-            let right = ir_expr_to_df_expr(right, params, schema)?;
-            Some(left.and(right))
-        }
+            ty: _,
+        } => Some(typed_expr_to_df_expr(left, params)?.and(typed_expr_to_df_expr(right, params)?)),
         IRExpr::Binary {
             left,
             op: BinaryOp::Or,
             right,
-        } => {
-            let left = ir_expr_to_df_expr(left, params, schema)?;
-            let right = ir_expr_to_df_expr(right, params, schema)?;
-            Some(left.or(right))
-        }
-        IRExpr::Not(inner) => Some(datafusion::logical_expr::not(ir_expr_to_df_expr(
-            inner, params, schema,
+            ty: _,
+        } => Some(typed_expr_to_df_expr(left, params)?.or(typed_expr_to_df_expr(right, params)?)),
+        IRExpr::Not(inner, _) => Some(datafusion::logical_expr::not(typed_expr_to_df_expr(
+            inner, params,
         )?)),
-        IRExpr::IsNull { expr, negated } => {
-            let operand = ir_expr_to_df_expr(expr, params, schema)?;
+        IRExpr::IsNull {
+            expr,
+            negated,
+            ty: _,
+        } => {
+            let operand = typed_expr_to_df_expr(expr, params)?;
             Some(if *negated {
                 operand.is_not_null()
             } else {
                 operand.is_null()
             })
         }
-        leaf => ir_expr_to_expr(leaf, params, None),
+        IRExpr::Cast { expr: child, ty } => {
+            if super::constant::is_constant(expr) {
+                let array = super::constant::evaluate_constant_array(expr, params).ok()?;
+                let value =
+                    datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
+                return Some(datafusion::prelude::lit(value));
+            }
+            Some(datafusion::logical_expr::cast(
+                typed_expr_to_df_expr(child, params)?,
+                ty.to_arrow()?,
+            ))
+        }
+        IRExpr::PropAccess { property, .. } => Some(datafusion::prelude::ident(property)),
+        IRExpr::Literal(literal, ty) => literal_to_expr(literal, ty),
+        IRExpr::Param(name, ty) => literal_to_expr(params.get(name)?, ty),
+        IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _) => None,
     }
 }
 
-/// Lower a pushable comparison, matching scalar literals to the opposing
-/// column type when known so the column remains indexable.
 fn comparison_to_df_expr(
     left: &IRExpr,
     op: CompOp,
     right: &IRExpr,
     params: &ParamMap,
-    schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::functions_nested::expr_fn::array_has;
-
     if matches!(op, CompOp::Contains) {
-        if let Some(items) = list_constant(left, params) {
-            return list_membership_to_df_expr(items, right, params, schema);
+        if super::constant::is_constant(left) {
+            return list_membership_to_df_expr(left, right, params);
         }
-        let left = ir_expr_to_expr(left, params, None)?;
-        let right = ir_expr_to_expr(right, params, None)?;
-        return Some(array_has(left, right));
+        return Some(datafusion::functions_nested::expr_fn::array_has(
+            typed_expr_to_df_expr(left, params)?,
+            typed_expr_to_df_expr(right, params)?,
+        ));
     }
-
-    if matches!(op, CompOp::StartsWith | CompOp::StringContains) {
-        use datafusion::functions::expr_fn::{contains, starts_with};
-        let left = ir_expr_to_expr(left, params, None)?;
-        let right = ir_expr_to_expr(right, params, None)?;
-        return Some(match op {
-            CompOp::StartsWith => starts_with(left, right),
-            _ => contains(left, right),
-        });
-    }
-
-    let left_col_type = prop_data_type(left, schema);
-    let right_col_type = prop_data_type(right, schema);
-    let left = comparison_operand_to_df_expr(left, params, schema, right_col_type.as_ref())?;
-    let right = comparison_operand_to_df_expr(right, params, schema, left_col_type.as_ref())?;
+    let left = typed_expr_to_df_expr(left, params)?;
+    let right = typed_expr_to_df_expr(right, params)?;
     Some(match op {
         CompOp::Eq => left.eq(right),
         CompOp::Ne => left.not_eq(right),
@@ -897,172 +1004,49 @@ fn comparison_to_df_expr(
         CompOp::Lt => left.lt(right),
         CompOp::Ge => left.gt_eq(right),
         CompOp::Le => left.lt_eq(right),
-        CompOp::Contains | CompOp::StartsWith | CompOp::StringContains => {
-            unreachable!("handled above")
-        }
+        CompOp::StartsWith => datafusion::functions::expr_fn::starts_with(left, right),
+        CompOp::StringContains => datafusion::functions::expr_fn::contains(left, right),
+        CompOp::Contains => unreachable!("handled above"),
     })
 }
 
-/// The elements of a list literal or a parameter bound to a list.
-fn list_constant<'a>(expr: &'a IRExpr, params: &'a ParamMap) -> Option<&'a [Literal]> {
-    let literal = match expr {
-        IRExpr::Literal(literal) => literal,
-        IRExpr::Param(name) => params.get(name)?,
-        _ => return None,
-    };
-    match literal {
-        Literal::List(items) => Some(items),
-        _ => None,
-    }
-}
-
-/// `[a, b] contains $x.p` as `p IN (a, b)`, each value typed toward the column
-/// so a scalar index serves it; a null element matches nothing and is left out.
-/// A set with no value is `p IS NULL AND NULL`: null for a null needle, else false.
+/// A constant list keeps one recorded element domain, including its explicit cast.
 fn list_membership_to_df_expr(
-    items: &[Literal],
+    list: &IRExpr,
     needle: &IRExpr,
     params: &ParamMap,
-    schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::lit as df_lit;
-    use datafusion::scalar::ScalarValue;
-
-    if !matches!(needle, IRExpr::PropAccess { .. }) {
+    let array = super::constant::evaluate_constant_array(list, params).ok()?;
+    let list = array.as_any().downcast_ref::<ListArray>()?;
+    if list.is_null(0) {
+        return Some(df_lit(ScalarValue::Boolean(None)));
+    }
+    let items = list.value(0);
+    if needle.ty().to_arrow().as_ref() != Some(items.data_type()) {
         return None;
     }
-    let column = ir_expr_to_expr(needle, params, None)?;
-    let target = prop_data_type(needle, schema);
-    let values = items
-        .iter()
-        .filter(|item| !matches!(item, Literal::Null))
-        .map(|item| literal_to_expr_coerced(item, target.as_ref()))
+    let needle = typed_expr_to_df_expr(needle, params)?;
+    let values = (0..items.len())
+        .filter(|row| !items.is_null(*row))
+        .map(|row| {
+            ScalarValue::try_from_array(items.as_ref(), row)
+                .ok()
+                .map(df_lit)
+        })
         .collect::<Option<Vec<_>>>()?;
     if values.is_empty() {
-        return Some(column.is_null().and(df_lit(ScalarValue::Boolean(None))));
+        return Some(needle.is_null().and(df_lit(ScalarValue::Boolean(None))));
     }
-    Some(column.in_list(values, false))
+    Some(needle.in_list(values, false))
 }
 
-/// One side of an ordering comparison: a Boolean subtree (`(age > 30) = true`)
-/// through `ir_expr_to_df_expr`, a leaf through `ir_expr_to_expr` with its
-/// literal typed toward the opposing column.
-fn comparison_operand_to_df_expr(
-    expr: &IRExpr,
-    params: &ParamMap,
-    schema: Option<&Schema>,
-    target: Option<&arrow_schema::DataType>,
+fn literal_to_expr(
+    literal: &Literal,
+    ty: &omnigraph_compiler::types::ExprType,
 ) -> Option<datafusion::prelude::Expr> {
-    match expr {
-        IRExpr::Binary { .. } | IRExpr::Not(_) | IRExpr::IsNull { .. } => {
-            ir_expr_to_df_expr(expr, params, schema)
-        }
-        leaf => ir_expr_to_expr(leaf, params, target),
-    }
-}
-
-/// Lower a property, literal or parameter for pushdown, preserving property case.
-/// Coerce literals toward `target` when possible; return `None` for other shapes.
-pub(super) fn ir_expr_to_expr(
-    expr: &IRExpr,
-    params: &ParamMap,
-    target: Option<&arrow_schema::DataType>,
-) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::ident;
-    match expr {
-        IRExpr::PropAccess { property, .. } => Some(ident(property)),
-        IRExpr::Literal(l) => literal_to_expr_coerced(l, target),
-        IRExpr::Param(name) => params
-            .get(name)
-            .and_then(|l| literal_to_expr_coerced(l, target)),
-        _ => None,
-    }
-}
-
-/// The Arrow type of a `PropAccess` operand, looked up in the scan's schema, or
-/// `None` if the expr is not a column or the schema/field is unavailable.
-pub(super) fn prop_data_type(
-    expr: &IRExpr,
-    schema: Option<&Schema>,
-) -> Option<arrow_schema::DataType> {
-    match expr {
-        IRExpr::PropAccess { property, .. } => schema?
-            .field_with_name(property)
-            .ok()
-            .map(|f| f.data_type().clone()),
-        _ => None,
-    }
-}
-
-/// Lower a literal for pushdown, coercing it to `target` (the comparison
-/// column's Arrow type) when known. Falls back to the natural-type
-/// `literal_to_expr` on a missing target or any coercion failure, so a filter is
-/// never demoted to `None` by coercion (a node scan has no in-memory fallback for
-/// inline filters — see `execute_node_scan`).
-pub(super) fn literal_to_expr_coerced(
-    lit: &Literal,
-    target: Option<&arrow_schema::DataType>,
-) -> Option<datafusion::prelude::Expr> {
-    if let Some(target) = target {
-        if let Some(e) = literal_to_typed_expr(lit, target) {
-            return Some(e);
-        }
-    }
-    literal_to_expr(lit)
-}
-
-/// Build a literal as a typed Arrow scalar matching `target`, reusing the same
-/// `literal_to_array` + `arrow_cast` path as the in-memory arm
-/// (`projection.rs::evaluate_filter`) so the two arms agree. Returns `None` on
-/// any failure (unbuildable literal, incompatible cast) — the caller then falls
-/// back to the natural-type literal.
-///
-/// Lossless-only for integer targets: typecheck permits numeric cross-type
-/// comparisons (`types_compatible`), so a fractional float or out-of-range
-/// integer can reach here. Casting those to a narrower integer would truncate
-/// (`2.7 -> 2`) or overflow to null, silently changing which rows match. We
-/// round-trip the cast and, on mismatch, return `None` so the caller keeps the
-/// natural literal — correct via DataFusion coercion, the index just goes unused
-/// for that out-of-domain predicate. Float targets are exempt: narrowing
-/// `F64 -> F32` is the column's own precision domain, not a value error.
-pub(super) fn literal_to_typed_expr(
-    lit: &Literal,
-    target: &arrow_schema::DataType,
-) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::lit as df_lit;
-    use datafusion::scalar::ScalarValue;
-
-    let arr = literal_to_array(lit, 1).ok()?;
-    if arr.data_type() == target {
-        return Some(df_lit(ScalarValue::try_from_array(&arr, 0).ok()?));
-    }
-    let casted = arrow_cast::cast::cast(&arr, target).ok()?;
-    if target.is_integer() {
-        let back = arrow_cast::cast::cast(&casted, arr.data_type()).ok()?;
-        let original = ScalarValue::try_from_array(&arr, 0).ok()?;
-        let round_tripped = ScalarValue::try_from_array(&back, 0).ok()?;
-        if original != round_tripped {
-            return None;
-        }
-    }
-    Some(df_lit(ScalarValue::try_from_array(&casted, 0).ok()?))
-}
-
-/// Lower a scalar literal without a target column type, or refuse a list.
-/// Dates remain strings for DataFusion coercion; typed scan predicates use
-/// `literal_to_typed_expr` to preserve the column's indexable type.
-pub(super) fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::lit as df_lit;
-    Some(match lit {
-        Literal::Null => df_lit(datafusion::scalar::ScalarValue::Null),
-        Literal::String(s) => df_lit(s.clone()),
-        Literal::Integer(n) => df_lit(*n),
-        Literal::Float(f) => df_lit(*f),
-        Literal::Bool(b) => df_lit(*b),
-        Literal::Date(s) => df_lit(s.clone()),
-        Literal::DateTime(s) => df_lit(s.clone()),
-        Literal::List(_) => return None,
-    })
+    let array = typed_literal_to_array(literal, ty, 1).ok()?;
+    let value = datafusion::scalar::ScalarValue::try_from_array(array.as_ref(), 0).ok()?;
+    Some(datafusion::prelude::lit(value))
 }
 
 pub(super) fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
@@ -1121,23 +1105,28 @@ pub(super) fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result
 
 #[cfg(test)]
 mod coercion_tests {
-    use super::{ir_expr_to_df_expr, literal_to_expr_coerced};
-    use arrow_schema::DataType;
+    use super::{ir_expr_to_df_expr, literal_to_expr};
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use omnigraph_compiler::ir::{IRExpr, ParamMap};
     use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+    use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     /// GQ's JSON parameters refuse a null list element; an embedded `ParamMap` carries one.
     #[test]
     fn a_null_list_element_is_left_out_of_the_pushed_membership() {
         let lowered = |items: Vec<Literal>| {
             let filter = IRExpr::Binary {
-                left: Box::new(IRExpr::Literal(Literal::List(items))),
+                left: Box::new(IRExpr::Literal(
+                    Literal::List(items),
+                    ExprType::from_prop(&PropType::list_of(ScalarType::String, false)),
+                )),
                 op: BinaryOp::Compare(CompOp::Contains),
+                ty: ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
                 right: Box::new(IRExpr::PropAccess {
                     variable: "n".to_string(),
                     property: "name".to_string(),
+                    ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
                 }),
             };
             ir_expr_to_df_expr(&filter, &ParamMap::new(), None).expect("a pushable membership")
@@ -1147,49 +1136,50 @@ mod coercion_tests {
         assert_eq!(lowered(vec![Literal::Null]), lowered(vec![]));
     }
 
-    /// GQT cannot inspect the typed literal that preserves a scan's index eligibility.
     #[test]
-    fn coerced_literals_keep_lossless_integer_comparisons_and_float_precision() {
-        for (literal, target, expected) in [
+    fn pushed_literals_keep_their_recorded_type() {
+        for (literal, scalar, expected) in [
             (
                 Literal::Float(2.7),
-                Some(DataType::Int32),
+                ScalarType::F64,
                 ScalarValue::Float64(Some(2.7)),
             ),
             (
                 Literal::Float(2.0),
-                Some(DataType::Int32),
-                ScalarValue::Int32(Some(2)),
+                ScalarType::F64,
+                ScalarValue::Float64(Some(2.0)),
             ),
             (
                 Literal::Integer(3_000_000_000),
-                Some(DataType::Int32),
+                ScalarType::I64,
                 ScalarValue::Int64(Some(3_000_000_000)),
             ),
             (
                 Literal::Integer(5),
-                Some(DataType::Int32),
+                ScalarType::I32,
                 ScalarValue::Int32(Some(5)),
             ),
             (
                 Literal::Float(0.1),
-                Some(DataType::Float32),
+                ScalarType::F32,
                 ScalarValue::Float32(Some(0.1)),
             ),
-            (Literal::Integer(5), None, ScalarValue::Int64(Some(5))),
-            (
-                Literal::Null,
-                Some(DataType::Int32),
-                ScalarValue::Int32(None),
-            ),
+            (Literal::Null, ScalarType::I32, ScalarValue::Int32(None)),
         ] {
-            let expression =
-                literal_to_expr_coerced(&literal, target.as_ref()).expect("scalar literal");
+            let ty =
+                ExprType::from_prop(&PropType::scalar(scalar, matches!(literal, Literal::Null)));
+            let expression = literal_to_expr(&literal, &ty).expect("typed scalar literal");
             let Expr::Literal(value, _) = expression else {
                 panic!("expected a literal")
             };
-            assert_eq!(value, expected, "{literal:?} against {target:?}");
+            assert_eq!(value, expected, "{literal:?} as {scalar}");
         }
-        assert!(literal_to_expr_coerced(&Literal::List(vec![Literal::Integer(1)]), None).is_none());
+        assert!(
+            literal_to_expr(
+                &Literal::Integer(3_000_000_000),
+                &ExprType::from_prop(&PropType::scalar(ScalarType::I32, false)),
+            )
+            .is_none()
+        );
     }
 }

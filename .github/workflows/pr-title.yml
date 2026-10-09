@@ -1,0 +1,58 @@
+name: PR Title
+
+# Every merge into `main` is a squash whose subject is the pull request
+# title, so the title is the line `git log` keeps. This is a policy check on
+# the pull request, so it must run code the pull request cannot edit:
+# `pull_request_target` takes this workflow and `scripts/check-pr-title.py`
+# from the base branch, and the head is never fetched or checked out. The
+# `edited` event re-runs the check when the title changes. On the merge
+# queue the group commit's message already carries the squash subject the
+# queue will land, so the merge-group run checks that subject with the same
+# script; a title edit after queueing does not change the captured subject
+# (see docs/dev/branch-protection.md, Merge queue).
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  merge_group:
+
+concurrency:
+  # A merge-group run has no pull request number; its ref is unique per entry.
+  group: pr-title-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr_title:
+    name: PR Title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # The base branch on a pull request; the queued commit on the merge group.
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Self-test the checker
+        run: python3 scripts/check-pr-title.py --self-test
+
+      - name: Check the pull request title
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/check-pr-title.py --title "$PR_TITLE"
+
+      - name: Check the subject the merge queue lands
+        if: github.event_name == 'merge_group'
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.merge_group.head_commit.message }}
+        run: python3 scripts/check-pr-title.py --squash-subject "$HEAD_COMMIT_MESSAGE"
+
+      - name: Refuse an event no step handles
+        if: github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
+        run: |
+          echo "::error::PR Title ran on ${GITHUB_EVENT_NAME}, which no step handles"
+          exit 1

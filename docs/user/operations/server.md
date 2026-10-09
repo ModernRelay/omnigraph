@@ -37,6 +37,21 @@ start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
+### Logs
+
+The server logs to standard output at `info` unless `RUST_LOG` sets other
+levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
+their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
+whose verbose SDK logs contain query arguments and results, and Lance's
+`lance::dataset_events` and `lance::file_audit`, which at `info` name every
+table's full storage URI, every file Lance creates or deletes, and each delete
+predicate with its entity IDs. Other targets keep their configured levels.
+Embedders using their own subscriber must enforce the same filter.
+
+A failed Blob delivery, change-route request or streamed response is logged by
+its error class, never by its message; see
+[HTTP errors](troubleshooting.md#http-errors).
+
 ## HTTP contract
 
 Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
@@ -187,10 +202,8 @@ graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
 execution retains its input and slot until it finishes, with no later result
 lookup. See [admission and shutdown](../deployment.md).
 
-`omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
-and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
-and results. Other targets keep their configured levels. Embedders using their
-own subscriber must enforce the same SDK filter.
+Verbose MCP SDK logs contain query arguments and results, so the server keeps
+them out of its log; see [Logs](#logs).
 
 Requests require the resource authority or a loopback host; browsers must use
 the resource origin, while native clients can omit `Origin`. The deployment
