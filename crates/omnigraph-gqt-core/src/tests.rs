@@ -2190,10 +2190,12 @@ fn refuses_nearest_over_a_string_property() {
 
 #[test]
 fn traversal_header_forces_index_builds() {
-    let text = format!("{HDR}# traversal: indexed\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    assert!(case.needs_indices);
-    assert_eq!(case.traversal, Some("indexed"));
+    for mode in ["auto", "indexed", "csr"] {
+        let text = format!("{HDR}# traversal: {mode}\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        let case = parse_case("x", &text).unwrap();
+        assert!(case.needs_indices);
+        assert_eq!(case.traversal, Some(mode));
+    }
 }
 
 #[test]

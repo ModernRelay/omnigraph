@@ -266,6 +266,7 @@ fn a_hash_join_lowers_its_probe_then_its_build_scan_then_itself() {
     let build = plan.add(PhysicalNode::Scan {
         source: ScanInput::Table,
         spec: Box::new(ScanSpec {
+            access: None,
             side: SideId::Base,
             table: omnigraph_planner::TableRef {
                 type_key: "node:Doc".to_string(),

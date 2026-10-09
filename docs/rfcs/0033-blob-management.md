@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-10-07
+updated: 2026-10-08
 discussion: null
 supersedes: []
 superseded_by: []
@@ -484,17 +484,21 @@ escape hatch.
 
 An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
 `take_blobs`, but Lance types do not appear in public signatures.
-Materializing rewrites use Lance's batched `read_blobs` API on managed rows
-with an explicit I/O buffer: a carried update or merge cell, the bounded rewrite
-stream and the schema-apply rewrite each pass one batch's managed stable row ids
-to one streamed call. Upgrade validation reads managed bytes through
-`read_blob_ranges` in bounded windows. Both APIs shipped in Lance 9.0.0 with
-row-id, row-index, and row-address selectors; Lance 10.0.0 is required for their
-null-preserving, request-cardinality behavior. Export and change-feed images
-still read one row at a time through `take_blobs` and `BlobFile::read`, and the
-single-cell read facade uses `take_blobs`; moving export and change images onto
-batched reads is Phase 4 work. The hard rule is the anti-pattern: it must not
-build a thread pool around one `BlobFile::read()` per row.
+Every complete-payload read uses Lance's batched `read_blobs` API on managed
+rows with an explicit I/O buffer, through one engine helper: a carried update or
+merge cell, the bounded rewrite stream and the schema-apply rewrite each pass
+one batch's managed stable row ids to one streamed call. Export and the
+change-feed baseline do the same for each batch of rows they walk, one call per
+Blob column, and consume the stream row by row, so one row's values and each
+call's bounded I/O buffer are resident however many rows the batch holds.
+Change-feed images and entity reads materialize one row, so their call carries
+that row's id: the change feed admits one change at a time against its page
+budget, and a continuation sentinel reads no payload. The API shipped in Lance
+9.0.0 with row-id, row-index, and row-address selectors; Lance 10.0.0 is
+required for its null-preserving, request-cardinality behavior. Only the
+single-cell read facade keeps `take_blobs`, for bounded ranges of one value.
+The hard rule is the anti-pattern: it must not build a thread pool around one
+`BlobFile::read()` per row.
 
 ### 4.1 Descriptor-first classification
 
@@ -1114,10 +1118,9 @@ evidence that users need the control. If production metrics later show placement
 as a material cost term, a follow-up RFC can propose an annotation with migration
 semantics and a comparative benchmark.
 
-Materializing rewrites read complete managed payloads with
-`Dataset::read_blobs` and upgrade validation reads ranges with
-`Dataset::read_blob_ranges` (§4); export, change images and lazy single-cell
-reads use `take_blobs` behind the engine facade. Logical row IDs are preferred within an exact snapshot.
+Materializing rewrites, export, change images and entity reads read complete
+managed payloads with `Dataset::read_blobs` (§4); lazy single-cell reads use
+`take_blobs` behind the engine facade. Logical row IDs are preferred within an exact snapshot.
 Physical row addresses never become public stable identity.
 
 ## 10. Security and resource model
@@ -1243,8 +1246,8 @@ The implementation extends existing owners before creating new fixtures, per
   as a different stable-property lifetime.
 - Phase 1 migrates `export.rs`'s four-way null/empty/non-empty/external fixture to
   the facade. External classification stays descriptor-first while the target is
-  unavailable; bulk export keeps its own `take_blobs` selection and must not
-  loop over the single-cell API.
+  unavailable; bulk export reads each batch's managed cells through one
+  batched read per Blob column and must not loop over the single-cell API.
 - `forbidden_apis.rs` removes the old `read_blob -> BlobFile` surface, classifies
   `read_blob_at` as read-only, and proves no durable call site was added.
 - The canonical-input owner presents Lance's prepared four-child Blob struct to
@@ -1488,11 +1491,10 @@ correctness gate.
 
 ### Phase 4 — measured optimization
 
-- Batched reads landed for materializing rewrites (`read_blobs`) and upgrade
-  validation (`read_blob_ranges`). Remaining: move export and change images onto
-  batched reads and make the schema-apply rewrite bounded and streamed (§8.4),
-  then benchmark. Tuning is optional and may not weaken the batched contract or
-  change logical behavior.
+- Batched reads (`read_blobs`) landed for materializing rewrites, export, the
+  change-feed baseline, change images and entity reads (§4). Remaining: make the
+  schema-apply rewrite bounded and streamed (§8.4), then benchmark. Tuning is
+  optional and may not weaken the batched contract or change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
 - Consider descriptor-preserving unchanged-cell updates only with an ownership
@@ -1723,6 +1725,30 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-08: Export, the change-feed baseline, change-feed images and entity
+  reads read managed payloads through the batched `read_blobs` helper the
+  materializing rewrites use, closing that Phase 4 item. Export and the
+  baseline issue one call per Blob column per batch of rows they walk and
+  consume it row by row, so one row's values and each call's bounded I/O
+  buffer are resident, not the batch's payloads; descriptor classification of
+  the whole batch precedes the call, so a ranged external descriptor is still
+  refused or described before any payload I/O. Change images and entity reads
+  stay one row per call: the change feed admits one change at a time against
+  its page budget, and reading ahead would fetch payloads a closed page
+  discards. The storage upgrade no longer reads Blob values, so no production
+  path calls `read_blob_ranges`. Superseded: §4's "Upgrade validation reads
+  managed bytes through `read_blob_ranges` in bounded windows." and "Export
+  and change-feed images still read one row at a time through `take_blobs` and
+  `BlobFile::read`, and the single-cell read facade uses `take_blobs`; moving
+  export and change images onto batched reads is Phase 4 work."; §9's
+  "Materializing rewrites read complete managed payloads with
+  `Dataset::read_blobs` and upgrade validation reads ranges with
+  `Dataset::read_blob_ranges` (§4); export, change images and lazy single-cell
+  reads use `take_blobs` behind the engine facade."; §12.2's "bulk export keeps
+  its own `take_blobs` selection"; and Phase 4's "Batched reads landed for
+  materializing rewrites (`read_blobs`) and upgrade validation
+  (`read_blob_ranges`). Remaining: move export and change images onto batched
+  reads and make the schema-apply rewrite bounded and streamed (§8.4)".
 - 2026-10-03: Current server-runtime cross-references now name the accepted
   decision; implementation and qualification gates remain with that owner.
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::Hash;
 
@@ -272,10 +273,111 @@ impl LogicalKind {
     }
 }
 
+/// The scalar-index query Lance's scanner built for a scan's pushed filter,
+/// mirrored leaf for leaf so a saved plan can replay the same access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IndexQuery {
+    Search {
+        index: String,
+        column: String,
+        search: String,
+    },
+    And {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    Or {
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+    Not {
+        input: Box<Self>,
+    },
+}
+
+impl IndexQuery {
+    fn index_names(&self, names: &mut BTreeSet<String>) {
+        match self {
+            Self::Search { index, .. } => {
+                names.insert(index.clone());
+            }
+            Self::And { left, right } | Self::Or { left, right } => {
+                left.index_names(names);
+                right.index_names(names);
+            }
+            Self::Not { input } => input.index_names(names),
+        }
+    }
+}
+
+/// Why a scan's access is decided at run time rather than at planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInput {
+    Nearest,
+    FullText,
+    EligibleIds,
+    SearchFilter,
+    JoinFilter,
+    DynamicExpression,
+}
+
+/// How one scan reads its table, decided once at planning from the index
+/// facts and the scanner's own plan; execution replays it without a probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "access", rename_all = "snake_case")]
+pub enum ScanAccess {
+    Sequential,
+    IndexProbe {
+        query: IndexQuery,
+        residual: Option<String>,
+    },
+    Runtime {
+        input: RuntimeInput,
+    },
+    IdLookup {
+        index: Option<String>,
+    },
+}
+
+impl ScanAccess {
+    pub fn use_scalar_index(&self) -> Option<bool> {
+        match self {
+            Self::Sequential => Some(false),
+            Self::IndexProbe { .. } => Some(true),
+            Self::Runtime { .. } | Self::IdLookup { .. } => None,
+        }
+    }
+
+    pub(crate) fn explain(&self, value: &mut Value) {
+        match self {
+            Self::Sequential => value["access"] = json!("sequential"),
+            Self::IndexProbe { query, residual } => {
+                let mut names = BTreeSet::new();
+                query.index_names(&mut names);
+                value["access"] = json!("index_probe");
+                value["index"] = json!(names);
+                value["index_query"] = json!(query);
+                value["residual"] = json!(residual);
+            }
+            Self::Runtime { input } => {
+                value["access"] = json!("runtime");
+                value["reason"] = json!(input);
+            }
+            Self::IdLookup { index } => {
+                value["access"] = json!("id_lookup");
+                value["index"] = json!(index);
+            }
+        }
+    }
+}
+
 /// Rows of one table at one pinned version, optionally scoped to a fragment
 /// set, with a pushed structured filter and a pushed projection.
 #[derive(Debug, Clone)]
 pub struct ScanSpec {
+    pub access: Option<ScanAccess>,
     pub side: SideId,
     pub table: TableRef,
     /// The pinned dataset version, absent when no dataset belongs to this image.
