@@ -438,6 +438,11 @@ resolved member list and per-member directions. Selection kinds are `named`,
 canonical catalog names, with JSON quotes available for a member name. An
 endpoint-only `expand $a $b: mode indexed_scan` applies to every Expand between
 those bindings, including selections.
+The optional `# traversal: auto` header prepares indexes while leaving mode
+selection to the cost model. Without a traversal header or another index
+requirement, a fixture does not build indexes. `indexed` and `csr` prepare
+indexes and force their respective paths.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -446,7 +451,7 @@ plan or its mode differs. A `scan <Type>[ as $var]: access id_lookup` line
 selects the physical scans of that type (or the one bound to that binding)
 and claims each is a traversal's destination read once per slice of at most
 256 input rows; it fails when no such scan is in the physical plan, the scan
-is a table scan (no access path) or the build side of a hash join. A `hash
+has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
@@ -461,6 +466,12 @@ of the scan, the candidates it asks the index for and, on a `nearest` scan,
 the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
 setting does). Nothing is compared as rendered text, so a planner that
 reaches the same facts by another route keeps the case green.
+
+A `scan <Type>[ as $var]: access sequential` line requires the recorded
+sequential choice. `access index_probe <physical-column>` requires a probe
+with that physical column in a leaf of `index_query`; it does not compare
+rendered search text, residuals or index names. `pass scan_access` records
+completed finalization; `pass key_to_id` records a safe key narrowing.
 
 ## Reference comparison
 

@@ -134,6 +134,9 @@ pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
     (memory_limit / 3).min(40 * 1024 * 1024) as usize
 }
 
+/// The built read and its scanner-normalized filter.
+pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
+
 /// Configuration surface for a scan after projection, filtering, and ordering
 /// have been selected by [`TableStore::scan_stream_with`].
 ///
@@ -218,6 +221,11 @@ impl PreparedScan {
 }
 
 impl ScanTuning<'_> {
+    pub(crate) fn use_scalar_index(&mut self, enabled: bool) -> &mut Self {
+        self.scanner.use_scalar_index(enabled);
+        self
+    }
+
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter_demand
             .merge(FtsFilterDemand::from_filter(&filter));
@@ -2155,6 +2163,24 @@ impl TableStore {
         Box::pin(async move {
             let scanner = prepared?.validated(&dataset).await?;
             scanner.create_plan().await.map_err(OmniError::storage)
+        })
+    }
+
+    pub(crate) fn scan_plan_with_filter<F>(
+        ds: &Dataset,
+        projection: Option<&[&str]>,
+        configure: F,
+    ) -> BoxFuture<'static, Result<PlannedScan>>
+    where
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
+    {
+        let prepared = PreparedScan::configure(ds, projection, None, None, false, configure);
+        let dataset = ds.clone();
+        Box::pin(async move {
+            let scanner = prepared?.validated(&dataset).await?;
+            let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
+            let filter = scanner.get_expr_filter().map_err(OmniError::storage)?;
+            Ok((plan, filter))
         })
     }
 
