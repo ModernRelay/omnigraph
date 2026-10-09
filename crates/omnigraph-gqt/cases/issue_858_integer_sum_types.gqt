@@ -1,0 +1,67 @@
+# issue: 858
+# red_on: 90b188bc
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Numbers {
+    id: String @key
+    signed: I32
+    unsigned: U32
+    small: F32
+    large: F64
+}
+--- seed
+{"type":"Numbers","data":{"id":"a","signed":2147483647,"unsigned":4294967295,"small":1.25,"large":1.25}}
+{"type":"Numbers","data":{"id":"b","signed":1,"unsigned":1,"small":0.5,"large":0.5}}
+--- query
+query typed_totals() {
+    match { $n: Numbers }
+    return { sum($n.signed) as signed, sum($n.unsigned) as unsigned, sum($n.small) as small, sum($n.large) as large }
+}
+--- expect unordered
+{"signed":2147483648.0,"unsigned":4294967296.0,"small":1.75,"large":1.75}
+--- expect shape
+signed: F64
+unsigned: F64
+small: F64
+large: F64
+--- expect plan
+aggregate signed: sum(I32) exact_integer round_to_nearest -> F64?
+aggregate unsigned: sum(U32) exact_integer round_to_nearest -> F64?
+aggregate small: sum(F32) float64 round_to_nearest -> F64?
+aggregate large: sum(F64) float64 round_to_nearest -> F64?
+
+--- query
+query parameters($amount: I32, $fraction: F32) {
+    match { $n: Numbers }
+    return { sum($amount) as total, min($amount) as smallest, max($fraction) as largest }
+}
+--- params
+{"amount":7,"fraction":1.25}
+--- expect unordered
+{"total":14.0,"smallest":7,"largest":1.25}
+--- expect shape
+total: F64
+smallest: I32
+largest: F32
+--- expect plan
+aggregate total: sum(I32) exact_integer round_to_nearest -> F64?
+aggregate smallest: min(I32) extremum error -> I32?
+aggregate largest: max(F32) extremum error -> F32?
+
+--- query
+query fraction_average() {
+    match { $n: Numbers }
+    return { avg($n.small) as mean }
+}
+--- expect unordered
+{"mean":0.875}
+--- expect shape
+mean: F64
+--- expect plan
+aggregate mean: avg(F32) float64 round_to_nearest -> F64?

@@ -1266,18 +1266,180 @@ fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
     counter(probes, "ContainsJoinExec", name)
 }
 
-/// 64 MiB of passage text under a 48 MiB pool: the unfiltered Passage scan
-/// refuses, the filtered one holds a batch at a time and the two citing rows.
-/// Rust, not `.gqt`: rows cannot show the pool's cap or the refusing owner.
+/// 64 MiB of payload under a 16 MiB pool: an unordered `limit 1` and a top-k
+/// read of the wide column answer. The limit stops the streamed scan of the
+/// narrow columns after a few batches, the top-k sorts them, and each fetches
+/// its one kept row's payload by row address. The pool is released. GQT cannot set the
+/// pool or read the operators' counters. The scale twin is
+/// `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
 #[tokio::test]
 #[serial]
-async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
+async fn a_wide_column_read_under_a_limit_follows_its_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = graph_fixture(&dir, 4_096, 16 * 1024).await;
+    let limit = 16 * MIB;
+
+    let any = r#"query any_payload() {
+        match { $p: Person }
+        return { $p.payload }
+        limit 1
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, any, "any_payload", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(result.num_rows(), 1);
+    let emitted: usize = probes
+        .execution_metrics()
+        .iter()
+        .filter(|metric| metric.operator == "ScanExec")
+        .map(|metric| metric.output_rows)
+        .sum();
+    assert!(
+        emitted < 4_097,
+        "the limit must stop the scan before it reads the type: {emitted} rows"
+    );
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
+    assert_released(&probes);
+
+    let top = r#"query greatest() {
+        match { $p: Person }
+        return { $p.name, $p.payload }
+        order { $p.name desc }
+        limit 1
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, top, "greatest", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "leaf04095"
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .len(),
+        16 * 1024
+    );
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
+    assert_released(&probes);
+}
+
+/// A join repeats a row once per output row, and hydration copies its
+/// values once per repetition: a `limit 108` over a hub's 512 edges returns
+/// copies of the hub's 40 KiB payload under a 16 MiB pool, and no chunk holds
+/// more than `hydrate_chunk_bytes` (2 MiB) of fetched rows and copies.
+/// Sixteen narrow sources come first, so the seed plans a window far wider
+/// than the hub's rows allow. GQT cannot set the pool or read the operator's
+/// gauge.
+#[tokio::test]
+#[serial]
+async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), GRAPH_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let person = |name: String, payload: String| {
+        serde_json::json!({"type":"Person", "data":{"name":name, "payload":payload}}).to_string()
+    };
+    let knows = |from: String, to: String| {
+        serde_json::json!({"edge":"Knows", "from":from, "to":to}).to_string()
+    };
+    let mut lines: Vec<String> = (0..16)
+        .map(|narrow| person(format!("a{narrow:02}"), String::new()))
+        .collect();
+    lines.push(person("hub".into(), "h".repeat(40 * 1024)));
+    lines.extend((0..512).map(|leaf| person(format!("leaf{leaf:03}"), String::new())));
+    lines.extend((0..16).map(|narrow| knows(format!("a{narrow:02}"), format!("leaf{narrow:03}"))));
+    lines.extend((0..512).map(|leaf| knows("hub".into(), format!("leaf{leaf:03}"))));
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    let fanout = r#"query fanout() {
+        match { $a: Person $a knows $b }
+        return { $a.name, $a.payload }
+        limit 108
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(16 * MIB, query_main(&v2, fanout, "fanout", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 108);
+    let column = |index: usize| {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+    let (names, payloads) = (column(0), column(1));
+    let mut hub_rows = 0;
+    for row in 0..batch.num_rows() {
+        let width = if names.value(row) == "hub" {
+            hub_rows += 1;
+            40 * 1024
+        } else {
+            0
+        };
+        assert_eq!(payloads.value(row).len(), width, "{}", names.value(row));
+    }
+    assert!(hub_rows >= 92, "{hub_rows} of the rows are the hub's");
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [108]);
+    let peak = counter(&probes, "HydrateExec", "peak_chunk_bytes");
+    assert_eq!(peak.len(), 1);
+    assert!(
+        peak[0] > 40 * 1024 && peak[0] as u64 <= omnigraph_planner::hydrate_chunk_bytes(16 * MIB),
+        "a chunk held {} bytes",
+        peak[0]
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_released(&probes);
+}
+
+/// 64 MiB of passage text under a 48 MiB pool: the Passage scan streams a
+/// batch at a time with or without needles, so the plain filtered product
+/// and the contains join both answer; only the join's marked scan sieves,
+/// and only a marked scan records the runtime-filter counters.
+/// Rust, not `.gqt`: rows cannot show the pool's cap or the scan's counters.
+#[tokio::test]
+#[serial]
+async fn a_passage_table_the_pool_cannot_hold_streams_with_and_without_needles() {
     let dir = tempfile::tempdir().unwrap();
     let v2 = citation_fixture(&dir, 16_384, 4_096).await;
     let limit = 48 * MIB;
+    let cited = [
+        ("mN-0001".to_string(), "p000007".to_string()),
+        ("mN-0003".to_string(), "p000011".to_string()),
+    ];
 
     let probes = QueryMemoryProbes::default();
-    let error = with_query_memory_probes(
+    let result = with_query_memory_probes(
         probes.clone(),
         with_query_memory_limit(
             limit,
@@ -1285,15 +1447,12 @@ async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
         ),
     )
     .await
-    .unwrap_err();
-    assert_memory_refusal(error, limit);
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    assert_eq!(cited_pairs(&result.concat_batches().unwrap()), cited);
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
     assert!(
-        probes
-            .refusals()
-            .iter()
-            .any(|owner| owner == "v2 scan attempt"),
-        "the unfiltered Passage scan must refuse its own collection: {:?}",
-        probes.refusals()
+        scan_counter(&probes, "runtime_filter_rows_read").is_empty(),
+        "an unmarked scan records no runtime-filter counters"
     );
     assert_released(&probes);
 
@@ -1304,13 +1463,7 @@ async fn a_text_contains_join_answers_where_the_unfiltered_scan_refuses() {
     )
     .await
     .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
-    assert_eq!(
-        cited_pairs(&result.concat_batches().unwrap()),
-        [
-            ("mN-0001".to_string(), "p000007".to_string()),
-            ("mN-0003".to_string(), "p000011".to_string()),
-        ]
-    );
+    assert_eq!(cited_pairs(&result.concat_batches().unwrap()), cited);
     assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
     assert_eq!(scan_counter(&probes, "runtime_filter_rows_read"), [16_384]);
     assert_eq!(
@@ -1464,6 +1617,7 @@ async fn empty_numbers_pair_with_the_shared_passage_batch() {
 /// The scan's sieve and the join's needle rows share the fill's one automaton,
 /// so a 14.5 MiB pool that fits one build of the 102 numbers' automaton pairs
 /// through it while the scan, every batch kept and its channel full, holds it.
+/// The 2 MB of passages are several of the scan's byte-sized batches.
 #[tokio::test]
 #[serial]
 async fn the_scan_and_the_join_share_one_matcher() {
@@ -1481,7 +1635,7 @@ async fn the_scan_and_the_join_share_one_matcher() {
         long.iter()
             .map(|(mid, number)| (mid.as_str(), number.as_str())),
     );
-    let v2 = citation_graph(&dir, &matters, 2_048, 16).await;
+    let v2 = citation_graph(&dir, &matters, 2_048, 1_024).await;
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
         probes.clone(),
@@ -1571,7 +1725,8 @@ fn cited_by(conjunct: &str, extra: &str) -> String {
 /// Rows of `(key, text)`: matter ids with numbers, or passage ids with texts.
 type KeyedTexts = Vec<(String, Option<String>)>;
 
-/// 1,200 passages over more than one Lance batch and numbers that nest
+/// 20,000 passages, whose sieved rows still fill more than one scan batch of
+/// the session's 8,192 rows, and numbers that nest
 /// (`16`, `016`, `1016`, `x1016`), repeat, equal a whole text, hold `é` or
 /// `日本`, are empty or null; texts are sometimes empty or null.
 fn generated_citations() -> (KeyedTexts, KeyedTexts) {
@@ -1593,7 +1748,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
         matters.push((mid.to_string(), Some(number.to_string())));
     }
     matters.push(("m-null".to_string(), None));
-    let passages = (0..1_200)
+    let passages = (0..20_000)
         .map(|i: usize| {
             let text = match i {
                 600 => Some("whole text of one passage".to_string()),
@@ -1618,7 +1773,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
                     ))
                 }
             };
-            (format!("p{i:04}"), text)
+            (format!("p{i:05}"), text)
         })
         .collect();
     (matters, passages)
@@ -1626,7 +1781,7 @@ fn generated_citations() -> (KeyedTexts, KeyedTexts) {
 
 /// The contains join equals its `or` form (the filtered cross join) and
 /// `str::contains` over every pair, with and without the empty number. Rust,
-/// not `.gqt`: generated inputs at Lance-batch scale.
+/// not `.gqt`: generated inputs at scan-batch scale.
 #[tokio::test]
 #[serial]
 async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_several_batches() {

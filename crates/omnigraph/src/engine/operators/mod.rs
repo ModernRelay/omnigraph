@@ -36,6 +36,7 @@ mod filter;
 #[cfg(test)]
 mod fixtures;
 mod hash_join;
+mod hydrate;
 mod limit;
 pub(in crate::engine) mod memory;
 mod metadata_count;
@@ -59,6 +60,7 @@ pub(super) use expand::{
 };
 pub(super) use filter::FilterExec;
 pub(super) use hash_join::{HashJoinExec, LookupSpec};
+pub(super) use hydrate::HydrateExec;
 pub(super) use limit::LimitExec;
 pub(super) use metadata_count::MetadataCountExec;
 pub(super) use projection::ProjectionExec;
