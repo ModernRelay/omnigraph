@@ -37,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -79,16 +79,17 @@ Merge queue entries trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml`
 through `merge_group` (`checks_requested`). These runs check out the combined
 queue commit; the classifier diffs the group's base and head, so a
 documentation-only entry skips the same work it skips on a pull request.
-Workspace tests fail fast as they do on pull requests. The PR metadata gate
-stays on `pull_request_target` and reports a pass on the queue; the
+Workspace tests fail fast as they do on pull requests. The PR metadata gates
+stay on `pull_request_target`; on the queue `Fix Regression Gate` reports a
+pass and `PR Title` checks the squash subject the entry is about to land; the
 vocabulary audit, Azurite, the format fence, the RustFS shards and the
 deployment jobs keep their pull-request or post-merge schedule and never run
 on the queue; the DST pinned suite runs there as a reporting context. Queue
 runs never publish releases or save the main branch's caches. Details:
 [branch-protection.md](branch-protection.md), Merge queue.
 
-Branch protection requires four contexts: `CI Gate`, `Check Workflow Action
-Pins`, `GQ Logic Tests` and `Fix Regression Gate`. `CI Gate` is the `ci_gate`
+Branch protection requires five contexts: `CI Gate`, `Check Workflow Action
+Pins`, `GQ Logic Tests`, `Fix Regression Gate` and `PR Title`. `CI Gate` is the `ci_gate`
 job of `ci.yml`: it needs `classify_changes`, `check_agents_md`,
 `workflow_action_pins`, `cargo_deny`, `graph_vocabulary_guard`, `fmt`,
 `lint`, `test`, `storage_upgrade_compatibility` and `test_aws_feature`, runs
@@ -99,7 +100,9 @@ restates it. Those ten jobs are what blocks `main`; a new blocking job joins
 `needs:` and the table in the same pull request, and
 `scripts/check-merge-group-triggers.py` holds the two equal and pins the
 gate's wiring. `Check Workflow Action Pins` is required on its own so a
-malformed gate cannot hide that validator's red. Details and the recovery
+malformed gate cannot hide that validator's red. `GQ Logic Tests`, `Fix
+Regression Gate` and `PR Title` are their own workflows and keep their own
+names. Details and the recovery
 routes: [branch-protection.md](branch-protection.md), CI Gate.
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
@@ -217,6 +220,23 @@ only as data for the diff range, never checked out or executed. It runs on
 body edits and label changes as well as pushes, builds nothing, and runs for
 every change class. On the merge queue's branch it reports a pass
 without a check ([branch-protection.md](branch-protection.md), Merge queue).
+`PR Title` (`pr-title.yml`) holds the pull request title to
+`type(scope)!: description`: a type from `feat fix perf refactor docs test ci
+build revert rfc release`, an optional lowercase scope list, `!` for a
+breaking change, and a description that starts lowercase (a backtick or digit
+also passes), carries no trailing period, and keeps the title within 100
+characters with no whitespace but the plain space; `docs(rfc):` is refused in favour of `rfc:`, and GitHub's
+`Revert "…"` title in favour of `revert: …` (the rule and its examples:
+[CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests).
+`scripts/check-pr-title.py` is the check; it runs its `--self-test` first and
+prints one actionable failure line with the accepted shape and two examples,
+as a log line and as a GitHub error annotation. It is a policy check on
+`pull_request_target` like the regression gate, re-run on every title edit,
+and the pull request head is never fetched. On the merge queue's branch it
+checks the first line of the group commit's message, minus the ` (#N)`
+suffix: the subject the queue lands, fixed when the group is built, so a
+title edit after queueing cannot change what lands unchecked
+([branch-protection.md](branch-protection.md), Merge queue).
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC
@@ -485,6 +505,8 @@ python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-storage-upgrade-ci.py --self-test
 python3 scripts/check-merge-group-triggers.py --self-test
 python3 scripts/ci_gate.py --self-test
+python3 scripts/check-pr-title.py --self-test
+python3 scripts/check-pr-title.py --title "<the title you will give the pull request>"
 python3 scripts/check-ci-cells.py --self-test
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
