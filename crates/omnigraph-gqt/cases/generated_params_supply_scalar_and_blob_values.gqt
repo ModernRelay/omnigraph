@@ -1,8 +1,8 @@
 # issue: none
 # notes: A `--- params generate` recipe supplies a mutation's parameters: a key
 # notes: and a 4-byte Blob generated from `{kind: blob}`, the same `base64:` text
-# notes: a literal body would carry. The insert lands, and a second insert
-# notes: with the same key under a literal body is refused: the key is taken.
+# notes: a literal body would carry. The insert lands under the generated key,
+# notes: in this process and in every DST worker, which generates it itself.
 
 --- runner
 timeout_ms: 10000
@@ -44,13 +44,3 @@ query slugs() {
 
 --- expect shape
 d.slug: String
-
---- mutate
-query put($slug: String, $body: Blob) {
-    insert Doc { slug: $slug, body: $body }
-}
-
---- params
-{"slug": "doc-00", "body": "base64:BwcHBw=="}
-
---- expect error: already has this id
