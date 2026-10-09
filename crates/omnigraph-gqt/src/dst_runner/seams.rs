@@ -286,6 +286,37 @@ enum ArmedKind {
     },
 }
 
+/// Forwards every crossing to the armed decider and writes the decision it
+/// returned to the trace, a no-op row when no trace is recording.
+#[cfg(tokio_unstable)]
+struct Traced<D: ?Sized>(std::sync::Arc<D>);
+
+#[cfg(tokio_unstable)]
+impl<D: omnigraph::seams::Decide + ?Sized> omnigraph::seams::Behavior for Traced<D> {}
+
+#[cfg(tokio_unstable)]
+impl<D: omnigraph::seams::Decide + ?Sized> omnigraph::seams::Decide for Traced<D> {
+    fn decide(&self, name: &'static str) -> omnigraph::seams::Decision {
+        let decision = self.0.decide(name);
+        let (verdict, effect) = decision_columns(decision);
+        crate::trace::crossing(name, verdict, effect);
+        decision
+    }
+}
+
+/// The trace's two columns for a decision: `pass`, `fire` with the effect,
+/// or `store` with the store effect.
+#[cfg(tokio_unstable)]
+pub(crate) fn decision_columns(
+    decision: omnigraph::seams::Decision,
+) -> (&'static str, Option<&'static str>) {
+    match decision {
+        omnigraph::seams::Decision::Pass => ("pass", None),
+        omnigraph::seams::Decision::Fire(effect) => ("fire", Some(effect.as_str())),
+        omnigraph::seams::Decision::Store(effect) => ("store", Some(effect.as_str())),
+    }
+}
+
 /// A rule outlives its step only through `finish_seams`, which drains it; the
 /// guard covers every other exit.
 #[cfg(tokio_unstable)]
@@ -365,9 +396,16 @@ pub(crate) fn arm_seams(
             super::release_phase_observer(&seam.at);
             let (guard, kind) = match admitted {
                 Admitted::Code(entry, effect) => {
-                    let (guard, counted) =
-                        entry.count_and_fire_at_with(seam.occurrence as u64, effect);
-                    (Some(guard), ArmedKind::Code { entry, counted })
+                    let counted = std::sync::Arc::new(omnigraph::seams::Counted::new(
+                        seam.occurrence as u64,
+                        effect,
+                    ));
+                    let behavior: std::sync::Arc<dyn omnigraph::seams::Decide> =
+                        std::sync::Arc::new(Traced(counted.clone()));
+                    (
+                        Some(entry.install(behavior)),
+                        ArmedKind::Code { entry, counted },
+                    )
                 }
                 Admitted::CodeStore(entry, effect) => {
                     let Some(decoration) = decoration.clone() else {
@@ -392,7 +430,8 @@ pub(crate) fn arm_seams(
                         crossings: std::sync::atomic::AtomicU64::new(0),
                         fired: std::sync::atomic::AtomicBool::new(false),
                     });
-                    let behavior: std::sync::Arc<dyn omnigraph::seams::Decide> = counted.clone();
+                    let behavior: std::sync::Arc<dyn omnigraph::seams::Decide> =
+                        std::sync::Arc::new(Traced(counted.clone()));
                     (
                         Some(entry.install(behavior)),
                         ArmedKind::CodeStore { entry, counted },
