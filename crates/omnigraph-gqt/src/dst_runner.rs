@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::runner_config::{Environment, Execution};
 use crate::{CaseOutcome, parse_case, stem_of};
 
-mod seams;
+pub(crate) mod seams;
 mod settings;
 
 #[cfg(tokio_unstable)]
@@ -61,23 +61,84 @@ pub(crate) fn active() -> bool {
 }
 
 pub(crate) fn observe(value: impl FnOnce() -> String) {
+    if overflowed() {
+        return;
+    }
+    let value = value();
+    crate::trace::emit(&crate::trace::Row::Observation { text: &value });
+}
+
+/// Whether this task's report stopped keeping rows at its limit; a host
+/// hook skips building a value the fold would drop.
+fn overflowed() -> bool {
+    OBSERVATIONS
+        .try_with(|events| events.borrow().overflow)
+        .unwrap_or(true)
+}
+
+/// The report's sink of the trace stream: every row the worker emits reaches
+/// it, and it keeps the operation, observation and evidence rows in the
+/// shape the terminal report has always carried, within `LIMIT`.
+pub(crate) fn fold(row: &crate::trace::Row<'_>) {
+    use crate::trace::Row;
     OBSERVATIONS
         .try_with(|events| {
             let mut events = events.borrow_mut();
-            if events.overflow {
-                return;
-            }
-            let value = value();
-            events.bytes += value.len();
-            if events.bytes > LIMIT || events.entries >= 100_000 {
-                events.overflow = true;
-            } else {
-                events.entries += 1;
-                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
-                    events.sessions.entry(index).or_default().values.push(value);
-                } else {
-                    events.values.push(value);
+            match row {
+                Row::Operation => {
+                    events.operation = crate::trace::current_step().map(|step| step.report_value());
                 }
+                Row::Observation { text } => {
+                    if events.overflow {
+                        return;
+                    }
+                    let value = (*text).to_string();
+                    events.bytes += value.len();
+                    if events.bytes > LIMIT || events.entries >= 100_000 {
+                        events.overflow = true;
+                    } else {
+                        events.entries += 1;
+                        if let Ok(index) =
+                            crate::measure::SESSION.try_with(|session| session.index)
+                        {
+                            events.sessions.entry(index).or_default().values.push(value);
+                        } else {
+                            events.values.push(value);
+                        }
+                    }
+                }
+                Row::Evidence {
+                    record,
+                    value,
+                    session,
+                } => {
+                    if events.overflow {
+                        return;
+                    }
+                    let mut event = serde_json::json!({"kind": record, "operation": events.operation, "value": value});
+                    if let Some(session) = session {
+                        event["session"] = serde_json::json!(session);
+                    }
+                    events.bytes += event.to_string().len();
+                    if events.bytes > LIMIT || events.entries >= 100_000 {
+                        events.overflow = true;
+                    } else {
+                        events.entries += 1;
+                        if let Ok(index) =
+                            crate::measure::SESSION.try_with(|session| session.index)
+                        {
+                            events
+                                .sessions
+                                .entry(index)
+                                .or_default()
+                                .evidence
+                                .push(event);
+                        } else {
+                            events.evidence.push(event);
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .unwrap_or_default();
@@ -126,25 +187,28 @@ fn lifecycle_probe() -> (
     .zip(counts.iter())
     .map(|(seam, count)| {
         let count = count.clone();
+        let name = seam.name();
         seam.observe(move || {
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::trace::crossing(name, "pass", None);
         })
     })
     .collect();
     (counts, guards)
 }
 
-/// The phase observers of a measured run: one pass-through decider per
-/// catalog seam, so the ledger learns which seam the engine crossed last.
+/// The phase observers of a measured or traced run: one pass-through decider
+/// per catalog seam, so the ledger learns which seam the engine crossed last
+/// and the trace sees every crossing.
 #[cfg(tokio_unstable)]
 static PHASE_OBSERVERS: std::sync::Mutex<Vec<(&'static str, DecideGuard)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Install a phase observer on every empty decision seam; a no-op when the
-/// process is not measuring.
+/// process neither measures nor records a trace.
 #[cfg(tokio_unstable)]
 pub(crate) fn rearm_phase_observers() {
-    if crate::measure::model().is_none() {
+    if crate::measure::model().is_none() && !crate::trace::active() {
         return;
     }
     let mut observers = PHASE_OBSERVERS.lock().unwrap();
@@ -156,7 +220,13 @@ pub(crate) fn rearm_phase_observers() {
         if observers.iter().any(|(held, _)| *held == name) || seam.with(|_| ()).is_some() {
             continue;
         }
-        observers.push((name, seam.observe(move || crate::measure::cross(name))));
+        observers.push((
+            name,
+            seam.observe(move || {
+                crate::measure::cross(name);
+                crate::trace::crossing(name, "pass", None);
+            }),
+        ));
     }
 }
 
@@ -227,41 +297,18 @@ pub struct MeasureOptions {
 }
 
 pub(crate) fn begin_operation(value: serde_json::Value) {
-    OBSERVATIONS
-        .try_with(|events| events.borrow_mut().operation = Some(value))
-        .unwrap_or_default();
+    crate::trace::operation(&value);
 }
 
 pub(crate) fn record(kind: &str, value: serde_json::Value) {
-    OBSERVATIONS
-        .try_with(|events| {
-            let mut events = events.borrow_mut();
-            if events.overflow {
-                return;
-            }
-            let mut event =
-                serde_json::json!({"kind": kind, "operation": events.operation, "value": value});
-            if let Ok(session) = crate::measure::SESSION.try_with(|s| s.label.slot) {
-                event["session"] = serde_json::json!(session);
-            }
-            events.bytes += event.to_string().len();
-            if events.bytes > LIMIT || events.entries >= 100_000 {
-                events.overflow = true;
-            } else {
-                events.entries += 1;
-                if let Ok(index) = crate::measure::SESSION.try_with(|session| session.index) {
-                    events
-                        .sessions
-                        .entry(index)
-                        .or_default()
-                        .evidence
-                        .push(event);
-                } else {
-                    events.evidence.push(event);
-                }
-            }
-        })
-        .unwrap_or_default();
+    if overflowed() {
+        return;
+    }
+    crate::trace::emit(&crate::trace::Row::Evidence {
+        record: kind,
+        value: &value,
+        session: crate::measure::SESSION.try_with(|s| s.label.slot).ok(),
+    });
 }
 
 pub(crate) fn observe_result(result: &QueryResult, ordered: bool) {
@@ -338,6 +385,8 @@ struct Input {
     effective_settings: settings::EffectiveSettings,
     #[serde(default)]
     engine: Engine,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
     bless: bool,
     /// `--measure`: the DST worker records every store request per step.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -388,6 +437,8 @@ struct Attempt {
     replay: usize,
     input: Input,
     outcome: Result<WorkerReport, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -616,8 +667,10 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
         Selection {
             target: None,
             storage: None,
+            store: None,
             seed: None,
             fast_tier: true,
+            trace: false,
             measure: None,
             artifacts: None,
         },
@@ -626,8 +679,9 @@ pub fn run_corpus_case(path: &Path, executable: &Path, bless: bool) -> CaseOutco
 
 /// Select only declared environment/seed values; omission executes the complete case.
 /// `measure` records every store request per step under the DST environments;
-/// `artifacts` is where the report and the measure TSV land, the build tree's
-/// `target/gqt-artifacts/` when `None`.
+/// `artifacts` holds reports, measurement TSVs and optional diagnostic traces;
+/// `None` uses the build tree's `target/gqt-artifacts/`.
+/// `trace` records each selected DST attempt outside replay comparisons.
 pub fn run_selected(
     path: &Path,
     executable: &Path,
@@ -637,6 +691,8 @@ pub fn run_selected(
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
+    store: Option<&str>,
+    trace: bool,
 ) -> CaseOutcome {
     run_with_selection(
         path,
@@ -645,8 +701,10 @@ pub fn run_selected(
         Selection {
             target,
             storage,
+            store,
             seed,
             fast_tier: false,
+            trace,
             measure,
             artifacts,
         },
@@ -656,8 +714,10 @@ pub fn run_selected(
 struct Selection<'a> {
     target: Option<&'a str>,
     storage: Option<&'a str>,
+    store: Option<&'a str>,
     seed: Option<u64>,
     fast_tier: bool,
+    trace: bool,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
 }
@@ -1286,7 +1346,15 @@ fn save_summary(summary: &Summary, artifacts: Option<&Path>) -> Result<(), Strin
         .keep()
         .map_err(|e| format!("report_failed: retain summary: {e}"))?;
     println!("GQT report: {}", path.display());
-    println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        println!("GQT replay unavailable: external store contents are not frozen");
+    } else {
+        println!("GQT replay: omnigraph-gqt --replay '{}'", path.display());
+    }
     Ok(())
 }
 
@@ -1444,8 +1512,29 @@ fn run_invocation(
     if selected_envs.is_empty() {
         return Err("invalid_case: environment selector matches no declared environment".into());
     }
+    case.admit_store(selection.store)?;
+    if selection.measure.is_some()
+        && !selected_envs.iter().any(|env| {
+            matches!(
+                env.execution,
+                Execution::Dst { .. } | Execution::ServerDst { .. }
+            )
+        })
+    {
+        return Err("invalid_case: --measure requires a selected DST environment".into());
+    }
+    if selection.trace
+        && !selected_envs.iter().any(|env| {
+            matches!(
+                env.execution,
+                Execution::Dst { .. } | Execution::ServerDst { .. }
+            )
+        })
+    {
+        return Err("invalid_case: --trace requires a selected DST environment".into());
+    }
     for env in &selected_envs {
-        env.admit(case.needs_dst())?;
+        env.admit_store(case.needs_dst(), selection.store)?;
     }
     for (ordinal, seams) in &case.seams {
         let step = case
@@ -1494,13 +1583,10 @@ fn run_invocation(
                 if worker_failed || isolation_lost || evidence_exhausted || deadline_expired {
                     continue;
                 }
-                let left = match remaining() {
-                    Ok(left) => left,
-                    Err(error) => {
-                        failures.push(error);
-                        return Err(failures.join("\n"));
-                    }
-                };
+                if let Err(error) = remaining() {
+                    failures.push(error);
+                    return Err(failures.join("\n"));
+                }
                 let input = Input {
                     case_path: path.to_path_buf(),
                     stem: stem_of(path),
@@ -1514,6 +1600,7 @@ fn run_invocation(
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
                     engine,
+                    store: selection.store.map(str::to_owned),
                     bless,
                     measure: selection.measure.is_some(),
                     model: selection
@@ -1521,7 +1608,39 @@ fn run_invocation(
                         .as_ref()
                         .map_or_else(String::new, |options| options.model.clone()),
                 };
-                let mut outcome = run_child(&input, executable, left);
+                let trace = match seed {
+                    Some(seed) if selection.trace => {
+                        let created = serde_json::to_value(env)
+                            .map_err(|e| format!("report_failed: encode environment: {e}"))
+                            .and_then(|environment| {
+                                crate::trace::create(
+                                    &artifacts_root(selection.artifacts.as_deref()),
+                                    &crate::trace::Start {
+                                        format: crate::trace::FORMAT,
+                                        version: crate::trace::VERSION,
+                                        invocation_id: &summary.invocation_id,
+                                        case_path: &input.case_path,
+                                        case_digest: &input.case_digest,
+                                        source_digest: &input.source_digest,
+                                        executable_digest: &input.executable_digest,
+                                        environment,
+                                        seed,
+                                        replay,
+                                    },
+                                )
+                            });
+                        match created {
+                            Ok(path) => Some(path),
+                            Err(error) => {
+                                failures.push(error);
+                                return Err(failures.join("\n"));
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let mut outcome = remaining()
+                    .and_then(|left| run_child(&input, executable, left, trace.as_deref()));
                 if let Ok(report) = &outcome {
                     let size = json(report)?.len();
                     retained_bytes = retained_bytes.saturating_add(size);
@@ -1553,6 +1672,7 @@ fn run_invocation(
                     replay,
                     input,
                     outcome,
+                    trace,
                 });
             }
             if reports.len() == 2 {
@@ -1577,7 +1697,30 @@ fn run_invocation(
     }
 }
 
-fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<WorkerReport, String> {
+fn store_environment_variable(store: &str, key: &str) -> bool {
+    if store.starts_with("s3://") {
+        return key.starts_with("AWS_");
+    }
+    store.starts_with("az://")
+        && (key.starts_with("AZURE_")
+            || matches!(
+                key,
+                "AZURITE_BLOB_STORAGE_URL"
+                    | "IDENTITY_ENDPOINT"
+                    | "IDENTITY_HEADER"
+                    | "MSI_ENDPOINT"
+                    | "AWS_ALLOW_HTTP"
+                    | "OBJECT_STORE_CLIENT_MAX_RETRIES"
+                    | "OBJECT_STORE_CLIENT_RETRY_TIMEOUT"
+            ))
+}
+
+fn run_child(
+    input: &Input,
+    executable: &Path,
+    budget: Duration,
+    trace: Option<&Path>,
+) -> Result<WorkerReport, String> {
     input.effective_settings.verify_expected(input.seed)?;
     let started = Instant::now();
     let dir =
@@ -1595,7 +1738,16 @@ fn run_child(input: &Input, executable: &Path, budget: Duration) -> Result<Worke
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(path) = trace {
+        cmd.env(crate::trace::WORKER_PATH, path);
+    }
     input.effective_settings.configure(&mut cmd);
+    if let Some(store) = &input.store {
+        cmd.envs(std::env::vars_os().filter(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| store_environment_variable(store, key))
+        }));
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("worker_failed: spawn: {e}"))?;
@@ -1666,7 +1818,14 @@ pub fn run_worker_if_requested(_path: &Path) -> Result<bool, String> {
             let input: Input = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("invalid_case: worker input: {e}"))?;
             let input_digest = digest(&bytes);
-            let report = match worker_report(&input, input_digest.clone()) {
+            let recording = std::env::var_os(crate::trace::WORKER_PATH)
+                .map(|path| crate::trace::Recording::start(Path::new(&path)))
+                .transpose();
+            let result = match &recording {
+                Ok(_) => worker_report(&input, input_digest.clone()),
+                Err(error) => Err(error.clone()),
+            };
+            let mut report = match result {
                 Ok(report) => report,
                 Err(error) => WorkerReport {
                     code: error_code(&error).into(),
@@ -1678,6 +1837,16 @@ pub fn run_worker_if_requested(_path: &Path) -> Result<bool, String> {
                     measurements: vec![],
                 },
             };
+            if let Ok(Some(recording)) = recording {
+                if let Err(error) = recording.finish(&report.code, &report.phase) {
+                    report.result = Err(match report.result {
+                        Ok(()) => error,
+                        Err(original) => format!("{original}\n{error}"),
+                    });
+                    report.code = "report_failed".into();
+                    report.phase = "teardown".into();
+                }
+            }
             std::fs::write(output, json(&report)?)
                 .map_err(|e| format!("report_failed: write worker report: {e}"))?;
             Ok(true)
@@ -1708,7 +1877,10 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     {
         return Err("environment_changed: worker selection is not declared".into());
     }
-    input.environment.admit(case.needs_dst())?;
+    case.admit_store(input.store.as_deref())?;
+    input
+        .environment
+        .admit_store(case.needs_dst(), input.store.as_deref())?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
@@ -1729,7 +1901,13 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                 .map_err(|e| format!("worker_failed: runtime: {e}"))?;
             runtime.block_on(capture(
                 input_digest,
-                crate::execute_case_on_engine(&case, &input.case_path, input.bless, input.engine),
+                crate::execute_case_on_engine(
+                    &case,
+                    &input.case_path,
+                    input.bless,
+                    input.engine,
+                    input.store.as_deref(),
+                ),
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
@@ -1975,6 +2153,13 @@ fn replay_attempts(
 ) -> Result<(), String> {
     refuse_ambient()?;
     crate::engine_from_env()?;
+    if summary
+        .attempts
+        .iter()
+        .any(|attempt| attempt.input.store.is_some())
+    {
+        return Err("invalid_case: external-store invocations cannot replay; the report does not freeze store contents".into());
+    }
     for attempt in &summary.attempts {
         attempt
             .input
@@ -2059,7 +2244,7 @@ fn replay_attempts(
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
             .ok_or("timeout: replay exceeded wall-time budget")?;
-        let outcome = run_child(&attempt.input, executable, remaining);
+        let outcome = run_child(&attempt.input, executable, remaining, None);
         let report = match outcome {
             Ok(report) => report,
             Err(error) => {
@@ -2070,6 +2255,7 @@ fn replay_attempts(
                     replay: attempt.replay,
                     input: attempt.input.clone(),
                     outcome: Err(error),
+                    trace: None,
                 });
                 return Err(failures.join("\n"));
             }
@@ -2089,6 +2275,7 @@ fn replay_attempts(
             replay: attempt.replay,
             input: attempt.input.clone(),
             outcome: Ok(report),
+            trace: None,
         });
     }
     if budget.is_some_and(|budget| started.elapsed() >= budget) {
@@ -2108,6 +2295,110 @@ mod action_tests {
     use super::seams::admitted_effect;
     use crate::runner_config::SeamAction;
 
+    #[cfg(unix)]
+    #[test]
+    fn timeout_retains_trace_after_worker_cleanup() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("worker");
+        std::fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let case_path = dir.path().join("case.gqt");
+        let trace =
+            crate::trace::create(dir.path(), &crate::trace::Start::test(&case_path)).unwrap();
+        let input = Input {
+            case_path,
+            stem: "timeout".into(),
+            text: "".into(),
+            case_digest: String::new(),
+            plan_digest: String::new(),
+            executable_digest: String::new(),
+            source_revision: String::new(),
+            source_digest: String::new(),
+            environment: Environment {
+                execution: Execution::Dst {
+                    storage: crate::runner_config::Storage::InMemoryObjectStore,
+                    seeds: vec![0],
+                },
+            },
+            seed: Some(0),
+            effective_settings: settings::EffectiveSettings::for_seed(Some(0)),
+            engine: Engine::V2,
+            store: None,
+            bless: false,
+            measure: false,
+            model: String::new(),
+        };
+        let error = run_child(&input, &executable, Duration::ZERO, Some(&trace)).unwrap_err();
+        assert!(error.starts_with("timeout:"), "{error}");
+        assert!(error.contains("contained=true"), "{error}");
+        let text = std::fs::read_to_string(trace).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "start");
+    }
+
+    #[test]
+    fn external_worker_environment_is_scoped_to_its_backend() {
+        for (uri, accepted) in [
+            ("file:///tmp/graph", vec![]),
+            (
+                "s3://bucket/graph",
+                vec![
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_ALLOW_HTTP",
+                    "AWS_S3_FORCE_PATH_STYLE",
+                ],
+            ),
+            (
+                "az://container/graph",
+                vec![
+                    "AZURE_STORAGE_ACCOUNT_NAME",
+                    "AZURE_STORAGE_ACCOUNT_KEY",
+                    "AZURE_STORAGE_USE_EMULATOR",
+                    "AZURITE_BLOB_STORAGE_URL",
+                    "IDENTITY_ENDPOINT",
+                    "IDENTITY_HEADER",
+                    "MSI_ENDPOINT",
+                    "AWS_ALLOW_HTTP",
+                    "OBJECT_STORE_CLIENT_MAX_RETRIES",
+                    "OBJECT_STORE_CLIENT_RETRY_TIMEOUT",
+                ],
+            ),
+        ] {
+            for key in &accepted {
+                assert!(super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+            for key in [
+                "FAILPOINTS",
+                "RAYON_NUM_THREADS",
+                "LANCE_CPU_THREADS",
+                "OMNIGRAPH_ENGINE",
+                "DST_ENTROPY_SEED",
+                "HOME",
+                "PATH",
+                "GQT_WORKER_INPUT",
+            ] {
+                assert!(!super::store_environment_variable(uri, key), "{uri}: {key}");
+            }
+        }
+        assert!(!super::store_environment_variable(
+            "s3://bucket/graph",
+            "AZURE_STORAGE_ACCOUNT_KEY"
+        ));
+        assert!(!super::store_environment_variable(
+            "az://container/graph",
+            "AWS_SECRET_ACCESS_KEY"
+        ));
+    }
     #[test]
     fn fail_and_contention_are_selectable_regardless_of_declaration_order() {
         for effects in [

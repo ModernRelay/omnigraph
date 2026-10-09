@@ -32,9 +32,11 @@ counts only cases under `cases/`.
 
 ## Explicit execution
 
-Every case starts with its existing issue header, followed by required runner,
-schema and seed sections. Configuration has no default target, storage, seed
-or timeout:
+Every case starts with its issue header and a required runner section.
+Schema and seed sections are optional together; without them, the runner
+requires `--store <URI>`. A case may have zero steps, including a dataset
+containing only schema and seed. Configuration has no default target,
+storage, seed or timeout:
 
 ```yaml
 --- runner
@@ -47,11 +49,22 @@ environments:
     seeds: [0, 42]
 ```
 
-The complete scenario executes against a fresh graph for each environment.
-These two target/storage combinations are implemented. Direct engine execution
-currently refuses seams. Server targets, direct-engine memory storage, cloud
-storage and other combinations fail admission explicitly; their names do not
-imply implementation or qualification.
+With schema and seed, the complete scenario executes against a fresh graph
+for each environment. These two target/storage combinations are implemented.
+With `--store`, direct engine execution opens an existing `file://`, `s3://`
+or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
+`azure-blob-storage` backend. It skips initialization, seed loading and
+automatic index building; ordinary steps may change the supplied store.
+`--store` refuses files with schema and seed, DST and server targets, seams,
+and concurrent blocks. Server targets, direct-engine memory storage and
+cloud fixture initialization fail admission explicitly.
+
+External workers inherit only the selected backend's storage configuration:
+`AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,
+Azure HTTP allowances and object-store retry settings for Azure. These values
+are not written to reports. The engine's existing backend admission rules
+still apply. Keep external queries outside `cases/`: corpus execution has no
+store argument and refuses a file without schema and seed.
 
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
@@ -70,15 +83,125 @@ The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;
 longer standalone reproductions must be selected deliberately. Unknown, duplicate, missing and inapplicable YAML fields are
-refused, as are aliases, anchors, merge keys and tags. Each DST seed runs twice
+refused, as are aliases, anchors, merge keys and tags. The same admission
+serves `--- seam` directives and generated recipes, and its errors name the
+section (runner configuration, seam directive, generated recipe). Mapping
+keys must be strings: a plain `true`, `1` or `~` key is refused rather than
+silently merged with its quoted twin. A YAML section body is the file text up
+to the next header with every line newline-terminated, so a block scalar that
+ends a body keeps the final line break the file shows. Each DST seed runs twice
 in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
 
+## Generated fixtures and loads
+
+An ordinary `--- seed` contains JSONL and loads with overwrite semantics.
+`--- seed generate: v1 seed: <u64>` contains a strict YAML recipe, appending
+one table batch per commit in recipe order. Later steps reuse that recipe:
+
+```yaml
+--- load generate: v1 seed: 42 mode: merge branch: work
+tables:
+  - kind: node
+    name: Person
+    rows: 3
+    commits: 2
+    start: 0
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      score: {kind: ordinal, start: -1, step: -1}
+      bucket: {kind: modulo, modulus: 2}
+      payload: {kind: repeat, text: x, count: 64}
+      embedding: {kind: vector, dimensions: 3}
+--- expect ok
+```
+
+The schema declares the types and keys. A load requires `mode: append` or
+`mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
+is `ok` or `error: <substring>`, with no params, affected-count, row or shape
+section. Table batches publish independently; a later failure does not undo
+earlier batches. A load in a loop repeats its unchanged recipe. Interpolation
+in generator bodies and headers is refused. Seed headers require an explicit
+unsigned 64-bit seed and `generate: v1`; load headers additionally require a
+mode. A load requires at least one nonempty batch; empty recipes are admitted
+only as seeds. Unknown, repeated or inapplicable arguments are refused.
+
+Each table requires `kind: node|edge`, `name`, `rows`, `commits` and `columns`.
+`start` defaults to zero; row `i` has ordinal `start + i`. Optional `wrap`
+reduces that ordinal modulo a positive bound, allowing reversible updates to
+existing keys. An edge also requires `from` and `to`. Optional `id` supplies
+an explicit identity; omitting it lets the loader derive a declared key.
+Envelope `id`, `from` and `to` generators must produce strings. Node recipes
+cannot supply endpoints. All these generators emit ordinary loader JSONL:
+
+| Column kind | Required fields | Value at ordinal `i` |
+| --- | --- | --- |
+| `literal` | `value` | The JSON value, including null |
+| `repeat` | `text`, `count` | `text` repeated `count` times |
+| `ordinal` | `start`, `step` | Signed 64-bit `start + step * i` |
+| `key` | `prefix`, `width` | Prefix plus a decimal ordinal, padded to at least `width` digits; optional positive `modulo` first reduces `i` |
+| `modulo` | `modulus` | `i % modulus`, with positive modulus |
+| `ranges` | `ranges`, `fallback` | First `{end, value}` with `i < end`, otherwise fallback; ends strictly increase |
+| `vector` | `dimensions` | Deterministic components in `[0, 1)`, exactly representable as `f32` |
+| `endpoint` | `prefix`, `width`, `population`, `distribution` | A padded key selected from `0..population` |
+
+Endpoint distribution is `{kind: ordinal}`, `{kind: uniform}`, or
+`{kind: zipf, exponent: 1.25}`. Ordinal selects `i % population`. Uniform
+uses rejection sampling. Zipf assigns rank `r = 1..population` weight
+`r^-exponent`. Explicit table order loads nodes before their dependent edges.
+
+For nonempty tables, `commits` is in `1..=rows`. Without `batch_rows`, rows
+split evenly across exactly that many calls, assigning remainder rows to the
+earliest calls. Optional `batch_rows` fixes chunk size and must produce exactly
+`commits` nonempty calls; the final chunk may be shorter. Zero rows require
+zero commits; an explicit `batch_rows` must still be in `1..=4096`. The recipe admits at most 256 tables, 256 columns per table,
+10 million total rows, 100000 total commits and a conservative 4 GiB JSON
+size bound. Each batch has at most 4096 rows and a conservative 16 MiB byte
+bound. Vectors have 1–4096 dimensions, key widths at most 128 and ranges at
+most 256 entries. Zipf requires a finite exponent in `(0, 16]`, population
+at most one million and at most eight million CDF entries across the recipe.
+Overflow, unsupported generators and YAML aliases, anchors, merge keys and
+tags are refused before initialization. A `#` line inside a recipe is YAML
+text, data inside a block scalar and dropped elsewhere; the `#`-line refusal
+applies to inline JSONL seed and expect bodies only. Schema compatibility is
+validated by the engine loader.
+
+`v1` pins the random stream to SHA-256 of the bytes
+`omnigraph-gqt-generate-v1\0`, then seed, ordinal, lane and rejection-attempt
+as little-endian `u64`, then the table and column names, each preceded by its
+UTF-8 byte length as little-endian `u64`. The word is the first eight digest
+bytes interpreted little-endian. Column names are `data.<name>` or `row.id`,
+`row.from`, `row.to`. Vector lane `d` uses word bits 40–63 divided by `2^24`.
+Uniform accepts words at or above `(-population) % population` in unsigned
+64-bit arithmetic, then takes the remainder; at most 128 attempts are admitted.
+Zipf accumulates weights in rank order using pinned `libm 0.2.16`, normalizes
+the cumulative sums, and selects the first bound strictly above word bits
+11–63 divided by `2^53`, clamping the final rank. Endpoint lane is zero;
+all non-rejection attempts are zero. Values depend on the seed, table, column
+and ordinal, so changing chunk boundaries leaves row values unchanged.
+
+`LoadStep::call_count()` exposes the exact number of engine loader calls.
+For one call, generation and JSON encoding complete before the execution
+host's operation callbacks. For multiple calls the callbacks surround the
+whole step, including batch generation; a benchmark selecting an engine-only
+load measurement must require exactly one call. Expectations run afterward.
+Every engine load error reaches the host as a typed fault before formatting.
+
+`benchmarks/fixtures/branch_merge_d50.gqt` declares the full synthetic merge
+dataset. `cases/generated_branch_merge_dataset.gqt` is its small parity
+fixture; tests compare its schema, rows, keys, payloads, branch divergence and
+publication history with the previous fixture builder, including reversible
+history preparation. A scaled D50 fixture also compares full content across
+four edge tables, including the `[5, 4, 4, 4]` update distribution. The full
+800000-row D50 recipe has a static check for 200 base publications and 12
+divergence publications per side, or 213 reachable commits per branch;
+that static check does not execute or verify the full-size dataset.
+
 ## Seam placement
 
 Place a seam directly before its mutate operation, a GQ mutation or a branch
-statement; no seam is crossed by a query step yet. Several seam blocks may
+statement, or before a generated load; no seam is crossed by a query step yet. Several seam blocks may
 precede one operation when they name distinct seams (contention at
 publication and a lost acknowledgement on one mutation,
 `cases/mutation_contention_and_lost_ack_survive_reopen.gqt`); each carries
@@ -107,7 +230,7 @@ subject that begins with
 `*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
 quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
 are fine inside the quotes. A store
-place is admitted before a mutate or branch step (a branch create writes
+place is admitted before a mutate, load or branch step (a branch create writes
 nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
 `contention`, `skip`, or a store action, the first being `misdirect`, with
 `lose`, `error`, `corrupt` and `delay` spellable and refused at admission
@@ -134,8 +257,8 @@ before the next operation or restart. Seam directives inside loops are
 refused. GQT does not add retries.
 
 A seam is admitted when its catalog operation matches the step it precedes:
-`mutation` before a mutate, `branch_merge`/`branch_create`/`branch_delete`
-before the matching branch statement, `any_write` before either; a seam of
+`mutation` before a mutate or load, `branch_merge`/`branch_create`/`branch_delete`
+before the matching branch statement, `any_write` before any of those; a seam of
 operation `unreachable` is refused. Occurrences must be 1–1000000. Delivery
 is proven by the runner's own decision: it counts crossings, fires the
 admitted effect on the declared occurrence, and the report carries
@@ -243,8 +366,11 @@ hash join $e
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
+hydrate $d: columns [body]
 pass projection_pushdown
 not pass aggregate_pushdown
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -258,9 +384,50 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
 the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
 none. Dropping a type key or swapping key order fails these assertions.
-`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Projection/read lists are sets; identity keys and selection members
+`hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
+exactly those columns of `$d` by row address above the root limit (pass
+`late_materialization`); the `scan` lines keep reading the logical plan, whose
+projection still lists them. `pass <name>` states that a named optimizer pass
+fired, `not pass <name>` that it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
+`aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the named output's aggregate function, input type, accumulator,
+overflow rule and result type. Accumulators are `count`, `exact_integer`,
+`float64` and `extremum`; overflow rules are `round_to_nearest` and `error`.
+Types use shape syntax, node type names or `exact_integer`. A type's `?`
+declares nullability here; a shape line's `?` describes observed null cells.
+An unfiltered count-only query can use `MetadataCount`, which has no aggregate
+specification and does not satisfy an `aggregate` line.
+`block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the same facts on an AntiJoin's aggregate leaf, named by its GQ text,
+even beneath a comparison cast. Bare row count has no aggregate spec.
+
+`result columns [total: F64?, person: Person]` checks the complete declared
+result in return order, including names, types and nullability. It follows
+Sort and Limit to the result node; a MetadataCount also declares columns.
+
+`type $p.age: I64?` requires at least one non-cast expression with that GQ
+text, and every matching expression must carry the stated type. Types are
+stored compiler declarations, including nullability. `cast $p.age: I64? ->
+F64?` requires an explicit conversion over that expression with exactly those
+source and target types; `no cast $p.age` refuses any conversion over it.
+The checks search every typed tree in the physical plan, including pushed
+filters, sort keys, ranked scans, join predicates, aggregate arguments and
+both block comparison operands.
+Cast text is transparent, so a `type` line selects the underlying expression.
+The internal `exact_integer` and `[exact_integer]` comparison types, optionally
+nullable, are accepted here but cannot be returned as public result columns.
+
+Every successful rows step compares the plan root's declared schema with the
+compiler's independent inference and with the executed result. The inference
+check compares declared nullability; the execution check rejects observed
+nulls in non-null columns and compares node objects by their complete Struct
+type. The runner also serializes and deserializes the executed bound plan,
+validates its typed expression trees and aggregate signatures/specs, compares
+its explain documents, and directly compares stored schemas, return types,
+named node-object declarations and complete block predicates/specs. These checks require no plan section
+and execute no additional query.
+
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in
 negative assertions. Assert destination projection on the dependent scan;
@@ -335,7 +502,71 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
+cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 ```
+
+`--store` may precede or follow the case paths. External-store reports retain
+the URI and step evidence, but cannot replay: the report does not freeze the
+store contents. `--- restart` reopens that same root.
+
+`--trace` saves diagnostic JSONL for each selected DST attempt, including
+both runs of every seed. It requires at least one selected DST environment;
+direct-engine attempts in a mixed case still run without recording. The flag
+may precede or follow paths and combines with `--measure` and selectors.
+The case format and assertions stay unchanged. Recording is off by default.
+
+Each attempt gets a unique file under `target/gqt-artifacts/trace/`, or
+`<dir>/trace/` with `--artifacts <dir>`. The runner prints each path before
+launching its worker and includes it in the invocation report. Files contain
+GQT operations, observations and assertion evidence, every decision seam
+crossing, plus available `omnigraph` tracing spans and events from all
+worker threads. This is a diagnostic stream, not a complete graph history or
+a lineage oracle.
+
+Every line is one flat JSON object: `idx`, `kind`, the columns of that kind,
+and from the first `operation` on the step the runner began last as `step`,
+`step_line`, `loop_binding` and `generation` (the `truncated` terminator
+excepted: it carries no step columns, so it always fits the bytes reserved
+for it). The schema is
+[`trace_schema.json`](trace_schema.json), one branch per kind; a library
+test serialises one row of every kind against it.
+
+| `kind` | columns | meaning |
+|---|---|---|
+| `start` | `format`, `version`, `invocation_id`, `case_path`, the three digests, `environment`, `seed`, `replay` | the header the supervisor writes before the worker starts; never carries step columns |
+| `operation` | the step columns | the runner began a case operation |
+| `observation` | `text` | one host observation, the lines the report keeps |
+| `evidence` | `record`, `value`, `session` | one assertion evidence record (`record` is `expectation`, `assertion`, `seam_delivered`, ...) with its value |
+| `seam_crossing` | `seam`, `decision` (`pass`, `fire`, `store`), `effect`, `session` | the engine crossed a decision seam and the installed decider answered |
+| `store_request` | `verb`, `class`, `dataset`, `path`, `range`, `bytes`, `session` | one object-store request as the `--measure` ledger notes it, both realms; only with `--measure`; `session` is the ledger's label (`setup`, `step`, `runner` or a block session), never null |
+| `span`, `span_record`, `span_close` | `id`, `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing span opened, recorded fields, closed |
+| `event` | `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing event; `parent` is the enclosing span's `id`, as on `span` rows |
+| `finish` | `code`, `phase` | the worker completed with this result |
+| `truncated` | `reason`, `max_bytes`, `max_records` | recording stopped at the limit; never carries step columns |
+
+Seam crossings come from the runner, not the engine: a pass-through observer
+sits on every catalog seam the step did not arm, and the armed deciders are
+wrapped, so each crossing lands with the decision the decider returned. The
+crossing's position inside the action is not recorded; the seam name and the
+step are. Store requests are the measure ledger's: with `--trace --measure`
+every request of both realms lands as a `store_request` row at the moment
+the ledger notes it (a listing page refused later keeps its `list` verb in
+the trace and is `list_failed` in the ledger), with the ledger's label
+(`setup`, `step`, `runner` or a block session) as its `session`. `--trace`
+alone wraps no store, so a store place that is not armed leaves no row. A
+concurrent block is one step whose sessions interleave on one thread;
+`session` names the session a row belongs to: `null` outside a block on
+evidence, crossing, span and event rows, the ledger's label on store rows.
+
+Recording stops at 16 MiB or 100000 records with a `truncated` record. Trace
+fields may also be shortened to bound capture memory. A killed worker
+retains its written prefix; a missing `finish` means the recording is
+incomplete.
+Recording errors fail the invocation and preserve the original case error.
+Trace paths and bytes do not participate in deterministic replay comparison;
+`--replay <report.json>` replays the case without creating another trace.
+Recording adds host I/O and may consume more of the case's wall-time budget.
 
 `--measure` records, for every step of each DST environment, the object-store
 requests made while the step ran (the engine's, and under a `--- store` rule
@@ -438,7 +669,9 @@ sharing a tick ran together) go to a `measurements` field the replay
 comparison skips. The invocation prints one ASCII table per environment, a
 row per step and per gap and a row per phase, and writes the long-form TSV
 under `target/gqt-artifacts/cost/` (phase rows as `phase.<name>.<field>`).
-Direct-engine environments record nothing: on a `file` root Lance bypasses
+`--measure` requires at least one selected DST environment and refuses a
+direct-only selection before starting any worker. In a mixed selection,
+direct-engine environments record nothing: on a `file` root Lance bypasses
 the wrapped store for data files, so only the DST in-memory object store
 sees every request. The control realm's counts are the in-memory adapter's:
 under DST its store never holds a Lance object, so the engine's probes of a
@@ -544,3 +777,17 @@ the one seed), so neither variable decides anything; the refusal keeps a stale
 one in a CI environment from being mistaken for a live control, and keeps the
 retired name from lingering. A case that must run one value writes it in a
 `set` step.
+
+## Shared execution library
+
+`omnigraph-gqt-core` owns the format, ordinary execution and expectation checks.
+It runs over a supplied `Session` and uses an explicit host for observations
+and operation boundaries. The GQT runner owns process isolation, discovery,
+DST scheduling, reference comparisons and measurement reports. Core has no
+build script or engine `test-util` dependency.
+
+Run both packages to include the shared format and executor tests:
+
+```bash
+cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked
+```

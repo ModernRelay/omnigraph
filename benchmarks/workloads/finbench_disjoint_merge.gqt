@@ -1,0 +1,195 @@
+# issue: none
+# notes: FinBench disjoint inserts; generated transfer IDs use logical-equivalence identity.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+branch merge "bench-source" into "bench-target"
+--- expect outcome: merged
+
+--- query branch: bench-target
+query reserved_accounts() {
+    match { $a: Account
+        $a.accountId starts_with "omnigraph-bench-fin-v1-" }
+    return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
+}
+--- expect unordered
+{"account":"omnigraph-bench-fin-v1-src-a","created":"2020-01-01T00:00:00","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+{"account":"omnigraph-bench-fin-v1-src-b","created":"2020-01-01T00:00:00","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+{"account":"omnigraph-bench-fin-v1-tgt-a","created":"2020-01-01T00:00:01","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+{"account":"omnigraph-bench-fin-v1-tgt-b","created":"2020-01-01T00:00:01","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+--- expect shape
+account: String
+created: DateTime
+blocked: Bool
+kind: String
+login: String
+level: String
+nickname: String?
+phonenum: String?
+email: String?
+last_login: DateTime?
+
+--- query branch: bench-target
+query reserved_transfers() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b
+        $e.orderNum starts_with "omnigraph-bench-fin-v1-" }
+    return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
+}
+--- expect unordered
+{"src":"omnigraph-bench-fin-v1-src-a","dst":"omnigraph-bench-fin-v1-src-b","amount":1.25,"created":"2020-01-01T00:00:00","order_num":"omnigraph-bench-fin-v1-src-order","pay":"bank_transfer","goods":"bank_transfer"}
+{"src":"omnigraph-bench-fin-v1-tgt-a","dst":"omnigraph-bench-fin-v1-tgt-b","amount":2.5,"created":"2020-01-01T00:00:01","order_num":"omnigraph-bench-fin-v1-tgt-order","pay":"bank_transfer","goods":"bank_transfer"}
+--- expect shape
+src: String
+dst: String
+amount: F64
+created: DateTime
+order_num: String
+pay: String
+goods: String
+comment: String?
+
+--- query branch: bench-target
+query account_count() {
+    match { $a: Account }
+    return { count($a) as n }
+}
+--- expect unordered
+{"n":1534184}
+--- expect shape
+n: I64
+
+--- query branch: bench-target
+query transfer_count() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b }
+    return { count($e) as n }
+}
+--- expect unordered
+{"n":6219883}
+--- expect shape
+n: I64
+
+--- query branch: bench-source
+query reserved_accounts() {
+    match { $a: Account
+        $a.accountId starts_with "omnigraph-bench-fin-v1-" }
+    return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
+}
+--- expect unordered
+{"account":"omnigraph-bench-fin-v1-src-a","created":"2020-01-01T00:00:00","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+{"account":"omnigraph-bench-fin-v1-src-b","created":"2020-01-01T00:00:00","blocked":false,"kind":"internet_account","login":"ipv4","level":"basic"}
+--- expect shape
+account: String
+created: DateTime
+blocked: Bool
+kind: String
+login: String
+level: String
+nickname: String?
+phonenum: String?
+email: String?
+last_login: DateTime?
+
+--- query branch: bench-source
+query reserved_transfers() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b
+        $e.orderNum starts_with "omnigraph-bench-fin-v1-" }
+    return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
+}
+--- expect unordered
+{"src":"omnigraph-bench-fin-v1-src-a","dst":"omnigraph-bench-fin-v1-src-b","amount":1.25,"created":"2020-01-01T00:00:00","order_num":"omnigraph-bench-fin-v1-src-order","pay":"bank_transfer","goods":"bank_transfer"}
+--- expect shape
+src: String
+dst: String
+amount: F64
+created: DateTime
+order_num: String
+pay: String
+goods: String
+comment: String?
+
+--- query branch: bench-source
+query account_count() {
+    match { $a: Account }
+    return { count($a) as n }
+}
+--- expect unordered
+{"n":1534182}
+--- expect shape
+n: I64
+
+--- query branch: bench-source
+query transfer_count() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b }
+    return { count($e) as n }
+}
+--- expect unordered
+{"n":6219882}
+--- expect shape
+n: I64
+
+--- query branch: main
+query reserved_accounts() {
+    match { $a: Account
+        $a.accountId starts_with "omnigraph-bench-fin-v1-" }
+    return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
+}
+--- expect unordered
+--- expect shape
+account: String
+created: DateTime
+blocked: Bool
+kind: String
+login: String
+level: String
+nickname: String?
+phonenum: String?
+email: String?
+last_login: DateTime?
+
+--- query branch: main
+query reserved_transfers() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b
+        $e.orderNum starts_with "omnigraph-bench-fin-v1-" }
+    return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
+}
+--- expect unordered
+--- expect shape
+src: String
+dst: String
+amount: F64
+created: DateTime
+order_num: String
+pay: String
+goods: String
+comment: String?
+
+--- query branch: main
+query account_count() {
+    match { $a: Account }
+    return { count($a) as n }
+}
+--- expect unordered
+{"n":1534180}
+--- expect shape
+n: I64
+
+--- query branch: main
+query transfer_count() {
+    match { $a: Account
+        $a $e:accounttransferaccount $b }
+    return { count($e) as n }
+}
+--- expect unordered
+{"n":6219881}
+--- expect shape
+n: I64

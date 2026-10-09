@@ -108,7 +108,6 @@ fn file_deadline_bounds_the_worker() {
     assert!(error.contains("exceeded wall-time budget"), "{error}");
 }
 
-#[cfg(tokio_unstable)]
 fn report(output: &std::process::Output) -> (std::path::PathBuf, serde_json::Value) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let path = stdout
@@ -119,6 +118,600 @@ fn report(output: &std::process::Output) -> (std::path::PathBuf, serde_json::Val
     let value = serde_json::from_slice(&std::fs::read(&path).expect("read retained report"))
         .expect("structured summary");
     (path, value)
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn trace_flag_retains_each_attempt_without_changing_replay() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let case = root.join("cases/dst_restart_preserves_rows.gqt");
+    let original = std::fs::read(&case).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let invoke = |trace: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        if trace {
+            command.arg("--trace");
+        }
+        command
+            .arg(&case)
+            .args([
+                "--target",
+                "omnigraph-engine-dst",
+                "--seed",
+                "0",
+                "--artifacts",
+            ])
+            .arg(artifacts.path())
+            .output()
+            .unwrap()
+    };
+    let plain = invoke(false);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(!artifacts.path().join("trace").exists());
+    let (_, plain_report) = report(&plain);
+    let traced = invoke(true);
+    assert!(
+        traced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&traced.stderr)
+    );
+    let (saved, traced_report) = report(&traced);
+    let attempts = traced_report["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0]["trace"], attempts[1]["trace"]);
+    for (index, attempt) in attempts.iter().enumerate() {
+        assert_eq!(attempt["input"], plain_report["attempts"][index]["input"]);
+        assert_eq!(
+            attempt["outcome"],
+            plain_report["attempts"][index]["outcome"]
+        );
+        let path = Path::new(attempt["trace"].as_str().unwrap());
+        assert!(path.starts_with(artifacts.path().canonicalize().unwrap()));
+        let text = std::fs::read_to_string(path).unwrap();
+        let records = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["kind"], "start");
+        assert_eq!(records[0]["format"], "omnigraph-gqt-diagnostic-trace");
+        assert_eq!(records[0]["replay"], index);
+        assert!(records[0].get("step").is_none());
+        assert_eq!(records.last().unwrap()["kind"], "finish");
+        assert_eq!(records.last().unwrap()["code"], "passed");
+        assert!(records.last().unwrap()["step"].is_u64());
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["idx"], index);
+        }
+        for kind in ["operation", "evidence"] {
+            assert!(
+                records.iter().any(|r| r["kind"] == kind),
+                "missing {kind}: {text}"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r["kind"] == "evidence" && r["record"] == "assertion")
+        );
+    }
+    let replay = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg("--replay")
+        .arg(saved)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        report(&replay).1["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("trace").is_none())
+    );
+    let repeated = invoke(true);
+    assert!(repeated.status.success());
+    assert_ne!(
+        report(&repeated).1["attempts"][0]["trace"],
+        attempts[0]["trace"]
+    );
+    assert_eq!(std::fs::read(case).unwrap(), original);
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn trace_captures_engine_events_from_the_dst_thread() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir().unwrap();
+    let case = dir.path().join("traversal.gqt");
+    let source = std::fs::read_to_string(root.join("cases/variable_hops_on_a_chain.gqt")).unwrap();
+    let source = source.replace(
+        "target: omnigraph-engine\n    storage: local-filesystem",
+        "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
+    );
+    std::fs::write(&case, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(case)
+        .args(["--trace", "--artifacts"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let attempts = summary["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    for attempt in attempts {
+        let text = std::fs::read_to_string(attempt["trace"].as_str().unwrap()).unwrap();
+        assert!(
+            text.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .any(|r| r["kind"] == "event"
+                    && r["target"] == "omnigraph::traverse"
+                    && r["fields"]["edge"] == "Knows"),
+            "missing engine traversal event"
+        );
+    }
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn trace_records_every_seam_crossing_with_its_step() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(root.join("cases/dst_fault_on_second_merge.gqt"))
+        .args(["--trace", "--artifacts"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let attempts = summary["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    for attempt in attempts {
+        let text = std::fs::read_to_string(attempt["trace"].as_str().unwrap()).unwrap();
+        let rows = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let crossings = rows
+            .iter()
+            .filter(|row| row["kind"] == "seam_crossing")
+            .collect::<Vec<_>>();
+        let armed = crossings
+            .iter()
+            .filter(|row| row["seam"] == "branch_merge.post_authority_capture")
+            .map(|row| {
+                (
+                    row["step"].as_u64(),
+                    row["decision"].as_str().unwrap(),
+                    row["effect"].as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            armed.last(),
+            Some(&(Some(5), "fire", Some("fail"))),
+            "{text}"
+        );
+        assert!(
+            armed[..armed.len() - 1]
+                .iter()
+                .all(|(_, decision, effect)| *decision == "pass" && effect.is_none()),
+            "{text}"
+        );
+        let seams = crossings
+            .iter()
+            .map(|row| row["seam"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(seams.len() > 1, "only {seams:?} crossed: {text}");
+        assert!(
+            crossings.iter().any(|row| row["step"].is_u64()),
+            "no crossing carries its step: {text}"
+        );
+        assert!(
+            rows.iter().all(|row| row["kind"] != "store_request"),
+            "store rows without --measure: {text}"
+        );
+    }
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn trace_flag_preserves_failure_and_reports_artifact_errors() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = tempfile::tempdir().unwrap();
+    let case = dir.path().join("failure.gqt");
+    let original =
+        std::fs::read_to_string(root.join("cases/dst_restart_preserves_rows.gqt")).unwrap();
+    std::fs::write(
+        &case,
+        original.replace("nodes=1 edges=0", "nodes=2 edges=0"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&case)
+        .args([
+            "--trace",
+            "--target",
+            "omnigraph-engine-dst",
+            "--seed",
+            "0",
+            "--artifacts",
+        ])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let (_, summary) = report(&output);
+    assert_eq!(summary["code"], "assertion_failed");
+    assert_eq!(summary["attempts"].as_array().unwrap().len(), 2);
+    assert!(
+        summary["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["outcome"]["Ok"]["code"] == "assertion_failed")
+    );
+    for attempt in summary["attempts"].as_array().unwrap() {
+        let text = std::fs::read_to_string(attempt["trace"].as_str().unwrap()).unwrap();
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["kind"], "finish");
+        assert_eq!(last["code"], "assertion_failed");
+    }
+    let blocked = tempfile::tempdir().unwrap();
+    std::fs::write(blocked.path().join("trace"), "not a directory").unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&case)
+        .args(["--trace", "--artifacts"])
+        .arg(blocked.path())
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("report_failed: create trace directory")
+    );
+}
+
+#[cfg(tokio_unstable)]
+#[test]
+fn trace_and_measure_coexist_in_mixed_environments() {
+    let case = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/dst_restart_preserves_rows.gqt");
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(case)
+        .args(["--trace", "--measure", "--artifacts"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, summary) = report(&output);
+    let attempts = summary["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 5);
+    for attempt in attempts {
+        if attempt["seed"].is_null() {
+            assert!(attempt.get("trace").is_none());
+        } else {
+            let trace = Path::new(attempt["trace"].as_str().unwrap());
+            assert!(trace.is_file());
+            assert!(
+                !attempt["outcome"]["Ok"]["measurements"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let text = std::fs::read_to_string(trace).unwrap();
+            let stores = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| row["kind"] == "store_request")
+                .collect::<Vec<_>>();
+            assert!(
+                stores
+                    .iter()
+                    .any(|row| row["session"] == "setup" && row["step"].is_null()),
+                "no setup request before the first step: {text}"
+            );
+            assert!(
+                stores
+                    .iter()
+                    .any(|row| row["session"] == "step" && row["step"].is_u64()),
+                "no step request carries its step: {text}"
+            );
+            assert!(
+                stores.iter().all(|row| row["verb"].is_string()
+                    && row["path"].is_string()
+                    && row["bytes"].is_u64()),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn trace_flag_requires_a_selected_dst_environment() {
+    let case = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/dst_restart_preserves_rows.gqt");
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(case)
+        .args(["--trace", "--target", "omnigraph-engine", "--artifacts"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--trace requires a selected DST environment")
+    );
+    assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
+    assert!(!dir.path().join("trace").exists());
+}
+
+#[test]
+fn external_store_persists_mutation_and_restart_and_refuses_replay() {
+    let case =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/external_store.gqt");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for option_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}/graph", dir.path().display());
+        runtime.block_on(async {
+            let db = omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+                .await
+                .unwrap();
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+                .load_jsonl(
+                    "{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}",
+                    omnigraph::loader::LoadMode::Overwrite,
+                )
+                .await
+                .unwrap();
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        if option_first {
+            command.args(["--store", &uri]).arg(&case);
+        } else {
+            command.arg(&case).args(["--store", &uri]);
+        }
+        let output = command.arg("--artifacts").arg(dir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (saved, summary) = report(&output);
+        assert_eq!(summary["attempts"][0]["input"]["store"], uri);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("GQT replay: "));
+        assert!(
+            summary["attempts"][0]["outcome"]["Ok"]["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event == "lifetime: opened generation 0")
+        );
+        #[cfg(tokio_unstable)]
+        for event in summary["attempts"][0]["outcome"]["Ok"]["evidence"]
+            .as_array()
+            .unwrap()
+        {
+            if event["kind"] == "engine_lifetime" {
+                assert_eq!(
+                    event["value"]["before"][0], 0,
+                    "external execution must not initialize"
+                );
+                assert_eq!(
+                    event["value"]["after"][0], 0,
+                    "external execution must not initialize"
+                );
+            }
+        }
+        let replay = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg("--replay")
+            .arg(saved)
+            .output()
+            .unwrap();
+        assert!(!replay.status.success());
+        assert!(
+            String::from_utf8_lossy(&replay.stderr)
+                .contains("external-store invocations cannot replay")
+        );
+        assert!(report(&replay).1["attempts"].as_array().unwrap().is_empty());
+        runtime.block_on(async {
+            let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();
+            let session =
+                omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default());
+            let rows = session
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    "query all() { match { $p: Person } return { $p.name } }",
+                    "all",
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.num_rows(), 2);
+        });
+    }
+}
+
+#[test]
+fn external_store_admission_refuses_before_workers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let case = root.join("tests/fixtures/runner/external_store.gqt");
+    let text = std::fs::read_to_string(&case).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("external.gqt");
+    let uri = format!("file://{}/untouched", dir.path().display());
+    for (text, store, expected) in [
+        (text.clone(), None, "requires --store"),
+        (
+            format!(
+                "{}--- schema\nnode Person {{ name: String @key }}\n--- seed\n",
+                text.split_once("--- query").unwrap().0
+            ),
+            Some(uri.as_str()),
+            "--store cannot be combined",
+        ),
+        (
+            text.replace("storage: local-filesystem", "storage: s3-compatible"),
+            Some(uri.as_str()),
+            "does not match",
+        ),
+        (
+            text.replace(
+                "target: omnigraph-engine\n    storage: local-filesystem",
+                "target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]",
+            ),
+            Some(uri.as_str()),
+            "--store requires direct engine",
+        ),
+        (
+            text.clone(),
+            Some("memory://unsupported"),
+            "--store requires a file://, s3:// or az:// URI",
+        ),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg(&path).arg("--artifacts").arg(dir.path());
+        if let Some(store) = store {
+            command.args(["--store", store]);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{expected}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
+        assert!(!dir.path().join("untouched").exists());
+    }
+    let corpus = omnigraph_gqt::run_corpus_case(
+        &case,
+        Path::new(env!("CARGO_BIN_EXE_omnigraph-gqt")),
+        false,
+    );
+    assert!(corpus.result.unwrap_err().contains("requires --store"));
+    let error = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(omnigraph_gqt::run_case(case, false))
+        .unwrap_err();
+    assert!(error.contains("requires --store"), "{error}");
+}
+
+#[test]
+fn measure_requires_a_selected_dst_environment() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/dst_restart_preserves_rows.gqt");
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(path)
+        .args(["--target", "omnigraph-engine", "--measure"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--measure requires a selected DST environment")
+    );
+    assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn external_store_missing_root_is_not_initialized() {
+    let case =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/external_store.gqt");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(case)
+        .arg("--store")
+        .arg(format!("file://{}", root.display()))
+        .arg("--artifacts")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("open failed:"));
+    assert!(!root.join("__manifest").exists());
+}
+
+#[test]
+fn external_store_selects_direct_execution_from_a_mixed_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("graph");
+    let uri = format!("file://{}", root.display());
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }")
+            .await
+            .unwrap();
+    });
+    let path = dir.path().join("empty_external.gqt");
+    std::fs::write(&path, "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n").unwrap();
+    for selected in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command
+            .arg(&path)
+            .args(["--store", &uri])
+            .arg("--artifacts")
+            .arg(dir.path());
+        if selected {
+            command.args(["--target", "omnigraph-engine"]);
+        }
+        let output = command.output().unwrap();
+        let (_, summary) = report(&output);
+        assert_eq!(
+            output.status.success(),
+            selected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            summary["attempts"].as_array().unwrap().len(),
+            usize::from(selected)
+        );
+        if selected {
+            assert_eq!(summary["scope"], "partial");
+        }
+    }
+}
+
+#[test]
+fn store_option_requires_one_nonempty_uri() {
+    let case =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/external_store.gqt");
+    for args in [
+        vec!["--store"],
+        vec!["--store", ""],
+        vec!["--store", "--measure"],
+        vec!["--store", "file:///unused", "--store", "file:///unused"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&case)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid_case:"));
+        assert!(report(&output).1["attempts"].as_array().unwrap().is_empty());
+    }
 }
 
 #[cfg(tokio_unstable)]

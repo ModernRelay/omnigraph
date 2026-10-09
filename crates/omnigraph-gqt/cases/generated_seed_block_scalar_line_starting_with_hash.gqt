@@ -1,0 +1,36 @@
+# issue: none
+# notes: A `#`-leading line inside a block scalar of a generated seed is data, not a GQT comment; the `#`-line refusal covers inline JSONL seeds only, so a seed recipe and a load recipe read the same text the same way.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key text: String }
+
+--- seed generate: v1 seed: 1
+tables:
+  - kind: node
+    name: Doc
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: doc-, width: 1}
+      text:
+        kind: literal
+        value: |-
+          # heading
+          body
+
+--- query
+query hashed() {
+    match { $d: Doc }
+    return { $d.slug, $d.text }
+}
+--- expect unordered
+{"d.slug":"doc-0","d.text":"# heading\nbody"}
+--- expect shape
+d.slug: String
+d.text: String

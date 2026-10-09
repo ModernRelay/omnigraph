@@ -5591,6 +5591,7 @@ dependencies = [
  "object_store",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-gqt-core",
  "predicates",
  "serde",
  "serde_json",
@@ -5724,6 +5725,7 @@ dependencies = [
  "datafusion",
  "frostem",
  "futures",
+ "globset",
  "lance",
  "lance-core",
  "lance-file",
@@ -5761,7 +5763,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "globset",
  "lance-core",
  "lance-io",
  "object_store",
@@ -5837,8 +5838,6 @@ dependencies = [
 name = "omnigraph-gqt"
 version = "0.13.0"
 dependencies = [
- "arrow-array",
- "arrow-schema",
  "async-trait",
  "datatest-stable",
  "futures",
@@ -5846,14 +5845,35 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-dst",
  "omnigraph-engine",
- "omnigraph-planner",
+ "omnigraph-gqt-core",
  "omnigraph-reference-engine",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "omnigraph-gqt-core"
+version = "0.13.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "futures",
+ "libm",
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "omnigraph-planner",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "unsafe-libyaml",
 ]
 
 [[package]]

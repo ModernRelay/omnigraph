@@ -1,0 +1,50 @@
+# issue: none
+# notes: A YAML section body is the file text up to the next header with every line newline-terminated, so a `|` block scalar that ends a `generate:` body loads `<word>\n` whether or not a blank line separates it from the next header.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key text: String }
+
+--- seed generate: v1 seed: 1
+tables:
+  - kind: node
+    name: Doc
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: a-, width: 1}
+      text:
+        kind: literal
+        value: |
+          alpha
+--- load generate: v1 seed: 1 mode: append
+tables:
+  - kind: node
+    name: Doc
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: b-, width: 1}
+      text:
+        kind: literal
+        value: |
+          beta
+
+--- expect ok
+
+--- query
+query both() {
+    match { $d: Doc }
+    return { $d.slug, $d.text }
+}
+--- expect unordered
+{"d.slug":"a-0","d.text":"alpha\n"}
+{"d.slug":"b-0","d.text":"beta\n"}
+--- expect shape
+d.slug: String
+d.text: String
