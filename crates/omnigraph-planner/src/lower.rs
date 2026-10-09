@@ -13,7 +13,9 @@ use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{ColumnRef, KeyJoinKind, ScanSpec};
-use crate::physical::{NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput};
+use crate::physical::{
+    HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput,
+};
 
 #[cfg(doc)]
 use crate::physical::RankKind;
@@ -133,6 +135,14 @@ pub trait Lower {
         &mut self,
         id: NodeId,
         side: SideId,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the rows that reached the output lowered.
+    fn hydrate_columns(
+        &mut self,
+        id: NodeId,
+        bindings: &[HydratedBinding],
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -370,6 +380,10 @@ impl PhysicalPlan {
             PhysicalNode::HydrateByAddress { input, side } => {
                 let input = self.lower_node(*input, l)?;
                 l.hydrate_by_address(id, *side, input)
+            }
+            PhysicalNode::HydrateColumns { input, bindings } => {
+                let input = self.lower_node(*input, l)?;
+                l.hydrate_columns(id, bindings, input)
             }
             PhysicalNode::RowCompare { input } => {
                 let input = self.lower_node(*input, l)?;

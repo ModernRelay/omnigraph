@@ -354,7 +354,10 @@ encoded into one bounded pending chunk only after snapshot production succeeds.
 Only initial process-capacity admission has a short timeout. An admitted
 producer waits for a frame credit or response closure, including the terminal
 baseline cursor. Slow readers retain their bounded reservation until delivery
-or disconnect; no short per-frame deadline truncates a valid stream.
+or disconnect; no short per-frame deadline truncates a valid stream. A producer
+hands its failure to the sender, which ends the body with a constant error and
+logs the failure's class, never its message: the HTTP trace layer logs a body
+error's text, and an engine message can hold object URIs or credentials.
 [Deployment limits](../user/deployment.md#admission-limits) distinguish this
 transport allowance from engine encoding and native memory.
 

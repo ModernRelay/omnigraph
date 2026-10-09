@@ -8,6 +8,7 @@ mod helpers;
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 
 use helpers::*;
@@ -1139,10 +1140,13 @@ async fn change_feed_detects_same_length_blob_only_update() {
     .await
     .unwrap();
 
-    let page = db
-        .poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor)))
-        .await
-        .unwrap();
+    let probes = MergeWriteProbes::default();
+    let page = with_merge_write_probes(
+        probes.clone(),
+        db.poll_change_feed(feed_request(None, ChangeFeedPosition::Cursor(cursor))),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         page.blocks.len(),
         1,
@@ -1153,9 +1157,18 @@ async fn change_feed_detects_same_length_blob_only_update() {
     assert_eq!(changes[0].id, "doc");
     assert_eq!(changes[0].op, ChangeOpKind::Update);
     assert_eq!(
+        changes[0].before.as_ref().unwrap().properties["payload"],
+        serde_json::json!("base64:QQ==")
+    );
+    assert_eq!(
         changes[0].after.as_ref().unwrap().properties["payload"],
         serde_json::json!("base64:Qg==")
     );
+    // The comparator's payload tie-break reads each side's cell, then the
+    // before and after images read theirs: each through one batched read of
+    // that row alone, since the page admits one change at a time.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 4);
+    assert_eq!(probes.blob_payload_read_calls(), 4);
 }
 
 /// A ranged external Blob descriptor, which only a writer outside OmniGraph

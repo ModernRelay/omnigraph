@@ -25,18 +25,19 @@ use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
     Accumulator, AggregateFields, BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields,
-    HashJoinFields, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Predicate, RankArm,
-    RankFuseFields, RankKind, RankedAccess, RuntimeFilterKind, RuntimeFilterSpec, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields, ValueTable,
+    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
+    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
+    RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandExecution,
-    ExpandStep, FilterExec, GraphEnv, HashJoinExec, LimitExec, LookupSpec, MetadataCountExec,
-    OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
-    ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
+    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LimitExec, LookupSpec,
+    MetadataCountExec, OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec,
+    RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
 };
 use super::*;
 
@@ -295,6 +296,35 @@ impl<'a> Lowering<'a> {
             _ => None,
         }
     }
+
+    /// The rows of the `Limit` directly over the projection over scan `id`:
+    /// the scan sends its first batch once it has that many rows instead of
+    /// gathering a full batch. Batch size never changes which rows reach the
+    /// limit, only how many are read before it stops.
+    fn limit_over_scan(&self, id: NodeId) -> Option<usize> {
+        let projection = self.plan.parent_of(id)?;
+        let Some(PhysicalNode::Projection { .. }) = self.plan.node(projection) else {
+            return None;
+        };
+        match self.plan.node(self.plan.parent_of(projection)?)? {
+            PhysicalNode::Limit { rows, .. } => Some(*rows),
+            _ => None,
+        }
+    }
+
+    /// The bindings a `HydrateColumns` over node `id` (through the `Sort`s
+    /// and the `Limit` above it) fetches: the projection skips their columns
+    /// and carries each binding's row address instead.
+    fn hydration_above(&self, mut id: NodeId) -> &'a [HydratedBinding] {
+        while let Some(parent) = self.plan.parent_of(id) {
+            match self.plan.node(parent) {
+                Some(PhysicalNode::Sort { .. } | PhysicalNode::Limit { .. }) => id = parent,
+                Some(PhysicalNode::HydrateColumns { bindings, .. }) => return bindings,
+                _ => break,
+            }
+        }
+        &[]
+    }
 }
 
 /// The engine's error with the planner walk's own refusals folded in.
@@ -387,20 +417,43 @@ impl<'l, 'a> Walk<'l, 'a> {
     /// The one operator of node `id`.
     fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
+        let node = self.lowering.node(id)?;
         if matches!(
-            self.lowering.node(id)?,
+            node,
             PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
                 | PhysicalNode::MetadataCount { .. }
+                | PhysicalNode::HydrateColumns { .. }
         ) {
             let declared = self.lowering.plan.properties(id).ok_or_else(|| {
                 OmniError::manifest_internal("return operator has no declared schema")
             })?;
-            super::typed_value::check_output_schema(
-                plan.schema().as_ref(),
-                declared.schema.as_ref(),
-                matches!(self.lowering.node(id)?, PhysicalNode::Projection { .. }),
-            )?;
+            let hidden = matches!(
+                node,
+                PhysicalNode::Projection { .. } | PhysicalNode::HydrateColumns { .. }
+            );
+            // A projection under `HydrateColumns` carries every declared
+            // column but the deferred ones, which the hydration above adds.
+            let deferred: Vec<usize> = if matches!(node, PhysicalNode::Projection { .. }) {
+                self.lowering
+                    .hydration_above(id)
+                    .iter()
+                    .flat_map(|binding| binding.columns.iter().map(|column| column.position))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let carried = Schema::new(
+                declared
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !deferred.contains(position))
+                    .map(|(_, field)| Arc::clone(field))
+                    .collect::<Vec<_>>(),
+            );
+            super::typed_value::check_output_schema(plan.schema().as_ref(), &carried, hidden)?;
         }
         self.operators.insert(id, Arc::clone(&plan));
         Ok(plan)
@@ -471,6 +524,9 @@ impl Lower for Walk<'_, '_> {
             }
         };
         let mut scan = self.lowering.scan(source, spec)?;
+        if let Some(rows) = self.lowering.limit_over_scan(id) {
+            scan = scan.with_gather_rows(rows);
+        }
         if let Some(filter) = runtime {
             scan = scan.with_runtime_filter(Some(Arc::clone(&filter)));
             self.runtime_filters.insert(id, filter);
@@ -509,6 +565,28 @@ impl Lower for Walk<'_, '_> {
 
     fn hydrate_by_address(&mut self, _id: NodeId, _side: SideId, _input: Plan) -> Lowers<Plan> {
         Err(Self::not_a_pipeline_node("HydrateByAddress"))
+    }
+
+    fn hydrate_columns(
+        &mut self,
+        id: NodeId,
+        bindings: &[HydratedBinding],
+        input: Plan,
+    ) -> Lowers<Plan> {
+        if !self.outers.is_empty() {
+            return Err(Self::not_a_pipeline_node("HydrateColumns"));
+        }
+        let declared = self.lowering.plan.properties(id).ok_or_else(|| {
+            OmniError::manifest_internal("`HydrateColumns` has no declared schema")
+        })?;
+        let hydrate = HydrateExec::try_new(
+            input,
+            bindings.to_vec(),
+            self.lowering.snapshot.clone(),
+            self.lowering.catalog,
+            declared.schema.as_ref(),
+        )?;
+        self.built(id, hydrate)
     }
 
     fn row_compare(&mut self, _id: NodeId, _input: Plan) -> Lowers<Plan> {
@@ -739,12 +817,33 @@ impl Lower for Walk<'_, '_> {
             return Err(OmniError::manifest("query has no return projections".to_string()).into());
         }
         let input_schema = input.schema();
+        let hydrated = self.lowering.hydration_above(id);
+        let deferred: Vec<usize> = hydrated
+            .iter()
+            .flat_map(|binding| binding.columns.iter().map(|column| column.position))
+            .collect();
         let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-            Vec::with_capacity(return_exprs.len());
-        for proj in return_exprs {
+            Vec::with_capacity(return_exprs.len() + hydrated.len());
+        for (position, proj) in return_exprs.iter().enumerate() {
+            if deferred.contains(&position) {
+                continue;
+            }
             let projected = Projected::Expression(proj.expr.clone(), proj.ty.clone());
             let name = return_name(proj);
             exprs.push((self.lowering.projection(projected, &self.scope), name));
+        }
+        for binding in hydrated {
+            let name = format!("{}.{}", binding.binding, lance_core::ROW_ADDR);
+            let (index, _) = input_schema.column_with_name(&name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the scan of `${}` carries no row address for `HydrateColumns`",
+                    binding.binding
+                ))
+            })?;
+            exprs.push((
+                Arc::new(Column::new(&name, index)),
+                format!("{ROW_ADDRESS_PREFIX}{}", binding.binding),
+            ));
         }
         if let Some((keys, tiebreak)) = self.lowering.sort_above(id) {
             let hidden = hidden_columns(

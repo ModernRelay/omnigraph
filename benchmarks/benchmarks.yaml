@@ -1,18 +1,14 @@
 # Fixtures describe starting states; workloads describe operations and checks.
 # Named runs and settings live here. Large history groups are explicitly opt-in.
+# No default environment or reset: a scenario without its own takes the host's
+# local default (APFS/clonefile on macOS, qualified XFS/plain-copy elsewhere).
 version: 2
 defaults:
   repetitions: 1
   deadline_seconds: 60
-  environment:
-    backend:
-      kind: local-fs
-      filesystem: apfs
-      storage_class: nvme-ssd
   protocol:
     attribution: per-phase
     schedule: manual
-    reset: local-clonefile
     timer: monotonic
 scenarios:
 - id: branch-merge-d50-process-cold-xfs
@@ -40,6 +36,22 @@ scenarios:
       --- mutate
       branch merge "bench-source" into "bench-target"
   repetitions: 5
+- id: branch-merge-d50-history64-xfs
+  fixture: fixtures/branch_merge_d50_history64.gqt
+  workload: workloads/branch_merge_d50_cold.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "bench-source" into "bench-target"
+  repetitions: 5
+  environment:
+    backend:
+      kind: local-fs
+      filesystem: xfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: plain-copy
 - id: equal-current-narrow-one-batch
   fixture: fixtures/equal_current_narrow_one_batch.gqt
   workload: workloads/equal_current_different_history.gqt
@@ -741,6 +753,8 @@ groups:
   - e2e-rrf-traversal
   aws-xfs-process-cold:
   - branch-merge-d50-process-cold-xfs
+  aws-xfs-history64:
+  - branch-merge-d50-history64-xfs
   finbench:
   - finbench-disjoint-merge
   history-1000:

@@ -127,9 +127,11 @@ impl DeletedIdBudget {
 }
 
 /// Scheduler I/O buffer of every batched managed Blob read; Lance's default is
-/// 32 MiB times the store's I/O parallelism. It caps read-ahead, not what a
-/// caller holds: 64 contiguous 1 MiB validation windows may arrive as one buffer.
-pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
+/// 32 MiB times the store's I/O parallelism. Lance plans the reads in
+/// request-order batches no larger than this, a larger value alone, and reads a
+/// batch when the stream reaches it, so a reader that takes values one at a
+/// time holds one batch of read-ahead.
+pub(crate) const BLOB_READ_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.

@@ -47,7 +47,7 @@ pub use collector::{
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
-    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
 use prepared_create::initial_schema_ir;

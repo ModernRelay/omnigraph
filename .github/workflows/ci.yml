@@ -214,8 +214,11 @@ jobs:
       - name: Check required storage upgrade coverage
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
-      - name: Check required contexts report on the merge queue
+      - name: Check required contexts report on the merge queue and the gate is wired
         run: python3 scripts/check-merge-group-triggers.py --self-test
+
+      - name: Check the CI Gate verdict
+        run: python3 scripts/ci_gate.py --self-test
 
       - name: Check required test cells exist in the sources
         run: python3 scripts/check-ci-cells.py --self-test
@@ -555,6 +558,9 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -583,6 +589,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
       - name: Clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro
 
@@ -596,7 +609,7 @@ jobs:
   test:
     name: Test Workspace
     needs: classify_changes
-    # Required context (docs/dev/ci.md, Full correctness graphs): fail-fast on
+    # Blocks main through CI Gate (docs/dev/ci.md, Full correctness graphs): fail-fast on
     # pull requests and the merge queue, `--no-fail-fast` on main, tags and
     # dispatch (the run step below; the main run also seeds the cache).
     if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -621,6 +634,9 @@ jobs:
       # the source with `Box::pin` (see `helpers::cost::cost_harness`); this
       # keeps CI deterministic across runners while that work continues.
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -641,6 +657,13 @@ jobs:
           # Save only from main, red or green (same rule as `lint`).
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # GQ Logic Tests owns GQT in both build shapes, including its DST runtime;
       # dst.yml owns the DST suite (excluded by name: with the workspace
@@ -750,6 +773,9 @@ jobs:
       # A missing predecessor binary fails the genuine journey instead of
       # skipping it: this context is required on every change.
       OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -770,6 +796,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
@@ -787,7 +820,7 @@ jobs:
           # The installer downloads the official archive and verifies its
           # SHA256 before extraction. An exact VERSION never falls back to edge.
           # A failed download leaves nothing behind, so each release gets three
-          # attempts before this required context goes red.
+          # attempts before this blocking job fails.
           install_release() {
             for attempt in 1 2 3; do
               REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \
@@ -886,6 +919,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -906,6 +942,13 @@ jobs:
           key: crossversion-v5-v10
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # CI pins only the immediate predecessor. Older seams remain env-gated
       # and on-demand, per docs/dev/testing.md.
@@ -959,7 +1002,7 @@ jobs:
     name: Test omnigraph-server --features aws
     needs: classify_changes
     runs-on: ubuntu-latest
-    # Required context whose cache saves only from main: a cold main run
+    # Blocks main through CI Gate; its cache saves only from main: a cold main run
     # that outruns the ceiling is cancelled before the save and every PR
     # stays cold (the dst.yml lesson). Sized for a cold dependency graph.
     timeout-minutes: 60
@@ -967,6 +1010,9 @@ jobs:
       contents: read
     env:
       CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Skip when no engine input changed
         if: needs.classify_changes.outputs.run_full_ci != 'true'
@@ -996,6 +1042,14 @@ jobs:
           # Save only from main, red or green (same rule as `lint`).
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Build omnigraph-server with aws feature
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -1047,6 +1101,9 @@ jobs:
       OMNIGRAPH_S3_TEST_PREFIX: github-actions
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1070,6 +1127,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # A red `main` run still seeds the cache pull requests restore.
           cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Start RustFS
         # Pinned to 1.0.0-beta.12 (2026-07-30). beta.8 carried hyper's short
@@ -1242,6 +1306,9 @@ jobs:
       OMNIGRAPH_AZURE_TEST_CONTAINER: omnigraph-tests
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -1261,6 +1328,13 @@ jobs:
             . -> target
           key: azurite-azure
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       - name: Start pinned Azurite Blob service
         # Azurite 3.35.0, pinned to the immutable multi-arch index digest.
@@ -1461,3 +1535,27 @@ jobs:
       - name: Dump Azurite logs on failure
         if: failure()
         run: docker logs azurite
+
+  # The one verdict branch protection requires from this workflow: every job
+  # that blocks main is in `needs:`, and scripts/ci_gate.py accepts a skip
+  # only where the job's own `if:` was false (docs/dev/branch-protection.md).
+  ci_gate:
+    name: CI Gate
+    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, test_aws_feature]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Judge the blocking jobs
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}
+        run: python3 scripts/ci_gate.py

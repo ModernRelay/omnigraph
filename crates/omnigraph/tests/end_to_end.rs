@@ -1415,6 +1415,74 @@ async fn blob_read_returns_bytes() {
         "one byte over the public range ceiling must be refused, got {limit_error:?}"
     );
 
+    // Export and entity reads render the same bytes through the batched
+    // managed read. The Document cells span three fragments and the edge
+    // payload its own table; a hydrated chunk's managed cells share one read.
+    let encoded = |bytes: &[u8]| {
+        serde_json::json!(format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    };
+    let probes = MergeWriteProbes::default();
+    let exported = with_merge_write_probes(probes.clone(), db.export_jsonl("main", &[]))
+        .await
+        .unwrap();
+    let lines = exported
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let document_content = |id: &str| {
+        lines
+            .iter()
+            .find(|line| line["type"] == "Document" && line["id"] == id)
+            .unwrap()["data"]["content"]
+            .clone()
+    };
+    assert_eq!(document_content("readme"), encoded(b"Hello World"));
+    assert_eq!(document_content("empty"), encoded(b""));
+    assert!(document_content("null").is_null());
+    assert_eq!(document_content(metacharacter_id), encoded(b"Meta"));
+    assert_eq!(document_content("large"), encoded(&large_payload));
+    let attachment = lines
+        .iter()
+        .find(|line| line["edge"] == "Attachment")
+        .unwrap();
+    assert_eq!(attachment["data"]["payload"], encoded(b"Edge"));
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        5,
+        "readme, empty, the metacharacter row, large and the edge payload"
+    );
+    assert!(
+        probes.blob_managed_batch_read_calls() <= probes.ordered_cursor_hydration_calls(),
+        "at most one read per hydrated chunk of a table with one Blob column"
+    );
+    assert!(
+        probes.blob_managed_batch_read_calls() < probes.blob_payload_read_calls(),
+        "managed cells of one chunk share a read"
+    );
+    let probes = MergeWriteProbes::default();
+    let entity = with_merge_write_probes(
+        probes.clone(),
+        db.entity_at_target(
+            ReadTarget::branch("main"),
+            "edge:Attachment",
+            "attachment-1",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(entity["payload"], encoded(b"Edge"));
+    assert_eq!(
+        (
+            probes.blob_managed_batch_read_calls(),
+            probes.blob_payload_read_calls()
+        ),
+        (1, 1)
+    );
+
     // ETags identify the exact table snapshot, not only the payload bytes:
     // repeating the same read is stable; advancing this node table changes its
     // tag; the untouched edge table retains its exact tag.

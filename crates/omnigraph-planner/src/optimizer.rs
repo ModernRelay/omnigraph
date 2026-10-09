@@ -12,9 +12,9 @@ use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 
 use crate::cost::{
-    AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, IndexCoverage,
-    choose_access_path, choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops,
-    scan_row_estimate,
+    AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR,
+    HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::PlanError;
 use crate::logical::{
@@ -26,9 +26,9 @@ use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::output::{node_object_types, return_schema};
 use crate::physical::{
-    Assumptions, Estimate, Hop, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
-    TextContains,
+    Assumptions, Estimate, Hop, HydratedBinding, HydratedColumn, NodeId, OverfetchRung,
+    PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind, RankScope, RankedAccess,
+    ScanInput, StatisticSource, TextContains,
 };
 use crate::source::{NodeTypeSpec, PlanSource, SideId};
 
@@ -1074,6 +1074,7 @@ pub fn physical_plan(
     bounds: &Bounds,
     mut fired: Vec<&'static str>,
 ) -> Result<Optimized, PlanError> {
+    let query = is_query_plan(plan);
     let before = plan
         .schema(plan.root())
         .cloned()
@@ -1105,11 +1106,13 @@ pub fn physical_plan(
         join_algorithm,
         expand_mode,
         access_path,
-        decisions,
+        mut decisions,
         ..
     } = lowering;
     physical.set_root(root);
-    if late_materialization {
+    let late_query =
+        query && materialize_returns_late(&mut physical, plan, source, &mut decisions)?;
+    if late_materialization || late_query {
         fired.push(PASS_LATE_MATERIALIZATION);
     }
     let contains_join = physical
@@ -1873,6 +1876,209 @@ fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
             predicate_reads(right, out);
         }
         Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => {}
+    }
+}
+
+/// Pass 6 on a query plan. A return column that nothing but the output
+/// reads (a bare `$b.property`, not a key, a `Blob` or a sort alias) leaves
+/// its binding's scan, which reads the binding's row address instead, and a
+/// `HydrateColumns` above the root `Limit` fetches it for the rows the limit
+/// kept. A scan reads (and Lance reads ahead) more rows than the limit keeps
+/// whenever a sort, a filter or a traversal sits below it, so the pass
+/// applies to every binding whose scan's row estimate is above
+/// `HYDRATE_ROW_RATIO` rows per kept row or unknown; a key lookup reads one
+/// row and keeps its columns. Plans that rank by fusion or aggregate keep
+/// theirs.
+fn materialize_returns_late(
+    physical: &mut PhysicalPlan,
+    logical: &LogicalPlan,
+    source: &dyn PlanSource,
+    decisions: &mut Vec<StatisticSource>,
+) -> Result<bool, PlanError> {
+    let root = physical.root();
+    let Some(&PhysicalNode::Limit { input, rows: limit }) = physical.node(root) else {
+        return Ok(false);
+    };
+    if limit == 0 {
+        return Ok(false);
+    }
+    let mut id = input;
+    let mut alias_keys: HashSet<String> = HashSet::new();
+    while let Some(PhysicalNode::Sort {
+        input, order_by, ..
+    }) = physical.node(id)
+    {
+        alias_keys.extend(order_by.iter().filter_map(|key| match &key.expr {
+            IRExpr::AliasRef(alias, _) => Some(alias.clone()),
+            _ => None,
+        }));
+        id = *input;
+    }
+    let Some(PhysicalNode::Projection { return_exprs, .. }) = physical.node(id) else {
+        return Ok(false);
+    };
+    let return_exprs = return_exprs.clone();
+    if physical.live().any(|(_, node)| {
+        matches!(
+            node,
+            PhysicalNode::RankFuse { .. } | PhysicalNode::Aggregate { .. }
+        )
+    }) {
+        return Ok(false);
+    }
+    let Some(returned) = logical_return_projection(logical) else {
+        return Ok(false);
+    };
+
+    // What decides rows: every read outside the return, then the return's
+    // own reads that are not a bare, unsorted property.
+    let mut kept: HashSet<(String, String)> = HashSet::new();
+    let mut whole: HashSet<String> = HashSet::new();
+    let mut keep = |read: ColumnRef| match read.property {
+        Some(property) => {
+            kept.insert((read.binding, property));
+        }
+        None => {
+            whole.insert(read.binding);
+        }
+    };
+    for (logical_id, node) in logical.live() {
+        if logical_id != returned {
+            node_reads(node).into_iter().for_each(&mut keep);
+        }
+    }
+    let mut candidates: BTreeMap<String, Vec<HydratedColumn>> = BTreeMap::new();
+    for (position, item) in return_exprs.iter().enumerate() {
+        let output = result_column(item);
+        match (&item.expr, output) {
+            (
+                IRExpr::PropAccess {
+                    variable, property, ..
+                },
+                output,
+            ) if !alias_keys.contains(&output) => {
+                candidates
+                    .entry(variable.clone())
+                    .or_default()
+                    .push(HydratedColumn {
+                        position,
+                        output,
+                        property: property.clone(),
+                    });
+            }
+            (expr, _) => {
+                let mut reads = Vec::new();
+                reads_of_expr(expr, &mut reads);
+                reads.into_iter().for_each(&mut keep);
+            }
+        }
+    }
+
+    let threshold = u64::try_from(limit)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(HYDRATE_ROW_RATIO);
+    let mut bindings = Vec::new();
+    let mut rewrites: Vec<(NodeId, Vec<String>)> = Vec::new();
+    for (binding, columns) in candidates {
+        if whole.contains(&binding) {
+            continue;
+        }
+        let scans: Vec<NodeId> = physical
+            .live()
+            .filter(|(_, node)| {
+                matches!(node, PhysicalNode::Scan { spec, .. }
+                    if spec.binding.as_deref() == Some(binding.as_str()))
+            })
+            .map(|(scan, _)| scan)
+            .collect();
+        let [scan] = scans[..] else {
+            continue;
+        };
+        let Some(PhysicalNode::Scan {
+            spec,
+            ranked: None,
+            keys_only: false,
+            ..
+        }) = physical.node(scan)
+        else {
+            continue;
+        };
+        let Some(projection) = spec.projection.as_ref() else {
+            continue;
+        };
+        let node_type = node_type_of(spec, source)?;
+        let deferrable = |property: &str| {
+            !kept.contains(&(binding.clone(), property.to_string()))
+                && !node_type.key.iter().any(|key| key == property)
+                && property != node_type.columns.id
+                && projection.iter().any(|column| column == property)
+                && node_type
+                    .schema
+                    .field_with_name(property)
+                    .is_ok_and(|field| {
+                        node_type.object_columns.iter().any(|name| name == property)
+                            || matches!(field.data_type(), DataType::FixedSizeList(..))
+                    })
+        };
+        let columns: Vec<HydratedColumn> = columns
+            .into_iter()
+            .filter(|column| deferrable(&column.property))
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+        let rows = scan_row_estimate(spec, source);
+        decisions.push(StatisticSource {
+            statistic: format!("hydrate_rows({binding})"),
+            value: format!(
+                "{} rows, limit {limit}, ratio {HYDRATE_ROW_RATIO}",
+                rows.map_or_else(|| "unknown".to_string(), |rows| rows.to_string())
+            ),
+            origin: "manifest row count, at most one row under a key equality",
+        });
+        if rows.is_some_and(|rows| rows <= threshold) {
+            continue;
+        }
+        let mut read: Vec<String> = projection
+            .iter()
+            .filter(|column| !columns.iter().any(|deferred| &deferred.property == *column))
+            .cloned()
+            .collect();
+        if !read.iter().any(|column| column == ROW_ADDR) {
+            read.push(ROW_ADDR.to_string());
+        }
+        rewrites.push((scan, read));
+        bindings.push(HydratedBinding {
+            binding,
+            table: spec.table.clone(),
+            columns,
+        });
+    }
+    if bindings.is_empty() {
+        return Ok(false);
+    }
+    for (scan, read) in rewrites {
+        if let Some(PhysicalNode::Scan { spec, .. }) = physical.node_mut(scan) {
+            spec.projection = Some(read);
+        }
+    }
+    let hydrate = physical.add(PhysicalNode::HydrateColumns {
+        input: root,
+        bindings,
+    });
+    physical.set_root(hydrate);
+    Ok(true)
+}
+
+/// The query's return `Projection`: under the root `Limit` and `Sort`s.
+fn logical_return_projection(plan: &LogicalPlan) -> Option<LogicalId> {
+    let mut id = plan.root();
+    loop {
+        match plan.node(id)? {
+            LogicalNode::Limit { input, .. } | LogicalNode::Sort { input, .. } => id = *input,
+            LogicalNode::Projection { .. } => return Some(id),
+            _ => return None,
+        }
     }
 }
 
@@ -3117,6 +3323,7 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
         PhysicalNode::SortMergeJoin { on, .. } => Some(vec![on.clone()]),
         PhysicalNode::HashJoin { probe, .. } => declared_ordering(plan, *probe),
         PhysicalNode::HydrateByAddress { input, .. }
+        | PhysicalNode::HydrateColumns { input, .. }
         | PhysicalNode::RowCompare { input, .. }
         | PhysicalNode::ClassifyThreeWay { input }
         | PhysicalNode::Page { input, .. }
@@ -3303,6 +3510,22 @@ fn derive_properties(
                         statistic: "retained_limit".to_string(),
                         value: bounds.hydration_chunk_hard_bytes.to_string(),
                         origin: "HYDRATION_CHUNK_HARD_BYTES",
+                    }],
+                }
+            }
+            PhysicalNode::HydrateColumns { input, .. } => {
+                let input = props(plan, *input)?;
+                let retained = hydrate_chunk_bytes(bounds.query_memory_pool_bytes);
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: input.ordering.clone(),
+                    rows: input.rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: Some(retained),
+                    sources: vec![StatisticSource {
+                        statistic: "retained_limit".to_string(),
+                        value: retained.to_string(),
+                        origin: "query memory pool / 8",
                     }],
                 }
             }

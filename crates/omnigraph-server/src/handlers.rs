@@ -5,6 +5,7 @@
 use super::*;
 use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::operations::OwnedResult;
+use crate::redacted_cause::RedactedCause;
 use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
 use crate::serving::GraphRequest;
 use crate::workload::{AdmissionGuard, IngressLease};
@@ -1041,7 +1042,7 @@ fn log_blob_transport_internal(refused: &ApiError) {
 fn redact_blob_api_error(
     mapped: ApiError,
     stage: &'static str,
-    cause: Option<blob_transport::RedactedCause>,
+    cause: Option<RedactedCause>,
 ) -> ApiError {
     if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
@@ -1117,7 +1118,7 @@ pub(crate) async fn server_export(
         .await
         .map_err(ApiError::from_omni)?;
     let producer_queue_lease = Arc::clone(&queue_lease);
-    let (tx, body_stream) = export_transport::channel(queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease, "export");
     tokio::spawn(
         async move {
             // Declared first so wrapped producer/input resources drop before
@@ -1141,8 +1142,7 @@ pub(crate) async fn server_export(
                     // Cancelling the pinned export future drops its move-only cut.
                 }
                 (cut, result) = &mut export => {
-                    let error = result.err().map(|error| std::io::Error::other(error.to_string()));
-                    tx.finish(cut, error).await;
+                    tx.finish(cut, result.err()).await;
                 }
             }
         }
@@ -1434,7 +1434,7 @@ async fn resolve_authorized_read_target_with_cause(
     actor: Option<&AuthenticatedActor>,
     branch: Option<String>,
     snapshot: Option<String>,
-) -> std::result::Result<ReadTarget, (ApiError, Option<blob_transport::RedactedCause>)> {
+) -> std::result::Result<ReadTarget, (ApiError, Option<RedactedCause>)> {
     if branch.is_some() && snapshot.is_some() {
         return Err((
             ApiError::bad_request("request may specify branch or snapshot, not both"),
@@ -1466,8 +1466,8 @@ async fn resolve_authorized_read_target_with_cause(
     Ok(target)
 }
 
-fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<blob_transport::RedactedCause>) {
-    let cause = blob_transport::RedactedCause::of(&error);
+fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>) {
+    let cause = RedactedCause::of(&error);
     (ApiError::from_omni(error), Some(cause))
 }
 
@@ -1787,7 +1787,7 @@ async fn invoke_stored_query(
     }
 
     info!(
-        graph = %handle.uri,
+        graph_id = %handle.key.graph_id,
         actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
         query = %query_name,
         kind = if is_mutation { "mutate" } else { "read" },
@@ -2796,9 +2796,24 @@ pub(crate) fn query_params_from_json(
 #[cfg(test)]
 mod change_route_error_tests {
     use super::*;
+    use crate::test_log_capture::Capture;
+
+    /// Assert the captured log carries every `expected` spelling and none of
+    /// the `leaked` ones.
+    fn assert_log(capture: &Capture, expected: &[&str], leaked: &[&str]) {
+        let logs = capture.output();
+        for expected in expected {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in leaked {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
 
     #[test]
     fn change_route_error_hides_substrate_paths() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let leaky =
             "/srv/data/graph/nodes/0000000a-0000000b.lance: No such file or directory".to_string();
         let mapped = change_route_error(OmniError::Storage(omnigraph::error::StorageFailure::new(
@@ -2811,10 +2826,21 @@ mod change_route_error_tests {
             "change route leaked a substrate path: {}",
             mapped.message()
         );
+        assert_log(
+            &capture,
+            &[
+                r#"error_kind="change_route_internal""#,
+                r#"error_variant="Storage""#,
+                "storage_kind=Some(Unknown)",
+            ],
+            &[".lance", "/srv/data", "No such file"],
+        );
     }
 
     #[test]
     fn change_route_error_hides_internal_manifest_table_keys() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let mapped = change_route_error(OmniError::manifest_internal(
             "invalid table key 'node:SecretType' at internal version 7",
         ));
@@ -2824,10 +2850,20 @@ mod change_route_error_tests {
             "change route leaked an internal table key: {}",
             mapped.message()
         );
+        assert_log(
+            &capture,
+            &[
+                r#"error_variant="Manifest""#,
+                "manifest_kind=Some(Internal)",
+            ],
+            &["node:SecretType", "internal version"],
+        );
     }
 
     #[test]
     fn change_route_error_passes_only_allowlisted_graph_errors_through() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         // Even Manifest::NotFound is too broad for the shared mapper. Only a
         // route that knows which public graph resource it looked up may turn
         // that category into a fixed 404.
@@ -2882,10 +2918,22 @@ mod change_route_error_tests {
         });
         assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!mapped.message().contains("node:Secret"));
+        // Neither the collapsed failures nor the contextual 404 log the text
+        // the response withholds, even at debug level.
+        assert_log(
+            &capture,
+            &[
+                r#"public_message=commit 'x' not found"#,
+                r#"error_variant="ResourceLimitExceeded""#,
+            ],
+            &["node:Secret", "/srv/private"],
+        );
     }
 
     #[test]
     fn change_route_recovery_exposes_id_but_redacts_internal_reason() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let mapped = change_route_error(OmniError::RecoveryRequired {
             operation_id: "op-public".to_string(),
             reason: "sidecar /srv/private/recovery.json names node:Secret".to_string(),
@@ -2898,6 +2946,11 @@ mod change_route_error_tests {
             Some(crate::ApiErrorDetails::RecoveryRequired(details))
                 if details.operation_id == "op-public"
         ));
+        assert_log(
+            &capture,
+            &["change route requires recovery", "operation_id=op-public"],
+            &["/srv/private", "node:Secret", "sidecar"],
+        );
     }
 }
 
@@ -3383,7 +3436,7 @@ fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), A
 fn change_route_not_found(error: OmniError, public_message: String) -> ApiError {
     match error {
         OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound => {
-            tracing::debug!(internal_error = %manifest, %public_message, "change resource not found");
+            tracing::debug!(%public_message, "change resource not found");
             ApiError::not_found(public_message)
         }
         other => change_route_error(other),
@@ -3410,8 +3463,9 @@ fn change_route_commit_lookup_error(error: OmniError, commit_id: &str) -> ApiErr
 /// This is intentionally an allowlist. Only variants whose types guarantee
 /// graph-vocabulary fields cross the wire. Everything else — including broad
 /// `Manifest::BadRequest` / conflict categories and any future `OmniError`
-/// variant — is logged and collapsed to a fixed 500 so adding an engine error
-/// can never accidentally expose an internal storage identifier or sidecar.
+/// variant — is logged by its class and collapsed to a fixed 500 so adding an
+/// engine error can never accidentally expose an internal storage identifier
+/// or sidecar, in the response or in the log.
 fn change_route_error(error: OmniError) -> ApiError {
     match error {
         OmniError::ResourceLimitExceeded {
@@ -3438,18 +3492,23 @@ fn change_route_error(error: OmniError) -> ApiError {
         | OmniError::ChangeFeedGap { .. }
         | OmniError::CommitHasNoParent { .. }
         | OmniError::ChangeSchemaBoundary { .. }) => ApiError::from_omni(safe),
-        OmniError::RecoveryRequired {
-            operation_id,
-            reason,
-        } => {
-            tracing::warn!(%operation_id, %reason, "change route requires recovery");
+        // The reason is engine text; the operation ID is what recovery needs.
+        OmniError::RecoveryRequired { operation_id, .. } => {
+            tracing::warn!(%operation_id, "change route requires recovery");
             ApiError::recovery_required(
                 "recovery required before changes can be read".to_string(),
                 operation_id,
             )
         }
         other => {
-            tracing::error!(error = %other, "change route internal error");
+            let cause = RedactedCause::of(&other);
+            tracing::error!(
+                error_kind = "change_route_internal",
+                error_variant = cause.variant,
+                storage_kind = ?cause.storage_kind,
+                manifest_kind = ?cause.manifest_kind,
+                "change route internal error"
+            );
             ApiError::internal("internal error while reading changes")
         }
     }
@@ -3636,7 +3695,7 @@ pub(crate) async fn server_changes_baseline(
         .await
         .map_err(change_route_error)?;
     let producer_queue_lease = Arc::clone(&queue_lease);
-    let (tx, body_stream) = export_transport::channel(queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease, "change_baseline");
     tokio::spawn(
         async move {
             // Declared first so wrapped producer/input resources drop before
@@ -3661,18 +3720,16 @@ pub(crate) async fn server_changes_baseline(
                     // The structural guarantee: the terminal handshake record is
                     // sent ONLY after every snapshot record succeeded. A failed or
                     // interrupted stream carries no usable cursor.
-                    let error = match result {
-                        Ok(()) => {
-                            tx.send_json_line(&api::ChangeBaselineRecord {
+                    let failure = match result {
+                        Ok(()) => tx
+                            .send_json_line(&api::ChangeBaselineRecord {
                                 baseline: api::change_baseline_output(&handshake),
                             })
                             .await
-                            .err()
-                            .map(|error| std::io::Error::other(error.to_string()))
-                        }
-                        Err(error) => Some(std::io::Error::other(error.to_string())),
+                            .err(),
+                        Err(error) => Some(error),
                     };
-                    tx.finish(cut, error).await;
+                    tx.finish(cut, failure).await;
                 }
             }
         }

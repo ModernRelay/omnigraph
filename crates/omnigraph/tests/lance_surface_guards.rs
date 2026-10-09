@@ -3034,7 +3034,8 @@ async fn compact_files_succeeds_on_blob_columns() {
 
 /// Guard 10, continued: every managed placement, null and valid empty survive
 /// compaction, a small-buffer `read_blobs` stream equals `execute()` in request
-/// order with duplicates, and an external row is resolved and read.
+/// order with duplicates, a taken value leaves the next I/O batch unread, and
+/// an external row is resolved and read.
 async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) {
     use arrow_array::types::UInt64Type;
 
@@ -3157,6 +3158,40 @@ async fn assert_batched_blob_reads_cover_every_placement(dir: &std::path::Path) 
             "read_blobs must keep request order, duplicates, null and valid empty (row {index})"
         );
     }
+
+    // Export holds one stream per Blob column across a batch's rows and takes
+    // one value at a time, so its memory bound is Lance planning request-order
+    // I/O batches no larger than the buffer (a larger value alone) and reading
+    // a batch only when the stream reaches it. Under a 64 KiB buffer the
+    // 80-byte inline value is its own batch: taking it must not read the 5 MiB
+    // dedicated value requested after it.
+    let dedicated_bytes = values[4].as_ref().unwrap().len() as u64;
+    let store = ds.object_store(None).await.unwrap();
+    let mut lazy = ds
+        .read_blobs("content")
+        .unwrap()
+        .with_row_ids(vec![row_ids[0], row_ids[4]])
+        .preserve_order(true)
+        .with_io_buffer_size_bytes(64 * 1024)
+        .try_into_stream()
+        .await
+        .unwrap();
+    let opened = store.io_stats_snapshot().read_bytes;
+    let first = lazy.try_next().await.unwrap().unwrap();
+    assert_eq!(first.data.as_deref(), values[0].as_deref());
+    let after_first = store.io_stats_snapshot().read_bytes;
+    assert!(
+        after_first - opened < dedicated_bytes,
+        "taking the first value read {} bytes: read_blobs read ahead into the next batch",
+        after_first - opened
+    );
+    let second = lazy.try_next().await.unwrap().unwrap();
+    assert_eq!(second.data.as_deref(), values[4].as_deref());
+    assert!(
+        store.io_stats_snapshot().read_bytes - after_first >= dedicated_bytes,
+        "the dedicated value is read when the stream reaches it"
+    );
+    assert!(lazy.try_next().await.unwrap().is_none());
 
     let external = ds
         .read_blobs("content")
