@@ -1,6 +1,8 @@
 <!--
   Thanks for contributing! See CONTRIBUTING.md and GOVERNANCE.md.
   A substantive PR needs a backing accepted issue or accepted RFC.
+  Title: `type(scope)!: lowercase description` (types and examples in
+  CONTRIBUTING.md, Pull Requests); the `PR Title` check refuses anything else.
 -->
 
 ## What & why
