@@ -24,7 +24,7 @@ use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy
 
 use helpers::collector::{
     detached_versions, insert_person, insert_scored, keep_one, main_plan, merge_three_chunk_chain,
-    retained_on, staged_since,
+    pins_in_history, retained_on, staged_since,
 };
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
@@ -1979,11 +1979,16 @@ async fn cleanup_keep_exceeding_history_preserves_every_available_version() {
         plan.branches
     );
 
+    let pins = pins_in_history(&db, "main", "node:Person").await;
     db.cleanup(keep_ten).await.unwrap();
 
+    // Every version a commit pins stays; only a chain's links below its
+    // pinned tip (the first load's effect beneath its full-text declaration)
+    // are reclaimed.
     let after = detached_versions(&person_uri).await;
     assert_eq!(
-        after, before,
+        after,
+        &before & &pins,
         "keep greater than available history must not become an unbounded cleanup"
     );
 }

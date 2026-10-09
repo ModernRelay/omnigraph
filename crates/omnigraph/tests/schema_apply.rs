@@ -1,6 +1,7 @@
 mod helpers;
 
 use base64::Engine;
+use lance::index::DatasetIndexExt;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -2659,6 +2660,87 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         before_commits.len() + 1,
         "metadata-only schema apply must still advance graph_head so it arbitrates concurrent prepared writes"
     );
+}
+
+// A full-text call answers with the index's analyzer at every schema apply.
+// Lance applies the analyzer only through a segment of the index; with none,
+// its flat path tokenizes bare, so "deep" misses "Deep Learning". Declaring a
+// full-text `@index` on a populated table, and a rewrite (a Lance overwrite,
+// which drops every index), each publish an untrained segment that carries the
+// analyzer; `ensure_indices` later builds the postings.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn full_text_analyzer_survives_index_declaration_and_rewrite_issue_904() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    body: String\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
+{"type":"Doc","data":{"slug":"d2","body":"deep dive"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let source = r#"query docs($q: String) {
+        match { $d: Doc search($d.body, $q) }
+        return { $d.slug }
+    }"#;
+    let deep = || async {
+        first_column_sorted(
+            &query_main(&db, source, "docs", &params(&[("q", "deep")]))
+                .await
+                .unwrap(),
+        )
+    };
+    let body_segments = || async {
+        let ds = open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+        let body = ds.schema().field("body").unwrap().id;
+        ds.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.fields.contains(&body))
+            .map(|index| index.fragment_bitmap.as_ref().map(|bitmap| bitmap.len()))
+            .collect::<Vec<_>>()
+    };
+
+    // Declaring the full-text index publishes its analyzer with the contract.
+    let declared = "node Doc {\n    slug: String @key\n    body: String @index\n}\n";
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert!(db.apply_schema(declared).await.unwrap().applied);
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert_eq!(after, before + 1, "the declaration is a table effect");
+    assert_eq!(
+        body_segments().await,
+        [Some(0)],
+        "one untrained segment: the analyzer without postings"
+    );
+    assert_eq!(deep().await, ["d1", "d2"]);
+
+    // A rewrite drops every index; the analyzer is declared again.
+    let rewritten =
+        "node Doc {\n    slug: String @key\n    body: String @index\n    extra: String?\n}\n";
+    assert!(db.apply_schema(rewritten).await.unwrap().applied);
+    assert_eq!(body_segments().await, [Some(0)]);
+    assert_eq!(deep().await, ["d1", "d2"]);
+
+    // The reconciler builds the postings over the declaration.
+    db.ensure_indices().await.unwrap();
+    assert_eq!(body_segments().await, [Some(1)]);
+    assert_eq!(deep().await, ["d1", "d2"]);
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is

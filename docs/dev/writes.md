@@ -228,6 +228,21 @@ publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 
+Every writer commits a table effect through
+`TableStore::commit_staged_detached`, which takes the table's declared
+full-text columns. Lance applies a full-text analyzer only through a segment
+of the index, so a version holding rows and no segment for a declared column
+would match with a bare tokenizer (no lowercasing, no stemming). A table's
+first rows, an overwrite load and a schema rewrite (an overwrite drops every
+index) produce such a version; when the committed version holds no segment
+for a declared column, the gateway chains an untrained, certified segment (an
+empty fragment bitmap, no postings) in a second detached commit under the same
+witness and returns that version to pin. Schema apply declares a full-text
+`@index` it adds to a table it does not rewrite the same way, beside the
+contract. The index writer builds postings where no segment covers a fragment,
+and the branch-merge insertion proof steps over a declaration link, which
+moves no row. The system-column upgrade keeps every index and declares none.
+
 Schema apply stages each existing-table rewrite as a detached Overwrite of
 the table's pin and publishes it one logical version past the published
 version. An added type uses its identity-derived path, which a retry derives

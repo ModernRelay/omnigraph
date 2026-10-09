@@ -713,7 +713,7 @@ gateway_surfaces! {
         "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
-        "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+        "has_fts_index", "has_fts_postings", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
         "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded",
         "preflight_external_blob_uris", "prepare_keyed_write_batch_with_preflight",
@@ -740,6 +740,9 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
     ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
+        "commit_full_text_declarations",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "validate_initial_empty_table",
         "transaction_identity",
@@ -754,7 +757,7 @@ gateway_surfaces! {
         "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
-        "has_btree_index", "has_fts_index",
+        "has_btree_index", "has_fts_index", "has_fts_postings",
         "has_vector_index", "first_row_id_for_filter",
         "with_external_blob_policy", "preflight_external_blob_uris",
         "preflight_persisted_blob_selection", "prepare_keyed_write_batch_with_preflight",
@@ -767,7 +770,7 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_rename_columns", "renamed_schema", "stage_delete", "stage_create_indices",
-        "stage_compaction", "stage_index_fold",
+        "stage_compaction", "stage_index_fold", "stage_full_text_declarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -784,13 +787,16 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
     ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
+        "commit_full_text_declarations",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
     ],
     "omnigraph-core/dataset_index.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
         "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
-        "has_btree_index_on", "has_fts_index_on", "has_vector_index_on",
+        "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -891,17 +897,17 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 31, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 3, WriteProtocol::Composed("staged commit primitive")),
-    ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
-    ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".create_index_builder(", 6, WriteProtocol::Composed("staged index primitive, RFC 0067 whole-rebuild fold and untrained full-text declaration")),
+    ("table_store.rs", ".execute_uncommitted(", 11, WriteProtocol::Composed("staged physical primitive")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),

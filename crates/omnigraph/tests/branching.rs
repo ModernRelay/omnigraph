@@ -479,10 +479,16 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
         .open_dataset("node:Document")
         .await
         .unwrap();
+    // The load declares the `title` full-text index with an untrained
+    // segment: no postings, and no scalar index a merge plan could select.
     let indices = ds.load_indices().await.unwrap();
     assert!(
-        indices.iter().all(is_system_index),
-        "blob correctness regression requires an index-absent table"
+        indices.iter().all(|index| is_system_index(index)
+            || index
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.is_empty())),
+        "blob correctness regression requires a table without built indexes"
     );
 
     main.branch_create("feature").await.unwrap();

@@ -746,16 +746,34 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<ExactCommitOutcome>;
 
     /// RFC 0067: commit one staged effect as a detached version, stamped
-    /// with the authority it was staged against.
+    /// with the authority it was staged against, declaring every full-text
+    /// column of `declared_full_text` the version holds no segment for
+    /// (`TableStore::commit_staged_detached`).
     async fn commit_staged_detached(
         &self,
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
+        declared_full_text: &[String],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
     )>;
+
+    /// Commit, detached under `witness`, an untrained full-text segment for
+    /// every column of `columns` the version holds no segment for
+    /// (`TableStore::commit_full_text_declarations`).
+    async fn commit_full_text_declarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[String],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<
+        Option<(
+            SnapshotHandle,
+            crate::table_store::StagedTransactionIdentity,
+        )>,
+    >;
 
     /// RFC 0067: the identity of the transaction a version records.
     fn transaction_identity(
@@ -800,6 +818,9 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Whether a full-text segment on `column` holds postings; an untrained
+    /// declaration segment does not.
+    async fn has_fts_postings(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
 
     // ── URI helpers ────────────────────────────────────────────────────
@@ -1255,13 +1276,20 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
+        declared_full_text: &[String],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
     )> {
         let ds_arc = snapshot.into_arc();
-        let (dataset, identity) =
-            TableStore::commit_staged_detached(self, ds_arc, staged.into_staged(), witness).await?;
+        let (dataset, identity) = TableStore::commit_staged_detached(
+            self,
+            ds_arc,
+            staged.into_staged(),
+            witness,
+            declared_full_text,
+        )
+        .await?;
         Ok((SnapshotHandle::new(dataset), identity))
     }
 
@@ -1270,6 +1298,24 @@ impl TableStorage for TableStore {
         snapshot: &SnapshotHandle,
     ) -> Result<crate::table_store::StagedTransactionIdentity> {
         TableStore::transaction_identity(self, snapshot.dataset())
+    }
+
+    async fn commit_full_text_declarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[String],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<
+        Option<(
+            SnapshotHandle,
+            crate::table_store::StagedTransactionIdentity,
+        )>,
+    > {
+        Ok(
+            TableStore::commit_full_text_declarations(self, snapshot.into_arc(), columns, witness)
+                .await?
+                .map(|(dataset, identity)| (SnapshotHandle::new(dataset), identity)),
+        )
     }
 
     async fn commit_staged_exact(
@@ -1334,6 +1380,10 @@ impl TableStorage for TableStore {
 
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
         TableStore::has_fts_index(self, snapshot.dataset(), column).await
+    }
+
+    async fn has_fts_postings(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
+        TableStore::has_fts_postings(self, snapshot.dataset(), column).await
     }
 
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {

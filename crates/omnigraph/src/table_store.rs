@@ -66,8 +66,9 @@ use crate::blob::{
     StorageRootConflict, nested_blob_field,
 };
 use crate::dataset_index::{
-    has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
-    user_indices_for_column, validate_full_text_demand, validate_full_text_scan,
+    has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
+    is_full_text_index, user_indices_for_column, validate_full_text_demand,
+    validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -544,6 +545,27 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
     );
 }
 
+/// Whether `transaction`, read at `expected_read_version`, only declares
+/// full-text indexes ([`TableStore::stage_full_text_declarations`]): a
+/// `CreateIndex` that adds untrained full-text segments (empty fragment
+/// bitmaps) and removes nothing. It moves no row.
+pub(crate) fn is_full_text_declaration(
+    transaction: &Transaction,
+    expected_read_version: u64,
+) -> bool {
+    transaction.read_version == expected_read_version
+        && matches!(
+            &transaction.operation,
+            Operation::CreateIndex { new_indices, removed_indices }
+                if removed_indices.is_empty()
+                    && !new_indices.is_empty()
+                    && new_indices.iter().all(|index| {
+                        is_full_text_index(index)
+                            && index.fragment_bitmap.as_ref().is_some_and(|bitmap| bitmap.is_empty())
+                    })
+        )
+}
+
 /// Verify one persisted link of the insertion-absence proof chain and return
 /// its exact physical row contribution. This is intentionally stricter than a
 /// property lookup: the caller must also supply the expected parent version,
@@ -733,6 +755,25 @@ impl StagedCommitMetadata {
     fn affected_rows(affected_rows: Option<RowAddrTreeMap>) -> Self {
         Self { affected_rows }
     }
+}
+
+/// One Lance detached commit of `transaction` on `ds`: no conflict pass, no
+/// HEAD movement, no auto-cleanup.
+async fn commit_detached(
+    ds: Arc<Dataset>,
+    transaction: Transaction,
+    affected_rows: Option<RowAddrTreeMap>,
+) -> Result<Dataset> {
+    let mut builder = CommitBuilder::new(ds)
+        .with_skip_auto_cleanup(true)
+        .with_detached(true);
+    if let Some(affected_rows) = affected_rows {
+        builder = builder.with_affected_rows(affected_rows);
+    }
+    builder
+        .execute(transaction)
+        .await
+        .map_err(OmniError::storage)
 }
 
 // Sealed storage surface: the `new_fragments`/`removed_fragment_ids`
@@ -3703,25 +3744,100 @@ impl TableStore {
     /// RFC 0067: commit a staged effect as a Lance detached
     /// version of its base. No conflict pass runs, nothing at HEAD moves, and
     /// the result is invisible until a manifest pin references it.
+    ///
+    /// `declared_full_text` names the table's declared full-text columns.
+    /// Lance applies a full-text analyzer only through a segment of the
+    /// index: rows no segment covers are matched with that segment's
+    /// analyzer, and with no segment at all its flat path tokenizes bare (no
+    /// lowercasing, no stemming). A column the committed version holds no
+    /// full-text segment for (a table whose first rows land here, an
+    /// overwrite, which drops every index) gets an untrained one in a second
+    /// detached commit chained on the first under the same witness, and the
+    /// returned version is that one. So no version a writer pins leaves a
+    /// declared full-text index without its analyzer; postings still come
+    /// from explicit reconciliation.
     pub async fn commit_staged_detached(
         &self,
         ds: Arc<Dataset>,
         mut staged: StagedWrite,
         witness: &StagingWitness,
+        declared_full_text: &[String],
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         witness.stamp(&mut staged.transaction);
-        let mut builder = CommitBuilder::new(ds)
-            .with_skip_auto_cleanup(true)
-            .with_detached(true);
-        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
-            builder = builder.with_affected_rows(affected_rows);
+        let mut dataset =
+            commit_detached(ds, staged.transaction, staged.commit_metadata.affected_rows).await?;
+        if let Some(mut declaration) = self
+            .stage_full_text_declarations(&dataset, declared_full_text)
+            .await?
+        {
+            witness.stamp(&mut declaration);
+            dataset = commit_detached(Arc::new(dataset), declaration, None).await?;
         }
-        let dataset = builder
-            .execute(staged.transaction)
-            .await
-            .map_err(OmniError::storage)?;
         let identity = self.transaction_identity(&dataset)?;
         Ok((dataset, identity))
+    }
+
+    /// Commit, detached on `ds` under `witness`, the declaration of every
+    /// column of `columns` holding no full-text segment
+    /// ([`Self::stage_full_text_declarations`]): the effect of a schema apply
+    /// that declares a full-text index on a table it does not rewrite. `None`
+    /// when every column already has a segment.
+    pub async fn commit_full_text_declarations(
+        &self,
+        ds: Arc<Dataset>,
+        columns: &[String],
+        witness: &StagingWitness,
+    ) -> Result<Option<(Dataset, StagedTransactionIdentity)>> {
+        let Some(mut declaration) = self.stage_full_text_declarations(&ds, columns).await? else {
+            return Ok(None);
+        };
+        witness.stamp(&mut declaration);
+        let dataset = commit_detached(ds, declaration, None).await?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok(Some((dataset, identity)))
+    }
+
+    /// The `CreateIndex` that gives every column of `columns` holding no
+    /// full-text segment on `ds` an untrained, certified one: an empty
+    /// fragment bitmap, no postings, the engine's analyzer. `None` when every
+    /// column already has a segment.
+    pub(crate) async fn stage_full_text_declarations(
+        &self,
+        ds: &Dataset,
+        columns: &[String],
+    ) -> Result<Option<Transaction>> {
+        let mut new_indices = Vec::new();
+        for column in columns {
+            if has_fts_index_on(ds, column).await? {
+                continue;
+            }
+            let params = InvertedIndexParams::default();
+            let mut builder_ds = ds.clone();
+            let mut segment = builder_ds
+                .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                .replace(true)
+                .train(false)
+                .execute_uncommitted()
+                .await
+                .map_err(|error| {
+                    OmniError::storage_context(
+                        format!("declare the full-text index on '{column}'"),
+                        error,
+                    )
+                })?;
+            fts_compat::write_certificate(ds, &mut segment).await?;
+            new_indices.push(segment);
+        }
+        Ok((!new_indices.is_empty()).then(|| {
+            TransactionBuilder::new(
+                ds.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices: Vec::new(),
+                },
+            )
+            .build()
+        }))
     }
 
     /// The identity of the transaction a version records (RFC 0067), read
@@ -4751,6 +4867,10 @@ impl TableStore {
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_fts_index_on(ds, column).await
+    }
+
+    pub async fn has_fts_postings(&self, ds: &Dataset, column: &str) -> Result<bool> {
+        has_fts_postings_on(ds, column).await
     }
 
     /// Metadata-only check (no data IO) of whether the FTS (inverted) index

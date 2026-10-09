@@ -383,9 +383,11 @@ async fn execute_with_lock(
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
+            // One rename-only `Project` commit per table: it keeps every
+            // index attachment, and declares no full-text index.
             let (detached, transaction) = db
                 .storage()
-                .commit_staged_detached(head, staged, &witness)
+                .commit_staged_detached(head, staged, &witness, &[])
                 .await?;
             let state = db.storage().table_state(&dataset_uri, &detached).await?;
             let published_dataset_version = entry.published_dataset_version + 1;

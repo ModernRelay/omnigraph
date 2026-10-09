@@ -251,6 +251,20 @@ pub async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     }))
 }
 
+/// Whether a full-text segment on `column` holds postings: it covers a
+/// fragment, or its coverage is unknown. An untrained segment (an empty
+/// fragment bitmap) only declares the analyzer.
+pub async fn has_fts_postings_on(ds: &Dataset, column: &str) -> Result<bool> {
+    let indices = user_indices_for_column(ds, column).await?;
+    Ok(indices.iter().any(|index| {
+        is_full_text_index(index)
+            && index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| !bitmap.is_empty())
+    }))
+}
+
 pub async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     let indices = user_indices_for_column(ds, column).await?;
     Ok(indices.iter().any(|index| {

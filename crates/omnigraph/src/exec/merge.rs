@@ -9,7 +9,7 @@ use crate::session::Session;
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
-use crate::table_store::certified_insert_absence_rows;
+use crate::table_store::{certified_insert_absence_rows, is_full_text_declaration};
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
 
@@ -975,8 +975,9 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 }
 
 /// Walk the source's chain of commits by `read_version` links down to either
-/// base pin, certifying each as an exact-id fenced insert; the new fragments
-/// are the source's fragments the base lacks, and the rows are the chain's.
+/// base pin, certifying each as an exact-id fenced insert or a full-text
+/// declaration (which moves no row); the new fragments are the source's
+/// fragments the base lacks, and the rows are the chain's.
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -990,12 +991,16 @@ async fn proven_chain_fragments(
         let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
         crate::instrumentation::record_proven_insert_history_read();
         let transaction = dataset.read_transaction().await.ok()??;
-        let rows = certified_insert_absence_rows(
-            &transaction,
-            identity.read_version,
-            id_field_id,
-            expected_schema_preorder_ids,
-        )?;
+        let rows = if is_full_text_declaration(&transaction, identity.read_version) {
+            0
+        } else {
+            certified_insert_absence_rows(
+                &transaction,
+                identity.read_version,
+                id_field_id,
+                expected_schema_preorder_ids,
+            )?
+        };
         proven_rows = proven_rows.checked_add(rows)?;
         if base_pins.contains(&transaction.read_version) {
             let base_ids: std::collections::HashSet<u64> = base
@@ -4071,14 +4076,16 @@ struct MergeChain {
     links: Vec<SnapshotHandle>,
     uuids: Vec<String>,
     witness: crate::table_store::StagingWitness,
+    declared_full_text: Vec<String>,
 }
 
 impl MergeChain {
-    fn new(witness: crate::table_store::StagingWitness) -> Self {
+    fn new(witness: crate::table_store::StagingWitness, declared_full_text: Vec<String>) -> Self {
         Self {
             links: Vec::new(),
             uuids: Vec::new(),
             witness,
+            declared_full_text,
         }
     }
 
@@ -4106,7 +4113,7 @@ async fn commit_detached_merge_stage(
 ) -> Result<SnapshotHandle> {
     let (detached, identity) = target_db
         .storage()
-        .commit_staged_detached(current, staged, &chain.witness)
+        .commit_staged_detached(current, staged, &chain.witness, &chain.declared_full_text)
         .await?;
     chain.links.push(detached.clone());
     chain.uuids.push(identity.uuid);
@@ -4191,7 +4198,10 @@ async fn publish_rewritten_merge_table(
     // Every chunk commits detached from the previous one (RFC 0067): a
     // failure anywhere leaves the chain as reclaimable garbage and the
     // target's linear HEAD untouched.
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     for (payload, semantics) in [
         (&staged.inserts, KeyedWriteSemantics::StrictInsert),
         (&staged.updates, KeyedWriteSemantics::KnownPresentUpdate),
@@ -4487,7 +4497,10 @@ async fn publish_proven_pure_insert_adopt(
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     let committed = commit_keyed_stream_chunks(
         target_db,
         table_key,
@@ -4564,7 +4577,10 @@ async fn publish_adopted_delta(
     // but `WhenMatched::Fail` is still required: a concurrent same-key writer
     // must conflict rather than letting this optimization bypass the fence.
     // The adapter keeps wide vector/blob rows streaming and batch-bounded.
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     if let Some(insert_table) = &delta.inserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
