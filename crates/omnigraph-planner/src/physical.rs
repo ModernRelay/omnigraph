@@ -683,8 +683,9 @@ pub enum PhysicalNode {
 
 impl PhysicalNode {
     /// The most rows this node keeps of its input whatever any predicate
-    /// holds: its count cut. Every variant is listed, so a node kind that
-    /// gains a cut cannot compile without declaring it here, and plan
+    /// holds: its count cut. Every variant is listed, so a new node kind
+    /// cannot compile without a classification here; a field that gives an
+    /// existing kind a cut still needs its arm changed by hand. Plan
     /// acceptance justifies every declared cut against the query.
     pub fn row_cut(&self) -> Option<usize> {
         match self {
