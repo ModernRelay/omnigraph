@@ -37,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `Release Note Gate`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -217,6 +217,17 @@ only as data for the diff range, never checked out or executed. It runs on
 body edits and label changes as well as pushes, builds nothing, and runs for
 every change class. On the merge queue's branch it reports a pass
 without a check ([branch-protection.md](branch-protection.md), Merge queue).
+
+`Release Note Gate` (`release-note-gate.yml`) checks the pull request title
+and its release notes with `scripts/check-pr-title.py`, run from the base
+branch on `pull_request_target`. The title reads `type(scope)!: summary` with
+a lowercase type from `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `ci`,
+`build`, `chore`, `revert`, `rfc`, `bench` or `release`; GitHub's
+`Revert "<title>"` counts as a revert. A `feat`, `fix` or `perf` pull request
+adds a `changelog.d` note and a `!` title adds a `.breaking.md` note, unless
+the pull request carries the `skip-changelog` label. Title and label edits
+re-run the gate; the merge-group run reports a pass without a check. See
+[release notes](documentation.md#release-notes).
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
 validates local documentation links, user/developer audience boundaries, RFC

@@ -2,8 +2,11 @@
 """Release-note contracts, using in-memory Git trees and read-only integration."""
 
 import copy
+import hashlib
+import importlib.util
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +21,26 @@ GUIDE = "docs/user/queries/index.md"
 ORIGINAL = b"# OmniGraph v0.12.0\n\nUnreleased.\n\n## Highlights\n\n- Original [guide](../user/queries/index.md).\n"
 ADOPTED = ORIGINAL.replace(b"Original [guide]", b"Updated CLI [guide]") + b"\n- Landed feature one.\n- Landed feature two.\n- Landed fix one.\n- Landed fix two.\n"
 CONFIG = json.dumps({"version": "v0.13.0", "base": "previous", "legacy": None}).encode()
+RELEASE = "changelog.d/v0.13.0.md"
+
+
+def release_text(intro="OmniGraph 0.13 makes reads cheaper.", why=None, highlights=3, body="Scans read only named columns.",
+                 contributors=("azimafroozeh", "pronskiy")):
+    parts = [intro, ""]
+    if why is not None:
+        parts += ["## Why these changes", "", why, ""]
+    if highlights:
+        parts += ["## Highlights", ""]
+        for number in range(highlights):
+            parts += [f"### Highlight {number + 1}", "", body, ""]
+    if contributors:
+        parts += ["## Contributors", ""] + [f"- @{handle}" for handle in contributors] + [""]
+    return ("\n".join(parts).rstrip("\n") + "\n").encode()
+
+
+RELEASE_TEXT = release_text()
+V0_12_0 = "a9aa28502a2217aefdf3464dbc6c39fb58d23d65"
+V0_12_0_BODY_SHA256 = "60f73177ee77bc39aa7f04da88e833a4957a9f332a764b5487da6f12df4db752"
 
 
 class MemoryRepository(notes.Repository):
@@ -31,6 +54,8 @@ class MemoryRepository(notes.Repository):
         self.trees[OTHER] = dict(base)
         self.working = dict(self.trees[TARGET])
         self.tags = set()
+        self.subjects = {}
+        self.adders = {}
 
     def resolve(self, ref):
         sha = self.refs.get(ref, ref)
@@ -62,6 +87,12 @@ class MemoryRepository(notes.Repository):
     def released(self, version):
         return version in self.tags
 
+    def added_by(self, base, target, path):
+        return self.subjects.get(path)
+
+    def adding_commit(self, base, target, path):
+        return self.adders.get(path)
+
 
 class ReleaseNotesTests(unittest.TestCase):
     def setUp(self):
@@ -77,6 +108,399 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_selects_target_paths_absent_from_base(self):
         self.assertEqual(list(notes.select(self.repo, "previous", "HEAD").notes), [NEW])
+
+    def test_release_file_is_selected_separately_from_notes(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.assertEqual(list(selected.notes), [NEW])
+        self.assertEqual(selected.release, {RELEASE: RELEASE_TEXT})
+        self.assertEqual(selected.release_inputs(), {RELEASE: notes.digest(RELEASE_TEXT)})
+
+    def test_release_file_for_another_version_is_refused(self):
+        self.repo.trees[TARGET]["changelog.d/v0.14.0.md"] = RELEASE_TEXT
+        with self.assertRaisesRegex(notes.NotesError, "named for the configured version"):
+            notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+
+    def test_published_release_file_is_immutable(self):
+        old = "changelog.d/v0.12.0.md"
+        self.repo.trees[BASE][old] = RELEASE_TEXT
+        self.repo.trees[TARGET][old] = RELEASE_TEXT + b"\nEdited.\n"
+        with self.assertRaisesRegex(notes.NotesError, "published notes"):
+            notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.repo.trees[TARGET][old] = RELEASE_TEXT
+        self.assertEqual(notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0").release, {})
+
+    def test_format_one_selection_ignores_release_files(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        selected = notes.select(self.repo, "previous", "HEAD")
+        self.assertEqual(list(selected.notes), [NEW])
+        self.assertEqual(selected.release, {})
+
+    def test_pull_request_number_comes_from_the_squash_subject(self):
+        for subject, number in (("feat(gq): add list membership (#803)", 803), ("release: v0.12.0 (#877)", 877),
+                                ("Merge pull request #680 from x/y", None), ("fix: refer to #12 in text", None),
+                                ("fix: zero (#0)", None), (None, None)):
+            with self.subTest(subject=subject):
+                self.assertEqual(notes.pr_number(subject), number)
+
+    def test_selection_links_notes_to_their_pull_requests(self):
+        self.repo.subjects[NEW] = "feat: add predicate (#803)"
+        self.repo.trees[TARGET]["changelog.d/direct.fixed.md"] = b"- Direct push.\n"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        self.assertEqual(selected.links, {NEW: 803})
+        self.assertEqual(notes.select(self.repo, "previous", "HEAD").links, {})
+
+    def test_note_caps_accept_one_short_paragraph(self):
+        notes.check_note_caps(NEW, b"- Add `in` list membership to GQ, pushed into the scan.\n")
+        notes.check_note_caps(NEW, b"- Short note.\r\n")
+        notes.check_note_caps(NEW, ("- " + "é" * 200 + "\n").encode())
+        notes.check_note_caps("changelog.d/upgrade.breaking.md",
+                              b"- Upgrade the CLI and server together. See the [upgrade guide][up-guide].\n\n"
+                              b"[up-guide]: ../docs/user/operations/upgrade.md\n")
+
+    def test_note_caps_count_visible_text_not_markup_or_definitions(self):
+        text = "- `code` [link][caps-link] " + "x" * 180 + "\n\n[caps-link]: ../docs/user/operations/upgrade.md\n"
+        notes.check_note_caps(NEW, text.encode())
+
+    def test_note_caps_refuse_long_or_structured_notes(self):
+        breaking = "changelog.d/upgrade.breaking.md"
+        for path, raw, message in (
+            (NEW, b"- " + b"word " * 50 + b"\n", "over the 200-character limit"),
+            (NEW, ("- " + "é" * 201 + "\n").encode(), "over the 200-character limit"),
+            (NEW, b"- First paragraph.\n\n  Second paragraph.\n", "one bullet with one paragraph"),
+            (NEW, b"- Feature:\n  - nested detail\n", "one bullet with one paragraph"),
+            (NEW, b"- Example:\n\n  ```text\n  code\n  ```\n", "one bullet with one paragraph"),
+            (breaking, b"- Upgrade everything together.\n", "link the guide"),
+            (breaking, b"- " + b"word " * 90 + b"[g][g-up].\n\n[g-up]: https://example.com\n", "over the 400-character limit"),
+        ):
+            with self.subTest(raw=raw[:40]), self.assertRaisesRegex(notes.NotesError, message):
+                notes.check_note_caps(path, raw)
+
+    def test_v0_12_0_oversized_notes_fail_the_caps(self):
+        repo = notes.Repository(notes.ROOT)
+        for path in ("changelog.d/a-release-highlights.added.md",
+                     "changelog.d/a-compatibility-and-behavior-changes.changed.md"):
+            with self.subTest(path=path), self.assertRaises(notes.NotesError):
+                notes.check_note_caps(path, repo.read(V0_12_0, path))
+
+    def test_release_file_splits_intro_why_and_highlights(self):
+        release = notes.split_release_file(RELEASE, release_text(why="The write path changed.").decode())
+        self.assertEqual(release.intro, "OmniGraph 0.13 makes reads cheaper.")
+        self.assertEqual(release.why, "The write path changed.")
+        self.assertEqual([title for title, _ in release.highlights], ["Highlight 1", "Highlight 2", "Highlight 3"])
+        self.assertTrue(release.highlights_text.startswith("### Highlight 1"))
+
+    def test_release_file_accepts_the_documented_shapes(self):
+        notes.check_release_file(RELEASE, release_text(), "v0.13.0", has_breaking=False)
+        notes.check_release_file(RELEASE, release_text(why="Why."), "v0.13.0", has_breaking=True)
+        notes.check_release_file("changelog.d/v0.13.1.md", release_text(highlights=0), "v0.13.1", has_breaking=False)
+        crlf = notes.check_release_file(RELEASE, release_text().replace(b"\n", b"\r\n"), "v0.13.0", has_breaking=False)
+        self.assertEqual(crlf, notes.check_release_file(RELEASE, release_text(), "v0.13.0", has_breaking=False))
+
+    def test_release_file_refusals(self):
+        many = " ".join(["word"] * 81)
+        for raw, version, breaking, message in (
+            (release_text(intro=""), "v0.13.0", False, "start with an intro"),
+            (release_text(intro=many), "v0.13.0", False, "the intro has 81 words"),
+            (release_text(), "v0.13.0", True, "add '## Why these changes'"),
+            (release_text(why=many), "v0.13.0", True, "has 81 words"),
+            (release_text(highlights=2), "v0.13.0", False, "2 highlights; write 3 to 5"),
+            (release_text(highlights=6), "v0.13.1", False, "6 highlights; write 0 to 5"),
+            (release_text(body=" ".join(["word"] * 151)), "v0.13.0", False, "highlight 'Highlight 1' has 151 words"),
+            (release_text() + b"\n## Roadmap\n\nLater.\n", "v0.13.0", False, "not '## Roadmap'"),
+            (b"# OmniGraph\n\n" + release_text(), "v0.13.0", False, "allowed headings"),
+            (release_text(intro="Intro.\n\n### Stray"), "v0.13.0", False, "belong under"),
+            (release_text().replace(b"## Highlights\n\n", b"## Highlights\n\nLoose text.\n\n"), "v0.13.0", False, "start every highlight"),
+            (release_text(why="One.") + b"\n## Why these changes\n\nTwo.\n", "v0.13.0", False, "appears twice"),
+            (release_text().replace(b"## Highlights", b"Highlights\n----------"), "v0.13.0", False, "use '## ' headings"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
+                notes.check_release_file(RELEASE, raw, version, breaking)
+
+    def test_format_follows_the_version(self):
+        self.assertEqual(notes.format_for("v0.12.0"), 1)
+        for version in ("v0.13.0", "v0.12.1", "v1.0.0"):
+            self.assertEqual(notes.format_for(version), 2)
+
+    def test_previous_tag_reads_only_version_tags(self):
+        for base, expected in (("refs/tags/v0.12.0", "v0.12.0"), ("v0.12.0", "v0.12.0"), ("previous", None),
+                               (None, None), (BASE, None), ("refs/heads/v0.12.0", None)):
+            with self.subTest(base=base):
+                self.assertEqual(notes.previous_tag(base), expected)
+
+    def test_format_two_metadata_records_release_links_and_previous(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        info = notes.metadata(selected, "v0.13.0", "2026-10-20", 2, "v0.12.0")
+        self.assertEqual(info["format"], 2)
+        self.assertEqual(info["release"], {RELEASE: notes.digest(RELEASE_TEXT)})
+        self.assertEqual(info["links"], {NEW: 803})
+        self.assertEqual(info["previous"], "v0.12.0")
+        self.assertEqual(set(notes.metadata(selected, "v0.13.0", "2026-10-20")), notes.FORMAT1_KEYS)
+
+    def test_format_two_refuses_a_legacy_baseline(self):
+        selected = notes.select(self.repo, BASE, TARGET, LEGACY)
+        with self.assertRaisesRegex(notes.NotesError, "no legacy baseline"):
+            notes.metadata(selected, "v0.12.0", "2026-10-20", 2)
+
+    def test_snapshot_info_validates_format_two_records(self):
+        self.repo.trees[TARGET][RELEASE] = RELEASE_TEXT
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        info = notes.metadata(selected, "v0.13.0", "2026-10-20", 2, "v0.12.0")
+
+        def record(value):
+            return "<!-- release-notes: " + json.dumps(value, sort_keys=True, separators=(",", ":")) + " -->\n"
+
+        self.assertEqual(notes.snapshot_info(record(info)), info)
+        for forged, message in (
+            (dict(info, release={}), "SHA-256 digest of changelog.d/v0.13.0.md"),
+            (dict(info, links={OLD: 5}), "pull request numbers"),
+            (dict(info, links={NEW: "803"}), "pull request numbers"),
+            (dict(info, previous="previous"), "previous release"),
+            ({key: value for key, value in info.items() if key != "links"}, "invalid release snapshot provenance"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(notes.NotesError, message):
+                notes.snapshot_info(record(forged))
+
+    def put(self, path, raw):
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[path] = raw
+
+    def snapshot2(self, version="v0.13.0"):
+        self.repo.refs["refs/tags/v0.12.0"] = BASE
+        config = json.dumps({"version": version, "base": "refs/tags/v0.12.0", "legacy": None}).encode()
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            tree[notes.CONFIG] = config
+        selected = notes.select(self.repo, "refs/tags/v0.12.0", "HEAD", release_version=version)
+        info = notes.metadata(selected, version, "2026-10-20", 2, notes.previous_tag("refs/tags/v0.12.0"))
+        return selected, info, notes.render(self.repo, selected, info)
+
+    def test_v0_12_0_body_is_byte_identical(self):
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            self.assertEqual(notes.main(["body", "--tag", "v0.12.0", "--target", "v0.12.0"]), 0)
+        self.assertEqual(hashlib.sha256(output.getvalue().encode("utf-8")).hexdigest(), V0_12_0_BODY_SHA256)
+
+    def test_format_two_page_order_links_and_footer(self):
+        self.put(RELEASE, release_text(why="The write path changed."))
+        self.put(notes.UPGRADE_GUIDE, b"# Upgrading\n")
+        self.put("changelog.d/upgrade.breaking.md",
+                 b"- Upgrade together. See the [guide][up-guide].\n\n[up-guide]: ../docs/user/operations/upgrade.md\n")
+        self.put("changelog.d/crash.fixed.md", b"- Fix a crash.\n")
+        self.repo.subjects.update({NEW: "feat: predicate (#803)", "changelog.d/upgrade.breaking.md": "feat!: contract (#814)"})
+        _, _, content = self.snapshot2()
+        order = ["OmniGraph 0.13 makes reads cheaper.", "## Highlights", "### Highlight 1", "## Upgrade actions",
+                 "The write path changed.", "- Upgrade together.", "## Features", "- A new predicate.",
+                 "## Fixes", "- Fix a crash.", "**Full changelog:**"]
+        positions = [content.index(text) for text in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(f"- A new predicate. ([#803]({notes.REPOSITORY}/pull/803))", content)
+        self.assertIn(f"[guide][up-guide]. ([#814]({notes.REPOSITORY}/pull/814))", content)
+        self.assertIn("- Fix a crash.\n", content)
+        self.assertIn(f"[v0.12.0...v0.13.0]({notes.REPOSITORY}/compare/v0.12.0...v0.13.0)", content)
+        self.assertIn("[Upgrade guide](../user/operations/upgrade.md)", content)
+
+    def test_format_two_sections_are_tight_lists_with_definitions_after(self):
+        self.put(RELEASE, release_text(why="Why."))
+        self.put(notes.UPGRADE_GUIDE, b"# Upgrading\n")
+        self.put("changelog.d/one.breaking.md", b"- First action. See [one][one-up].\n\n[one-up]: ../docs/user/operations/upgrade.md\n")
+        self.put("changelog.d/two.breaking.md", b"- Second action. See [two][two-up].\n\n[two-up]: ../docs/user/operations/upgrade.md\n")
+        _, _, content = self.snapshot2()
+        self.assertIn("- First action. See [one][one-up].\n- Second action. See [two][two-up].\n\n"
+                      "[one-up]: ../user/operations/upgrade.md\n[two-up]: ../user/operations/upgrade.md\n", content)
+        section = content[content.index("## Upgrade actions"):content.index("## Features")]
+        self.assertEqual(sum(token.type == "bullet_list_open" for token in notes.parse_markdown(section).tokens), 1)
+
+    def test_note_order_puts_listed_notes_first_and_is_not_rendered(self):
+        self.put("changelog.d/a-first.fixed.md", b"- Alpha fix.\n")
+        self.put("changelog.d/z-last.fixed.md", b"- Zulu fix.\n")
+        self.put(RELEASE, RELEASE_TEXT + b"\n## Note order\n\n- z-last.fixed.md\n")
+        selected, _, content = self.snapshot2()
+        self.assertLess(content.index("- Zulu fix."), content.index("- Alpha fix."))
+        self.assertNotIn("Note order", content)
+        notes.check_release_inputs(selected, "v0.13.0", complete=True)
+
+    def test_note_order_refusals(self):
+        self.put("changelog.d/a-first.fixed.md", b"- Alpha fix.\n")
+        for order, message in (("- missing.fixed.md", "not in this release"),
+                               ("- a-first.fixed.md\n- a-first.fixed.md", "appears twice"),
+                               ("a-first.fixed.md", "one note file name per")):
+            with self.subTest(order=order):
+                self.put(RELEASE, RELEASE_TEXT + f"\n## Note order\n\n{order}\n".encode())
+                selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+                with self.assertRaisesRegex(notes.NotesError, message):
+                    notes.check_release_inputs(selected, "v0.13.0", complete=True)
+
+    def test_format_two_joins_soft_wrapped_lines(self):
+        self.put(RELEASE, release_text(intro="OmniGraph 0.13 makes\nreads cheaper.",
+                                       body="Scans read only\nnamed columns.\n\n```text\nline one\nline two\n```"))
+        self.put("changelog.d/wrapped.fixed.md", b"- A wrapped note\n  that continues.\n")
+        self.put("changelog.d/hard.fixed.md", b"- A hard break\\\n  stays.\n")
+        _, _, content = self.snapshot2()
+        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n", content)
+        self.assertIn("Scans read only named columns.\n\n```text\nline one\nline two\n```", content)
+        self.assertIn("- A wrapped note that continues.\n", content)
+        self.assertIn("- A hard break\\\n  stays.\n", content)
+
+    def test_contributors_are_thanked_before_the_footer(self):
+        self.put(RELEASE, release_text(contributors=("azimafroozeh", "aaltshuler", "pronskiy")))
+        _, _, content = self.snapshot2()
+        thanks = "## Contributors\n\nThanks to @azimafroozeh, @aaltshuler and @pronskiy, who contributed to this release.\n"
+        self.assertIn(thanks, content)
+        self.assertLess(content.index("## Features"), content.index(thanks))
+        self.assertLess(content.index(thanks), content.index("**Full changelog:**"))
+        self.put(RELEASE, release_text(contributors=("pronskiy",)))
+        self.assertIn("Thanks to @pronskiy, who contributed to this release.", self.snapshot2()[2])
+
+    def test_contributor_refusals(self):
+        for raw, message in ((release_text(contributors=()), "add '## Contributors'"),
+                             (release_text(contributors=("pronskiy", "pronskiy")), "appears twice"),
+                             (release_text(contributors=("not a handle",)), "one GitHub handle per")):
+            with self.subTest(message=message):
+                self.put(RELEASE, raw)
+                selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+                with self.assertRaisesRegex(notes.NotesError, message):
+                    notes.check_release_inputs(selected, "v0.13.0", complete=True)
+        self.put(RELEASE, release_text(contributors=()))
+        notes.check_release_inputs(notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0"), "v0.13.0", complete=False)
+
+    def test_highlights_can_be_pending_until_the_snapshot(self):
+        self.put(RELEASE, release_text(highlights=0))
+        selected, _, content = self.snapshot2()
+        self.assertIn(f"## Highlights\n\n_{notes.PENDING_HIGHLIGHTS}_\n", content)
+        notes.check_release_inputs(selected, "v0.13.0", complete=False)
+        with self.assertRaisesRegex(notes.NotesError, "0 highlights; write 3 to 5"):
+            notes.check_release_inputs(selected, "v0.13.0", complete=True)
+        self.put(RELEASE, release_text(highlights=6))
+        selected = notes.select(self.repo, "previous", "HEAD", release_version="v0.13.0")
+        with self.assertRaisesRegex(notes.NotesError, "6 highlights; write 3 to 5"):
+            notes.check_release_inputs(selected, "v0.13.0", complete=False)
+
+    def test_format_two_preview_without_release_file_shows_placeholder(self):
+        _, _, content = self.snapshot2()
+        self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", content)
+        self.assertNotIn("## Highlights", content)
+        self.assertNotIn("Upgrade guide", content)
+
+    def test_patch_release_with_no_notes_renders_intro_and_says_so(self):
+        for tree in (self.repo.trees[TARGET], self.repo.trees[AUDITED], self.repo.working):
+            del tree[NEW]
+        self.put("changelog.d/v0.13.1.md", release_text(highlights=0))
+        _, _, content = self.snapshot2("v0.13.1")
+        self.assertIn("OmniGraph 0.13 makes reads cheaper.\n\nNo user-visible changes recorded.", content)
+        self.assertNotIn("## Highlights", content)
+        self.assertNotIn("## Upgrade actions", content)
+
+    def test_format_two_body_drops_header_and_provenance(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        selected, info, content = self.snapshot2()
+        body = notes.render(self.repo, selected, info, "v0.13.0", header=False)
+        self.assertTrue(content.startswith("# OmniGraph v0.13.0\n\nReleased 2026-10-20.\n\n<!-- release-notes: "))
+        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertNotIn("<!-- release-notes", body)
+
+    def test_release_file_links_follow_the_note_link_rules(self):
+        self.put(RELEASE, release_text(intro="See the [query guide][rel-guide].\n\n[rel-guide]: ../docs/user/queries/index.md#predicates"))
+        selected, info, content = self.snapshot2()
+        self.assertIn("[rel-guide]: ../user/queries/index.md#predicates", content)
+        published = notes.render(self.repo, selected, info, "v0.13.0", header=False)
+        self.assertIn(f"[rel-guide]: {notes.REPOSITORY}/blob/v0.13.0/docs/user/queries/index.md#predicates", published)
+        self.put(RELEASE, release_text(intro="See [guide](../docs/user/queries/index.md)."))
+        with self.assertRaisesRegex(notes.NotesError, "reference definitions"):
+            self.snapshot2()
+
+    def test_format_two_snapshot_requires_the_release_file(self):
+        selected, info, _ = self.snapshot2()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            with self.assertRaisesRegex(notes.NotesError, "write changelog.d/v0.13.0.md"):
+                notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertFalse((self.repo.root / "docs/releases").exists())
+
+    def test_format_two_snapshot_round_trips_through_verify_and_body(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        selected, info, content = self.snapshot2()
+        with tempfile.TemporaryDirectory() as directory:
+            self.repo.root = Path(directory)
+            path = notes.write_snapshot(self.repo, selected, info, False, False)
+            self.assertEqual(path.read_text(), content)
+            self.repo.trees[AUDITED]["docs/releases/v0.13.0.md"] = path.read_bytes()
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1], info)
+        self.repo.refs["refs/tags/v0.13.0"] = AUDITED
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["body", "--tag", "v0.13.0", "--target", AUDITED]), 0)
+        body = output.getvalue()
+        self.assertTrue(body.startswith("OmniGraph 0.13 makes reads cheaper."))
+        self.assertNotIn("<!-- release-notes", body)
+        self.assertIn(f"([#803]({notes.REPOSITORY}/pull/803))", body)
+
+    def test_verify_tolerates_links_that_appear_after_the_squash(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        _, info, content = self.snapshot2()
+        self.assertEqual(info["links"], {})
+        self.repo.subjects[NEW] = "release: prepare v0.13.0 (#900)"
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1]["links"], {})
+
+    def test_verify_tolerates_a_prep_branch_link_the_release_squash_replaced(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "fix: cherry-picked from main (#912)"
+        _, info, content = self.snapshot2()
+        self.assertEqual(info["links"], {NEW: 912})
+        self.repo.subjects[NEW] = "release: v0.13.0 (#913)"
+        self.repo.adders.update({NEW: "f" * 40, "docs/releases/v0.13.0.md": "e" * 40})
+        with self.assertRaisesRegex(notes.NotesError, "disagree with history"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+        self.repo.adders["docs/releases/v0.13.0.md"] = "f" * 40
+        self.assertEqual(notes.verify_snapshot(self.repo, content, AUDITED)[1]["links"], {NEW: 912})
+
+    def test_verify_refuses_forged_links_and_late_release_edits(self):
+        self.put(RELEASE, RELEASE_TEXT)
+        self.repo.subjects[NEW] = "feat: predicate (#803)"
+        _, info, content = self.snapshot2()
+
+        def encode(value):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+        forged = content.replace(encode(info), encode(dict(info, links={NEW: 999})))
+        with self.assertRaisesRegex(notes.NotesError, "disagree with history"):
+            notes.verify_snapshot(self.repo, forged, AUDITED)
+        self.repo.trees[AUDITED][RELEASE] = RELEASE_TEXT + b"\nLate edit.\n"
+        with self.assertRaisesRegex(notes.NotesError, "release file changed after snapshot"):
+            notes.verify_snapshot(self.repo, content, AUDITED)
+
+    def test_docs_check_applies_caps_before_the_snapshot_exists(self):
+        self.snapshot2()
+        self.repo.working["changelog.d/wordy.fixed.md"] = b"- " + b"word " * 50 + b"\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/releases").mkdir(parents=True)
+            errors = []
+            with patch.object(notes, "Repository", return_value=self.repo):
+                notes.check_working_notes(root, errors)
+        self.assertTrue(any("over the 200-character limit" in error for error in errors), errors)
+
+    def test_preview_cli_uses_format_two_for_new_versions(self):
+        self.snapshot2()
+        output = io.StringIO()
+        with patch.object(notes, "Repository", return_value=self.repo), patch("sys.stdout", output):
+            self.assertEqual(notes.main(["preview", "--target", TARGET]), 0)
+        self.assertIn(f"_{notes.PENDING_RELEASE_FILE}_", output.getvalue())
+        self.assertIn('"format":2', output.getvalue())
+
+    def test_release_note_gate_matches_the_composer_note_names(self):
+        spec = importlib.util.spec_from_file_location("check_pr_title", notes.ROOT / "scripts/check-pr-title.py")
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        self.assertEqual(set(gate.CATEGORIES), set(notes.CATEGORIES))
+        for path in ("changelog.d/x.added.md", "changelog.d/a-b.breaking.md", "changelog.d/v0.13.0.md",
+                     "changelog.d/x.other.md", "changelog.d/sub/x.fixed.md", "docs/x.added.md"):
+            match = notes.NOTE_NAME.fullmatch(path)
+            with self.subTest(path=path):
+                self.assertEqual(bool(gate.NOTE_PATH.fullmatch(path)), bool(match) and match.group(1) in notes.CATEGORIES)
 
     def test_unreleased_edits_and_reverts_use_final_tree(self):
         self.repo.trees[TARGET][NEW] = b"- Final wording.\n"
@@ -658,6 +1082,37 @@ class ReleaseNotesTests(unittest.TestCase):
         raw = repo.read("d0bbe07fc666d1bf8e89815d39f4dfe20be18d24", notes.LEGACY_PATH)
         self.assertEqual(notes.digest(raw), "de05c5362a0acc9c942324e5a753932b6d229627e96bf9f4fb43b6e5f0b88f77")
         self.assertEqual(sum(line.startswith(b"- ") for line in raw.splitlines()), 50)
+
+
+class AddedByGitTests(unittest.TestCase):
+    def test_added_by_reads_the_adding_commit_subject(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                subprocess.run(["git", "-C", directory, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                                "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+            git("init", "-q", "-b", "main")
+            git("config", "diff.renames", "copies")
+            git("config", "log.follow", "true")
+            (root / "changelog.d").mkdir()
+            (root / "changelog.d/first.added.md").write_text("- First.\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: first (#5)")
+            repo = notes.Repository(root)
+            base = repo.resolve("HEAD")
+            git("mv", "changelog.d/first.added.md", "changelog.d/moved.added.md")
+            (root / "changelog.d/second.added.md").write_text("- Second.\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, "HEAD", "changelog.d/second.added.md"), "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, "HEAD", "changelog.d/moved.added.md"), "feat: second (#6)")
+            self.assertEqual(repo.added_by(None, base, "changelog.d/first.added.md"), "feat: first (#5)")
+            self.assertIsNone(repo.added_by(base, "HEAD", "changelog.d/first.added.md"))
+            self.assertIsNone(repo.added_by(None, "HEAD", "changelog.d/untracked.added.md"))
+            self.assertEqual(repo.adding_commit(None, "HEAD", "changelog.d/moved.added.md"), repo.resolve("HEAD"))
+            self.assertIsNone(repo.adding_commit(base, "HEAD", "changelog.d/first.added.md"))
 
 
 if __name__ == "__main__":

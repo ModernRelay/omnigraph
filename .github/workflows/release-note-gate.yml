@@ -1,0 +1,70 @@
+name: Release Note Gate
+
+# A policy check on the pull request, built like Fix Regression Gate:
+# `pull_request_target` runs this workflow file and the script from the base
+# branch; the head is fetched only as data for the diff range and is never
+# checked out or executed. The title and labels reach the script through
+# `env:`, never interpolated into the shell. The metadata events re-run the
+# gate when a title edit or the `skip-changelog` label changes its answer.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+  # Required contexts must also report on the merge queue's branch; the gate
+  # passed on the pull request before it was queued, so the merge-group run
+  # reports without a check (docs/dev/branch-protection.md, Merge queue).
+  merge_group:
+
+concurrency:
+  group: release-note-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release_note_gate:
+    name: Release Note Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Report the merge-group run
+        if: github.event_name == 'merge_group'
+        run: echo "Merge-group run; the gate already passed on the pull request itself."
+
+      - name: Checkout base
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the pull request head
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+
+      - name: Check the title and release notes
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-pr-title.py --self-test
+          python3 scripts/check-pr-title.py \
+            --title "$PR_TITLE" \
+            --labels "$PR_LABELS" \
+            --range "$BASE_SHA...$HEAD_SHA"
+
+      - name: Refuse an event no step handles
+        if: github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
+        run: |
+          echo "::error::Release Note Gate ran on ${GITHUB_EVENT_NAME}, which no step handles"
+          exit 1

@@ -21,6 +21,7 @@
 - [ ] Change is focused (one logical change)
 - [ ] Tests added/updated for behavior changes (or N/A)
 - [ ] Public docs updated if user-facing surface changed (or N/A)
+- [ ] Release note in `changelog.d/` for a user-visible change, or the `skip-changelog` label; title reads `type(scope)!: summary` ([release notes](../blob/main/docs/dev/documentation.md#release-notes))
 - [ ] Reviewed against [docs/dev/invariants.md](../blob/main/docs/dev/invariants.md) — no Hard Invariant weakened, no deny-list item hit (or justified)
 
 ## Local verification

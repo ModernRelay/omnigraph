@@ -205,8 +205,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   schema construct, behavior, or limit.
 - Update current developer guides when architecture or support boundaries
   change. Put rationale/history in one RFC, not a copied design note.
-- Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
-  follow [release-note authoring](docs/dev/documentation.md#release-notes).
+- Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes
+  and title the PR `type(scope)!: summary`; follow
+  [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.

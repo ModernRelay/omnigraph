@@ -220,6 +220,9 @@ jobs:
       - name: Check required test cells exist in the sources
         run: python3 scripts/check-ci-cells.py --self-test
 
+      - name: Self-test the Release Note Gate
+        run: python3 scripts/check-pr-title.py --self-test
+
       - name: Assert the classification copies match this workflow
         run: |
           python3 scripts/check-classify-copy.py --self-test
