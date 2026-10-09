@@ -690,7 +690,12 @@ async fn run_cell(
     if writer == Writer::BlobClear {
         put_photo(&db, &format!("m{index}_seed")).await.unwrap();
     }
-    let photo_before = observe_photo(&db).await;
+    let blob_writer = matches!(writer, Writer::BlobPut | Writer::BlobClear);
+    let photo_before = if blob_writer {
+        observe_photo(&db).await
+    } else {
+        None
+    };
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
     let knows_head_before = linear_head(&knows_uri).await;
@@ -898,7 +903,7 @@ async fn run_cell(
         same_handle, model,
         "{cell}: the writer's handle disagrees with a fresh one"
     );
-    if matches!(writer, Writer::BlobPut | Writer::BlobClear) {
+    if blob_writer {
         // The cell holds the written value exactly when the write was
         // acknowledged, on a fresh handle and on the writer's own.
         let expected = match writer {
