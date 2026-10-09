@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-07
+updated: 2026-10-08
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -668,6 +668,62 @@ Both plans include the observed ledger CAS, input digest, resource changes and
 explicit managed-root deletion including history. They write no ledger or plan
 resource and consume no deployment sequence. Apply checks its fresh accepted
 base; an observed plan is neither a reservation nor permission to replay work.
+
+### Fresh empty-cluster bootstrap handoff
+
+An opt-in storage-owner bootstrap may initialize a fresh S3 root with only
+cluster-scoped management policies, then transfer its native lock to the first
+serving process without deleting the lock. This is not recovery of a previous
+writer, engine settlement, general restart, graph initialization or an expiring
+lease. Local and Azure backends remain unsupported by this handoff: local CAS
+is emulated, and Azure requires its separate admission qualification.
+
+`bootstrap_serving(config_dir, caller)` captures and validates the ordinary
+bounded configuration and existing bootstrap authorization. It refuses graphs,
+schemas, queries, providers, Blob bindings, existing ledgers, graph residue and
+unknown native control state. Freshness covers native-owned authority and graph
+namespaces; unrelated opaque application metadata is neither adopted nor used
+as execution authority. It acquires one private bootstrap admission and retains
+it across the initial ledger and the existing policy deployment protocol.
+That capability never escapes to callers or permits a second deployment. No
+graph engine opens. Every state transition increments the native revision and
+uses its captured CAS; immutable inputs and policies use content-addressed
+create-if-absent writes. No success, error, cancellation or destructor deletes
+this admission. Only exact terminal convergence can produce the receipt.
+
+`BootstrapServingReceipt` is strict, versioned JSON bounded to 16 KiB. It binds
+canonical root, bootstrap lock identity and exact backend version, ledger
+identity, terminal state revision and content CAS, deployment identity, input
+digest, applied configuration digest and result revision. It is a projection
+of existing native authority, not another mutable ledger or bearer credential.
+Loss before receipt delivery retains uncertainty; a repeat bootstrap refuses.
+
+`claim_bootstrap_serving(root, receipt)` checks the explicitly selected root,
+bounded receipt, original immutable input, exact terminal zero-graph result,
+management policy and bootstrap lock. It conditionally replaces that exact
+lock version with a fresh, unpredictable serving-process lock identity. Two
+claimants cannot both win; an error or lost acknowledgement never grants a
+serving capability. A later process cannot adopt an observed serving lock or
+repeat a claim by using its bytes. After confirmed CAS, the claimant revalidates
+the terminal state and returns its admitted serving snapshot under the same
+new guard. Any subsequent failure retains that guard. Server startup accepts
+an explicit `--bootstrap-handoff FILE` alongside its selected `--cluster`;
+ordinary startup, authentication and policy behavior stay unchanged.
+
+The old bootstrap can have no new transition after its terminal result. Late
+retries of earlier ledger writes use already-spent CAS versions; immutable
+payload retries cannot change content; a delayed lock create cannot replace an
+existing lock. This narrow proof permits the ownership transfer without a
+general native-I/O drain capability. Any unconditional write, delete, graph
+effect, reused revision or retry against a refreshed CAS invalidates it.
+Raw/older writers and administrative lock removal remain externally excluded.
+
+Qualification extends cluster admission/deployment tests with two claimants,
+delayed spent CAS, lost claim acknowledgement, cancellation, exact input/root/
+policy binding, malformed receipts and refusal of repeated initialization.
+S3-compatible backend tests establish actual conditional-write behavior;
+provider deployment evidence remains separate. General S3 replacement and
+undo retain the existing stopped-writer and accepted-I/O settlement boundary.
 
 ## Online deployment
 

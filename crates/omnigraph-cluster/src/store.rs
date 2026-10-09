@@ -48,6 +48,10 @@ pub(crate) struct StateSnapshot {
     pub(crate) state_cas: Option<String>,
 }
 
+fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
+    Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string())
+}
+
 /// Only explicit stopped-ledger conversion may remove obsolete runtime fields.
 /// The remaining ledger is decoded by the ordinary strict types and validator.
 fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diagnostic> {
@@ -209,6 +213,97 @@ impl ClusterStore {
 
     pub(crate) fn kind(&self) -> StorageKind {
         self.storage.kind()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bootstrap_test_adapter(mut self, adapter: Arc<dyn StorageAdapter>) -> Self {
+        self.adapter = adapter;
+        self
+    }
+
+    async fn require_absent_native_paths(&self, paths: &[&str]) -> Result<(), Diagnostic> {
+        for path in paths {
+            if self
+                .adapter
+                .exists(&self.uri(path))
+                .await
+                .map_err(|error| {
+                    Diagnostic::error("bootstrap_freshness_unknown", *path, error.to_string())
+                })?
+            {
+                return Err(Diagnostic::error(
+                    "bootstrap_root_not_fresh",
+                    *path,
+                    "existing native authority or graph data prevents initial bootstrap",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_fresh_bootstrap(&self, own_lock: bool) -> Result<(), Diagnostic> {
+        self.require_no_bootstrap_graphs_or_recovery().await?;
+        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR])
+            .await?;
+        if !own_lock {
+            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE])
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(&self) -> Result<(), Diagnostic> {
+        self.require_absent_native_paths(&[
+            crate::CLUSTER_GRAPHS_DIR,
+            "__manifest",
+            "__history",
+            CLUSTER_RECOVERIES_DIR,
+            "__cluster/approvals",
+        ])
+        .await
+    }
+
+    pub(crate) async fn acquire_bootstrap_lock(
+        &self,
+    ) -> Result<(StateLockGuard, String), Diagnostic> {
+        crate::state_lock::acquire_bootstrap_lock(
+            self.adapter.clone(),
+            self.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+        )
+        .await
+        .map_err(bootstrap_lock_error)
+    }
+
+    pub(crate) async fn verify_bootstrap_lock(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<(), Diagnostic> {
+        crate::state_lock::verify_bootstrap_lock(
+            &self.adapter,
+            &self.uri(CLUSTER_LOCK_FILE),
+            id,
+            version,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
+    }
+
+    pub(crate) async fn claim_bootstrap_lock(
+        &self,
+        id: &str,
+        version: &str,
+    ) -> Result<StateLockGuard, Diagnostic> {
+        crate::state_lock::claim_bootstrap_lock(
+            self.adapter.clone(),
+            self.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+            id,
+            version,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
     }
 
     /// Canonical identity of the same store used for the serving snapshot.

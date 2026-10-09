@@ -5675,6 +5675,7 @@ dependencies = [
 name = "omnigraph-cluster"
 version = "0.13.0"
 dependencies = [
+ "async-trait",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",

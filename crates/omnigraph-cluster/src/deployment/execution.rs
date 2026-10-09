@@ -49,7 +49,7 @@ async fn policies(
     Ok(policies)
 }
 
-fn authorize_bootstrap_bundle(
+pub(super) fn authorize_bootstrap_bundle(
     bundle: &DeploymentBundle,
     caller: &DeploymentCaller,
 ) -> Result<(), Diagnostic> {
@@ -601,7 +601,7 @@ fn bundle_from_capture(
     }
 }
 
-fn validate_bundle(bundle: &DeploymentBundle, root: &str) -> Result<(), Diagnostic> {
+pub(super) fn validate_bundle(bundle: &DeploymentBundle, root: &str) -> Result<(), Diagnostic> {
     validate_bundle_with_root(bundle, root, |declared| {
         ClusterStore::for_storage_root(declared)?.canonical_root()
     })
@@ -1619,6 +1619,32 @@ async fn execute_captured_deployment(
     effects_started: &mut bool,
 ) -> Result<DeploymentLookup, Diagnostic> {
     let store = ClusterStore::for_storage_root(bundle.canonical_root())?;
+    execute_captured_deployment_in_store(
+        &store,
+        bundle,
+        requested_id,
+        caller,
+        admission,
+        live_graphs,
+        report_id,
+        on_accepted,
+        effects_started,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Same executor under the private bootstrap store/owner.
+pub(super) async fn execute_captured_deployment_in_store(
+    store: &ClusterStore,
+    bundle: &CapturedDeployment,
+    requested_id: Option<&str>,
+    caller: &DeploymentCaller,
+    admission: &ClusterAdmission,
+    live_graphs: &BTreeMap<String, std::sync::Arc<Omnigraph>>,
+    report_id: impl FnOnce(&str, &str, &str),
+    on_accepted: impl FnOnce(DeploymentLookup),
+    effects_started: &mut bool,
+) -> Result<DeploymentLookup, Diagnostic> {
     let root = store.canonical_root()?;
     validate_bundle(bundle, &root)?;
     if admission.canonical_root() != root {
@@ -1631,12 +1657,12 @@ async fn execute_captured_deployment(
     let input_digest = bundle.input_digest()?;
     // Existing identities are lookup-only, including while their owner holds
     // the lock. Input equality is required before exposing the original result.
-    let (before, before_cas) = read_existing(&store).await?;
+    let (before, before_cas) = read_existing(store).await?;
     require_v2(&before)?;
     if let Some(id) = requested_id {
         let existing = lookup(&before, id)?;
         if !matches!(existing, DeploymentLookup::NotRecorded) {
-            lookup_policies(&store, &before, caller, Some(id)).await?;
+            lookup_policies(store, &before, caller, Some(id)).await?;
             let recorded_digest = before
                 .outstanding
                 .as_ref()
@@ -1660,7 +1686,7 @@ async fn execute_captured_deployment(
             return Ok(existing);
         }
     }
-    deployment_policies(&store, &before, bundle, caller).await?;
+    deployment_policies(store, &before, bundle, caller).await?;
     let sequence = before.next_sequence.unwrap();
     let id = requested_id.map(str::to_owned).unwrap_or_else(|| {
         format!(
@@ -1685,7 +1711,7 @@ async fn execute_captured_deployment(
         policy,
         ..
     } = match prepare_deployment(
-        &store,
+        store,
         bundle,
         caller,
         (before, before_cas),
@@ -1708,10 +1734,10 @@ async fn execute_captured_deployment(
         ));
     }
     seams::fail(&DEPLOYMENT_BEFORE_ACCEPTANCE)?;
-    cas = replace(&store, &mut state, &cas).await?;
+    cas = replace(store, &mut state, &cas).await?;
     on_accepted(lookup(&state, &id)?);
     seams::fail(&DEPLOYMENT_AFTER_ACCEPTANCE)?;
-    install_catalog_payloads(&store, &state, bundle).await?;
+    install_catalog_payloads(store, &state, bundle).await?;
     for (graph, entry) in state.outstanding.as_ref().unwrap().graphs.clone() {
         let result = if let Some(delete) = &entry.delete {
             state
@@ -1722,9 +1748,9 @@ async fn execute_captured_deployment(
                 .get_mut(&graph)
                 .unwrap()
                 .state = GraphDeploymentState::Started;
-            cas = replace(&store, &mut state, &cas).await?;
+            cas = replace(store, &mut state, &cas).await?;
             seams::fail(&DEPLOYMENT_AFTER_STARTED)?;
-            complete_graph_deletion(&store, &graph, delete, &id, admission).await?;
+            complete_graph_deletion(store, &graph, delete, &id, admission).await?;
             seams::fail(&DEPLOYMENT_AFTER_SCHEMA)?;
             GraphDeploymentResult::Deleted {
                 contract: delete.contract.clone(),
@@ -1738,7 +1764,7 @@ async fn execute_captured_deployment(
                 .get_mut(&graph)
                 .unwrap()
                 .state = GraphDeploymentState::Started;
-            cas = replace(&store, &mut state, &cas).await?;
+            cas = replace(store, &mut state, &cas).await?;
             seams::fail(&DEPLOYMENT_AFTER_STARTED)?;
             let db = Omnigraph::apply_prepared_graph_create(create).await
                 .map_err(|error| refusal("deployment_outcome_unknown", format!("deployment {id} graph creation remains outstanding under admission {}: {error}", admission.lock_id())))?;
@@ -1755,7 +1781,7 @@ async fn execute_captured_deployment(
             let db = match live_graphs.get(&graph) {
                 Some(db) => db.clone(),
                 None => std::sync::Arc::new(
-                    open_graph(&store, &graph, &policy, false)
+                    open_graph(store, &graph, &policy, false)
                         .await
                         .map_err(|error| retained_error(error, admission.lock_id()))?,
                 ),
@@ -1768,7 +1794,7 @@ async fn execute_captured_deployment(
                 .get_mut(&graph)
                 .unwrap()
                 .state = GraphDeploymentState::Started;
-            cas = replace(&store, &mut state, &cas).await?;
+            cas = replace(store, &mut state, &cas).await?;
             seams::fail(&DEPLOYMENT_AFTER_STARTED)?;
             let applied = db.apply_prepared_schema_as(intent, caller.actor()).await
                 .map_err(|error| refusal("deployment_outcome_unknown", format!("deployment {id} remains outstanding under admission {}; schema invocation failed: {error}; establish quiescence and reconcile its original identity", admission.lock_id())))?;
@@ -1802,9 +1828,9 @@ async fn execute_captured_deployment(
             .state = GraphDeploymentState::Settled {
             result: Box::new(result),
         };
-        cas = replace(&store, &mut state, &cas).await?;
+        cas = replace(store, &mut state, &cas).await?;
     }
-    let result = finish(&store, &mut state, &cas, bundle).await?;
+    let result = finish(store, &mut state, &cas, bundle).await?;
     // Exact publication is not a proof that all accepted native/control I/O
     // has stopped. Retain admission until explicit operator quiescence/unlock.
     Ok(DeploymentLookup::Complete { result })

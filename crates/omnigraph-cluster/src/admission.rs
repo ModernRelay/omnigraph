@@ -48,6 +48,30 @@ struct AdmissionOwner {
 }
 
 impl ClusterAdmission {
+    /// Only the private policy-only bootstrap protocol can transfer an
+    /// already-held lock into an admission. Neither owner is ever unlocked.
+    pub(crate) fn from_bootstrap_lock(
+        store: ClusterStore,
+        guard: StateLockGuard,
+        serving_deployment: Option<crate::DeploymentResult>,
+    ) -> Self {
+        let purpose = if serving_deployment.is_some() {
+            ClusterAdmissionPurpose::Serve
+        } else {
+            ClusterAdmissionPurpose::Deployment
+        };
+        Self(Arc::new(AdmissionOwner {
+            canonical_root: store
+                .canonical_root()
+                .expect("bootstrap has a validated S3 root"),
+            store,
+            guard,
+            schema_contracts: BTreeMap::new(),
+            serving_deployment,
+            purpose,
+        }))
+    }
+
     pub fn canonical_root(&self) -> &str {
         &self.0.canonical_root
     }
@@ -149,6 +173,12 @@ impl ClusterAdmission {
     /// outstanding clone, or abandonment retains the persisted lock. Operators
     /// must exclude concurrent force-unlock/release; the backend has no
     /// conditional-delete guarantee.
+    ///
+    /// After bootstrap transfer, this obligation includes earlier accepted
+    /// bootstrap control I/O, not only the current serving process. Otherwise
+    /// deleting this lock could let a delayed bootstrap create-if-absent
+    /// recreate its old lock. The transfer proves those attempts harmless
+    /// only while the lock remains continuously present.
     pub async fn release_after_settlement(self) -> Result<(), Diagnostic> {
         let owner = Arc::try_unwrap(self.0).map_err(|owner| {
             Diagnostic::error(

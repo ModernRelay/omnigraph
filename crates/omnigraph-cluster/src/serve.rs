@@ -100,6 +100,18 @@ pub struct AdmittedServingSnapshot {
 }
 
 impl AdmittedServingSnapshot {
+    pub(crate) fn from_bootstrap(
+        snapshot: ServingSnapshot,
+        canonical_root: String,
+        admission: crate::admission::ClusterAdmission,
+    ) -> Self {
+        Self {
+            snapshot,
+            canonical_root,
+            admission: Some(admission),
+        }
+    }
+
     pub fn canonical_root(&self) -> &str {
         &self.canonical_root
     }

@@ -186,6 +186,26 @@ doors remain operator-excluded across outstanding work and recovery. No tags or
 additional retention store protect deployment evidence, and the executor never
 runs cleanup.
 
+Fresh S3 initialization has one narrower exception to exact-ID unlock:
+`bootstrap_serving` executes only the initial cluster-scoped policy deployment
+under a private retained bootstrap lock. It opens no graphs and returns a strict
+16 KiB maximum receipt bound to the exact root, input, native ledger/result,
+state CAS and original lock version. Native authority, graph or recovery
+residue refuses initialization; unrelated opaque metadata grants no authority.
+`claim_bootstrap_serving` validates those bindings and conditionally replaces
+that same lock version with a new process-owned serving lock before capturing
+the empty serving snapshot. It never deletes the lock or adopts an earlier
+claim after an uncertain acknowledgement. Errors, cancellation and lost
+responses retain exclusion. Already-issued bootstrap state updates use spent
+CAS predecessors; immutable payload retries cannot alter achieved input. This
+is only fresh zero-graph bootstrap, not native-I/O settlement, existing-writer
+replacement or expiry-based takeover. Later serving owners retain the ordinary
+settled-release obligations above, including all earlier accepted bootstrap
+control I/O. Settling only the current serving process is insufficient: deleting
+its lock could let an older bootstrap create-if-absent request recreate the
+bootstrap lock. Handoff itself proves those attempts harmless only while the
+continuously retained lock exists.
+
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
 The distributed support boundary remains one mutation-capable writer process.

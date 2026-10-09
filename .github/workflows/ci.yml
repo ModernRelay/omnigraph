@@ -1139,6 +1139,17 @@ jobs:
             --test system_local \
             -- --nocapture --test-threads=1 2>&1 | tee "$test_log"
 
+          # Keep the same package feature graph for this admitted-startup unit
+          # fixture; selecting only server would rebuild Lance and object_store.
+          cargo test --locked \
+            -p omnigraph-engine \
+            -p omnigraph-server \
+            -p omnigraph-cluster \
+            -p omnigraph-cli \
+            --lib \
+            settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
+            -- --exact --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
+
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
@@ -1157,6 +1168,7 @@ jobs:
             public_physical_ref_token_rejects_s3_same_version_aba \
             server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             server_boots_cluster_from_bare_storage_uri_and_serves_query \
+            settings::tests::s3_bootstrap_handoff_serves_empty_then_deploys_first_graph \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
             cluster_e2e_s3_live_apply_without_restart \
             local_cli_s3_end_to_end_init_load_read_flow

@@ -37,6 +37,11 @@ start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
+For first boot of a fresh, empty S3 cluster initialized by the library, use
+`--bootstrap-handoff FILE` with its exact receipt. This is a one-time ownership
+claim, not a restart or recovery path; see
+[first boot from a bootstrap receipt](../clusters/index.md#first-boot-from-a-bootstrap-receipt).
+
 ## HTTP contract
 
 Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
