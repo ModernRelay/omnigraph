@@ -197,46 +197,6 @@ See the [policy guide](docs/user/operations/policy.md).
 
 Both npm packages are versioned in lockstep with `omnigraph-server`.
 
-## Local quick test (no server)
-
-1-min setup to try it: an **embedded, local file-backed graph** (no server, no
-object store). For dev and experiments; production is the deployed cluster above.
-
-```bash
-cat > schema.pg <<'PG'
-node Source {
-  slug: String @key
-  title: String
-}
-
-node Claim {
-  slug: String @key
-  statement: String
-}
-
-edge Supports: Source -> Claim
-PG
-printf '%s\n' \
-  '{"type":"Claim","data":{"slug":"lower-latency","statement":"The migration reduced request latency."}}' \
-  '{"type":"Source","data":{"slug":"load-test","title":"Load test report"}}' \
-  '{"edge":"Supports","from":"load-test","to":"lower-latency"}' > data.jsonl
-
-omnigraph init  --schema schema.pg ./graph.omni
-omnigraph load  --data data.jsonl --mode overwrite --store ./graph.omni
-
-# "Which sources support the lower-latency claim?"
-omnigraph query --store ./graph.omni \
-  --params '{"claim":"lower-latency"}' \
-  -e 'query sources_for_claim($claim: String) {
-    match {
-      $claim_node: Claim { slug: $claim }
-      $source supports $claim_node
-    }
-    return { $source.title as source }
-  }'
-# → Load test report
-```
-
 ## Docs
 
 - [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
