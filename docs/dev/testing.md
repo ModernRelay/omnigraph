@@ -104,6 +104,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- engine `export.rs` owns export's batched managed Blob read (one read per Blob column per batch, in request order, shared by the change-feed baseline) and `changes.rs` the change images' reads;
 - engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;

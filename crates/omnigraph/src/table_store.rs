@@ -74,7 +74,7 @@ use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
+    BLOB_READ_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
     KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 
@@ -959,7 +959,7 @@ pub(crate) struct ExternalBlobPreflight {
 pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
 
 /// The managed payloads of one Blob column, in the order of the row ids given
-/// to [`TableStore::managed_blob_payloads`]. The rewrite takes one per managed
+/// to [`TableStore::managed_blob_payloads`]. The reader takes one per managed
 /// descriptor and then calls `finish`.
 pub(crate) struct ManagedBlobPayloads<'a> {
     column_name: &'a str,
@@ -977,18 +977,18 @@ impl ManagedBlobPayloads<'_> {
         let data = next
             .ok_or_else(|| {
                 OmniError::blob_integrity(format!(
-                    "Blob rewrite for '{column_name}' lost alignment with managed source rows"
+                    "managed Blob read of '{column_name}' lost alignment with its managed rows"
                 ))
             })?
             .data
             .ok_or_else(|| {
                 OmniError::blob_integrity(format!(
-                    "Blob rewrite for '{column_name}' returned null for a managed descriptor"
+                    "managed Blob read of '{column_name}' returned null for a managed descriptor"
                 ))
             })?;
         if data.len() as u64 != length {
             return Err(OmniError::blob_integrity(format!(
-                "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
+                "managed Blob read of '{column_name}' observed managed length {}, descriptor recorded {length}",
                 data.len()
             )));
         }
@@ -1006,7 +1006,7 @@ impl ManagedBlobPayloads<'_> {
                 .is_some()
         {
             return Err(OmniError::blob_integrity(format!(
-                "Blob rewrite for '{}' produced extra managed source blobs",
+                "managed Blob read of '{}' produced extra managed blobs",
                 self.column_name
             )));
         }
@@ -2023,8 +2023,10 @@ impl TableStore {
     }
 
     /// The one batched managed Blob read (`Dataset::read_blobs`): ordered,
-    /// streamed, with the explicit rewrite I/O buffer. `managed_row_ids` must
-    /// name managed rows only; Lance would resolve and read an external row.
+    /// streamed, with the explicit I/O buffer. Materializing rewrites,
+    /// export, the change-feed baseline, change images and entity reads all
+    /// read managed payloads here. `managed_row_ids` must name managed rows
+    /// only; Lance would resolve and read an external row.
     pub(crate) async fn managed_blob_payloads<'a>(
         ds: &Dataset,
         column_name: &'a str,
@@ -2040,7 +2042,7 @@ impl TableStore {
                     .map_err(OmniError::storage)?
                     .with_row_ids(managed_row_ids)
                     .preserve_order(true)
-                    .with_io_buffer_size_bytes(BLOB_REBUILD_IO_BUFFER_BYTES)
+                    .with_io_buffer_size_bytes(BLOB_READ_IO_BUFFER_BYTES)
                     .try_into_stream()
                     .await
                     .map_err(OmniError::storage)?,
