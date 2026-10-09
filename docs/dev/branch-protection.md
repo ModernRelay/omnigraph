@@ -6,13 +6,14 @@ protection.
 
 ## Current policy
 
-`main` requires these four PR status contexts, names that do not change when
+`main` requires these five PR status contexts, names that do not change when
 CI changes:
 
 - `CI Gate`
 - `Check Workflow Action Pins`
 - `GQ Logic Tests`
 - `Fix Regression Gate`
+- `PR Title`
 
 Checks are strict; under the merge queue the entry is built on the current
 `main`, and GitHub does not require the author to update the pull request
@@ -126,8 +127,8 @@ temporary `gh-readonly-queue/main/…` branch from the current `main` plus the
 entries ahead of it, fires the `merge_group` event there, and merges only when
 every required context has reported green on that branch. A required context
 that never reports on the merge-group branch holds the entry until the queue's
-status-check timeout removes it, so `ci.yml`, `gq-logic-tests.yml`, and
-`fix-regression-gate.yml` list `merge_group` under `on:`, the `Format
+status-check timeout removes it, so `ci.yml`, `gq-logic-tests.yml`,
+`fix-regression-gate.yml`, and `pr-title.yml` list `merge_group` under `on:`, the `Format
 (rustfmt)` and `Lint (clippy)` job conditions accept the event beside
 `pull_request`, and `scripts/check-merge-group-triggers.py`, a step of `Check
 Workflow Action Pins`, fails the build when a workflow owning a required
@@ -160,6 +161,23 @@ stays open: a body or label edit after queueing re-runs the gate on the pull
 request only; whether a red result there removes the entry is not documented
 by GitHub, and the red context stays visible on the pull request either way.
 
+`PR Title` (`pr-title.yml`) holds the pull request title to
+`type(scope)!: description` ([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull
+Requests; `scripts/check-pr-title.py` is the check). Every merge is a squash
+whose subject is the title, so the title is the one line `git log` keeps for
+the change. On the pull request it runs on `pull_request_target`, so the
+checker comes from `main`, and a title edit (`edited`) re-runs it. On the
+merge-group run the group commit's message carries the squash subject the
+queue will land (`merge_group.head_commit.message`, first line, with the
+` (#N)` suffix GitHub appends), so the same checker runs on that subject.
+A title edited after queueing does not change that captured subject: the
+edit re-runs only the pull-request check, and whether a red result there
+removes the entry is undocumented, as for the regression gate above. That
+the landed commit's subject is the captured one is inferred from the
+payload, not documented; one observed queue run after rollout confirms it.
+This merge-group run executes the queued commit's copy of the checker, like
+every merge-group run; the policy copy ran on the pull request.
+
 Landing a pull request: click **Merge when ready** once the reporting
 contexts have reported; GitHub queues the pull request when its required
 contexts are green. A queued entry whose merge-group checks fail, or that hits
@@ -183,7 +201,7 @@ the post-merge runs (`Test Workspace`, the fence, the shards, Azurite, the
 vocabulary audit, the edge release) cover the whole group at once, and a
 revert picks the entry's own squash commit out of that push.
 
-Changing one of the four required context names still needs the rule page:
+Changing one of the five required context names still needs the rule page:
 the old name never reports again, so loosen the live rule first, land the
 change (the JSON edit rides in the same pull request as the workflow edit;
 the validator refuses the pair split), then re-apply the JSON; other pull
@@ -212,8 +230,8 @@ If the gate or the validator cannot execute at all (the checkout action or
 the runners are down), no `needs:` edit helps, and the settings-based route
 remains: an administrator unticks the context that cannot report on the rule
 page, lands the fix, and re-applies the JSON. Unticking `CI Gate` relaxes
-every job inside it at once and leaves the other three contexts required;
-hold unrelated merges while it is unticked, and verify all four names and
+every job inside it at once and leaves the other four contexts required;
+hold unrelated merges while it is unticked, and verify all five names and
 the queue values on the page afterwards. Unticking the queue alone changes
 nothing, because the status requirement binds with or without the queue.
 Untick the queue only for a queue-specific failure while the pull request's
@@ -256,7 +274,7 @@ The script removes the JSON's explanatory `_comment` and updates
 `repos/ModernRelay/omnigraph/branches/main/protection`. It requires an
 authenticated `gh` token with repository-administration permission.
 
-To change the policy (the four names or any other setting the JSON carries;
+To change the policy (the five names or any other setting the JSON carries;
 which jobs block `main` is changed in `ci.yml` instead, see CI Gate):
 
 1. Update `.github/branch-protection.json` in a PR.

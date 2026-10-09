@@ -25,7 +25,7 @@ job, a step-level `if:` inside an owning job, `paths:` filters, and anchors or
 aliases.
 
 The second half pins the `CI Gate` wiring (docs/dev/branch-protection.md): the
-policy's contexts are exactly the four in `OWNERS`, each owned by the named
+policy's contexts are exactly the five in `OWNERS`, each owned by the named
 job of the named workflow; `ci.yml`'s `ci_gate` job runs under `if: always()`
 with no `continue-on-error`, its `needs:` equals the job table in
 `scripts/ci_gate.py`, every needed job uses a block mapping without
@@ -62,6 +62,7 @@ OWNERS = {
     VALIDATOR_CONTEXT: (CI_WORKFLOW, VALIDATOR_JOB),
     "GQ Logic Tests": (".github/workflows/gq-logic-tests.yml", "gq_logic_tests"),
     "Fix Regression Gate": (".github/workflows/fix-regression-gate.yml", "fix_regression_gate"),
+    "PR Title": (".github/workflows/pr-title.yml", "pr_title"),
 }
 GATE_COMMAND = "python3 scripts/ci_gate.py"
 GATE_ENV = {
@@ -394,7 +395,7 @@ def validate_gate(workflows: dict[str, str], contexts: list[str], table: dict[st
     for context in sorted(expected - set(contexts)):
         failures.append(f"policy lacks required context {context!r}")
     for context in sorted(set(contexts) - expected):
-        failures.append(f"policy requires {context!r}, which is not one of the four gate-era contexts")
+        failures.append(f"policy requires {context!r}, which is not one of the five gate-era contexts")
     for context, (path, job) in OWNERS.items():
         if path not in parsed:
             failures.append(f"{path}: missing, must own {context!r}")
@@ -617,12 +618,13 @@ jobs:
 """
 GATE_GQ = "on:\n  pull_request:\n  merge_group:\njobs:\n  gq_logic_tests:\n    name: GQ Logic Tests\n    if: always()\n    runs-on: u\n"
 GATE_FIX = "on:\n  pull_request_target:\n  merge_group:\njobs:\n  fix_regression_gate:\n    name: Fix Regression Gate\n    runs-on: u\n"
+GATE_TITLE = "on:\n  pull_request_target:\n  merge_group:\njobs:\n  pr_title:\n    name: PR Title\n    runs-on: u\n"
 GATE_CONTEXTS = list(OWNERS)
 
 
 def self_test_gate() -> None:
     def run(ci: str = GATE_CI, contexts: list[str] = GATE_CONTEXTS, table: dict[str, str] = GATE_TABLE, **extra: str) -> list[str]:
-        workflows = {CI_WORKFLOW: ci, OWNERS["GQ Logic Tests"][0]: GATE_GQ, OWNERS["Fix Regression Gate"][0]: GATE_FIX, **extra}
+        workflows = {CI_WORKFLOW: ci, OWNERS["GQ Logic Tests"][0]: GATE_GQ, OWNERS["Fix Regression Gate"][0]: GATE_FIX, OWNERS["PR Title"][0]: GATE_TITLE, **extra}
         return validate(workflows, contexts) + validate_gate(workflows, contexts, table)
 
     def refused(fragment: str, *args, **kw) -> None:
@@ -645,7 +647,10 @@ def self_test_gate() -> None:
     accepted()
     refused("policy lacks required context 'CI Gate'", GATE_CI, [c for c in GATE_CONTEXTS if c != GATE_CONTEXT])
     refused("policy lacks required context 'Check Workflow Action Pins'", GATE_CI, [c for c in GATE_CONTEXTS if c != VALIDATOR_CONTEXT])
-    refused("not one of the four gate-era contexts", GATE_CI, [*GATE_CONTEXTS, "Test Workspace"])
+    refused("not one of the five gate-era contexts", GATE_CI, [*GATE_CONTEXTS, "Test Workspace"])
+    refused("policy lacks required context 'PR Title'", GATE_CI, [c for c in GATE_CONTEXTS if c != "PR Title"])
+    refused("must be owned by job 'pr_title'", **{OWNERS["PR Title"][0]: GATE_TITLE.replace("pr_title:", "title:")})
+    refused("no merge_group in the on: mapping", **{OWNERS["PR Title"][0]: GATE_TITLE.replace("  merge_group:\n", "")})
     refused("must be owned by job 'ci_gate'", gate("    name: CI Gate\n", "    name: CI gate\n"))
     refused("must be owned by job 'ci_gate'", GATE_CI.replace("  ci_gate:\n", "  ci_gate2:\n"))
     refused("must be owned by job 'workflow_action_pins'", validator("    name: Check Workflow Action Pins\n", "    name: Check Pins\n"))
