@@ -19,6 +19,7 @@ members = [
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",
     "crates/omnigraph-gqt-core",
+    "crates/omnigraph-gqt-served",
     "tools/omnigraph-vocabulary-guard",
 ]
 default-members = [

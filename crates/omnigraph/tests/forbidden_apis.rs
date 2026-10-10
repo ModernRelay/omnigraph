@@ -156,6 +156,8 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "omnigraph-catalog/history.rs",
     "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
 /// Out-of-line modules are parsed as standalone files, so the walker cannot see
@@ -166,6 +168,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
 /// a new call inside a trusted implementation still requires an explicit
 /// protocol disposition.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
+    "engine/plan_source/key_tests.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
@@ -749,7 +754,7 @@ gateway_surfaces! {
         "scan_batches", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
-        "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
+        "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
         "fts_covers_all_fragments",
         "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",

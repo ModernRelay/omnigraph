@@ -363,6 +363,22 @@ impl Generated {
         Ok(())
     }
 
+    /// Every batch in load order as (table name, row range, text), for a
+    /// loader that is not a `Session`; a table's distributions are drawn
+    /// once, as `load_observed` draws them.
+    pub(crate) fn batch_texts(
+        &self,
+    ) -> impl Iterator<Item = Result<(String, std::ops::Range<u64>, String), String>> + '_ {
+        self.tables.iter().flat_map(move |table| {
+            let distributions = table.distributions();
+            table.batches().map(move |range| {
+                let distributions = distributions.as_ref().map_err(Clone::clone)?;
+                let text = self.batch(table, distributions, range.start, range.end)?;
+                Ok((table.name.clone(), range, text))
+            })
+        })
+    }
+
     fn batch(
         &self,
         table: &Table,
