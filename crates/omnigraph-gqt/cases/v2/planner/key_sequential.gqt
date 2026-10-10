@@ -1,0 +1,70 @@
+# issue: none
+# notes: https://github.com/ModernRelay/omnigraph/issues/854; A String key keeps its written equality and uses the identity index when available.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"β'\"\\","age":22}}
+{"type":"Person","data":{"slug":"","age":33}}
+
+--- query
+set engine = v2;
+query plain($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "alpha"}
+--- expect unordered
+{"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access sequential
+not pass key_to_id
+pass scan_access
+
+--- query
+set engine = v2;
+query escaped($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "β'\"\\"}
+--- expect unordered
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access sequential
+not pass key_to_id
+pass scan_access
+
+--- query
+set engine = v2;
+query empty($s: String) {
+    match { $p: Person $s = $p.slug }
+    return { $p.age }
+}
+--- params
+{"s": ""}
+--- expect unordered
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access sequential
+not pass key_to_id
+pass scan_access

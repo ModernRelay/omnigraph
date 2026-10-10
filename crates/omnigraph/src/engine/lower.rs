@@ -204,7 +204,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    fn scan(&self, source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+    fn scan(&self, mut source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+        if let ScanSource::Table { mode, .. } = &mut source {
+            mode.scalar_index = spec
+                .access
+                .as_ref()
+                .and_then(|access| access.use_scalar_index());
+        }
         let lookup = self.lookup(spec)?;
         ScanExec::try_new(
             source,

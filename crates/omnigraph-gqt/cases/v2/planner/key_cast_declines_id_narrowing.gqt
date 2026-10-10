@@ -1,0 +1,35 @@
+# issue: none
+# traversal: auto
+# notes: An F64 comparison merges two I64 keys; narrowing to one physical ID would drop a row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Counter {
+    number: I64 @key
+}
+
+--- seed
+{"type":"Counter","data":{"number":9007199254740992}}
+{"type":"Counter","data":{"number":9007199254740993}}
+
+--- query
+set engine = v2;
+query rounded($n: F64) {
+    match { $c: Counter $c.number = $n }
+    return { $c.number }
+}
+--- params
+{"n":9007199254740992.0}
+--- expect unordered
+{"c.number":9007199254740992}
+{"c.number":9007199254740993}
+--- expect shape
+c.number: I64
+--- expect plan
+not pass key_to_id
+pass scan_access
