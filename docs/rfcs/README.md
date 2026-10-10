@@ -244,3 +244,4 @@ then dated RFCs by date.
 | [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |
 | [2026-10-01](2026-10-01-engine-settlement-and-resource-bounds.md) | Engine settlement and resource bounds | maintainer | accepted | partial |
 | [2026-10-08](2026-10-08-index-facts-as-planner-input.md) | Index facts as planner input | maintainer | accepted | complete |
+| [2026-10-10](2026-10-10-unpublished-graph-commits.md) | Unpublished graph commits | maintainer | draft | not-started |
