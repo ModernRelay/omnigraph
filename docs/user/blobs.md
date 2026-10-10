@@ -150,15 +150,27 @@ and retry.
 
 | Limit | Applies to | Reported resource |
 |---|---|---|
-| 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
-| 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
-| 32 MiB per touched type, and 32 MiB across all touched types, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
-| 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
-| 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
+| `write_max_bytes` decoded bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
+| `write_max_bytes` decoded bytes | One `base64:` value in an insert or update mutation; a statement's values add up across its Blob properties and an update's matched rows. A load reports its decoded bytes under the `for <table>` and `per operation` names | `decoded blob input bytes per operation` |
+| `write_max_bytes` row bytes per type and across all touched types | Incremental writes: `append` and `merge` loads, inserts and updates. Counts ordinary columns, Blob descriptors and Arrow bookkeeping; excludes logical Blob payload buffers | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation`, `keyed parsed entity bytes for <table>`, `keyed parsed entity bytes per operation` |
+| `write_max_bytes` logical Blob payload bytes | One incremental write across all types: inline payloads, copied external payloads and Blob values carried by updates count together | `materialized blob payload bytes`, `decoded blob input bytes per operation` |
+| `write_max_bytes` Blob payload bytes | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |
 | 32 MiB of retained URI metadata | One write operation or merge. Every copy of a URI the operation keeps counts, plus 24 bytes per copy: admission keeps each reference's text twice and each distinct object's normalized URI twice, so distinct URIs reach the limit at about 8 MiB of text | `external Blob URI metadata bytes` |
 | 64 KiB | One external URI | `external Blob URI bytes` |
 | 4 MiB | One embedded managed range read | `Blob read range bytes` |
+
+Superseded versions of a key written in one operation count as input
+(`decoded blob input bytes per operation`) until the last-write-wins fold.
+An update of a row inserted earlier in the same mutation is such a version:
+it carries the pending row's Blob, so that payload counts twice, the carried
+copy as `materialized blob payload bytes`.
+
+[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts
+`1..=33554432`. Payload and row allowances are independent: a payload exactly
+at the limit fits when its row and descriptors also fit. Repeated external
+references each count their payload length even when one fetch serves them.
+External-only admission can also report `materialized external blob payload bytes`.
 
 `<table>` names the type as `node:<Type>` or `edge:<Type>`, for example
 `keyed entity bytes for node:Document`.

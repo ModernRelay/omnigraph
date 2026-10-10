@@ -5,6 +5,7 @@ mod helpers;
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
@@ -13,7 +14,9 @@ use omnigraph::db::{
     GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, StagingVerdict,
 };
 use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
-use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::instrumentation::{
+    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
@@ -212,6 +215,9 @@ fn rfc023_external_writer_process() {
             match action.as_str() {
                 "load" => {
                     db.load("main", &payload, mode).await.unwrap();
+                }
+                "load_feature" => {
+                    db.load("feature", &payload, mode).await.unwrap();
                 }
                 "schema_apply_company" => {
                     db.apply_schema(&payload).await.unwrap();
@@ -918,17 +924,10 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A fork collision must be classified by the manifest authority, not by Lance
-// branch versions. When a concurrent first-write legitimately wins the fork
-// race, the loser sees a changed read set — but that is a safe pre-effect
-// retry for Insert. RFC-022 discards and reprepares it automatically, never
-// misclassifying the live fork as an orphan that needs cleanup.
-//
-// Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
-// it parks the first arrival (writer A) at the fork point until released; later
-// arrivals (writer B) fall through. The test waits on the reached condition,
-// lets B win and commit the fork, then releases A.
-#[tokio::test(flavor = "multi_thread")]
+/// A fork collision is classified by the manifest authority, not by Lance
+/// branch versions: the first write that loses the fork race sees a changed
+/// read set and reprepares against the live fork instead of cleaning it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let _scenario = FailScenario::setup();
@@ -939,42 +938,50 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     main.branch_create("feature").await.unwrap();
 
     let rv = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
+    let probes = QueryIoProbes::default();
 
     let uri_a = uri.clone();
+    let writer_probes = probes.clone();
     let writer_a = tokio::spawn(async move {
         let a = helpers::session(Omnigraph::open(&uri_a).await.unwrap());
-        helpers::mutate_branch(
-            &a,
-            "feature",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        with_query_io_probes(
+            writer_probes,
+            helpers::mutate_branch(
+                &a,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            ),
         )
         .await
     });
 
-    // Wait until A is parked at the fork point.
     rv.wait_until_reached().await;
 
-    // B wins the fork and commits it.
-    let b = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    helpers::mutate_branch(
-        &b,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
+    let external_uri = uri.clone();
+    let external = tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            external_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"Frank","age":41}}"#.to_string(),
+            "load_feature",
+        )
+    })
+    .await;
 
-    // Release A; it resumes, sees that B changed branch authority, discards its
-    // stale attempt, and reprepares Eve against the now-live feature fork.
     rv.release();
-    writer_a
-        .await
+    let writer_result = writer_a.await;
+    external.unwrap().expect("B must publish while A is parked");
+    assert!(!rv.timed_out(), "A must stay parked until B publishes");
+    writer_result
         .unwrap()
         .expect("A's retryable insert must reprepare after B wins the fork");
+    assert_eq!(
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        1,
+        "A must discard its stale attempt after the foreign writer publishes"
+    );
 
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(

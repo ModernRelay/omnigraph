@@ -219,6 +219,17 @@ pub(crate) fn typed_sha256<T: Serialize>(value: &T) -> Result<String, Diagnostic
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// True for exactly 64 lowercase hexadecimal characters.
+pub fn digest(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 pub(crate) fn valid_kebab_id(value: &str) -> bool {
     let mut saw_segment_char = false;
     let mut previous_was_hyphen = false;

@@ -6,10 +6,13 @@ use crate::ordered_cursor::{
 };
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
+use crate::storage_layer::WriteBudget;
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
-use crate::table_store::{certified_insert_absence_rows, is_full_text_declaration};
+use crate::table_store::{
+    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_full_text_declaration,
+};
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
 
@@ -117,6 +120,7 @@ struct StagedTable {
     /// consumes these, rather than assuming Lance's scanner will emit a
     /// particular physical batch shape.
     chunk_rows: Vec<usize>,
+    write_budget: WriteBudget,
 }
 
 #[derive(Debug)]
@@ -140,6 +144,7 @@ struct DeleteIdChunks {
     /// bookkeeping. Per-chunk bounds alone would still permit a 1,024-chunk
     /// plan to retain tens of GiB before the first effect.
     retained_bytes: u64,
+    write_budget: WriteBudget,
 }
 
 #[derive(Debug)]
@@ -149,20 +154,21 @@ struct DeleteIdChunk {
 }
 
 impl DeleteIdChunks {
-    fn new(id_col: &'static str) -> Self {
+    fn new(id_col: &'static str, write_budget: WriteBudget) -> Self {
         Self {
             id_col,
             chunks: Vec::new(),
             retained_bytes: 0,
+            write_budget,
         }
     }
 
     fn push(&mut self, id: String) -> Result<()> {
-        self.push_bounded(id, KEYED_WRITE_MAX_ROWS, KEYED_WRITE_MAX_BYTES)
+        self.push_bounded(id, KEYED_WRITE_MAX_ROWS, self.write_budget.bytes())
     }
 
     fn push_bounded(&mut self, id: String, max_rows: usize, max_bytes: u64) -> Result<()> {
-        self.push_with_bounds(id, max_rows, max_bytes, KEYED_WRITE_MAX_BYTES)
+        self.push_with_bounds(id, max_rows, max_bytes, self.write_budget.bytes())
     }
 
     fn push_with_bounds(
@@ -408,6 +414,7 @@ struct ProvenPureInsertAdopt {
     /// Exact pre-effect row boundaries observed from the bounded
     /// source-interval stream. Each boundary becomes one filtered transaction.
     chunk_rows: Vec<usize>,
+    write_budget: WriteBudget,
 }
 
 #[derive(Debug, Clone)]
@@ -609,14 +616,16 @@ struct StagedTableWriter {
     dataset: Option<Dataset>,
     buffered_rows: usize,
     buffered_bytes: u64,
+    buffered_payload_bytes: u64,
     row_count: u64,
     chunk_rows: Vec<usize>,
+    write_budget: WriteBudget,
     batches: Vec<RecordBatch>,
     external_payloads: crate::table_store::ExternalBlobPayloadCache,
 }
 
 impl StagedTableWriter {
-    fn new(table_key: &str, schema: SchemaRef) -> Result<Self> {
+    fn new(table_key: &str, schema: SchemaRef, write_budget: WriteBudget) -> Result<Self> {
         let dir = merge_stage_tempdir(table_key)?;
         let dataset_uri = dir.path().join("table.lance").to_string_lossy().to_string();
         let materialize_blobs = schema_has_blob(&schema)?;
@@ -628,8 +637,10 @@ impl StagedTableWriter {
             dataset: None,
             buffered_rows: 0,
             buffered_bytes: 0,
+            buffered_payload_bytes: 0,
             row_count: 0,
             chunk_rows: Vec::new(),
+            write_budget,
             batches: Vec::new(),
             external_payloads: crate::table_store::ExternalBlobPayloadCache::new(),
         })
@@ -646,58 +657,61 @@ impl StagedTableWriter {
         let indices = UInt64Array::from(vec![row.row_index as u64]);
         let input = arrow_select::take::take_record_batch(&row.batch, &indices)
             .map_err(OmniError::arrow_internal)?;
-        let predicted_row_bytes = if self.materialize_blobs {
+        let predicted = if self.materialize_blobs {
             materializer.predicted_materialized_blob_batch_bytes(
                 &row.dataset,
                 &input,
                 external_preflight,
-                KEYED_WRITE_MAX_BYTES,
+                self.write_budget.bytes(),
             )?
         } else {
-            u64::try_from(input.get_array_memory_size()).map_err(|_| {
-                OmniError::manifest_internal("branch merge row memory size exceeds u64")
-            })?
+            crate::table_store::write_batch_bytes(&input)?
         };
-        if predicted_row_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "branch-merge fenced entity bytes",
-                KEYED_WRITE_MAX_BYTES,
-                predicted_row_bytes,
-            ));
-        }
+        self.write_budget
+            .check("branch-merge fenced entity bytes", predicted.rows)?;
+        self.write_budget
+            .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, predicted.payload)?;
         let predicted_overflow = self
             .buffered_bytes
-            .checked_add(predicted_row_bytes)
-            .is_none_or(|bytes| bytes > KEYED_WRITE_MAX_BYTES);
+            .checked_add(predicted.rows)
+            .is_none_or(|bytes| bytes > self.write_budget.bytes())
+            || self
+                .buffered_payload_bytes
+                .checked_add(predicted.payload)
+                .is_none_or(|bytes| bytes > self.write_budget.bytes());
         if self.buffered_rows > 0
             && (self.buffered_rows >= KEYED_WRITE_MAX_ROWS || predicted_overflow)
         {
-            // Flush before payload I/O, not after. Otherwise two individually
-            // valid rows can transiently retain more than the chunk ceiling.
             self.flush().await?;
         }
         let batch = self
             .row_batch(row, input, materializer, external_preflight)
             .await?;
-        let row_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("branch merge row memory size exceeds u64")
-        })?;
-        if row_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "branch-merge fenced entity bytes",
-                KEYED_WRITE_MAX_BYTES,
-                row_bytes,
-            ));
-        }
+        let usage = crate::table_store::write_batch_bytes(&batch)?;
+        let row_bytes = usage.rows;
+        self.write_budget
+            .check("branch-merge fenced entity bytes", row_bytes)?;
+        self.write_budget
+            .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, usage.payload)?;
         let would_exceed_bytes = self
             .buffered_bytes
             .checked_add(row_bytes)
-            .is_none_or(|bytes| bytes > KEYED_WRITE_MAX_BYTES);
+            .is_none_or(|bytes| bytes > self.write_budget.bytes())
+            || self
+                .buffered_payload_bytes
+                .checked_add(usage.payload)
+                .is_none_or(|bytes| bytes > self.write_budget.bytes());
         if self.buffered_rows > 0
             && (self.buffered_rows >= KEYED_WRITE_MAX_ROWS || would_exceed_bytes)
         {
             self.flush().await?;
         }
+        self.buffered_payload_bytes = self
+            .buffered_payload_bytes
+            .checked_add(usage.payload)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("branch merge payload byte count overflow")
+            })?;
         self.row_count = self
             .row_count
             .checked_add(1)
@@ -709,7 +723,8 @@ impl StagedTableWriter {
             .ok_or_else(|| OmniError::manifest_internal("branch merge byte count overflow"))?;
         self.batches.push(batch);
         if self.buffered_rows >= KEYED_WRITE_MAX_ROWS
-            || self.buffered_bytes >= KEYED_WRITE_MAX_BYTES
+            || self.buffered_bytes >= self.write_budget.bytes()
+            || self.buffered_payload_bytes >= self.write_budget.bytes()
         {
             self.flush().await?;
         }
@@ -728,7 +743,7 @@ impl StagedTableWriter {
                 .materialize_blob_batch_bounded_with_preflight_cache(
                     &row.dataset,
                     batch,
-                    KEYED_WRITE_MAX_BYTES,
+                    self.write_budget.bytes(),
                     external_preflight,
                     &mut self.external_payloads,
                 )
@@ -763,6 +778,7 @@ impl StagedTableWriter {
             dataset: self.dataset.unwrap(),
             row_count: self.row_count,
             chunk_rows: self.chunk_rows,
+            write_budget: self.write_budget,
         })
     }
 
@@ -780,6 +796,7 @@ impl StagedTableWriter {
         };
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
+        self.buffered_payload_bytes = 0;
         self.chunk_rows.push(batch.num_rows());
         let chunk_count = u64::try_from(self.chunk_rows.len())
             .map_err(|_| OmniError::manifest_internal("branch merge chunk count exceeds u64"))?;
@@ -846,6 +863,7 @@ async fn try_proven_pure_insert_history(
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
     id_col: &'static str,
+    write_budget: WriteBudget,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(base_entry) = base_snapshot.dataset(table_key) else {
         return Ok(None);
@@ -955,6 +973,7 @@ async fn try_proven_pure_insert_history(
             fragments,
         },
         chunk_rows: Vec::new(),
+        write_budget,
     }))
 }
 
@@ -1035,6 +1054,7 @@ async fn finalize_proven_pure_insert_adopt(
     mut proven: ProvenPureInsertAdopt,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(chunk_rows) = plan_proven_pure_insert_chunks(
         db,
@@ -1044,6 +1064,7 @@ async fn finalize_proven_pure_insert_adopt(
         proven.inserted_rows,
         external_preflight,
         system_columns,
+        write_budget,
     )
     .await?
     else {
@@ -1059,12 +1080,14 @@ async fn try_proven_pure_insert_adopt(
     base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<Option<ProvenPureInsertAdopt>> {
     let Some(proven) = try_proven_pure_insert_history(
         table_key,
         base_snapshot,
         source_snapshot,
         system_columns.id,
+        write_budget,
     )
     .await?
     else {
@@ -1077,6 +1100,7 @@ async fn try_proven_pure_insert_adopt(
         proven,
         &empty_external_preflight,
         system_columns,
+        write_budget,
     )
     .await
 }
@@ -1326,6 +1350,7 @@ async fn plan_proven_pure_insert_chunks(
     expected_rows: u64,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<Option<Vec<usize>>> {
     let scan_timing = crate::instrumentation::start_merge_timing(
         crate::instrumentation::MergeTimingPhase::ProvenInsertPlanScan,
@@ -1339,6 +1364,7 @@ async fn plan_proven_pure_insert_chunks(
             interval,
             external_preflight,
             system_columns,
+            write_budget,
         )
         .await?;
     let mut chunk_rows = Vec::new();
@@ -1461,6 +1487,7 @@ async fn compute_adopt_delta(
     source_snapshot: &Snapshot,
     materialize_blobs: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
+    write_budget: WriteBudget,
 ) -> Result<Option<AdoptDelta>> {
     let full_schema = schema_for_table_key(catalog, table_key)?;
     let schema = if materialize_blobs {
@@ -1469,11 +1496,15 @@ async fn compute_adopt_delta(
         validation_schema(catalog, table_key, &full_schema)?
     };
     let materializer = target_db.blob_materializer();
-    let mut append_writer =
-        StagedTableWriter::new(&format!("{}_adopt_append", table_key), schema.clone())?;
-    let mut upsert_writer = StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema)?;
+    let mut append_writer = StagedTableWriter::new(
+        &format!("{}_adopt_append", table_key),
+        schema.clone(),
+        write_budget,
+    )?;
+    let mut upsert_writer =
+        StagedTableWriter::new(&format!("{}_adopt_upsert", table_key), schema, write_budget)?;
     let id_col = catalog.system_columns.id;
-    let mut deleted_ids = DeleteIdChunks::new(id_col);
+    let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
     let mut base =
         OrderedTableCursor::from_snapshot_lazy(base_snapshot, table_key, "base", id_col).await?;
     let mut source =
@@ -1755,15 +1786,20 @@ async fn stage_streaming_table_merge_walk(
     conflicts: &mut Vec<MergeConflict>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
+    write_budget: WriteBudget,
 ) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
     let prior_conflict_count = conflicts.len();
     let materializer = target_db.blob_materializer();
-    let mut insert_writer =
-        StagedTableWriter::new(&format!("{}_inserts", table_key), schema.clone())?;
-    let mut update_writer = StagedTableWriter::new(&format!("{}_updates", table_key), schema)?;
+    let mut insert_writer = StagedTableWriter::new(
+        &format!("{}_inserts", table_key),
+        schema.clone(),
+        write_budget,
+    )?;
+    let mut update_writer =
+        StagedTableWriter::new(&format!("{}_updates", table_key), schema, write_budget)?;
     let id_col = catalog.system_columns.id;
-    let mut deleted_ids = DeleteIdChunks::new(id_col);
+    let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
     let mut base =
         OrderedTableCursor::from_snapshot(base_snapshot, table_key, "base", id_col).await?;
     let mut source =
@@ -2424,7 +2460,8 @@ async fn plan_lineage_merge(
         "lineage merge: candidate discovery complete"
     );
 
-    let mut candidate_chunks = DeleteIdChunks::new(catalog.system_columns.id);
+    let mut candidate_chunks =
+        DeleteIdChunks::new(catalog.system_columns.id, WriteBudget::default());
     for id in candidate_ids {
         match candidate_chunks.push_bounded(id, LINEAGE_FILTER_MAX_IDS, KEYED_WRITE_MAX_BYTES) {
             Ok(()) => {}
@@ -2465,15 +2502,20 @@ async fn stage_lineage_table_merge(
     conflicts: &mut Vec<MergeConflict>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
     mut outcome_log: Option<&mut Vec<(String, RowOutcomeKind)>>,
+    write_budget: WriteBudget,
 ) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
     let prior_conflict_count = conflicts.len();
     let materializer = target_db.blob_materializer();
-    let mut insert_writer =
-        StagedTableWriter::new(&format!("{}_inserts", table_key), schema.clone())?;
-    let mut update_writer = StagedTableWriter::new(&format!("{}_updates", table_key), schema)?;
+    let mut insert_writer = StagedTableWriter::new(
+        &format!("{}_inserts", table_key),
+        schema.clone(),
+        write_budget,
+    )?;
+    let mut update_writer =
+        StagedTableWriter::new(&format!("{}_updates", table_key), schema, write_budget)?;
     let id_col = catalog.system_columns.id;
-    let mut deleted_ids = DeleteIdChunks::new(id_col);
+    let mut deleted_ids = DeleteIdChunks::new(id_col, write_budget);
     let mut needs_update = false;
 
     for chunk in &plan.candidate_chunks.chunks {
@@ -2650,6 +2692,7 @@ fn stage_streaming_table_merge<'a>(
     conflicts: &'a mut Vec<MergeConflict>,
     external_preflight: &'a crate::table_store::ExternalBlobPreflight,
     lineage: MergeLineage,
+    write_budget: WriteBudget,
 ) -> std::pin::Pin<
     Box<impl std::future::Future<Output = Result<Option<StagedMergeResult>>> + Send + 'a>,
 > {
@@ -2666,6 +2709,7 @@ fn stage_streaming_table_merge<'a>(
                     conflicts,
                     external_preflight,
                     None,
+                    write_budget,
                 )
                 .await?;
                 crate::instrumentation::record_completed_merge_classification(false);
@@ -2690,6 +2734,7 @@ fn stage_streaming_table_merge<'a>(
                             conflicts,
                             external_preflight,
                             None,
+                            write_budget,
                         )
                         .await?;
                         crate::instrumentation::record_completed_merge_classification(true);
@@ -2706,6 +2751,7 @@ fn stage_streaming_table_merge<'a>(
                             conflicts,
                             external_preflight,
                             None,
+                            write_budget,
                         )
                         .await?;
                         crate::instrumentation::record_completed_merge_classification(false);
@@ -2725,6 +2771,7 @@ fn stage_streaming_table_merge<'a>(
                     conflicts,
                     external_preflight,
                     Some(&mut walk_log),
+                    write_budget,
                 )
                 .await?;
                 crate::instrumentation::record_completed_merge_classification(false);
@@ -2749,6 +2796,7 @@ fn stage_streaming_table_merge<'a>(
                     &mut lineage_conflicts,
                     external_preflight,
                     Some(&mut lineage_log),
+                    write_budget,
                 )
                 .await?;
                 crate::instrumentation::record_completed_merge_classification(true);
@@ -3451,6 +3499,7 @@ async fn classify_adopt(
     table_key: &str,
     target_active: Option<&str>,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
+    write_budget: WriteBudget,
 ) -> Result<Option<CandidateTableState>> {
     let Some(source_entry) = source_snapshot.dataset(table_key) else {
         // Source has no such table — nothing to adopt or validate.
@@ -3473,6 +3522,7 @@ async fn classify_adopt(
             base_snapshot,
             source_snapshot,
             catalog.system_columns,
+            write_budget,
         )
         .await?
     {
@@ -3483,6 +3533,7 @@ async fn classify_adopt(
         base_snapshot,
         source_snapshot,
         catalog.system_columns.id,
+        write_budget,
     )
     .await?
     {
@@ -3499,6 +3550,7 @@ async fn classify_adopt(
         table_key,
         advances_head,
         external_preflight,
+        write_budget,
     )
     .await?;
 
@@ -3521,7 +3573,13 @@ async fn classify_general_adopt(
     table_key: &str,
     advances_head: bool,
     external_preflight: &crate::table_store::ExternalBlobPreflight,
+    write_budget: WriteBudget,
 ) -> Result<CandidateTableState> {
+    let delta_budget = if advances_head {
+        write_budget
+    } else {
+        WriteBudget::default()
+    };
     let validation_delta = compute_adopt_delta(
         target_db,
         table_key,
@@ -3530,6 +3588,7 @@ async fn classify_general_adopt(
         source_snapshot,
         advances_head,
         external_preflight,
+        delta_budget,
     )
     .await?;
     match (advances_head, validation_delta) {
@@ -3938,6 +3997,7 @@ mod chain_limit_tests {
             inserts: None,
             updates: None,
             deleted_ids: DeleteIdChunks {
+                write_budget: WriteBudget::default(),
                 id_col: SYSTEM_COLUMNS_LEGACY.id,
                 chunks: (0..chunk_count)
                     .map(|_| DeleteIdChunk {
@@ -3950,9 +4010,68 @@ mod chain_limit_tests {
         })
     }
 
+    #[tokio::test]
+    async fn write_max_bytes_staged_publication_compacts_the_planned_prefix() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let parent = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "small".to_string(),
+                "x".repeat(10_000),
+            ]))],
+        )
+        .unwrap();
+        let reader = arrow_array::RecordBatchIterator::new([Ok(parent)], schema.clone());
+        let mut stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        let settings = omnigraph_compiler::settings::SessionSettings::default()
+            .with("write_max_bytes", "4093")
+            .unwrap();
+        let budget = WriteBudget::from_settings(&settings);
+        let mut pending = None;
+        let chunk = next_exact_staged_chunk(&mut stream, &mut pending, &schema, 1, budget)
+            .await
+            .unwrap();
+        assert_eq!(chunk.num_rows(), 1);
+        assert!(crate::table_store::write_batch_bytes(&chunk).unwrap().rows <= budget.bytes());
+    }
+
+    #[tokio::test]
+    async fn write_max_bytes_staged_publication_preserves_an_exact_whole_batch() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec![
+                "exact".to_string(),
+            ]))],
+        )
+        .unwrap();
+        let bytes = crate::table_store::write_batch_bytes(&batch).unwrap().rows;
+        let settings = omnigraph_compiler::settings::SessionSettings::default()
+            .with("write_max_bytes", &bytes.to_string())
+            .unwrap();
+        let budget = WriteBudget::from_settings(&settings);
+        let reader = arrow_array::RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        let chunk = next_exact_staged_chunk(&mut stream, &mut None, &schema, 1, budget)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::table_store::write_batch_bytes(&chunk).unwrap().rows,
+            bytes
+        );
+    }
+
     #[test]
     fn branch_merge_delete_ids_split_on_row_and_escaped_byte_bounds() {
-        let mut row_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
+        let mut row_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         for row in 0..=KEYED_WRITE_MAX_ROWS {
             row_bounded.push(format!("id-{row}")).unwrap();
         }
@@ -3968,7 +4087,8 @@ mod chain_limit_tests {
         // `a'b` is six bytes as an escaped SQL literal (`'a''b'`) and the
         // `id IN (` / `)` framing is another eight. The exact 14-byte filter
         // fits; adding a second id starts a new chunk rather than exceeding it.
-        let mut byte_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
+        let mut byte_bounded =
+            DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         byte_bounded
             .push_bounded("a'b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap();
@@ -3989,7 +4109,7 @@ mod chain_limit_tests {
             "id IN ('x')"
         );
 
-        let error = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id)
+        let error = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default())
             .push_bounded("a''b".to_string(), KEYED_WRITE_MAX_ROWS, 14)
             .unwrap_err();
         assert!(matches!(
@@ -4001,7 +4121,8 @@ mod chain_limit_tests {
             } if resource == "branch-merge delete filter bytes"
         ));
 
-        let mut retained_bounded = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
+        let mut retained_bounded =
+            DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         retained_bounded
             .push_with_bounds("a".to_string(), KEYED_WRITE_MAX_ROWS, 1024, 256)
             .unwrap();
@@ -4028,7 +4149,7 @@ mod chain_limit_tests {
 
     #[test]
     fn branch_merge_delete_chunks_chain_one_link_each() {
-        let mut deleted_ids = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id);
+        let mut deleted_ids = DeleteIdChunks::new(SYSTEM_COLUMNS_LEGACY.id, WriteBudget::default());
         for row in 0..=KEYED_WRITE_MAX_ROWS {
             deleted_ids.push(format!("id-{row}")).unwrap();
         }
@@ -4290,6 +4411,7 @@ async fn next_exact_staged_chunk(
     carry: &mut Option<RecordBatch>,
     schema: &SchemaRef,
     expected_rows: usize,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     if expected_rows == 0 {
         return Err(OmniError::manifest_internal(
@@ -4298,6 +4420,7 @@ async fn next_exact_staged_chunk(
     }
     let mut remaining = expected_rows;
     let mut slices = Vec::new();
+    let mut partial_batch = false;
     while remaining > 0 {
         let batch = match carry.take() {
             Some(batch) => batch,
@@ -4318,6 +4441,7 @@ async fn next_exact_staged_chunk(
             },
         };
         let take = remaining.min(batch.num_rows());
+        partial_batch |= take < batch.num_rows();
         slices.push(batch.slice(0, take));
         remaining -= take;
         if take < batch.num_rows() {
@@ -4325,13 +4449,31 @@ async fn next_exact_staged_chunk(
         }
     }
     let chunk = if slices.len() == 1 {
-        slices.pop().expect("one slice")
+        let slice = slices.pop().expect("one slice");
+        let usage = crate::table_store::write_batch_bytes(&slice)?;
+        let retained = slice.get_array_memory_size() as u64;
+        let logical = crate::table_store::batch_slice_memory_size(&slice, 0, slice.num_rows())?;
+        if !partial_batch
+            && usage.rows <= write_budget.bytes()
+            && usage.payload <= write_budget.bytes()
+            && retained <= write_budget.bytes().saturating_mul(2)
+            && retained <= logical.saturating_add(64 * 1024)
+        {
+            slice
+        } else {
+            let indices = UInt64Array::from_iter_values(0..slice.num_rows() as u64);
+            arrow_select::take::take_record_batch(&slice, &indices)
+                .map_err(OmniError::arrow_internal)?
+        }
     } else {
         arrow_select::concat::concat_batches(schema, &slices).map_err(OmniError::arrow_internal)?
     };
-    let chunk_bytes = u64::try_from(chunk.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("branch merge chunk bytes exceed u64"))?;
-    if chunk.num_rows() > KEYED_WRITE_MAX_ROWS || chunk_bytes > KEYED_WRITE_MAX_BYTES {
+    let usage = crate::table_store::write_batch_bytes(&chunk)?;
+    let chunk_bytes = usage.rows;
+    if chunk.num_rows() > KEYED_WRITE_MAX_ROWS
+        || chunk_bytes > write_budget.bytes()
+        || usage.payload > write_budget.bytes()
+    {
         return Err(OmniError::manifest_internal(format!(
             "branch merge reconstructed a keyed chunk outside its planned bound: {} rows / {chunk_bytes} bytes",
             chunk.num_rows()
@@ -4350,10 +4492,11 @@ async fn commit_staged_keyed_chunks(
     between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
 ) -> Result<SnapshotHandle> {
+    let write_budget = table.write_budget;
     let source = SnapshotHandle::new(table.dataset.clone());
     let stream = target_db
         .storage()
-        .scan_stream_for_rewrite_bounded(&source, KEYED_WRITE_MAX_ROWS, KEYED_WRITE_MAX_BYTES)
+        .scan_stream_for_rewrite_bounded(&source, KEYED_WRITE_MAX_ROWS, write_budget.bytes())
         .await?;
     let schema: SchemaRef = Arc::new(table.dataset.schema().into());
     commit_keyed_stream_chunks(
@@ -4368,6 +4511,7 @@ async fn commit_staged_keyed_chunks(
         chain,
         between_chunk_failpoint,
         system_columns,
+        write_budget,
     )
     .await
 }
@@ -4394,11 +4538,14 @@ async fn commit_keyed_stream_chunks(
     chain: &mut MergeChain,
     between_chunk_failpoint: Option<&'static crate::seams::DecideSeam>,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<SnapshotHandle> {
     let mut carry = None;
     let mut observed_rows = 0_u64;
     for (chunk_index, expected_rows) in chunk_rows.iter().copied().enumerate() {
-        let batch = next_exact_staged_chunk(&mut stream, &mut carry, schema, expected_rows).await?;
+        let batch =
+            next_exact_staged_chunk(&mut stream, &mut carry, schema, expected_rows, write_budget)
+                .await?;
         observed_rows = observed_rows
             .checked_add(batch.num_rows() as u64)
             .ok_or_else(|| OmniError::manifest_internal("branch merge row count overflow"))?;
@@ -4409,7 +4556,14 @@ async fn commit_keyed_stream_chunks(
             KeyedChunkStage::General(semantics) => {
                 target_db
                     .storage()
-                    .stage_keyed_write(current.clone(), table_key, batch, semantics, system_columns)
+                    .stage_keyed_write(
+                        current.clone(),
+                        table_key,
+                        batch,
+                        semantics,
+                        system_columns,
+                        write_budget,
+                    )
                     .await?
             }
             KeyedChunkStage::ProvenStrictInsert => {
@@ -4421,7 +4575,12 @@ async fn commit_keyed_stream_chunks(
                 )?;
                 target_db
                     .storage()
-                    .stage_proven_strict_insert(current.clone(), chunk, system_columns)
+                    .stage_proven_strict_insert(
+                        current.clone(),
+                        chunk,
+                        system_columns,
+                        write_budget,
+                    )
                     .await?
             }
         };
@@ -4484,6 +4643,7 @@ async fn publish_proven_pure_insert_adopt(
     expected_version: u64,
     system_columns: SystemColumns,
 ) -> Result<(crate::db::DatasetUpdate, MergeChain)> {
+    let write_budget = proven.write_budget;
     let (current, full_path, table_branch) = prepared_target.into_parts();
     let source = SnapshotHandle::new(proven.source.clone());
     let stream = target_db
@@ -4494,6 +4654,7 @@ async fn publish_proven_pure_insert_adopt(
             &proven.interval,
             external_preflight,
             system_columns,
+            write_budget,
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
@@ -4513,6 +4674,7 @@ async fn publish_proven_pure_insert_adopt(
         &mut chain,
         Some(&BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS),
         system_columns,
+        write_budget,
     )
     .await?;
     let final_state = target_db
@@ -4802,6 +4964,7 @@ impl Session {
             actor_id,
             self.settings().merge_lineage(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
         ))
         .await;
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
@@ -4849,6 +5012,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         lineage: MergeLineage,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<MergeResult> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
@@ -4972,6 +5136,7 @@ impl Omnigraph {
             actor_id,
             lineage,
             history_release_bytes,
+            write_budget,
         ))
         .await;
         if !merge_result
@@ -5018,6 +5183,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         lineage: MergeLineage,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5077,6 +5243,7 @@ impl Omnigraph {
                         table_key,
                         target_active.as_deref(),
                         &empty_external_preflight,
+                        write_budget,
                     )
                     .await?
                     {
@@ -5099,6 +5266,7 @@ impl Omnigraph {
                         &mut conflicts,
                         &empty_external_preflight,
                         lineage,
+                        write_budget,
                     )
                     .await?;
                     table_walk_timing.finish();
@@ -5125,6 +5293,7 @@ impl Omnigraph {
                     base_snapshot,
                     source_snapshot,
                     catalog.system_columns.id,
+                    write_budget,
                 )
                 .await?
                 {
@@ -5185,13 +5354,7 @@ impl Omnigraph {
             .preflight_persisted_blob_selection(&blob_selection)
             .await?;
         let carried_blob_bytes = blob_selection.materialized_payload_bytes(&external_preflight)?;
-        if carried_blob_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "materialized blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
-                carried_blob_bytes,
-            ));
-        }
+        write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, carried_blob_bytes)?;
 
         for table_key in &ordered_table_keys {
             if !blob_table_keys.contains(table_key) {
@@ -5234,6 +5397,7 @@ impl Omnigraph {
                             proven,
                             &external_preflight,
                             catalog.system_columns,
+                            write_budget,
                         )
                         .await?
                         {
@@ -5247,6 +5411,7 @@ impl Omnigraph {
                                     table_key,
                                     true,
                                     &external_preflight,
+                                    write_budget,
                                 )
                                 .await?
                             }
@@ -5260,6 +5425,7 @@ impl Omnigraph {
                                 table_key,
                                 true,
                                 &external_preflight,
+                                write_budget,
                             )
                             .await?
                         }
@@ -5289,6 +5455,7 @@ impl Omnigraph {
                         table_key,
                         target_active.as_deref(),
                         &external_preflight,
+                        write_budget,
                     )
                     .await?
                 };
@@ -5314,6 +5481,7 @@ impl Omnigraph {
                 &mut conflicts,
                 &external_preflight,
                 lineage,
+                write_budget,
             )
             .await?;
             table_walk_timing.finish();

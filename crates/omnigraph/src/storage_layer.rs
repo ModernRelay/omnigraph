@@ -73,27 +73,60 @@ use crate::table_store::{
 pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
 pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The operation-wide sibling of the per-table keyed ceiling. This uses the
-/// existing Arrow accounting (including its conservative shared-buffer count),
-/// not a second allocator or a claim about native execution/RSS.
-pub(crate) fn retained_keyed_bytes(current: u64, additional: u64) -> Result<u64> {
+/// Immutable allowance captured from the effective session once per operation.
+/// Each existing row, payload, parser and removed-id account has this ceiling;
+/// the accounts remain independent and keep their original scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteBudget(u64);
+
+impl WriteBudget {
+    pub(crate) fn from_settings(settings: &omnigraph_compiler::settings::SessionSettings) -> Self {
+        Self(settings.write_max_bytes())
+    }
+
+    pub(crate) fn bytes(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) fn check(self, resource: impl Into<String>, actual: u64) -> Result<()> {
+        if actual > self.0 {
+            return Err(OmniError::resource_limit(resource, self.0, actual));
+        }
+        Ok(())
+    }
+}
+
+impl Default for WriteBudget {
+    fn default() -> Self {
+        Self::from_settings(&omnigraph_compiler::settings::SessionSettings::default())
+    }
+}
+
+/// The operation-wide sibling of the per-table row-data ceiling. Arrow
+/// bookkeeping and shared buffers retain their conservative accounting;
+/// logical Blob payload buffers have a separate allowance.
+pub(crate) fn retained_keyed_bytes(
+    current: u64,
+    additional: u64,
+    budget: WriteBudget,
+) -> Result<u64> {
     let actual = current
         .checked_add(additional)
         .ok_or_else(|| OmniError::manifest_internal("retained keyed batch byte count overflow"))?;
-    if actual > KEYED_WRITE_MAX_BYTES {
-        return Err(OmniError::resource_limit(
-            "retained keyed batch bytes per operation",
-            KEYED_WRITE_MAX_BYTES,
-            actual,
-        ));
-    }
+    budget.check("retained keyed batch bytes per operation", actual)?;
     Ok(actual)
 }
 
-pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u64> {
-    let bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("retained keyed batch bytes exceed u64"))?;
-    retained_keyed_bytes(current, bytes)
+pub(crate) fn retain_keyed_batch(
+    current: u64,
+    batch: &RecordBatch,
+    budget: WriteBudget,
+) -> Result<u64> {
+    retained_keyed_bytes(
+        current,
+        crate::table_store::write_batch_bytes(batch)?.rows,
+        budget,
+    )
 }
 
 /// One allowance per mutation (all tables and cascades) or load (all replacement
@@ -102,9 +135,14 @@ pub(crate) fn retain_keyed_batch(current: u64, batch: &RecordBatch) -> Result<u6
 #[derive(Default)]
 pub(crate) struct DeletedIdBudget {
     bytes: u64,
+    budget: WriteBudget,
 }
 
 impl DeletedIdBudget {
+    pub(crate) fn new(budget: WriteBudget) -> Self {
+        Self { bytes: 0, budget }
+    }
+
     pub(crate) fn retain(&mut self, id: &str) -> Result<()> {
         let bytes = id
             .len()
@@ -114,13 +152,8 @@ impl DeletedIdBudget {
             .ok_or_else(|| {
                 OmniError::manifest_internal("retained removed-id byte count overflow")
             })?;
-        if bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "retained removed-id bytes per operation",
-                KEYED_WRITE_MAX_BYTES,
-                bytes,
-            ));
-        }
+        self.budget
+            .check("retained removed-id bytes per operation", bytes)?;
         self.bytes = bytes;
         Ok(())
     }
@@ -133,11 +166,20 @@ impl DeletedIdBudget {
 /// time holds one batch of read-ahead.
 pub(crate) const BLOB_READ_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Resources a mutation already retains before a pending-aware update scan:
+/// `rows` on the scanned table, `bytes` and `payload_bytes` across every table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PendingUsage {
+    pub(crate) rows: u64,
+    pub(crate) bytes: u64,
+    pub(crate) payload_bytes: u64,
+}
+
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
 ///
-/// `initial_rows` accounts for batches already accumulated on this table;
-/// `initial_bytes` accounts for every table already retained by the graph
+/// `initial.rows` accounts for batches already accumulated on this table;
+/// `initial.bytes` accounts for every table already retained by the graph
 /// mutation. A later `update` allocates another full-row batch before the
 /// end-of-query dedupe, so its matched committed/pending view must fit in the
 /// remaining operation byte budget rather than receiving a fresh 32-MiB
@@ -147,16 +189,20 @@ pub(crate) const BLOB_READ_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingScanBudget {
     pub(crate) table_key: String,
-    pub(crate) initial_rows: u64,
-    pub(crate) initial_bytes: u64,
+    pub(crate) initial: PendingUsage,
+    pub(crate) write_budget: WriteBudget,
 }
 
 impl PendingScanBudget {
-    pub(crate) fn new(table_key: impl Into<String>, initial_rows: u64, initial_bytes: u64) -> Self {
+    pub(crate) fn new(
+        table_key: impl Into<String>,
+        initial: PendingUsage,
+        write_budget: WriteBudget,
+    ) -> Self {
         Self {
             table_key: table_key.into(),
-            initial_rows,
-            initial_bytes,
+            initial,
+            write_budget,
         }
     }
 }
@@ -626,6 +672,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         batch: RecordBatch,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch>;
 
     /// Authorize and probe the complete operation's distinct external Blob
@@ -640,6 +687,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch>;
 
     /// Rewrite retained Overwrite URI cells to the exact normalized targets
@@ -685,6 +733,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle>;
 
     /// Stage a provenance-proven strict insert without re-running Lance's
@@ -698,6 +747,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle>;
 
     /// Blob-aware full-row stream with an explicit batch ceiling. Branch
@@ -720,6 +770,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<SendableRecordBatchStream>;
 
     #[cfg(test)]
@@ -1138,8 +1189,10 @@ impl TableStorage for TableStore {
         table_key: &str,
         batch: RecordBatch,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch> {
-        TableStore::prepare_keyed_write_batch(self, table_key, batch, system_columns).await
+        TableStore::prepare_keyed_write_batch(self, table_key, batch, system_columns, write_budget)
+            .await
     }
 
     async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight> {
@@ -1152,6 +1205,7 @@ impl TableStorage for TableStore {
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch> {
         TableStore::prepare_keyed_write_batch_with_preflight(
             self,
@@ -1159,6 +1213,7 @@ impl TableStorage for TableStore {
             batch,
             preflight,
             system_columns,
+            write_budget,
         )
         .await
     }
@@ -1208,11 +1263,20 @@ impl TableStorage for TableStore {
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_keyed_write(self, ds, table_key, batch, semantics, system_columns)
-            .await
-            .map(StagedHandle::new)
+        TableStore::stage_keyed_write(
+            self,
+            ds,
+            table_key,
+            batch,
+            semantics,
+            system_columns,
+            write_budget,
+        )
+        .await
+        .map(StagedHandle::new)
     }
 
     async fn stage_proven_strict_insert(
@@ -1220,9 +1284,10 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         chunk: ProvenInsertChunk,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedHandle> {
         let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_proven_strict_insert(self, ds, chunk, system_columns)
+        TableStore::stage_proven_strict_insert(self, ds, chunk, system_columns, write_budget)
             .await
             .map(StagedHandle::new)
     }
@@ -1244,6 +1309,7 @@ impl TableStorage for TableStore {
         interval: &crate::table_store::ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<SendableRecordBatchStream> {
         TableStore::scan_proven_insert_delta_bounded(
             self,
@@ -1252,6 +1318,7 @@ impl TableStorage for TableStore {
             interval,
             external_preflight,
             system_columns,
+            write_budget,
         )
         .await
     }
