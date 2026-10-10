@@ -69,6 +69,16 @@ node Document {
 }
 ```
 
+The vector is the embedding of the record's `body` value exactly as stored,
+and a text `nearest($d.embedding, $q)` embeds `$q` exactly as given. Neither
+side adds a type name, a field label or any other template, and neither trims
+whitespace, so a record whose `body` equals the query text embeds the same
+input. The one difference a provider can see is the retrieval role: Gemini
+receives `RETRIEVAL_DOCUMENT` for stored text and `RETRIEVAL_QUERY` for a
+query, and the other providers receive identical requests. Vectors you compute
+yourself must embed the source value the same way to be comparable with text
+queries.
+
 When `model` is recorded, a text `nearest` query is rejected unless the active
 provider resolves to exactly that model id. Changing the recorded source or
 model is not an in-place schema migration; rebuild or re-embed the data instead.
@@ -91,7 +101,29 @@ every vector was supplied. Human CLI output prints the corresponding guidance.
 omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
 ```
 
+The spec names, for each node type, the vector property to fill and the one
+property whose value it embeds:
+
+```json
+{
+  "dimension": 1536,
+  "types": {
+    "Document": { "target": "embedding", "fields": ["body"] }
+  }
+}
+```
+
+`fields` must name exactly one property, the source the target's `@embed`
+declares; a spec that lists none or several is refused. The command does not
+read the schema, so keep `target`, `fields`, and `dimension` equal to the
+`@embed` declaration and its `Vector(N)`. The source's string value is embedded
+unchanged, as described under [Schema annotation](#schema-annotation). A record
+whose source is absent, null, or blank gets no vector; a source value that is
+not a string is refused.
+
 By default it fills missing vectors. Use `--reembed-all` to replace selected
-vectors or `--clean` to remove them. `--type` and `--select` restrict the records
-processed. A seed manifest can be supplied with `--seed` instead of separate
-input, output, and spec paths.
+vectors or `--clean` to remove them. A replaced record whose source is absent,
+null, or blank loses its vector and is counted as cleaned. `--type` and
+`--select` restrict the records processed. A seed manifest can be supplied with
+`--seed` instead of separate input, output, and spec paths; its `embeddings`
+entry takes the same shape as the spec.

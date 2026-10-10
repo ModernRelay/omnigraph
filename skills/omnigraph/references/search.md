@@ -39,6 +39,20 @@ remain null even when its source text is supplied.
 omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
 ```
 
+The spec maps each type to its vector and the one source property its
+`@embed` names; `fields` must hold exactly that property:
+
+```json
+{ "dimension": 1536, "types": { "Chunk": { "target": "embedding", "fields": ["text"] } } }
+```
+
+The source value is embedded exactly as stored, with no type or field-name
+template, which is also how a text `nearest($c.embedding, $q)` embeds `$q`; a
+chunk whose text equals the query lies at distance zero under a
+role-independent model. A record with an absent, null or blank source gets no
+vector. Vectors from older `omnigraph embed` builds embedded a
+`type: <T>\n<field>: <value>` template; regenerate them with `--reembed-all`.
+
 By default it fills missing vectors. Load the output explicitly afterward.
 
 Use the same file/spec form with `--reembed-all` to replace selected vectors,
