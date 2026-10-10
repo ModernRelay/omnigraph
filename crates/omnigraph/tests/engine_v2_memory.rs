@@ -1422,6 +1422,147 @@ async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
     assert_released(&probes);
 }
 
+/// Rows that widen after a narrow run cannot overshoot a chunk: a top-k of
+/// 150 over 100 one-byte payloads and then 96 of 64 KiB in another fragment,
+/// under a 16 MiB pool.
+/// The seed plans the second window from the narrow rows, so it asks for 50
+/// wide rows (3.2 MB); the fetch charges each row as Lance decodes it and
+/// stops past half the 2 MiB chunk bound, so no chunk holds more than the
+/// bound and one row. GQT cannot set the pool or read the operator's gauge.
+#[tokio::test]
+#[serial]
+async fn a_hydrated_fetch_stops_at_the_chunk_bound_when_rows_widen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(dir.path().to_str().unwrap(), GRAPH_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = 64 * 1024;
+    let person = |name: String, payload: String| {
+        serde_json::json!({"type":"Person", "data":{"name":name, "payload":payload}}).to_string()
+    };
+    // Two loads, so the narrow rows sit in a fragment of their own and the
+    // seed measures them narrow.
+    let narrow: Vec<String> = (0..100)
+        .map(|row| person(format!("a{row:03}"), "x".into()))
+        .chain((0..540).map(|row| person(format!("c{row:03}"), "x".into())))
+        .collect();
+    db.load_jsonl(&narrow.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let wide_rows: Vec<String> = (0..96)
+        .map(|row| person(format!("b{row:03}"), "w".repeat(wide)))
+        .collect();
+    db.load_jsonl(&wide_rows.join("\n"), LoadMode::Append)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    let widening = r#"query widening() {
+        match { $p: Person }
+        return { $p.name, $p.payload }
+        order { $p.name asc }
+        limit 150
+    }"#;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            16 * MIB,
+            query_main(&v2, widening, "widening", &params(&[])),
+        ),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 150);
+    let payloads = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for row in 0..150 {
+        let width = if row < 100 { 1 } else { wide };
+        assert_eq!(payloads.value(row).len(), width, "row {row}");
+    }
+    assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [150]);
+    let peak = counter(&probes, "HydrateExec", "peak_chunk_bytes");
+    let bound = omnigraph_planner::hydrate_chunk_bytes(16 * MIB) as usize;
+    assert_eq!(peak.len(), 1);
+    assert!(
+        peak[0] > wide && peak[0] <= bound + 2 * wide,
+        "a chunk held {} bytes; the bound is {bound} and one row",
+        peak[0]
+    );
+    assert!(probes.refusals().is_empty(), "{:?}", probes.refusals());
+    assert_released(&probes);
+}
+
+/// A graph branch stages its writes as detached commits in the table's own
+/// base, so hydration on it reads every row, inherited from main or written
+/// on the branch, in one request per fragment, as on main: no row is read one
+/// per request, the shape reserved for a table reached through a Lance base
+/// path (`fragment_rows_reads_inherited_and_own_fragments_by_address`). GQT
+/// cannot read the operator's counters.
+#[tokio::test]
+#[serial]
+async fn hydration_on_a_graph_branch_reads_in_coalesced_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = graph_fixture(&dir, 40, 1024).await;
+    v2.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &v2,
+        "feature",
+        r#"query add() { insert Person { name: "zz", payload: "new" } }"#,
+        "add",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    let top = r#"query top_two() {
+        match { $p: Person }
+        return { $p.name, $p.payload }
+        order { $p.name desc }
+        limit 2
+    }"#;
+    for (branch, expected) in [
+        ("main", ["leaf00039", "leaf00038"]),
+        ("feature", ["zz", "leaf00039"]),
+    ] {
+        let probes = QueryMemoryProbes::default();
+        let result = with_query_memory_probes(
+            probes.clone(),
+            query_branch(&v2, branch, top, "top_two", &params(&[])),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{branch}: {error}"));
+        let batch = result.concat_batches().unwrap();
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            (0..batch.num_rows())
+                .map(|row| names.value(row))
+                .collect::<Vec<_>>(),
+            expected,
+            "{branch}"
+        );
+        assert_eq!(
+            counter(&probes, "HydrateExec", "hydrated_rows"),
+            [2],
+            "{branch}"
+        );
+        assert_eq!(
+            counter(&probes, "HydrateExec", "single_row_reads"),
+            [0],
+            "{branch}"
+        );
+        assert_released(&probes);
+    }
+}
+
 /// 64 MiB of passage text under a 48 MiB pool: the Passage scan streams a
 /// batch at a time with or without needles, so the plain filtered product
 /// and the contains join both answer; only the join's marked scan sieves,
