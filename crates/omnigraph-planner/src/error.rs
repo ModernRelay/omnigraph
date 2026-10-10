@@ -16,4 +16,9 @@ pub enum PlanError {
     /// this arm; the registry test pins that.
     #[error("planner internal error: {0}")]
     Internal(String),
+    /// The plan source failed while answering a lookup (opening a pinned
+    /// table, reading its index metadata): the source's own error class is
+    /// the caller's answer, never a planner defect.
+    #[error("the plan source failed: {detail}")]
+    Source { detail: String },
 }

@@ -4,13 +4,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use omnigraph_gqt::MeasureOptions;
+use omnigraph_gqt::{MeasureOptions, ServerTarget};
 
 struct Selection {
     paths: Vec<PathBuf>,
     target: Option<String>,
     storage: Option<String>,
     store: Option<String>,
+    server: Option<ServerTarget>,
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
     artifacts: Option<PathBuf>,
@@ -19,10 +20,10 @@ struct Selection {
 
 enum Invocation {
     Replay(PathBuf),
-    Case(Selection),
+    Case(Box<Selection>),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI>] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
@@ -43,6 +44,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         target: None,
         storage: None,
         store: None,
+        server: None,
         seed: None,
         measure: None,
         artifacts: None,
@@ -52,16 +54,29 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut model: Option<String> = None;
     let mut baseline: Option<PathBuf> = None;
     let mut write_baseline = false;
+    let mut server: Option<String> = None;
+    let mut graph: Option<String> = None;
+    let mut token: Option<String> = None;
+    let value = |args: &mut std::iter::Peekable<std::slice::Iter<'_, OsString>>, missing: &str| {
+        args.next()
+            .and_then(|v| v.to_str())
+            .filter(|v| !v.is_empty() && !v.starts_with("--"))
+            .map(str::to_owned)
+            .ok_or_else(|| missing.to_string())
+    };
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--store") if selection.store.is_none() => {
-                selection.store = Some(
-                    args.next()
-                        .and_then(|v| v.to_str())
-                        .filter(|v| !v.is_empty() && !v.starts_with("--"))
-                        .ok_or("--store requires a URI")?
-                        .into(),
-                );
+                selection.store = Some(value(&mut args, "--store requires a URI")?);
+            }
+            Some("--server") if server.is_none() => {
+                server = Some(value(&mut args, "--server requires a URL")?);
+            }
+            Some("--graph") if graph.is_none() => {
+                graph = Some(value(&mut args, "--graph requires a graph id")?);
+            }
+            Some("--token") if token.is_none() => {
+                token = Some(value(&mut args, "--token requires a bearer token")?);
             }
             Some("--trace") if !selection.trace => selection.trace = true,
             Some("--measure") if !measure => measure = true,
@@ -138,6 +153,20 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     if write_baseline && baseline.is_none() {
         return Err("--write-baseline needs --baseline <path>, the file to write".into());
     }
+    match (server, graph) {
+        (Some(url), Some(graph)) => {
+            if selection.store.is_some() {
+                return Err("--server and --store are mutually exclusive".into());
+            }
+            selection.server = Some(ServerTarget { url, graph, token });
+        }
+        (Some(_), None) => {
+            return Err("--server needs --graph <ID>, the graph under /graphs/".into());
+        }
+        (None, Some(_)) => return Err("--graph needs --server <URL>".into()),
+        (None, None) if token.is_some() => return Err("--token needs --server <URL>".into()),
+        (None, None) => {}
+    }
     if measure {
         selection.measure = Some(MeasureOptions {
             model: model.unwrap_or_else(|| "unit".into()),
@@ -145,7 +174,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
             write_baseline,
         });
     }
-    Ok(Invocation::Case(selection))
+    Ok(Invocation::Case(Box::new(selection)))
 }
 
 /// The case files the paths name: a file as itself, a directory as every
@@ -216,7 +245,8 @@ fn run() -> Result<(), String> {
                 .map_err(|error| refusal(format!("invalid_case: {error}")))?;
             let selected = selection.target.is_some()
                 || selection.storage.is_some()
-                || selection.seed.is_some();
+                || selection.seed.is_some()
+                || selection.server.is_some();
             let mut failures = Vec::new();
             for path in &files {
                 let outcome = omnigraph_gqt::run_selected(
@@ -229,6 +259,7 @@ fn run() -> Result<(), String> {
                     selection.measure.clone(),
                     selection.artifacts.clone(),
                     selection.store.as_deref(),
+                    selection.server.as_ref(),
                     selection.trace,
                 );
                 println!(

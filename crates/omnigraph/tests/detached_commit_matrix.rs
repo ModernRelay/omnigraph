@@ -68,10 +68,12 @@ enum Writer {
     /// A fast-forward merge of a branch holding one Person insert into main:
     /// a pointer switch with no table effect, so only its pre-publish window.
     Merge,
-    /// Schema apply adding a nullable Person property: one detached rewrite
-    /// of Person, no row change, the contract row published atomically.
+    /// Schema apply evolving two tables by metadata-only commits, no row
+    /// change, the contract row published atomically: Knows renames `since`
+    /// and adds `weight` (a Project, then a Merge chained on it), and Person
+    /// adds `city` (one Merge).
     SchemaApply,
-    /// The same rewrite through an intent persisted before invocation and
+    /// The same evolution through an intent persisted before invocation and
     /// deserialized by the child; recovery never reruns that original intent.
     PreparedSchemaApply,
     /// Optimize over a Person table with four small fragments: one detached
@@ -113,7 +115,12 @@ fn photo_bytes(name: &str) -> Bytes {
 }
 
 fn city_schema() -> String {
-    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?")
+    helpers::TEST_SCHEMA
+        .replace("age: I32?", "age: I32?\n    city: String?")
+        .replace(
+            "since: Date?",
+            "met: Date? @rename_from(\"since\")\n    weight: I32?",
+        )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,7 +160,11 @@ impl Writer {
             Writer::Cleanup => vec![],
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish],
             Writer::Merge => vec![PrePublish],
-            Writer::SchemaApply | Writer::PreparedSchemaApply => vec![PostDetached(1), PrePublish],
+            // Knows' Project and Merge, then Person's Merge: park inside
+            // Knows' chain, after it, and before publication.
+            Writer::SchemaApply | Writer::PreparedSchemaApply => {
+                vec![PostDetached(1), PostDetached(2), PrePublish]
+            }
             Writer::Optimize => vec![PostDetached(1), PrePublish],
             Writer::Load => vec![PostDetached(1), PrePublish],
             Writer::FtsRebuild => vec![PostDetached(1), PrePublish],
