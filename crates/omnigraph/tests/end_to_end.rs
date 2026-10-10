@@ -4,13 +4,15 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use base64::Engine as _;
 use futures::TryStreamExt;
 
+use bytes::Bytes;
+use omnigraph::db::SnapshotId;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{
-    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind, ExternalBlobBase,
-    ExternalBlobExecutionScope, ExternalBlobPolicy,
+    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobPrecondition, BlobWriteOutcome,
+    EntityKind, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
 };
 use omnigraph_compiler::ir::ParamMap;
 
@@ -2147,6 +2149,201 @@ async fn blob_update_null_round_trip() {
         )
         .await
         .unwrap_err(),
+    );
+}
+
+/// Replacing and clearing one Blob cell by exact id, on a node and on an edge:
+/// the write never inserts a row, its receipt is the publication's exact
+/// commit, its ETag equals a read at that commit, a stale or `*` precondition
+/// is judged at the write base, and clearing an already-null cell publishes
+/// nothing. Rust, not GQT: a `.gq` statement cannot carry raw bytes or an
+/// `If-Match`.
+#[tokio::test]
+async fn blob_put_and_clear_replace_one_cell_by_exact_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), BLOB_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let data = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8="}}
+{"type":"Document","data":{"title":"peer"}}
+{"edge":"Attachment","id":"attachment-1","from":"readme","to":"peer","data":{"payload":"base64:RWRnZQ=="}}"#;
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
+
+    let managed_etag = |read: omnigraph::BlobRead| match read.content {
+        BlobContent::Managed { etag, .. } => etag,
+        BlobContent::External(external) => panic!("expected managed, got {external:?}"),
+    };
+    for cell in [
+        node_blob_cell("Document", "readme", "content"),
+        edge_blob_cell("Attachment", "attachment-1", "payload"),
+    ] {
+        let before = managed_etag(
+            db.read_blob_at(ReadTarget::branch("main"), cell.clone())
+                .await
+                .unwrap(),
+        );
+        let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+
+        let stale = db
+            .put_blob_at_as(
+                "main",
+                cell.clone(),
+                Bytes::from_static(b"never"),
+                Some(BlobPrecondition::Tags(vec![BlobEtag::from_tag(
+                    "\"stale\"",
+                )])),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&stale, OmniError::BlobWritePreconditionFailed { current_etag: Some(current) }
+                if current == before.as_str()),
+            "{stale:?}"
+        );
+        assert_eq!(
+            snapshot_main(&db).await.unwrap().graph_manifest_version(),
+            head,
+            "a failed precondition has no effect"
+        );
+
+        let BlobWriteOutcome::Managed {
+            length,
+            etag,
+            commit,
+        } = db
+            .put_blob_at_as(
+                "main",
+                cell.clone(),
+                Bytes::from_static(b"Replaced"),
+                Some(BlobPrecondition::Tags(vec![before.clone()])),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a put stores managed bytes");
+        };
+        assert_eq!(length, 8);
+        assert_ne!(etag, before);
+        let at_commit = db
+            .read_blob_at(
+                ReadTarget::snapshot(SnapshotId::new(commit.graph_commit_id.clone())),
+                cell.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            managed_etag(at_commit),
+            etag,
+            "the ETag equals a read at the commit"
+        );
+        assert_eq!(
+            read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell.clone()).await,
+            b"Replaced"
+        );
+
+        let BlobWriteOutcome::Managed { etag: again, .. } = db
+            .put_blob_at_as(
+                "main",
+                cell.clone(),
+                Bytes::from_static(b""),
+                Some(BlobPrecondition::AnyExisting),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a put stores managed bytes");
+        };
+        assert_eq!(
+            read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell.clone()).await,
+            b"",
+            "a valid empty value is managed, not null"
+        );
+
+        let BlobWriteOutcome::Null { commit: Some(_) } = db
+            .clear_blob_at_as(
+                "main",
+                cell.clone(),
+                Some(BlobPrecondition::Tags(vec![again])),
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("clearing a value publishes a commit");
+        };
+        let cleared = db
+            .read_blob_at(ReadTarget::branch("main"), cell.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&cleared, OmniError::Manifest(error) if error.kind == ManifestErrorKind::NotFound),
+            "{cleared:?}"
+        );
+
+        let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+        assert!(matches!(
+            db.clear_blob_at_as("main", cell.clone(), None, None)
+                .await
+                .unwrap(),
+            BlobWriteOutcome::Null { commit: None }
+        ));
+        for refused in [
+            db.clear_blob_at_as(
+                "main",
+                cell.clone(),
+                Some(BlobPrecondition::AnyExisting),
+                None,
+            )
+            .await
+            .unwrap_err(),
+            db.put_blob_at_as(
+                "main",
+                cell.clone(),
+                Bytes::from_static(b"x"),
+                Some(BlobPrecondition::AnyExisting),
+                None,
+            )
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    refused,
+                    OmniError::BlobWritePreconditionFailed { current_etag: None }
+                ),
+                "a null cell satisfies neither precondition form"
+            );
+        }
+        assert_eq!(
+            snapshot_main(&db).await.unwrap().graph_manifest_version(),
+            head,
+            "an already-null clear and failed preconditions publish nothing"
+        );
+    }
+
+    let missing = db
+        .put_blob_at_as(
+            "main",
+            node_blob_cell("Document", "absent", "content"),
+            Bytes::from_static(b"x"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&missing, OmniError::Manifest(error) if error.kind == ManifestErrorKind::NotFound),
+        "{missing:?}"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Document").await,
+        2,
+        "a put never inserts a row"
     );
 }
 

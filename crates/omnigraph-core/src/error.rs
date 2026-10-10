@@ -312,6 +312,16 @@ pub enum OmniError {
         expected: String,
         actual: Option<String>,
     },
+    /// A Blob write's `If-Match` precondition did not hold at the write's
+    /// pinned base, so the write had no effect. Distinct from the graph-head
+    /// `PreconditionFailed`: it compares the cell's strong validator, and a
+    /// null or external cell has none. `current_etag` is the managed cell's
+    /// validator at that base, or `None` when the cell has none.
+    #[error(
+        "Blob write precondition failed; the cell's current validator is {}",
+        current_etag.as_deref().unwrap_or("<none>")
+    )]
+    BlobWritePreconditionFailed { current_etag: Option<String> },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -861,6 +871,10 @@ impl OmniError {
             expected: expected.into(),
             actual,
         }
+    }
+
+    pub fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
+        Self::BlobWritePreconditionFailed { current_etag }
     }
 
     pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {

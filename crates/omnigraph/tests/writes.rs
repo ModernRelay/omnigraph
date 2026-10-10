@@ -25,7 +25,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::instrumentation::{StageWriteProbes, with_stage_write_probes};
 use omnigraph::loader::LoadMode;
-use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph::{BlobCell, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -1368,6 +1368,363 @@ query update_shelf($note: String) {
         matches!(null, OmniError::Manifest(ref error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
         "the null cell stays null, got {null:?}"
     );
+}
+
+/// A Blob put admits a value of exactly the session's `write_max_bytes`
+/// (32 MiB by default) and refuses one more byte before opening a table. The
+/// row's other Blob cells are carried by value and share the operation's
+/// payload allowance, so a put whose target and carried sibling together
+/// exceed it is refused before any table effect.
+/// Rust, not GQT: the case format has no Blob put step.
+#[tokio::test]
+async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
+    use base64::Engine;
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+
+    const DEFAULT_LIMIT: usize = 32 * 1024 * 1024;
+    const LOWERED_LIMIT: usize = 4096;
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? preview: Blob? }\n";
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let preview = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![5_u8; 3000])
+    );
+    let rows = format!(
+        "{}\n{}",
+        serde_json::json!({"type": "Document", "data": {"title": "lone"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "paired", "preview": preview}}),
+    );
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    let cell = |title: &str, property: &str| node_blob_cell("Document", title, property);
+    let refused_put = |error: &OmniError, limit: usize, actual: usize| {
+        matches!(error, OmniError::ResourceLimitExceeded { resource, limit: l, actual: a }
+            if resource == "Blob write payload bytes"
+                && *l == limit as u64
+                && *a == actual as u64)
+    };
+
+    db.put_blob_at_as(
+        "main",
+        cell("lone", "content"),
+        bytes::Bytes::from(vec![7_u8; DEFAULT_LIMIT]),
+        None,
+        None,
+    )
+    .await
+    .expect("a value of exactly the default limit is admitted");
+    let stored =
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell("lone", "content")).await;
+    assert_eq!(stored.len(), DEFAULT_LIMIT);
+    let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let over = db
+        .put_blob_at_as(
+            "main",
+            cell("lone", "content"),
+            bytes::Bytes::from(vec![7_u8; DEFAULT_LIMIT + 1]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused_put(&over, DEFAULT_LIMIT, DEFAULT_LIMIT + 1),
+        "{over:?}"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        head,
+        "the refusal precedes any graph effect"
+    );
+
+    // A lowered `write_max_bytes` lowers the put's bound and the allowance
+    // the carried sibling shares.
+    db.set(
+        SettingId::WriteMaxBytes,
+        &SettingValue::Integer(LOWERED_LIMIT as i64),
+        Source::File,
+    )
+    .unwrap();
+    db.put_blob_at_as(
+        "main",
+        cell("lone", "content"),
+        bytes::Bytes::from(vec![7_u8; LOWERED_LIMIT]),
+        None,
+        None,
+    )
+    .await
+    .expect("a value of exactly the session's limit is admitted");
+    let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let over = db
+        .put_blob_at_as(
+            "main",
+            cell("lone", "content"),
+            bytes::Bytes::from(vec![7_u8; LOWERED_LIMIT + 1]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused_put(&over, LOWERED_LIMIT, LOWERED_LIMIT + 1),
+        "{over:?}"
+    );
+    let carried = db
+        .put_blob_at_as(
+            "main",
+            cell("paired", "content"),
+            bytes::Bytes::from(vec![7_u8; 2000]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&carried, OmniError::ResourceLimitExceeded { resource, limit, actual }
+            if resource == "decoded blob input bytes per operation"
+                && *limit == LOWERED_LIMIT as u64
+                && *actual == 5000),
+        "the carried sibling shares the payload allowance: {carried:?}"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        head,
+        "both refusals precede any graph effect"
+    );
+}
+
+/// A put never reads the old value of the cell it replaces, so it succeeds
+/// when that value is an external reference whose object is gone. Under an
+/// admitting policy it carries the row's other cells by value: a managed
+/// sibling stays byte-identical, and an external sibling is read and stored as
+/// managed bytes, because Lance's merge-insert cannot carry the reference.
+#[tokio::test]
+async fn blob_put_carries_siblings_by_value_and_never_reads_its_target() {
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? preview: Blob? }\n";
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let gone = source_dir.join("gone.bin");
+    std::fs::write(&gone, b"about to vanish").unwrap();
+    let sibling = source_dir.join("sibling.bin");
+    std::fs::write(&sibling, b"external sibling").unwrap();
+    let file_uri = |path: &std::path::Path| url::Url::from_file_path(path).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(allow)
+            .unwrap(),
+    );
+    let rows = format!(
+        "{}\n{}",
+        serde_json::json!({"type": "Document", "data": {
+            "title": "stale-target", "content": file_uri(&gone), "preview": "base64:a2VwdA=="}}),
+        serde_json::json!({"type": "Document", "data": {
+            "title": "external-sibling", "content": "base64:b2xk", "preview": file_uri(&sibling)}}),
+    );
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    std::fs::remove_file(&gone).unwrap();
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.put_blob_at_as(
+            "main",
+            node_blob_cell("Document", "stale-target", "content"),
+            bytes::Bytes::from_static(b"replacement"),
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("a put never reads the value it replaces");
+    assert_eq!(probes.external_blob_probe_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    for (property, expected) in [("content", &b"replacement"[..]), ("preview", &b"kept"[..])] {
+        assert_eq!(
+            read_managed_blob_bytes(
+                &db,
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", "stale-target", property),
+            )
+            .await,
+            expected,
+            "{property}"
+        );
+    }
+
+    db.put_blob_at_as(
+        "main",
+        node_blob_cell("Document", "external-sibling", "content"),
+        bytes::Bytes::from_static(b"new"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external-sibling", "preview"),
+        )
+        .await,
+        b"external sibling",
+        "the carried external sibling is stored as managed bytes"
+    );
+}
+
+/// Under a denying policy a put or clear that must carry a stored external
+/// reference fails with `StoredExternalBlobDenied` naming that sibling, on a
+/// node and on an edge, without effect. A row holding two such cells is
+/// recovered by a `merge` load of the whole row, which never reads the stored
+/// cells, for a node and an edge; a node can also be recovered by a `.gq`
+/// update assigning both cells. An edge has no `.gq` update.
+#[tokio::test]
+async fn blob_write_under_deny_names_the_carried_reference_and_whole_row_writes_recover() {
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    preview: Blob?
+}
+edge Attachment: Document -> Document {
+    payload: Blob?
+    thumb: Blob?
+}
+"#;
+    const CLEAR_BOTH: &str = r#"
+query clear_both($content: Blob?, $preview: Blob?) {
+    update Document set { content: $content, preview: $preview } where title = "by-update"
+}
+"#;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let source = source_dir.join("stored.bin");
+    std::fs::write(&source, b"stored external bytes").unwrap();
+    let source_uri = url::Url::from_file_path(&source).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let uri = graph_path.to_str().unwrap().to_string();
+    {
+        let seeding = helpers::session(
+            Omnigraph::init(&uri, SCHEMA)
+                .await
+                .unwrap()
+                .with_external_blob_policy(allow)
+                .unwrap(),
+        );
+        let mut rows = Vec::new();
+        for title in ["by-load", "by-update"] {
+            rows.push(serde_json::json!({"type": "Document", "data": {
+                "title": title, "content": source_uri, "preview": source_uri}}));
+        }
+        rows.push(serde_json::json!({"edge": "Attachment", "id": "attached",
+            "from": "by-load", "to": "by-update",
+            "data": {"payload": source_uri, "thumb": source_uri}}));
+        let rows = rows
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        seeding
+            .load_jsonl(&rows, LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let node = |property: &str| node_blob_cell("Document", "by-load", property);
+    let edge = |property: &str| BlobCell {
+        entity: omnigraph::EntityKind::Edge,
+        type_name: "Attachment".into(),
+        id: "attached".into(),
+        property: property.into(),
+    };
+    for (cell, carried, type_key) in [
+        (node("content"), "preview", "node:Document"),
+        (edge("payload"), "thumb", "edge:Attachment"),
+    ] {
+        let put = db
+            .put_blob_at_as(
+                "main",
+                cell.clone(),
+                bytes::Bytes::from_static(b"x"),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let clear = db
+            .clear_blob_at_as("main", cell.clone(), None, None)
+            .await
+            .unwrap_err();
+        for error in [put, clear] {
+            assert!(
+                matches!(&error, OmniError::StoredExternalBlobDenied { type_key: key, property, .. }
+                    if key == type_key && property == carried),
+                "{error:?}"
+            );
+        }
+    }
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        head,
+        "a denied carry has no effect"
+    );
+
+    let whole_rows = format!(
+        "{}\n{}",
+        serde_json::json!({"type": "Document", "data": {
+            "title": "by-load", "content": "base64:bmV3", "preview": null}}),
+        serde_json::json!({"edge": "Attachment", "id": "attached",
+            "from": "by-load", "to": "by-update",
+            "data": {"payload": "base64:bmV3", "thumb": null}}),
+    );
+    db.load_jsonl(&whole_rows, LoadMode::Merge)
+        .await
+        .expect("a merge load of the whole row never reads the stored cells");
+    for cell in [node("content"), edge("payload")] {
+        assert_eq!(
+            read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell).await,
+            b"new"
+        );
+    }
+    let mut nulls = params(&[]);
+    for name in ["content", "preview"] {
+        nulls.insert(
+            name.to_string(),
+            omnigraph_compiler::query::ast::Literal::Null,
+        );
+    }
+    db.mutate("main", CLEAR_BOTH, "clear_both", &nulls)
+        .await
+        .expect("an update assigning both cells reads neither");
 }
 
 /// Carrying an unassigned stored external reference needs the graph's policy
