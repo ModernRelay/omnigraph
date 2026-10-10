@@ -41,8 +41,13 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-use crate::archive::{ARCHIVE_FORMAT_VERSION, ArchiveError, ArchiveRecordIter, iter_archive};
+use crate::archive::{
+    ARCHIVE_FORMAT_VERSION, ArchiveError, ArchiveReceiptV1, ArchiveRecordIter, iter_archive,
+};
 use crate::counting::LogicalCallCounts;
+use crate::gqt_record::{
+    EmbeddedEvidence, GqtEvidence, GqtRunRecordV1, ServedSutIdentityV1, ServedSutKind,
+};
 use crate::record::RunRecordV1;
 
 /// Version of the projection layout, schema, manifest, and pointer contract.
@@ -58,7 +63,7 @@ const GRAPH_DIRECTORY: &str = "graph";
 const MANIFEST_FILE: &str = "manifest-v1.json";
 const MAX_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-const PROJECTION_TRANSFORM_VERSION: u32 = 4;
+const PROJECTION_TRANSFORM_VERSION: u32 = 5;
 const MAX_PROJECTED_RECORDS: usize = 100_000;
 const MAX_BATCH_ROWS: usize = 2_048;
 const MAX_BATCH_BYTES: usize = 24 * 1024 * 1024;
@@ -123,42 +128,46 @@ node BenchmarkRun {
     invoked_at_unix_ms: U64
     case_id: String
     case_digest: String
+    sut_evidence: String
     package_version: String
     source_commit: String
     source_tree_dirty: Bool
     build_profile: String
     build_opt_level: String
     debug_assertions: Bool
-    target_triple: String
-    rustc_version: String
-    build_declared_release_lto: String
-    build_declared_release_codegen_units: U32
-    build_declared_release_strip: Bool
-    build_cargo_encoded_rustflags_present: Bool
-    build_release_profile_environment_overrides_supported: Bool
+    target_triple: String?
+    rustc_version: String?
+    build_declared_release_lto: String?
+    build_declared_release_codegen_units: U32?
+    build_declared_release_strip: Bool?
+    build_cargo_encoded_rustflags_present: Bool?
+    build_release_profile_environment_overrides_supported: Bool?
     build_effective_codegen_options_proved: Bool
-    worker_executable_sha256: String
+    worker_executable_sha256: String?
     sut_fingerprint: String
     sut_json: String
-    machine_fingerprint: String
-    machine_format_version: U32
-    machine_os_name: String
-    machine_os_version: String
-    machine_kernel_version: String
-    machine_architecture: String
-    machine_cpu_model: String
-    machine_logical_cores: U32
-    machine_physical_cores: U32
-    machine_total_memory_bytes: U64
-    machine_resource_control_json: String
-    machine_scheduling_json: String
-    machine_resource_limits_json: String
-    machine_label: String
+    client_build_json: String?
+    client_machine_json: String?
+    machine_fingerprint: String?
+    machine_format_version: U32?
+    machine_os_name: String?
+    machine_os_version: String?
+    machine_kernel_version: String?
+    machine_architecture: String?
+    machine_cpu_model: String?
+    machine_logical_cores: U32?
+    machine_physical_cores: U32?
+    machine_total_memory_bytes: U64?
+    machine_resource_control_json: String?
+    machine_scheduling_json: String?
+    machine_resource_limits_json: String?
+    machine_label: String?
+    backend_evidence: String
     backend_fingerprint: String
     backend_json: String
-    fixture_manifest_sha256: String
+    fixture_manifest_sha256: String?
     fixture_logical_sha256: String
-    fixture_physical_sha256: String
+    fixture_physical_sha256: String?
     acquisition_status: String
     claim_eligible: Bool
     terminal_failed_repetition: U32?
@@ -173,12 +182,12 @@ node BenchmarkRun {
     p95_supported: Bool
     wall_evidence: String
     floor_multiplier_millis: U32
-    lance_data_plane_logical_calls_min: U64
-    lance_data_plane_logical_calls_p50: U64
-    lance_data_plane_logical_calls_max: U64
-    control_plane_logical_calls_min: U64
-    control_plane_logical_calls_p50: U64
-    control_plane_logical_calls_max: U64
+    lance_data_plane_logical_calls_min: U64?
+    lance_data_plane_logical_calls_p50: U64?
+    lance_data_plane_logical_calls_max: U64?
+    control_plane_logical_calls_min: U64?
+    control_plane_logical_calls_p50: U64?
+    control_plane_logical_calls_max: U64?
     logical_counts_presence_json: String
     physical_counts_presence_json: String
 }
@@ -220,6 +229,7 @@ query list_runs_for_point_page($point_id: String, $after_key: String) {
         $run.invoked_at_unix_ms as invoked_at_unix_ms
         $run.case_id as case_id
         $run.case_digest as case_digest
+        $run.sut_evidence as sut_evidence
         $run.package_version as package_version
         $run.source_commit as source_commit
         $run.source_tree_dirty as source_tree_dirty
@@ -237,6 +247,8 @@ query list_runs_for_point_page($point_id: String, $after_key: String) {
         $run.worker_executable_sha256 as worker_executable_sha256
         $run.sut_fingerprint as sut_fingerprint
         $run.sut_json as sut_json
+        $run.client_build_json as client_build_json
+        $run.client_machine_json as client_machine_json
         $run.machine_fingerprint as machine_fingerprint
         $run.machine_format_version as machine_format_version
         $run.machine_os_name as machine_os_name
@@ -251,6 +263,7 @@ query list_runs_for_point_page($point_id: String, $after_key: String) {
         $run.machine_scheduling_json as machine_scheduling_json
         $run.machine_resource_limits_json as machine_resource_limits_json
         $run.machine_label as machine_label
+        $run.backend_evidence as backend_evidence
         $run.backend_fingerprint as backend_fingerprint
         $run.backend_json as backend_json
         $run.fixture_manifest_sha256 as fixture_manifest_sha256
@@ -329,6 +342,7 @@ query projection_run_rows_page($after_key: String) {
         $run.invoked_at_unix_ms as invoked_at_unix_ms
         $run.case_id as case_id
         $run.case_digest as case_digest
+        $run.sut_evidence as sut_evidence
         $run.package_version as package_version
         $run.source_commit as source_commit
         $run.source_tree_dirty as source_tree_dirty
@@ -346,6 +360,8 @@ query projection_run_rows_page($after_key: String) {
         $run.worker_executable_sha256 as worker_executable_sha256
         $run.sut_fingerprint as sut_fingerprint
         $run.sut_json as sut_json
+        $run.client_build_json as client_build_json
+        $run.client_machine_json as client_machine_json
         $run.machine_fingerprint as machine_fingerprint
         $run.machine_format_version as machine_format_version
         $run.machine_os_name as machine_os_name
@@ -360,6 +376,7 @@ query projection_run_rows_page($after_key: String) {
         $run.machine_scheduling_json as machine_scheduling_json
         $run.machine_resource_limits_json as machine_resource_limits_json
         $run.machine_label as machine_label
+        $run.backend_evidence as backend_evidence
         $run.backend_fingerprint as backend_fingerprint
         $run.backend_json as backend_json
         $run.fixture_manifest_sha256 as fixture_manifest_sha256
@@ -587,42 +604,46 @@ struct RunRow {
     invoked_at_unix_ms: u64,
     case_id: String,
     case_digest: String,
+    sut_evidence: SutEvidence,
     package_version: String,
     source_commit: String,
     source_tree_dirty: bool,
     build_profile: String,
     build_opt_level: String,
     debug_assertions: bool,
-    target_triple: String,
-    rustc_version: String,
-    build_declared_release_lto: String,
-    build_declared_release_codegen_units: u32,
-    build_declared_release_strip: bool,
-    build_cargo_encoded_rustflags_present: bool,
-    build_release_profile_environment_overrides_supported: bool,
+    target_triple: Option<String>,
+    rustc_version: Option<String>,
+    build_declared_release_lto: Option<String>,
+    build_declared_release_codegen_units: Option<u32>,
+    build_declared_release_strip: Option<bool>,
+    build_cargo_encoded_rustflags_present: Option<bool>,
+    build_release_profile_environment_overrides_supported: Option<bool>,
     build_effective_codegen_options_proved: bool,
-    worker_executable_sha256: String,
+    worker_executable_sha256: Option<String>,
     sut_fingerprint: String,
     sut_json: String,
-    machine_fingerprint: String,
-    machine_format_version: u32,
-    machine_os_name: String,
-    machine_os_version: String,
-    machine_kernel_version: String,
-    machine_architecture: String,
-    machine_cpu_model: String,
-    machine_logical_cores: u32,
-    machine_physical_cores: u32,
-    machine_total_memory_bytes: u64,
-    machine_resource_control_json: String,
-    machine_scheduling_json: String,
-    machine_resource_limits_json: String,
-    machine_label: String,
+    client_build_json: Option<String>,
+    client_machine_json: Option<String>,
+    machine_fingerprint: Option<String>,
+    machine_format_version: Option<u32>,
+    machine_os_name: Option<String>,
+    machine_os_version: Option<String>,
+    machine_kernel_version: Option<String>,
+    machine_architecture: Option<String>,
+    machine_cpu_model: Option<String>,
+    machine_logical_cores: Option<u32>,
+    machine_physical_cores: Option<u32>,
+    machine_total_memory_bytes: Option<u64>,
+    machine_resource_control_json: Option<String>,
+    machine_scheduling_json: Option<String>,
+    machine_resource_limits_json: Option<String>,
+    machine_label: Option<String>,
+    backend_evidence: SutEvidence,
     backend_fingerprint: String,
     backend_json: String,
-    fixture_manifest_sha256: String,
+    fixture_manifest_sha256: Option<String>,
     fixture_logical_sha256: String,
-    fixture_physical_sha256: String,
+    fixture_physical_sha256: Option<String>,
     acquisition_status: String,
     claim_eligible: bool,
     terminal_failed_repetition: Option<u32>,
@@ -637,14 +658,22 @@ struct RunRow {
     p95_supported: bool,
     wall_evidence: String,
     floor_multiplier_millis: u32,
-    lance_data_plane_logical_calls_min: u64,
-    lance_data_plane_logical_calls_p50: u64,
-    lance_data_plane_logical_calls_max: u64,
-    control_plane_logical_calls_min: u64,
-    control_plane_logical_calls_p50: u64,
-    control_plane_logical_calls_max: u64,
+    lance_data_plane_logical_calls_min: Option<u64>,
+    lance_data_plane_logical_calls_p50: Option<u64>,
+    lance_data_plane_logical_calls_max: Option<u64>,
+    control_plane_logical_calls_min: Option<u64>,
+    control_plane_logical_calls_p50: Option<u64>,
+    control_plane_logical_calls_max: Option<u64>,
     logical_counts_presence_json: String,
     physical_counts_presence_json: String,
+}
+
+/// Who produced a row's build, machine and backend facts: the measuring worker or a deployment receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SutEvidence {
+    WorkerObserved,
+    DeclaredDeployment,
 }
 
 #[derive(Serialize)]
@@ -1705,56 +1734,64 @@ fn legacy_run_row(
         invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
         case_id: record.run.case_id.clone(),
         case_digest: record.run.case_digest.clone(),
+        sut_evidence: SutEvidence::WorkerObserved,
         package_version: record.sut.package_version.clone(),
         source_commit: record.sut.source_commit.clone(),
         source_tree_dirty: record.sut.source_tree_dirty,
         build_profile: record.sut.build.profile.clone(),
         build_opt_level: record.sut.build.cargo_opt_level.clone(),
         debug_assertions: record.sut.build.debug_assertions,
-        target_triple: record.sut.build.target_triple.clone(),
-        rustc_version: record.sut.build.rustc_version.clone(),
-        build_declared_release_lto: record.sut.build.declared_release_lto.clone(),
-        build_declared_release_codegen_units: record.sut.build.declared_release_codegen_units,
-        build_declared_release_strip: record.sut.build.declared_release_strip,
-        build_cargo_encoded_rustflags_present: record.sut.build.cargo_encoded_rustflags_present,
-        build_release_profile_environment_overrides_supported: record
-            .sut
-            .build
-            .release_profile_environment_overrides_supported,
+        target_triple: Some(record.sut.build.target_triple.clone()),
+        rustc_version: Some(record.sut.build.rustc_version.clone()),
+        build_declared_release_lto: Some(record.sut.build.declared_release_lto.clone()),
+        build_declared_release_codegen_units: Some(record.sut.build.declared_release_codegen_units),
+        build_declared_release_strip: Some(record.sut.build.declared_release_strip),
+        build_cargo_encoded_rustflags_present: Some(
+            record.sut.build.cargo_encoded_rustflags_present,
+        ),
+        build_release_profile_environment_overrides_supported: Some(
+            record
+                .sut
+                .build
+                .release_profile_environment_overrides_supported,
+        ),
         build_effective_codegen_options_proved: record.sut.build.effective_codegen_options_proved,
-        worker_executable_sha256: record.sut.build.worker_executable_sha256.clone(),
+        worker_executable_sha256: Some(record.sut.build.worker_executable_sha256.clone()),
         sut_fingerprint: typed_json_sha256(&record.sut, "system under test")?,
         sut_json: canonical_json(&record.sut, "system under test")?,
-        machine_fingerprint: typed_json_sha256(machine, "machine identity")?,
-        machine_format_version: machine.format_version,
-        machine_os_name: machine.os_name.clone(),
-        machine_os_version: machine.os_version.clone(),
-        machine_kernel_version: machine.kernel_version.clone(),
-        machine_architecture: machine.architecture.clone(),
-        machine_cpu_model: machine.cpu_model.clone(),
-        machine_logical_cores: machine.logical_cores,
-        machine_physical_cores: machine.physical_cores,
-        machine_total_memory_bytes: machine.total_memory_bytes,
-        machine_resource_control_json: canonical_json(
+        client_build_json: None,
+        client_machine_json: None,
+        machine_fingerprint: Some(typed_json_sha256(machine, "machine identity")?),
+        machine_format_version: Some(machine.format_version),
+        machine_os_name: Some(machine.os_name.clone()),
+        machine_os_version: Some(machine.os_version.clone()),
+        machine_kernel_version: Some(machine.kernel_version.clone()),
+        machine_architecture: Some(machine.architecture.clone()),
+        machine_cpu_model: Some(machine.cpu_model.clone()),
+        machine_logical_cores: Some(machine.logical_cores),
+        machine_physical_cores: Some(machine.physical_cores),
+        machine_total_memory_bytes: Some(machine.total_memory_bytes),
+        machine_resource_control_json: Some(canonical_json(
             &machine.resource_control,
             "machine resource control",
-        )?,
-        machine_scheduling_json: canonical_json(&machine.scheduling, "machine scheduling")?,
-        machine_resource_limits_json: canonical_json(
+        )?),
+        machine_scheduling_json: Some(canonical_json(&machine.scheduling, "machine scheduling")?),
+        machine_resource_limits_json: Some(canonical_json(
             &machine.resource_limits,
             "machine resource limits",
-        )?,
-        machine_label: machine.machine_label.clone(),
+        )?),
+        machine_label: Some(machine.machine_label.clone()),
+        backend_evidence: SutEvidence::WorkerObserved,
         backend_fingerprint: typed_json_sha256(&record.backend, "backend evidence")?,
         backend_json: canonical_json(&record.backend, "backend evidence")?,
-        fixture_manifest_sha256: record.fixture.manifest_sha256.clone(),
+        fixture_manifest_sha256: Some(record.fixture.manifest_sha256.clone()),
         fixture_logical_sha256: record
             .fixture
             .manifest
             .logical
             .logical_content_sha256
             .clone(),
-        fixture_physical_sha256: record.fixture.manifest.physical.tree_sha256.clone(),
+        fixture_physical_sha256: Some(record.fixture.manifest.physical.tree_sha256.clone()),
         acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
         claim_eligible: record.claim_eligible(),
         terminal_failed_repetition: record
@@ -1781,12 +1818,12 @@ fn legacy_run_row(
         p95_supported: wall.p95_supported,
         wall_evidence: json_string(&wall.evidence, "wall evidence")?,
         floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
-        lance_data_plane_logical_calls_min: calls.lance_data_plane.min,
-        lance_data_plane_logical_calls_p50: calls.lance_data_plane.p50,
-        lance_data_plane_logical_calls_max: calls.lance_data_plane.max,
-        control_plane_logical_calls_min: calls.control_plane.min,
-        control_plane_logical_calls_p50: calls.control_plane.p50,
-        control_plane_logical_calls_max: calls.control_plane.max,
+        lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
+        lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
+        lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
+        control_plane_logical_calls_min: Some(calls.control_plane.min),
+        control_plane_logical_calls_p50: Some(calls.control_plane.p50),
+        control_plane_logical_calls_max: Some(calls.control_plane.max),
         logical_counts_presence_json: canonical_json(
             &record.measurements.layer_presence.logical.counts,
             "logical counts presence",
@@ -1798,7 +1835,7 @@ fn legacy_run_row(
     })
 }
 
-fn gqt_point_row(record: &crate::gqt_record::GqtRunRecordV1) -> Result<PointRow, ProjectionError> {
+fn gqt_point_row(record: &GqtRunRecordV1) -> Result<PointRow, ProjectionError> {
     require_sha256(&record.run.point_id, "point id")?;
     let run_spec_json = canonical_json(&record.run.run_spec, "run spec")?;
     Ok(PointRow {
@@ -1811,10 +1848,28 @@ fn gqt_point_row(record: &crate::gqt_record::GqtRunRecordV1) -> Result<PointRow,
 }
 
 fn gqt_run_row(
-    record: &crate::gqt_record::GqtRunRecordV1,
-    receipt: &crate::archive::ArchiveReceiptV1,
+    record: &GqtRunRecordV1,
+    receipt: &ArchiveReceiptV1,
 ) -> Result<RunRow, ProjectionError> {
-    let machine = &record.machine;
+    match record.evidence().map_err(|e| {
+        ProjectionError::new("projection_gqt_evidence_missing", None, e.to_string())
+    })? {
+        GqtEvidence::Embedded(evidence) => embedded_gqt_run_row(record, &evidence, receipt),
+        GqtEvidence::Served(sut) => served_gqt_run_row(record, sut, receipt),
+    }
+}
+
+fn embedded_gqt_run_row(
+    record: &GqtRunRecordV1,
+    evidence: &EmbeddedEvidence<'_>,
+    receipt: &ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    let &EmbeddedEvidence {
+        sut,
+        machine,
+        backend,
+        fixture,
+    } = evidence;
     let wall = &record.measurements.wall_clock;
     let calls = gqt_logical_call_summaries(record)?;
     Ok(RunRow {
@@ -1826,56 +1881,54 @@ fn gqt_run_row(
         invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
         case_id: record.run.case_id.clone(),
         case_digest: record.run.case_digest.clone(),
-        package_version: record.sut.package_version.clone(),
-        source_commit: record.sut.source_commit.clone(),
-        source_tree_dirty: record.sut.source_tree_dirty,
-        build_profile: record.sut.build.profile.clone(),
-        build_opt_level: record.sut.build.cargo_opt_level.clone(),
-        debug_assertions: record.sut.build.debug_assertions,
-        target_triple: record.sut.build.target_triple.clone(),
-        rustc_version: record.sut.build.rustc_version.clone(),
-        build_declared_release_lto: record.sut.build.declared_release_lto.clone(),
-        build_declared_release_codegen_units: record.sut.build.declared_release_codegen_units,
-        build_declared_release_strip: record.sut.build.declared_release_strip,
-        build_cargo_encoded_rustflags_present: record.sut.build.cargo_encoded_rustflags_present,
-        build_release_profile_environment_overrides_supported: record
-            .sut
-            .build
-            .release_profile_environment_overrides_supported,
-        build_effective_codegen_options_proved: record.sut.build.effective_codegen_options_proved,
-        worker_executable_sha256: record.sut.build.worker_executable_sha256.clone(),
-        sut_fingerprint: typed_json_sha256(&record.sut, "system under test")?,
-        sut_json: canonical_json(&record.sut, "system under test")?,
-        machine_fingerprint: typed_json_sha256(machine, "machine identity")?,
-        machine_format_version: machine.format_version,
-        machine_os_name: machine.os_name.clone(),
-        machine_os_version: machine.os_version.clone(),
-        machine_kernel_version: machine.kernel_version.clone(),
-        machine_architecture: machine.architecture.clone(),
-        machine_cpu_model: machine.cpu_model.clone(),
-        machine_logical_cores: machine.logical_cores,
-        machine_physical_cores: machine.physical_cores,
-        machine_total_memory_bytes: machine.total_memory_bytes,
-        machine_resource_control_json: canonical_json(
+        sut_evidence: SutEvidence::WorkerObserved,
+        package_version: sut.package_version.clone(),
+        source_commit: sut.source_commit.clone(),
+        source_tree_dirty: sut.source_tree_dirty,
+        build_profile: sut.build.profile.clone(),
+        build_opt_level: sut.build.cargo_opt_level.clone(),
+        debug_assertions: sut.build.debug_assertions,
+        target_triple: Some(sut.build.target_triple.clone()),
+        rustc_version: Some(sut.build.rustc_version.clone()),
+        build_declared_release_lto: Some(sut.build.declared_release_lto.clone()),
+        build_declared_release_codegen_units: Some(sut.build.declared_release_codegen_units),
+        build_declared_release_strip: Some(sut.build.declared_release_strip),
+        build_cargo_encoded_rustflags_present: Some(sut.build.cargo_encoded_rustflags_present),
+        build_release_profile_environment_overrides_supported: Some(
+            sut.build.release_profile_environment_overrides_supported,
+        ),
+        build_effective_codegen_options_proved: sut.build.effective_codegen_options_proved,
+        worker_executable_sha256: Some(sut.build.worker_executable_sha256.clone()),
+        sut_fingerprint: typed_json_sha256(sut, "system under test")?,
+        sut_json: canonical_json(sut, "system under test")?,
+        client_build_json: None,
+        client_machine_json: None,
+        machine_fingerprint: Some(typed_json_sha256(machine, "machine identity")?),
+        machine_format_version: Some(machine.format_version),
+        machine_os_name: Some(machine.os_name.clone()),
+        machine_os_version: Some(machine.os_version.clone()),
+        machine_kernel_version: Some(machine.kernel_version.clone()),
+        machine_architecture: Some(machine.architecture.clone()),
+        machine_cpu_model: Some(machine.cpu_model.clone()),
+        machine_logical_cores: Some(machine.logical_cores),
+        machine_physical_cores: Some(machine.physical_cores),
+        machine_total_memory_bytes: Some(machine.total_memory_bytes),
+        machine_resource_control_json: Some(canonical_json(
             &machine.resource_control,
             "machine resource control",
-        )?,
-        machine_scheduling_json: canonical_json(&machine.scheduling, "machine scheduling")?,
-        machine_resource_limits_json: canonical_json(
+        )?),
+        machine_scheduling_json: Some(canonical_json(&machine.scheduling, "machine scheduling")?),
+        machine_resource_limits_json: Some(canonical_json(
             &machine.resource_limits,
             "machine resource limits",
-        )?,
-        machine_label: machine.machine_label.clone(),
-        backend_fingerprint: typed_json_sha256(&record.backend, "backend evidence")?,
-        backend_json: canonical_json(&record.backend, "backend evidence")?,
-        fixture_manifest_sha256: typed_json_sha256(&record.fixture, "dataset manifest")?,
-        fixture_logical_sha256: record
-            .fixture
-            .handoff
-            .summary
-            .logical_content_sha256
-            .clone(),
-        fixture_physical_sha256: record.fixture.handoff.physical.digest_sha256.clone(),
+        )?),
+        machine_label: Some(machine.machine_label.clone()),
+        backend_evidence: SutEvidence::WorkerObserved,
+        backend_fingerprint: typed_json_sha256(backend, "backend evidence")?,
+        backend_json: canonical_json(backend, "backend evidence")?,
+        fixture_manifest_sha256: Some(typed_json_sha256(fixture, "dataset manifest")?),
+        fixture_logical_sha256: fixture.handoff.summary.logical_content_sha256.clone(),
+        fixture_physical_sha256: Some(fixture.handoff.physical.digest_sha256.clone()),
         acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
         claim_eligible: record.claim_eligible(),
         terminal_failed_repetition: record
@@ -1902,12 +1955,134 @@ fn gqt_run_row(
         p95_supported: wall.p95_supported,
         wall_evidence: json_string(&wall.evidence, "wall evidence")?,
         floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
-        lance_data_plane_logical_calls_min: calls.lance_data_plane.min,
-        lance_data_plane_logical_calls_p50: calls.lance_data_plane.p50,
-        lance_data_plane_logical_calls_max: calls.lance_data_plane.max,
-        control_plane_logical_calls_min: calls.control_plane.min,
-        control_plane_logical_calls_p50: calls.control_plane.p50,
-        control_plane_logical_calls_max: calls.control_plane.max,
+        lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
+        lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
+        lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
+        control_plane_logical_calls_min: Some(calls.control_plane.min),
+        control_plane_logical_calls_p50: Some(calls.control_plane.p50),
+        control_plane_logical_calls_max: Some(calls.control_plane.max),
+        logical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.logical.counts,
+            "logical counts presence",
+        )?,
+        physical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.physical.counts,
+            "physical counts presence",
+        )?,
+    })
+}
+
+fn served_gqt_run_row(
+    record: &GqtRunRecordV1,
+    sut: &ServedSutIdentityV1,
+    receipt: &ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    let deployment = &sut.receipt;
+    let server = &deployment.server;
+    let machine = deployment.machine.as_ref();
+    let wall = &record.measurements.wall_clock;
+    let evidence = match sut.kind {
+        ServedSutKind::DeclaredDeployment => SutEvidence::DeclaredDeployment,
+    };
+    Ok(RunRow {
+        invocation_id: record.invocation().invocation_id.clone(),
+        record_sha256: receipt.record_sha256.clone(),
+        archive_object: receipt.object_relative_path.clone(),
+        archive_pointer: receipt.pointer_relative_path.clone(),
+        session_id: record.invocation.session_id.clone(),
+        invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
+        case_id: record.run.case_id.clone(),
+        case_digest: record.run.case_digest.clone(),
+        sut_evidence: evidence,
+        package_version: server.package_version.clone(),
+        source_commit: server.source_commit.clone(),
+        source_tree_dirty: server.source_tree_dirty,
+        build_profile: server.profile.clone(),
+        build_opt_level: server.cargo_opt_level.clone(),
+        debug_assertions: server.debug_assertions,
+        target_triple: server.target_triple.clone(),
+        rustc_version: server.rustc_version.clone(),
+        build_declared_release_lto: None,
+        build_declared_release_codegen_units: None,
+        build_declared_release_strip: None,
+        build_cargo_encoded_rustflags_present: None,
+        build_release_profile_environment_overrides_supported: None,
+        build_effective_codegen_options_proved: false,
+        worker_executable_sha256: None,
+        sut_fingerprint: typed_json_sha256(server, "declared server system under test")?,
+        sut_json: canonical_json(server, "declared server system under test")?,
+        client_build_json: Some(canonical_json(&sut.client_build, "client build")?),
+        client_machine_json: Some(canonical_json(&sut.client_machine, "client machine")?),
+        machine_fingerprint: machine
+            .map(|m| typed_json_sha256(m, "declared server machine"))
+            .transpose()?,
+        machine_format_version: machine.map(|m| m.format_version),
+        machine_os_name: machine.map(|m| m.os_name.clone()),
+        machine_os_version: machine.map(|m| m.os_version.clone()),
+        machine_kernel_version: machine.map(|m| m.kernel_version.clone()),
+        machine_architecture: machine.map(|m| m.architecture.clone()),
+        machine_cpu_model: machine.map(|m| m.cpu_model.clone()),
+        machine_logical_cores: machine.map(|m| m.logical_cores),
+        machine_physical_cores: machine.map(|m| m.physical_cores),
+        machine_total_memory_bytes: machine.map(|m| m.total_memory_bytes),
+        machine_resource_control_json: machine
+            .map(|m| {
+                canonical_json(
+                    &m.resource_control,
+                    "declared server machine resource_control",
+                )
+            })
+            .transpose()?,
+        machine_scheduling_json: machine
+            .map(|m| canonical_json(&m.scheduling, "declared server machine scheduling"))
+            .transpose()?,
+        machine_resource_limits_json: machine
+            .map(|m| {
+                canonical_json(
+                    &m.resource_limits,
+                    "declared server machine resource_limits",
+                )
+            })
+            .transpose()?,
+        machine_label: machine.map(|m| m.machine_label.clone()),
+        backend_evidence: evidence,
+        backend_fingerprint: typed_json_sha256(&deployment.backend, "declared server backend")?,
+        backend_json: canonical_json(&deployment.backend, "declared server backend")?,
+        fixture_manifest_sha256: None,
+        fixture_logical_sha256: deployment.dataset.logical_content_sha256.clone(),
+        fixture_physical_sha256: None,
+        acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
+        claim_eligible: record.claim_eligible(),
+        terminal_failed_repetition: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.failed_repetition),
+        terminal_stage: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.stage.as_str().to_string()),
+        terminal_code: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.code.clone()),
+        requested_repetitions: record.acquisition.requested_repetitions,
+        observed_repetitions: record.acquisition.observed_repetitions,
+        min_us: wall.min_us,
+        p50_us: wall.p50_us,
+        max_us: wall.max_us,
+        p95_us: wall.p95_us,
+        p95_supported: wall.p95_supported,
+        wall_evidence: json_string(&wall.evidence, "wall evidence")?,
+        floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
+        lance_data_plane_logical_calls_min: None,
+        lance_data_plane_logical_calls_p50: None,
+        lance_data_plane_logical_calls_max: None,
+        control_plane_logical_calls_min: None,
+        control_plane_logical_calls_p50: None,
+        control_plane_logical_calls_max: None,
         logical_counts_presence_json: canonical_json(
             &record.measurements.layer_presence.logical.counts,
             "logical counts presence",
@@ -3149,8 +3324,17 @@ fn gqt_logical_call_summaries(
     let mut lance_data_plane = Vec::with_capacity(record.measurements.raw_samples.len());
     let mut control_plane = Vec::with_capacity(record.measurements.raw_samples.len());
     for sample in &record.measurements.raw_samples {
-        let manifest = sum_call_counts(sample.logical_store_calls.manifest)?;
-        let table = sum_call_counts(sample.logical_store_calls.table)?;
+        let (Some(logical), Some(control)) =
+            (&sample.logical_store_calls, &sample.control_store_calls)
+        else {
+            return Err(ProjectionError::new(
+                "projection_gqt_counts_missing",
+                None,
+                "embedded GQT record lacks logical or control counters",
+            ));
+        };
+        let manifest = sum_call_counts(logical.manifest)?;
+        let table = sum_call_counts(logical.table)?;
         lance_data_plane.push(manifest.checked_add(table).ok_or_else(|| {
             ProjectionError::new(
                 "projection_logical_call_overflow",
@@ -3158,7 +3342,6 @@ fn gqt_logical_call_summaries(
                 "per-repetition Lance data-plane logical call total does not fit u64",
             )
         })?);
-        let control = &sample.control_store_calls;
         control_plane.push(sum_u64_values(
             [
                 control.read_text,
@@ -4776,46 +4959,48 @@ mod tests {
             invoked_at_unix_ms: 1,
             case_id: "case".to_string(),
             case_digest: "c".repeat(64),
+            sut_evidence: SutEvidence::WorkerObserved,
             package_version: "0.10.0".to_string(),
             source_commit: "d".repeat(40),
             source_tree_dirty: false,
             build_profile: "release".to_string(),
             build_opt_level: "3".to_string(),
             debug_assertions: false,
-            target_triple: "aarch64-apple-darwin".to_string(),
-            rustc_version: "rustc 1.97.1".to_string(),
-            build_declared_release_lto: "thin".to_string(),
-            build_declared_release_codegen_units: 16,
-            build_declared_release_strip: true,
-            build_cargo_encoded_rustflags_present: false,
-            build_release_profile_environment_overrides_supported: true,
+            target_triple: Some("aarch64-apple-darwin".to_string()),
+            rustc_version: Some("rustc 1.97.1".to_string()),
+            build_declared_release_lto: Some("thin".to_string()),
+            build_declared_release_codegen_units: Some(16),
+            build_declared_release_strip: Some(true),
+            build_cargo_encoded_rustflags_present: Some(false),
+            build_release_profile_environment_overrides_supported: Some(true),
             build_effective_codegen_options_proved: false,
-            worker_executable_sha256: "e".repeat(64),
+            worker_executable_sha256: Some("e".repeat(64)),
             sut_fingerprint: "f".repeat(64),
             sut_json: "{}".to_string(),
-            machine_fingerprint: "1".repeat(64),
-            machine_format_version: 1,
-            machine_os_name: "macos".to_string(),
-            machine_os_version: "26.0".to_string(),
-            machine_kernel_version: "25.0".to_string(),
-            machine_architecture: "aarch64".to_string(),
-            machine_cpu_model: "Apple".to_string(),
-            machine_logical_cores: 8,
-            machine_physical_cores: 8,
-            machine_total_memory_bytes: 16,
-            machine_resource_control_json: "{\"kind\":\"macos-native\"}".to_string(),
-            machine_scheduling_json:
-                "{\"nice_level\":0,\"policy\":\"other\",\"priority\":31,\"reset_on_fork\":false}"
-                    .to_string(),
-            machine_resource_limits_json:
-                "{\"scope_version\":1,\"values_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
-                    .to_string(),
-            machine_label: "hostname-sha256:label".to_string(),
+            client_build_json: None,
+            client_machine_json: None,
+            machine_fingerprint: Some("1".repeat(64)),
+            machine_format_version: Some(1),
+            machine_os_name: Some("macos".to_string()),
+            machine_os_version: Some("26.0".to_string()),
+            machine_kernel_version: Some("25.0".to_string()),
+            machine_architecture: Some("aarch64".to_string()),
+            machine_cpu_model: Some("Apple".to_string()),
+            machine_logical_cores: Some(8),
+            machine_physical_cores: Some(8),
+            machine_total_memory_bytes: Some(16),
+            machine_resource_control_json: Some("{\"kind\":\"macos-native\"}".to_string()),
+            machine_scheduling_json: Some("{\"nice_level\":0,\"policy\":\"other\",\"priority\":31,\"reset_on_fork\":false}"
+                    .to_string()),
+            machine_resource_limits_json: Some("{\"scope_version\":1,\"values_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"
+                    .to_string()),
+            machine_label: Some("hostname-sha256:label".to_string()),
+            backend_evidence: SutEvidence::WorkerObserved,
             backend_fingerprint: "2".repeat(64),
             backend_json: "{}".to_string(),
-            fixture_manifest_sha256: "3".repeat(64),
+            fixture_manifest_sha256: Some("3".repeat(64)),
             fixture_logical_sha256: "4".repeat(64),
-            fixture_physical_sha256: "5".repeat(64),
+            fixture_physical_sha256: Some("5".repeat(64)),
             acquisition_status: "complete".to_string(),
             claim_eligible: false,
             terminal_failed_repetition: None,
@@ -4830,12 +5015,12 @@ mod tests {
             p95_supported: false,
             wall_evidence: "directional".to_string(),
             floor_multiplier_millis: 2_000,
-            lance_data_plane_logical_calls_min: 7,
-            lance_data_plane_logical_calls_p50: 7,
-            lance_data_plane_logical_calls_max: 7,
-            control_plane_logical_calls_min: 2,
-            control_plane_logical_calls_p50: 2,
-            control_plane_logical_calls_max: 2,
+            lance_data_plane_logical_calls_min: Some(7),
+            lance_data_plane_logical_calls_p50: Some(7),
+            lance_data_plane_logical_calls_max: Some(7),
+            control_plane_logical_calls_min: Some(2),
+            control_plane_logical_calls_p50: Some(2),
+            control_plane_logical_calls_max: Some(2),
             logical_counts_presence_json: r#"{"status":"observed"}"#.to_string(),
             physical_counts_presence_json: r#"{"status":"absent"}"#.to_string(),
         };

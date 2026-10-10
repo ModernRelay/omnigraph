@@ -482,3 +482,214 @@ fn non_utf8_cache_paths_return_json_diagnostics_instead_of_panicking() {
     );
     assert!(!path.exists());
 }
+
+#[test]
+fn served_preflight_rejects_incompatible_selection_before_acquisition() {
+    use omnigraph_bench::gqt_served::{
+        ServerArtifactV1, ServerBuildAttestationV1, ServerDatasetAttestationV1,
+        ServerDeploymentReceiptV1, canonical_endpoint,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let config = root().join("benchmarks/benchmarks.yaml");
+    let catalog = omnigraph_bench::catalog::Catalog::load(&config).unwrap();
+    let group = catalog
+        .resolve(Some("query-shapes-served"), Some(1))
+        .unwrap();
+    let first = group.runs[0].case.gqt().unwrap();
+    assert!(
+        group.runs[1..]
+            .iter()
+            .any(|run| { run.case.gqt().unwrap().recipe_sha256 != first.recipe_sha256 })
+    );
+    let receipt = ServerDeploymentReceiptV1 {
+        format_version: 1,
+        endpoint_sha256: omnigraph_bench::gqt_case::sha256_bytes(
+            canonical_endpoint(&url).unwrap().as_bytes(),
+        ),
+        graph: "bench".into(),
+        server: ServerBuildAttestationV1 {
+            package_version: "0.13.0".into(),
+            source_commit: "a".repeat(40),
+            source_tree_dirty: false,
+            profile: "release".into(),
+            cargo_opt_level: "2".into(),
+            debug_assertions: false,
+            artifact: ServerArtifactV1::Image {
+                sha256: "b".repeat(64),
+            },
+            target_triple: None,
+            rustc_version: None,
+            engine: None,
+        },
+        backend: first.definition.environment.backend.clone(),
+        dataset: ServerDatasetAttestationV1 {
+            recipe_sha256: first.recipe_sha256.clone(),
+            logical_content_sha256: "c".repeat(64),
+            algorithm: omnigraph_bench::dataset_identity::DATASET_LOGICAL_ALGORITHM.into(),
+        },
+        machine: None,
+    };
+    receipt.bind(first).unwrap();
+    fs::write(
+        directory.path().join("receipt.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+
+    for (selector, token_env, code, detail) in [
+        (
+            "query-shapes-served",
+            None,
+            "invalid_run_input",
+            "dataset recipe",
+        ),
+        (
+            "tiny-read",
+            None,
+            "invalid_run_input",
+            "embedded scenarios refuse",
+        ),
+        (
+            first.definition.id.as_str(),
+            Some("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT"),
+            "invalid_server_input",
+            "runtime namespaces",
+        ),
+        (
+            first.definition.id.as_str(),
+            Some("LANCE_MEM_POOL_SIZE"),
+            "invalid_server_input",
+            "runtime namespaces",
+        ),
+    ] {
+        let mut command = Command::cargo_bin("omnigraph-bench").unwrap();
+        command
+            .current_dir(directory.path())
+            .timeout(std::time::Duration::from_secs(10))
+            .args([
+                "run",
+                selector,
+                "--config",
+                config.to_str().unwrap(),
+                "--server",
+                &url,
+                "--graph",
+                "bench",
+                "--server-receipt",
+                "receipt.json",
+                "--dataset-cache",
+                "cache",
+                "--archive",
+                "archive",
+                "--repetitions",
+                "1",
+                "--json",
+            ]);
+        if let Some(name) = token_env {
+            command
+                .args(["--server-token-env", name])
+                .env(name, "credential-must-not-enter-provenance");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{selector}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["cli_output_version"], 1, "{result}");
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["diagnostics"][0]["code"], code, "{result}");
+        assert!(
+            result["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains(detail),
+            "{result}"
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("credential-must-not-enter-provenance")
+            );
+        }
+        assert!(!directory.path().join("archive").exists());
+        assert!(!directory.path().join("cache").exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn cache_status_of_a_served_scenario_is_not_applicable() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = root().join("benchmarks/benchmarks.yaml");
+    let result = run(
+        directory.path(),
+        &[
+            "cache",
+            "status",
+            "e2e-query-count-served",
+            "--config",
+            config.to_str().unwrap(),
+            "--dataset-cache",
+            "cache",
+            "--json",
+        ],
+        true,
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["value"]["source"], "not_applicable");
+    assert_eq!(result["value"]["cache"], "unknown");
+    assert_eq!(
+        result["diagnostics"][0]["code"],
+        "served_scenario_has_no_dataset_cache"
+    );
+    assert!(!directory.path().join("cache").exists());
+}
+
+#[test]
+fn served_groups_pin_their_scenarios_and_twin_measured_text() {
+    let catalog =
+        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml")).unwrap();
+    let query_shapes = [
+        "e2e-query-scan",
+        "e2e-query-wide-scan",
+        "e2e-query-filter",
+        "e2e-query-lookup",
+        "e2e-query-count",
+        "e2e-query-grouped",
+        "e2e-query-top-people",
+        "e2e-query-friends",
+        "e2e-query-filtered-friends",
+        "e2e-query-no-friends",
+        "e2e-query-count-bare",
+        "e2e-query-destination-projection",
+        "e2e-query-grouped-fanout",
+    ];
+    let traversals = [
+        "e2e-traversal-hop1",
+        "e2e-traversal-hop2",
+        "e2e-traversal-hop3",
+    ];
+    for (group, twins) in [
+        ("query-shapes-served", &query_shapes[..]),
+        ("traversal-served", &traversals[..]),
+    ] {
+        let suite = catalog.resolve(Some(group), None).unwrap();
+        let ids: Vec<_> = suite.runs.iter().map(|run| run.case.id().to_owned()).collect();
+        let expected: Vec<_> = twins.iter().map(|twin| format!("{twin}-served")).collect();
+        assert_eq!(ids, expected, "{group}");
+        for twin in twins {
+            let served = catalog.plan(&format!("{twin}-served")).unwrap();
+            let embedded = catalog.plan(twin).unwrap();
+            assert_eq!(
+                served.definition.workload.measured_step.text,
+                embedded.definition.workload.measured_step.text,
+                "{twin}"
+            );
+        }
+    }
+}
