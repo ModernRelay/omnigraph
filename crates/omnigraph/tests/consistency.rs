@@ -242,6 +242,68 @@ async fn load_keyed_write_row_cap_excludes_strict_overwrite() {
     assert_eq!(count_rows(&over, "node:Thing").await, LIMIT + 1);
 }
 
+#[tokio::test]
+async fn write_max_bytes_load_boundaries_are_independent_and_atomic() {
+    use base64::Engine as _;
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+    for strict in [false, true] {
+        for mode in [LoadMode::Append, LoadMode::Merge] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = helpers::session(
+                Omnigraph::init(
+                    dir.path().to_str().unwrap(),
+                    "node Doc { slug: String @key content: Blob? note: String? }",
+                )
+                .await
+                .unwrap(),
+            );
+            db.set(
+                SettingId::WriteMaxBytes,
+                &SettingValue::Integer(4093),
+                Source::File,
+            )
+            .unwrap();
+            let row = |slug: &str, bytes: usize| {
+                serde_json::json!({
+                    "type":"Doc", "data":{"slug":slug,"note":"scalar","content":format!("base64:{}",
+                        base64::engine::general_purpose::STANDARD.encode(vec![0; bytes]))}
+                })
+                .to_string()
+            };
+            let exact = row("exact", 4093);
+            if strict {
+                db.load_graph_batch("main", &exact, mode).await.unwrap();
+            } else {
+                db.load_jsonl(&exact, mode).await.unwrap();
+            }
+            let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+            let wide =
+                serde_json::json!({"type":"Doc","data":{"slug":"wide","note":"x".repeat(4094)}})
+                    .to_string();
+            for input in [
+                row("over", 4094),
+                format!("{}\n{}", row("a", 2047), row("b", 2047)),
+                wide,
+            ] {
+                let error = if strict {
+                    db.load_graph_batch("main", &input, mode).await.unwrap_err()
+                } else {
+                    db.load_jsonl(&input, mode).await.unwrap_err()
+                };
+                assert!(
+                    matches!(error, OmniError::ResourceLimitExceeded { limit: 4093, .. }),
+                    "strict={strict}, mode={mode:?}: {error:?}"
+                );
+                assert_eq!(
+                    snapshot_main(&db).await.unwrap().graph_manifest_version(),
+                    before
+                );
+                assert_eq!(count_rows(&db, "node:Doc").await, 1);
+            }
+        }
+    }
+}
+
 /// The sibling 32 MiB cap is measured from the staged Arrow batch, not JSON
 /// syntax. A single wide keyed row must be rejected with a typed limit before
 /// either Lance HEAD or graph visibility can move.

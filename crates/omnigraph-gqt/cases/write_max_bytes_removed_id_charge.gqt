@@ -1,0 +1,125 @@
+# issue: none
+# notes: A removed ID is charged its UTF-8 length plus 24 bytes, and a @key node's ID is its key value: "日" (3 bytes) costs 27, so 26 refuses and 27 admits.
+# notes: "a" and "b" cost 50: 49 refuses and 50 admits. "x" plus its one edge with a generated 26-byte ID costs 75: 74 refuses with node and edge intact, 75 admits and cascades.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+    grp: String
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"日","grp":"solo"}}
+{"type":"Doc","data":{"slug":"a","grp":"pair"}}
+{"type":"Doc","data":{"slug":"b","grp":"pair"}}
+{"type":"Doc","data":{"slug":"x","grp":"hub"}}
+{"type":"Doc","data":{"slug":"y","grp":"leaf"}}
+{"edge":"Cites","from":"x","to":"y"}
+
+--- mutate
+set write_max_bytes = 26;
+query delete_multibyte_under() {
+    delete Doc where slug = "日"
+}
+
+--- expect error: retained removed-id bytes per operation
+
+--- mutate
+set write_max_bytes = 27;
+query delete_multibyte_exact() {
+    delete Doc where slug = "日"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 49;
+query delete_pair_under() {
+    delete Doc where grp = "pair"
+}
+
+--- expect error: retained removed-id bytes per operation
+
+--- mutate
+set write_max_bytes = 50;
+query delete_pair_exact() {
+    delete Doc where grp = "pair"
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+set write_max_bytes = 74;
+query delete_hub_under() {
+    delete Doc where slug = "x"
+}
+
+--- expect error: retained removed-id bytes per operation
+
+--- query
+query docs_after_refused_cascade() {
+    match { $d: Doc }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"x"}
+{"d.slug":"y"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query cites_after_refused_cascade() {
+    match { $a: Doc $a $e:cites $b }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+{"a.slug":"x","b.slug":"y"}
+
+--- expect shape
+a.slug: String
+b.slug: String
+
+--- mutate
+set write_max_bytes = 75;
+query delete_hub_exact() {
+    delete Doc where slug = "x"
+}
+
+--- expect affected: nodes=1 edges=1
+
+--- query
+query docs_after_cascade() {
+    match { $d: Doc }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"y"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query cites_after_cascade() {
+    match { $a: Doc $a $e:cites $b }
+    return { $a.slug, $b.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+a.slug: String
+b.slug: String
