@@ -1911,7 +1911,8 @@ async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let writer = init_and_load(&dir).await;
-    publish_until_history_exists(&writer, dir.path()).await;
+    let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+    publish_until_history_exists(&release_writer, dir.path()).await;
     writer.branch_create("feature").await.unwrap();
     let insert = |name: &'static str| mixed_params(&[("$name", name)], &[("$age", 30)]);
     mutate_branch(
@@ -1954,7 +1955,7 @@ async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
             read_both_branches().await;
             assert_eq!(history.requests(), (0, 0), "branch reads");
 
-            let foreign = publish_until_history_is_written(&writer, &history, "foreign").await;
+            let foreign = publish_until_history_is_written(&release_writer, &history, "foreign").await;
             mutate_branch(
                 &writer,
                 "feature",
@@ -1982,11 +1983,18 @@ async fn open_refresh_and_branch_reads_issue_no_request_to_history() {
                 "refresh, stale reads and a branch switch"
             );
 
-            let own = publish_until_history_is_written(&reader, &history, "own").await;
-            assert!(
-                own > OLD_COMMIT_COUNT_BOUND,
-                "{own} publishes filled the buffer: the release follows the byte budget"
-            );
+            let held = OLD_COMMIT_COUNT_BOUND + 1;
+            for publish in 0..held {
+                insert_people(&reader, &format!("own_{publish}"), 1).await;
+                assert_eq!(
+                    history.requests(),
+                    (0, 0),
+                    "publish {publish}: the production byte budget holds more than the old commit bound"
+                );
+            }
+            let release_reader = with_setting(&reader, "history_release_bytes", "2048");
+            let own = held
+                + publish_until_history_is_written(&release_reader, &history, "own_release").await;
 
             let commits = reader.list_commits(Some("main")).await.unwrap();
             assert_eq!(commits.len(), commits_on_main + foreign + own);
@@ -2018,7 +2026,8 @@ async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let writer = init_and_load(&dir).await;
-    publish_until_history_exists(&writer, dir.path()).await;
+    let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+    publish_until_history_exists(&release_writer, dir.path()).await;
     let buffered = 4;
     insert_people(&writer, "buffered", buffered - 1).await;
     writer.branch_create("feature").await.unwrap();
@@ -2218,6 +2227,7 @@ async fn repeated_merges_of_an_open_branch_append_each_source_commit_once() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let writer = init_and_load(&dir).await;
+    let release_writer = with_setting(&writer, "history_release_bytes", "2048");
     writer.branch_create("feature").await.unwrap();
     let (probes, history) = HistoryPlane::install();
     with_query_io_probes(
@@ -2241,8 +2251,12 @@ async fn repeated_merges_of_an_open_branch_append_each_source_commit_once() {
                     .expect("test setup: each merge publishes a merge commit")
                     .graph_commit_id;
                 history.requests();
-                publish_until_history_is_written(&writer, &history, &format!("release_{merge}"))
-                    .await;
+                publish_until_history_is_written(
+                    &release_writer,
+                    &history,
+                    &format!("release_{merge}"),
+                )
+                .await;
                 let released = omnigraph_catalog::history::read_commit(
                     uri,
                     &omnigraph_core::lance_access::control_session(),
