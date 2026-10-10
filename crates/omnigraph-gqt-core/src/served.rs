@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use crate::{
     Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep, MAIN_BRANCH,
-    MergeExpect, MutateExpect, MutateStep, QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail,
-    WriteExpect, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
-    operation, step_kind, step_label, substitute,
+    MergeExpect, MutateExpect, MutateStep, ParamsInput, QueryExpect, QueryStep, Seed, ShowStep,
+    Step, StepFail, WriteExpect, check_error_expect, check_rows_json, expectation_evidence,
+    merge_outcome_word, operation, step_kind, step_label, substitute,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -406,17 +406,20 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     }
 }
 
-/// The `--- params` body as it goes on the wire: the JSON the case spells,
-/// bindings substituted; the server holds it against the declaration, so a
-/// parameter error is the server's answer, never a local verdict.
+/// The `--- params` as they go on the wire: the JSON the case spells,
+/// bindings substituted, or a recipe's generated values; the server holds them
+/// against the declaration, so a parameter error is the server's answer, never
+/// a local verdict. A generated value travels in the request body, under the
+/// server's request limits.
 fn wire_params(
-    params_raw: Option<&String>,
+    params: Option<&ParamsInput>,
     binding: Option<(&str, &str)>,
 ) -> Result<Option<Value>, String> {
-    params_raw
-        .map(|raw| {
-            serde_json::from_str::<Value>(&substitute(raw, binding))
-                .map_err(|e| format!("params are not valid JSON: {e}"))
+    params
+        .map(|params| match params {
+            ParamsInput::Literal(raw) => serde_json::from_str::<Value>(&substitute(raw, binding))
+                .map_err(|e| format!("params are not valid JSON: {e}")),
+            ParamsInput::Generated(generated) => generated.generate(),
         })
         .transpose()
 }

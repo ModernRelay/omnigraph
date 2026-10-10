@@ -39,7 +39,15 @@ pub mod runner_config;
 mod served;
 mod yaml;
 pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
-pub use generate::{Generated, Seed};
+pub use generate::{Generated, GeneratedParams, Seed};
+
+/// A step's `--- params`: a literal JSON body under the loop's substitution
+/// rule, or a generated recipe, which takes no substitution.
+#[derive(Debug)]
+pub enum ParamsInput {
+    Literal(String),
+    Generated(GeneratedParams),
+}
 pub use host::{ExecutionHost, PlainHost};
 use omnigraph::storage::StorageAdapter;
 pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
@@ -210,7 +218,7 @@ pub struct QueryStep {
     /// The `branch: <name>` header argument; `main` when unspelled.
     pub branch: String,
     decl: Box<QueryDecl>,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
     expect: QueryExpect,
     /// The match clause carries an unbound traversal, so a successful run
     /// must show at least one Expand on the pinned path.
@@ -231,7 +239,7 @@ pub struct MutateStep {
     /// The `branch: <name>` header argument, as `QueryStep::branch`.
     branch: String,
     ast_params: Vec<Param>,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
     expect: MutateExpect,
 }
 
@@ -1077,7 +1085,7 @@ struct PendingStep {
     decl: Box<QueryDecl>,
     ordered_refusal: Option<String>,
     expects_expand: bool,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
 }
 
 /// The rows expect of a read step: the body under its substitution rule,
@@ -1837,7 +1845,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 }));
             }
             "params" => {
-                if !rest.is_empty() {
+                if !rest.is_empty() && !rest.starts_with("generate:") {
                     return Err(format!("unknown section `--- {}`", section.name));
                 }
                 let step = match pending.as_mut() {
@@ -1867,15 +1875,24 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         section.header_line + 1
                     ));
                 }
-                let body: String = section
-                    .body
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                validate_subst_tokens(&body, open_loop.as_ref().map(|(v, _, _)| v.as_str()))?;
-                substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                step.params_raw = Some(body);
+                if rest.is_empty() {
+                    let body: String = section
+                        .body
+                        .iter()
+                        .map(|(_, l)| *l)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    validate_subst_tokens(&body, open_loop.as_ref().map(|(v, _, _)| v.as_str()))?;
+                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                    step.params_raw = Some(ParamsInput::Literal(body));
+                } else {
+                    // A recipe is not substituted: its lines stay outside
+                    // `substitutable_lines`, so a `${` in it is refused.
+                    step.params_raw = Some(ParamsInput::Generated(
+                        GeneratedParams::parse(rest, &yaml_body(&section.body))
+                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?,
+                    ));
+                }
             }
             "expect" => {
                 if let Some(Pending::Concurrent(mut step)) =
@@ -2260,18 +2277,19 @@ fn substitute(text: &str, binding: Option<(&str, &str)>) -> String {
 }
 
 fn build_params(
-    params_raw: Option<&String>,
+    params_raw: Option<&ParamsInput>,
     ast_params: &[Param],
     binding: Option<(&str, &str)>,
 ) -> Result<omnigraph_compiler::ParamMap, String> {
     let json = match params_raw {
-        Some(raw) => {
+        Some(ParamsInput::Literal(raw)) => {
             let substituted = substitute(raw, binding);
             Some(
                 serde_json::from_str::<Value>(&substituted)
                     .map_err(|e| format!("params are not valid JSON: {e}"))?,
             )
         }
+        Some(ParamsInput::Generated(generated)) => Some(generated.generate()?),
         None => None,
     };
     json_params_to_param_map(json.as_ref(), ast_params, JsonParamMode::Standard)
