@@ -23,6 +23,7 @@ pub enum SourceAvailability {
     Missing,
     Invalid,
     Unbound,
+    NotApplicable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -82,6 +83,17 @@ impl CacheInspection {
         }
     }
 
+    /// The answer for a served scenario, which reads a provisioned graph and no cache entry.
+    pub fn served_not_applicable(path: &Path, message: impl Into<String>) -> Self {
+        let mut result = Self::new(path, None);
+        result.source = Some(SourceAvailability::NotApplicable);
+        result.diagnostic = Some(RunnerError::new(
+            "served_scenario_has_no_dataset_cache",
+            message,
+        ));
+        result
+    }
+
     fn fail(mut self, state: CacheState, code: &str, message: impl Into<String>) -> Self {
         self.cache = state;
         self.diagnostic = Some(RunnerError::new(code, message));
@@ -131,7 +143,9 @@ impl DatasetLease {
                 limits,
             )
             .and_then(|t| t.restore_active()),
-            ResetMode::S3Versioning => return Err(error("unsupported dataset reset")),
+            ResetMode::None | ResetMode::S3Versioning => {
+                return Err(error("unsupported dataset reset"));
+            }
         }
         .map_err(|e| error(e.to_string()))?;
         prepared
@@ -186,6 +200,10 @@ fn is_quarantined(root: &Path) -> RunnerResult<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(error(e.to_string())),
     }
+}
+pub(crate) fn quarantine_directory(root: &Path, why: &str) -> RunnerResult<()> {
+    let directory = File::open(root).map_err(|e| error(e.to_string()))?;
+    write_quarantine(root, &directory, why)
 }
 fn write_quarantine(root: &Path, directory: &File, why: &str) -> RunnerResult<()> {
     let mut options = OpenOptions::new();
@@ -999,7 +1017,10 @@ pub(crate) fn validate_manifest_evidence(manifest: &DatasetManifestV1) -> Result
     }
     let m = &h.template_metadata;
     if manifest.format_version != 1
-        || manifest.reset == ResetMode::S3Versioning
+        || !matches!(
+            manifest.reset,
+            ResetMode::LocalClonefile | ResetMode::PlainCopy
+        )
         || h.physical.files == 0
         || h.physical.bytes == 0
         || h.physical.files != m.files
@@ -1341,7 +1362,8 @@ mod tests {
             .unwrap()
             .plan("finbench-disjoint-merge")
             .unwrap()
-            .dataset_build_plan();
+            .dataset_build_plan()
+            .unwrap();
         let DatasetRecipe::Registered { reference, .. } = &plan.dataset else {
             panic!("registered fixture required");
         };

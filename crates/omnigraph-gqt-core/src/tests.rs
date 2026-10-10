@@ -72,6 +72,107 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     }
 }
 
+/// A `--- params generate` recipe supplies a step's parameters: its values
+/// reach the engine as a literal body's would, a Blob value included. The
+/// header takes `generate: v1` and a seed only, the recipe takes no `${`
+/// substitution, and its JSON bound is checked when the case parses.
+#[tokio::test]
+async fn generated_params_supply_a_step_and_are_refused_outside_their_contract() {
+    const GENERATED: &str =
+        "--- params generate: v1 seed: 7\nparams:\n  n: {kind: key, prefix: gen-, width: 3}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{MUTATE}{GENERATED}--- expect affected: nodes=1 edges=0\n\
+         --- query\nquery named() {{\n    match {{ $p: Person {{ name: \"gen-000\" }} }}\n    return {{ $p.name }}\n}}\n\
+         --- expect unordered\n{{\"p.name\": \"gen-000\"}}\n{SHAPE}"
+    );
+    let case = parse_case("generated_params", &text).unwrap();
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    let blob = format!(
+        "{HDR}--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode Doc {{\n    slug: String @key\n    body: Blob?\n}}\n--- seed\n\
+         --- mutate\nquery put($slug: String, $body: Blob) {{\n    insert Doc {{ slug: $slug, body: $body }}\n}}\n\
+         --- params generate: v1 seed: 0\nparams:\n  slug: {{kind: literal, value: doc}}\n  body: {{kind: blob, byte: 1, length: 3}}\n\
+         --- expect affected: nodes=1 edges=0\n"
+    );
+    let case = parse_case("generated_blob_param", &blob).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step");
+    };
+    let Some(ParamsInput::Generated(generated)) = step.params_raw.as_ref() else {
+        panic!("expected generated params");
+    };
+    assert_eq!(
+        generated.generate().unwrap(),
+        serde_json::json!({"slug": "doc", "body": "base64:AQEB"})
+    );
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    // A Zipf endpoint is prepared as a table's is, under the same total
+    // bound, which is checked before any distribution is built.
+    let zipf = |name: &str, population: u64| {
+        format!(
+            "  {name}: {{kind: endpoint, prefix: s, width: 1, population: {population}, distribution: {{kind: zipf, exponent: 1.25}}}}\n"
+        )
+    };
+    let skewed = GeneratedParams::parse(
+        "generate: v1 seed: 0",
+        &format!("params:\n{}", zipf("s", 1)),
+    )
+    .unwrap();
+    assert_eq!(skewed.generate().unwrap(), serde_json::json!({"s": "s0"}));
+    let wide = (0..9)
+        .map(|i| zipf(&format!("s{i}"), 1_000_000))
+        .collect::<String>();
+    assert!(
+        GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
+            .unwrap_err()
+            .contains("zipf tables exceed 8000000 entries")
+    );
+
+    for (from, to) in [
+        ("generate: v1", "generate: v2"),
+        (" seed: 7", ""),
+        ("seed: 7", "seed: 7 mode: merge"),
+        ("seed: 7", "seed: 7 branch: main"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: key, prefix: gen-, width: 3, extra: 1}",
+        ),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: literal, value: \"${n}\"}",
+        ),
+        ("params:\n  n:", "params: {}\n  n:"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: blob, byte: 0, length: 50331648}",
+        ),
+        ("--- expect affected", "--- params\n{}\n--- expect affected"),
+    ] {
+        let changed = text.replacen(from, to, 1);
+        assert_ne!(changed, text, "{from} must occur in the case");
+        assert!(
+            parse_case("generated_params", &changed).is_err(),
+            "{from} -> {to}"
+        );
+    }
+    assert!(
+        parse_case(
+            "generated_params",
+            &format!(
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
+            )
+        )
+        .is_err(),
+        "a generated load takes no params"
+    );
+}
+
 #[test]
 fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
     for recipe in [

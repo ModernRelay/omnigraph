@@ -1373,7 +1373,7 @@ fn remaining(total: Duration, elapsed: Duration) -> Duration {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use crate::counting::LogicalCallCounts;
     use crate::legacy::case::{ValidatedCase, parse_case};
     use crate::runner::{
@@ -1423,7 +1423,7 @@ mod tests {
         }
     }
 
-    fn machine_identity() -> MachineIdentityV1 {
+    pub(crate) fn machine_identity() -> MachineIdentityV1 {
         MachineIdentityV1 {
             format_version: crate::machine::MACHINE_IDENTITY_FORMAT_VERSION,
             os_name: "macos".to_string(),
@@ -1449,7 +1449,7 @@ mod tests {
         }
     }
 
-    fn worker_build() -> WorkerBuildV1 {
+    pub(crate) fn worker_build() -> WorkerBuildV1 {
         WorkerBuildV1 {
             source_commit: "0".repeat(40),
             source_tree_dirty: Some(false),
@@ -1593,7 +1593,9 @@ mod tests {
 
     /// Create the executable in an isolated process so concurrent test forks
     /// cannot retain writable script handles and make Linux exec return ETXTBSY.
-    fn worker_script(body: &str) -> (MutexGuard<'static, ()>, tempfile::TempDir, PathBuf) {
+    pub(crate) fn worker_script(
+        body: &str,
+    ) -> (MutexGuard<'static, ()>, tempfile::TempDir, PathBuf) {
         let guard = WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

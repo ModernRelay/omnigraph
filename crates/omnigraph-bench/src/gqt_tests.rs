@@ -69,12 +69,11 @@ fn catalog() -> PathBuf {
 }
 fn recorded_catalog() -> crate::catalog::Catalog {
     let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    catalog.definition.defaults.environment = Some(GqtEnvironment {
-        backend: crate::case::Backend::LocalFs {
+    catalog.definition.defaults.environment =
+        Some(GqtEnvironment::embedded(crate::case::Backend::LocalFs {
             filesystem: crate::case::LocalFilesystem::Apfs,
             storage_class: crate::case::LocalStorageClass::NvmeSsd,
-        },
-    });
+        }));
     catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
     catalog
 }
@@ -119,7 +118,7 @@ async fn run_sample_with_logical(
     let scratch = directory.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     let (logical, _) = crate::dataset_worker::build_dataset(
-        &plan.dataset_build_plan(),
+        &plan.dataset_build_plan().unwrap(),
         root.to_str().unwrap(),
         &scratch,
         None,
@@ -138,7 +137,18 @@ async fn run_sample_with_logical(
     let mut signals = Signals::default();
     let sample =
         execute_gqt_rep_signaled(1, &root, &physical, &metadata, &bound, &mut signals).await?;
-    validate_sample(&sample, &bound, 1, &physical, sample.elapsed_us, false).unwrap();
+    validate_sample(
+        &sample,
+        &bound,
+        1,
+        &crate::gqt_protocol::PreparationProofV2::Embedded {
+            physical_digest: physical,
+            metadata_digest: metadata,
+        },
+        sample.elapsed_us,
+        false,
+    )
+    .unwrap();
     assert_eq!(signals.events, vec!["ready", "settled"]);
     assert_eq!(signals.elapsed, Some(sample.elapsed_us));
     Ok((sample, signals, logical))
@@ -240,7 +250,7 @@ fn end_to_end_catalog_selects_complete_public_operations() {
     for (name, kind) in END_TO_END {
         let p = catalog.plan(name).unwrap();
         p.revalidate().unwrap();
-        p.dataset_build_plan().revalidate().unwrap();
+        p.dataset_build_plan().unwrap().revalidate().unwrap();
         crate::gqt_runner::preflight_acquisition_budget(&p, 1).unwrap();
         let parsed = p.queries.parse().unwrap();
         let steps = workload_steps(&parsed).unwrap();
@@ -351,7 +361,7 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     for (name, warm) in query_shape_cases() {
         let p = catalog.plan(name).unwrap();
         p.revalidate().unwrap();
-        p.dataset_build_plan().revalidate().unwrap();
+        p.dataset_build_plan().unwrap().revalidate().unwrap();
         crate::gqt_runner::preflight_acquisition_budget(&p, 1).unwrap();
         let parsed = p.queries.parse().unwrap();
         let steps = workload_steps(&parsed).unwrap();
@@ -688,7 +698,7 @@ async fn empty_seed_and_unwritten_child_have_reproducible_dataset_identity() {
         let scratch = directory.path().join(format!("scratch{index}"));
         std::fs::create_dir(&scratch).unwrap();
         let (logical, _) = crate::dataset_worker::build_dataset(
-            &p.dataset_build_plan(),
+            &p.dataset_build_plan().unwrap(),
             active.to_str().unwrap(),
             &scratch,
             None,
@@ -728,7 +738,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     let scratch = directory.path().join("scratch");
     std::fs::create_dir(&scratch).unwrap();
     let (summary, registered_source_identity) = crate::dataset_worker::build_dataset(
-        &plan.dataset_build_plan(),
+        &plan.dataset_build_plan().unwrap(),
         active.to_str().unwrap(),
         &scratch,
         None,
@@ -770,10 +780,10 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
             case_digest: plan.case_digest.clone(),
             run_spec: bound.identity,
         },
-        sut: legacy.sut,
-        machine: legacy.machine,
-        backend: legacy.backend,
-        fixture: crate::dataset_cache::DatasetManifestV1 {
+        sut: crate::gqt_record::GqtSutIdentityV1::Embedded(Box::new(legacy.sut)),
+        machine: Some(legacy.machine),
+        backend: Some(legacy.backend),
+        fixture: Some(crate::dataset_cache::DatasetManifestV1 {
             format_version: 1,
             key: "a".repeat(64),
             recipe_sha256: plan.recipe_sha256,
@@ -786,8 +796,8 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
                 physical,
                 template_metadata,
             },
-        },
-        dataset_cache_hit: true,
+        }),
+        dataset_cache_hit: Some(true),
         acquisition: AcquisitionV1 {
             status: AcquisitionStatusV1::Complete,
             requested_repetitions: 1,
@@ -823,23 +833,36 @@ fn rehash_record(record: &mut crate::gqt_record::GqtRunRecordV1) {
 async fn gqt_authority_refuses_invalid_machine_counters_dataset_and_treatment() {
     let record = authority_fixture().await;
     let mutations: &[fn(&mut crate::gqt_record::GqtRunRecordV1)] = &[
-        |r| r.machine.logical_cores = 0,
+        |r| r.machine.as_mut().unwrap().logical_cores = 0,
         |r| {
             r.measurements.raw_samples[0]
                 .logical_store_calls
+                .as_mut()
+                .unwrap()
                 .manifest
                 .get = u64::MAX;
-            r.measurements.raw_samples[0].logical_store_calls.table.get = 1;
+            r.measurements.raw_samples[0]
+                .logical_store_calls
+                .as_mut()
+                .unwrap()
+                .table
+                .get = 1;
         },
         |r| {
-            r.measurements.raw_samples[0].control_store_calls.write_text = 1;
             r.measurements.raw_samples[0]
                 .control_store_calls
+                .as_mut()
+                .unwrap()
+                .write_text = 1;
+            r.measurements.raw_samples[0]
+                .control_store_calls
+                .as_mut()
+                .unwrap()
                 .mutation_calls = 0;
         },
-        |r| r.fixture.handoff.summary.branches.clear(),
-        |r| r.fixture.handoff.summary.algorithm = "unknown".into(),
-        |r| r.fixture.handoff.template_metadata.files += 1,
+        |r| r.fixture.as_mut().unwrap().handoff.summary.branches.clear(),
+        |r| r.fixture.as_mut().unwrap().handoff.summary.algorithm = "unknown".into(),
+        |r| r.fixture.as_mut().unwrap().handoff.template_metadata.files += 1,
         |r| r.run.run_spec.protocol.deadline_seconds = Some(0),
         |r| {
             r.run.run_spec.measured_step.text =
@@ -892,7 +915,7 @@ async fn mixed_legacy_and_gqt_archive_rebuilds_and_queries_both_points() {
     let canonical = crate::gqt_record::canonical_bytes(&gqt).unwrap();
     assert_eq!(
         crate::gqt_record::parse(&canonical).unwrap(),
-        crate::gqt_record::AnyRunRecordV1::Gqt(gqt.clone())
+        crate::gqt_record::AnyRunRecordV1::Gqt(Box::new(gqt.clone()))
     );
     crate::archive::publish_record(&archive, &legacy).unwrap();
     let receipt = crate::archive::publish_record(&archive, &gqt).unwrap();
@@ -935,7 +958,7 @@ fn raw_dataset_plan_needs_no_measured_operation_and_unions_query_indexes() {
     .unwrap();
     assert!(indexed.needs_indices);
     assert_eq!(indexed.recipe_sha256, measured.recipe_sha256);
-    assert_eq!(indexed, measured.dataset_build_plan());
+    assert_eq!(indexed, measured.dataset_build_plan().unwrap());
 }
 #[test]
 fn acquisition_receipts_fit_before_dataset_io() {
@@ -973,7 +996,7 @@ fn acquisition_receipts_fit_before_dataset_io() {
 async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() {
     let record = authority_fixture().await;
     let p = plan("tiny-read");
-    let logical = &record.fixture.handoff.summary;
+    let logical = &record.fixture.as_ref().unwrap().handoff.summary;
     let bound = p
         .bind(&logical.logical_content_sha256, &logical.algorithm)
         .unwrap();
@@ -987,17 +1010,18 @@ async fn completed_gqt_prefix_has_one_owner_and_failed_repetition_is_retained() 
         requested_repetitions: 2,
         bound,
         build: crate::runner::build_evidence(None).unwrap(),
-        machine: record.machine,
-        environment: crate::environment::LocalEnvironmentEvidence {
+        machine: record.machine.unwrap(),
+        environment: Some(crate::environment::LocalEnvironmentEvidence {
             filesystem: "apfs".into(),
             storage_class: "nvme-ssd".into(),
             mount_point: "/test".into(),
             storage_protocol: "local".into(),
             available_bytes: 1024,
             probe: "test",
-        },
+        }),
         fixture: record.fixture,
-        dataset_cache_hit: true,
+        dataset_cache_hit: Some(true),
+        server_receipt: None,
         samples: vec![sample.clone()],
         wall_clock: crate::runner::WallClockSummary {
             observed_repetitions: 1,
@@ -1120,4 +1144,88 @@ async fn expected_parameter_error_does_not_claim_a_warming_engine_read() {
     let error = run_sample(&p).await.unwrap_err();
     assert_eq!(error.code, "gqt_prepare_failed");
     assert!(error.context.gqt_settled_sample.is_none());
+}
+
+#[path = "gqt_served_tests.rs"]
+mod served;
+
+#[tokio::test]
+async fn gqt_record_build_rejects_receipts_outside_the_frozen_program() {
+    use crate::gqt_record::GqtSutIdentityV1;
+    use crate::gqt_runner::RunExecution;
+    use crate::runner::{BuildEvidence, WallClockSummary};
+
+    let record = authority_fixture().await;
+    let GqtSutIdentityV1::Embedded(sut) = &record.sut else {
+        panic!("expected embedded fixture");
+    };
+    let build = &sut.build;
+    let plan = plan("tiny-read");
+    let bound = plan
+        .bind(
+            &record.run.run_spec.dataset_logical_digest,
+            &record.run.run_spec.dataset_identity_algorithm,
+        )
+        .unwrap();
+    let wall = &record.measurements.wall_clock;
+    let mut execution = RunExecution {
+        runner_output_version: 1,
+        case_id: record.run.case_id.clone(),
+        case_path: std::path::PathBuf::from("fixture"),
+        point_id: bound.point_id.clone(),
+        point_name: bound.point_name.clone(),
+        requested_repetitions: 1,
+        bound,
+        build: BuildEvidence {
+            source_commit: sut.source_commit.clone(),
+            source_tree_dirty: sut.source_tree_dirty,
+            cargo_profile: build.profile.clone(),
+            cargo_opt_level: build.cargo_opt_level.clone(),
+            debug_assertions: build.debug_assertions,
+            effective_lance_mem_pool_size: sut.engine.lance_mem_pool_size.clone(),
+            target_triple: build.target_triple.clone(),
+            rustc_version: build.rustc_version.clone(),
+            declared_release_lto: build.declared_release_lto.clone(),
+            declared_release_codegen_units: build.declared_release_codegen_units,
+            declared_release_strip: build.declared_release_strip,
+            cargo_encoded_rustflags_present: build.cargo_encoded_rustflags_present,
+            release_profile_environment_overrides_supported: build
+                .release_profile_environment_overrides_supported,
+            effective_codegen_options_proved: build.effective_codegen_options_proved,
+            engine_feature_flags: sut.engine.feature_flags.clone(),
+            enabled_techniques: sut.engine.enabled_techniques.clone(),
+            worker_executable_sha256: Some(build.worker_executable_sha256.clone()),
+        },
+        machine: record.machine.clone().unwrap(),
+        environment: Some(crate::environment::LocalEnvironmentEvidence {
+            filesystem: "apfs".into(),
+            storage_class: "nvme-ssd".into(),
+            mount_point: "/fixture".into(),
+            storage_protocol: "fixture".into(),
+            available_bytes: 1,
+            probe: "fixture",
+        }),
+        fixture: record.fixture.clone(),
+        dataset_cache_hit: record.dataset_cache_hit,
+        server_receipt: None,
+        samples: record.measurements.raw_samples.clone(),
+        wall_clock: WallClockSummary {
+            observed_repetitions: 1,
+            min_us: wall.min_us,
+            p50_us: wall.p50_us,
+            max_us: wall.max_us,
+            p95_us: wall.p95_us,
+            p95_supported: wall.p95_supported,
+        },
+        durable_record: false,
+    };
+    crate::gqt_record::build(&execution, record.invocation.clone(), None).unwrap();
+    let suffix = execution.samples[0].steps.last_mut().unwrap();
+    assert!(suffix.ordinal > execution.bound.identity.measured_step.ordinal);
+    suffix.ordinal = 999;
+    let error = crate::gqt_record::build(&execution, record.invocation, None).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown receipt ordinal"),
+        "{error}"
+    );
 }

@@ -119,12 +119,17 @@ impl Scenario {
             .clone()
             .or_else(|| defaults.environment.clone())
             .unwrap_or_else(local_environment);
-        let reset = match environment.backend {
-            Backend::LocalFs {
-                filesystem: LocalFilesystem::Apfs,
-                ..
-            } => ResetMode::LocalClonefile,
-            _ => ResetMode::PlainCopy,
+        let served = environment.target == crate::gqt_case::Target::Server;
+        let reset = if served {
+            ResetMode::None
+        } else {
+            match environment.backend {
+                Backend::LocalFs {
+                    filesystem: LocalFilesystem::Apfs,
+                    ..
+                } => ResetMode::LocalClonefile,
+                _ => ResetMode::PlainCopy,
+            }
         };
         let protocol = Protocol {
             deadline_seconds: self
@@ -135,7 +140,11 @@ impl Scenario {
                 .protocol
                 .attribution
                 .or(defaults.protocol.attribution)
-                .unwrap_or(Attribution::PerPhase),
+                .unwrap_or(if served {
+                    Attribution::Off
+                } else {
+                    Attribution::PerPhase
+                }),
             schedule: self
                 .protocol
                 .schedule
@@ -171,16 +180,14 @@ impl Scenario {
 }
 
 pub fn local_environment() -> GqtEnvironment {
-    GqtEnvironment {
-        backend: Backend::LocalFs {
-            filesystem: if cfg!(target_os = "macos") {
-                LocalFilesystem::Apfs
-            } else {
-                LocalFilesystem::Xfs
-            },
-            storage_class: LocalStorageClass::NvmeSsd,
+    GqtEnvironment::embedded(Backend::LocalFs {
+        filesystem: if cfg!(target_os = "macos") {
+            LocalFilesystem::Apfs
+        } else {
+            LocalFilesystem::Xfs
         },
-    }
+        storage_class: LocalStorageClass::NvmeSsd,
+    })
 }
 
 #[derive(Debug, Clone)]

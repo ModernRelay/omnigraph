@@ -1,8 +1,8 @@
 //! Strict scenario dispatch. Historical definitions remain readable; new runs use GQT.
 pub use crate::legacy::case::{
     Attribution, Backend, CacheCondition, EnginePreparation, LocalFilesystem, LocalStorageClass,
-    PageCacheCondition, ProcessLifecycle, Protocol, ResetMode, S3Implementation, S3Versioning,
-    Schedule, Timer, WarmupProgram,
+    NetworkPosition, PageCacheCondition, ProcessLifecycle, Protocol, ResetMode, S3Implementation,
+    S3Versioning, Schedule, Timer, WarmupProgram,
 };
 use crate::model::{Diagnostic, ValidationOutcome};
 use serde::{Deserialize, Serialize};

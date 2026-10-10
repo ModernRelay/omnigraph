@@ -1,0 +1,54 @@
+# issue: none
+# notes: A `--- params generate` recipe supplies a step's parameters: a key
+# notes: from a Zipf endpoint over one value and a 4-byte Blob generated from
+# notes: `{kind: blob}`, the same `base64:` text a literal body would carry. The
+# notes: insert lands under the generated key and a read filtered by the same
+# notes: recipe finds it, in this process, in every DST worker, which generates
+# notes: the values itself, and through omnigraph-server's request body.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: Blob?
+}
+
+--- seed
+
+--- mutate
+query put($slug: String, $body: Blob) {
+    insert Doc { slug: $slug, body: $body }
+}
+
+--- params generate: v1 seed: 0
+params:
+  slug: {kind: endpoint, prefix: doc-, width: 2, population: 1, distribution: {kind: zipf, exponent: 1.25}}
+  body: {kind: blob, byte: 7, length: 4}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query by_slug($slug: String) {
+    match { $d: Doc { slug: $slug } }
+    return { $d.slug }
+}
+
+--- params generate: v1 seed: 0
+params:
+  slug: {kind: endpoint, prefix: doc-, width: 2, population: 1, distribution: {kind: zipf, exponent: 1.25}}
+
+--- expect unordered
+{"d.slug": "doc-00"}
+
+--- expect shape
+d.slug: String

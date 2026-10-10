@@ -390,11 +390,13 @@ pub struct CacheCondition {
 #[serde(rename_all = "kebab-case")]
 pub enum ProcessLifecycle {
     FreshPerRepetition,
+    LongRunningServer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnginePreparation {
+    Uncontrolled,
     PreparationOnly,
     WarmedByProgram,
     ReopenedAfterProgram,
@@ -453,6 +455,7 @@ pub enum Schedule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResetMode {
+    None,
     PlainCopy,
     LocalClonefile,
     S3Versioning,
@@ -657,6 +660,7 @@ fn normalize_identity_strings(case: &mut CaseV1) {
 impl CacheCondition {
     pub(crate) fn display_label(&self) -> &'static str {
         match self.engine {
+            EnginePreparation::Uncontrolled => "server-uncontrolled",
             EnginePreparation::PreparationOnly => "process-cold",
             EnginePreparation::WarmedByProgram => "warm",
             EnginePreparation::ReopenedAfterProgram => "post-reopen",
@@ -893,7 +897,15 @@ fn validate_indexes(
 }
 
 fn validate_cache_condition(condition: &CacheCondition, diagnostics: &mut Vec<Diagnostic>) {
-    let ProcessLifecycle::FreshPerRepetition = condition.process;
+    if condition.process != ProcessLifecycle::FreshPerRepetition
+        || condition.engine == EnginePreparation::Uncontrolled
+    {
+        diagnostics.push(Diagnostic::error(
+            "unsupported_cache_condition",
+            "environment.cache_condition",
+            "legacy cases require a fresh embedded process",
+        ));
+    }
     if condition.iterations > MAX_WARMUP_ITERATIONS {
         diagnostics.push(Diagnostic::error(
             "warmup_iteration_budget_exceeded",
@@ -902,6 +914,7 @@ fn validate_cache_condition(condition: &CacheCondition, diagnostics: &mut Vec<Di
         ));
     }
     match condition.engine {
+        EnginePreparation::Uncontrolled => {}
         EnginePreparation::PreparationOnly => {
             if condition.page_cache != PageCacheCondition::Uncontrolled
                 || condition.program != WarmupProgram::None
