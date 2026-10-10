@@ -316,8 +316,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
 }
 
 /// A bare search order plans the score `Sort` the engine runs, with the
-/// query's limit as its fetch; a fusion plans none, since it orders its own
-/// rows, and each arm keeps every cross-binding conjunct in its own subtree.
+/// query's limit as its fetch; a fusion plans the same `Sort` over its fused
+/// score column, and each arm keeps every cross-binding conjunct in its subtree.
 #[test]
 fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     let bm25 = IRExpr::Bm25 {
@@ -376,15 +376,16 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     );
     let json = plan.to_json();
     assert_eq!(json["node"], "Page");
-    assert_eq!(json["inputs"][0]["node"], "Projection");
-    let fuse = &json["inputs"][0]["inputs"][0];
+    let sort = &json["inputs"][0];
+    assert_eq!(sort["node"], "Sort");
+    assert_eq!(sort["keys"], serde_json::json!(["$c._rrf desc"]));
+    assert_eq!(sort["fetch"], 10);
+    assert_eq!(sort["inputs"][0]["node"], "Projection");
+    let fuse = &sort["inputs"][0]["inputs"][0];
     assert_eq!(fuse["node"], "RankFuse");
     assert_eq!(fuse["limit"], 10);
     assert!(fuse["k"].is_null());
-    assert_eq!(
-        fuse["properties"]["ordering"],
-        serde_json::json!(["rrf($c, $c) desc"])
-    );
+    assert!(fuse["properties"]["ordering"].is_null());
     let arms = fuse["inputs"].as_array().expect("two arm inputs");
     assert_eq!(arms.len(), 2);
     assert_ne!(arms[0]["id"], arms[1]["id"]);
@@ -416,10 +417,12 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     assert_ne!(arms[0]["inputs"][1]["id"], arms[1]["inputs"][1]["id"]);
     assert_eq!(arms[0]["inputs"][1]["ranked"]["fetch"], 10);
     assert!(arms[1]["inputs"][1]["ranked"]["fetch"].is_null());
-    assert!(
-        !plan
-            .live()
-            .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+    assert_eq!(
+        plan.live()
+            .filter(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+            .count(),
+        1,
+        "one Sort above the fusion, none inside an arm"
     );
 }
 

@@ -86,10 +86,12 @@ partitions probed per index delta; `null` is no cap) and `scope` (`order`
 for the query's own order, `primary` or `secondary` for an arm of `rrf()`). A
 physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` and
-`row_tiebreak`. These downstream row keys follow the arm's score and fused node
-ID; selected edges use `$e.@type` before `$e.@id`. Fusion still scores the
-ranked node by its ID. A
+`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` (the
+query's, which sizes the nearest arm's candidate window; the fused rows are
+cut by the `Limit` above the `Sort`) and `row_tiebreak`. These downstream
+row keys follow the arm's score and fused node ID; selected edges use
+`$e.@type` before `$e.@id`. Fusion still scores the ranked node by its ID and
+appends the fused score as `<binding>._rrf`. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
 planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
