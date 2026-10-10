@@ -23,8 +23,8 @@
 use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use crate::storage_layer::{
-    IndexBuildSpec, KEYED_BLOB_PAYLOAD_MAX_BYTES, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
-    KeyedBytes, KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
+    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
+    PendingScanBudget, PendingUsage, ProvenInsertChunk, SnapshotHandle, WriteBudget,
 };
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
@@ -188,6 +188,74 @@ fn blob_person_pk_batch(id: &str, payload: &[u8]) -> RecordBatch {
     .unwrap()
 }
 
+#[test]
+fn write_max_bytes_separates_only_typed_valid_blob_payloads() {
+    let batch = blob_person_pk_batch("one", &vec![0; 4093]);
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 4093);
+    assert!(usage.rows < 4093);
+    assert!(batch.get_array_memory_size() as u64 > 4093);
+    let content = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let null_content = StructArray::new(
+        content.fields().clone(),
+        content.columns().to_vec(),
+        Some(datafusion::arrow::buffer::NullBuffer::from(vec![false])),
+    );
+    let null_batch = RecordBatch::try_new(
+        batch.schema(),
+        vec![batch.column(0).clone(), Arc::new(null_content)],
+    )
+    .unwrap();
+    assert_eq!(super::write_batch_bytes(&null_batch).unwrap().payload, 0);
+    let ordinary = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "bytes",
+            DataType::LargeBinary,
+            false,
+        )])),
+        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            vec![0; 4094].as_slice(),
+        ]))],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&ordinary).unwrap();
+    assert_eq!(usage.payload, 0);
+    assert!(
+        usage.rows > 4093,
+        "ordinary binary bytes stay in the row account"
+    );
+    let mut builder = lance::blob::BlobArrayBuilder::new(3);
+    for _ in 0..3 {
+        builder.push_bytes(vec![0; 2730]).unwrap();
+    }
+    let content = builder.finish().unwrap();
+    let data = content
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .column_by_name("data")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::LargeBinaryArray>()
+        .unwrap();
+    assert!(
+        data.values().capacity() > 8190,
+        "fixture must retain payload capacity slack"
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![lance::blob::blob_field("content", true)])),
+        vec![content],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 8190);
+    assert!(usage.rows < 8190);
+}
+
 fn staged_key_filter(
     staged: &StagedWrite,
 ) -> &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter {
@@ -253,90 +321,26 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
     None
 }
 
-/// A keyed batch charges a managed Blob value's logical length to the payload
-/// ceiling and the Arrow bytes around it to the framing ceiling, so a value of
-/// exactly the payload ceiling fits, though the batch's whole Arrow size is over
-/// it, and one more byte is refused by the payload ceiling. An external
-/// reference's URI is framing: it carries no payload.
-#[test]
-fn keyed_bytes_split_blob_payload_from_framing() {
-    let limit = usize::try_from(KEYED_BLOB_PAYLOAD_MAX_BYTES).unwrap();
-    let exact = blob_person_pk_batch("alice", &vec![7_u8; limit]);
-    let bytes = KeyedBytes::of(&exact).unwrap();
-    assert_eq!(bytes.payload, KEYED_BLOB_PAYLOAD_MAX_BYTES);
-    assert!(bytes.framing > 0, "the batch around a value is never empty");
-    assert_eq!(
-        bytes.framing + bytes.payload,
-        u64::try_from(exact.get_array_memory_size()).unwrap()
-    );
-    assert!(bytes.framing + bytes.payload > KEYED_WRITE_MAX_BYTES);
-    assert_eq!(
-        bytes
-            .ensure_fits("keyed write bytes for node:Person")
-            .unwrap(),
-        bytes
-    );
-
-    let over = blob_person_pk_batch("alice", &vec![7_u8; limit + 1]);
-    match KeyedBytes::of(&over)
-        .unwrap()
-        .ensure_fits("keyed write bytes for node:Person")
-    {
-        Err(OmniError::ResourceLimitExceeded {
-            resource,
-            limit,
-            actual,
-        }) => {
-            assert_eq!(resource, "keyed write Blob payload bytes for node:Person");
-            assert_eq!(
-                (limit, actual),
-                (
-                    KEYED_BLOB_PAYLOAD_MAX_BYTES,
-                    KEYED_BLOB_PAYLOAD_MAX_BYTES + 1
-                )
-            );
-        }
-        other => panic!("one payload byte over must be refused, got {other:?}"),
-    }
-
-    let mut external = lance::blob::BlobArrayBuilder::new(1);
-    external.push_uri("s3://bucket/object.bin").unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        lance::blob::blob_field("content", true),
-    ]));
-    let reference = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["bob"])) as _,
-            external.finish().unwrap(),
-        ],
-    )
-    .unwrap();
-    let bytes = KeyedBytes::of(&reference).unwrap();
-    assert_eq!(bytes.payload, 0);
-    assert_eq!(
-        bytes.framing,
-        u64::try_from(reference.get_array_memory_size()).unwrap()
-    );
-}
-
 #[test]
 fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
     PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64,
-        KeyedBytes {
-            framing: KEYED_WRITE_MAX_BYTES,
-            payload: KEYED_BLOB_PAYLOAD_MAX_BYTES,
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64,
+            bytes: KEYED_WRITE_MAX_BYTES,
+            payload_bytes: 0,
         },
+        WriteBudget::default(),
     ))
-    .expect("the exact keyed row, framing and payload limits are inclusive");
+    .expect("the exact keyed row/byte limits are inclusive");
 
     let row_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64 + 1,
-        KeyedBytes::default(),
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64 + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one row over must be rejected");
@@ -351,8 +355,11 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
 
     let byte_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        0,
-        KeyedBytes::framing(KEYED_WRITE_MAX_BYTES + 1),
+        PendingUsage {
+            bytes: KEYED_WRITE_MAX_BYTES + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one byte over must be rejected");
@@ -364,23 +371,6 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             actual,
         } if resource == "retained keyed batch bytes per operation"
             && actual == KEYED_WRITE_MAX_BYTES + 1
-    ));
-
-    let payload_error = PendingScanAccount::new(PendingScanBudget::new(
-        "test:people",
-        0,
-        KeyedBytes::payload(KEYED_BLOB_PAYLOAD_MAX_BYTES + 1),
-    ))
-    .err()
-    .expect("one payload byte over must be rejected");
-    assert!(matches!(
-        payload_error,
-        OmniError::ResourceLimitExceeded {
-            ref resource,
-            limit: KEYED_BLOB_PAYLOAD_MAX_BYTES,
-            actual,
-        } if resource == "retained keyed batch Blob payload bytes per operation"
-            && actual == KEYED_BLOB_PAYLOAD_MAX_BYTES + 1
     ));
 }
 
@@ -511,6 +501,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
             person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -563,6 +554,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -593,6 +585,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -616,6 +609,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -649,6 +643,7 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -748,6 +743,7 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -806,6 +802,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -833,6 +830,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -924,6 +922,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1040,6 +1039,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1054,6 +1054,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1100,6 +1101,7 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
             person_pk_batch(&[("carol", Some(40))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1110,7 +1112,12 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
     let version_before_rejection = advanced.version().version;
 
     let error = store
-        .stage_proven_strict_insert(advanced, chunk, SYSTEM_COLUMNS_LEGACY)
+        .stage_proven_strict_insert(
+            advanced,
+            chunk,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1163,7 +1170,7 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
     let version_before_rejection = target.version().version;
 
     let error = store
-        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY)
+        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY, WriteBudget::default())
         .await
         .unwrap_err();
     assert!(
@@ -1206,6 +1213,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 )
                 .unwrap(),
                 SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1216,6 +1224,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
                 SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1321,6 +1330,7 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             person_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -1353,6 +1363,7 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             wrong_batch,
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -1376,6 +1387,39 @@ fn proven_insert_delta_scan_never_enables_strict_batch_size() {
 }
 
 #[tokio::test]
+async fn write_max_bytes_proven_insert_compacts_a_single_retained_row() {
+    let schema = person_pk_schema();
+    let parent = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "small".to_string(),
+                "x".repeat(5000),
+            ])),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+        ],
+    )
+    .unwrap();
+    let slice = parent.slice(0, 1);
+    let settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "4093")
+        .unwrap();
+    let budget = WriteBudget::from_settings(&settings);
+    let retained = slice.get_array_memory_size() as u64;
+    assert!(retained > budget.bytes() && retained <= 2 * budget.bytes());
+    let reader = arrow_array::RecordBatchIterator::new([Ok(slice)], schema.clone());
+    let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let output: Vec<_> =
+        super::bounded_proven_insert_stream(schema, raw, "Person".to_string(), budget)
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert!(super::write_batch_bytes(&output[0]).unwrap().rows <= budget.bytes());
+}
+
+#[tokio::test]
 async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
     let schema = person_pk_schema();
     let batches = (0..10)
@@ -1393,11 +1437,15 @@ async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
         .collect::<Vec<_>>();
     let reader = arrow_array::RecordBatchIterator::new(batches, schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let output: Vec<RecordBatch> =
-        super::bounded_proven_insert_stream(schema, raw, "Person".to_string())
-            .try_collect()
-            .await
-            .unwrap();
+    let output: Vec<RecordBatch> = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    )
+    .try_collect()
+    .await
+    .unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 10);
     assert!(u64::try_from(output[0].get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
@@ -1434,7 +1482,12 @@ async fn proven_insert_boundary_normalizer_splits_retained_parent_lazily() {
 
     let reader = arrow_array::RecordBatchIterator::new([Ok(parent)], schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let mut output = super::bounded_proven_insert_stream(schema, raw, "Person".to_string());
+    let mut output = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    );
 
     for _ in 0..3 {
         let batch = output
@@ -1540,7 +1593,11 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 0, KeyedBytes::default()),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage::default(),
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
@@ -1562,7 +1619,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8190, KeyedBytes::default()),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8190,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect("projection containing key_column must succeed");
@@ -1583,7 +1647,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8191, KeyedBytes::default()),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8191,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("pending + unshadowed committed output must share the row budget");

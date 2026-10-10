@@ -1,0 +1,74 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query grouped() {
+    match { $p: Person }
+    return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+}
+--- expect unordered
+{"p.team":"g0","total":450,"mean":45.0,"n":10}
+{"p.team":"g1","total":460,"mean":46.0,"n":10}
+{"p.team":"g2","total":470,"mean":47.0,"n":10}
+{"p.team":"g3","total":480,"mean":48.0,"n":10}
+{"p.team":"g4","total":490,"mean":49.0,"n":10}
+{"p.team":"g5","total":500,"mean":50.0,"n":10}
+{"p.team":"g6","total":510,"mean":51.0,"n":10}
+{"p.team":"g7","total":520,"mean":52.0,"n":10}
+{"p.team":"g8","total":530,"mean":53.0,"n":10}
+{"p.team":"g9","total":540,"mean":54.0,"n":10}
+--- expect shape
+p.team: String
+total: F64
+mean: F64
+n: I64
+
+--- query
+query grouped() {
+    match { $p: Person }
+    return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+}
+--- expect unordered
+{"p.team":"g0","total":450,"mean":45.0,"n":10}
+{"p.team":"g1","total":460,"mean":46.0,"n":10}
+{"p.team":"g2","total":470,"mean":47.0,"n":10}
+{"p.team":"g3","total":480,"mean":48.0,"n":10}
+{"p.team":"g4","total":490,"mean":49.0,"n":10}
+{"p.team":"g5","total":500,"mean":50.0,"n":10}
+{"p.team":"g6","total":510,"mean":51.0,"n":10}
+{"p.team":"g7","total":520,"mean":52.0,"n":10}
+{"p.team":"g8","total":530,"mean":53.0,"n":10}
+{"p.team":"g9","total":540,"mean":54.0,"n":10}
+--- expect shape
+p.team: String
+total: F64
+mean: F64
+n: I64
+
+--- query
+query grouped() {
+    match { $p: Person }
+    return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+}
+--- expect unordered
+{"p.team":"g0","total":450,"mean":45.0,"n":10}
+{"p.team":"g1","total":460,"mean":46.0,"n":10}
+{"p.team":"g2","total":470,"mean":47.0,"n":10}
+{"p.team":"g3","total":480,"mean":48.0,"n":10}
+{"p.team":"g4","total":490,"mean":49.0,"n":10}
+{"p.team":"g5","total":500,"mean":50.0,"n":10}
+{"p.team":"g6","total":510,"mean":51.0,"n":10}
+{"p.team":"g7","total":520,"mean":52.0,"n":10}
+{"p.team":"g8","total":530,"mean":53.0,"n":10}
+{"p.team":"g9","total":540,"mean":54.0,"n":10}
+--- expect shape
+p.team: String
+total: F64
+mean: F64
+n: I64

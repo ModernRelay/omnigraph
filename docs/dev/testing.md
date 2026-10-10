@@ -464,15 +464,18 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 The active performance workload definitions live in GQT under
 [`benchmarks/`](../../benchmarks/README.md). Unsupported maintenance, real
-concurrency, HTTP and streaming instruments are preserved in
+concurrency, historical HTTP and streaming instruments are preserved in
 [`benchmarks/deferred/`](../../benchmarks/deferred/README.md), outside Cargo
 discovery. Cleanup and optimization belong in GQ before GQT can exercise them.
 Historical HTTP records remain readable by `scripts/analyze-http-perf.py` and
-`scripts/analyze-http-retention.py`; acquisition is deferred.
+`scripts/analyze-http-retention.py`; those instruments remain deferred.
+[Read-only served acquisition](../../crates/omnigraph-bench/README.md#served-read-only-acquisition)
+is available for GQT query and traversal workloads.
 
 Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
 
-The benchmark runner executes `gqt-v1` dataset/query pairs through the same
+For embedded execution, the benchmark runner executes `gqt-v1` dataset/query
+pairs through the same
 production core used by GQT correctness tests. It selects one engine operation
 by ordinal and exact header/body echo, then closes its clock and logical
 counters before expectations and subsequent explicit verification. Reads,
@@ -480,12 +483,18 @@ mutations, branch controls, single-call generated loads, and engine restart
 use the same adapter. Bench wall-clock still requires a qualified release
 binary; GQT correctness and DST execution do not acquire benchmark timings.
 
-Every repetition uses a fresh SHA-attested process and restores the dataset
+Every embedded repetition uses a fresh SHA-attested process and restores the dataset
 at its stable active path from a never-opened APFS clonefile or verified
 Linux/XFS copy. The persistent dataset cache holds its lock through worker
 verification and containment. Index requirements are unioned across dataset
 and queries and applied with the seed before updates/deletes. This ordering
 is exercised by the shipped stale-index pairs.
+
+Served read-only programs use a pre-provisioned graph and fresh client workers.
+They do not reset the long-running server. The selected HTTP request and result
+materialization are timed; expectations remain outside the interval. Server
+identity comes from a declared deployment receipt, while server storage counts
+and RSS remain absent. Client build, machine and RSS evidence stay separate.
 
 ```bash
 RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
@@ -500,7 +509,9 @@ cleanup; a later assertion or protocol failure cannot turn Settled timing
 into a passing sample.
 
 `gqt_tests.rs` owns public pair/directory discovery, selection, engine receipts,
-index preparation, and mixed archive/projection coverage. `dataset_identity`,
+index preparation, and mixed archive/projection coverage. `gqt_served_tests.rs`
+owns served admission, client/server evidence separation, protocol containment
+and measured HTTP callback ordering. `dataset_identity`,
 `dataset_cache`, and `dataset_worker` own logical history, cache integrity,
 and contained building; `gqt_runner`, `gqt_supervisor`, and `gqt_protocol` own
 operation boundaries and worker admission. `registered_fixture`, `reset`, and
@@ -525,10 +536,11 @@ explicit logical equivalence. Commands and limits are in the
 [benchmark catalog](../../benchmarks/README.md#registered-finbench-merge).
 
 Do not archive diagnostic JSON as telemetry. To publish authoritative
-`suite run` records, first commit the exact source under test, build the release binary from
-that clean tree, and pass `--archive <DIR>`. The commit records source
-provenance; the executable digest and normalized build/engine facts bind the
-exact SUT bytes. Source revalidation compares raw tracked source bytes without
+`suite run` records, build the benchmark client from clean committed source
+and pass `--archive <DIR>`. Its commit, executable digest and build facts
+identify the observed client. For embedded execution these also identify the
+SUT; served SUT facts come from the declared deployment receipt.
+Source revalidation compares raw tracked source bytes without
 Git clean filters, disables replacement objects and permissive stat-cache
 modes, and refuses hidden index flags or ignored untracked source inputs.
 Profile-file LTO/codegen/strip values are declarations, not

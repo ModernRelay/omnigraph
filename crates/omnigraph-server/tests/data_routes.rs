@@ -992,6 +992,33 @@ async fn blob_put_raw_body_bounds_media_type_length_and_deadline() {
         blob_exchange(&app, blob_write_request(Method::PUT, &uri, "after", None)).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_admission_open(&operations, &workload, "after").await;
+
+    // The server's process `write_max_bytes` bounds the value once the body is
+    // read; a `PUT` carries no settings that could change it.
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "4093".to_string())
+    })
+    .unwrap();
+    let lowered = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap()
+            .with_process_defaults(ProcessDefaults { settings, sources }),
+    );
+    let (status, _, body) = blob_exchange(
+        &lowered,
+        blob_write_request(Method::PUT, &uri, vec![7_u8; 4094], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let refused = serde_json::from_slice::<ErrorOutput>(&body)
+        .unwrap()
+        .resource_limit
+        .unwrap();
+    assert_eq!(
+        (refused.resource.as_str(), refused.limit, refused.actual),
+        ("Blob write payload bytes", 4093, 4094)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3333,6 +3360,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "request"
             ),
             show_row(
+                "write_max_bytes",
+                "33554432",
+                "33554432",
+                "default",
+                "request"
+            ),
+            show_row(
                 "history_release_bytes",
                 "262144",
                 "262144",
@@ -3481,6 +3515,86 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         body["rows"][3],
         show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_max_bytes_request_override_reset_and_load_process_default() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "4093".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    for (query, value, source) in [
+        ("show write_max_bytes;", "8191", "request"),
+        (
+            "set write_max_bytes = 6143; show write_max_bytes;",
+            "6143",
+            "file",
+        ),
+        (
+            "reset write_max_bytes; show write_max_bytes;",
+            "4093",
+            "env",
+        ),
+    ] {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({
+                    "query":query, "settings":{"write_max_bytes":8191}
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            show_output(&[show_row(
+                "write_max_bytes",
+                value,
+                "33554432",
+                source,
+                "request"
+            )])
+        );
+    }
+    let head = main_head_commit_id(&app).await;
+    for limit in [0, 33554433] {
+        let (status, body) = json_response(&app, json_post("/mutate", &json!({
+            "query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"refused","age":1},
+            "settings":{"write_max_bytes":limit}
+        }))).await;
+        assert_settings_refusal_needle(status, &body, "1..=33554432");
+    }
+    let data = json!({"type":"Person","data":{"name":"x".repeat(4094),"age":1}}).to_string();
+    for path in ["/load", "/load/ndjson"] {
+        let request = if path == "/load/ndjson" {
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(data.clone()))
+                .unwrap()
+        } else {
+            json_post(path, &json!({"branch":"main","mode":"append","data":data}))
+        };
+        let (status, body) = json_response(&app, request).await;
+        assert!(!status.is_success(), "{path}: {body}");
+        assert!(body.to_string().contains("4093"), "{path}: {body}");
+        assert_eq!(main_head_commit_id(&app).await, head);
+    }
+    let (status, body) = json_response(&app, json_post("/mutate", &json!({
+        "query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"x".repeat(4094),"age":1},
+        "settings":{"write_max_bytes":33554432}
+    }))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a request may raise an environment default: {body}"
     );
 }
 

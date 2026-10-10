@@ -520,6 +520,9 @@ impl GraphClient {
                     request.traversal_work_limit =
                         Some(given.get(SettingId::TraversalWorkLimit).parse()?)
                 }
+                SettingId::WriteMaxBytes => {
+                    request.write_max_bytes = Some(given.get(SettingId::WriteMaxBytes).parse()?)
+                }
                 SettingId::HistoryReleaseBytes => {
                     request.history_release_bytes =
                         Some(given.get(SettingId::HistoryReleaseBytes).parse()?)
@@ -2758,9 +2761,12 @@ mod tests {
         ]);
         let client =
             GraphClient::managed(&server.origin, "knowledge", "data-credential".into()).unwrap();
-        let settings =
-            parse_set_flags(&["merge_lineage=off".to_string(), "ann_nprobes=1".to_string()])
-                .unwrap();
+        let settings = parse_set_flags(&[
+            "merge_lineage=off".to_string(),
+            "ann_nprobes=1".to_string(),
+            "write_max_bytes=4093".to_string(),
+        ])
+        .unwrap();
         client
             .query(
                 ReadTarget::branch("main"),
@@ -2803,7 +2809,7 @@ mod tests {
         assert!(requests[4].body.get("query_source").is_none());
         assert!(requests[4].body.get("query_name").is_none());
         assert!(requests[4].body.get("settings").is_none());
-        let field = json!({"merge_lineage": "off", "ann_nprobes": 1});
+        let field = json!({"merge_lineage": "off", "ann_nprobes": 1, "write_max_bytes": 4093});
         assert_eq!(requests[0].path, "/graphs/knowledge/query");
         assert_eq!(requests[0].body["settings"], field);
         assert_eq!(

@@ -8,7 +8,7 @@ use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
 use crate::session::Session;
-use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle};
+use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, WriteBudget};
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 
@@ -342,9 +342,9 @@ fn typed_list_literal_to_array(
 }
 
 /// Build a single-element blob array from a URI or base64 value string.
-fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
+fn build_blob_array_from_value(value: &str, write_budget: WriteBudget) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(1);
-    append_blob_value(&mut builder, value)?;
+    append_blob_value(&mut builder, value, write_budget)?;
     builder.finish().map_err(OmniError::lance_internal)
 }
 
@@ -357,6 +357,33 @@ pub(super) fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
     builder.finish().map_err(OmniError::lance_internal)
 }
 
+fn preflight_blob_assignments(
+    assignments: &HashMap<String, Literal>,
+    blob_properties: &HashSet<String>,
+    rows: usize,
+    write_budget: WriteBudget,
+) -> Result<()> {
+    let mut bytes = 0_u64;
+    for property in blob_properties {
+        if let Some(Literal::String(value)) = assignments.get(property)
+            && let Some(encoded) = value.strip_prefix("base64:")
+        {
+            bytes = bytes
+                .checked_add(crate::loader::decoded_blob_bytes(encoded)?)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("Blob assignment byte count overflow")
+                })?;
+        }
+    }
+    let bytes =
+        bytes
+            .checked_mul(u64::try_from(rows).map_err(|_| {
+                OmniError::manifest_internal("Blob assignment row count exceeds u64")
+            })?)
+            .ok_or_else(|| OmniError::manifest_internal("Blob assignment byte count overflow"))?;
+    write_budget.check("decoded blob input bytes per operation", bytes)
+}
+
 /// Build a single-row RecordBatch from resolved assignments.
 fn build_insert_batch(
     schema: &SchemaRef,
@@ -364,7 +391,9 @@ fn build_insert_batch(
     assignments: &HashMap<String, Literal>,
     blob_properties: &HashSet<String>,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
+    preflight_blob_assignments(assignments, blob_properties, 1, write_budget)?;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
@@ -372,7 +401,7 @@ fn build_insert_batch(
             columns.push(Arc::new(StringArray::from(vec![id])));
         } else if blob_properties.contains(field.name()) {
             if let Some(Literal::String(uri)) = assignments.get(field.name()) {
-                columns.push(build_blob_array_from_value(uri)?);
+                columns.push(build_blob_array_from_value(uri, write_budget)?);
             } else if field.is_nullable() {
                 columns.push(build_null_blob_array(1)?);
             } else {
@@ -457,7 +486,9 @@ fn apply_assignments(
     batch: &RecordBatch,
     assignments: &HashMap<String, Literal>,
     blob_properties: &HashSet<String>,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
+    preflight_blob_assignments(assignments, blob_properties, batch.num_rows(), write_budget)?;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
@@ -465,7 +496,7 @@ fn apply_assignments(
                 Some(Literal::String(uri)) => {
                     let mut builder = BlobArrayBuilder::new(batch.num_rows());
                     for _ in 0..batch.num_rows() {
-                        append_blob_value(&mut builder, uri)?;
+                        append_blob_value(&mut builder, uri, write_budget)?;
                     }
                     builder.finish().map_err(OmniError::lance_internal)?
                 }
@@ -839,6 +870,7 @@ impl Session {
             expected_head,
             settings.stage_write_concurrency(),
             HistoryReleaseBytes(settings.history_release_bytes()),
+            WriteBudget::from_settings(&settings),
         )
         .await
     }
@@ -881,6 +913,7 @@ impl Omnigraph {
         expected_head: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -901,6 +934,7 @@ impl Omnigraph {
                     history_release_bytes,
                     attempt == 0,
                     &mut retryable,
+                    write_budget,
                 )
                 .await
             {
@@ -935,6 +969,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
         retryable: &mut bool,
+        write_budget: WriteBudget,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         // Capture one branch-wide write authority: native branch identity,
@@ -976,7 +1011,7 @@ impl Omnigraph {
         // base (RFC 0067). The publisher then makes the complete result
         // graph-visible in one manifest CAS. Branch is threaded explicitly — no
         // coordinator swap.
-        let mut staging = MutationStaging::default();
+        let mut staging = MutationStaging::new(write_budget);
 
         // Lower + validate up front so the touched-dataset set is known before
         // execution. A lowering/validation error returns exactly as it did
@@ -1256,6 +1291,7 @@ impl Omnigraph {
                     &resolved,
                     &blob_props,
                     catalog.system_columns,
+                    staging.write_budget(),
                 )?;
                 let has_key = node_type.key.is_some();
                 let table_key = format!("node:{}", type_name);
@@ -1344,6 +1380,7 @@ impl Omnigraph {
                     &resolved,
                     &blob_props,
                     catalog.system_columns,
+                    staging.write_budget(),
                 )?;
                 let has_key = edge_type.key.is_some();
                 let table_key = format!("edge:{}", type_name);
@@ -1425,6 +1462,7 @@ impl Omnigraph {
         // property is refused even when the predicate matches no row.
         let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
         let blob_props = node_type.blob_properties.clone();
+        preflight_blob_assignments(&resolved, &blob_props, 1, staging.write_budget())?;
         // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
         let assigned_blobs = schema
             .fields()
@@ -1469,8 +1507,11 @@ impl Omnigraph {
         // batches via DataFusion `MemTable` (read-your-writes for prior ops in
         // this query). The pending side may include rows from earlier
         // `insert` / `update` ops on the same table.
-        let (pending_rows, pending_bytes) = staging.pending_resource_usage(&table_key)?;
-        let scan_budget = PendingScanBudget::new(&table_key, pending_rows, pending_bytes);
+        let scan_budget = PendingScanBudget::new(
+            &table_key,
+            staging.pending_resource_usage(&table_key)?,
+            staging.write_budget(),
+        );
         let pending_batches = staging.pending_batches(&table_key);
         let pending_schema = staging.pending_schema(&table_key);
         // Use merge semantics on the union: a committed row whose `id`
@@ -1522,7 +1563,13 @@ impl Omnigraph {
 
         let affected_count = matched.num_rows();
 
-        let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
+        let updated = apply_assignments(
+            &schema,
+            &matched,
+            &resolved,
+            &blob_props,
+            staging.write_budget(),
+        )?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
         // Accumulate the updated batch into the Merge-mode pending stream.

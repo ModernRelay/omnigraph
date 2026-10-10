@@ -674,6 +674,19 @@ fn blob_put_and_clear_write_receipts_and_refuse_bad_input_before_scope() {
     );
     output_failure(&mut blob("get", readme));
 
+    // The process's `write_max_bytes` bounds the value a `--store` put writes.
+    let lowered = output_failure(
+        blob("put", edge)
+            .env("OMNIGRAPH_WRITE_MAX_BYTES", "4093")
+            .write_stdin(vec![7_u8; 4094])
+            .arg("--json"),
+    );
+    assert_eq!(
+        parse_stdout_json(&lowered)["resource_limit"],
+        json!({"resource": "Blob write payload bytes", "limit": 4093, "actual": 4094})
+    );
+    assert_eq!(get(edge), b"from stdin");
+
     // Refused before the graph is addressed: the store does not exist.
     let absent = temp.path().join("absent.omni");
     let unreachable = |verb: &str| {

@@ -672,7 +672,6 @@ async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_eff
 
 const OPERATION_BYTES: u64 = 32 * 1024 * 1024;
 const KEYED_BATCH_BYTES: &str = "retained keyed batch bytes per operation";
-const KEYED_BATCH_PAYLOAD_BYTES: &str = "retained keyed batch Blob payload bytes per operation";
 const REMOVED_ID_BYTES: &str = "retained removed-id bytes per operation";
 
 fn operation_refusal(error: &OmniError, label: &str) -> bool {
@@ -892,29 +891,17 @@ edge LinkZ: Zed -> Zed { n: I32? }
     );
 }
 
-/// External payload to be copied joins the operation's Blob payload allowance
-/// with managed payload, before any payload read: 12 MiB copied plus 21 MiB
-/// managed is refused although each fits. Retained rows have their own
-/// allowance, so 24 MiB copied plus 10 MiB of rows fits.
-/// Rust, not GQT: MiB-scale inputs and the payload-read probe are outside the case format.
+/// The read probe distinguishes payload admission from a late staging refusal.
 #[tokio::test]
-async fn external_blob_bytes_join_the_operation_payload_allowance_before_any_payload_read() {
-    use base64::Engine;
-
-    const SCHEMA: &str = "\
-node Document { title: String @key content: Blob? note: String? }
-node Image { title: String @key content: Blob? note: String? }
-";
-
+async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_reading() {
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? note: String? }\nnode Image { title: String @key content: Blob? }";
     let dir = tempfile::tempdir().unwrap();
     let external_path = dir.path().join("payload.blob");
-    let file = std::fs::File::create(&external_path).unwrap();
-    file.set_len(12 * 1024 * 1024).unwrap();
-    drop(file);
+    std::fs::write(&external_path, vec![0; 2048]).unwrap();
     let external_uri = format!("file://{}", external_path.display());
     let policy = ExternalBlobPolicy::allow(vec![
         ExternalBlobBase::new(
-            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            url::Url::from_directory_path(dir.path()).unwrap(),
             ExternalBlobExecutionScope::EmbeddedOnly,
         )
         .unwrap(),
@@ -929,142 +916,78 @@ node Image { title: String @key content: Blob? note: String? }
             .with_external_blob_policy(policy)
             .unwrap(),
     );
-    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
     let files = files_under(&graph_path);
-
-    let managed = format!(
-        "base64:{}",
-        base64::engine::general_purpose::STANDARD.encode(vec![7_u8; 21 * 1024 * 1024])
-    );
     let stage_probes = StageWriteProbes::rendezvous(1);
     let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let source = r#"set write_max_bytes = 8191;
+        query mixed($uri: String, $inline: Blob) {
+            insert Document { title: "one", content: $uri }
+            insert Document { title: "two", content: $uri }
+            insert Image { title: "three", content: $inline }
+        }"#;
+    use base64::Engine as _;
+    let inline = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4096])
+    );
     let error = with_stage_write_probes(
         stage_probes.clone(),
         omnigraph::instrumentation::with_merge_write_probes(
             read_probes.clone(),
             db.mutate(
                 "main",
-                r#"query wide($uri: String, $managed: Blob) {
-                    insert Document { title: "one", content: $uri }
-                    insert Image { title: "two", content: $managed }
-                }"#,
-                "wide",
-                &params(&[("$uri", &external_uri), ("$managed", &managed)]),
+                source,
+                "mixed",
+                &params(&[("$uri", &external_uri), ("$inline", &inline)]),
             ),
         ),
     )
     .await
-    .expect_err("copied and managed payloads must share one operation allowance");
+    .unwrap_err();
     assert!(
-        operation_refusal(&error, KEYED_BATCH_PAYLOAD_BYTES),
-        "unexpected refusal: {error:?}"
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                limit: 8191,
+                actual: 8192,
+                ..
+            }
+        ),
+        "{error:?}"
     );
     assert_eq!(
         read_probes.blob_payload_read_calls(),
         0,
-        "aggregate admission must precede every external payload read"
+        "inline and external admission precedes GET"
     );
-    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(stage_probes.entered(), 0);
     assert_eq!(files_under(&graph_path), files);
     assert_eq!(
         snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before_manifest
+        before
     );
-    let note = "x".repeat(5 * 1024 * 1024);
-    let accepted = db
-        .mutate(
+
+    let inline = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4095])
+    );
+    let accepted = omnigraph::instrumentation::with_merge_write_probes(
+        read_probes.clone(),
+        db.mutate(
             "main",
-            r#"query wide($uri: String, $note: String) {
-                insert Document { title: "one", content: $uri, note: $note }
-                insert Image { title: "two", content: $uri, note: $note }
-            }"#,
-            "wide",
-            &params(&[("$uri", &external_uri), ("$note", &note)]),
-        )
-        .await
-        .expect("24 MiB copied and 10 MiB of rows fit under separate allowances");
-    assert_eq!(accepted.affected_nodes, 2);
-}
-
-/// Three equal payloads leave a LargeBinary buffer at 4/3 of its content, and
-/// the unused capacity, about 8.1 MiB over both types, is framing. With 13 MiB
-/// of rows per type the predicted framing, 26 MiB, fits; the materialized
-/// framing, about 34.1 MiB, does not. Rust, not GQT: MiB-scale inputs, builder
-/// capacity.
-#[tokio::test]
-async fn materialized_blob_batches_are_rechecked_against_the_operation_allowance_before_staging() {
-    const SCHEMA: &str = "\
-node Document { title: String @key content: Blob? note: String? }
-node Image { title: String @key content: Blob? note: String? }
-";
-
-    let dir = tempfile::tempdir().unwrap();
-    let external_path = dir.path().join("payload.blob");
-    let file = std::fs::File::create(&external_path).unwrap();
-    file.set_len(4 * 1024 * 1024 + 64 * 1024).unwrap();
-    drop(file);
-    let external_uri = format!("file://{}", external_path.display());
-    let policy = ExternalBlobPolicy::allow(vec![
-        ExternalBlobBase::new(
-            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
-            ExternalBlobExecutionScope::EmbeddedOnly,
-        )
-        .unwrap(),
-    ])
-    .unwrap();
-    let graph_dir = tempfile::tempdir().unwrap();
-    let graph_path = graph_dir.path().join("graph");
-    let db = helpers::session(
-        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy)
-            .unwrap(),
-    );
-    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
-    let files = files_under(&graph_path);
-
-    let stage_probes = StageWriteProbes::rendezvous(1);
-    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let error = with_stage_write_probes(
-        stage_probes.clone(),
-        omnigraph::instrumentation::with_merge_write_probes(
-            read_probes.clone(),
-            db.mutate(
-                "main",
-                r#"query thrice($uri: String, $note: String) {
-                    insert Document { title: "a", content: $uri, note: $note }
-                    insert Document { title: "b", content: $uri }
-                    insert Document { title: "c", content: $uri }
-                    insert Image { title: "a", content: $uri, note: $note }
-                    insert Image { title: "b", content: $uri }
-                    insert Image { title: "c", content: $uri }
-                }"#,
-                "thrice",
-                &params(&[
-                    ("$uri", &external_uri),
-                    ("$note", &"x".repeat(13 * 1024 * 1024)),
-                ]),
-            ),
+            source,
+            "mixed",
+            &params(&[("$uri", &external_uri), ("$inline", &inline)]),
         ),
     )
     .await
-    .expect_err("materialized batches must be summed across tables before staging");
-    assert!(
-        operation_refusal(&error, KEYED_BATCH_BYTES),
-        "unexpected refusal: {error:?}"
-    );
+    .expect("8191 payload bytes plus independent scalar rows fit");
+    assert_eq!(accepted.affected_nodes, 3);
     assert_eq!(
         read_probes.blob_payload_read_calls(),
-        2,
-        "the pre-read estimate admits this operation; only the re-check after reading refuses"
-    );
-    assert_eq!(stage_probes.entered(), 0);
-    assert_eq!(files_under(&graph_path), files);
-    assert_eq!(
-        snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before_manifest
+        1,
+        "fetch caching preserves repeated-reference charging"
     );
 }
 
@@ -1240,8 +1163,7 @@ query update_note($note: String) {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "retained keyed batch Blob payload bytes per operation"
-                && actual == LIMIT + 1
+            } if resource == "materialized blob payload bytes" && actual > LIMIT
         ),
         "oversized update blob must be rejected before payload read, got {error:?}"
     );
@@ -1304,187 +1226,6 @@ query replace_content($c: Blob) {
     )
     .await;
     assert_eq!(&bytes[..], &[1, 2, 3]);
-
-    // The payload ceiling is inclusive: an external cell of exactly the limit
-    // is carried beside its row, read once and stored as managed bytes.
-    let exact_path = dir.path().join("exact.blob");
-    let file = std::fs::File::create(&exact_path).unwrap();
-    file.set_len(LIMIT).unwrap();
-    drop(file);
-    let exact_row = serde_json::json!({
-        "type": "Document",
-        "data": {
-            "title": "wide",
-            "content": format!("file://{}", exact_path.display()),
-        }
-    })
-    .to_string();
-    db.load_jsonl(&exact_row, LoadMode::Overwrite)
-        .await
-        .unwrap();
-    db.mutate(
-        "main",
-        UPDATE,
-        "update_note",
-        &params(&[("$note", "carried")]),
-    )
-    .await
-    .expect("an external cell of exactly the payload ceiling is carried");
-    let bytes = read_managed_blob_bytes(
-        &db,
-        ReadTarget::branch("main"),
-        node_blob_cell("Document", "wide", "content"),
-    )
-    .await;
-    assert_eq!(bytes.len(), usize::try_from(LIMIT).unwrap());
-    assert!(bytes.iter().all(|&byte| byte == 0));
-}
-
-/// A managed Blob value of exactly the payload ceiling fits beside its row:
-/// payload and framing have separate ceilings, and the compatibility loader's
-/// pre-decode forecast splits like the batch check, by the declared property
-/// types, so a `String` that starts with `base64:` stays framing. One more
-/// byte is refused before any graph or table effect. The strict NDJSON loader
-/// bounds its encoded line instead, so the exact-limit value's 44.7 MB line
-/// is refused. Rust: this owner reads the stored bytes back, asserts nothing
-/// moved on refusal and probes the compatibility loader, which GQT reaches
-/// only through generated loads capped at 16 MiB per batch; a GQT case would
-/// carry the 44.7 MB parameter as literal text.
-#[tokio::test]
-async fn exact_limit_blob_payload_fits_beside_its_row_and_one_more_byte_is_refused() {
-    use base64::Engine;
-
-    const LIMIT: usize = 32 * 1024 * 1024;
-    const SCHEMA: &str = "node Document { title: String @key note: String? content: Blob? }\n";
-    const INSERT: &str = r#"
-query put_doc($title: String, $c: Blob) {
-    insert Document { title: $title, content: $c }
-}
-
-query put_noted($title: String, $note: String, $c: Blob) {
-    insert Document { title: $title, note: $note, content: $c }
-}
-"#;
-    let encode = |bytes: usize| {
-        format!(
-            "base64:{}",
-            base64::engine::general_purpose::STANDARD.encode(vec![7_u8; bytes])
-        )
-    };
-    let row = |title: &str, content: &str| {
-        serde_json::json!({"type": "Document", "data": {"title": title, "content": content}})
-            .to_string()
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let db = helpers::session(
-        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap(),
-    );
-
-    let exact = encode(LIMIT);
-    db.mutate(
-        "main",
-        INSERT,
-        "put_doc",
-        &params(&[("$title", "inserted"), ("$c", &exact)]),
-    )
-    .await
-    .expect("an insert admits an exact-limit value");
-    db.load_jsonl(&row("loaded", &exact), LoadMode::Merge)
-        .await
-        .expect("the compatibility loader admits an exact-limit value");
-    for title in ["inserted", "loaded"] {
-        let bytes = read_managed_blob_bytes(
-            &db,
-            ReadTarget::branch("main"),
-            node_blob_cell("Document", title, "content"),
-        )
-        .await;
-        assert_eq!(bytes.len(), LIMIT, "{title}");
-        assert!(bytes.iter().all(|&byte| byte == 7), "{title}");
-    }
-
-    // A 24 MiB Blob beside a String whose text starts with `base64:` and holds
-    // 12 MiB more: the String is framing to both the mutation and the
-    // loader's forecast, so each admits the row. Counting the String's
-    // decoded 9 MiB as payload would refuse it at 33 MiB.
-    let blob = encode(24 * 1024 * 1024);
-    let note = format!("base64:{}", "A".repeat(12 * 1024 * 1024));
-    db.mutate(
-        "main",
-        INSERT,
-        "put_noted",
-        &params(&[("$title", "noted"), ("$note", &note), ("$c", &blob)]),
-    )
-    .await
-    .expect("a String that looks like base64 is framing to a mutation");
-    db.load_jsonl(
-        &serde_json::json!({"type": "Document", "data": {
-            "title": "noted-load", "note": note, "content": blob}})
-        .to_string(),
-        LoadMode::Merge,
-    )
-    .await
-    .expect("a String that looks like base64 is framing to the loader's forecast");
-    for title in ["noted", "noted-load"] {
-        assert_eq!(
-            read_managed_blob_bytes(
-                &db,
-                ReadTarget::branch("main"),
-                node_blob_cell("Document", title, "content"),
-            )
-            .await
-            .len(),
-            24 * 1024 * 1024,
-            "{title}"
-        );
-    }
-
-    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
-    let strict = db
-        .load_graph_batch("main", &row("strict", &exact), LoadMode::Merge)
-        .await
-        .expect_err("the strict loader bounds the encoded line");
-    assert!(
-        matches!(&strict, OmniError::ResourceLimitExceeded { resource, .. }
-            if resource == "graph_batch_line_bytes"),
-        "{strict:?}"
-    );
-
-    let over = encode(LIMIT + 1);
-    let insert = db
-        .mutate(
-            "main",
-            INSERT,
-            "put_doc",
-            &params(&[("$title", "over"), ("$c", &over)]),
-        )
-        .await
-        .expect_err("one more byte is refused");
-    let load = db
-        .load_jsonl(&row("over", &over), LoadMode::Merge)
-        .await
-        .expect_err("one more byte is refused");
-    for (error, resource) in [
-        (insert, "decoded blob input bytes"),
-        (
-            load,
-            "keyed parsed entity Blob payload bytes for node:Document",
-        ),
-    ] {
-        assert!(
-            matches!(&error, OmniError::ResourceLimitExceeded { resource: actual_resource, limit, actual }
-                if actual_resource == resource
-                    && *limit == LIMIT as u64
-                    && *actual == LIMIT as u64 + 1),
-            "{error:?}"
-        );
-    }
-    assert_eq!(
-        snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before
-    );
 }
 
 /// A predicate update carrying many rows' Blob cells reads the managed ones in
@@ -1629,26 +1370,29 @@ query update_shelf($note: String) {
     );
 }
 
-/// A Blob put admits a value of exactly 32 MiB and refuses one more byte
-/// before opening a table. The row's other Blob cells are carried by value and
-/// share the operation's payload allowance, so a put whose target and carried
-/// sibling together exceed it is refused before any table effect.
-/// Rust, not GQT: MiB-scale payloads and raw bytes are outside the case format.
+/// A Blob put admits a value of exactly the session's `write_max_bytes`
+/// (32 MiB by default) and refuses one more byte before opening a table. The
+/// row's other Blob cells are carried by value and share the operation's
+/// payload allowance, so a put whose target and carried sibling together
+/// exceed it is refused before any table effect.
+/// Rust, not GQT: the case format has no Blob put step.
 #[tokio::test]
 async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
     use base64::Engine;
+    use omnigraph::settings::{SettingId, SettingValue, Source};
 
-    const LIMIT: usize = 32 * 1024 * 1024;
+    const DEFAULT_LIMIT: usize = 32 * 1024 * 1024;
+    const LOWERED_LIMIT: usize = 4096;
     const SCHEMA: &str = "node Document { title: String @key content: Blob? preview: Blob? }\n";
     let dir = tempfile::tempdir().unwrap();
-    let db = helpers::session(
+    let mut db = helpers::session(
         Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
             .await
             .unwrap(),
     );
     let preview = format!(
         "base64:{}",
-        base64::engine::general_purpose::STANDARD.encode(vec![5_u8; 20 * 1024 * 1024])
+        base64::engine::general_purpose::STANDARD.encode(vec![5_u8; 3000])
     );
     let rows = format!(
         "{}\n{}",
@@ -1657,43 +1401,83 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
     );
     db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
     let cell = |title: &str, property: &str| node_blob_cell("Document", title, property);
+    let refused_put = |error: &OmniError, limit: usize, actual: usize| {
+        matches!(error, OmniError::ResourceLimitExceeded { resource, limit: l, actual: a }
+            if resource == "Blob write payload bytes"
+                && *l == limit as u64
+                && *a == actual as u64)
+    };
 
     db.put_blob_at_as(
         "main",
         cell("lone", "content"),
-        bytes::Bytes::from(vec![7_u8; LIMIT]),
+        bytes::Bytes::from(vec![7_u8; DEFAULT_LIMIT]),
         None,
         None,
     )
     .await
-    .expect("a value of exactly the limit is admitted");
+    .expect("a value of exactly the default limit is admitted");
     let stored =
         read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell("lone", "content")).await;
-    assert_eq!(stored.len(), LIMIT);
-
+    assert_eq!(stored.len(), DEFAULT_LIMIT);
     let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
     let over = db
         .put_blob_at_as(
             "main",
             cell("lone", "content"),
-            bytes::Bytes::from(vec![7_u8; LIMIT + 1]),
+            bytes::Bytes::from(vec![7_u8; DEFAULT_LIMIT + 1]),
             None,
             None,
         )
         .await
         .unwrap_err();
     assert!(
-        matches!(&over, OmniError::ResourceLimitExceeded { resource, limit, actual }
-            if resource == "Blob write payload bytes"
-                && *limit == LIMIT as u64
-                && *actual == LIMIT as u64 + 1),
+        refused_put(&over, DEFAULT_LIMIT, DEFAULT_LIMIT + 1),
+        "{over:?}"
+    );
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        head,
+        "the refusal precedes any graph effect"
+    );
+
+    // A lowered `write_max_bytes` lowers the put's bound and the allowance
+    // the carried sibling shares.
+    db.set(
+        SettingId::WriteMaxBytes,
+        &SettingValue::Integer(LOWERED_LIMIT as i64),
+        Source::File,
+    )
+    .unwrap();
+    db.put_blob_at_as(
+        "main",
+        cell("lone", "content"),
+        bytes::Bytes::from(vec![7_u8; LOWERED_LIMIT]),
+        None,
+        None,
+    )
+    .await
+    .expect("a value of exactly the session's limit is admitted");
+    let head = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let over = db
+        .put_blob_at_as(
+            "main",
+            cell("lone", "content"),
+            bytes::Bytes::from(vec![7_u8; LOWERED_LIMIT + 1]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused_put(&over, LOWERED_LIMIT, LOWERED_LIMIT + 1),
         "{over:?}"
     );
     let carried = db
         .put_blob_at_as(
             "main",
             cell("paired", "content"),
-            bytes::Bytes::from(vec![7_u8; 20 * 1024 * 1024]),
+            bytes::Bytes::from(vec![7_u8; 2000]),
             None,
             None,
         )
@@ -1701,9 +1485,9 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
         .unwrap_err();
     assert!(
         matches!(&carried, OmniError::ResourceLimitExceeded { resource, limit, actual }
-            if resource == "keyed entity Blob payload bytes for node:Document"
-                && *limit == LIMIT as u64
-                && *actual == 40 * 1024 * 1024),
+            if resource == "decoded blob input bytes per operation"
+                && *limit == LOWERED_LIMIT as u64
+                && *actual == 5000),
         "the carried sibling shares the payload allowance: {carried:?}"
     );
     assert_eq!(
