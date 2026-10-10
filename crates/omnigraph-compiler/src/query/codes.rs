@@ -1,6 +1,7 @@
 //! The catalog of query compile diagnostic codes (RFC 0047). A code is
 //! stable once published: its meaning is frozen, its message text may
-//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's; the
+//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's, `P…`
+//! codes the planner's; the
 //! numbering has gaps where earlier stages were withdrawn, and a withdrawn
 //! number is never reused.
 
@@ -69,6 +70,13 @@ codes! {
     T51 = "unknown type";
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
+
+    // Planner.
+    P001 = "a ranking orders a binding a traversal reaches";
+    P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
+    P003 = "the traversal work limit is out of range or recorded twice";
+    P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
+    P005 = "an rrf() ranks two bindings one traversal connects";
 }
 
 #[cfg(test)]
@@ -82,7 +90,10 @@ mod tests {
         for code in ALL {
             assert!(seen.insert(code.as_str()), "duplicate code {code}");
             let (prefix, number) = code.as_str().split_at(1);
-            assert!(matches!(prefix, "Q" | "T"), "{code}: unknown namespace");
+            assert!(
+                matches!(prefix, "Q" | "T" | "P"),
+                "{code}: unknown namespace"
+            );
             assert!(
                 number.parse::<u32>().is_ok(),
                 "{code}: the number must parse"

@@ -6,8 +6,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::QueryDiagnostic;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::codes::{P001, P002, P004, P005};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
@@ -18,7 +20,7 @@ use crate::cost::{
     choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
     scan_row_estimate,
 };
-use crate::error::PlanError;
+use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
     LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
@@ -164,11 +166,13 @@ fn resolve_query(
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
     if ir.has_edge_selections() {
-        let limit = source
-            .traversal_work_limit()
-            .ok_or_else(|| PlanError::Unsupported {
-                detail: "edge selections require a finite traversal_work_limit".to_string(),
-            })?;
+        let limit = source.traversal_work_limit().ok_or_else(|| {
+            PlanError::refused(
+                P002,
+                "edge selections require a finite traversal_work_limit",
+                Some(SET_TRAVERSAL_WORK_LIMIT),
+            )
+        })?;
         let assumptions = Assumptions {
             traversal_work_limit: Some(limit),
             ..Default::default()
@@ -176,10 +180,11 @@ fn resolve_query(
         assumptions.validated_traversal_work_limit()?;
         plan.set_traversal_work_limit(Some(limit));
         if source.traversal() == Traversal::Csr {
-            return Err(PlanError::Unsupported {
-                detail: "edge selections do not support traversal = csr; use auto or indexed"
-                    .to_string(),
-            });
+            return Err(PlanError::refused(
+                P004,
+                "edge selections do not support traversal = csr; use auto or indexed",
+                Some("run the traversal with traversal mode `auto` or `indexed`"),
+            ));
         }
     }
     let QueryIR {
@@ -1150,6 +1155,32 @@ pub fn physical_plan(
 
 /// The nodes of the pipeline under `root` that constrain its rows: every
 /// node reachable from `root` without entering an `AntiJoin`'s inner tree.
+/// Whether a traversal of the top-level pipeline under `root` connects
+/// bindings `a` and `b`, through any chain of `Expand`s.
+fn traversal_connects(plan: &PhysicalPlan, root: NodeId, a: &str, b: &str) -> bool {
+    let edges: Vec<(&str, &str)> = top_level(plan, root)
+        .into_iter()
+        .filter_map(|id| match plan.node(id) {
+            Some(PhysicalNode::Expand { src, dst, .. }) => Some((src.as_str(), dst.as_str())),
+            _ => None,
+        })
+        .collect();
+    let mut reached = vec![a];
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (src, dst) in &edges {
+            for (from, to) in [(src, dst), (dst, src)] {
+                if reached.contains(from) && !reached.contains(to) {
+                    reached.push(to);
+                    grew = true;
+                }
+            }
+        }
+    }
+    reached.contains(&b)
+}
+
 fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
     let mut nodes = Vec::new();
     let mut pending = vec![root];
@@ -2215,11 +2246,23 @@ impl Lowering<'_> {
                 RankKind::Nearest => "nearest",
                 RankKind::Bm25 => "bm25",
             };
-            return Err(PlanError::Unsupported {
-                detail: format!(
-                    "`{function}()` orders `${binding}`, a traversal destination, which engine v2 does not support; order on the traversal's source binding, or match the destination with search()"
-                ),
-            });
+            // Declaring the binding first makes it the component's scan root,
+            // which is ranked; the compiler picks the first-declared binding.
+            return Err(PlanError::Unsupported(Box::new(
+                QueryDiagnostic::plan(
+                    P001,
+                    format!(
+                        "`{function}()` orders `${binding}`, a traversal destination; engine v2 ranks only the binding a traversal starts from"
+                    ),
+                )
+                .with_expression(format!(
+                    "{function}(${binding}.{}, {})",
+                    access.property, access.query
+                ))
+                .with_fix(format!(
+                    "declare `${binding}` first in `match`, so the ranking starts the traversal"
+                )),
+            )));
         }
         self.unmark(scan);
         match self.physical.node_mut(scan) {
@@ -2756,6 +2799,43 @@ impl Lowering<'_> {
                 })?;
                 let limit = limit.and_then(|limit| usize::try_from(limit).ok());
                 let [primary_arm, secondary_arm] = arms.as_ref();
+                if primary_arm.binding != secondary_arm.binding
+                    && traversal_connects(
+                        &self.physical,
+                        primary,
+                        &primary_arm.binding,
+                        &secondary_arm.binding,
+                    )
+                {
+                    // One of two bindings a traversal connects always starts
+                    // it and the other is reached, and engine v2 ranks only the
+                    // binding a traversal starts from: no declaration order
+                    // serves both arms, so the refusal offers none.
+                    let call = |arm: &SearchArm| {
+                        let function = match arm.kind {
+                            RankKind::Nearest => "nearest",
+                            RankKind::Bm25 => "bm25",
+                        };
+                        format!(
+                            "{function}(${}.{}, {})",
+                            arm.binding, arm.property, arm.query
+                        )
+                    };
+                    return Err(PlanError::Unsupported(Box::new(
+                        QueryDiagnostic::plan(
+                            P005,
+                            format!(
+                                "`rrf()` ranks `${}` and `${}`, which one traversal connects; engine v2 ranks only the binding a traversal starts from, so one arm always ranks a traversal destination and no declaration order serves both",
+                                primary_arm.binding, secondary_arm.binding
+                            ),
+                        )
+                        .with_expression(format!(
+                            "rrf({}, {})",
+                            call(primary_arm),
+                            call(secondary_arm)
+                        )),
+                    )));
+                }
                 let mut lowered_arms = Vec::with_capacity(2);
                 let mut bm25_scans = Vec::new();
                 let mut primary_scan = None;
@@ -2977,8 +3057,12 @@ impl Lowering<'_> {
                 ExpandPolicy::Budgeted,
             ));
         }
-        let member = edges.named().ok_or_else(|| PlanError::Unsupported {
-            detail: "edge selections require a finite traversal_work_limit".to_string(),
+        let member = edges.named().ok_or_else(|| {
+            PlanError::refused(
+                P002,
+                "edge selections require a finite traversal_work_limit",
+                Some(SET_TRAVERSAL_WORK_LIMIT),
+            )
         })?;
         let edge_type = &member.edge_type;
         let direction = member.direction;

@@ -36,7 +36,6 @@ use serial_test::serial;
 
 use omnigraph::Session;
 use omnigraph::db::Omnigraph;
-use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::instrumentation::{
     QueryIoProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, with_query_io_probes,
 };
@@ -578,8 +577,11 @@ async fn shape_fence_covers_all_fallback_rows() {
     )
     .await
     .expect_err("engine v2 refuses a ranked order on a traversal destination");
-    assert!(
-        matches!(&refused, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+    assert_eq!(
+        refused
+            .diagnostic()
+            .map(|diagnostic| diagnostic.code.as_str()),
+        Some("P001"),
         "ranked_var_is_expand_dst: the refusal is a user error: {refused:?}"
     );
     assert!(

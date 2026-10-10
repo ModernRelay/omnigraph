@@ -685,25 +685,31 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
 #[test]
 fn issue_659_selection_admission_precedes_lowering_of_outer_named_edges() {
     let op = correlated(alternatives());
-    for (source, expected) in [
-        (source(), "require a finite traversal_work_limit"),
+    for (source, expected, code) in [
+        (source(), "require a finite traversal_work_limit", "P002"),
         (
             source().with_traversal_work_limit(0),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source().with_traversal_work_limit(i64::MAX as u64 + 1),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source()
                 .with_traversal_work_limit(100)
                 .with_traversal(Traversal::Csr),
             "do not support traversal = csr",
+            "P004",
         ),
     ] {
         let error = resolve(&op, &source).unwrap_err();
-        assert!(matches!(error, PlanError::Unsupported { .. }));
+        let PlanError::Unsupported(diagnostic) = &error else {
+            panic!("a refusal by design: {error:?}");
+        };
+        assert_eq!(diagnostic.code.as_str(), code, "{error}");
         assert!(error.to_string().contains(expected), "{error}");
     }
 }

@@ -189,7 +189,7 @@ impl<'a> QuerySource<'a> {
             return Ok(());
         }
         let tables = omnigraph_planner::optimizer::column_statistics_needed(operation, self)
-            .map_err(no_plan)?;
+            .map_err(plan_error)?;
         for type_key in tables {
             let dataset = Arc::new(self.snapshot.open_lance_dataset(&type_key).await?);
             if dataset.manifest().data_storage_format.lance_file_format() == ConcreteFileVersion::V1
@@ -459,6 +459,21 @@ impl PlanSource for QuerySource<'_> {
     }
 }
 
+/// A query shape the planner refuses by design: the caller's error, a bad
+/// request carrying the planner's diagnostic on every door.
+fn unsupported_query(diagnostic: Box<omnigraph_compiler::QueryDiagnostic>) -> OmniError {
+    OmniError::Compiler(omnigraph_compiler::error::CompilerError::Query(diagnostic))
+}
+
+/// A planning failure outside the gate: a refusal by design keeps its
+/// diagnostic, anything else is a planner defect.
+fn plan_error(error: PlanError) -> OmniError {
+    match error {
+        PlanError::Unsupported(diagnostic) => unsupported_query(diagnostic),
+        other => no_plan(other),
+    }
+}
+
 fn no_plan(reason: impl std::fmt::Display) -> OmniError {
     OmniError::manifest_internal(format!(
         "the planner built no plan for this query: {reason}"
@@ -493,7 +508,7 @@ pub(crate) async fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan>
         .map_err(|reason| match source.take_source_failure() {
             Some(error) => error,
             None => match reason {
-                Unrouted::UnsupportedQuery { message } => OmniError::manifest(message),
+                Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
                 reason => no_plan(reason.to_json()),
             },
         })
@@ -525,9 +540,9 @@ pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQ
         }),
         Decision::PendingQuery(_) => Err(no_plan("query finalization remained pending")),
         Decision::Executor {
-            reason: Unrouted::UnsupportedQuery { message },
+            reason: Unrouted::UnsupportedQuery { diagnostic },
             ..
-        } => Err(OmniError::manifest(message)),
+        } => Err(unsupported_query(diagnostic)),
         Decision::Executor { reason, .. } => Err(source
             .take_source_failure()
             .unwrap_or_else(|| no_plan(reason.to_json()))),

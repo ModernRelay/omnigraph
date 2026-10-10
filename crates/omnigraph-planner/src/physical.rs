@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
-use crate::error::PlanError;
+use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
     tiebreak_text,
@@ -19,6 +19,7 @@ use crate::logical::{
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
 use crate::source::SideId;
+use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
 pub type NodeId = usize;
@@ -136,18 +137,24 @@ impl Assumptions {
     /// `1..=i64::MAX`, or wildcard provenance without a captured limit.
     pub fn validated_traversal_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
         if self.settings.contains_key("traversal_work_limit") {
-            return Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry".to_string(),
-            });
+            return Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry",
+                None,
+            ));
         }
         match self.traversal_work_limit {
-            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must be in 1..=i64::MAX".to_string(),
-            }),
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must be in 1..=i64::MAX",
+                Some("set `traversal_work_limit` to a value in 1..=9223372036854775807"),
+            )),
             Some(limit) => Ok(NonZeroU64::new(limit)),
-            None if self.has_wildcard_traversal => Err(PlanError::Unsupported {
-                detail: "wildcard traversal requires a finite traversal_work_limit".to_string(),
-            }),
+            None if self.has_wildcard_traversal => Err(PlanError::refused(
+                P002,
+                "wildcard traversal requires a finite traversal_work_limit",
+                Some(SET_TRAVERSAL_WORK_LIMIT),
+            )),
             None => Ok(None),
         }
     }
