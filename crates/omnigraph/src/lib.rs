@@ -47,7 +47,8 @@ pub(crate) mod table_store;
 pub(crate) mod validate;
 
 pub use blob::{
-    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
+    BLOB_READ_RANGE_MAX_BYTES, BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell,
+    BlobContent, BlobEtag, BlobPrecondition, BlobRead, BlobReader, BlobWriteOutcome,
     EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
     ExternalBlobRef, RangedExternalBlob, StorageRootConflict,
 };
