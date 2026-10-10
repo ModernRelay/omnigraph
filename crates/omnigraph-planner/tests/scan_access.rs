@@ -272,7 +272,7 @@ fn failure_and_cancellation_publish_no_partial_plan() {
     assert_eq!(source.dropped.load(Ordering::SeqCst), 1);
 }
 #[test]
-fn runtime_and_absent_catalog_skip_split_and_replay_keeps_legacy_default() {
+fn runtime_absent_and_uncovering_catalogs_skip_split_and_replay_keeps_legacy_default() {
     let mut source = source();
     for reason in [
         RuntimeInput::SearchFilter,
@@ -330,4 +330,30 @@ fn runtime_and_absent_catalog_skip_split_and_replay_keeps_legacy_default() {
             .unwrap();
     assert_eq!(access(&plan), vec![Some(ScanAccess::Sequential)]);
     assert_eq!(source.calls.load(Ordering::SeqCst), calls);
+    // An index that covers no current fragment, such as an untrained
+    // full-text segment, cannot narrow the scan either; unknown coverage may.
+    let fact = |coverage| IndexFact {
+        name: "body_idx".into(),
+        column: "__id".into(),
+        kind: IndexKind::Inverted,
+        coverage,
+    };
+    source.base = source.base.with_index_facts(
+        "node:Doc",
+        vec![fact(Some(FragmentCoverage {
+            covered: 0,
+            total: 1,
+        }))],
+    );
+    let plan =
+        futures::executor::block_on(plan_query(&query(false), &source, &fixture_bounds::BOUNDS))
+            .unwrap();
+    assert_eq!(access(&plan), vec![Some(ScanAccess::Sequential)]);
+    assert_eq!(source.calls.load(Ordering::SeqCst), calls);
+    source.base = source.base.with_index_facts("node:Doc", vec![fact(None)]);
+    let plan =
+        futures::executor::block_on(plan_query(&query(false), &source, &fixture_bounds::BOUNDS))
+            .unwrap();
+    assert_eq!(access(&plan), vec![Some(answer())]);
+    assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
 }
