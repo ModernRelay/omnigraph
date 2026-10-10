@@ -28,7 +28,7 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
 }
 
 #[test]
-fn managed_outcomes_preserve_public_exit_contract() {
+fn lifecycle_outcomes_preserve_public_exit_contract() {
     for (state, expected) in [
         ("converged", 0),
         ("failed", 1),
@@ -39,12 +39,12 @@ fn managed_outcomes_preserve_public_exit_contract() {
         ("stalled", 5),
         ("cancelled", 6),
     ] {
-        assert_eq!(outcome_exit(state).unwrap(), Some(expected));
+        assert_eq!(lifecycle::outcome_exit(state).unwrap(), Some(expected));
     }
     for state in ["proposed", "offered", "running"] {
-        assert_eq!(outcome_exit(state).unwrap(), None);
+        assert_eq!(lifecycle::outcome_exit(state).unwrap(), None);
     }
-    assert!(outcome_exit("done").is_err());
+    assert!(lifecycle::outcome_exit("done").is_err());
 }
 
 #[test]
@@ -277,7 +277,17 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
             "--plan",
             "saved-plan",
         ],
-        vec!["omnigraph", "cluster", "status", "--managed", "run-id"],
+        vec!["omnigraph", "cluster", "status", "--managed", "delivery-id"],
+        vec![
+            "omnigraph",
+            "cluster",
+            "status",
+            "--managed",
+            "delivery-id",
+            "--wait",
+            "--timeout",
+            "1",
+        ],
     ] {
         assert!(parse_cluster(&args).is_ok(), "refused {args:?}");
     }

@@ -205,17 +205,18 @@ your config directory:
 omnigraph login --api https://control.example
 omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
 omnigraph cluster plan --managed --config ./company-brain --json > plan.json
-omnigraph cluster apply --managed --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
+omnigraph cluster apply --managed --config ./company-brain --plan "$(jq -r .data.preview_id plan.json)" --json
 omnigraph cluster status --managed --config ./company-brain --json
 omnigraph cluster history --managed --config ./company-brain --json
 omnigraph logout --api https://control.example
 ```
 
 Commit and push external configuration before planning. The API plans its
-bound head, or the pushed revision selected with `--rev`. Apply uses the exact
-saved plan and your current permissions. To release an unused plan, run
-`omnigraph cluster cancel --managed PLAN_RUN_ID --config ./company-brain`; its result
-remains in history and cannot be applied afterward.
+bound head, or the full pushed commit ID selected with `--rev`. Apply uses that
+exact preview and your current permissions. It waits for the native result,
+active runtime and archived evidence. `--no-wait` returns the reserved delivery
+ID; follow it with `cluster status --managed DEPLOYMENT_ID --wait`. Cancellation
+is available only before that delivery's first dispatch attempt.
 
 The explicit `--managed` flag uses the folder's `.omnigraph/context` to select
 the API and cluster. Without it, cluster commands ignore that context.

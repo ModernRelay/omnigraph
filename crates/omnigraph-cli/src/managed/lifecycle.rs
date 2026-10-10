@@ -4,6 +4,28 @@ use super::*;
 mod capture;
 mod pending;
 
+pub(super) fn outcome_exit(state: &str) -> Result<Option<i32>> {
+    Ok(match state {
+        "converged" => Some(0),
+        "failed" => Some(1),
+        "refused" | "blocked" => Some(2),
+        "partially_converged" => Some(3),
+        "recovery_required" => Some(4),
+        "stalled" => Some(5),
+        "cancelled" => Some(6),
+        "proposed" | "offered" | "running" => None,
+        _ => return Err(Failure::protocol()),
+    })
+}
+
+fn operation_exit(body: &Value) -> Result<Option<i32>> {
+    outcome_exit(
+        body.pointer("/data/state")
+            .and_then(Value::as_str)
+            .ok_or_else(Failure::protocol)?,
+    )
+}
+
 pub(super) fn handles(command: &ClusterCommand) -> bool {
     matches!(
         command,
@@ -232,7 +254,7 @@ impl Identity {
                 "lifecycle response identity or action differs from the request",
             ));
         }
-        run_exit(body)?;
+        operation_exit(body)?;
         Ok(Self {
             cluster_id: cluster_id.into(),
             incarnation: incarnation.into(),
@@ -456,7 +478,7 @@ async fn wait_operation(
         return Ok((body, 0));
     }
     loop {
-        if let Some(exit) = run_exit(&body)? {
+        if let Some(exit) = operation_exit(&body)? {
             return Ok((body, exit));
         }
         let phase = body

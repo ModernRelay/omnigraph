@@ -154,6 +154,10 @@ retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
 `--managed` selection, and wrong-mode refusals before context or external access.
 Direct apply must ignore both valid and malformed managed folder context.
+Managed deployment fixtures also exercise immutable preview/delivery bodies,
+original-ID recovery, current authorization refusals, bounded waiting through
+uncertain delivery/archival, and queued-only cancellation. They do not replace
+native server execution tests or establish deployed service compatibility.
 CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
 replacement, graph addition, policy grant/revocation and management handoff;
 the original submitter retains only its exact receipt access after restart.

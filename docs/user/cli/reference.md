@@ -245,7 +245,7 @@ for binding, coordination and refresh bounds.
 
 `omnigraph logout --api ORIGIN` requests provider-session revocation and clears
 local credentials. Its `provider_revocation_confirmed` result reports whether
-revocation succeeded. Accepted runs continue. Named-server login is unchanged.
+revocation succeeded. Accepted work continues. Named-server login is unchanged.
 
 `omnigraph use CLUSTER_ID --api ORIGIN [--config DIR] [--json]` verifies access
 to the cluster, then atomically writes `DIR/.omnigraph/context`:
@@ -265,56 +265,59 @@ query, or fragment. HTTPS is required except for exact localhost,
 
 | Managed command | Behavior |
 |---|---|
-| `cluster plan --managed [--rev REVISION]` | Plan the pushed revision, or the bound head when omitted |
-| `cluster apply --managed --plan PLAN_RUN_ID` | Apply exactly that saved plan with current permissions |
-| `cluster status --managed [RUN_ID]` | Read the cluster projections, or one run belonging to that cluster |
-| `cluster history --managed [--limit N] [--since RFC3339]` | Read up to N runs, default 100, maximum 1000 |
-| `cluster cancel --managed RUN_ID` | Cancel a pending run; abandon a converged unused plan and release its lease |
+| `cluster plan --managed [--rev REVISION]` | Prepare a preview of the full pushed commit ID, or resolve the bound head when omitted |
+| `cluster apply --managed --plan PREVIEW_ID` | Deliver that exact preview under current permissions |
+| `cluster status --managed [DEPLOYMENT_ID] [--wait]` | Read labeled cluster observations, or an exact delivery; `--wait` requires its ID |
+| `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
+| `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
 See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
 
-All accept `--config DIR` and `--json`. Managed plan and apply accept
-`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. Without a
-supplied key, plan or apply generates one and prints it to stderr before
-submission. Reuse that key with the same body
-to recover from an uncertain response; changing the body under a key is
-refused by the API. Retry cancellation or abandonment using the same run id.
-Plan and apply do not upload local files or infer a revision from uncommitted
-changes; `cluster push --managed` explicitly prepares managed source. A saved plan retains the service's change lease
-until it is applied, abandoned, or expires under the API's rules.
+All accept `--config DIR` and `--json`. Plan and apply also accept
+`--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
+generated and printed before submission. Retain it and the exact request after
+uncertainty: replaying the same key/body retrieves the same reservation;
+changed input refuses. The CLI never repeats a submission automatically.
+Once an ID is known, observe it. Cancellation is idempotent, but refuses after
+possible dispatch and cannot stop native effects.
+Plan and apply read pushed source, not uncommitted local edits; use
+`cluster push --managed` to upload. Previews hold no change lease. Source edits
+grant no deployment permission: applied policy authorizes native effects.
+A stale generation or changed policy refuses without substituting a preview.
 
-Plan and apply normally poll every two seconds for up to 300 seconds.
-`--timeout` accepts 1–3600 seconds. Reaching the deadline stops only the local
-wait; inspect `cluster status --managed RUN_ID` to continue following the run.
-`--no-wait` prints the accepted run and exits 0. Every HTTP request has a
+Plan returns its synchronous preview. Replaying its key returns metadata,
+without redisclosing the saved native plan. Apply and exact-ID status waiting
+poll every two seconds for up to 300 seconds. `--timeout` accepts 1–3600
+seconds. Reaching the deadline stops only the local wait; continue with
+`cluster status --managed DEPLOYMENT_ID --wait`. Apply `--no-wait` prints the
+durable delivery reservation and both product/native IDs, then exits 0;
+it does not establish native acceptance or activation. Every HTTP request has a
 10-second deadline and an 8 MiB response limit; redirects are refused.
-`--json` prints one API envelope to stdout with its provenance and
-requested/effective/observed labels intact. Progress and idempotency keys use
+`--json` prints one API envelope to stdout with its native fields and separate
+source, delivery, archive and runtime observations intact. Progress and idempotency keys use
 stderr; refusals use a JSON problem object with a `type` field.
 
-| Managed run result | Exit code |
+| Managed deployment result | Exit code |
 |---|---|
-| Converged | 0 |
-| Failed or transport error | 1 |
-| Refused or blocked | 2 |
-| Partially converged | 3 |
-| Recovery required | 4 |
-| Stalled or wait deadline reached | 5 |
-| Cancelled, including successful pending-run cancellation | 6 |
+| Prepared preview, valid observation, confirmed cancellation, or explicit no-wait reservation | 0 |
+| Waited apply/status: fresh converged native result, active runtime and archived evidence | 0 |
+| Native failure/nonconverged result, transport or protocol error | 1 |
+| Explicit refusal | 2 |
+| Local wait deadline with delivery, observation, activation or archive unresolved | 5 |
 
-Status and history reads exit 0 when retrieved successfully. Abandoning a
-saved plan preserves its converged result and exits 0. Managed apply does not
-prompt for an additional approval: the API checks the authenticated caller's
-permissions. `--as`, `--server`, `--profile`, `--graph`, `--store`, and the
-global `--cluster` selector do not apply to these managed cluster operations.
+Snapshot reads exit 0 without implying deployment success. Historical results
+cannot establish current activation. Unresolved preview replay exits 5 with its
+ID. There is no plan abandonment or inferred retry safety/exit 75 from HTTP.
+Cloud lifecycle commands retain their [separate outcomes](managed-lifecycle.md#recover-an-uncertain-response).
+Applied policy authorizes execution. `--as`, `--server`, `--profile`, `--graph`,
+`--store`, and global `--cluster` do not select managed cluster operations.
 
-For unattended execution, provide an explicitly scoped automation token and
-its API origin together:
+For unattended execution, supply an accepted service bearer and its API origin:
 
 ```bash
 export OMNIGRAPH_CONTROL_API=https://control.example
 # Supply OMNIGRAPH_CONTROL_TOKEN through your CI secret mechanism.
-omnigraph cluster apply --managed --plan PLAN_RUN_ID --idempotency-key DEPLOYMENT_KEY --json
+omnigraph cluster apply --managed --plan PREVIEW_ID --idempotency-key DEPLOYMENT_KEY --json
 ```
 
 The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
@@ -329,8 +332,7 @@ local deployment. Service-only `create`, `push`, `delete`, `undo-delete`, `token
 `--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
 be combined with them.
 Use `cluster operation --managed OPERATION_ID [--wait]` for service lifecycle observation;
-`cluster status --managed [RUN_ID]` reads cluster projections or a managed run. Self-hosted
-`cluster status --deployment-id ID` addresses a separate deployment receipt.
+self-hosted `cluster status --deployment-id ID` addresses a native receipt.
 
 ## Managed data access
 
@@ -338,8 +340,7 @@ After login and cluster selection, use `graphs list` to discover graphs, then
 `query`, `mutate`, `load`, or commit reads with `--graph` from the managed folder.
 Missing or expired identity credentials are acquired before the operation;
 applied Cedar policy decides permissions. See [managed data access](managed-data.md)
-for offline behavior, identity binding,
-discovery and credential clearing.
+for offline behavior, identity binding, discovery and credential clearing.
 
 ## Confirmation rules
 
