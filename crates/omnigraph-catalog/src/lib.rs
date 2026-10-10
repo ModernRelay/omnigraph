@@ -490,6 +490,40 @@ impl SnapshotDataset {
         crate::dataset_index::has_fts_index_on(&self.dataset, column).await
     }
 
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        crate::dataset_index::has_fts_postings_on(&self.dataset, column).await
+    }
+
+    /// The names of this version's built index entries: every entry of the
+    /// raw index-metadata section, read without the current reader's
+    /// supported-version filtering (see [`Self::has_raw_index_section`]),
+    /// except untrained full-text segments, which index no row. System
+    /// entries count as built. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        if !self.has_raw_index_section() {
+            return Ok(Vec::new());
+        }
+        let store = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            &store,
+            self.dataset.manifest_location(),
+            self.dataset.manifest(),
+        )
+        .await
+        .map_err(OmniError::storage)?;
+        Ok(indices
+            .into_iter()
+            .filter(|index| !crate::dataset_index::is_untrained_full_text(index))
+            .map(|index| index.name)
+            .collect())
+    }
+
     /// Whether this dataset has a user vector index on physical `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
         crate::dataset_index::has_vector_index_on(&self.dataset, column).await

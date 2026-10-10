@@ -233,6 +233,29 @@ publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 
+Every writer commits a table effect through
+`TableStore::commit_staged_detached`, which takes the table's declared
+full-text columns. Lance applies a full-text analyzer only through a segment
+of the index, so a version holding rows and no segment for a declared column
+would match with a bare tokenizer (no lowercasing, no stemming). A table's
+first rows and an overwrite load (an overwrite drops every index) produce such
+a version, as does a schema evolution that adds a full-text column; when the
+committed version holds no segment for a declared column, the gateway chains
+an untrained, certified segment (an empty fragment bitmap, no postings) in a
+second detached commit under the same witness and returns that version to
+pin. The gateway decides this before the commit from the base version's index
+metadata and the effect's operation, as Lance's manifest build decides (an
+overwrite keeps no index, an index commit swaps the segments it removes for
+the ones it adds, and any other operation keeps a segment of every index whose
+column remains), resolving each column by field id in the schema the version
+will have, so a renamed column keeps its index; Lance's commit loads the same
+metadata, so the check adds no storage request. Schema apply declares a
+full-text `@index` it adds to a table it does not evolve the same way, beside
+the contract. The index writer builds postings where no segment covers a
+fragment, and the branch-merge insertion proof steps over a declaration link,
+which moves no row. The system-column upgrade keeps every index and declares
+none.
+
 Schema apply changes an existing table's columns by metadata-only Lance
 commits (`TableStore::stage_schema_evolution`). Renamed and dropped columns
 commit as one detached `Operation::Project` of the table's pin, the surviving

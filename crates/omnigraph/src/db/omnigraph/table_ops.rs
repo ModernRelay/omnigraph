@@ -456,7 +456,12 @@ async fn maintain_indices_for_branch(
             let witness = txn.authority.staging_witness()?;
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(ds, staged, &witness)
+                .commit_staged_detached(
+                    ds,
+                    staged,
+                    &witness,
+                    &declared_full_text_columns(&catalog, &target.table_key),
+                )
                 .await?;
             let state = db
                 .storage()
@@ -538,6 +543,39 @@ enum NodePropIndexKind {
     Btree,
     Fts,
     Vector,
+}
+
+/// The columns of `table_key` that carry a declared full-text index: every
+/// one-column `@index`/`@key` node property [`node_prop_index_kind`] maps to
+/// full text, the same rule the index builder follows. Edges declare none.
+/// Every detached commit a writer publishes declares them
+/// (`TableStore::commit_staged_detached`).
+pub(crate) fn declared_full_text_columns(catalog: &Catalog, table_key: &str) -> Vec<String> {
+    let Some(node_type) = table_key
+        .strip_prefix("node:")
+        .and_then(|type_name| catalog.node_types.get(type_name))
+    else {
+        return Vec::new();
+    };
+    let mut columns: Vec<String> = node_type
+        .indices
+        .iter()
+        .filter_map(|index_cols| match index_cols.as_slice() {
+            [property] => Some(property),
+            _ => None,
+        })
+        .filter(|property| {
+            node_type
+                .properties
+                .get(*property)
+                .and_then(node_prop_index_kind)
+                == Some(NodePropIndexKind::Fts)
+        })
+        .cloned()
+        .collect();
+    columns.sort();
+    columns.dedup();
+    columns
 }
 
 fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
@@ -765,8 +803,11 @@ async fn plan_index_work_node(
             continue;
         };
         match node_prop_index_kind(prop_type) {
+            // An untrained segment only declares the analyzer
+            // (`TableStore::commit_staged_detached`); the postings are built
+            // here once no segment covers a fragment.
             Some(NodePropIndexKind::Fts) => {
-                if !db.storage().has_fts_index(ds, prop_name).await? {
+                if !db.storage().has_fts_postings(ds, prop_name).await? {
                     work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                         column: prop_name.clone(),
                     });

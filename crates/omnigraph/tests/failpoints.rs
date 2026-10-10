@@ -23,7 +23,8 @@ use omnigraph::seams::catalog;
 use serial_test::serial;
 
 use helpers::collector::{
-    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain, staged_since,
+    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain,
+    pins_in_history, staged_since,
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
@@ -8179,12 +8180,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         .unwrap();
     }
     let person_uri = node_table_uri(&db, "Person").await;
-    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
-    let detached_before = raw.list_detached_manifests().await.unwrap().len();
+    let detached_before = detached_versions(&person_uri).await;
     assert!(
-        detached_before >= 3,
+        detached_before.len() >= 3,
         "every write leaves its detached version"
     );
+    let pins = pins_in_history(&db, "main", "node:Person").await;
 
     for pass in 0..2 {
         let stats = db
@@ -8204,9 +8205,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         );
     }
 
-    let detached_after = raw.list_detached_manifests().await.unwrap().len();
+    // Every pinned version is a young proven copy and stays; only the first
+    // load's effect beneath its full-text declaration, a link no commit pins,
+    // is reclaimed.
     assert_eq!(
-        detached_after, detached_before,
+        detached_versions(&person_uri).await,
+        &detached_before & &pins,
         "young proven copies are kept, not reaped"
     );
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
@@ -8554,8 +8558,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 2,
-        "the retry sweeps what the first pass left of the two links and main's pruned base pin: {row:?}"
+        row.manifests_removed, 3,
+        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
+         base load's effect beneath its full-text declaration: {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {

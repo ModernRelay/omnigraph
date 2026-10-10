@@ -122,6 +122,14 @@ pub struct FragmentCoverage {
 }
 
 impl IndexFact {
+    /// Whether the index may narrow a scan: its coverage is unknown, or it
+    /// covers at least one current fragment. An index that covers none, such
+    /// as an untrained full-text segment that only declares an analyzer,
+    /// cannot.
+    pub fn may_narrow(&self) -> bool {
+        self.coverage.is_none_or(|coverage| coverage.covered > 0)
+    }
+
     pub fn fully_covers_btree(&self, column: &str) -> bool {
         self.column == column
             && matches!(self.kind, IndexKind::Btree { usable: true })

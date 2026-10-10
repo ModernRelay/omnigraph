@@ -251,6 +251,26 @@ pub async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     }))
 }
 
+/// Whether `index` is an untrained full-text segment: an empty fragment
+/// bitmap and no postings. It only declares a declared column's analyzer,
+/// which Lance applies to every row no segment covers, and indexes no row.
+pub fn is_untrained_full_text(index: &IndexMetadata) -> bool {
+    is_full_text_index(index)
+        && index
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.is_empty())
+}
+
+/// Whether a full-text segment on `column` holds postings: it covers a
+/// fragment, or its coverage is unknown ([`is_untrained_full_text`] does not).
+pub async fn has_fts_postings_on(ds: &Dataset, column: &str) -> Result<bool> {
+    let indices = user_indices_for_column(ds, column).await?;
+    Ok(indices
+        .iter()
+        .any(|index| is_full_text_index(index) && !is_untrained_full_text(index)))
+}
+
 pub async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
     let indices = user_indices_for_column(ds, column).await?;
     Ok(indices.iter().any(|index| {

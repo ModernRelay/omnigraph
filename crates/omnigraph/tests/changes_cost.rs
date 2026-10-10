@@ -213,6 +213,16 @@ node Document {
         .await
         .unwrap();
         let db = helpers::session(db);
+        // A table's first write also declares the `slug` full-text index in a
+        // chained commit, which the candidate path does not step through (the
+        // exact path serves that window); measure ordinary later writes.
+        db.load(
+            "main",
+            r#"{"type":"Document","data":{"slug":"seed"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
         let batch = (0..DELTA_ROWS)
             .map(|row| {
                 format!(

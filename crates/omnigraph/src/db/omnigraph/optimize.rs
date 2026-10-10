@@ -579,6 +579,7 @@ async fn apply_optimize_table_effects(
     let full_path = work.full_path;
     let base = work.initial_snapshot;
     let witness = work.witness;
+    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
     let options = CompactionOptions::default();
     let mut chain = Vec::new();
@@ -590,7 +591,7 @@ async fn apply_optimize_table_effects(
     {
         let (rewrite, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         metrics = compaction_metrics;
         tip = rewrite;
@@ -607,7 +608,7 @@ async fn apply_optimize_table_effects(
         }
         let (folded, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         tip = folded;
         tip_identity = Some(identity);
@@ -641,7 +642,7 @@ async fn apply_optimize_table_effects(
         }
         let (indexed, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         tip = indexed;
         tip_identity = Some(identity);

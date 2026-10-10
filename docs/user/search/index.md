@@ -158,7 +158,8 @@ declarations do not currently create property indexes.
 
 Indexes are derived performance data. A new declaration may still be pending,
 and newly written entities may fall outside existing coverage. Queries remain
-correct by scanning missing or uncovered data; vector search falls back to an
+correct by scanning missing or uncovered data: full-text functions match the
+scanned rows with the index's analyzer, and vector search falls back to an
 exact scan when needed. Run:
 
 ```bash
