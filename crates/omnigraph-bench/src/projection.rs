@@ -1851,9 +1851,10 @@ fn gqt_run_row(
     record: &GqtRunRecordV1,
     receipt: &ArchiveReceiptV1,
 ) -> Result<RunRow, ProjectionError> {
-    match record.evidence().map_err(|e| {
-        ProjectionError::new("projection_gqt_evidence_missing", None, e.to_string())
-    })? {
+    match record
+        .evidence()
+        .map_err(|e| ProjectionError::new("projection_gqt_evidence_missing", None, e.to_string()))?
+    {
         GqtEvidence::Embedded(evidence) => embedded_gqt_run_row(record, &evidence, receipt),
         GqtEvidence::Served(sut) => served_gqt_run_row(record, sut, receipt),
     }

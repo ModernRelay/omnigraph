@@ -57,12 +57,11 @@ fn catalog() -> PathBuf {
 }
 fn recorded_catalog() -> crate::catalog::Catalog {
     let mut catalog = crate::catalog::Catalog::load(&catalog().join("benchmarks.yaml")).unwrap();
-    catalog.definition.defaults.environment = Some(GqtEnvironment::embedded(
-        crate::case::Backend::LocalFs {
+    catalog.definition.defaults.environment =
+        Some(GqtEnvironment::embedded(crate::case::Backend::LocalFs {
             filesystem: crate::case::LocalFilesystem::Apfs,
             storage_class: crate::case::LocalStorageClass::NvmeSsd,
-        },
-    ));
+        }));
     catalog.definition.defaults.protocol.reset = Some(crate::case::ResetMode::LocalClonefile);
     catalog
 }

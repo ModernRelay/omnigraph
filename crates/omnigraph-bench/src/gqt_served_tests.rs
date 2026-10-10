@@ -111,7 +111,10 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     invalid.definition.protocol.reset = ResetMode::None;
     assert!(replan(invalid).is_err());
     for (suffix, refusal) in [
-        ("\n--- restart\n", "omnigraph-server has no door for step 4 (restart)"),
+        (
+            "\n--- restart\n",
+            "omnigraph-server has no door for step 4 (restart)",
+        ),
         (
             "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n",
             "step 4 (mutate) is not read-only",
@@ -127,7 +130,13 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
         .unwrap_err();
         assert!(error.contains(refusal), "{error}");
     }
-    let measured = p.queries.text.match_indices("--- query\n").nth(1).unwrap().0;
+    let measured = p
+        .queries
+        .text
+        .match_indices("--- query\n")
+        .nth(1)
+        .unwrap()
+        .0;
     let mut text = p.queries.text.clone();
     text.insert_str(measured + "--- query\n".len(), "set merge_lineage = off;\n");
     let parsed = omnigraph_gqt_core::parse_case("served_settings_prefix", &text).unwrap();
@@ -322,7 +331,12 @@ fn served_redaction_covers_form_encoded_token() {
     let escaped = serde_json::to_string(token).unwrap();
     let form: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
     let percent = form.replace('+', "%20");
-    for spelling in [&escaped[1..escaped.len() - 1], form.as_str(), percent.as_str(), token] {
+    for spelling in [
+        &escaped[1..escaped.len() - 1],
+        form.as_str(),
+        percent.as_str(),
+        token,
+    ] {
         let redacted =
             crate::gqt_served::redact_error(format!("server said: {spelling}."), Some(token));
         assert_eq!(redacted, "server said: <redacted>.", "{spelling}");
@@ -483,10 +497,9 @@ async fn served_rejects_embedded_only_evidence() {
     invalid.fixture = embedded.fixture.clone();
     assert!(crate::gqt_record::validate(&invalid).is_err());
     let mut invalid = r.clone();
-    invalid.measurements.raw_samples[0].logical_store_calls = embedded.measurements.raw_samples
-        [0]
-    .logical_store_calls
-    .clone();
+    invalid.measurements.raw_samples[0].logical_store_calls = embedded.measurements.raw_samples[0]
+        .logical_store_calls
+        .clone();
     assert!(crate::gqt_record::validate(&invalid).is_err());
 }
 
@@ -1227,7 +1240,9 @@ val: I64
             .await
             .unwrap_err();
         assert!(
-            error.message.contains("served input requires a server point"),
+            error
+                .message
+                .contains("served input requires a server point"),
             "{}",
             error.message
         );

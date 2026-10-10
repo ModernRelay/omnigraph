@@ -327,12 +327,8 @@ fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
         let selected_kind = selected_kind(&spec.measured_step.text)?;
         validate_merge_evidence(s.merge.as_ref(), selected_kind, spec.protocol.attribution)
             .map_err(error)?;
-        validate_receipt_treatment(
-            &s.steps,
-            spec.measured_step.ordinal,
-            &spec.cache_condition,
-        )
-        .map_err(error)?;
+        validate_receipt_treatment(&s.steps, spec.measured_step.ordinal, &spec.cache_condition)
+            .map_err(error)?;
         let selected: Vec<_> = s
             .steps
             .iter()

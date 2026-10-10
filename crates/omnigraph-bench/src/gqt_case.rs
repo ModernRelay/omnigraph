@@ -742,7 +742,8 @@ pub fn override_sources(
 }
 
 /// The only step kinds a served workload may contain anywhere in its program.
-pub const SERVED_READ_KINDS: [StepKind; 3] = [StepKind::Query, StepKind::BranchList, StepKind::Show];
+pub const SERVED_READ_KINDS: [StepKind; 3] =
+    [StepKind::Query, StepKind::BranchList, StepKind::Show];
 
 /// Engine preparation implied by the executed prefix reads, a restart, and the process lifecycle.
 pub(crate) fn engine_preparation(

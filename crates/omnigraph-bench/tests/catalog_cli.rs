@@ -653,7 +653,8 @@ fn cache_status_of_a_served_scenario_is_not_applicable() {
 #[test]
 fn served_groups_pin_their_scenarios_and_twin_measured_text() {
     let catalog =
-        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml")).unwrap();
+        omnigraph_bench::catalog::Catalog::load(&root().join("benchmarks/benchmarks.yaml"))
+            .unwrap();
     let query_shapes = [
         "e2e-query-scan",
         "e2e-query-wide-scan",
@@ -679,7 +680,11 @@ fn served_groups_pin_their_scenarios_and_twin_measured_text() {
         ("traversal-served", &traversals[..]),
     ] {
         let suite = catalog.resolve(Some(group), None).unwrap();
-        let ids: Vec<_> = suite.runs.iter().map(|run| run.case.id().to_owned()).collect();
+        let ids: Vec<_> = suite
+            .runs
+            .iter()
+            .map(|run| run.case.id().to_owned())
+            .collect();
         let expected: Vec<_> = twins.iter().map(|twin| format!("{twin}-served")).collect();
         assert_eq!(ids, expected, "{group}");
         for twin in twins {

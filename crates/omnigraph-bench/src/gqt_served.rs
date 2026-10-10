@@ -66,8 +66,8 @@ impl ServerDeploymentReceiptV1 {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text =
             read_text_file(path, MAX_RECEIPT_BYTES, "server receipt").map_err(|e| e.message)?;
-        let receipt: Self = serde_json::from_str(&text)
-            .map_err(|e| format!("invalid server receipt JSON: {e}"))?;
+        let receipt: Self =
+            serde_json::from_str(&text).map_err(|e| format!("invalid server receipt JSON: {e}"))?;
         receipt.validate()?;
         Ok(receipt)
     }
@@ -193,7 +193,8 @@ impl ServedInput {
     ) -> Result<Self, ServedInputError> {
         let at = |path: &'static str| move |message: String| ServedInputError { path, message };
         let url = canonical_endpoint(server).map_err(at("server"))?;
-        let receipt = ServerDeploymentReceiptV1::load(receipt_path).map_err(at("server-receipt"))?;
+        let receipt =
+            ServerDeploymentReceiptV1::load(receipt_path).map_err(at("server-receipt"))?;
         let token = token_variable
             .map(read_token)
             .transpose()
@@ -262,7 +263,8 @@ pub(crate) fn validate_token_environment_name(name: &str) -> Result<(), String> 
             "token variable name may contain only ASCII letters, digits and underscores".into(),
         );
     }
-    if is_omnigraph_runtime_override(OsStr::new(name)) || is_lance_runtime_override(OsStr::new(name))
+    if is_omnigraph_runtime_override(OsStr::new(name))
+        || is_lance_runtime_override(OsStr::new(name))
     {
         return Err("token variable must use a separate name outside the LANCE_ and OMNIGRAPH_ runtime namespaces".into());
     }
