@@ -112,6 +112,28 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
         .await
         .unwrap();
 
+    // A Zipf endpoint is prepared as a table's is, under the same total
+    // bound, which is checked before any distribution is built.
+    let zipf = |name: &str, population: u64| {
+        format!(
+            "  {name}: {{kind: endpoint, prefix: s, width: 1, population: {population}, distribution: {{kind: zipf, exponent: 1.25}}}}\n"
+        )
+    };
+    let skewed = GeneratedParams::parse(
+        "generate: v1 seed: 0",
+        &format!("params:\n{}", zipf("s", 1)),
+    )
+    .unwrap();
+    assert_eq!(skewed.generate().unwrap(), serde_json::json!({"s": "s0"}));
+    let wide = (0..9)
+        .map(|i| zipf(&format!("s{i}"), 1_000_000))
+        .collect::<String>();
+    assert!(
+        GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
+            .unwrap_err()
+            .contains("zipf tables exceed 8000000 entries")
+    );
+
     for (from, to) in [
         ("generate: v1", "generate: v2"),
         (" seed: 7", ""),

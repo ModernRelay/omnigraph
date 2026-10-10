@@ -1,8 +1,10 @@
 # issue: none
-# notes: A `--- params generate` recipe supplies a mutation's parameters: a key
-# notes: and a 4-byte Blob generated from `{kind: blob}`, the same `base64:` text
-# notes: a literal body would carry. The insert lands under the generated key,
-# notes: in this process and in every DST worker, which generates it itself.
+# notes: A `--- params generate` recipe supplies a step's parameters: a key
+# notes: from a Zipf endpoint over one value and a 4-byte Blob generated from
+# notes: `{kind: blob}`, the same `base64:` text a literal body would carry. The
+# notes: insert lands under the generated key and a read filtered by the same
+# notes: recipe finds it, in this process, in every DST worker, which generates
+# notes: the values itself, and through omnigraph-server's request body.
 
 --- runner
 timeout_ms: 10000
@@ -12,6 +14,8 @@ environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- schema
 node Doc {
@@ -28,16 +32,20 @@ query put($slug: String, $body: Blob) {
 
 --- params generate: v1 seed: 0
 params:
-  slug: {kind: key, prefix: doc-, width: 2}
+  slug: {kind: endpoint, prefix: doc-, width: 2, population: 1, distribution: {kind: zipf, exponent: 1.25}}
   body: {kind: blob, byte: 7, length: 4}
 
 --- expect affected: nodes=1 edges=0
 
 --- query
-query slugs() {
-    match { $d: Doc }
+query by_slug($slug: String) {
+    match { $d: Doc { slug: $slug } }
     return { $d.slug }
 }
+
+--- params generate: v1 seed: 0
+params:
+  slug: {kind: endpoint, prefix: doc-, width: 2, population: 1, distribution: {kind: zipf, exponent: 1.25}}
 
 --- expect unordered
 {"d.slug": "doc-00"}
