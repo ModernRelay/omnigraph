@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -29,8 +29,7 @@ use crate::exec::staging::{MutationStaging, PendingMode};
 use crate::seams::{catalog, decide_seam, fail};
 use crate::session::Session;
 use crate::storage_layer::{
-    DeletedIdBudget, KEYED_BLOB_PAYLOAD_MAX_BYTES, KEYED_WRITE_MAX_BYTES, KeyedBytes,
-    retain_keyed_batch,
+    DeletedIdBudget, KEYED_WRITE_MAX_BYTES, WriteBudget, retain_keyed_batch,
 };
 
 /// Result of a load operation.
@@ -251,6 +250,7 @@ impl Session {
             LoadInputShape::LoaderCompatible,
             self.settings().stage_write_concurrency(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
         )
         .await
     }
@@ -295,6 +295,7 @@ impl Session {
             LoadInputShape::StrictGraphBatch,
             self.settings().stage_write_concurrency(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
         )
         .await
     }
@@ -324,6 +325,7 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
@@ -348,6 +350,7 @@ impl Omnigraph {
             input_shape,
             stage_write_concurrency,
             history_release_bytes,
+            write_budget,
         ))
         .await
     }
@@ -363,6 +366,7 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<LoadReceipt> {
         // Schema/catalog authority is captured once via the `WriteTxn` (plus its
         // cheap trailing identity-marker fence); the only second full validation
@@ -409,6 +413,7 @@ impl Omnigraph {
                 input_shape,
                 stage_write_concurrency,
                 history_release_bytes,
+                write_budget,
             )
             .await
             .map_err(|error| {
@@ -469,6 +474,7 @@ impl Omnigraph {
         input_shape: LoadInputShape,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<LoadReceipt> {
         load_jsonl_data(
             self,
@@ -479,6 +485,7 @@ impl Omnigraph {
             input_shape,
             stage_write_concurrency,
             history_release_bytes,
+            write_budget,
         )
         .await
     }
@@ -537,6 +544,7 @@ async fn load_jsonl_data(
     input_shape: LoadInputShape,
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
+    write_budget: WriteBudget,
 ) -> Result<LoadReceipt> {
     const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -557,6 +565,7 @@ async fn load_jsonl_data(
             stage_write_concurrency,
             history_release_bytes,
             attempt == 0,
+            write_budget,
         )
         .await
         {
@@ -588,6 +597,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
     first_attempt: bool,
+    write_budget: WriteBudget,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -607,7 +617,10 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
     let mut strict_rows = StrictGraphRows::default();
-    let mut keyed_input_budget = KeyedInputBudget::default();
+    let mut keyed_input_budget = KeyedInputBudget {
+        write_budget,
+        ..KeyedInputBudget::default()
+    };
     // Strict syntax is independent of the keyed-write transaction ceiling.
     // Append/Merge route through the bounded keyed adapter; Overwrite stages a
     // Lance replacement transaction and must retain the bulk-replacement
@@ -665,8 +678,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
                     account_keyed_json_row(
                         &format!("node:{type_name}"),
                         &data,
-                        &catalog.node_types[&type_name].blob_properties,
                         0,
+                        &catalog.node_types[&type_name].properties,
                         &mut keyed_input_budget,
                     )?;
                 }
@@ -717,8 +730,8 @@ async fn load_jsonl_reader_once<R: BufRead>(
                     account_keyed_json_row(
                         &format!("edge:{canonical}"),
                         &data,
-                        &edge_type.blob_properties,
                         from.len().saturating_add(to.len()),
+                        &edge_type.properties,
                         &mut keyed_input_budget,
                     )?;
                 }
@@ -748,7 +761,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // open and the manifest publish, so the parsed batches, validation catalog,
     // base snapshot, native branch identity, exact graph head, and schema
     // identity form one immutable authority unit.
-    let mut staging = MutationStaging::default();
+    let mut staging = MutationStaging::new(write_budget);
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Upsert,
         // Append mode is a strict exact-id insert. Every physical graph table
@@ -776,16 +789,22 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
     let mut node_id_remap = TypedNodeIdRemap::default();
-    let mut prepared_keyed_bytes = KeyedBytes::default();
+    let mut prepared_keyed_bytes = 0;
     let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
         Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
     let mut __dst_nr: Vec<_> = node_rows.into_iter().collect();
     __dst_nr.sort_by(|a, b| a.0.cmp(&b.0));
     for (type_name, rows) in __dst_nr {
         let node_type = &catalog.node_types[&type_name];
-        let batch = build_node_batch(node_type, &rows, &mut node_id_remap, catalog.system_columns)?;
+        let batch = build_node_batch(
+            node_type,
+            &rows,
+            &mut node_id_remap,
+            catalog.system_columns,
+            write_budget,
+        )?;
         if bounded_keyed_input {
-            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
@@ -802,9 +821,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget)?;
         if bounded_keyed_input {
-            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
@@ -845,9 +864,15 @@ async fn load_jsonl_reader_once<R: BufRead>(
     __dst_er.sort_by(|a, b| a.0.cmp(&b.0));
     for (edge_name, rows) in __dst_er {
         let edge_type = &catalog.edge_types[&edge_name];
-        let batch = build_edge_batch(edge_type, &rows, &node_id_remap, catalog.system_columns)?;
+        let batch = build_edge_batch(
+            edge_type,
+            &rows,
+            &node_id_remap,
+            catalog.system_columns,
+            write_budget,
+        )?;
         if bounded_keyed_input {
-            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
@@ -864,9 +889,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let _entry = snapshot
             .dataset(&table_key)
             .ok_or_else(|| OmniError::manifest(missing_graph_type_at_snapshot(&table_key)))?;
-        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows, write_budget)?;
         if bounded_keyed_input {
-            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch)?;
+            prepared_keyed_bytes = retain_keyed_batch(prepared_keyed_bytes, &batch, write_budget)?;
         }
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
@@ -912,7 +937,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
     // orphan. (Per-table, like the rest of Overwrite handling.)
     if mode == LoadMode::Overwrite {
-        let mut removed_id_budget = DeletedIdBudget::default();
+        let mut removed_id_budget = DeletedIdBudget::new(write_budget);
         let keys: Vec<String> = changeset.keys().cloned().collect();
         for table_key in keys {
             let removed = crate::validate::overwrite_removed_ids(
@@ -1257,8 +1282,8 @@ fn parse_strict_graph_rows<R: BufRead>(
                     account_keyed_json_row(
                         &table_key,
                         &row,
-                        &catalog.node_types[&type_name].blob_properties,
                         0,
+                        &catalog.node_types[&type_name].properties,
                         keyed_input_budget,
                     )?;
                 }
@@ -1300,8 +1325,8 @@ fn parse_strict_graph_rows<R: BufRead>(
                     account_keyed_json_row(
                         &table_key,
                         &JsonValue::Object(data.clone()),
-                        &edge_type.blob_properties,
                         from.len().saturating_add(to.len()),
+                        &edge_type.properties,
                         keyed_input_budget,
                     )?;
                 }
@@ -1446,27 +1471,25 @@ fn take_object_or_empty(
 #[derive(Default)]
 struct KeyedInputBudget {
     tables: HashMap<String, KeyedTableInput>,
-    bytes: KeyedBytes,
+    bytes: u64,
+    payload_bytes: u64,
+    write_budget: WriteBudget,
 }
 
 #[derive(Default)]
 struct KeyedTableInput {
     rows: usize,
-    bytes: KeyedBytes,
+    bytes: u64,
 }
 
 /// Charge a keyed JSON record before the parse spool retains it: a lower bound
-/// on its Arrow bytes per table and across tables, taken before base64 is
-/// decoded, split like the later batch check (`KeyedBytes`) by the type's
-/// declared Blob properties: a `base64:` value of a Blob property is payload by its
-/// decoded length, and every other value, a `String` that happens to start
-/// with `base64:` included, is framing. Not a JSON DOM bound;
-/// `MutationStaging::append_batch` is the authority.
+/// on its Arrow payload per table and across tables, taken before base64 is
+/// decoded. Not a JSON DOM bound; `MutationStaging::append_batch` is the authority.
 fn account_keyed_json_row(
     table_key: &str,
     data: &JsonValue,
-    blob_properties: &HashSet<String>,
     structural_string_bytes: usize,
+    properties: &HashMap<String, PropType>,
     budgets: &mut KeyedInputBudget,
 ) -> Result<()> {
     let entry = budgets.tables.entry(table_key.to_string()).or_default();
@@ -1481,89 +1504,103 @@ fn account_keyed_json_row(
             entry.rows as u64,
         ));
     }
-    let structural = u64::try_from(structural_string_bytes)
-        .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?;
-    let fields = match data {
-        JsonValue::Object(fields) => {
-            fields
-                .iter()
-                .try_fold(KeyedBytes::default(), |bytes, (name, value)| {
-                    let blob = blob_properties.contains(name);
-                    bytes.checked_add(estimate_json_keyed_bytes(value, blob)?)
-                })?
-        }
-        other => estimate_json_keyed_bytes(other, false)?,
-    };
-    let row_bytes = fields.checked_add(KeyedBytes::framing(structural))?;
+    let object = data
+        .as_object()
+        .ok_or_else(|| OmniError::manifest("input data must be an object"))?;
+    let mut estimated = 0_u64;
+    let mut payload = 0_u64;
+    for (name, value) in object {
+        let row_bytes = if properties.get(name).is_some_and(|property| {
+            property.scalar == omnigraph_compiler::types::ScalarType::Blob && !property.list
+        }) {
+            let encoded = value
+                .as_str()
+                .and_then(|value| value.strip_prefix("base64:"));
+            if let Some(encoded) = encoded {
+                payload = payload
+                    .checked_add(decoded_blob_bytes(encoded)?)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal("keyed input Blob payload overflow")
+                    })?;
+                16
+            } else {
+                estimate_json_arrow_bytes(value)?.saturating_add(16)
+            }
+        } else {
+            estimate_json_arrow_bytes(value)?
+        };
+        estimated = estimated
+            .checked_add(row_bytes)
+            .ok_or_else(|| OmniError::manifest_internal("keyed input row bytes overflow"))?;
+    }
+    let payload_bytes = budgets
+        .payload_bytes
+        .checked_add(payload)
+        .ok_or_else(|| OmniError::manifest_internal("keyed input Blob payload overflow"))?;
+    budgets
+        .write_budget
+        .check("decoded blob input bytes per operation", payload_bytes)?;
+    budgets.payload_bytes = payload_bytes;
+    let row_bytes = estimated
+        .checked_add(
+            u64::try_from(structural_string_bytes)
+                .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
+        )
+        .ok_or_else(|| OmniError::manifest_internal("keyed input entity bytes overflow"))?;
     entry.bytes = entry
         .bytes
-        .checked_add(row_bytes)?
-        .ensure_fits(&format!("keyed parsed entity bytes for {table_key}"))?;
-    budgets.bytes = budgets
-        .bytes
-        .checked_add(row_bytes)?
-        .ensure_fits("keyed parsed entity bytes per operation")?;
+        .checked_add(row_bytes)
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
+    if entry.bytes > budgets.write_budget.bytes() {
+        return Err(OmniError::resource_limit(
+            format!("keyed parsed entity bytes for {table_key}"),
+            budgets.write_budget.bytes(),
+            entry.bytes,
+        ));
+    }
+    let total = budgets.bytes.checked_add(row_bytes).ok_or_else(|| {
+        OmniError::manifest_internal("keyed parsed operation byte count overflow")
+    })?;
+    if total > budgets.write_budget.bytes() {
+        return Err(OmniError::resource_limit(
+            "keyed parsed entity bytes per operation",
+            budgets.write_budget.bytes(),
+            total,
+        ));
+    }
+    budgets.bytes = total;
     Ok(())
 }
 
-/// A lower bound on the Arrow bytes of a Blob property's value.
 fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
-    let bytes = estimate_json_keyed_bytes(value, true)?;
-    bytes
-        .framing
-        .checked_add(bytes.payload)
-        .ok_or_else(|| OmniError::manifest_internal("JSON value bytes overflow"))
-}
-
-/// A lower bound on the Arrow bytes a JSON value becomes. When `blob` says the
-/// value is a Blob property's, a `base64:` string counts its decoded length as
-/// payload; everything else, nested values included, is framing.
-fn estimate_json_keyed_bytes(value: &JsonValue, blob: bool) -> Result<KeyedBytes> {
     match value {
-        JsonValue::Null => Ok(KeyedBytes::default()),
-        JsonValue::Bool(_) => Ok(KeyedBytes::framing(1)),
+        JsonValue::Null => Ok(0),
+        JsonValue::Bool(_) => Ok(1),
         // Four bytes avoids rejecting valid Float32/Int32 input early. Wider
         // physical scalars are charged exactly by the later Arrow batch check.
-        JsonValue::Number(_) => Ok(KeyedBytes::framing(4)),
-        JsonValue::String(value) => {
-            let string_bytes = |bytes: usize| {
-                u64::try_from(bytes)
-                    .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64"))
-            };
-            match value.strip_prefix("base64:").filter(|_| blob) {
-                Some(encoded) => Ok(KeyedBytes::payload(string_bytes(
-                    base64::decoded_len_estimate(encoded.len()).saturating_sub(
-                        encoded
-                            .as_bytes()
-                            .iter()
-                            .rev()
-                            .take_while(|&&byte| byte == b'=')
-                            .count(),
-                    ),
-                )?)),
-                None => Ok(KeyedBytes::framing(string_bytes(value.len())?)),
-            }
-        }
+        JsonValue::Number(_) => Ok(4),
+        JsonValue::String(value) => u64::try_from(value.len())
+            .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64")),
         JsonValue::Array(values) => {
             let offsets = u64::try_from(values.len())
                 .map_err(|_| OmniError::manifest_internal("JSON array length exceeds u64"))?
                 .checked_add(1)
                 .and_then(|count| count.checked_mul(4))
                 .ok_or_else(|| OmniError::manifest_internal("JSON array offset bytes overflow"))?;
-            values
-                .iter()
-                .try_fold(KeyedBytes::framing(offsets), |bytes, value| {
-                    bytes.checked_add(estimate_json_keyed_bytes(value, false)?)
-                })
+            values.iter().try_fold(offsets, |bytes, value| {
+                bytes
+                    .checked_add(estimate_json_arrow_bytes(value)?)
+                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
+            })
         }
         // Property names are schema, not per-row Arrow payload. Count values
         // only so the early lower bound does not reject an otherwise-valid
         // wide schema; exact field buffers are charged after batch building.
-        JsonValue::Object(values) => values
-            .values()
-            .try_fold(KeyedBytes::default(), |bytes, value| {
-                bytes.checked_add(estimate_json_keyed_bytes(value, false)?)
-            }),
+        JsonValue::Object(values) => values.values().try_fold(0_u64, |bytes, value| {
+            bytes
+                .checked_add(estimate_json_arrow_bytes(value)?)
+                .ok_or_else(|| OmniError::manifest_internal("JSON object bytes overflow"))
+        }),
     }
 }
 
@@ -1606,6 +1643,7 @@ fn build_node_batch(
     rows: &[JsonValue],
     node_id_remap: &mut TypedNodeIdRemap,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let schema = node_type.arrow_schema.clone();
     let row_refs = rows.iter().collect::<Vec<_>>();
@@ -1613,6 +1651,7 @@ fn build_node_batch(
         &format!("node:{}", node_type.name),
         node_type.blob_properties.iter().map(String::as_str),
         &row_refs,
+        write_budget,
     )?;
 
     // Materialize the typed property columns before deriving physical ids. A
@@ -1622,7 +1661,7 @@ fn build_node_batch(
     let mut property_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() - 1);
     for field in schema.fields().iter().skip(1) {
         if node_type.blob_properties.contains(field.name()) {
-            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
+            let col = build_blob_column(field.name(), field.is_nullable(), rows, write_budget)?;
             property_columns.push(col);
         } else {
             let col = build_column_from_json(
@@ -1631,6 +1670,7 @@ fn build_node_batch(
                 field.is_nullable(),
                 rows,
                 JsonConversionMode::LoaderCompat,
+                write_budget,
             )?;
             property_columns.push(col);
         }
@@ -1735,6 +1775,7 @@ fn build_edge_batch(
     rows: &[(String, String, JsonValue)],
     node_id_remap: &TypedNodeIdRemap,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
     let row_refs = rows.iter().map(|(_, _, data)| data).collect::<Vec<_>>();
@@ -1742,6 +1783,7 @@ fn build_edge_batch(
         &format!("edge:{}", edge_type.name),
         edge_type.blob_properties.iter().map(String::as_str),
         &row_refs,
+        write_budget,
     )?;
 
     let srcs: Vec<String> = rows
@@ -1771,7 +1813,12 @@ fn build_edge_batch(
         Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         if edge_type.blob_properties.contains(field.name()) {
-            let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
+            let col = build_blob_column(
+                field.name(),
+                field.is_nullable(),
+                &data_values,
+                write_budget,
+            )?;
             property_columns.push(col);
         } else {
             let col = build_column_from_json(
@@ -1780,6 +1827,7 @@ fn build_edge_batch(
                 field.is_nullable(),
                 &data_values,
                 JsonConversionMode::LoaderCompat,
+                write_budget,
             )?;
             property_columns.push(col);
         }
@@ -1894,6 +1942,7 @@ pub(crate) fn normalize_strict_json_rows(
     catalog: &Catalog,
     table_key: &str,
     rows: &[JsonValue],
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     if rows.is_empty() {
         return Err(OmniError::manifest_internal(
@@ -1905,13 +1954,13 @@ pub(crate) fn normalize_strict_json_rows(
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
-        normalize_strict_node_rows(node_type, rows, catalog.system_columns)
+        normalize_strict_node_rows(node_type, rows, catalog.system_columns, write_budget)
     } else if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type = catalog
             .edge_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
-        normalize_strict_edge_rows(edge_type, rows, catalog.system_columns)
+        normalize_strict_edge_rows(edge_type, rows, catalog.system_columns, write_budget)
     } else {
         Err(OmniError::manifest(format!(
             "invalid table key '{table_key}'"
@@ -1923,6 +1972,7 @@ fn normalize_strict_node_rows(
     node_type: &NodeType,
     rows: &[JsonValue],
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("node:{}", node_type.name);
@@ -1942,18 +1992,19 @@ fn normalize_strict_node_rows(
         &schema,
         &objects,
         &node_type.blob_properties,
-        KEYED_WRITE_MAX_BYTES,
+        write_budget.bytes(),
     )?;
     preflight_blob_decode_budget(
         &table_key,
         node_type.blob_properties.iter().map(String::as_str),
         &rows.iter().collect::<Vec<_>>(),
+        write_budget,
     )?;
 
     let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(1));
     for field in schema.fields().iter().skip(1) {
         let column = if node_type.blob_properties.contains(field.name()) {
-            build_blob_column(field.name(), field.is_nullable(), rows)?
+            build_blob_column(field.name(), field.is_nullable(), rows, write_budget)?
         } else {
             build_column_from_json(
                 field.name(),
@@ -1961,6 +2012,7 @@ fn normalize_strict_node_rows(
                 field.is_nullable(),
                 rows,
                 JsonConversionMode::Strict,
+                write_budget,
             )?
         };
         property_columns.push(column);
@@ -2029,6 +2081,7 @@ fn normalize_strict_edge_rows(
     edge_type: &EdgeType,
     rows: &[JsonValue],
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let objects = strict_row_objects(rows)?;
     let table_key = format!("edge:{}", edge_type.name);
@@ -2050,12 +2103,13 @@ fn normalize_strict_edge_rows(
         &schema,
         &objects,
         &edge_type.blob_properties,
-        KEYED_WRITE_MAX_BYTES,
+        write_budget.bytes(),
     )?;
     preflight_blob_decode_budget(
         &table_key,
         edge_type.blob_properties.iter().map(String::as_str),
         &rows.iter().collect::<Vec<_>>(),
+        write_budget,
     )?;
 
     let srcs = objects
@@ -2072,7 +2126,7 @@ fn normalize_strict_edge_rows(
     let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(3));
     for field in schema.fields().iter().skip(3) {
         let column = if edge_type.blob_properties.contains(field.name()) {
-            build_blob_column(field.name(), field.is_nullable(), rows)?
+            build_blob_column(field.name(), field.is_nullable(), rows, write_budget)?
         } else {
             build_column_from_json(
                 field.name(),
@@ -2080,6 +2134,7 @@ fn normalize_strict_edge_rows(
                 field.is_nullable(),
                 rows,
                 JsonConversionMode::Strict,
+                write_budget,
             )?
         };
         property_columns.push(column);
@@ -2264,7 +2319,10 @@ fn preflight_strict_rows_arrow_bytes(
         for field in schema.fields() {
             let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
             let field_bytes = if blob_properties.contains(field.name()) {
-                16_u64.saturating_add(estimate_json_arrow_bytes(value)?)
+                16_u64.saturating_add(match value.as_str() {
+                    Some(value) if value.starts_with("base64:") => 0,
+                    _ => estimate_json_arrow_bytes(value)?,
+                })
             } else {
                 projected_strict_column_bytes(field.data_type(), value)?
             };
@@ -2355,6 +2413,7 @@ fn preflight_blob_decode_budget<'a>(
     table_key: &str,
     blob_properties: impl Iterator<Item = &'a str>,
     rows: &[&JsonValue],
+    write_budget: WriteBudget,
 ) -> Result<()> {
     let mut decoded_bytes = 0_u64;
     for property in blob_properties {
@@ -2366,21 +2425,14 @@ fn preflight_blob_decode_budget<'a>(
             else {
                 continue;
             };
-            let estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
-                encoded
-                    .as_bytes()
-                    .iter()
-                    .rev()
-                    .take_while(|&&byte| byte == b'=')
-                    .count(),
-            ) as u64;
+            let estimate = decoded_blob_bytes(encoded)?;
             decoded_bytes = decoded_bytes.checked_add(estimate).ok_or_else(|| {
                 OmniError::manifest_internal("decoded blob input byte count overflow")
             })?;
-            if decoded_bytes > KEYED_BLOB_PAYLOAD_MAX_BYTES {
+            if decoded_bytes > write_budget.bytes() {
                 return Err(OmniError::resource_limit(
                     format!("decoded blob input bytes for {table_key}"),
-                    KEYED_BLOB_PAYLOAD_MAX_BYTES,
+                    write_budget.bytes(),
                     decoded_bytes,
                 ));
             }
@@ -2389,22 +2441,32 @@ fn preflight_blob_decode_budget<'a>(
     Ok(())
 }
 
+pub(crate) fn decoded_blob_bytes(encoded: &str) -> Result<u64> {
+    let bytes = base64::decoded_len_estimate(encoded.len()).saturating_sub(
+        encoded
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'=')
+            .take(2)
+            .count(),
+    );
+    u64::try_from(bytes).map_err(|_| OmniError::manifest_internal("decoded Blob bytes exceed u64"))
+}
+
 /// Append a blob value (URI or base64 bytes) to a BlobArrayBuilder.
-pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> Result<()> {
+pub(crate) fn append_blob_value(
+    builder: &mut BlobArrayBuilder,
+    value: &str,
+    write_budget: WriteBudget,
+) -> Result<()> {
     if let Some(encoded) = value.strip_prefix("base64:") {
-        let decoded_estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
-            encoded
-                .as_bytes()
-                .iter()
-                .rev()
-                .take_while(|&&b| b == b'=')
-                .count(),
-        );
-        if decoded_estimate as u64 > KEYED_BLOB_PAYLOAD_MAX_BYTES {
+        let decoded_estimate = decoded_blob_bytes(encoded)?;
+        if decoded_estimate > write_budget.bytes() {
             return Err(OmniError::resource_limit(
                 "decoded blob input bytes",
-                KEYED_BLOB_PAYLOAD_MAX_BYTES,
-                decoded_estimate as u64,
+                write_budget.bytes(),
+                decoded_estimate,
             ));
         }
         let bytes = base64::engine::general_purpose::STANDARD
@@ -2421,12 +2483,17 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
 }
 
 /// Build a blob column from JSON values using Lance BlobArrayBuilder.
-fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<ArrayRef> {
+fn build_blob_column(
+    name: &str,
+    nullable: bool,
+    rows: &[JsonValue],
+    write_budget: WriteBudget,
+) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(rows.len());
     for row in rows {
         match row.get(name) {
             Some(JsonValue::String(s)) => {
-                append_blob_value(&mut builder, s)?;
+                append_blob_value(&mut builder, s, write_budget)?;
             }
             Some(JsonValue::Null) | None if nullable => {
                 builder.push_null().map_err(OmniError::lance_internal)?;
@@ -2460,6 +2527,7 @@ fn build_column_from_json(
     nullable: bool,
     rows: &[JsonValue],
     mode: JsonConversionMode,
+    write_budget: WriteBudget,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
         DataType::Utf8 => {
@@ -2685,10 +2753,10 @@ fn build_column_from_json(
                     .and_then(|rows| rows.checked_mul(u64::try_from(dim_usize).ok()?))
                     .and_then(|values| values.checked_mul(4))
                     .unwrap_or(u64::MAX);
-                if allocation_bytes > KEYED_WRITE_MAX_BYTES {
+                if allocation_bytes > write_budget.bytes() {
                     return Err(OmniError::resource_limit(
                         "strict_input_arrow_bytes",
-                        KEYED_WRITE_MAX_BYTES,
+                        write_budget.bytes(),
                         allocation_bytes,
                     ));
                 }
@@ -3609,8 +3677,15 @@ edge WorksAt: Person -> Company
             let rows = vec![wrong.clone()];
             for mode in modes {
                 for nullable in [true, false] {
-                    let err = build_column_from_json("day", &data_type, nullable, &rows, mode)
-                        .expect_err("a wrong-typed date is refused, never stored as NULL");
+                    let err = build_column_from_json(
+                        "day",
+                        &data_type,
+                        nullable,
+                        &rows,
+                        mode,
+                        WriteBudget::default(),
+                    )
+                    .expect_err("a wrong-typed date is refused, never stored as NULL");
                     assert!(
                         err.to_string().contains(expected),
                         "{mode:?} {data_type:?} nullable={nullable} {wrong}: {err}"
@@ -3625,8 +3700,15 @@ edge WorksAt: Person -> Company
             let list_rows = vec![serde_json::json!({"days": [19723, wrong["day"].clone()]})];
             let list_expected = expected.replace("'day'", "'days'");
             for mode in modes {
-                let err = build_column_from_json("days", &list_type, true, &list_rows, mode)
-                    .expect_err("a wrong-typed date list item is refused, never stored as NULL");
+                let err = build_column_from_json(
+                    "days",
+                    &list_type,
+                    true,
+                    &list_rows,
+                    mode,
+                    WriteBudget::default(),
+                )
+                .expect_err("a wrong-typed date list item is refused, never stored as NULL");
                 assert!(
                     err.to_string().contains(&list_expected),
                     "{mode:?} {data_type:?}: {err}"
@@ -3663,6 +3745,7 @@ edge WorksAt: Person -> Company
                 true,
                 std::slice::from_ref(&good),
                 JsonConversionMode::LoaderCompat,
+                WriteBudget::default(),
             )
             .expect("integer counts, date strings, and null still load");
             let value = match data_type {
@@ -3833,6 +3916,7 @@ edge WorksAt: Person -> Company
             true,
             &wrong_scalar,
             JsonConversionMode::LoaderCompat,
+            WriteBudget::default(),
         )
         .unwrap();
         assert!(
@@ -3845,6 +3929,7 @@ edge WorksAt: Person -> Company
             true,
             &wrong_scalar,
             JsonConversionMode::Strict,
+            WriteBudget::default(),
         )
         .expect_err("strict normalization must not turn a wrong type into null");
         assert!(strict.to_string().contains("expects Int32"), "{strict:?}");
@@ -3861,6 +3946,7 @@ edge WorksAt: Person -> Company
             false,
             &wrong_list,
             JsonConversionMode::LoaderCompat,
+            WriteBudget::default(),
         )
         .expect("bulk-load compatibility retains nullable list-item coercion");
         let strict = build_column_from_json(
@@ -3869,6 +3955,7 @@ edge WorksAt: Person -> Company
             false,
             &wrong_list,
             JsonConversionMode::Strict,
+            WriteBudget::default(),
         )
         .expect_err("strict normalization must reject a wrong list item");
         assert!(
@@ -3883,6 +3970,7 @@ edge WorksAt: Person -> Company
             true,
             &missing_nullable,
             JsonConversionMode::Strict,
+            WriteBudget::default(),
         )
         .expect("a missing nullable strict-row property remains null");
         assert!(strict.is_null(0));
@@ -3897,6 +3985,7 @@ edge WorksAt: Person -> Company
             true,
             &missing_nullable,
             JsonConversionMode::Strict,
+            WriteBudget::default(),
         )
         .expect_err("strict normalization must bound vector allocation before building");
         assert!(
@@ -3973,73 +4062,12 @@ edge WorksAt: Person -> Company
         ));
     }
 
-    /// The pre-decode forecast charges a `base64:` value by its decoded length to
-    /// the payload ceiling and the rest of the row to the framing ceiling, like
-    /// the batch check after it, so an exact-limit value fits beside its row and
-    /// one more decoded byte is refused by the payload ceiling.
-    #[test]
-    fn parsed_forecast_charges_base64_payload_apart_from_framing() {
-        let limit = usize::try_from(KEYED_BLOB_PAYLOAD_MAX_BYTES).unwrap();
-        let encode = |bytes: usize| {
-            format!(
-                "base64:{}",
-                base64::engine::general_purpose::STANDARD.encode(vec![7_u8; bytes])
-            )
-        };
-
-        let blobs = HashSet::from(["content".to_string()]);
-        let row = serde_json::json!({"title": "exact", "content": encode(limit)});
-        let mut budget = KeyedInputBudget::default();
-        account_keyed_json_row("node:Document", &row, &blobs, 0, &mut budget)
-            .expect("an exact-limit payload fits beside its row");
-        assert_eq!(
-            budget.bytes,
-            KeyedBytes {
-                framing: 5,
-                payload: KEYED_BLOB_PAYLOAD_MAX_BYTES,
-            }
-        );
-
-        // The declared type decides: the same `base64:` text in a property
-        // that is not a Blob is framing by its full length.
-        let note = encode(1024);
-        let row = serde_json::json!({"title": "typed", "note": note.clone(), "content": encode(8)});
-        let mut budget = KeyedInputBudget::default();
-        account_keyed_json_row("node:Document", &row, &blobs, 0, &mut budget).unwrap();
-        assert_eq!(
-            budget.bytes,
-            KeyedBytes {
-                framing: 5 + note.len() as u64,
-                payload: 8,
-            }
-        );
-
-        let row = serde_json::json!({"title": "over", "content": encode(limit + 1)});
-        let error = account_keyed_json_row(
-            "node:Document",
-            &row,
-            &blobs,
-            0,
-            &mut KeyedInputBudget::default(),
-        )
-        .expect_err("one decoded byte over must be refused");
-        assert!(matches!(
-            error,
-            OmniError::ResourceLimitExceeded {
-                ref resource,
-                limit: KEYED_BLOB_PAYLOAD_MAX_BYTES,
-                actual,
-            } if resource == "keyed parsed entity Blob payload bytes for node:Document"
-                && actual == KEYED_BLOB_PAYLOAD_MAX_BYTES + 1
-        ));
-    }
-
     #[test]
     fn operation_byte_allowances_span_graph_types_and_include_their_ceiling() {
         let row = serde_json::json!({"payload": "x".repeat(17 * 1024 * 1024)});
         let mut budget = KeyedInputBudget::default();
-        account_keyed_json_row("node:Person", &row, &HashSet::new(), 0, &mut budget).unwrap();
-        let error = account_keyed_json_row("node:Company", &row, &HashSet::new(), 0, &mut budget)
+        account_keyed_json_row("node:Person", &row, 0, &HashMap::new(), &mut budget).unwrap();
+        let error = account_keyed_json_row("node:Company", &row, 0, &HashMap::new(), &mut budget)
             .expect_err("keyed parse bytes must be aggregated across types");
         assert!(matches!(error,
             OmniError::ResourceLimitExceeded { ref resource, limit: KEYED_WRITE_MAX_BYTES, actual }
@@ -4047,19 +4075,20 @@ edge WorksAt: Person -> Company
                     && actual > KEYED_WRITE_MAX_BYTES
         ));
 
-        use crate::storage_layer::{KeyedBytes, retained_keyed_bytes};
         assert_eq!(
-            retained_keyed_bytes(
-                KeyedBytes::framing(KEYED_WRITE_MAX_BYTES - 1),
-                KeyedBytes::framing(1)
+            crate::storage_layer::retained_keyed_bytes(
+                KEYED_WRITE_MAX_BYTES - 1,
+                1,
+                WriteBudget::default()
             )
             .unwrap(),
-            KeyedBytes::framing(KEYED_WRITE_MAX_BYTES)
+            KEYED_WRITE_MAX_BYTES
         );
         assert!(
-            retained_keyed_bytes(
-                KeyedBytes::framing(KEYED_WRITE_MAX_BYTES),
-                KeyedBytes::framing(1)
+            crate::storage_layer::retained_keyed_bytes(
+                KEYED_WRITE_MAX_BYTES,
+                1,
+                WriteBudget::default()
             )
             .is_err()
         );
@@ -4979,12 +5008,12 @@ node Doc {
             "x".repeat(crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES as usize - prefix.len())
         );
         let mut builder = BlobArrayBuilder::new(1);
-        append_blob_value(&mut builder, &exact).unwrap();
+        append_blob_value(&mut builder, &exact, WriteBudget::default()).unwrap();
 
         let oversized = format!("{exact}x");
         let mut builder = BlobArrayBuilder::new(1);
         assert!(matches!(
-            append_blob_value(&mut builder, &oversized),
+            append_blob_value(&mut builder, &oversized, WriteBudget::default(),),
             Err(OmniError::ResourceLimitExceeded {
                 resource,
                 limit: crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES,
@@ -4995,10 +5024,23 @@ node Doc {
 
         let mut builder = BlobArrayBuilder::new(1);
         assert!(matches!(
-            append_blob_value(&mut builder, ""),
+            append_blob_value(&mut builder, "", WriteBudget::default(),),
             Err(OmniError::ExternalBlobPolicy { uri, reason })
                 if uri == "<redacted>"
                     && reason == "external Blob URI must be non-empty"
+        ));
+    }
+
+    #[test]
+    fn write_max_bytes_refuses_excess_base64_padding_before_decode_allocation() {
+        let settings = omnigraph_compiler::settings::SessionSettings::default()
+            .with("write_max_bytes", "8")
+            .unwrap();
+        let mut builder = BlobArrayBuilder::new(1);
+        let value = format!("base64:{}", "=".repeat(40));
+        assert!(matches!(
+            append_blob_value(&mut builder, &value, WriteBudget::from_settings(&settings)),
+            Err(OmniError::ResourceLimitExceeded { limit: 8, actual, .. }) if actual > 8
         ));
     }
 

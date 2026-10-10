@@ -484,8 +484,8 @@ in Seams at an explicit step. A step is one of:
   kinds. A seed may use `--- seed generate: v1 seed: <u64>` with the same
   recipe, appending batches in order instead of loading inline JSONL with
   overwrite semantics. Generators include literals, repeated strings,
-  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors
-  and ordinal/uniform/Zipf endpoints. Table `commits` fixes the number of
+  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors,
+  ordinal/uniform/Zipf endpoints and `base64:` Blob values. Table `commits` fixes the number of
   loader calls, with optional `batch_rows` fixing the chunk boundaries.
   A generated load requires at least one nonempty batch; empty recipes are
   admitted only as seeds, and any explicit batch size remains bounded.
@@ -585,7 +585,11 @@ in Seams at an explicit step. A step is one of:
   blocks only and refuses count predicates and a string `nearest` argument,
   so a step using those carries no reference comparison.
 - `--- mutate via <api>` (one API of Execution routes, below) holding exactly one GQ declaration with a mutation body,
-  followed by an optional `--- params` and a mandatory `--- expect` with
+  followed by an optional `--- params` (a JSON object, or a
+  `--- params generate: v1 seed: <u64>` recipe of one generator per
+  parameter, the same for a query step; see the
+  [generated fixture contract](../../crates/omnigraph-gqt/README.md#generated-fixtures-and-loads))
+  and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
   `affected: nodes=<N> edges=<M>` (success with both counts asserted; both
   are required, enumerated rather than summed), or `error: <substring>`.
