@@ -41,7 +41,7 @@ use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -105,6 +105,11 @@ pub(crate) enum PlanLine {
     ScanAccess {
         type_name: String,
         binding: Option<String>,
+    },
+    ScanIndex {
+        type_name: String,
+        binding: Option<String>,
+        column: Option<String>,
     },
     /// A physical `HashJoin` reaches `$binding`'s rows through a build of
     /// its table, and when `ran` is claimed, the run took that side of the
@@ -221,6 +226,8 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 PASS_JOIN_ALGORITHM,
                 PASS_EXPAND_MODE,
                 PASS_ACCESS_PATH,
+                omnigraph_planner::scan_access::PASS_SCAN_ACCESS,
+                omnigraph_planner::scan_access::PASS_KEY_TO_ID,
             ]
             .contains(&name)
             {
@@ -596,12 +603,25 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         } else if let Some(access) = claim.strip_prefix("access ") {
-            if access.trim() != ID_LOOKUP {
-                return Err(refused(
-                    "claims `access id_lookup`; a destination read once as a build side is `hash join $var`",
-                ));
+            let words: Vec<_> = access.split_whitespace().collect();
+            match words.as_slice() {
+                [ID_LOOKUP] => lines.push(PlanLine::ScanAccess { type_name, binding }),
+                ["sequential"] => lines.push(PlanLine::ScanIndex {
+                    type_name,
+                    binding,
+                    column: None,
+                }),
+                ["index_probe", column] if identifier(column) => lines.push(PlanLine::ScanIndex {
+                    type_name,
+                    binding,
+                    column: Some((*column).to_string()),
+                }),
+                _ => {
+                    return Err(refused(
+                        "claims `access id_lookup`, `access sequential` or `access index_probe <column>`",
+                    ));
+                }
             }
-            lines.push(PlanLine::ScanAccess { type_name, binding });
             continue;
         } else if let Some(list) = claim.strip_prefix("filter reads") {
             ScanClaim::FilterReads {
@@ -812,6 +832,7 @@ struct PlannedAccess {
     type_key: String,
     binding: Option<String>,
     access: Option<String>,
+    index_query: Option<omnigraph_planner::IndexQuery>,
     ranked: Option<PlannedRanking>,
     runtime_filter: Option<String>,
 }
@@ -1012,6 +1033,9 @@ fn require_typed_fields(node: &Value) -> Result<(), String> {
         ("keys", "typed_keys"),
         ("residual", "typed_residual"),
     ] {
+        if plain == "residual" && node.get("node").and_then(Value::as_str) == Some("Scan") {
+            continue;
+        }
         if let Some(values) = node.get(plain) {
             let count = values.as_array().ok_or_else(|| missing(typed))?.len();
             if node.get(typed).and_then(Value::as_array).map(Vec::len) != Some(count) {
@@ -1211,6 +1235,9 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 .get("access")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            index_query: node
+                .get("index_query")
+                .and_then(|query| serde_json::from_value(query.clone()).ok()),
             ranked: node
                 .get("ranked")
                 .and_then(Value::as_object)
@@ -1722,6 +1749,40 @@ pub(crate) fn plan_mismatch(
                     ));
                 }
             }
+            PlanLine::ScanIndex {
+                type_name,
+                binding,
+                column,
+            } => {
+                let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
+                    Ok(selected) => selected,
+                    Err(mismatch) => return Some(mismatch),
+                };
+                let want = if column.is_some() {
+                    "index_probe"
+                } else {
+                    "sequential"
+                };
+                for scan in selected {
+                    if scan.access.as_deref() != Some(want) {
+                        return Some(format!(
+                            "expect plan: the scan of `{type_name}` has access {:?}, expected `{want}`",
+                            scan.access
+                        ));
+                    }
+                    if let Some(column) = column {
+                        if !scan
+                            .index_query
+                            .as_ref()
+                            .is_some_and(|query| probes_column(query, column))
+                        {
+                            return Some(format!(
+                                "expect plan: the scan of `{type_name}` does not probe column `{column}`"
+                            ));
+                        }
+                    }
+                }
+            }
             PlanLine::ScanAccess { type_name, binding } => {
                 let selected = match physical_scans(&nodes, type_name, binding.as_deref()) {
                     Ok(selected) => selected,
@@ -1837,6 +1898,17 @@ pub(crate) fn plan_mismatch(
 
 /// The physical scans of `type_name` (bound to `binding` when named), or
 /// the mismatch naming what the plan scans instead.
+fn probes_column(query: &omnigraph_planner::IndexQuery, column: &str) -> bool {
+    use omnigraph_planner::IndexQuery;
+    match query {
+        IndexQuery::Search { column: found, .. } => found == column,
+        IndexQuery::And { left, right } | IndexQuery::Or { left, right } => {
+            probes_column(left, column) || probes_column(right, column)
+        }
+        IndexQuery::Not { input } => probes_column(input, column),
+    }
+}
+
 fn physical_scans<'n>(
     nodes: &'n PlannedNodes,
     type_name: &str,
@@ -2653,6 +2725,40 @@ mod tests {
             "hash join $d took hash_join",
         ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn scalar_access_claims_require_matching_typed_leaves_on_every_scan() {
+        let leaf = json!({"kind":"search","index":"by_age","column":"age","search":"age = 1"});
+        let scan = json!({"node":"Scan","table":"node:Doc","binding":"d","access":"index_probe",
+            "index_query":{"kind":"not","input":{"kind":"or","left":leaf.clone(),"right":leaf}},
+            "residual":"(active = true)"});
+        let claims = parse_plan_body(&[(0, "scan Doc as $d: access index_probe age")]).unwrap();
+        let explain = json!({"physical_plan":scan});
+        assert_eq!(check(&claims, &explain), None);
+        for bad in [
+            json!(null),
+            json!({"kind":"unknown"}),
+            json!({"kind":"search","index":"by_title","column":"title","search":"title = age"}),
+        ] {
+            let mut explain = explain.clone();
+            explain["physical_plan"]["index_query"] = bad;
+            assert!(check(&claims, &explain).is_some());
+        }
+        let mut sequential = explain["physical_plan"].clone();
+        sequential["access"] = json!("sequential");
+        sequential.as_object_mut().unwrap().remove("index_query");
+        let both = json!({"physical_plan":{"node":"CrossJoin","inputs":[explain["physical_plan"],sequential.clone()]}});
+        assert!(check(&claims, &both).is_some());
+        let claims = parse_plan_body(&[(0, "scan Doc as $d: access sequential")]).unwrap();
+        assert_eq!(check(&claims, &json!({"physical_plan":sequential})), None);
+        for refused in [
+            "scan Doc: access index_probe",
+            "scan Doc: access sequential age",
+            "scan Doc: access index_probe age extra",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err());
         }
     }
 

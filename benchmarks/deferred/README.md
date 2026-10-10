@@ -24,10 +24,12 @@ GQT can benchmark them. GQT must not introduce separate maintenance commands.
   active instrument to guard. Ordinary engine correctness and deterministic
   cost tests remain at their owning layers.
 - `crates/omnigraph/tests/compaction_memory.rs.disabled`: the stock-Lance
-  compaction comparator and the engine optimize peak-allocation assertion.
-  The latter is deferred pending GQ optimization support; it is no longer an
-  executable resource regression test. Existing deterministic Blob compaction
-  tests remain active.
+  compaction comparator, the engine optimize peak-allocation assertion, the
+  schema-apply peak that stays flat in a table's Blob bytes, and the optimize
+  that erases a dropped Blob property within the compaction batch budget.
+  These are deferred pending GQ schema and optimization support; they are no
+  longer executable resource regression tests. Existing deterministic Blob
+  compaction, schema-evolution and erasure tests remain active.
 - `crates/omnigraph/tests/manifest_history_curve.rs.disabled`: four ignored
   acquisition instruments covering publication and schema-outcome histories,
   request/byte counts, retained storage and diagnostic timings. Restoring them

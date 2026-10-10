@@ -3,10 +3,10 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new_null_array};
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
-use lance::blob::{BlobArrayBuilder, blob_field};
+use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -3295,17 +3295,6 @@ async fn warm_resolved_target(
     })
 }
 
-fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
-    }
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next().unwrap());
-    }
-    let batch_schema = batches[0].schema();
-    arrow_select::concat::concat_batches(&batch_schema, &batches).map_err(OmniError::arrow_internal)
-}
-
 fn blob_properties_for_table_key<'a>(
     catalog: &'a Catalog,
     table_key: &str,
@@ -3729,7 +3718,7 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, new_null_array};
 
     use super::*;
     use crate::db::manifest::ManifestCoordinator;

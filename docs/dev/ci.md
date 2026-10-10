@@ -135,7 +135,7 @@ scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
 cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
 `lance_version_columns` and `forbidden_apis`. All four select the
-`Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude
+`Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
 omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
 graph, the one `Test Workspace` builds, and the engine scopes reuse the
 crossversion scope's build; a scope that selected `-p omnigraph-engine
@@ -154,7 +154,7 @@ The released 0.12 cluster-ledger journey is separate
 Current-version live schema and policy deployment remains required by `Test Workspace`.
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
-required context aggregating three qualification jobs. `GQT (ordinary)` checks
+required context aggregating four qualification jobs. `GQT (ordinary)` checks
 unavailable-DST refusal and the unit tests of `omnigraph-gqt`,
 `omnigraph-gqt-core` and `omnigraph-bench` under an empty `RUSTFLAGS`, then
 runs the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`)
@@ -173,8 +173,16 @@ refused there; schema-and-seed datasets with zero steps are admitted.
 `--measure` refuses a selection with no DST environment.
 `GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
 `--- expect same as v1` comparison runs inside it, so no job selects an
-engine. `GQT (dst-clippy)` checks all package targets with Clippy. All
-three run from the repository root under
+engine. `GQT (dst-clippy)` checks all package targets with Clippy.
+`GQT (served)` runs `crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs`:
+every corpus case that declares the `omnigraph-server` target runs again
+through an in-process server, its in-process verdict must be green and its
+served verdict must equal it; `gqt_served_count.rs` in the same job totals
+the served and skipped cases and fails when no case is served.
+It selects the tests-only crate `omnigraph-gqt-served` under an empty
+`RUSTFLAGS`, the one job that builds that crate, so `Test Workspace` excludes
+it beside `omnigraph-gqt` and shares no engine build with it. All
+four run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
 Each job has its own 60-minute budget and cache key. The budget is at least
 twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
@@ -335,7 +343,8 @@ Container entrypoint and Azure deployment-validation jobs test argument composit
 The workspace suite (`Test Workspace`) runs on every pull request, merge-queue entry and push to `main` that changes engine input, on release tags, and by manual dispatch. GQT has its own configured owner above. The `main`, tag, and dispatch form (a pull request and a merge-queue entry drop `--no-fail-fast`):
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-fail-fast \
+cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+  --profile ci --no-fail-fast \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
@@ -346,6 +355,24 @@ dispatch it is the post-merge detection channel and keeps `--no-fail-fast`,
 so every independent failure stays attributable; a red run there is
 stop-the-line. The job compiles in one step (`cargo test --no-run`) and runs
 in the next, so compile and run wall clock read apart in the log.
+
+The run step uses `cargo-nextest` (binary version pinned in the job through
+the commit-pinned `taiki-e/install-action`) rather than `cargo test`: `cargo
+test` runs the workspace's test binaries one after another, so the run's wall
+clock is the sum of the binaries' durations, and a binary whose remaining
+tests are few and process-bound (the CLI, server and upgrade journeys) holds
+the machine while they finish. nextest schedules every test of every binary
+through one queue, a process per test, so another binary's tests fill that
+time. Which journeys form the tail is a matter for the suite's per-test
+timings, not asserted here. nextest runs no doctest, so the step keeps a
+`cargo test --doc` call on the same graph after it. The `ci` profile in
+`.config/nextest.toml` writes
+`target/nextest/ci/junit.xml` with captured output, and
+`scripts/check-workspace-test-owners.py` reads that report for the owners
+the job requires by name (the two upgrade journeys and the CLI/server/proxy
+journeys listed in the step) and for the upgrade journeys' captured notices,
+in place of grepping a `--nocapture` log. The local command in
+[testing.md](testing.md) stays `cargo test`; the two run the same binaries.
 
 The `main` run also seeds the dependency cache that pull requests restore.
 Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
@@ -426,7 +453,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   Azure owners run nowhere else, so a change that removes or renames one
   reports on the pull request instead of first appearing on `main`; wait for
   it before clicking Merge when ready. Every owner runs under the `Test
-  Workspace` selection (`--workspace --exclude omnigraph-gqt --exclude
+  Workspace` selection (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
   omnigraph-dst --features "$FAILPOINT_FEATURES"`) and names only its
   target, so the job builds one Lance graph. Its 90-minute ceiling is the
   cold-cache envelope; a warm run takes minutes. A red run on a pull request that touched
@@ -483,7 +510,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_ma
 cargo clippy --workspace --all-targets --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
   -- -D warnings -W clippy::dbg_macro
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```

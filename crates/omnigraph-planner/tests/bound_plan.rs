@@ -100,7 +100,12 @@ fn query(order_by: IRExpr) -> QueryIR {
 }
 
 fn plan(order_by: IRExpr) -> PhysicalPlan {
-    plan_query(&query(order_by), &source(), &fixture_bounds::BOUNDS).expect("the query plans")
+    futures::executor::block_on(plan_query(
+        &query(order_by),
+        &source(),
+        &fixture_bounds::BOUNDS,
+    ))
+    .expect("the query plans")
 }
 
 fn ranked_scan(plan: &PhysicalPlan, scope: RankScope) -> usize {
@@ -353,7 +358,8 @@ fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
         order_by: vec![],
         limit: Some(3),
     };
-    plan_query(&query, &source(), &fixture_bounds::BOUNDS).expect("the query plans")
+    futures::executor::block_on(plan_query(&query, &source(), &fixture_bounds::BOUNDS))
+        .expect("the query plans")
 }
 
 fn bound(plan: PhysicalPlan) -> BoundPlan {
@@ -519,7 +525,8 @@ fn a_hydrating_plan_reads_back_with_its_bindings() {
         ty: prop("d", "text").ty().clone(),
     });
     query.limit = Some(2);
-    let plan = plan_query(&query, &source(), &fixture_bounds::BOUNDS).expect("the query plans");
+    let plan = futures::executor::block_on(plan_query(&query, &source(), &fixture_bounds::BOUNDS))
+        .expect("the query plans");
     assert!(matches!(
         plan.node(plan.root()),
         Some(PhysicalNode::HydrateColumns { bindings, .. })
