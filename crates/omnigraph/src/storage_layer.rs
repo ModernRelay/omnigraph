@@ -831,6 +831,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         renames: &[(String, String)],
     ) -> Result<StagedHandle>;
 
+    /// Stage the next metadata-only commit of a planned schema evolution, or
+    /// `None` when no step remains; see `TableStore::stage_schema_evolution`.
+    /// Committed through `commit_staged_detached`.
+    async fn stage_schema_evolution(
+        &self,
+        snapshot: &SnapshotHandle,
+        evolution: &mut crate::table_store::SchemaEvolution,
+    ) -> Result<Option<StagedHandle>>;
+
     /// Stage a delete (two-phase, no HEAD advance) of the rows `filter`, a typed
     /// DataFusion expression, selects; `None` when 0 rows match and the table is
     /// not touched (no transaction, no version). See `TableStore::stage_delete`.
@@ -1375,6 +1384,18 @@ impl TableStorage for TableStore {
         TableStore::stage_rename_columns(self, snapshot.dataset(), renames)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_schema_evolution(
+        &self,
+        snapshot: &SnapshotHandle,
+        evolution: &mut crate::table_store::SchemaEvolution,
+    ) -> Result<Option<StagedHandle>> {
+        Ok(
+            TableStore::stage_schema_evolution(self, snapshot.dataset(), evolution)
+                .await?
+                .map(StagedHandle::new),
+        )
     }
 
     async fn stage_delete(
