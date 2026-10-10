@@ -1237,7 +1237,7 @@ pub struct MergeWriteProbes {
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
     /// Blob payload values a rewrite consumed while rebuilding descriptor rows
-    /// into a logical source (a keyed write or a schema rewrite), or that
+    /// into a logical source (a keyed write or a branch merge), or that
     /// export, a change image or an entity read rendered: one per managed
     /// value, counted after the batched managed read returned it and its
     /// length matched, and one per external object read (rewrites only).

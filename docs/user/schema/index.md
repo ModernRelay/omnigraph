@@ -154,6 +154,15 @@ nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, updating descriptions or instructions, and
 dropping node, edge, or property declarations.
 
+None of these changes rewrites existing rows. Adding a nullable property,
+renaming a property, or dropping a property changes only the table's metadata:
+existing rows read the new property as null, no stored value or Blob is read,
+and existing indexes keep covering the rows they covered. The time and memory
+the apply takes therefore do not grow with the number of rows or the size of
+their values. They still grow with the table's metadata: its columns, its
+indexes and its fragments, of which a table written by many small commits has
+more until `omnigraph optimize` compacts them.
+
 Applying changed schema text, including comments or formatting, records the new
 source in one graph commit even when no table changes are needed. Applying the
 same accepted source again leaves the graph unchanged.
@@ -165,10 +174,22 @@ rejected. The plan reports the exact unsupported step before anything changes.
 
 A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`
-stops retaining them; after that, the dropped data cannot be recovered. Review
-the plan carefully, and treat the cleanup that follows as the step that cannot
-be undone. To reclaim the space, run cleanup with a retention that excludes
-the commits before the drop. See [cleanup](../operations/maintenance.md#cleanup).
+stops retaining them. A dropped type's data is reclaimed by that cleanup. A
+dropped property's values also stay in the table's current data files, beside
+the properties that remain, until the next `omnigraph optimize`: every
+optimize rewrites each fragment of a table that still stores a dropped
+property's values, copying only the remaining properties. Optimize rewrites
+main only, and cleanup deletes the old files only once nothing it retains
+references them: a live branch keeps the commit it was created from and its
+head, a tag keeps the snapshot it names, and the retention policy keeps older
+commits. Merging a branch releases none of its files; only deleting the branch
+does. To erase dropped data, run optimize after the drop, delete every branch
+created from a commit before that optimize and every tag naming such a commit,
+then run cleanup with a retention that excludes the commits before the
+optimize, for example `--keep 1`; after that, the dropped data cannot be
+recovered. Review the plan carefully, and treat that cleanup as the step that
+cannot be undone. See [optimize](../operations/maintenance.md#optimize) and
+[cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
