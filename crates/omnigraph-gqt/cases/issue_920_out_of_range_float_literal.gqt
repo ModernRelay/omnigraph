@@ -1,0 +1,29 @@
+# issue: 920
+# red_on: main @ 1beab855; before the fix the query reports `value Float(inf) exceeds F64 range` at execution instead of a stable type diagnostic.
+# notes: An overflowing decimal float must be refused during type checking before execution.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node N {
+    f: F64
+}
+
+--- seed
+{"type":"N","data":{"f":0.0}}
+
+--- query
+set engine = v2;
+query out_of_range_float_literal() {
+    match {
+        $x: N
+        $x.f < 999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999.0
+    }
+    return { $x.f }
+}
+
+--- expect error: T3: float literal must be finite and within the F64 range
