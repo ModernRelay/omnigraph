@@ -742,6 +742,112 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     );
 }
 
+/// Adding a nullable Blob property writes no data, so rows written before the
+/// add sit in a fragment with no data file for it, which Lance reads as null.
+/// Both sides of a general three-way merge update rows of that fragment, so
+/// every row the merge classifies has its base image there; the merge compares
+/// them and carries each side's values.
+#[tokio::test]
+async fn branch_merge_compares_rows_written_before_a_blob_property_was_added() {
+    const WRITES: &str = r#"
+query set_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+
+query set_thumb($title: String, $thumb: Blob) {
+    update Document set { thumb: $thumb } where title = $title
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+    db.load_jsonl(
+        concat!(
+            "{\"type\":\"Document\",\"data\":{\"title\":\"a\",\"content\":\"base64:QQ==\",\"note\":\"a\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"b\",\"note\":\"b\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"c\",\"note\":\"c\"}}",
+        ),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let evolved = BLOB_SCHEMA.replace(
+        "    note: String?\n",
+        "    note: String?\n    thumb: Blob?\n",
+    );
+    assert!(db.apply_schema(&evolved).await.unwrap().applied);
+    db.branch_create("feature").await.unwrap();
+
+    mutate_main(
+        &db,
+        WRITES,
+        "set_note",
+        &params(&[("$title", "a"), ("$note", "main")]),
+    )
+    .await
+    .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        WRITES,
+        "set_note",
+        &params(&[("$title", "b"), ("$note", "feature")]),
+    )
+    .await
+    .unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        WRITES,
+        "set_thumb",
+        &params(&[("$title", "c"), ("$thumb", "base64:Yw==")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    let exported = db
+        .export_jsonl("main", &["Document".to_string()])
+        .await
+        .unwrap();
+    let mut rows = exported
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let cell = |name: &str| row["data"].get(name).cloned().unwrap_or_default();
+            (cell("title"), cell("note"), cell("content"), cell("thumb"))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.0.to_string());
+    let null = serde_json::Value::Null;
+    assert_eq!(
+        rows,
+        [
+            (
+                serde_json::json!("a"),
+                serde_json::json!("main"),
+                serde_json::json!("base64:QQ=="),
+                null.clone(),
+            ),
+            (
+                serde_json::json!("b"),
+                serde_json::json!("feature"),
+                null.clone(),
+                null.clone(),
+            ),
+            (
+                serde_json::json!("c"),
+                serde_json::json!("c"),
+                null,
+                serde_json::json!("base64:Yw=="),
+            ),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_reads() {
     // Lance branch versions live in independent namespaces and a deleted

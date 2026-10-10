@@ -1,0 +1,104 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query top_people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name asc }
+    limit 20
+}
+--- expect ordered
+{"p.name":"p000599","p.age":99}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000589","p.age":89}
+{"p.name":"p000588","p.age":88}
+{"p.name":"p000587","p.age":87}
+{"p.name":"p000586","p.age":86}
+{"p.name":"p000585","p.age":85}
+{"p.name":"p000584","p.age":84}
+{"p.name":"p000583","p.age":83}
+{"p.name":"p000582","p.age":82}
+{"p.name":"p000581","p.age":81}
+{"p.name":"p000580","p.age":80}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+query top_people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name asc }
+    limit 20
+}
+--- expect ordered
+{"p.name":"p000599","p.age":99}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000589","p.age":89}
+{"p.name":"p000588","p.age":88}
+{"p.name":"p000587","p.age":87}
+{"p.name":"p000586","p.age":86}
+{"p.name":"p000585","p.age":85}
+{"p.name":"p000584","p.age":84}
+{"p.name":"p000583","p.age":83}
+{"p.name":"p000582","p.age":82}
+{"p.name":"p000581","p.age":81}
+{"p.name":"p000580","p.age":80}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+query top_people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name asc }
+    limit 20
+}
+--- expect ordered
+{"p.name":"p000599","p.age":99}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000589","p.age":89}
+{"p.name":"p000588","p.age":88}
+{"p.name":"p000587","p.age":87}
+{"p.name":"p000586","p.age":86}
+{"p.name":"p000585","p.age":85}
+{"p.name":"p000584","p.age":84}
+{"p.name":"p000583","p.age":83}
+{"p.name":"p000582","p.age":82}
+{"p.name":"p000581","p.age":81}
+{"p.name":"p000580","p.age":80}
+--- expect shape
+p.name: String
+p.age: I64

@@ -7084,7 +7084,10 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let session = crate::lance_access::control_session();
-    let (full, replaced_head) = buffered_run(TAIL_MAX_COMMITS);
+    let buffered = 8;
+    let budget = HistoryReleaseBytes(1024);
+    let (full, replaced_head) = buffered_run(buffered);
+    assert!(full.is_full_under(&replaced_head, &[], budget).unwrap());
     let next_head = GraphLineageRow {
         graph_manifest_version: replaced_head.graph_manifest_version + 1,
         ..probe_commit("next", Some(&replaced_head.graph_commit_id))
@@ -7096,7 +7099,7 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
             &next_head,
             appended,
             &[],
-            HistoryReleaseBytes::PRODUCTION,
+            budget,
         )
     };
 
@@ -7108,13 +7111,13 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
         "{error}"
     );
     let all_but_the_newest =
-        super::history::settle(uri, &session, &full.records(&[])[..TAIL_MAX_COMMITS - 1])
+        super::history::settle(uri, &session, &full.records(&[])[..buffered - 1])
             .await
             .unwrap();
     let error = after(Some(&all_but_the_newest)).unwrap_err();
     assert!(
         error.to_string().contains(&format!(
-            "'c{TAIL_MAX_COMMITS}' would leave the buffer of `__manifest`"
+            "'c{buffered}' would leave the buffer of `__manifest`"
         )),
         "{error}"
     );
@@ -7127,6 +7130,10 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
     );
 
     let (with_room, replaced_head) = buffered_run(15);
+    let next_head = GraphLineageRow {
+        graph_manifest_version: replaced_head.graph_manifest_version + 1,
+        ..probe_commit("next", Some(&replaced_head.graph_commit_id))
+    };
     assert!(!with_room.is_full(&replaced_head, &[]).unwrap());
     assert_eq!(
         with_room
@@ -7142,6 +7149,25 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
             .commits()
             .len(),
         16
+    );
+
+    let unbounded = HistoryReleaseBytes(usize::MAX);
+    let (at_ceiling, replaced_head) = buffered_run(TAIL_MAX_COMMITS);
+    assert!(
+        at_ceiling
+            .is_full_under(&replaced_head, &[], unbounded)
+            .unwrap(),
+        "the commit ceiling fills the buffer under any byte budget"
+    );
+    let (one_below, replaced_head) = buffered_run(TAIL_MAX_COMMITS - 1);
+    assert!(
+        !one_below
+            .is_full_under(&replaced_head, &[], unbounded)
+            .unwrap()
+    );
+    assert!(
+        one_below.closes_with_under(&replaced_head, &[], unbounded),
+        "the commit that reaches the ceiling closes the buffer"
     );
 }
 

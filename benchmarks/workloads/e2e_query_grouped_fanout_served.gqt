@@ -1,0 +1,44 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64

@@ -3331,7 +3331,10 @@ mod tests {
 
         let loaded = load_archive(archive.path()).unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].record, AnyRunRecordV1::Legacy(record.clone()));
+        assert_eq!(
+            loaded[0].record,
+            AnyRunRecordV1::Legacy(Box::new(record.clone()))
+        );
         assert_eq!(loaded[0].receipt.record_sha256, first.record_sha256);
         assert!(!loaded[0].receipt.newly_published);
 
@@ -3380,7 +3383,7 @@ mod tests {
 
         assert_eq!(
             load_archive(&archive).unwrap()[0].record,
-            AnyRunRecordV1::Legacy(record.clone())
+            AnyRunRecordV1::Legacy(Box::new(record.clone()))
         );
         assert!(archive.join(receipt.object_relative_path).is_file());
         assert!(archive.join(receipt.pointer_relative_path).is_file());
@@ -3608,7 +3611,7 @@ mod tests {
         assert_eq!(remaining_pointer_directory_sync_failures(), 0);
         assert_eq!(
             load_archive(archive.path()).unwrap()[0].record,
-            AnyRunRecordV1::Legacy(record.clone())
+            AnyRunRecordV1::Legacy(Box::new(record.clone()))
         );
     }
 
@@ -3719,7 +3722,7 @@ mod tests {
         );
         assert_eq!(
             load_archive(&archive).unwrap()[0].record,
-            AnyRunRecordV1::Legacy(record.clone())
+            AnyRunRecordV1::Legacy(Box::new(record.clone()))
         );
     }
 
@@ -3816,7 +3819,7 @@ mod tests {
         assert_eq!(remaining_pointer_directory_sync_failures(), 0);
         assert_eq!(
             load_archive(archive.path()).unwrap()[0].record,
-            AnyRunRecordV1::Legacy(record.clone())
+            AnyRunRecordV1::Legacy(Box::new(record.clone()))
         );
 
         inject_pointer_directory_sync_failures(std::iter::repeat_n(
@@ -3977,17 +3980,20 @@ mod tests {
         let anchored = load_invocation(&inventory.anchored_root, invocation_id)
             .unwrap()
             .0;
-        assert_eq!(anchored.record, AnyRunRecordV1::Legacy(original.clone()));
+        assert_eq!(
+            anchored.record,
+            AnyRunRecordV1::Legacy(Box::new(original.clone()))
+        );
         assert_ne!(
             anchored.record,
-            AnyRunRecordV1::Legacy(forged_external_root)
+            AnyRunRecordV1::Legacy(Box::new(forged_external_root))
         );
 
         fs::rename(&archive, &replacement).unwrap();
         fs::rename(&displaced, &archive).unwrap();
         assert_eq!(
             inventory.next().unwrap().unwrap().record,
-            AnyRunRecordV1::Legacy(original)
+            AnyRunRecordV1::Legacy(Box::new(original))
         );
     }
 
