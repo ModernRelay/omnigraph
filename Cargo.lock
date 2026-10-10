@@ -5645,6 +5645,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "color-eyre",
  "futures",

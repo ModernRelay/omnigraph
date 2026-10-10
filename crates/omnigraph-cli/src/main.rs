@@ -1380,6 +1380,72 @@ async fn run(cli: Cli) -> Result<()> {
                     print_blob_stat_human(&output);
                 }
             }
+            BlobCommand::Put {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                file,
+                if_match,
+                json,
+            } => {
+                // A malformed precondition and input over the limit are
+                // refused before scope resolution, so neither arm starts.
+                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
+                let bytes = blob_cli::read_put_input(file.as_deref())?;
+                let query =
+                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client
+                    .blob_write(&query, Some(bytes), if_match.as_deref(), precondition)
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_write_human(&output);
+                }
+            }
+            BlobCommand::Clear {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                if_match,
+                json,
+            } => {
+                let precondition = blob_cli::parse_if_match(if_match.as_deref())?;
+                let query =
+                    blob_cli::blob_write_query(entity.into(), type_name, id, property, branch);
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client
+                    .blob_write(&query, None, if_match.as_deref(), precondition)
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_write_human(&output);
+                }
+            }
         },
         Command::Query {
             name,

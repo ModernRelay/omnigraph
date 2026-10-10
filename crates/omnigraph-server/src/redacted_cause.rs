@@ -48,6 +48,7 @@ impl RedactedCause {
             OmniError::BlobRangeNotSatisfiable { .. } => "BlobRangeNotSatisfiable",
             OmniError::RecoveryRequired { .. } => "RecoveryRequired",
             OmniError::PreconditionFailed { .. } => "PreconditionFailed",
+            OmniError::BlobWritePreconditionFailed { .. } => "BlobWritePreconditionFailed",
             OmniError::Policy(_) => "Policy",
             OmniError::AlreadyInitialized { .. } => "AlreadyInitialized",
             OmniError::InitializationCommitted { .. } => "InitializationCommitted",

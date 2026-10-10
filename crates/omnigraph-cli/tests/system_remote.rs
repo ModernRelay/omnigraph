@@ -724,6 +724,129 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
     }
 }
 
+/// A Blob put or clear whose successful receipt is lost in delivery is
+/// published once and never resent: the CLI reports the failure, the server
+/// holds exactly the receipt the proxy saw, and the proxy saw one submission.
+/// The put carries 2 MiB of raw bytes, past the JSON request bound.
+#[test]
+fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
+    use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (cluster_dir, _) = blob_parity_config(temp.path(), &temp.path().join("local.omni"));
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let client = graph_http_client();
+    let graph_url = format!("{}/graphs/{PARITY_GRAPH_ID}", server.base_url);
+    let blob_url = format!("{graph_url}/blob?entity=node&type=Document&id=readme&property=content");
+    let authorized = |request: reqwest::blocking::RequestBuilder| {
+        request.header("authorization", format!("Bearer {PARITY_TOKEN}"))
+    };
+    let commits = || {
+        authorized(client.get(format!("{graph_url}/commits?branch=main")))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap()
+    };
+    let payload = temp.path().join("payload.bin");
+    let bytes: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    std::fs::write(&payload, &bytes).unwrap();
+
+    for put in [true, false] {
+        for fault in [
+            MergeDeliveryFault::Disconnect,
+            MergeDeliveryFault::Truncate,
+            MergeDeliveryFault::GatewayTimeout,
+            MergeDeliveryFault::CallerWait,
+        ] {
+            if !put {
+                authorized(client.put(&blob_url))
+                    .header("content-type", "application/octet-stream")
+                    .body(b"to clear".to_vec())
+                    .send()
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+            }
+            let before = commits();
+            let proxy = IntentApiFixture::graph_blob_write_proxy(&server.base_url, fault);
+            let mut command = cli();
+            command
+                .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                .arg("blob")
+                .arg(if put { "put" } else { "clear" })
+                .args(["node", "Document", "readme", "content"]);
+            if put {
+                command.arg("--file").arg(&payload);
+            }
+            command
+                .arg("--server")
+                .arg(&proxy.origin)
+                .arg("--graph")
+                .arg(PARITY_GRAPH_ID)
+                .arg("--json")
+                .timeout(std::time::Duration::from_secs(15));
+            let output = output_failure(&mut command);
+            if !matches!(fault, MergeDeliveryFault::CallerWait) {
+                assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
+            }
+            if !output.stdout.is_empty() {
+                let error = parse_stdout_json(&output);
+                assert!(error.get("error").is_some(), "{put}/{fault:?}: {error}");
+                assert!(
+                    error.get("commit").is_none(),
+                    "lost delivery is not success"
+                );
+            }
+
+            let captured = proxy.forwarded_responses();
+            assert_eq!(captured.len(), 1, "{put}/{fault:?}: one upstream write");
+            let upstream: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+            assert_eq!(upstream["kind"], if put { "managed" } else { "null" });
+            let receipt = &upstream["commit"];
+            let after = commits();
+            assert_eq!(after["commits"][0], *receipt, "{put}/{fault:?}");
+            assert_eq!(
+                after["commits"].as_array().unwrap().len(),
+                before["commits"].as_array().unwrap().len() + 1,
+                "{put}/{fault:?}: published once"
+            );
+            let read = authorized(client.get(&blob_url)).send().unwrap();
+            if put {
+                assert_eq!(read.status(), reqwest::StatusCode::OK);
+                assert_eq!(
+                    read.headers()["etag"].to_str().unwrap(),
+                    upstream["etag"].as_str().unwrap()
+                );
+                assert_eq!(read.bytes().unwrap().as_ref(), bytes.as_slice());
+            } else {
+                assert_eq!(read.status(), reqwest::StatusCode::NOT_FOUND);
+            }
+            proxy.assert_complete();
+            let requests = proxy.requests();
+            assert_eq!(requests.len(), 2, "discovery and exactly one submission");
+            assert_eq!(requests[0].method, "HEAD");
+            assert_eq!(requests[1].method, if put { "PUT" } else { "DELETE" });
+            if put {
+                assert_eq!(
+                    requests[1].raw_body, bytes,
+                    "the raw body crossed unchanged"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn remote_deployment_delivery_loss_preserves_owned_completion() {
     use std::io::{BufRead, BufReader, Write};
