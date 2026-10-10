@@ -3119,6 +3119,10 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
         Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
+        Literal::Float(value) if !value.is_finite() => Err(CompilerError::typed(
+            T3,
+            "float literal must be finite and within the F64 range".to_string(),
+        )),
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
         Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
         Literal::Date(value) => {
