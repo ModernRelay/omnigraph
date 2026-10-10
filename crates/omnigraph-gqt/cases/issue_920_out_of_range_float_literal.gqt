@@ -13,6 +13,9 @@ node N {
     f: F64
 }
 
+--- seed
+{"type":"N","data":{"f":0.0}}
+
 --- query
 set engine = v2;
 query out_of_range_float_literal() {
