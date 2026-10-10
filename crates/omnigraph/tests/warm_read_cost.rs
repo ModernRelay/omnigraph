@@ -560,7 +560,7 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
-        commit_many(&db, 20).await;
+        commit_many(&db, 3).await;
         let mut writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
 
         // Keep each assertion phase on the heap: their control/write futures

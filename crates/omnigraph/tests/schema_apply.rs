@@ -485,21 +485,17 @@ async fn parked_writer_blocks_schema_apply() {
 
     let post_gate =
         helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+    let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let schema_db = Arc::clone(&db);
     let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
-    // Wall time: an apply past the gate makes store requests before the seam.
-    let crossed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while !post_gate.reached() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await;
+    queued.wait_until_reached().await;
     assert!(
-        crossed.is_err(),
+        !post_gate.reached(),
         "schema apply must wait behind a writer's held shared schema permit; it \
          crossed its effect gate while the writer was parked",
     );
     assert!(!schema_task.is_finished());
+    queued.release();
 
     in_envelope.release();
     writer

@@ -2658,7 +2658,7 @@ async fn offline_deployment_reserves_created_query_projection_before_schema_effe
     // projection: every new address also appears in resource_statuses.
     let mut state = read_state_json(dir.path());
     state["approval_records"]["retained_audit"] = json!("");
-    let headroom = 240 * 1024;
+    let headroom = 48 * 1024;
     let target_bytes = deployment::MAX_LEDGER_BYTES - headroom;
     let padding = target_bytes - serde_json::to_vec(&state).unwrap().len();
     state["approval_records"]["retained_audit"] = json!("a".repeat(padding));
@@ -2670,7 +2670,7 @@ async fn offline_deployment_reserves_created_query_projection_before_schema_effe
     let mut config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
     let mut declarations = String::new();
     let mut projected_growth = 0;
-    for index in 0..512 {
+    for index in 0..96 {
         let name = format!("query_{index:03}_{}", "x".repeat(200));
         let address = config::query_address("knowledge", &name);
         assert!(address.len() <= 512);

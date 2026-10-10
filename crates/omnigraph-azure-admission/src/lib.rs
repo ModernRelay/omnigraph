@@ -926,8 +926,9 @@ mod tests {
     use std::io::ErrorKind;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
-    use std::time::Instant;
 
     enum ScriptedResponse {
         Status(&'static str),
@@ -986,12 +987,16 @@ mod tests {
         (endpoint, handle)
     }
 
-    fn redirect_target(response: Vec<u8>) -> (String, JoinHandle<Option<String>>) {
+    /// A listener that records the one request a followed redirect would send;
+    /// `stop` ends the accept loop after one more non-blocking accept.
+    fn redirect_target(response: Vec<u8>) -> (String, JoinHandle<Option<String>>, Arc<AtomicBool>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
         let handle = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut final_pass = false;
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -1015,8 +1020,12 @@ mod tests {
                         return Some(String::from_utf8(bytes).unwrap());
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return None;
+                        if stopped.load(Ordering::SeqCst) {
+                            if final_pass {
+                                return None;
+                            }
+                            final_pass = true;
+                            continue;
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -1024,7 +1033,7 @@ mod tests {
                 }
             }
         });
-        (endpoint, handle)
+        (endpoint, handle, stop)
     }
 
     fn scripted_client(endpoint: &str) -> AdmissionClient {
@@ -1098,7 +1107,7 @@ mod tests {
             std::str::from_utf8(token_body).unwrap()
         )
         .into_bytes();
-        let (target_endpoint, target) = redirect_target(target_response);
+        let (target_endpoint, target, stop_target) = redirect_target(target_response);
         let redirect_response = format!(
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_endpoint}/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
@@ -1115,6 +1124,7 @@ mod tests {
             .access_token(&admission_http_client().unwrap())
             .await;
         redirector.join().unwrap();
+        stop_target.store(true, Ordering::SeqCst);
         let forwarded = target.join().unwrap();
 
         assert!(matches!(
@@ -1135,7 +1145,7 @@ mod tests {
             proposed.as_str()
         )
         .into_bytes();
-        let (target_endpoint, target) = redirect_target(target_response);
+        let (target_endpoint, target, stop_target) = redirect_target(target_response);
         let redirect_response = format!(
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target_endpoint}/lease\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
@@ -1147,6 +1157,7 @@ mod tests {
 
         let result = client.try_acquire(proposed).await;
         redirector.join().unwrap();
+        stop_target.store(true, Ordering::SeqCst);
         let forwarded = target.join().unwrap();
 
         assert!(matches!(

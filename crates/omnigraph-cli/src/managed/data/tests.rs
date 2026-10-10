@@ -1067,7 +1067,8 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
     let mut chunked = format!("{:x}\r\n", 8 * 1024 * 1024 + 1).into_bytes();
     chunked.extend(vec![b' '; 8 * 1024 * 1024 + 1]);
     chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-    for (reply, expected) in [
+    let operations = ["query", "load", "commit-list", "commit-show"];
+    let cases = [
         (
             IntentReply {
                 status: 307,
@@ -1092,11 +1093,17 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
             },
             "8 MiB",
         ),
-    ] {
-        for operation in ["query", "load", "commit-list", "commit-show"] {
-            let server = IntentApiFixture::graph(vec![reply.clone()]);
-            let client =
-                GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    ];
+    let server = IntentApiFixture::graph(
+        cases
+            .iter()
+            .flat_map(|(reply, _)| std::iter::repeat_n(reply.clone(), operations.len()))
+            .collect(),
+    );
+    let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    let mut completed = 0;
+    for (_, expected) in &cases {
+        for operation in operations {
             let error = match operation {
                 "load" => client
                     .load(
@@ -1122,9 +1129,11 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                     .unwrap_err(),
             };
             assert!(error.to_string().contains(expected), "{error}");
-            server.assert_complete();
+            completed += 1;
+            assert_eq!(server.workflow_requests().len(), completed, "{operation}");
         }
     }
+    server.assert_complete();
     target.assert_complete();
 }
 
@@ -1133,7 +1142,8 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
     let encoded = DATA_TOKEN.replace('h', "\\u0068");
     let batch = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(batch.path(), "{}\n").unwrap();
-    for (status, body) in [
+    let operations = ["mutate", "load", "commit-list", "commit-show"];
+    let cases = [
         (200, json!(DATA_TOKEN).to_string()),
         (401, format!("{{\"error\":\"rejected {encoded}\"}}")),
         (403, format!("rejected {DATA_TOKEN}")),
@@ -1143,41 +1153,96 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
             412,
             json!({"error":format!("rejected {DATA_TOKEN}"),"precondition_failure":{"expected":DATA_TOKEN,"actual":null}}).to_string(),
         ),
-    ] {
-      for operation in ["mutate", "load", "commit-list", "commit-show"] {
-        let server = IntentApiFixture::graph(vec![IntentReply { status, headers: vec![("Retry-After".into(), format!("retry-{DATA_TOKEN}"))], body: body.as_bytes().to_vec() }]);
-        let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
-        let (error, evidence) = crate::command_outcome::observe(async { match operation {
-            "load" => client.load("main", None, batch.path().to_str().unwrap(), crate::cli::CliLoadMode::Append, &[]).await.unwrap_err(),
-            "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
-            "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
-            _ => client
-            .mutate("main", "mutation m() {}", Some("m"), None, Some("head-a"), &[])
-            .await
-            .unwrap_err(), } }).await;
-        // Reflected/mismatched expected tokens do not prove our conditional
-        // request was refused, even when the HTTP status happens to be 412.
-        assert!(error.downcast_ref::<crate::helpers::PreconditionFailedCli>().is_none());
-        let rendered = if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
-            serde_json::to_string(&remote.output).unwrap()
-        } else {
-            error.to_string()
-        };
-        assert!(!rendered.contains(DATA_TOKEN), "credential leaked: {status}");
-        if status == 200 {
-            assert_eq!(rendered, "invalid managed data response");
-        } else {
-            assert!(rendered.contains("[redacted]"), "{rendered}");
+    ];
+    let server = IntentApiFixture::graph(
+        cases
+            .iter()
+            .flat_map(|(status, body)| {
+                std::iter::repeat_n(
+                    IntentReply {
+                        status: *status,
+                        headers: vec![("Retry-After".into(), format!("retry-{DATA_TOKEN}"))],
+                        body: body.as_bytes().to_vec(),
+                    },
+                    operations.len(),
+                )
+            })
+            .collect(),
+    );
+    let client = GraphClient::managed(&server.origin, "knowledge", DATA_TOKEN.into()).unwrap();
+    let mut completed = 0;
+    for (status, _) in cases {
+        for operation in operations {
+            let (error, evidence) = crate::command_outcome::observe(async {
+                match operation {
+                    "load" => client
+                        .load(
+                            "main",
+                            None,
+                            batch.path().to_str().unwrap(),
+                            crate::cli::CliLoadMode::Append,
+                            &[],
+                        )
+                        .await
+                        .unwrap_err(),
+                    "commit-list" => client.list_commits(Some("main")).await.unwrap_err(),
+                    "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
+                    _ => client
+                        .mutate(
+                            "main",
+                            "mutation m() {}",
+                            Some("m"),
+                            None,
+                            Some("head-a"),
+                            &[],
+                        )
+                        .await
+                        .unwrap_err(),
+                }
+            })
+            .await;
+            assert!(
+                error
+                    .downcast_ref::<crate::helpers::PreconditionFailedCli>()
+                    .is_none(),
+                "{status} {operation}: a reflected or mismatched expected token never proves our conditional request was refused, even at HTTP 412"
+            );
+            let rendered =
+                if let Some(remote) = error.downcast_ref::<crate::helpers::RemoteErrorCli>() {
+                    serde_json::to_string(&remote.output).unwrap()
+                } else {
+                    error.to_string()
+                };
+            assert!(
+                !rendered.contains(DATA_TOKEN),
+                "credential leaked: {status}"
+            );
+            if status == 200 {
+                assert_eq!(rendered, "invalid managed data response");
+            } else {
+                assert!(rendered.contains("[redacted]"), "{rendered}");
+            }
+            let failure =
+                serde_json::to_string(&crate::command_outcome::Failure::classify(error, evidence))
+                    .unwrap();
+            assert!(
+                !failure.contains(DATA_TOKEN),
+                "outcome leaked credential: {failure}"
+            );
+            assert!(failure.contains("retry-[redacted]"), "{failure}");
+            completed += 1;
+            assert_eq!(
+                server.workflow_requests().len(),
+                completed,
+                "{status} {operation}"
+            );
         }
-        let failure = serde_json::to_string(&crate::command_outcome::Failure::classify(error, evidence)).unwrap();
-        assert!(!failure.contains(DATA_TOKEN), "outcome leaked credential: {failure}");
-        assert!(failure.contains("retry-[redacted]"), "{failure}");
-        server.assert_complete();
-      }
     }
+    server.assert_complete();
 }
 
 #[tokio::test]
+#[ignore = "nightly: a real 30.75 s reply proves the 300 s load timeout outlives the 30 s managed deadline"]
 async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let context = context();

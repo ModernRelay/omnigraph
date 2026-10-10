@@ -556,6 +556,19 @@ query insert_person($name: String, $age: I32) {
 
 #[test]
 fn remote_merge_delivery_loss_never_replays_committed_effect() {
+    assert_merge_delivery_loss_never_replays_committed_effect(false);
+}
+
+#[test]
+fn remote_merge_statement_delivery_loss_never_replays_committed_effect() {
+    assert_merge_delivery_loss_never_replays_committed_effect(true);
+}
+
+/// One real server, four delivery faults on the verb (`branch merge`) or the
+/// statement (`mutate -e "branch merge …"`) spelling of the same merge.
+fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
     use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
@@ -573,118 +586,149 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
             .unwrap()
     };
 
-    for statement in [false, true] {
-        for (index, fault) in [
-            MergeDeliveryFault::Disconnect,
-            MergeDeliveryFault::Truncate,
-            MergeDeliveryFault::GatewayTimeout,
-            MergeDeliveryFault::CallerWait,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let source = format!("delivery-{}-{index}", usize::from(statement));
-            let marker = format!("Merged-{source}");
-            client
-                .post(format!("{graph_url}/branches"))
-                .json(&json!({"from": "main", "name": source}))
-                .send()
-                .unwrap()
-                .error_for_status()
+    for (index, fault) in [
+        MergeDeliveryFault::Disconnect,
+        MergeDeliveryFault::Truncate,
+        MergeDeliveryFault::GatewayTimeout,
+        MergeDeliveryFault::CallerWait,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = format!("delivery-{}-{index}", usize::from(statement));
+        let marker = format!("Merged-{source}");
+        client
+            .post(format!("{graph_url}/branches"))
+            .json(&json!({"from": "main", "name": source}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let change = client
+            .post(format!("{graph_url}/mutate"))
+            .json(&json!({
+                "branch": source,
+                "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
+                "params": {"name": marker}
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .unwrap();
+        let before_target = get_json("commits?branch=main");
+        let before_source = get_json(&format!("commits?branch={source}"));
+
+        let proxy = IntentApiFixture::graph_merge_proxy(&server.base_url, fault);
+        let mut args: Vec<String> = if statement {
+            vec![
+                "mutate".into(),
+                "-e".into(),
+                format!("branch merge \"{source}\" into main"),
+            ]
+        } else {
+            vec!["branch".into(), "merge".into(), source.clone()]
+        };
+        args.extend(
+            [
+                "--server",
+                proxy.origin.as_str(),
+                "--graph",
+                GRAPH_ID,
+                "--json",
+            ]
+            .map(String::from),
+        );
+        let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
+            let mut caller = cli_process()
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
-            let change = client
-                .post(format!("{graph_url}/mutate"))
-                .json(&json!({
-                    "branch": source,
-                    "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
-                    "params": {"name": marker}
-                }))
-                .send()
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .json::<serde_json::Value>()
-                .unwrap();
-            let before_target = get_json("commits?branch=main");
-            let before_source = get_json(&format!("commits?branch={source}"));
-
-            let proxy = IntentApiFixture::graph_merge_proxy(&server.base_url, fault);
-            let mut command = cli();
-            if statement {
-                command
-                    .arg("mutate")
-                    .arg("-e")
-                    .arg(format!("branch merge \"{source}\" into main"));
-            } else {
-                command.arg("branch").arg("merge").arg(&source);
-            }
-            command
-                .arg("--server")
-                .arg(&proxy.origin)
-                .arg("--graph")
-                .arg(GRAPH_ID)
-                .arg("--json")
-                // CallerWait deliberately expires this process wait while the
-                // proxy owns a fully consumed successful server response. It
-                // qualifies caller abandonment, not a production deadline flag.
-                .timeout(std::time::Duration::from_secs(15));
-            let output = output_failure(&mut command);
-            if !matches!(fault, MergeDeliveryFault::CallerWait) {
-                assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
-            }
-            if !output.stdout.is_empty() {
-                let error = parse_stdout_json(&output);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while proxy.forwarded_responses().is_empty() {
                 assert!(
-                    error.get("error").is_some(),
-                    "{statement}/{fault:?}: {error}"
+                    caller.try_wait().unwrap().is_none(),
+                    "{statement}/{fault:?}: caller must still wait while the proxy owns the consumed reply"
                 );
                 assert!(
-                    error.get("commit").is_none(),
-                    "lost delivery is not success"
+                    Instant::now() < deadline,
+                    "{statement}/{fault:?}: upstream merge must complete before the caller is abandoned"
                 );
-                assert!(
-                    error.get("outcome").is_none(),
-                    "lost delivery is not success"
-                );
+                std::thread::sleep(Duration::from_millis(5));
             }
+            assert!(
+                caller.try_wait().unwrap().is_none(),
+                "{statement}/{fault:?}: caller must still wait when the consumed reply is withheld"
+            );
+            caller.kill().unwrap();
+            caller.wait_with_output().unwrap()
+        } else {
+            output_failure(cli().args(&args).timeout(Duration::from_secs(15)))
+        };
+        assert!(
+            !output.status.success(),
+            "{statement}/{fault:?}: lost delivery must not report success"
+        );
+        if !matches!(fault, MergeDeliveryFault::CallerWait) {
+            assert_eq!(output.status.code(), Some(1), "{statement}/{fault:?}");
+        }
+        if !output.stdout.is_empty() {
+            let error = parse_stdout_json(&output);
+            assert!(
+                error.get("error").is_some(),
+                "{statement}/{fault:?}: {error}"
+            );
+            assert!(
+                error.get("commit").is_none(),
+                "lost delivery is not success"
+            );
+            assert!(
+                error.get("outcome").is_none(),
+                "lost delivery is not success"
+            );
+        }
 
-            let captured = proxy.forwarded_responses();
-            assert_eq!(
-                captured.len(),
-                1,
-                "{statement}/{fault:?}: successful upstream merge"
-            );
-            let upstream: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
-            let outcome = if statement {
-                &upstream["outcome"]["merge"]
-            } else {
-                &upstream["outcome"]
-            };
-            assert_eq!(outcome, "fast_forward", "{statement}/{fault:?}");
-            let receipt = &upstream["commit"];
-            let commit_id = receipt["graph_commit_id"].as_str().unwrap();
-            assert_eq!(
-                receipt["parent_commit_id"],
-                before_target["commits"][0]["graph_commit_id"]
-            );
-            assert_eq!(
-                receipt["merged_parent_commit_id"],
-                change["commit"]["graph_commit_id"]
-            );
+        let captured = proxy.forwarded_responses();
+        assert_eq!(
+            captured.len(),
+            1,
+            "{statement}/{fault:?}: successful upstream merge"
+        );
+        let upstream: serde_json::Value = serde_json::from_slice(&captured[0].body).unwrap();
+        let outcome = if statement {
+            &upstream["outcome"]["merge"]
+        } else {
+            &upstream["outcome"]
+        };
+        assert_eq!(outcome, "fast_forward", "{statement}/{fault:?}");
+        let receipt = &upstream["commit"];
+        let commit_id = receipt["graph_commit_id"].as_str().unwrap();
+        assert_eq!(
+            receipt["parent_commit_id"],
+            before_target["commits"][0]["graph_commit_id"]
+        );
+        assert_eq!(
+            receipt["merged_parent_commit_id"],
+            change["commit"]["graph_commit_id"]
+        );
 
-            // Inspect the actual server independently of the proxy's captured
-            // body: one target publication, that exact receipt, retained source
-            // and the intended row on both branches despite failed delivery.
-            assert_eq!(get_json(&format!("commits/{commit_id}")), *receipt);
-            let after_target = get_json("commits?branch=main");
-            assert_eq!(after_target["commits"][0], *receipt);
-            assert_eq!(
-                after_target["commits"].as_array().unwrap().len(),
-                before_target["commits"].as_array().unwrap().len() + 1
-            );
-            assert_eq!(get_json(&format!("commits?branch={source}")), before_source);
-            for branch in ["main", source.as_str()] {
-                let rows = client
+        assert_eq!(
+            get_json(&format!("commits/{commit_id}")),
+            *receipt,
+            "{statement}/{fault:?}: the server itself holds the receipt the proxy captured"
+        );
+        let after_target = get_json("commits?branch=main");
+        assert_eq!(after_target["commits"][0], *receipt);
+        assert_eq!(
+            after_target["commits"].as_array().unwrap().len(),
+            before_target["commits"].as_array().unwrap().len() + 1
+        );
+        assert_eq!(get_json(&format!("commits?branch={source}")), before_source);
+        for branch in ["main", source.as_str()] {
+            let rows = client
                     .post(format!("{graph_url}/query"))
                     .json(&json!({
                         "branch": branch,
@@ -697,30 +741,29 @@ fn remote_merge_delivery_loss_never_replays_committed_effect() {
                     .unwrap()
                     .json::<serde_json::Value>()
                     .unwrap();
-                assert_eq!(rows["rows"], json!([{"p.name": marker, "p.age": 33}]));
-            }
-            proxy.assert_complete();
-            let requests = proxy.requests();
-            assert_eq!(
-                requests.len(),
-                2,
-                "discovery and exactly one data submission"
-            );
-            assert_eq!(requests[0].method, "HEAD");
-            assert_eq!(requests[0].path, "/healthz");
-            assert_eq!(requests[1].method, "POST");
-            assert_eq!(
-                requests[1].path,
-                format!(
-                    "/graphs/{GRAPH_ID}/{}",
-                    if statement {
-                        "mutate"
-                    } else {
-                        "branches/merge"
-                    }
-                )
-            );
+            assert_eq!(rows["rows"], json!([{"p.name": marker, "p.age": 33}]));
         }
+        proxy.assert_complete();
+        let requests = proxy.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "discovery and exactly one data submission"
+        );
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(
+            requests[1].path,
+            format!(
+                "/graphs/{GRAPH_ID}/{}",
+                if statement {
+                    "mutate"
+                } else {
+                    "branches/merge"
+                }
+            )
+        );
     }
 }
 
@@ -828,7 +871,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
                 "--deployment-id",
                 &id,
                 "--timeout",
-                if times_out { "3" } else { "15" },
+                if times_out { "2" } else { "15" },
                 "--json",
             ])
             .timeout(Duration::from_secs(20));

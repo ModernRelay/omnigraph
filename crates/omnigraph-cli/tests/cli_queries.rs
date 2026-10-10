@@ -505,7 +505,7 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
             ENVELOPE_BEFORE_CONSENT,
         ),
     ];
-    for (args, expected, rule) in cases {
+    for_each_concurrently(cases.to_vec(), CASE_WORKERS, |(args, expected, rule)| {
         let stderr = refusal(args);
         assert!(
             stderr.contains(expected),
@@ -516,7 +516,7 @@ fn branch_statement_local_refusals_happen_before_any_round_trip() {
             "{args:?}: the refusal must not follow a round trip (nothing listens on \
              {unreachable}); got: {stderr}"
         );
-    }
+    });
 
     let absent = temp.path().join("absent.omni");
     let stderr = stderr_string(&output_failure(

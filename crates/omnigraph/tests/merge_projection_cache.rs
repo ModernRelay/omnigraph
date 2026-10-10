@@ -184,15 +184,16 @@ fn repeated_merge_reuses_local_projection_and_refreshes_foreign() {
 }
 
 /// A cold merge uses held tails for recent divergence and addressed history
-/// blocks for an older base, without enumerating all settled ancestry.
+/// blocks for an older base, without enumerating all settled ancestry. Under a
+/// 2048-byte `history_release_bytes` main's buffer releases every fourth publish.
 #[test]
 fn cold_merge_uses_held_tail_before_settled_history() {
     on_big_stack(|| async {
         cost_harness(async {
-            for divergence in [1, 33] {
+            for divergence in [1, 6] {
                 let dir = tempfile::tempdir().unwrap();
-                let db = init_and_load(&dir).await;
-                for age in 40..88 {
+                let db = with_setting(&init_and_load(&dir).await, "history_release_bytes", "2048");
+                for age in 40..47 {
                     mutate_main(
                         &db,
                         MUTATION_QUERIES,
@@ -214,7 +215,9 @@ fn cold_merge_uses_held_tail_before_settled_history() {
                 assert_eq!(outcome.unwrap().outcome, MergeOutcome::Merged);
                 assert_eq!(
                     io.projection_full_refreshes, 0,
-                    "divergence {divergence}: cold merge must use held tails or addressed blocks"
+                    "divergence {divergence}: cold merge must use held tails or addressed blocks \
+                     (the fork is one publish after a release, so one round keeps the base in \
+                     the held tail and six rounds release it from both heads at round 2)"
                 );
                 for (name, age) in [("Alice", 130 + divergence), ("Bob", 125 + divergence)] {
                     let result = db
