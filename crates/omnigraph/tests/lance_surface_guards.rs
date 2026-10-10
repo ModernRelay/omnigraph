@@ -5802,6 +5802,273 @@ async fn fts_prefilter_does_not_change_covered_fragment_scores() {
     );
 }
 
+fn segment_guard_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+    ]))
+}
+
+fn segment_guard_batch(rows: &[(&str, &str, &str)]) -> RecordBatch {
+    RecordBatch::try_new(
+        segment_guard_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+async fn segment_guard_write(uri: &str, rows: &[(&str, &str, &str)], mode: WriteMode) -> Dataset {
+    let batches = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![Ok(segment_guard_batch(rows))]
+    };
+    Dataset::write(
+        RecordBatchIterator::new(batches, segment_guard_schema()),
+        uri,
+        Some(WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+/// Every row a full-text search returns, by id, with its score's bits; a row
+/// returned twice is listed twice.
+async fn segment_guard_search(ds: &Dataset, query: &str) -> Vec<(String, u32)> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id", "_score"]).unwrap();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new(query.to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+    let scores = batch
+        .column_by_name("_score")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Float32Type>();
+    let mut rows: Vec<_> = (0..batch.num_rows())
+        .map(|row| (ids.value(row).to_string(), scores.value(row).to_bits()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+async fn segment_guard_filter(ds: &Dataset, filter: &str) -> Vec<String> {
+    let mut scanner = ds.scan();
+    scanner.project(&["id"]).unwrap();
+    scanner.filter(filter).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+    let mut rows: Vec<_> = (0..batch.num_rows())
+        .map(|row| ids.value(row).to_string())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn segment_guard_ids(rows: &[(String, u32)]) -> Vec<&str> {
+    rows.iter().map(|(id, _)| id.as_str()).collect()
+}
+
+/// An inverted index with no trained rows — built over an empty table, or
+/// with `train(false)` over a populated one — has an empty fragment bitmap
+/// and no postings, yet Lance matches every row it does not cover with that
+/// index's tokenizer: the rows and BM25 scores equal a full build's. With no
+/// segment at all, Lance's flat path tokenizes with a bare `SimpleTokenizer`
+/// (no lowercasing, no stemming) and answers differently. Declaring a
+/// full-text index's analyzer with an untrained segment, before its postings
+/// are built, rests on this. If it goes red, an untrained segment no longer
+/// carries the analyzer to uncovered rows.
+#[tokio::test]
+async fn fts_untrained_segment_applies_its_analyzer_to_rows_it_does_not_cover() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+    let rows = [
+        ("e1", "Deep Learning", "open"),
+        ("e2", "deep dive", "open"),
+        ("e3", "Diving deeper into graphs", "open"),
+    ];
+    let params = InvertedIndexParams::default();
+
+    let no_segment = segment_guard_write(&path("none.lance"), &rows, WriteMode::Create).await;
+
+    let mut full = segment_guard_write(&path("full.lance"), &rows, WriteMode::Create).await;
+    full.create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let mut empty_first = segment_guard_write(&path("empty.lance"), &[], WriteMode::Create).await;
+    empty_first
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let empty_first = segment_guard_write(&path("empty.lance"), &rows, WriteMode::Append).await;
+
+    let mut untrained =
+        segment_guard_write(&path("untrained.lance"), &rows, WriteMode::Create).await;
+    untrained
+        .create_index_builder(&["text"], IndexType::Inverted, &params)
+        .train(false)
+        .await
+        .unwrap();
+
+    for ds in [&empty_first, &untrained] {
+        let segments = ds.load_indices().await.unwrap();
+        let segment = segments
+            .iter()
+            .find(|index| {
+                index
+                    .fields
+                    .contains(&ds.schema().field("text").unwrap().id)
+            })
+            .expect("the untrained full-text segment is published");
+        assert!(
+            segment.fragment_bitmap.as_ref().unwrap().is_empty(),
+            "an untrained segment covers no fragment, so every row is scanned flat"
+        );
+    }
+    for query in ["deep", "Deep", "dive"] {
+        let built = segment_guard_search(&full, query).await;
+        assert_eq!(
+            segment_guard_search(&empty_first, query).await,
+            built,
+            "{query}"
+        );
+        assert_eq!(
+            segment_guard_search(&untrained, query).await,
+            built,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&full, "deep").await),
+        ["e1", "e2"]
+    );
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&no_segment, "deep").await),
+        ["e2"],
+        "without a segment the flat path is case-sensitive, so this guard tells \
+         a segment's analyzer from the bare tokenizer"
+    );
+}
+
+/// Lance masks a logical index's results by the union of its segments'
+/// fragment coverage (`DatasetPreFilter::new`). On a stable-row-id dataset an
+/// update keeps the row id and moves the row to a new fragment; once a delta
+/// segment covers that fragment, the older segment's entry for the row passes
+/// the mask. Full-text search then returns the row for a term it no longer
+/// holds, and twice for a term both versions hold; a BTREE equality returns it
+/// for its old value. Lance applies per-segment ownership to vector search
+/// only (lance#7371, lance#8351). OmniGraph therefore keeps one segment per
+/// scalar and full-text index: a lagging index is rebuilt whole
+/// (`stage_index_fold`, the full-text rebuild), never folded into a delta.
+/// When this goes red, ownership covers these paths and a delta fold becomes
+/// safe after updates.
+#[tokio::test]
+async fn index_delta_segment_serves_stale_entries_of_an_updated_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("stale.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = segment_guard_write(
+        uri,
+        &[
+            ("a1", "graph engines", "open"),
+            ("a2", "graph search", "open"),
+            ("a3", "relational databases", "done"),
+        ],
+        WriteMode::Create,
+    )
+    .await;
+    ds.create_index(
+        &["text"],
+        IndexType::Inverted,
+        Some("text_fts".into()),
+        &InvertedIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["status"],
+        IndexType::BTree,
+        Some("status_btree".into()),
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    let staged = stage_pk_merge(
+        Arc::new(ds.clone()),
+        segment_guard_batch(&[("a1", "omega engines", "done")]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    let mut ds = CommitBuilder::new(Arc::new(ds))
+        .execute(staged.transaction)
+        .await
+        .unwrap();
+
+    // One segment per index: the updated row's new fragment is unindexed and
+    // the old entry is masked.
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "graph").await),
+        ["a2"]
+    );
+    assert_eq!(segment_guard_filter(&ds, "status = 'open'").await, ["a2"]);
+
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let segments = ds.load_indices().await.unwrap();
+    for name in ["text_fts", "status_btree"] {
+        assert_eq!(
+            segments.iter().filter(|index| index.name == name).count(),
+            2,
+            "append-mode optimize leaves a delta segment for {name}"
+        );
+    }
+    let red = "a delta segment no longer serves an updated row's stale entry: \
+               Lance applies segment ownership here, so a delta fold is safe after updates";
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "graph").await),
+        ["a1", "a2"],
+        "{red}"
+    );
+    assert_eq!(
+        segment_guard_ids(&segment_guard_search(&ds, "engines").await),
+        ["a1", "a1"],
+        "{red}"
+    );
+    assert_eq!(
+        segment_guard_filter(&ds, "status = 'open'").await,
+        ["a1", "a2"],
+        "{red}"
+    );
+}
+
 /// A branch ref read racing `replace_metadata` on the same ref must succeed:
 /// the ref is never deleted, so any error is a torn read (Lance 11.0.0 read refs
 /// as `head` then `get_range`, and a rewrite between the two calls yields a prefix).
