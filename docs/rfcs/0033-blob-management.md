@@ -486,8 +486,8 @@ An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
 `take_blobs`, but Lance types do not appear in public signatures.
 Every complete-payload read uses Lance's batched `read_blobs` API on managed
 rows with an explicit I/O buffer, through one engine helper: a carried update or
-merge cell, the bounded rewrite stream and the schema-apply rewrite each pass
-one batch's managed stable row ids to one streamed call. Export and the
+merge cell and the bounded rewrite stream each pass one batch's managed stable
+row ids to one streamed call. Export and the
 change-feed baseline do the same for each batch of rows they walk, one call per
 Blob column, and consume the stream row by row, so one row's values and each
 call's bounded I/O buffer are resident however many rows the batch holds.
@@ -1040,19 +1040,16 @@ Every path that carries an existing Blob cell uses the central descriptor
 decoder and accounts `BlobReader::len()` before payload allocation. Zero-length
 managed values participate as values. A nullable cell alone is skipped.
 
-Schema apply carries a whole-object external descriptor without probing or
-reading its target. Lance's current logical Blob input cannot express an
-existing external offset/length range, so schema apply refuses such a valid
-ranged descriptor before recovery arm or table movement; it never silently
-widens the cell to the whole object. Supporting descriptor-preserving ranged
-schema rewrites remains part of the future ownership-proof optimization below.
+Schema apply never rewrites a Blob cell. Adding, renaming or dropping a
+property is a metadata-only Lance commit that keeps every data file, so managed
+values of every placement, null and valid-empty cells and external descriptors,
+whole-object or ranged, stay exactly as stored, and an added Blob property reads
+as null in every existing row. Schema apply reads no payload and probes no
+external target, so it needs no Blob byte budget and cannot widen a range.
 
-The current materializing rewrite is a V1 implementation, not an ideal
-physical plan, and the schema-apply rewrite is not bounded: it scans the whole
-table into one batch and holds every managed payload of a rewritten Blob column
-in memory before staging. Mutation and merge carries stay under their operation
-budget (§10). A bounded, streamed schema-apply rewrite is required future work.
-A future optimization may carry immutable
+The materializing rewrite of mutation and merge carries is a V1
+implementation, not an ideal physical plan, and stays under its operation
+budget (§10). A future optimization may carry immutable
 prepared descriptors for unchanged cells only after a Lance surface guard proves
 that references cannot escape their source dataset/incarnation and recovery can
 account for every file. Correctness and ownership proof come before avoiding the
@@ -1133,7 +1130,7 @@ Physical row addresses never become public stable identity.
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
 | Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
-| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. The schema-apply rewrite has no byte ceiling yet (§8.4) |
+| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. Schema apply reads no Blob payload: its column changes are metadata-only (§8.4) |
 | Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
@@ -1492,8 +1489,8 @@ correctness gate.
 ### Phase 4 — measured optimization
 
 - Batched reads (`read_blobs`) landed for materializing rewrites, export, the
-  change-feed baseline, change images and entity reads (§4). Remaining: make the
-  schema-apply rewrite bounded and streamed (§8.4), then benchmark. Tuning is
+  change-feed baseline, change images and entity reads (§4), and schema apply
+  stopped rewriting Blob columns (§8.4). Remaining: benchmark. Tuning is
   optional and may not weaken the batched contract or change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
@@ -1725,6 +1722,35 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-04: Schema apply's column changes became metadata-only Lance
+  commits: renames and drops as a detached `Project`, additions as a detached
+  `Merge` over the unchanged fragments, keeping every data file. The rewrite
+  had held every managed payload of a table in memory inside the server's
+  deployment path. Superseded sentences: §4's "a carried update or merge cell,
+  the bounded rewrite stream and the schema-apply rewrite each pass one
+  batch's managed stable row ids to one streamed call" (the schema-apply
+  rewrite is gone); §8.4's "Lance's current logical Blob input cannot express
+  an existing external offset/length range, so schema apply refuses such a
+  valid ranged descriptor before recovery arm or table movement; it never
+  silently widens the cell to the whole object.", "Supporting
+  descriptor-preserving ranged schema rewrites remains part of the future
+  ownership-proof optimization below.", "The current materializing rewrite is
+  a V1 implementation, not an ideal physical plan, and the schema-apply
+  rewrite is not bounded: it scans the whole table into one batch and holds
+  every managed payload of a rewritten Blob column in memory before staging."
+  and "A bounded, streamed schema-apply rewrite is required future work."
+  (a ranged descriptor is now kept as stored, and no rewrite remains to
+  bound); §10's rewrite-amplification sentence "The schema-apply rewrite has
+  no byte ceiling yet (§8.4)"; and Phase 4's "make the schema-apply rewrite
+  bounded and streamed (§8.4)". A dropped Blob property's managed bytes now
+  stay with their data files until the next `optimize`, which rewrites every
+  fragment still holding a dropped column without reading it (the
+  `compaction_memory.rs` erasure instrument measured 34.1 MiB at its peak on 64
+  rows of a kept and a dropped 1 MiB value, under the 42 MiB compaction bound),
+  and `cleanup` then deletes them once no retained version names them. The
+  `lance_surface_guards.rs` evolution guard pins the Lance facts; the
+  `compaction_memory.rs` instrument measured schema apply's peak at 72.1 and
+  136.1 MiB on 64 and 128 MiB Blob tables before, and 5.1 MiB on both after.
 - 2026-10-08: Export, the change-feed baseline, change-feed images and entity
   reads read managed payloads through the batched `read_blobs` helper the
   materializing rewrites use, closing that Phase 4 item. Export and the

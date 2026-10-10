@@ -2444,7 +2444,7 @@ async fn commit_changes_page_token_rejections_are_typed() {
 
 #[tokio::test]
 async fn commit_changes_refuse_unprovable_schema_boundary() {
-    use omnigraph::changes::ChangeFeedScope;
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
     use omnigraph::error::OmniError;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2469,20 +2469,23 @@ node Ghost {
     let scope = ChangeFeedScope::default();
     db.load_with_receipt(
         "main",
-        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n\
+         {\"type\":\"Person\",\"data\":{\"name\":\"Carol\",\"age\":50}}",
         LoadMode::Merge,
     )
     .await
     .unwrap();
 
-    // (a) A property add rewrites the table: the two pinned endpoints of the
-    // schema-apply commit no longer share one user schema.
+    // (a) A property add changes the table's user schema (metadata-only, no
+    // row rewritten): the two pinned endpoints of the schema-apply commit no
+    // longer share one user schema.
     db.apply_schema(
         r#"
 node Person {
     name: String @key
     age: I32?
     note: String?
+    attachment: Blob?
 }
 
 node Ghost {
@@ -2501,6 +2504,133 @@ node Ghost {
         OmniError::ChangeSchemaBoundary { type_name, .. } => assert_eq!(type_name, "Person"),
         other => panic!("expected a typed schema boundary, got: {other:?}"),
     }
+
+    // The add kept every data file: the fragment holding Alice and Carol
+    // physically lacks `note` and `attachment`, and Lance reads both as null
+    // there; a null Blob names no data file. Later commits name only the rows
+    // they wrote, with exact images whose before side is read from that
+    // fragment, and the net diff since the add is exactly those rows, never
+    // every row of a fragment that lacks the added columns.
+    let after_add = snapshot_id(&db, "main").await.unwrap();
+    db.load_with_receipt(
+        "main",
+        r#"{"type":"Person","data":{"name":"Bob","age":40,"attachment":"base64:Ym9i"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let writes = r#"
+query set_note($name: String, $note: String) {
+    update Person set { note: $note } where name = $name
+}
+
+query set_attachment($name: String, $attachment: Blob) {
+    update Person set { attachment: $attachment } where name = $name
+}
+"#;
+    let set_note = db
+        .mutate_with_receipt(
+            "main",
+            writes,
+            "set_note",
+            &params(&[("$name", "Alice"), ("$note", "hello")]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("the update publishes");
+    db.mutate_with_receipt(
+        "main",
+        writes,
+        "set_attachment",
+        &params(&[("$name", "Carol"), ("$attachment", "base64:Y2Fyb2w=")]),
+    )
+    .await
+    .unwrap();
+    type Images = Option<(serde_json::Value, serde_json::Value)>;
+    let images = |change: &omnigraph::changes::GraphEntityChange| -> (String, _, Images, Images) {
+        let note_and_attachment = |image: Option<&omnigraph::changes::EntityImage>| {
+            image.map(|image| {
+                (
+                    image.properties["note"].clone(),
+                    image.properties["attachment"].clone(),
+                )
+            })
+        };
+        (
+            change.id.clone(),
+            change.op,
+            note_and_attachment(change.before.as_ref()),
+            note_and_attachment(change.after.as_ref()),
+        )
+    };
+    let null = serde_json::Value::Null;
+    let alice = (
+        "Alice".to_string(),
+        omnigraph::changes::ChangeOpKind::Update,
+        Some((null.clone(), null.clone())),
+        Some((serde_json::json!("hello"), null.clone())),
+    );
+    let page = db
+        .commit_changes_page(&set_note.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.block.changes.iter().map(images).collect::<Vec<_>>(),
+        std::slice::from_ref(&alice)
+    );
+    let feed = db
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(add_commit.clone())),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        feed.blocks
+            .iter()
+            .flat_map(|block| &block.changes)
+            .map(images)
+            .collect::<Vec<_>>(),
+        [
+            (
+                "Bob".to_string(),
+                omnigraph::changes::ChangeOpKind::Insert,
+                None,
+                Some((null.clone(), serde_json::json!("base64:Ym9i"))),
+            ),
+            alice,
+            (
+                "Carol".to_string(),
+                omnigraph::changes::ChangeOpKind::Update,
+                Some((null.clone(), null.clone())),
+                Some((null.clone(), serde_json::json!("base64:Y2Fyb2w="))),
+            ),
+        ]
+    );
+    let since_add = diff_since_branch(&db, "main", after_add, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        change_tuples(&since_add),
+        [
+            (
+                "node:Person".to_string(),
+                "Alice".to_string(),
+                ChangeOp::Update
+            ),
+            (
+                "node:Person".to_string(),
+                "Bob".to_string(),
+                ChangeOp::Insert
+            ),
+            (
+                "node:Person".to_string(),
+                "Carol".to_string(),
+                ChangeOp::Update
+            ),
+        ]
+    );
 
     // (b) Dropping a type that still holds data is schema evolution with data
     // present — refused, never synthesized into entity deletes.
