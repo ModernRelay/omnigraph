@@ -7,7 +7,7 @@
 mod helpers;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
