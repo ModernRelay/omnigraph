@@ -750,22 +750,23 @@ All load modes share the mutation publisher and recovery protocol:
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
 
-Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
-and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
-The sum uses `get_array_memory_size`, preserving conservative shared-buffer
-counting, and managed Blob payloads are charged apart from it under their own
-32 MiB ceilings (see [writes](writes.md)). Keyed parsing separately caps its
-decoded-payload estimate across types at 32 MiB before retaining each row. External Blob copy admission includes
-the retained keyed batches plus copied payload estimates before payload reads;
-materialized batches are checked again before fragment staging.
+Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
+An immutable `WriteBudget` captures the session's `write_max_bytes` (default
+32 MiB) once, including retries. Retained row data has one allowance per table
+and one across tables; logical Blob payloads have a separate allowance.
+The row account uses Arrow memory size minus typed logical Blob payload buffer
+capacity, retaining descriptor and shared-buffer accounting. Keyed parsing
+checks row estimates and decoded payload bytes independently. Inline and
+copied external payloads are admitted together before payload reads, then
+materialized batches are checked again before staging.
 
 Mutation delete, cascading delete and Overwrite replacement removal scan IDs
-incrementally under one 32 MiB allowance per operation, charging UTF-8 bytes
-plus one `String` slot before copying an ID. These checks precede this
-operation's data fragments and publication. They do not bound JSON containers,
-simultaneous conversion copies, predicate/validation state or native scan
-buffers. Overwrite's bulk input retains its existing separate checks and is not
-subject to the keyed row limit. See [writes.md](writes.md#keyed-writes).
+incrementally under their own `write_max_bytes` allowance per operation,
+charging UTF-8 bytes plus one `String` slot before copying. These checks precede
+the operation's data fragments and publication. They do not bound JSON
+containers, simultaneous conversion copies, predicate/validation state or
+native scan buffers. Overwrite's bulk input retains its separate checks and is
+not subject to keyed aggregate row limits. See [writes.md](writes.md#keyed-writes).
 
 `load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
 line is one logical node or edge envelope; duplicate members, physical fields,

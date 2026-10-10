@@ -86,8 +86,8 @@ action on the branch. Neither verb inserts a row: a missing entity is
 The write never reads the cell's old value. Lance replaces whole rows, so the row's other cells
 are carried as an `update` carries them: a stored external reference among
 them needs the external Blob policy to admit its source, and their managed
-payloads count toward the operation's 32 MiB Blob payload limit together with
-the new value.
+payloads count toward the operation's Blob payload allowance, `write_max_bytes`,
+together with the new value.
 
 A precondition makes the write conditional on the cell's current value: over
 HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
@@ -111,9 +111,11 @@ before retrying with a precondition.
 Over HTTP:
 
 - `PUT` takes a `Content-Type: application/octet-stream` body of at most 32 MiB,
-  inclusive. Another media type is a `415`. A body over the limit is a `413`,
+  inclusive. Another media type is a `415`. A body over 32 MiB is a `413`,
   refused before any of it is read when `Content-Length` declares it, and a body
-  that does not arrive before the server's body deadline is a `408`;
+  that does not arrive before the server's body deadline is a `408`. The value
+  must also fit the server's `write_max_bytes`, which a request cannot change;
+  a larger one is a `413` once the body is read;
 - both verbs take `branch` (default `main`) and refuse `snapshot` or any other
   unknown parameter with a `400`. A missing branch is a `404`;
 - `change` is authorized before the body is read;
@@ -220,30 +222,38 @@ and retry.
 
 | Limit | Applies to | Reported resource |
 |---|---|---|
-| 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
-| 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
-| 32 MiB per touched type, and 32 MiB across all touched types, Blob payloads excluded | Incremental writes: `append` and `merge` loads, inserts, updates and branch merges. Every byte of the rows except managed Blob payloads counts, URIs and Blob framing included | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
-| 32 MiB of managed Blob payload per touched type, and 32 MiB across all touched types, inclusive | The same writes. Each Blob value counts its length; external bytes copied in and Blob values carried unchanged by an update count. A single value of exactly 32 MiB fits beside its row | the same names with `Blob payload bytes` in place of `bytes`, for example `keyed entity Blob payload bytes for <table>` |
-| 32 MiB, inclusive | The bytes of one Blob put, embedded or the body of an HTTP `PUT`, checked before the write opens a table | `Blob write payload bytes` |
-| 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
-| 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
+| `write_max_bytes` decoded bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
+| `write_max_bytes` decoded bytes | One `base64:` value in an insert or update mutation; a statement's values add up across its Blob properties and an update's matched rows. A load reports its decoded bytes under the `for <table>` and `per operation` names | `decoded blob input bytes per operation` |
+| `write_max_bytes` row bytes per type and across all touched types | Incremental writes: `append` and `merge` loads, inserts and updates. Counts ordinary columns, Blob descriptors and Arrow bookkeeping; excludes logical Blob payload buffers | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation`, `keyed parsed entity bytes for <table>`, `keyed parsed entity bytes per operation` |
+| `write_max_bytes` logical Blob payload bytes | One incremental write across all types: inline payloads, copied external payloads and Blob values carried by updates or by a Blob put count together | `materialized blob payload bytes`, `decoded blob input bytes per operation` |
+| `write_max_bytes` bytes, inclusive | The bytes of one Blob put, embedded or the body of an HTTP `PUT`, checked before the write opens a table | `Blob write payload bytes` |
+| `write_max_bytes` Blob payload bytes | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |
 | 32 MiB of retained URI metadata | One write operation or merge. Every copy of a URI the operation keeps counts, plus 24 bytes per copy: admission keeps each reference's text twice and each distinct object's normalized URI twice, so distinct URIs reach the limit at about 8 MiB of text | `external Blob URI metadata bytes` |
 | 64 KiB | One external URI | `external Blob URI bytes` |
 | 4 MiB | One embedded managed range read | `Blob read range bytes` |
+
+Superseded versions of a key written in one operation count as input
+(`decoded blob input bytes per operation`) until the last-write-wins fold.
+An update of a row inserted earlier in the same mutation is such a version:
+it carries the pending row's Blob, so that payload counts twice, the carried
+copy as `materialized blob payload bytes`.
+
+[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts
+`1..=33554432`. Payload and row allowances are independent: a payload exactly
+at the limit fits when its row and descriptors also fit. Repeated external
+references each count their payload length even when one fetch serves them.
+External-only admission can also report `materialized external blob payload bytes`.
 
 `<table>` names the type as `node:<Type>` or `edge:<Type>`, for example
 `keyed entity bytes for node:Document`.
 
 The HTTP load request body is also capped at 32 MiB. That cap counts the
 encoded request, so one request carries about 24 MiB of decoded `base64:`
-data. The NDJSON loader that `omnigraph load` and `/load/ndjson` use caps each
-encoded line at 32 MiB the same way. The embedded `load` API checks each row's
-decoded size instead and has no line cap, so it admits a 32 MiB value; over
-HTTP, `/load` keeps its 32 MiB body cap. A Blob `PUT` carries raw bytes, not
-`base64:` text, so its 32 MiB body holds a full 32 MiB value. Every other HTTP
-request is bounded by the default 1 MiB request body limit, so a `base64:`
-literal in an HTTP mutation hits that limit first.
+data. A Blob `PUT` carries raw bytes, not `base64:` text, so its 32 MiB body
+holds a full 32 MiB value. Every HTTP request other than a load (`/load` and
+`/load/ndjson`) or a Blob `PUT` is bounded by the default 1 MiB request body
+limit, so a `base64:` literal in an HTTP mutation hits that limit first.
 
 Values larger than these limits stay readable. The CLI and the HTTP server
 read managed values in 4 MiB ranges, so a large value streams without a

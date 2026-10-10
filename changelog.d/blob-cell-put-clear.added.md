@@ -6,7 +6,8 @@
   tags) or `BlobPrecondition::AnyExisting` (the cell is not null), fails with
   `BlobWritePreconditionFailed`, which names the current ETag, and changes
   nothing. A put returns the value's length, its ETag and the commit; the ETag
-  is the one a read at that commit reports. One put holds at most 32 MiB,
-  inclusive; a larger one fails before any table is opened with resource
-  `Blob write payload bytes`. The HTTP server exposes them as `PUT` and
-  `DELETE /blob`; the CLI does not expose them yet.
+  is the one a read at that commit reports. One put holds at most the
+  session's `write_max_bytes` (32 MiB by default), inclusive; a larger one
+  fails before any table is opened with resource `Blob write payload bytes`.
+  The HTTP server exposes them as `PUT` and `DELETE /blob`; the CLI does not
+  expose them yet.

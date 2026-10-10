@@ -1946,10 +1946,14 @@ query all() {
     .unwrap();
     assert_eq!(first_column_sorted(&result).len(), 1);
     let stopped = emitted(&probes);
+    let chunks_per_producer_stage = 2 + 1;
+    let stopped_bound = (1 + 2 * chunks_per_producer_stage) * 256;
     assert!(
-        (1..=4 * 256).contains(&stopped),
+        (1..=stopped_bound).contains(&stopped),
         "the walk handed on {stopped} of {pairs} pairs before the limit dropped its stream; \
-         at most four 256-pair chunks fit: one consumed, two queued, one blocked at send"
+         at most {stopped_bound} fit under any schedule: one 256-pair chunk consumed by the \
+         limit, and for each of the two producer stages between them (expand, hydrate) two \
+         chunks queued in its capacity-2 channel plus one blocked at send"
     );
     let probes = QueryMemoryProbes::default();
     with_query_memory_probes(

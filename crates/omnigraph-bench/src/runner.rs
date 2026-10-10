@@ -1032,11 +1032,11 @@ pub(crate) fn refuse_unmodeled_runtime_overrides() -> RunnerResult<()> {
     validate_runtime_overrides(std::env::vars_os())
 }
 
-fn is_omnigraph_runtime_override(name: &OsStr) -> bool {
+pub(crate) fn is_omnigraph_runtime_override(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("OMNIGRAPH_")
 }
 
-fn is_lance_runtime_override(name: &OsStr) -> bool {
+pub(crate) fn is_lance_runtime_override(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("LANCE_")
 }
 
@@ -1537,7 +1537,7 @@ fn validate_production_reset(case: &crate::legacy::case::CaseV1) -> RunnerResult
             "unsupported_runner_axis",
             "plain-copy requires verified Linux XFS instance-store NVMe with the process-fresh, preparation-only, page-cache-uncontrolled cache declaration",
         )),
-        ResetMode::S3Versioning => Err(RunnerError::new(
+        ResetMode::None | ResetMode::S3Versioning => Err(RunnerError::new(
             "unsupported_runner_axis",
             "runner-v1 does not implement S3 reset",
         )),
@@ -1704,7 +1704,7 @@ async fn execute_owned_run(
                         RunnerError::new("fixture_handoff_failed", error.to_string())
                     })?,
                 ),
-                ResetMode::S3Versioning => {
+                ResetMode::None | ResetMode::S3Versioning => {
                     return Err(RunnerError::new(
                         "unsupported_runner_axis",
                         "local runner cannot accept an S3 reset handoff",

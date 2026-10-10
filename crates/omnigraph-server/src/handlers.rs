@@ -1004,7 +1004,7 @@ pub(crate) async fn server_blob_head(
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
             )),
-        (status = 413, description = "The body exceeds 32 MiB, or the entity's carried Blob payloads and the new value exceed the write's payload limit", body = ErrorOutput),
+        (status = 413, description = "The body exceeds 32 MiB, or the value alone or with the entity's carried Blob payloads exceeds the server's `write_max_bytes`", body = ErrorOutput),
         (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),

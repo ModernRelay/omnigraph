@@ -20,16 +20,15 @@ use super::mutation::{
 };
 use super::staging::{MutationStaging, PendingMode};
 use crate::blob::{
-    BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag,
-    BlobPrecondition, BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag,
-    resolve_blob_cell,
+    BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag, BlobPrecondition,
+    BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag, resolve_blob_cell,
 };
 use crate::changes::EntityKind;
 use crate::db::Omnigraph;
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::error::{OmniError, Result};
 use crate::session::Session;
-use crate::storage_layer::PendingScanBudget;
+use crate::storage_layer::{PendingScanBudget, WriteBudget};
 
 /// What one Blob cell write stores.
 enum BlobCellValue {
@@ -62,9 +61,10 @@ impl Session {
     /// Replace one Blob cell of an existing node or edge with managed bytes.
     ///
     /// The entity must exist; the write never inserts a row. `bytes` is at
-    /// most 32 MiB, inclusive, and is refused before any table is opened when
-    /// it is larger. The row's other Blob cells are carried by value, so they
-    /// share the operation's 32 MiB payload allowance, and a stored external
+    /// most the session's `write_max_bytes` (32 MiB by default), inclusive,
+    /// and is refused before any table is opened when it is larger. The row's
+    /// other Blob cells are carried by value, so they share the operation's
+    /// payload allowance, and a stored external
     /// reference among them must be admitted by the graph's external Blob
     /// policy (`StoredExternalBlobDenied` otherwise). A failed `precondition`
     /// returns `BlobWritePreconditionFailed` without effect. The outcome's
@@ -79,13 +79,7 @@ impl Session {
     ) -> Result<BlobWriteOutcome> {
         let length = u64::try_from(bytes.len())
             .map_err(|_| OmniError::manifest_internal("Blob write payload length exceeds u64"))?;
-        if length > BLOB_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                BLOB_WRITE_PAYLOAD_RESOURCE,
-                BLOB_WRITE_MAX_BYTES,
-                length,
-            ));
-        }
+        WriteBudget::from_settings(self.settings()).check(BLOB_WRITE_PAYLOAD_RESOURCE, length)?;
         self.write_blob_cell_as(
             branch,
             cell,
@@ -138,6 +132,7 @@ impl Session {
             actor_id,
             settings.stage_write_concurrency(),
             HistoryReleaseBytes(settings.history_release_bytes()),
+            WriteBudget::from_settings(&settings),
         )
         .await
     }
@@ -159,6 +154,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
     ) -> Result<BlobWriteOutcome> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -173,6 +169,7 @@ impl Omnigraph {
                     actor_id,
                     stage_write_concurrency,
                     history_release_bytes,
+                    write_budget,
                     &mut first,
                 )
                 .await
@@ -204,6 +201,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        write_budget: WriteBudget,
         first: &mut Option<AttemptIdentity>,
     ) -> Result<BlobWriteOutcome> {
         let first_attempt = first.is_none();
@@ -265,7 +263,7 @@ impl Omnigraph {
             )));
         }
 
-        let mut staging = MutationStaging::default();
+        let mut staging = MutationStaging::new(write_budget);
         let (handle, _full_path, _table_branch) = open_table_for_mutation(
             self,
             &mut staging,
@@ -319,8 +317,11 @@ impl Omnigraph {
 
         // The row's other cells, carried by value, with the target column left
         // out so its old payload is never read.
-        let (pending_rows, pending_bytes) = staging.pending_resource_usage(&resolved.table_key)?;
-        let budget = PendingScanBudget::new(&resolved.table_key, pending_rows, pending_bytes);
+        let budget = PendingScanBudget::new(
+            &resolved.table_key,
+            staging.pending_resource_usage(&resolved.table_key)?,
+            write_budget,
+        );
         let carried = self
             .storage()
             .scan_with_pending_materialized_blobs(

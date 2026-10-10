@@ -156,8 +156,7 @@ One managed load accepts at most **32 MiB (33,554,432 bytes)** of input. The
 CLI checks this before sending the request. Incremental `append` and `merge`
 also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds, plus
 **32 MiB across retained keyed batches** and a separate parsed-payload estimate
-across types; managed Blob payloads have their own 32 MiB per table and across
-tables. Strict loads check projected in-memory size too. The NDJSON byte
+across types. Strict loads check projected in-memory size too. The NDJSON byte
 bound does not prove that a batch fits those
 [engine limits](../mutations/index.md#limits-and-conflicts).
 Split prepared `append` and `merge` inputs into suitable batches, preserving

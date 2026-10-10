@@ -1836,7 +1836,7 @@
             }
           },
           "413": {
-            "description": "The body exceeds 32 MiB, or the entity's carried Blob payloads and the new value exceed the write's payload limit; Request body exceeds its route limit before operation admission",
+            "description": "The body exceeds 32 MiB, or the value alone or with the entity's carried Blob payloads exceeds the server's `write_max_bytes`; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -10248,6 +10248,12 @@
             "type": "integer",
             "description": "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
             "maximum": 9223372036854775807,
+            "minimum": 1
+          },
+          "write_max_bytes": {
+            "type": "integer",
+            "description": "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes",
+            "maximum": 33554432,
             "minimum": 1
           }
         },

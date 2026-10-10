@@ -148,27 +148,26 @@ Loads preserve supplied embeddings and do not generate them. Results report
 ## Limits and conflicts
 
 Insert/update mutations and incremental keyed loads are bounded to 8,192
-entities and 32 MiB per touched type, plus 32 MiB of retained Arrow batches
-across all touched types in one operation. Managed Blob payloads are not part of
-those bytes: they have their own 32 MiB per touched type and across all touched
-types, so a single 32 MiB value fits beside its row. Keyed loads also have a
-separate 32 MiB parsed-payload estimate across types, split the same way.
-External Blob payloads that require copying count toward the payload
-allowance. Every strict load retains its
-projected in-memory size check. Blob values have further limits; see
-[Blob limits](../blobs.md#limits).
+entities per touched type. The [`write_max_bytes`](../queries/settings.md)
+setting (default 32 MiB) bounds retained row data per type and across all
+touched types. Blob payloads have a separate allowance of the same size,
+including inline bytes, copied external bytes and carried update values.
+Every version of a key written in one mutation counts, so an insert and an
+update of the same row charge its Blob twice.
+Keyed loads also bound their parser estimate independently. Every strict
+load retains its projected input check. See [Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
-a separate 32 MiB allowance per operation for those IDs, summed over all
+a separate `write_max_bytes` allowance per operation for those IDs, summed over all
 touched types. Each removed ID is charged its UTF-8 length plus 24 bytes, so
-the allowance holds 671,088 IDs of 26 bytes, the length of a generated ID. A
+the default allowance holds 671,088 IDs of 26 bytes, the length of a generated ID. A
 delete and the edges it cascades to draw on the same allowance. An overwrite of
 entities loaded without a `@key` and without an explicit `id` removes every
 committed ID of that type, because those IDs are generated again on each load.
 
 Oversized work returns a resource-limit error before its data is staged or
-published. These checks do not bound total engine memory, and no setting
-changes them. Split larger inserts, updates, keyed loads and deletes into
+published. These checks do not bound total engine memory. The setting can
+lower each allowance from its 32 MiB maximum. Split larger inserts, updates, keyed loads and deletes into
 explicit commits. An overwrite replaces each represented type as one image and
 cannot be split: it keeps its bulk-input behavior and remains subject to its
 separate input and removed-ID checks.
