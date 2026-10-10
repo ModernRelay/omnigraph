@@ -5863,6 +5863,7 @@ version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "base64 0.22.1",
  "futures",
  "libm",
  "omnigraph-api-types",
