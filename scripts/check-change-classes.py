@@ -85,6 +85,11 @@ CLASSES = {
             # The crate that owns the corpus; every reader in it runs under
             # `GQ Logic Tests`, gated on `run_gqt`.
             "crates/omnigraph-gqt/": "GQ Logic Tests",
+            # The served conformance and its count test read the corpus
+            # through an in-process server; `GQT (served)` runs them on
+            # `run_gqt`, and no other job builds the crate.
+            "crates/omnigraph-gqt-served/": "GQ Logic Tests (served)",
+            "crates/omnigraph-cli/tests/gqt_served_smoke.rs": "GQ Logic Tests (served)",
             # The seam guard counts a case's `at:` name as arming a seam, so
             # `GQT (ordinary)` runs this test on `run_gqt` beside
             # `Test Workspace`'s engine-input run.

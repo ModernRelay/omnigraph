@@ -107,7 +107,7 @@ to one for equality on an `@key` property, then multiplied per hop by the
 edge type's average fanout and capped at its destination count; this is an
 estimate, not an upper bound),
 the manifest-resident edge and endpoint node counts the engine serves through
-`PlanSource::expand_statistics`, the effective hop count and whether an
+`PlanSource::expand_statistics`, pinned endpoint index coverage, the effective hop count and whether an
 earlier `Expand` or `AntiJoin` of the same plan realized the CSR. The
 decision is recorded on `PhysicalNode::Expand { mode, frontier_estimate,
 policy }`, printed by `explain` and asserted by the GQT line `expand $s Knows
@@ -117,14 +117,19 @@ run may take the other mode by the same model and inputs; `Pinned` when the
 session's traversal pin chose, and `Uncosted` when no statistics existed (the
 plan records `csr` and no estimate); under both the run takes no other mode.
 Under `Costed` the engine can reconsider a CSR choice when the observed first
-frontier is smaller than the estimate, probes the BTREE coverage before an
-indexed start and re-runs the cost model (a degraded BTREE is priced as a
+frontier is smaller than the estimate and re-runs the cost model (a degraded BTREE is priced as a
 full edge scan per hop; a CSR warmed by an earlier operator is free), and at
 every indexed hop after the first re-decides with the observed frontier
 (`should_switch_to_csr`). Every input of those re-decisions is on the node
-(`inputs`, the two ceilings included) or is data of the run (the probed
-coverage, the observed frontier, the CSR this run built); the report row's
+(`inputs`, the two ceilings included) or is data of the run (the observed
+frontier, the CSR this run built); the report row's
 `ran` names the mode the traversal ended on.
+
+`coverage_provenance: pinned_index_facts` means coverage was derived from the
+pinned catalog and is never probed again. Accepted saved plans without this
+field default to `legacy_assumed` and retain the runtime coverage correction.
+Explain statistics do not select this compatibility behavior. The [index-facts
+contract](architecture.md#index-facts-in-read-planning) owns catalog normalization.
 
 | Setting | Default | Effect |
 |---|---:|---|
@@ -220,7 +225,10 @@ frontiers and builds that already fit need no column-statistics I/O. Lance
 caches file metadata; a cold candidate can fetch it. Planning
 never scans query data. Ordinary execution builds no explain JSON or structural hash.
 `explain_query` uses the same optimizer passes through the diagnostic gate,
-which returns `Decision::Engine` with the logical and physical explain trees. A
+which returns an opaque `Decision::PendingQuery`. Both entry points await
+scan-access finalization before binding or publishing an explain. Finalization
+first narrows safe single-String-key predicates, then records Lance's static
+probe or sequential choice. Only the completed decision is `Decision::Engine`. A
 lowering error is a planner defect surfaced as an error, never a fallback to
 a hand-written sequence. `projection_pushdown` writes each scan and expansion destination projection
 from what the whole tree reads through its binding: `id` and the key always;
@@ -551,7 +559,9 @@ run-time choice the run makes is data the planner wrote:
   and resolved value (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
   `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, through `expand_statistics`), the gate
   policy, and the memory limit. `plan_query` and `route` read the source
-  through a recording wrapper, so the record is exhaustive by construction.
+  through a recording wrapper during synchronous optimization. Async scan
+  finalization uses the original source's same gathered dataset pins and
+  resolved parameters; it reads no additional settings.
   `bind` refuses a binding that lacks an assumed name, `QueryContext` is sized
   from the assumed limit, and the run reads no ambient limit and no
   environment variable.
@@ -740,21 +750,23 @@ All load modes share the mutation publisher and recovery protocol:
 | `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
 | `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
 
-Mutation insert/update and keyed Load retain the per-table limits of 8,192 rows
-and 32 MiB, plus one 32 MiB sum of retained Arrow batches across touched tables.
-The sum uses `get_array_memory_size`, preserving conservative shared-buffer
-counting. Keyed parsing separately caps its decoded-payload estimate across
-types at 32 MiB before retaining each row. External Blob copy admission includes
-the retained keyed batches plus copied payload estimates before payload reads;
-materialized batches are checked again before fragment staging.
+Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
+An immutable `WriteBudget` captures the session's `write_max_bytes` (default
+32 MiB) once, including retries. Retained row data has one allowance per table
+and one across tables; logical Blob payloads have a separate allowance.
+The row account uses Arrow memory size minus typed logical Blob payload buffer
+capacity, retaining descriptor and shared-buffer accounting. Keyed parsing
+checks row estimates and decoded payload bytes independently. Inline and
+copied external payloads are admitted together before payload reads, then
+materialized batches are checked again before staging.
 
 Mutation delete, cascading delete and Overwrite replacement removal scan IDs
-incrementally under one 32 MiB allowance per operation, charging UTF-8 bytes
-plus one `String` slot before copying an ID. These checks precede this
-operation's data fragments and publication. They do not bound JSON containers,
-simultaneous conversion copies, predicate/validation state or native scan
-buffers. Overwrite's bulk input retains its existing separate checks and is not
-subject to the keyed row limit. See [writes.md](writes.md#keyed-writes).
+incrementally under their own `write_max_bytes` allowance per operation,
+charging UTF-8 bytes plus one `String` slot before copying. These checks precede
+the operation's data fragments and publication. They do not bound JSON
+containers, simultaneous conversion copies, predicate/validation state or
+native scan buffers. Overwrite's bulk input retains its separate checks and is
+not subject to keyed aggregate row limits. See [writes.md](writes.md#keyed-writes).
 
 `load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
 line is one logical node or edge envelope; duplicate members, physical fields,

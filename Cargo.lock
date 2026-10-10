@@ -5601,6 +5601,7 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
+ "url",
 ]
 
 [[package]]
@@ -5862,11 +5863,14 @@ version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "base64 0.22.1",
  "futures",
  "libm",
+ "omnigraph-api-types",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-planner",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5877,10 +5881,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-gqt-served"
+version = "0.13.0"
+dependencies = [
+ "axum",
+ "datatest-stable",
+ "omnigraph-engine",
+ "omnigraph-gqt",
+ "omnigraph-gqt-core",
+ "omnigraph-server",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "omnigraph-planner"
 version = "0.13.0"
 dependencies = [
  "arrow-schema",
+ "futures",
  "omnigraph-compiler",
  "serde",
  "serde_json",

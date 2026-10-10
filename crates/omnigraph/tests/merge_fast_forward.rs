@@ -1423,6 +1423,115 @@ query insert_doc($title: String, $content: Blob, $note: String) {
 }
 "#;
 
+/// A diverged table requires payload materialization and planned write chunks.
+/// Both lineage implementations must use the same setting through publication.
+#[tokio::test]
+async fn write_max_bytes_merge_keeps_independent_payload_and_chunk_allowances() {
+    use base64::Engine as _;
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+    for lineage in ["off", "on", "verify"] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut main = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+        main.branch_create("feature").await.unwrap();
+        let payload = format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(vec![0; 8191])
+        );
+        let mut source_rows = vec![
+            serde_json::json!({"type":"Document","data":{
+                "title":"payload", "content":payload, "note":"scalar"
+            }})
+            .to_string(),
+        ];
+        for index in 0..3 {
+            source_rows.push(
+                serde_json::json!({"type":"Document","data":{
+                    "title":format!("source-{index}"), "note":"x".repeat(6000)
+                }})
+                .to_string(),
+            );
+        }
+        main.load("feature", &source_rows.join("\n"), LoadMode::Append)
+            .await
+            .unwrap();
+        main.load(
+            "main",
+            r#"{"type":"Document","data":{"title":"target","note":"target"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        main.set(
+            SettingId::MergeLineage,
+            &SettingValue::Ident(lineage.to_string()),
+            Source::File,
+        )
+        .unwrap();
+        main.set(
+            SettingId::WriteMaxBytes,
+            &SettingValue::Integer(8190),
+            Source::File,
+        )
+        .unwrap();
+        let before = snapshot_main(&main).await.unwrap().graph_manifest_version();
+        let probes = MergeWriteProbes::default();
+        let error = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OmniError::ResourceLimitExceeded {
+                    limit: 8190,
+                    actual: 8191,
+                    ..
+                }
+            ),
+            "{lineage}: {error:?}"
+        );
+        assert_eq!(
+            snapshot_main(&main).await.unwrap().graph_manifest_version(),
+            before
+        );
+        assert_eq!(
+            probes.stage_fenced_insert_calls()
+                + probes.stage_merge_insert_calls()
+                + probes.stage_known_present_update_calls(),
+            0
+        );
+        main.set(
+            SettingId::WriteMaxBytes,
+            &SettingValue::Integer(8191),
+            Source::File,
+        )
+        .unwrap();
+        let probes = MergeWriteProbes::default();
+        let result = with_merge_write_probes(probes.clone(), main.branch_merge("feature", "main"))
+            .await
+            .expect("exact payload and independently bounded rows must publish");
+        assert_eq!(result.outcome, MergeOutcome::Merged);
+        assert_eq!(count_rows(&main, "node:Document").await, 5);
+        assert!(
+            probes.stage_fenced_insert_calls()
+                + probes.stage_merge_insert_calls()
+                + probes.stage_known_present_update_calls()
+                > 1,
+            "fixture must publish multiple bounded chunks"
+        );
+        assert_eq!(
+            read_managed_blob_bytes(
+                &main,
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", "payload", "content")
+            )
+            .await
+            .len(),
+            8191
+        );
+    }
+}
+
 /// A proven pure-insert fast-forward on a Blob table is a pointer switch onto
 /// main: no general ordered diff, no Blob payload read, and the managed bytes
 /// of both rows read back through main.

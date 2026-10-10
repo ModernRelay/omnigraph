@@ -36,12 +36,22 @@ pub mod concurrent;
 mod generate;
 mod host;
 pub mod runner_config;
+mod served;
 mod yaml;
 pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
-pub use generate::{Generated, Seed};
+pub use generate::{Generated, GeneratedParams, Seed};
+
+/// A step's `--- params`: a literal JSON body under the loop's substitution
+/// rule, or a generated recipe, which takes no substitution.
+#[derive(Debug)]
+pub enum ParamsInput {
+    Literal(String),
+    Generated(GeneratedParams),
+}
 pub use host::{ExecutionHost, PlainHost};
 use omnigraph::storage::StorageAdapter;
 pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
+pub use served::{ServerTarget, admit_served, execute_steps_served};
 
 mod plan;
 mod report;
@@ -60,8 +70,8 @@ pub struct Case {
     pub seams: BTreeMap<usize, Vec<SeamDirective>>,
     pub source_lines: BTreeMap<usize, usize>,
     pub fixture: Option<Fixture>,
-    /// The `# traversal:` pin: the harness-only traversal field on the case
-    /// session plus the expand-path check; `None` leaves it at `auto`.
+    /// The harness-only traversal setting; any header requests index preparation.
+    /// `auto` retains cost selection, while `indexed` and `csr` check the forced path.
     traversal: Option<&'static str>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
@@ -208,7 +218,7 @@ pub struct QueryStep {
     /// The `branch: <name>` header argument; `main` when unspelled.
     pub branch: String,
     decl: Box<QueryDecl>,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
     expect: QueryExpect,
     /// The match clause carries an unbound traversal, so a successful run
     /// must show at least one Expand on the pinned path.
@@ -229,7 +239,7 @@ pub struct MutateStep {
     /// The `branch: <name>` header argument, as `QueryStep::branch`.
     branch: String,
     ast_params: Vec<Param>,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
     expect: MutateExpect,
 }
 
@@ -455,11 +465,12 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "notes" => {}
             "traversal" => {
                 traversal = Some(match value {
+                    "auto" => "auto",
                     "indexed" => "indexed",
                     "csr" => "csr",
                     other => {
                         return Err(format!(
-                            "line {}: `# traversal:` takes `indexed` or `csr`, got `{other}`",
+                            "line {}: `# traversal:` takes `auto`, `indexed` or `csr`, got `{other}`",
                             idx + 1
                         ));
                     }
@@ -1074,7 +1085,7 @@ struct PendingStep {
     decl: Box<QueryDecl>,
     ordered_refusal: Option<String>,
     expects_expand: bool,
-    params_raw: Option<String>,
+    params_raw: Option<ParamsInput>,
 }
 
 /// The rows expect of a read step: the body under its substitution rule,
@@ -1834,7 +1845,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 }));
             }
             "params" => {
-                if !rest.is_empty() {
+                if !rest.is_empty() && !rest.starts_with("generate:") {
                     return Err(format!("unknown section `--- {}`", section.name));
                 }
                 let step = match pending.as_mut() {
@@ -1864,15 +1875,24 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         section.header_line + 1
                     ));
                 }
-                let body: String = section
-                    .body
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                validate_subst_tokens(&body, open_loop.as_ref().map(|(v, _, _)| v.as_str()))?;
-                substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                step.params_raw = Some(body);
+                if rest.is_empty() {
+                    let body: String = section
+                        .body
+                        .iter()
+                        .map(|(_, l)| *l)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    validate_subst_tokens(&body, open_loop.as_ref().map(|(v, _, _)| v.as_str()))?;
+                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                    step.params_raw = Some(ParamsInput::Literal(body));
+                } else {
+                    // A recipe is not substituted: its lines stay outside
+                    // `substitutable_lines`, so a `${` in it is refused.
+                    step.params_raw = Some(ParamsInput::Generated(
+                        GeneratedParams::parse(rest, &yaml_body(&section.body))
+                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?,
+                    ));
+                }
             }
             "expect" => {
                 if let Some(Pending::Concurrent(mut step)) =
@@ -2257,18 +2277,19 @@ fn substitute(text: &str, binding: Option<(&str, &str)>) -> String {
 }
 
 fn build_params(
-    params_raw: Option<&String>,
+    params_raw: Option<&ParamsInput>,
     ast_params: &[Param],
     binding: Option<(&str, &str)>,
 ) -> Result<omnigraph_compiler::ParamMap, String> {
     let json = match params_raw {
-        Some(raw) => {
+        Some(ParamsInput::Literal(raw)) => {
             let substituted = substitute(raw, binding);
             Some(
                 serde_json::from_str::<Value>(&substituted)
                     .map_err(|e| format!("params are not valid JSON: {e}"))?,
             )
         }
+        Some(ParamsInput::Generated(generated)) => Some(generated.generate()?),
         None => None,
     };
     json_params_to_param_map(json.as_ref(), ast_params, JsonParamMode::Standard)
@@ -2756,6 +2777,26 @@ fn check_rows(
     let Value::Array(actual) = rows else {
         return Err(fail("engine returned a non-array row set".into()));
     };
+    check_rows_json(host, label, &actual, ordered, body_raw, span, binding)
+}
+
+/// `check_rows` on rows already rendered as JSON objects: the in-process
+/// path renders them from the `QueryResult`, the served path reads them off
+/// the wire, and both judge the expect body here.
+fn check_rows_json(
+    host: &impl ExecutionHost,
+    label: &str,
+    actual: &[Value],
+    ordered: bool,
+    body_raw: &str,
+    span: BodySpan,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let fail = |message: String| StepFail {
+        label: label.to_string(),
+        message,
+        bless_lines: None,
+    };
     host.observe(|| {
         let mut rows = actual.iter().map(Value::to_string).collect::<Vec<_>>();
         if !ordered {
@@ -2764,7 +2805,7 @@ fn check_rows(
         format!("{label} rows: {rows:?}")
     });
     let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
-    compare_rows(&expected, &actual, ordered).map_err(|(message, rows)| StepFail {
+    compare_rows(&expected, actual, ordered).map_err(|(message, rows)| StepFail {
         label: label.to_string(),
         message,
         bless_lines: Some((span, rows)),
@@ -3310,44 +3351,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.record(
-                    "expectation",
-                    || match step {
-                        Step::Query(q) => {
-                            let mut evidence = read_expect_evidence(&q.expect);
-                            if let Some(plan) = &q.plan {
-                                evidence["plan"] = serde_json::json!(plan.lines);
-                            }
-                            evidence
-                        }
-                        Step::List(l) => read_expect_evidence(&l.expect),
-                        Step::Mutate(m) => match &m.expect {
-                            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
-                            MutateExpect::Affected { nodes, edges } => {
-                                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
-                            }
-                            MutateExpect::Error { needle } => {
-                                serde_json::json!({"kind": "error", "contains": needle})
-                            }
-                        },
-                        Step::Load(step) => serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)}),
-                        Step::Control(c) => {
-                            serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
-                        }
-                        Step::Settings(s) => {
-                            serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
-                        }
-                        Step::Show(s) => read_expect_evidence(&s.expect),
-                        Step::Restart { .. } => {
-                            serde_json::json!({"kind": "restart", "storage": "preserved"})
-                        }
-                        Step::Concurrent(c) => serde_json::json!({
-                            "kind": "concurrent",
-                            "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
-                            "order": c.order.iter().map(|e| format!("{} {}", c.sessions[e.session].label, e.event)).collect::<Vec<_>>(),
-                        }),
-                    },
-                );
+                host.record("expectation", || expectation_evidence(step));
                 let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
                 let armed = host.arm_seams(seams, step)?;
                 let lifetime_before = host.lifetime_counts();
@@ -3483,6 +3487,46 @@ async fn execute_steps_inner<H: ExecutionHost>(
         }
     }
     Err(detail)
+}
+
+/// The `expectation` evidence of a step, recorded before it runs on either
+/// executor.
+fn expectation_evidence(step: &Step) -> Value {
+    match step {
+        Step::Query(q) => {
+            let mut evidence = read_expect_evidence(&q.expect);
+            if let Some(plan) = &q.plan {
+                evidence["plan"] = serde_json::json!(plan.lines);
+            }
+            evidence
+        }
+        Step::List(l) => read_expect_evidence(&l.expect),
+        Step::Mutate(m) => match &m.expect {
+            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
+            MutateExpect::Affected { nodes, edges } => {
+                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+            }
+            MutateExpect::Error { needle } => {
+                serde_json::json!({"kind": "error", "contains": needle})
+            }
+        },
+        Step::Load(step) => {
+            serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)})
+        }
+        Step::Control(c) => {
+            serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
+        }
+        Step::Settings(s) => {
+            serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
+        }
+        Step::Show(s) => read_expect_evidence(&s.expect),
+        Step::Restart { .. } => serde_json::json!({"kind": "restart", "storage": "preserved"}),
+        Step::Concurrent(c) => serde_json::json!({
+            "kind": "concurrent",
+            "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
+            "order": c.order.iter().map(|e| format!("{} {}", c.sessions[e.session].label, e.event)).collect::<Vec<_>>(),
+        }),
+    }
 }
 
 fn read_expect_evidence(expect: &QueryExpect) -> Value {

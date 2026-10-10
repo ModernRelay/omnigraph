@@ -278,6 +278,25 @@ mod tests {
     }
 
     #[test]
+    fn write_max_bytes_default_is_the_existing_ceiling() {
+        assert_eq!(
+            SessionSettings::default().write_max_bytes(),
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES
+        );
+        assert_eq!(
+            SettingId::WriteMaxBytes.spec().default,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES.to_string()
+        );
+        assert!(matches!(
+            SettingId::WriteMaxBytes.spec().kind,
+            omnigraph_compiler::settings::SettingKind::Integer {
+                min: 1,
+                max: Some(33_554_432)
+            }
+        ));
+    }
+
+    #[test]
     fn history_release_bytes_default_is_the_catalog_constant() {
         assert_eq!(
             SessionSettings::default().history_release_bytes(),

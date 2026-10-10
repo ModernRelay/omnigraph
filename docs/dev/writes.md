@@ -144,10 +144,10 @@ physical-effect proofs:
 | Writer | Physical adapter | Publication |
 |---|---|---|
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
-| SchemaApply | Existing-table detached rewrites; original added-type Create or qualified reuse/detached replacement; complete table delta and replacement schema-contract row | One main-branch graph commit |
+| SchemaApply | Existing-table metadata-only schema evolution (a detached `Project` for renamed and dropped columns, then a detached `Merge` adding nullable columns over the unchanged fragments; no data file written, no row read); original added-type Create or qualified reuse/detached replacement; complete table delta and replacement schema-contract row | One main-branch graph commit |
 | BranchMerge | Onto main: a pointer switch, main's registration taking the source's pin. Into a named branch: a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
-| Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
+| Optimize | One detached compaction `Rewrite` per productive table (Lance's plan plus every fragment still holding a dropped column), chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
@@ -208,17 +208,22 @@ still does, or when no `__manifest` version ever named it and the authority
 its transaction properties record is provably gone. Nothing defers a table's
 collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
 
-Optimize plans each table's compaction from its pin and stages the rewrite
-detached with fragment ids above the base's high-water mark, so it needs no
-`ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
-detached commit chained on the rewrite under its name (Lance 11 folds only
-through a linear commit), keeping a vector index's partition count; the batch
-publishes once with an exact CAS on every planned pin, and a pin a concurrent
-writer moved fails the run with a read-set conflict so the next run re-plans.
-A failure before publication leaves unpublished staging the collector
-reclaims once it is dead. A strict mutation prepared before Optimize's
-publication reports the same read-set conflict as it would after any other
-writer.
+Optimize plans each table's compaction from its pin
+(`TableStore::plan_table_compaction`): Lance's plan, plus a task of its own
+for every other fragment whose data or overlay files still list a field id the
+schema lacks, the values of a dropped column. The rewrite scans the current
+schema only, so its files hold no dropped value; this is how a drop is erased,
+deterministically, whatever Lance's size and deletion heuristics select. It
+stages the rewrite detached with fragment ids above the base's high-water
+mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
+rebuilt whole as a detached commit chained on the rewrite under its name
+(Lance 11 folds only through a linear commit), keeping a vector index's
+partition count; the batch publishes once with an exact CAS on every planned
+pin, and a pin a concurrent writer moved fails the run with a read-set
+conflict so the next run re-plans. A failure before publication leaves
+unpublished staging the collector reclaims once it is dead. A strict mutation
+prepared before Optimize's publication reports the same read-set conflict as
+it would after any other writer.
 
 The index writer (`ensure_indices` and the explicit full-text rebuild)
 follows the same protocol: it opens each productive table at its pin, stages
@@ -228,9 +233,33 @@ publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 
-Schema apply stages each existing-table rewrite as a detached Overwrite of
-the table's pin and publishes it one logical version past the published
-version. An added type uses its identity-derived path, which a retry derives
+Schema apply changes an existing table's columns by metadata-only Lance
+commits (`TableStore::stage_schema_evolution`). Renamed and dropped columns
+commit as one detached `Operation::Project` of the table's pin, the surviving
+columns keeping their field ids, metadata and indexes; added nullable columns
+commit as a detached `Operation::Merge` over the unchanged fragments, with
+field ids above every id the data files reference, which fragments that lack
+them read as null. Lance refuses a Merge that renames a field, so a table with
+both kinds chains the Merge on the Project, and the pin names the tip; either
+way the table publishes one logical version past its published version. No
+data file is written and no row or Blob payload is read, so the apply's memory
+and I/O do not grow with the rows or payload bytes the table stores; they
+still grow with its fragment, schema and index metadata, because planning
+walks the fragment inventory, the Merge carries it and each detached commit
+serializes it. Every surviving index keeps its coverage, and a stored external
+Blob descriptor, ranged or not, is never rebuilt. A dropped column's values
+stay in the data files until the next optimize rewrites every fragment holding
+them (above); `cleanup` then deletes the old files once no retained version
+references them. The collector retains every live branch's head and creation
+point and every tagged version, so a branch created before that optimize keeps
+the old files, merged or not, until it is deleted. Every evolved table's
+commits are planned once, from its manifest, before the first effect, and the
+effects stage exactly that plan, each step checking that its base has the
+columns the previous step left. A column whose type or nullability would change refuses at
+planning; the schema planner emits no such step. The physical column order
+follows the catalog.
+
+An added type uses its identity-derived path, which a retry derives
 again from the accepted allocator. Retry preserves that path and every
 existing version. It can reuse an original empty, stable-row-ID version-one
 Create with the desired physical schema. If that original Create has another
@@ -335,28 +364,30 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before its
-  data is staged.
+- one table's keyed input is bounded to 8,192 rows and the effective
+  `write_max_bytes` (default 32 MiB) before its data is staged.
 
 Insert/update mutations and keyed Append/Merge loads also cap the sum of
-retained Arrow batches across tables at 32 MiB
-(`retained keyed batch bytes per operation`). Admission uses
-`get_array_memory_size` accounting; shared buffers may be conservatively counted
-more than once. An update's pending-aware scan charges the same sum under the
-same resource name. The keyed parse spool separately caps its decoded-payload
-estimate across tables at 32 MiB (`keyed parsed entity bytes per operation`).
-External Blob copy admission adds copied payload estimates, which are not yet
-read, to the retained keyed batches under the same resource name before reading
-payloads, then checks materialized batches before staging fragments.
+retained row data across tables at `write_max_bytes`
+(`retained keyed batch bytes per operation`). Admission starts with
+`get_array_memory_size`, subtracting only typed logical Blob payload buffer
+capacity. Offsets, validity, URI descriptors and ordinary columns remain in
+the row account; shared buffers may be counted more than once. Logical Blob
+payload lengths have an independent allowance of the same size. Payload
+accounts count logical payload lengths; builder over-capacity (up to about one
+third) is outside them. Pending-aware
+update scans charge both accounts, including their initial pending input.
+The keyed parse spool separately caps its row estimate and decoded Blob bytes.
+Inline and copied external payload lengths are admitted together before GETs;
+materialized row and payload accounts are checked again before staging.
 
 Delete mutations, cascades and Overwrite's removed-ID detection stream matches
-instead of collecting the full scan. One 32 MiB
-`retained removed-id bytes per operation` allowance covers all tables, charging
-each ID's UTF-8 length plus one 24-byte `String` slot before copying it.
-Overwrite's bulk input is not subject to the keyed row/batch limits. These are
-fixed representation limits with no setting, not a
-combined allocator/RSS budget; native scan buffers, conversion copies and
-validation's derived state are outside them. Refusal precedes the current
+under one `write_max_bytes` removed-ID allowance per operation, charging each
+ID's UTF-8 length plus one 24-byte `String` slot before copying it.
+Overwrite's bulk input is not subject to the keyed aggregate row/batch limits.
+These are representation limits, not a combined allocator/RSS budget; native
+scan buffers, conversion copies and validation's derived state are outside them.
+Refusal precedes the current
 operation's fragment staging and publication, though writable open may have
 completed earlier schema work and a load may already have created its branch.
 
@@ -417,7 +448,7 @@ payload ranges before reading bytes or staging any effect.
 
 Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
-external bytes under the operation's 32 MiB budget because Lance's MergeInsert
+external bytes under the operation's `write_max_bytes` Blob payload budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
 adoption does no source I/O. An update never reads the Blobs it assigns; a
 carried stored external reference the policy refuses fails as
