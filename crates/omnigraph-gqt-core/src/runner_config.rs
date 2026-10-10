@@ -106,6 +106,31 @@ impl Environment {
         }
     }
 
+    /// Admission under `--server`: only an `omnigraph-server` environment
+    /// runs against the named server, with any declared storage (the server
+    /// reports no backend to check it against, so the declaration is
+    /// recorded, not verified); `omnigraph-server-dst` stays unimplemented.
+    pub fn admit_served(&self) -> Result<(), String> {
+        match self.execution {
+            Execution::Server { .. } => Ok(()),
+            Execution::Engine { .. } | Execution::Dst { .. } => Err(format!(
+                "unsupported_environment: --server runs only omnigraph-server environments, not {self}"
+            )),
+            Execution::ServerDst { .. } => Err(format!(
+                "unsupported_environment: {self} requests an unavailable combination; --server implements omnigraph-server only"
+            )),
+        }
+    }
+
+    /// Whether the environment is served by an `omnigraph-server` process,
+    /// which only a `--server` invocation can reach.
+    pub fn is_served(&self) -> bool {
+        matches!(
+            self.execution,
+            Execution::Server { .. } | Execution::ServerDst { .. }
+        )
+    }
+
     /// `needs_dst` is `Case::needs_dst`: what only the DST runner can host.
     pub fn admit(&self, needs_dst: bool) -> Result<(), String> {
         match self.execution {
@@ -373,12 +398,23 @@ mod tests {
         let config = parse_runner(ENGINE).unwrap();
         assert!(config.environments[0].admit(false).is_ok());
         assert!(config.environments[0].admit(true).is_err());
-        let server = ENGINE.replace("omnigraph-engine", "omnigraph-server");
+        let server = parse_runner(&ENGINE.replace("omnigraph-engine", "omnigraph-server")).unwrap();
+        assert!(server.environments[0].admit(false).is_err());
+        assert!(server.environments[0].admit_served().is_ok());
+        assert!(server.environments[0].is_served());
+        assert!(!config.environments[0].is_served());
         assert!(
-            parse_runner(&server).unwrap().environments[0]
-                .admit(false)
-                .is_err()
+            config.environments[0]
+                .admit_served()
+                .unwrap_err()
+                .contains("--server runs only omnigraph-server environments")
         );
+        let server_dst = parse_runner(
+            &(ENGINE.replace("omnigraph-engine", "omnigraph-server-dst") + "    seeds: [0]\n"),
+        )
+        .unwrap();
+        assert!(server_dst.environments[0].is_served());
+        assert!(server_dst.environments[0].admit_served().is_err());
         let dst = ENGINE
             .replace("omnigraph-engine", "omnigraph-engine-dst")
             .replace("local-filesystem", "in-memory-object-store")

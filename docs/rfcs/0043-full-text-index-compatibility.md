@@ -210,8 +210,8 @@ None for this slice. Incremental full-text proof propagation is out of scope.
 - 2026-10-09: An untrained segment, built from no rows by the same builder
   with `train(false)`, carries the analyzer and the same proof. Lance applies
   an analyzer only through a segment, so a declared column with no segment
-  searched with a bare tokenizer after a table's first rows, an overwrite or a
-  schema rewrite. Every writer now declares such a segment in the commit that
+  searched with a bare tokenizer after a table's first rows, an overwrite or
+  the addition of a full-text property. Every writer now declares such a segment in the commit that
   leaves a version without one, and ensure builds postings where no segment
   covers a fragment. The certificate still vouches only for segments the
   engine's builder wrote from rows, all of them or none; merged or remapped

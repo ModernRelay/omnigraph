@@ -129,7 +129,7 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
@@ -151,6 +151,7 @@ cargo deny --locked check               # from the repository root, after Cargo.
 python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
 python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
+python3 scripts/check-workspace-test-owners.py --self-test   # after editing the `Test Workspace` owner list or .config/nextest.toml
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 

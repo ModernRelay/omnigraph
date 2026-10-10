@@ -472,10 +472,12 @@ async fn prepare_optimize_table(
         .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
 
+    // The same plan `stage_compaction` executes: a fragment still holding a
+    // dropped property's values is compaction work even when Lance's planner
+    // would leave the table alone.
     let options = CompactionOptions::default();
-    let will_compact = plan_compaction(snapshot.dataset(), &options)
-        .await
-        .map_err(OmniError::storage)?
+    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), &options)
+        .await?
         .num_tasks()
         > 0;
     let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;

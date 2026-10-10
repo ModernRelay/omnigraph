@@ -82,22 +82,22 @@ SCOPES = {
     # Workspace` builds; a scope with its own selection resolved a third
     # graph (docs/dev/ci.md, cache rule).
     "crossversion": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
         "crates/omnigraph-cli/tests/crossversion_upgrade.rs",
         "",
     ),
     "engine": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1',
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1',
         "crates/omnigraph/src/db/upgrade/tests.rs",
         "db::upgrade::tests::",
     ),
     "lance": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1',
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1',
         "crates/omnigraph/tests/lance_version_columns.rs",
         "",
     ),
     "protocol": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1',
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1',
         "crates/omnigraph/tests/forbidden_apis.rs",
         "",
     ),
@@ -308,7 +308,7 @@ class GuardTests(unittest.TestCase):
 
     def test_old_package_feature_selection_fails(self):
         changed = self.workflow.replace(
-            "cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade",
+            "cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade",
             "cargo test --locked -p omnigraph-cli --test crossversion_upgrade",
         )
         self.assertNotEqual(changed, self.workflow)

@@ -1,10 +1,5 @@
 use super::*;
-use crate::blob::{BlobDescriptor, BlobDescriptorDecoder, ExternalBlobRef};
 use crate::seams::{decide_seam, fail};
-use futures::TryStreamExt;
-
-const SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS: usize = 1024;
-const SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 
 mod prepared;
 mod settlement;
@@ -139,8 +134,9 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// After each SchemaApply table effect commits (a detached rewrite or a
-    /// new-table create), before the next table effect or the publication.
+    /// After each SchemaApply table effect commits (a detached schema-evolution
+    /// commit, one of at most two per table, or a new-table create), before
+    /// the next table effect or the publication.
     pub static SCHEMA_APPLY_POST_TABLE_COMMIT = ("schema_apply.post_table_commit", Unreachable, [Fail]);
 }
 
@@ -329,7 +325,7 @@ where
     // Resolve every rename before classifying dependent property steps. The
     // planner currently emits RenameType first, but correctness must not depend
     // on step ordering: a same-apply rename + property drop still routes the
-    // rewrite to the source table captured under its old alias.
+    // schema evolution to the source table captured under its old alias.
     let renamed_tables = plan
         .steps
         .iter()
@@ -345,7 +341,10 @@ where
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    let mut rewritten_tables = BTreeSet::new();
+    // Existing tables whose columns change: added, renamed or dropped
+    // properties. Each evolves by metadata-only Lance commits that keep every
+    // data file; no row is read or rewritten.
+    let mut evolved_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
     let mut changed_edge_tables = false;
@@ -389,7 +388,7 @@ where
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
-                rewritten_tables.insert(table_key);
+                evolved_tables.insert(table_key);
             }
             SchemaMigrationStep::RenameProperty {
                 type_kind,
@@ -404,7 +403,7 @@ where
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
-                rewritten_tables.insert(table_key.clone());
+                evolved_tables.insert(table_key.clone());
                 property_renames
                     .entry(table_key)
                     .or_default()
@@ -432,17 +431,16 @@ where
                 if matches!(type_kind, SchemaTypeKind::Interface) {
                     continue;
                 }
-                // A property drop routes through the existing
-                // stage_overwrite rewrite path. batch_for_schema_apply_rewrite
-                // iterates the *target* schema fields, so a property
-                // absent from desired_catalog is naturally projected
-                // away in the rebuilt batch. Nothing is reclaimed after the
-                // publish; see `SchemaMigrationStep::DropProperty`.
+                // A property drop removes the column from the table's
+                // schema by a metadata-only commit: its values stay in the
+                // existing data files, which older versions still read.
+                // Nothing is reclaimed at apply; see
+                // `SchemaMigrationStep::DropProperty`.
                 let table_key = schema_table_key(*type_kind, type_name);
                 if table_key.starts_with("edge:") {
                     changed_edge_tables = true;
                 }
-                rewritten_tables.insert(table_key);
+                evolved_tables.insert(table_key);
             }
             SchemaMigrationStep::DropType { type_kind, name } => {
                 if matches!(type_kind, SchemaTypeKind::Interface) {
@@ -468,14 +466,15 @@ where
     }
 
     // A full-text index the desired schema declares on a table this apply
-    // neither adds, rewrites nor drops (a new `@index`) is declared in this
+    // neither adds, evolves nor drops (a new `@index`) is declared in this
     // publication by an untrained segment, so no search on it runs without
-    // its analyzer; the postings are built off the critical path.
+    // its analyzer; the postings are built off the critical path. An evolved
+    // table declares its full-text columns in its evolution's commits.
     let mut declared_tables = BTreeMap::<String, Vec<String>>::new();
     for type_name in desired_catalog.node_types.keys() {
         let table_key = schema_table_key(SchemaTypeKind::Node, type_name);
         if added_tables.contains(&table_key)
-            || rewritten_tables.contains(&table_key)
+            || evolved_tables.contains(&table_key)
             || dropped_tables.contains(&table_key)
         {
             continue;
@@ -502,7 +501,7 @@ where
     let mut table_tombstones =
         BTreeMap::<crate::db::manifest::TableIdentity, (String, u64, Option<String>)>::new();
 
-    for table_key in &rewritten_tables {
+    for table_key in &evolved_tables {
         if added_tables.contains(table_key) {
             continue;
         }
@@ -523,7 +522,7 @@ where
         let accepted_identity = table_identity_for_schema_key(&accepted_ir, source_table_key)?;
         if identity != accepted_identity || identity != entry.identity {
             return Err(OmniError::manifest_internal(format!(
-                "schema apply rewrite identity mismatch: source '{}' is {}, target '{}' is {}",
+                "schema apply evolution identity mismatch: source '{}' is {}, target '{}' is {}",
                 source_table_key, entry.identity, table_key, identity
             )));
         }
@@ -657,30 +656,40 @@ where
         existing_heads.insert(entry.type_key.clone(), head);
     }
 
-    // Lance's logical Blob rewrite input cannot represent an existing
-    // external offset/length range. Discover that unsupported persisted state
-    // across the complete rewrite set before any added / lexically earlier
-    // table can move. The builder repeats this check as a defensive invariant.
-    for table_key in &rewritten_tables {
+    // Plan every table's schema evolution from its manifest before any table
+    // moves: a column whose type or nullability would change, a required
+    // added column or a mismatched property identity refuses here, with the
+    // graph unchanged. The effects stage exactly these plans.
+    let mut evolutions = BTreeMap::<String, crate::table_store::SchemaEvolution>::new();
+    for table_key in &evolved_tables {
         if added_tables.contains(table_key) {
             continue;
         }
         let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
         let source_ds = existing_heads.get(source_table_key).ok_or_else(|| {
             OmniError::manifest_internal(format!(
-                "missing preflighted source table '{}' for schema Blob range validation",
+                "missing preflighted source table '{}' for schema evolution",
                 source_table_key
             ))
         })?;
-        validate_schema_rewrite_external_ranges(
-            source_ds,
-            source_table_key,
-            accepted_catalog.as_ref(),
-            table_key,
-            &desired_catalog,
-            property_renames.get(table_key),
-        )
-        .await?;
+        let target = schema_for_table_key(&desired_catalog, table_key)?;
+        let mut renames = property_renames
+            .get(table_key)
+            .map(|renames| {
+                renames
+                    .iter()
+                    .map(|(to, from)| (from.clone(), to.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        renames.sort();
+        let evolution = TableStore::plan_schema_evolution(source_ds.dataset(), &target, &renames)
+            .map_err(|error| {
+            OmniError::manifest(format!(
+                "schema apply cannot evolve table '{source_table_key}' in place: {error}"
+            ))
+        })?;
+        evolutions.insert(table_key.clone(), evolution);
     }
 
     let mut published_commit: Option<String> = None;
@@ -780,10 +789,8 @@ where
             fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
-        for table_key in &rewritten_tables {
-            if added_tables.contains(table_key) {
-                continue;
-            }
+        for (table_key, mut evolution) in evolutions {
+            let table_key = &table_key;
             let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
             let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
                 OmniError::manifest(format!(
@@ -791,51 +798,65 @@ where
                     source_table_key, table_key
                 ))
             })?;
-            let source_ds = existing_heads.remove(source_table_key).ok_or_else(|| {
+            // Reuse the handle that was opened and pin-checked before the
+            // effects; reopening here would introduce a second HEAD observation.
+            let mut tip = existing_heads.remove(source_table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "missing preflighted source table '{}' for schema apply",
                     source_table_key
                 ))
             })?;
-            let batch = batch_for_schema_apply_rewrite(
-                db,
-                &source_ds,
-                source_table_key,
-                accepted_catalog.as_ref(),
-                table_key,
-                &desired_catalog,
-                property_renames.get(table_key),
-            )
-            .await?;
-            let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
-            // Reuse the handle that was opened and pin-checked before the
-            // effects; reopening here would introduce a second HEAD observation.
-            let staged = db.storage().stage_overwrite(&source_ds, batch).await?;
             let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
             if identity != entry.identity {
                 return Err(OmniError::manifest_internal(format!(
-                    "SchemaApply rewrite '{}' changed table identity {} to {}",
+                    "SchemaApply evolution '{}' changed table identity {} to {}",
                     table_key, entry.identity, identity
                 )));
             }
+            let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
             let witness = crate::table_store::StagingWitness::new(
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
-            let (detached, transaction) = db
+            // A Project for renames and drops, then a Merge for additions,
+            // each a detached commit of the previous; the pin names the tip.
+            // Neither writes a data file, so every surviving index keeps its
+            // coverage and no row or Blob payload is read.
+            let declared =
+                super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
+            let mut tip_transaction = None;
+            while let Some(staged) = db
                 .storage()
-                .commit_staged_detached(
-                    source_ds,
-                    staged,
-                    &witness,
-                    &super::table_ops::declared_full_text_columns(&desired_catalog, table_key),
-                )
-                .await?;
-            // The rewrite is a Lance overwrite, which drops every index; the
-            // commit declared the full-text ones again, and optimize /
-            // ensure_indices rebuild postings and the other indexes off the
-            // critical path. Reads scan uncovered fragments meanwhile.
-            let state = db.storage().table_state(&dataset_uri, &detached).await?;
+                .stage_schema_evolution(&tip, &mut evolution)
+                .await?
+            {
+                // A step that adds a full-text column, or meets one newly
+                // declared, chains that column's analyzer segment.
+                let (next, transaction) = db
+                    .storage()
+                    .commit_staged_detached(tip, staged, &witness, &declared)
+                    .await?;
+                tip = next;
+                tip_transaction = Some(transaction);
+                fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+            }
+            let (tip, transaction) = match tip_transaction {
+                Some(transaction) => (tip, transaction),
+                // The table already has the target schema: only a newly
+                // declared full-text index can still need a commit.
+                None => match db
+                    .storage()
+                    .commit_full_text_declarations(tip, &declared, &witness)
+                    .await?
+                {
+                    Some(declared) => {
+                        fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+                        declared
+                    }
+                    None => continue,
+                },
+            };
+            let state = db.storage().table_state(&dataset_uri, &tip).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
             let version_metadata = state
                 .version_metadata
@@ -853,7 +874,6 @@ where
                     version_metadata,
                 },
             );
-            fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
         }
 
         // An added `@index` records its intent in the desired catalog/IR
@@ -1063,262 +1083,4 @@ where
         commit: Some(published.commit),
         contract: prepared.desired_contract().clone(),
     })
-}
-
-pub(super) async fn batch_for_schema_apply_rewrite(
-    db: &Omnigraph,
-    source_ds: &SnapshotHandle,
-    source_table_key: &str,
-    source_catalog: &Catalog,
-    target_table_key: &str,
-    target_catalog: &Catalog,
-    property_renames: Option<&HashMap<String, String>>,
-) -> Result<RecordBatch> {
-    let target_schema = schema_for_table_key(target_catalog, target_table_key)?;
-    let source_blob_properties = blob_properties_for_table_key(source_catalog, source_table_key)?;
-    let target_blob_properties = blob_properties_for_table_key(target_catalog, target_table_key)?;
-    let needs_row_ids = !source_blob_properties.is_empty() || !target_blob_properties.is_empty();
-    let batches = if needs_row_ids {
-        db.storage()
-            .scan_with_row_id(source_ds, None, None, None, true)
-            .await?
-    } else {
-        db.storage().scan_batches(source_ds).await?
-    };
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(target_schema));
-    }
-    let source_schema = batches[0].schema();
-    let batch = concat_or_empty_batches(source_schema, batches)?;
-
-    let row_ids = if needs_row_ids {
-        Some(
-            batch
-                .column_by_name("_rowid")
-                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "expected _rowid column when rewriting '{}'",
-                        source_table_key
-                    ))
-                })?
-                .values()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
-
-    let mut columns = Vec::with_capacity(target_schema.fields().len());
-    for field in target_schema.fields() {
-        let source_name = property_renames
-            .and_then(|renames| renames.get(field.name()))
-            .map(String::as_str)
-            .unwrap_or_else(|| field.name().as_str());
-        if let Some(column) = batch.column_by_name(source_name) {
-            if target_blob_properties.contains(field.name())
-                && source_blob_properties.contains(source_name)
-            {
-                let descriptions =
-                    column
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| {
-                            OmniError::blob_integrity(format!(
-                                "expected blob descriptions for '{}.{}'",
-                                source_table_key, source_name
-                            ))
-                        })?;
-                let rebuilt = rebuild_blob_column(
-                    db,
-                    source_ds,
-                    source_name,
-                    descriptions,
-                    row_ids.as_deref().unwrap_or(&[]),
-                )
-                .await?;
-                columns.push(rebuilt);
-            } else {
-                columns.push(column.clone());
-            }
-        } else {
-            columns.push(new_null_array(field.data_type(), batch.num_rows()));
-        }
-    }
-
-    RecordBatch::try_new(target_schema, columns).map_err(OmniError::arrow_internal)
-}
-
-/// Descriptor-only pre-effect validation for external Blob cells that a schema
-/// rewrite will carry. Project only the source Blob columns that survive in
-/// the target schema; this performs no external-object lookup or payload read.
-async fn validate_schema_rewrite_external_ranges(
-    source_ds: &SnapshotHandle,
-    source_table_key: &str,
-    source_catalog: &Catalog,
-    target_table_key: &str,
-    target_catalog: &Catalog,
-    property_renames: Option<&HashMap<String, String>>,
-) -> Result<()> {
-    let source_blob_properties = blob_properties_for_table_key(source_catalog, source_table_key)?;
-    let target_blob_properties = blob_properties_for_table_key(target_catalog, target_table_key)?;
-    let mut source_columns = target_blob_properties
-        .iter()
-        .filter_map(|target_name| {
-            let source_name = property_renames
-                .and_then(|renames| renames.get(target_name))
-                .unwrap_or(target_name);
-            source_blob_properties
-                .contains(source_name)
-                .then(|| source_name.clone())
-        })
-        .collect::<Vec<_>>();
-    source_columns.sort();
-    source_columns.dedup();
-    if source_columns.is_empty() {
-        return Ok(());
-    }
-
-    let projection = source_columns
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let mut batches = crate::table_store::TableStore::scan_stream_bounded(
-        source_ds.dataset(),
-        Some(&projection),
-        None,
-        None,
-        false,
-        SCHEMA_BLOB_DESCRIPTOR_SCAN_ROWS,
-        SCHEMA_BLOB_DESCRIPTOR_SCAN_BYTES,
-    )
-    .await?;
-    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
-        for source_name in &source_columns {
-            let descriptions = batch
-                .column_by_name(source_name)
-                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
-                .ok_or_else(|| {
-                    OmniError::blob_integrity(format!(
-                        "expected blob descriptions for '{}.{}' during pre-arm schema validation",
-                        source_table_key, source_name
-                    ))
-                })?;
-            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
-            for row in 0..descriptions.len() {
-                if let BlobDescriptor::External {
-                    uri,
-                    offset,
-                    length,
-                } = decoder.classify(row)?
-                {
-                    whole_external_uri_for_schema_rewrite(uri, offset, length)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn rebuild_blob_column(
-    _db: &Omnigraph,
-    source_ds: &SnapshotHandle,
-    column_name: &str,
-    descriptions: &StructArray,
-    row_ids: &[u64],
-) -> Result<Arc<dyn Array>> {
-    let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
-    let mut builder = BlobArrayBuilder::new(row_ids.len());
-    let mut managed_row_ids = Vec::new();
-    let mut row_descriptors = Vec::with_capacity(row_ids.len());
-
-    for (row, row_id) in row_ids.iter().enumerate() {
-        let descriptor = decoder.classify(row)?;
-        if matches!(descriptor, BlobDescriptor::Managed { .. }) {
-            managed_row_ids.push(*row_id);
-        }
-        row_descriptors.push(descriptor);
-    }
-
-    let mut managed_blobs =
-        TableStore::managed_blob_payloads(source_ds.dataset(), column_name, managed_row_ids)
-            .await?;
-
-    for descriptor in row_descriptors {
-        match descriptor {
-            BlobDescriptor::Null => builder.push_null().map_err(OmniError::lance_internal)?,
-            BlobDescriptor::External {
-                uri,
-                offset,
-                length,
-            } => {
-                let uri = whole_external_uri_for_schema_rewrite(uri, offset, length)?;
-                builder.push_uri(uri).map_err(OmniError::lance_internal)?;
-            }
-            BlobDescriptor::Managed { length } => {
-                builder
-                    .push_bytes(managed_blobs.next(length).await?)
-                    .map_err(OmniError::lance_internal)?;
-            }
-        }
-    }
-
-    managed_blobs.finish().await?;
-
-    builder.finish().map_err(OmniError::lance_internal)
-}
-
-/// Lance's logical Blob input can retain a whole-object URI but cannot encode
-/// a descriptor range. Refuse a valid ranged descriptor before schema staging
-/// instead of silently widening it to the entire target object.
-fn whole_external_uri_for_schema_rewrite(
-    uri: String,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<String> {
-    let reference = ExternalBlobRef {
-        uri,
-        offset,
-        length,
-    };
-    if let Err(ranged) = reference.whole_object_uri() {
-        return Err(OmniError::manifest(format!(
-            "schema rewrite cannot preserve {ranged}"
-        )));
-    }
-    Ok(reference.uri)
-}
-
-#[cfg(test)]
-mod blob_rewrite_tests {
-    use super::whole_external_uri_for_schema_rewrite;
-    use crate::error::OmniError;
-
-    #[test]
-    fn schema_rewrite_never_widens_an_external_blob_range() {
-        assert_eq!(
-            whole_external_uri_for_schema_rewrite("s3://bucket/base/object".to_string(), 0, None,)
-                .unwrap(),
-            "s3://bucket/base/object"
-        );
-        for (offset, length) in [(1, None), (0, Some(1)), (7, Some(0))] {
-            let error = whole_external_uri_for_schema_rewrite(
-                "s3://user:secret@bucket/base/object?signature=private".to_string(),
-                offset,
-                length,
-            )
-            .unwrap_err();
-            assert!(matches!(error, OmniError::Manifest(_)));
-            assert!(
-                error
-                    .to_string()
-                    .contains("cannot preserve ranged external Blob descriptor")
-            );
-            assert!(!error.to_string().contains("secret"));
-            assert!(!error.to_string().contains("signature"));
-            assert!(!error.to_string().contains("private"));
-        }
-    }
 }
