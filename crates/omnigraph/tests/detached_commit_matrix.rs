@@ -17,7 +17,8 @@
 //! handle writes again once the fault stops, without reopening.
 //! `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors, and
 //! `OMNIGRAPH_MATRIX_WRITERS=Insert,…` narrows the writers. Seams are
-//! process-global, so the matrix is serial.
+//! process-global, so every writer × window point is one serial `#[test]`,
+//! which nextest runs as its own process.
 #![cfg(feature = "failpoints")]
 
 mod helpers;
@@ -313,7 +314,7 @@ fn reclaim_everything() -> CleanupPolicyOptions {
 
 /// Subprocess half of the matrix: not `serial`, the parent waits for it.
 #[test]
-#[ignore = "subprocess helper; exercised by rfc_0067_failure_window_matrix"]
+#[ignore = "subprocess helper; exercised by the rfc_0067_failure_window_matrix_* points"]
 fn rfc0067_matrix_child_process() {
     if std::env::var_os(CHILD_ENV).is_none() {
         return;
@@ -955,26 +956,112 @@ async fn run_cell(
     )
 }
 
-/// The matrix, run outside libtest's 2-MiB thread: every cell chains a graph
-/// init, the faulted writer, a recovery actor and the oracle.
-#[test]
-#[serial]
-fn rfc_0067_failure_window_matrix() {
+impl Recovery {
+    /// A same-handle recovery after a kill or race is the parent's handle,
+    /// which never ran the writer; it applies to Return only.
+    fn applies(self, fault: Fault) -> bool {
+        self != Recovery::SameHandle || fault == Fault::Return
+    }
+}
+
+/// One matrix point, run outside libtest's 2-MiB thread: every cell chains a
+/// graph init, the faulted writer, a recovery actor and the oracle.
+fn run_point(writer: Writer, window: Window, faults: &'static [Fault]) {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(run_matrix());
+                .block_on(run_matrix(writer, window, faults));
         })
         .unwrap()
         .join()
         .unwrap();
 }
 
-async fn run_matrix() {
+const ALL_FAULTS: &[Fault] = &[Fault::Return, Fault::Kill, Fault::Race];
+
+/// One `#[test]` per writer × window point; `POINTS` lists them for the
+/// coverage guard.
+macro_rules! matrix_points {
+    ($($name:ident: $writer:ident, $window:expr, $faults:expr;)+) => {
+        const POINTS: &[(Writer, Window, &[Fault])] =
+            &[$((Writer::$writer, $window, $faults),)+];
+        $(
+            #[test]
+            #[serial]
+            fn $name() {
+                run_point(Writer::$writer, $window, $faults);
+            }
+        )+
+    };
+}
+
+matrix_points! {
+    rfc_0067_failure_window_matrix_insert_post_detached_1: Insert, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_insert_pre_publish: Insert, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_1: MultiTable, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_2: MultiTable, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_pre_publish: MultiTable, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_post_detached_1: EnsureIndices, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_pre_publish: EnsureIndices, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_merge_pre_publish: Merge, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_1: SchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_2: SchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_pre_publish: SchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_1: PreparedSchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_2: PreparedSchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_pre_publish: PreparedSchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_post_detached_1: Optimize, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_pre_publish: Optimize, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_post_detached_1: Load, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_pre_publish: Load, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_post_detached_1: FtsRebuild, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_pre_publish: FtsRebuild, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_1: SystemColumnUpgrade, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_2: SystemColumnUpgrade, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_pre_publish: SystemColumnUpgrade, Window::PrePublish, ALL_FAULTS;
+}
+
+/// Every window of every writer is one point of `POINTS`, each fault exactly
+/// once, so a new window or writer cannot miss the matrix.
+#[test]
+fn every_writer_window_is_a_matrix_point() {
+    let writers = [
+        Writer::Insert,
+        Writer::MultiTable,
+        Writer::Cleanup,
+        Writer::EnsureIndices,
+        Writer::Merge,
+        Writer::SchemaApply,
+        Writer::PreparedSchemaApply,
+        Writer::Optimize,
+        Writer::Load,
+        Writer::FtsRebuild,
+        Writer::SystemColumnUpgrade,
+    ];
+    let mut covered: Vec<(Writer, Window, Fault)> = POINTS
+        .iter()
+        .flat_map(|(writer, window, faults)| {
+            faults.iter().map(move |fault| (*writer, *window, *fault))
+        })
+        .collect();
+    let mut expected: Vec<(Writer, Window, Fault)> = writers
+        .into_iter()
+        .flat_map(|writer| {
+            writer.windows().into_iter().flat_map(move |window| {
+                ALL_FAULTS.iter().map(move |fault| (writer, window, *fault))
+            })
+        })
+        .collect();
+    covered.sort_by_key(|cell| format!("{cell:?}"));
+    expected.sort_by_key(|cell| format!("{cell:?}"));
+    assert_eq!(covered, expected);
+}
+
+async fn run_matrix(writer: Writer, window: Window, faults: &[Fault]) {
     let _scenario = FailScenario::setup();
     let full = std::env::var("OMNIGRAPH_MATRIX").is_ok_and(|value| value == "full");
     // SameHandle is a DEFAULT actor: it is the generalized liveness check —
@@ -996,53 +1083,33 @@ async fn run_matrix() {
             Recovery::SameHandle,
         ]
     };
-    let writers = [
-        Writer::Insert,
-        Writer::MultiTable,
-        Writer::Cleanup,
-        Writer::EnsureIndices,
-        Writer::Merge,
-        Writer::SchemaApply,
-        Writer::PreparedSchemaApply,
-        Writer::Optimize,
-        Writer::Load,
-        Writer::FtsRebuild,
-        Writer::SystemColumnUpgrade,
-    ];
-    let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {
         list.split(',')
             .map(|writer| writer.trim().to_string())
             .collect()
     });
+    if only
+        .as_ref()
+        .is_some_and(|list| !list.iter().any(|name| *name == format!("{writer:?}")))
+    {
+        return;
+    }
     let mut index = 0usize;
     let mut reports = Vec::new();
     let started = std::time::Instant::now();
-    for writer in writers {
-        if only
-            .as_ref()
-            .is_some_and(|list| !list.iter().any(|name| *name == format!("{writer:?}")))
-        {
-            continue;
-        }
-        for window in writer.windows() {
-            for fault in faults {
-                for recovery in &recoveries {
-                    // A same-handle recovery after a kill or race is the parent's
-                    // handle, which never ran the writer; keep it for Return only.
-                    if *recovery == Recovery::SameHandle && fault != Fault::Return {
-                        continue;
-                    }
-                    index += 1;
-                    let report = Box::pin(run_cell(index, writer, window, fault, *recovery)).await;
-                    eprintln!("MATRIX {report}");
-                    reports.push(report);
-                }
+    for fault in faults {
+        for recovery in &recoveries {
+            if !recovery.applies(*fault) {
+                continue;
             }
+            index += 1;
+            let report = Box::pin(run_cell(index, writer, window, *fault, *recovery)).await;
+            eprintln!("MATRIX {report}");
+            reports.push(report);
         }
     }
     eprintln!(
-        "MATRIX SUMMARY: {} cells passed the oracle in {:.1}s",
+        "MATRIX SUMMARY: {writer:?} {window:?} {faults:?}: {} cells passed the oracle in {:.1}s",
         reports.len(),
         started.elapsed().as_secs_f64()
     );

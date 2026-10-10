@@ -1,0 +1,117 @@
+# Its own workflow, like `gqt-slow-nightly.yml`: `dst-nightly.yml` sets the
+# pool-quiescing variables for every job. Every test below is `#[ignore]`d on
+# the `Test Workspace` gate and keeps its real waits here: a `nightly:` test
+# waits out a production deadline (the 30 s managed deadline, the 5 s discovery
+# bound, the CLI's 2 s and 500 ms polls) or runs a whole CLI/server journey on
+# those polls, and a `heavy-repro:` test is a scale repro (AGENTS.md, ignore
+# species). nextest selects on names, not on the ignore message, so a test
+# enrols by its exact name in the list below, and the owner check refuses a
+# run in which an enrolled name did not run or did not pass. A second step
+# runs the engine's `proptest_equivalence` binary at 48 cases, the breadth its
+# `config()` gives up on the gate (12 cases unless `PROPTEST_CASES` is set).
+name: Tests slow nightly
+
+on:
+  schedule:
+    - cron: "15 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  tests-slow:
+    name: Ignored slow tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      # Same floor as `Test Workspace`: unoptimized builds keep every nested
+      # async engine frame, deeper than a default 2 MiB thread stack.
+      RUST_MIN_STACK: 16777216
+      FAILPOINT_FEATURES: omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # The same pinned scheduler as `Test Workspace`, so a local
+      # `cargo nextest run --run-ignored only` reproduces this run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # Its own cache: a rust-cache key carries the job. Saved every night,
+      # red or green.
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: tests-slow
+          cache-on-failure: true
+
+      - name: Compile the workspace and failpoint test graph
+        run: |
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run \
+            --features "$FAILPOINT_FEATURES"
+
+      - name: Run the enrolled ignored tests
+        run: |
+          set -euo pipefail
+          # One exact name per line. An in-source test carries its module path,
+          # an integration test its bare name, as nextest lists them.
+          filter=""
+          owners=()
+          for test_name in \
+            client::tests::managed_mutations_use_thirty_second_deadline_without_retrying \
+            client::tests::managed_reads_use_thirty_second_deadline_without_retrying \
+            client::tests::graph_http_discovery_has_its_own_five_second_bound \
+            managed::data::tests::managed_load_sends_exact_ndjson_and_preserves_the_server_receipt \
+            managed::auth::tests::device_login_polls_the_provider_and_never_the_old_broker \
+            managed::auth::tests::failed_login_custody_attempts_to_revoke_the_new_provider_session \
+            cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
+            core_live_apply_captures_server_file_root_without_local_storage_access \
+            managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity \
+            managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it \
+            managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity \
+            grouped_transfer_aggregation_streams_at_scale_issue_723 \
+            expand_projection_avoids_offset_overflow_scale_issue_703
+          do
+            filter="${filter:+$filter + }test(=$test_name)"
+            owners+=(--passed "$test_name")
+          done
+          # The `ci` profile (.config/nextest.toml) writes the JUnit report the
+          # owner check reads; `--no-fail-fast` overrides its fail-fast so one
+          # red deadline does not hide the others.
+          target/debug/omnigraph --version
+          cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+            --profile ci --no-fail-fast --run-ignored only \
+            --features "$FAILPOINT_FEATURES" \
+            -E "$filter"
+          python3 scripts/check-workspace-test-owners.py target/nextest/ci/junit.xml "${owners[@]}"
+
+      - name: Run the property tests at nightly breadth
+        env:
+          PROPTEST_CASES: "48"
+        run: |
+          set -euo pipefail
+          cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+            --features "$FAILPOINT_FEATURES" \
+            -E 'binary(proptest_equivalence)'
+
+      - name: Retain the JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tests-slow-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 30

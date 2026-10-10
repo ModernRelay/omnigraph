@@ -94,12 +94,12 @@ async fn selected_fanout_obeys_work_and_memory_limits_issue_659() {
 #[serial]
 async fn selected_traversal_owned_state_refuses_a_realistic_pool_and_releases_issue_659() {
     let dir = tempfile::tempdir().unwrap();
-    let db = graph_fixture(&dir, 32_768, 0).await;
+    let db = graph_fixture(&dir, 16_384, 0).await;
     let query = r#"query friends() {
         match { $a: Person { name: "hub" } $a (knows | knows){1,3} $b }
         return { $b.@id }
     }"#;
-    let limit = 2 * MIB;
+    let limit = MIB;
     let probes = QueryMemoryProbes::default();
     let error = with_query_memory_probes(
         probes.clone(),
@@ -122,7 +122,7 @@ async fn selected_traversal_owned_state_refuses_a_realistic_pool_and_releases_is
             .await
             .unwrap()
             .num_rows(),
-        32_768
+        16_384
     );
 }
 
@@ -171,7 +171,7 @@ node Item {
         .await
         .unwrap(),
     );
-    let groups = 65_536;
+    let groups = 32_768;
     let mut seed = String::new();
     for group in 0..groups {
         let row = serde_json::json!({
@@ -799,8 +799,8 @@ async fn expand_projects_unused_destination_payload_before_fanout_issue_703() {
 #[serial]
 async fn grouped_transfer_aggregation_streams_under_fixed_pool_issue_723() {
     let dir = tempfile::tempdir().unwrap();
-    let db = helpers::transfer_aggregation::fixture(&dir, 1).await;
-    helpers::transfer_aggregation::assert_streaming_contract(&db, 1, 16 * MIB).await;
+    let db = helpers::transfer_aggregation::fixture(&dir, 1, 4).await;
+    helpers::transfer_aggregation::assert_streaming_contract(&db, 1, 4, 4 * MIB).await;
 }
 
 /// The build fits the pool, but repeated wide output must fail at ChargeExec.
@@ -1082,9 +1082,9 @@ async fn csr_single_hop_materializes_only_emitted_destination_ids() {
         .unwrap(),
     );
     let name = |row: usize| format!("destination-{row:06}-xxxxxxxxxxxxxxxx");
-    let mut lines = Vec::with_capacity(60_004);
+    let mut lines = Vec::with_capacity(30_004);
     lines.push(serde_json::json!({"type":"Person","data":{"name":"hub"}}).to_string());
-    for row in 0..60_000 {
+    for row in 0..30_000 {
         lines.push(serde_json::json!({"type":"Person","data":{"name":name(row)}}).to_string());
     }
     for row in 0..3 {
@@ -1108,7 +1108,7 @@ query one_hop() {
         let probes = QueryMemoryProbes::default();
         let result = with_query_memory_probes(
             probes.clone(),
-            with_query_memory_limit(4 * MIB, query_main(&v2, queries, query, &params(&[]))),
+            with_query_memory_limit(2 * MIB, query_main(&v2, queries, query, &params(&[]))),
         )
         .await
         .unwrap_or_else(|error| panic!("{query}: {error}; refusals={:?}", probes.refusals()));
@@ -1266,18 +1266,15 @@ fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
     counter(probes, "ContainsJoinExec", name)
 }
 
-/// 64 MiB of payload under a 16 MiB pool: an unordered `limit 1` and a top-k
-/// read of the wide column answer. The limit stops the streamed scan of the
-/// narrow columns after a few batches, the top-k sorts them, and each fetches
-/// its one kept row's payload by row address. The pool is released. GQT cannot set the
-/// pool or read the operators' counters. The scale twin is
-/// `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
+/// 16 MiB of payload under a 4 MiB pool: a `limit 1` and a top-k `limit 1`
+/// each stop the narrow scan early and fetch one payload by row address.
+/// GQT cannot set the pool; scale twin `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
 #[tokio::test]
 #[serial]
 async fn a_wide_column_read_under_a_limit_follows_its_result() {
     let dir = tempfile::tempdir().unwrap();
-    let v2 = graph_fixture(&dir, 4_096, 16 * 1024).await;
-    let limit = 16 * MIB;
+    let v2 = graph_fixture(&dir, 4_096, 4 * 1024).await;
+    let limit = 4 * MIB;
 
     let any = r#"query any_payload() {
         match { $p: Person }
@@ -1337,7 +1334,7 @@ async fn a_wide_column_read_under_a_limit_follows_its_result() {
             .unwrap()
             .value(0)
             .len(),
-        16 * 1024
+        4 * 1024
     );
     assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
     assert_released(&probes);
@@ -1422,17 +1419,15 @@ async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
     assert_released(&probes);
 }
 
-/// 64 MiB of passage text under a 48 MiB pool: the Passage scan streams a
-/// batch at a time with or without needles, so the plain filtered product
-/// and the contains join both answer; only the join's marked scan sieves,
-/// and only a marked scan records the runtime-filter counters.
-/// Rust, not `.gqt`: rows cannot show the pool's cap or the scan's counters.
+/// 16 MiB of passage text under a 12 MiB pool: the Passage scan streams with
+/// or without needles, and only the join's marked scan sieves and records
+/// the runtime-filter counters. GQT cannot set the pool or read them.
 #[tokio::test]
 #[serial]
 async fn a_passage_table_the_pool_cannot_hold_streams_with_and_without_needles() {
     let dir = tempfile::tempdir().unwrap();
-    let v2 = citation_fixture(&dir, 16_384, 4_096).await;
-    let limit = 48 * MIB;
+    let v2 = citation_fixture(&dir, 16_384, 1_024).await;
+    let limit = 12 * MIB;
     let cited = [
         ("mN-0001".to_string(), "p000007".to_string()),
         ("mN-0003".to_string(), "p000011".to_string()),
@@ -1474,18 +1469,18 @@ async fn a_passage_table_the_pool_cannot_hold_streams_with_and_without_needles()
     assert_released(&probes);
 }
 
-/// 64 MiB of passages, each holding the needle `x`, under a 32 MiB pool: the
+/// 16 MiB of passages, each holding the needle `x`, under an 8 MiB pool: the
 /// marked scan streams each sieved Lance batch instead of holding the table,
 /// so the query answers where the breaker refuses. GQT cannot set the pool.
 #[tokio::test]
 #[serial]
 async fn a_marked_scan_streams_a_passage_table_the_pool_cannot_hold() {
     let dir = tempfile::tempdir().unwrap();
-    let v2 = citation_graph(&dir, &[("mN-0001", "N-0001"), ("m-x", "x")], 16_384, 4_096).await;
+    let v2 = citation_graph(&dir, &[("mN-0001", "N-0001"), ("m-x", "x")], 16_384, 1_024).await;
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
         probes.clone(),
-        with_query_memory_limit(32 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+        with_query_memory_limit(8 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
     )
     .await
     .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
@@ -1503,18 +1498,18 @@ async fn a_marked_scan_streams_a_passage_table_the_pool_cannot_hold() {
     assert_released(&probes);
 }
 
-/// The same 64 MiB under one empty number: the scan reads unfiltered yet still
-/// streams batches bounded like a sieved read's, so it answers under 32 MiB.
+/// The same 16 MiB under one empty number: the scan reads unfiltered yet still
+/// streams batches bounded like a sieved read's, so it answers under 8 MiB.
 /// GQT cannot set the pool that tells a bounded batch from a default one.
 #[tokio::test]
 #[serial]
 async fn an_empty_number_streams_a_passage_table_the_pool_cannot_hold() {
     let dir = tempfile::tempdir().unwrap();
-    let v2 = citation_graph(&dir, &[("m", "")], 16_384, 4_096).await;
+    let v2 = citation_graph(&dir, &[("m", "")], 16_384, 1_024).await;
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
         probes.clone(),
-        with_query_memory_limit(32 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
+        with_query_memory_limit(8 * MIB, query_main(&v2, CITED, "cited", &params(&[]))),
     )
     .await
     .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));

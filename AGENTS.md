@@ -193,9 +193,13 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   and an `#[ignore]`d test in a `tests/repro_issue_*.rs` target otherwise,
   and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
-  (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
-  expensive regression repros use `heavy-repro:` and thereby enroll in the
-  nightly job.
+  (`instrument:`, `hunt:`, `heavy-repro:`, `nightly:`, or the environment it
+  needs); expensive regression repros use `heavy-repro:`, a test that waits
+  out a real production deadline or runs a whole CLI journey on the real poll
+  interval uses `nightly:`, and both enroll by exact name in
+  `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
+  with `--run-ignored only` and refuses a run in which an enrolled name did
+  not pass.
 - Engine v1 is frozen: every file under
   `crates/omnigraph-reference-engine/src/` is pinned by
   `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only

@@ -37,11 +37,12 @@ struct Parity {
 }
 
 fn parity() -> Parity {
-    let (temp, local, remote) = twin_graphs();
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("local.omni");
     // RFC-011 cluster-only: the remote arm is served from a converged
     // cluster directory (one graph, id `parity`), seeded with the same
     // fixture data as the local twin.
-    let cluster_dir = parity_configs(temp.path(), &local, &remote);
+    let cluster_dir = parity_configs(temp.path(), &local);
     let server = spawn_server_with_cluster_env(
         &cluster_dir,
         &[(
@@ -892,7 +893,7 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
         }
         // This is a protocol-deadline regression, not a throughput threshold:
         // socket backpressure must outlive the 250 ms admission timeout.
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(750));
         let drain_started = Instant::now();
         let deadline = drain_started + Duration::from_secs(30);
         let mut buffer = [0; 64 * 1024];

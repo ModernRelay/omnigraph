@@ -2408,78 +2408,107 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn generated_dataset_matches_the_legacy_fixture_and_reversible_history() {
-        for (tables, delta, commits) in [(1, 3, 0), (1, 3, 2), (1, 3, 8), (1, 3, 64), (4, 50, 0)] {
-            let mut plan = plan(32, tables, delta);
-            plan.compaction_recency = CompactionRecency::NotOptimized;
-            plan.requested_history_depth = 1 + u64::try_from(tables * 5).unwrap() + commits;
-            if commits != 0 {
-                plan.preparation = Some(preparation(commits, 7, 42));
-            }
-            let old_root = tempfile::tempdir().unwrap();
-            let old = initialize_local_fixture(old_root.path().to_str().unwrap(), &plan)
-                .await
-                .unwrap();
-            let case = omnigraph_gqt_core::parse_case(
-                "generated_branch_merge_dataset",
-                &generated_fixture_source(&plan),
-            )
-            .unwrap();
-            let fixture = case.fixture.as_ref().unwrap();
-            let directory = tempfile::tempdir().unwrap();
-            let uri = directory.path().to_str().unwrap();
-            let session = Session::from_defaults(
-                Arc::new(Omnigraph::init(uri, &fixture.schema).await.unwrap()),
-                SessionSettings::default(),
-            );
-            omnigraph_gqt_core::seed_case(&session, &fixture.seed, case.needs_indices)
-                .await
-                .unwrap();
-            let db = omnigraph_gqt_core::execute_steps(
-                &case,
-                std::path::Path::new("unused.gqt"),
-                false,
-                session,
-                uri,
-                None,
-                &omnigraph_gqt_core::PlainHost,
-            )
+    async fn generated_dataset_matches_the_legacy_fixture(
+        tables: usize,
+        delta: usize,
+        commits: u64,
+    ) {
+        let mut plan = plan(32, tables, delta);
+        plan.compaction_recency = CompactionRecency::NotOptimized;
+        plan.requested_history_depth = 1 + u64::try_from(tables * 5).unwrap() + commits;
+        if commits != 0 {
+            plan.preparation = Some(preparation(commits, 7, 42));
+        }
+        let old_root = tempfile::tempdir().unwrap();
+        let old = initialize_local_fixture(old_root.path().to_str().unwrap(), &plan)
             .await
             .unwrap();
-            let mut digest = Sha256::new();
-            digest.update(LOGICAL_FIXTURE_DIGEST_DOMAIN);
-            hash_logical_field(
-                &mut digest,
-                b"schema-shape",
-                verified_schema_shape_json(&db, &plan).unwrap().as_bytes(),
-            );
-            hash_logical_field(&mut digest, b"logical-index-inventory", b"[]");
-            for (branch, state) in [
-                (MAIN_BRANCH, BranchState::Main),
-                (SOURCE_BRANCH, BranchState::Source),
-                (TARGET_BRANCH, BranchState::Target),
-            ] {
-                verify_branch(&db, branch, &plan, state, Some(&mut digest))
-                    .await
-                    .unwrap();
-            }
-            assert_eq!(
-                format!("{:x}", digest.finalize()),
-                old.logical_content_sha256
-            );
-            assert_eq!(
-                db.list_commits(Some(SOURCE_BRANCH)).await.unwrap().len() as u64,
-                old.source_history_depth
-            );
-            assert_eq!(
-                db.list_commits(Some(TARGET_BRANCH)).await.unwrap().len() as u64,
-                old.target_history_depth
-            );
-            let protected = capture_protected_branch_heads(&db).await.unwrap();
-            db.branch_merge(SOURCE_BRANCH, TARGET_BRANCH).await.unwrap();
-            verify_merged_graph(&db, &plan, &protected).await.unwrap();
+        let case = omnigraph_gqt_core::parse_case(
+            "generated_branch_merge_dataset",
+            &generated_fixture_source(&plan),
+        )
+        .unwrap();
+        let fixture = case.fixture.as_ref().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().to_str().unwrap();
+        let session = Session::from_defaults(
+            Arc::new(Omnigraph::init(uri, &fixture.schema).await.unwrap()),
+            SessionSettings::default(),
+        );
+        omnigraph_gqt_core::seed_case(&session, &fixture.seed, case.needs_indices)
+            .await
+            .unwrap();
+        let db = omnigraph_gqt_core::execute_steps(
+            &case,
+            std::path::Path::new("unused.gqt"),
+            false,
+            session,
+            uri,
+            None,
+            &omnigraph_gqt_core::PlainHost,
+        )
+        .await
+        .unwrap();
+        let mut digest = Sha256::new();
+        digest.update(LOGICAL_FIXTURE_DIGEST_DOMAIN);
+        hash_logical_field(
+            &mut digest,
+            b"schema-shape",
+            verified_schema_shape_json(&db, &plan).unwrap().as_bytes(),
+        );
+        hash_logical_field(&mut digest, b"logical-index-inventory", b"[]");
+        for (branch, state) in [
+            (MAIN_BRANCH, BranchState::Main),
+            (SOURCE_BRANCH, BranchState::Source),
+            (TARGET_BRANCH, BranchState::Target),
+        ] {
+            verify_branch(&db, branch, &plan, state, Some(&mut digest))
+                .await
+                .unwrap();
         }
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            old.logical_content_sha256
+        );
+        assert_eq!(
+            db.list_commits(Some(SOURCE_BRANCH)).await.unwrap().len() as u64,
+            old.source_history_depth
+        );
+        assert_eq!(
+            db.list_commits(Some(TARGET_BRANCH)).await.unwrap().len() as u64,
+            old.target_history_depth
+        );
+        let protected = capture_protected_branch_heads(&db).await.unwrap();
+        db.branch_merge(SOURCE_BRANCH, TARGET_BRANCH).await.unwrap();
+        verify_merged_graph(&db, &plan, &protected).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_unaged() {
+        generated_dataset_matches_the_legacy_fixture(1, 3, 0).await;
+    }
+
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_with_reversible_history_2() {
+        generated_dataset_matches_the_legacy_fixture(1, 3, 2).await;
+    }
+
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_with_reversible_history_8() {
+        generated_dataset_matches_the_legacy_fixture(1, 3, 8).await;
+    }
+
+    /// Seed 42 first wraps a preparation batch at pair 5 (start 27 of 32
+    /// rows), so sixteen commits are the smallest depth that executes the
+    /// wraparound branch of `preparation_batch` on both fixture builders.
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_with_wrapping_history_16() {
+        generated_dataset_matches_the_legacy_fixture(1, 3, 16).await;
+    }
+
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_with_four_tables_d50() {
+        generated_dataset_matches_the_legacy_fixture(4, 50, 0).await;
     }
 
     #[test]
@@ -2579,7 +2608,7 @@ mod tests {
 
         // Aging is a state treatment: actual graph history changes while every
         // current row, endpoint, cohort and property remains the same.
-        for commits in [2, 8, 64] {
+        for commits in [2, 8, 16] {
             plan.preparation = Some(preparation(commits, 7, 42));
             plan.requested_history_depth = 6 + commits;
             let aged_directory = tempfile::tempdir().unwrap();

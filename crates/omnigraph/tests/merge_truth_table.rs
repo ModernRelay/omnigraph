@@ -1034,14 +1034,19 @@ async fn run_cell(case: &MergeCase) -> DirectionResult {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn merge_pair_truth_table() {
+/// Executable cells run on this many threads, each with its own current-thread
+/// runtime: the engine's write futures are not `Send`, so one shared runtime
+/// cannot spread the cells over its workers.
+const CELL_WORKERS: usize = 8;
+
+#[test]
+fn merge_pair_truth_table() {
     let start = Instant::now();
     let mut total_cells = 0_usize;
     let mut executable_cells = 0_usize;
     let mut unsupported_cells = 0_usize;
-    let mut directions_run = 0_usize;
 
+    let mut cases = Vec::new();
     for left in OpVariant::ALL {
         for right in OpVariant::ALL {
             total_cells += 1;
@@ -1051,12 +1056,45 @@ async fn merge_pair_truth_table() {
             } else {
                 executable_cells += 1;
             }
-            let result = run_cell(&case).await;
-            if !matches!(result.outcome, ActualOutcome::Skipped) {
-                directions_run += 1;
-            }
+            cases.push(case);
         }
     }
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(cases));
+    let results: Vec<DirectionResult> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..CELL_WORKERS)
+            .map(|_| {
+                let queue = std::sync::Arc::clone(&queue);
+                std::thread::Builder::new()
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn_scoped(scope, move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        let mut results = Vec::new();
+                        loop {
+                            let next = queue.lock().unwrap().pop();
+                            let Some(case) = next else { break };
+                            results.push(runtime.block_on(run_cell(&case)));
+                        }
+                        results
+                    })
+                    .unwrap()
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+            .collect()
+    });
+    let directions_run = results
+        .iter()
+        .filter(|result| !matches!(result.outcome, ActualOutcome::Skipped))
+        .count();
 
     let elapsed = start.elapsed();
     println!(

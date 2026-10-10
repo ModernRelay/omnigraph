@@ -263,6 +263,7 @@ async fn cached_login_does_not_restart_provider_authorization() {
 }
 
 #[tokio::test]
+#[ignore = "nightly: real 5 s device-flow poll intervals, 20 s in all"]
 async fn device_login_polls_the_provider_and_never_the_old_broker() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
     let transport = MockTransport::with(vec![
@@ -317,6 +318,7 @@ async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
 }
 
 #[tokio::test]
+#[ignore = "nightly: one real 5 s device-flow poll interval"]
 async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
     struct RefusingStore;
     impl Store for RefusingStore {
