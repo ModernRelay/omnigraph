@@ -8,5 +8,5 @@
   nothing. A put returns the value's length, its ETag and the commit; the ETag
   is the one a read at that commit reports. One put holds at most the
   session's `write_max_bytes` (32 MiB by default), inclusive; a larger one
-  fails before any table is opened with resource `Blob write payload bytes`. The CLI and HTTP server do not expose these
-  writes yet.
+  fails before any table is opened with resource `Blob write payload bytes`.
+  The CLI and HTTP server do not expose these writes yet.
