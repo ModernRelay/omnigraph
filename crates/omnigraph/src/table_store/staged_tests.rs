@@ -2667,3 +2667,276 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
     assert_eq!(compaction_blob_batch_rows(BUDGET / 2 + 1), 1);
     assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
 }
+
+/// Lance applies a per-run source budget only to the tasks its own planner
+/// returns, so the dropped-column tasks the graph planner appends would run
+/// outside it: options that set any budget are refused before planning.
+#[tokio::test]
+async fn table_compaction_planning_refuses_source_budgets() {
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
+    assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+
+    let budgets = [
+        CompactionOptions {
+            max_source_fragments: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_rows: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_bytes: Some(1),
+            ..CompactionOptions::default()
+        },
+    ];
+    for options in budgets {
+        match TableStore::plan_table_compaction(&ds, &options).await {
+            Err(OmniError::Manifest(manifest))
+                if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+            other => panic!("a source budget must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// The schema-evolution planner reads only the manifest: renames and drops
+/// plan one Project, additions one Merge, both a Project then a Merge, an
+/// unchanged schema nothing; every change that would need a rewrite refuses.
+#[tokio::test]
+async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
+    use crate::db::STABLE_PROPERTY_ID_METADATA_KEY as MARKER;
+
+    fn pk_id() -> Field {
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+    fn marked(name: &str, data_type: DataType, nullable: bool, id: &str) -> Field {
+        Field::new(name, data_type, nullable)
+            .with_metadata([(MARKER.to_string(), id.to_string())].into_iter().collect())
+    }
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("evolve.lance");
+    let schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        ],
+    )
+    .unwrap();
+    let ds = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        uri.to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let age_id = ds.schema().field("age").unwrap().id;
+    let max_id = ds.manifest.max_field_id();
+
+    let mut unchanged = TableStore::plan_schema_evolution(&ds, &schema, &[]).unwrap();
+    assert!(unchanged.project.is_none() && unchanged.merge.is_none());
+    assert!(
+        store
+            .stage_schema_evolution(&ds, &mut unchanged)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let renamed = Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]);
+    let mut plan =
+        TableStore::plan_schema_evolution(&ds, &renamed, &renames(&[("age", "years")])).unwrap();
+    assert!(plan.merge.is_none());
+    let project = plan.project.clone().unwrap();
+    assert_eq!(project.field("years").unwrap().id, age_id);
+    assert!(project.field("note").is_none());
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Project {
+            preserves_nullability: true,
+            ..
+        }
+    ));
+    assert_eq!(staged.transaction.read_version, ds.version().version);
+    // The plan is consumed; a step staged against a dataset the previous
+    // step did not leave refuses.
+    assert!(plan.project.is_none());
+    let error = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the ones the plan expects"),
+        "{error}"
+    );
+
+    let added = Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]);
+    let mut plan = TableStore::plan_schema_evolution(&ds, &added, &[]).unwrap();
+    assert!(plan.project.is_none());
+    let merge = plan.merge.clone().unwrap();
+    assert_eq!(
+        merge
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "age", "city", "note"],
+        "the evolved schema keeps the target's column order"
+    );
+    assert_eq!(merge.field("city").unwrap().id, max_id + 1);
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    match &staged.transaction.operation {
+        Operation::Merge { fragments, .. } => {
+            assert_eq!(fragments.as_slice(), ds.manifest.fragments.as_slice())
+        }
+        other => panic!("expected a Merge, got {other:?}"),
+    }
+
+    let both = Schema::new(vec![
+        pk_id(),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("years", DataType::Int32, true, "1"),
+    ]);
+    let plan =
+        TableStore::plan_schema_evolution(&ds, &both, &renames(&[("age", "years")])).unwrap();
+    let project = plan.project.unwrap();
+    assert_eq!(
+        project
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "years"],
+        "the Project carries the renames and drops, the Merge the additions"
+    );
+    assert!(plan.merge.unwrap().field("city").is_some());
+
+    let refusals = [
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, true, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![
+                pk_id(),
+                marked("age", DataType::Int32, true, "1"),
+                marked("city", DataType::Utf8, false, "3"),
+            ]),
+            Vec::new(),
+            "is not nullable",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "9")]),
+            Vec::new(),
+            "carries property identity 1, not 9",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]),
+            renames(&[("ghost", "years")]),
+            "which the dataset does not have",
+        ),
+    ];
+    for (target, renames, expected) in refusals {
+        let error = TableStore::plan_schema_evolution(&ds, &target, &renames).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected '{expected}', got: {error}"
+        );
+    }
+
+    // A column written before property markers existed adopts its identity
+    // from the target, as the replaced full-table rewrite did.
+    let unmarked_schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let unmarked = Dataset::write(
+        arrow_array::RecordBatchIterator::new(
+            vec![Ok(RecordBatch::try_new(
+                unmarked_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int32Array::from(vec![Some(1)])),
+                ],
+            )
+            .unwrap())],
+            unmarked_schema,
+        ),
+        dir.path().join("unmarked.lance").to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let marked_target = Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "1")]);
+    let adopted = TableStore::plan_schema_evolution(&unmarked, &marked_target, &[])
+        .unwrap()
+        .project
+        .unwrap();
+    assert_eq!(
+        adopted
+            .field("age")
+            .unwrap()
+            .metadata
+            .get(MARKER)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        adopted.field("age").unwrap().id,
+        unmarked.schema().field("age").unwrap().id
+    );
+}

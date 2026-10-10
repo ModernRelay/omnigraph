@@ -27,10 +27,22 @@ omnigraph optimize ./graph.omni
 omnigraph optimize ./graph.omni --json
 ```
 
-Optimize rewrites small fragments into fewer larger fragments, rebuilds each
-scalar or vector index whose coverage lags behind appended rows, and builds
-missing declared indexes that are ready to build. It does not delete old
-versions or collect unused table forks. Use `cleanup` for storage reclamation.
+Optimize rewrites small fragments into fewer larger fragments, rewrites every
+fragment that still stores a dropped property's values, rebuilds each scalar or
+vector index whose coverage lags behind appended rows, and builds missing
+declared indexes that are ready to build. It does not delete old versions or
+collect unused table forks. Use `cleanup` for storage reclamation.
+
+Dropping a property removes it from the schema without rewriting its table
+(see [schema changes](../schema/index.md#schema-changes)), so its values stay
+in the table's data files. Every optimize rewrites each fragment that still
+holds them, whatever its size, copying only the remaining properties; the
+dropped values are not read. A `cleanup` then deletes the old files, Blob
+values included, once nothing it retains references them: no commit its
+retention keeps, no live branch created from a commit before that optimize,
+and no tag naming such a commit. Merging a branch does not release its files;
+deleting it does. A table holding no dropped values and nothing else to
+compact is left alone.
 
 Each table's work is staged as detached Lance versions of the table's current
 pin and published in one graph commit, like any other write. A run

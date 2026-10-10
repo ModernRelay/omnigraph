@@ -97,9 +97,11 @@ pub enum SchemaMigrationStep {
         type_kind: SchemaTypeKind,
         name: String,
     },
-    /// Remove a property from an existing type: the table is rewritten
-    /// without the column. Older table versions keep it, and older graph
-    /// commits read it until `omnigraph cleanup` stops retaining them.
+    /// Remove a property from an existing type: a metadata-only commit takes
+    /// the column out of the table's schema and rewrites no row. Its values
+    /// stay in the existing data files until a compaction rewrites them, and
+    /// older graph commits read it until `omnigraph cleanup` stops retaining
+    /// them.
     DropProperty {
         type_kind: SchemaTypeKind,
         type_name: String,
@@ -716,11 +718,9 @@ fn plan_properties(
         .iter()
         .filter(|property| !consumed.contains(&property.property_id))
     {
-        // Property removed from the desired schema. Apply reuses the
-        // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
-        // iterates target_schema.fields(), so the dropped column is
-        // naturally projected away. Retention, which the OG-DS-104
-        // destructive tier expects, is stated on
+        // Property removed from the desired schema. Apply drops the column
+        // from the table's schema by a metadata-only commit. Retention, which
+        // the OG-DS-104 destructive tier expects, is stated on
         // `SchemaMigrationStep::DropProperty`.
         steps.push(SchemaMigrationStep::DropProperty {
             type_kind,
@@ -1443,8 +1443,8 @@ node Account @rename_from("User") {
         // Removing a property from the desired schema emits
         // DropProperty (schema-lint v1 chassis commit #3,
         // MR-694). The plan is `supported = true` — the apply path
-        // handles the drop via the existing stage_overwrite rewrite
-        // projection. Verified at the integration level by
+        // drops the column by a metadata-only commit. Verified at the
+        // integration level by
         // `apply_schema_drops_a_nullable_property_and_preserves_prior_version`
         // in `crates/omnigraph/tests/schema_apply.rs`.
         let accepted = ir(r#"

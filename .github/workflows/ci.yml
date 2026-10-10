@@ -649,6 +649,13 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
+      # The run step schedules the test binaries through nextest; the binary
+      # version is pinned so the hosted scheduler matches a local run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -671,7 +678,7 @@ jobs:
       # The run step reuses these binaries (same flags, features, and env).
       - name: Compile the workspace and failpoint test graph
         run: |
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-run \
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run \
             --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
@@ -702,7 +709,6 @@ jobs:
       - name: Run workspace and failpoint tests once
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/workspace-tests.log"
           # A pull request and a merge-queue entry are gates: stop at the
           # first red suite. Main, tag, and dispatch runs are detection
           # channels: --no-fail-fast, so every independent failure is reported.
@@ -710,26 +716,27 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "merge_group" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
-            --features "$FAILPOINT_FEATURES" \
-            -- --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
-            echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
-            exit 1
-          fi
-          grep -Fq "v0.9 refusal and export/import rebuild completed" "$test_log" \
-            || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
-          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
-            || { echo "::error::exact v0.9 refusal and rebuild regression did not pass"; exit 1; }
-          if grep -Fq "skipping immediate-predecessor v6 upgrade test" "$test_log"; then
-            echo "::error::v6 format fence skipped despite a configured 0.10 release binary"
-            exit 1
-          fi
-          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \\.\\.\\. ok" "$test_log" \
-            || { echo "::error::exact v6 format fence did not pass"; exit 1; }
-          # These real CLI/server/proxy journeys must execute in the ordinary
-          # workspace gate. A removed, filtered or re-ignored owner is not green.
+          # nextest runs every test of every binary through one scheduler, a
+          # process per test, so the process-bound journeys overlap instead of
+          # draining one binary at a time. The `ci` profile
+          # (.config/nextest.toml) writes the JUnit report with captured
+          # output; the owner check below reads it in place of a log.
+          cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+            --profile ci ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+            --features "$FAILPOINT_FEATURES"
+          # nextest runs no doctest; `cargo test` did. Keep that owner on the
+          # same graph so a future doctest still runs here.
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --doc \
+            ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+            --features "$FAILPOINT_FEATURES"
+          # The two upgrade journeys and these real CLI/server/proxy journeys
+          # must execute in the ordinary workspace gate. A removed, filtered or
+          # re-ignored owner is not green, and a journey that skipped its
+          # released binary is not green either.
+          owners=()
           for test_name in \
+            current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end \
+            current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \
             cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
             remote_server_and_cli_end_to_end_flow \
             remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
@@ -748,9 +755,13 @@ jobs:
             graphs_list_against_multi_graph_server \
             mutate_if_commit_lost_cas_exits_4_issue_365
           do
-            grep -Fq "test ${test_name} ... ok" "$test_log" \
-              || { echo "::error::required server e2e case did not pass: $test_name"; exit 1; }
+            owners+=(--passed "$test_name")
           done
+          python3 scripts/check-workspace-test-owners.py target/nextest/ci/junit.xml \
+            "${owners[@]}" \
+            --output-lacks "current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=skipping v0.9 upgrade e2e:" \
+            --output-has "current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=v0.9 refusal and export/import rebuild completed" \
+            --output-lacks "current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10=skipping immediate-predecessor v6 upgrade test"
 
 
 
@@ -876,28 +887,28 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
 
       - name: Run required storage upgrade engine tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-lance.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log lance "$test_log"
 
       - name: Run required storage upgrade protocol tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-protocol.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
   v5_v10_format_fence:
@@ -1422,7 +1433,7 @@ jobs:
           # once; a per-owner `-p` resolved six graphs, four with the Lance
           # stack, 89 minutes on main (docs/dev/ci.md, cache rule). An owner
           # names only its target: `--lib`, or `--test <file>`.
-          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
+          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
           require_cell() {
             grep -Eq "test (tests::)?${1} \.\.\. ok" "$test_log" \
               || { echo "::error::required Azure cell '${1}' did not execute normally"; exit 1; }

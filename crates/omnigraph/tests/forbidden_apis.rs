@@ -156,6 +156,8 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "omnigraph-catalog/history.rs",
     "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
 /// Out-of-line modules are parsed as standalone files, so the walker cannot see
@@ -166,6 +168,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
 /// a new call inside a trusted implementation still requires an explicit
 /// protocol disposition.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
+    "engine/plan_source/key_tests.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
@@ -722,8 +727,8 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "stage_delete", "stage_create_indices", "stage_compaction",
-        "stage_index_fold",
+        "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_create_indices",
+        "stage_compaction", "stage_index_fold",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -749,7 +754,7 @@ gateway_surfaces! {
         "scan_batches", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
-        "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
+        "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
         "fts_covers_all_fragments",
         "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
@@ -763,11 +768,13 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
+        "plan_table_compaction",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "renamed_schema", "stage_delete", "stage_create_indices",
-        "stage_compaction", "stage_index_fold",
+        "stage_rename_columns", "renamed_schema", "stage_schema_evolution",
+        "plan_schema_evolution", "stage_delete", "stage_create_indices", "stage_compaction",
+        "stage_index_fold",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -891,7 +898,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 31, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
@@ -908,7 +915,7 @@ durable_calls! {
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
     ("exec/merge.rs", ".dataset()", 4, WriteProtocol::Exact("RFC 0067 detached merge chain")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached schema rewrite + incompatible original-empty-table retry")),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached metadata-only schema evolution + incompatible original-empty-table retry")),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
@@ -974,7 +981,7 @@ durable_calls! {
     ("changes/mod.rs", ".dataset()", 11, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
-    ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
@@ -3686,11 +3693,6 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
             (
                 "managed_blob_payloads",
                 "db/omnigraph/export.rs".to_string(),
-                1
-            ),
-            (
-                "managed_blob_payloads",
-                "db/omnigraph/schema_apply.rs".to_string(),
                 1
             ),
             ("managed_blob_payloads", "table_store.rs".to_string(), 1),

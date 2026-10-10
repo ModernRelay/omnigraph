@@ -54,6 +54,8 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::table_ops::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     crate::db::omnigraph::table_ops::ENSURE_INDICES_POST_TABLE_EFFECT,
     crate::db::omnigraph::table_ops::FORK_BEFORE_CLASSIFY,
+    crate::engine::plan_source::QUERY_INDEX_FACTS_PRE_LOAD,
+    crate::engine::plan_source::QUERY_SCAN_ACCESS_PRE_TABLE_OPEN,
     crate::exec::merge::BRANCH_MERGE_ADOPT_AFTER_APPEND_PRE_UPSERT,
     crate::exec::merge::BRANCH_MERGE_ADOPT_AFTER_UPSERT_PRE_DELETE,
     crate::exec::merge::BRANCH_MERGE_ADOPT_BETWEEN_INSERT_CHUNKS,
