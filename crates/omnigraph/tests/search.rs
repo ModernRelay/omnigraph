@@ -2293,7 +2293,11 @@ async fn rrf_fuses_two_vector_queries() {
     )
     .await
     .unwrap();
-    assert_eq!(result_slugs(&r), vec!["rl-intro", "ml-intro", "dl-basics"]);
+    assert_eq!(
+        result_slugs(&r),
+        vec!["rl-intro", "dl-basics", "ml-intro"],
+        "rl-intro sits in both windows (1/63 + 1/62); ml-intro and dl-basics each lead one arm and miss the other's window of three, tie at 1/61, and the id tie-break orders dl before ml (RFC 0047 §One total order)"
+    );
 }
 
 #[tokio::test]

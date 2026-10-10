@@ -1,0 +1,31 @@
+# issue: none
+# red_on: 2026-10-11 full-population RRF working tree: one retained batch per entity exceeds query_memory_bytes (157286918 > 157286400) before the limit.
+# notes: Narrow identical BM25 arms and limit one expose full-population fusion allocation without any hydration saving.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Doc { slug: String @key text: String @index }
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Doc
+    rows: 45000
+    commits: 12
+    columns:
+      slug: {kind: key, prefix: "", width: 6}
+      text: {kind: literal, value: needle}
+--- query
+set engine = v2;
+query narrow_fused_limit() {
+  match { $d: Doc }
+  return { 1 as one }
+  order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle")) }
+  limit 1
+}
+--- expect unordered
+{"one":1}
+--- expect shape
+one: I64

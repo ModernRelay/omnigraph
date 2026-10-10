@@ -150,11 +150,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
             .unwrap();
         assert!(arms.iter().all(|arm| arm.binding == "a"));
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
-        );
+        assert!(leads_with_fused_score(&plan, "a"));
         let bound = omnigraph_planner::BoundPlan {
             plan,
             values: Default::default(),
@@ -465,8 +461,24 @@ fn literal_order_keys_keep_the_sort_and_remaining_identity_order() {
     }
 }
 
+/// Whether the plan's `Sort` leads with `<binding>._rrf desc`, the fused
+/// score column a `RankFuse` appends (RFC 0047 §Total order).
+fn leads_with_fused_score(plan: &omnigraph_planner::PhysicalPlan, binding: &str) -> bool {
+    plan.live().any(|(_, node)| match node {
+        PhysicalNode::Sort { order_by, .. } => order_by.first().is_some_and(|key| {
+            key.descending
+                && matches!(
+                    &key.expr,
+                    IRExpr::PropAccess { variable, property, .. }
+                        if variable == binding && property == "_rrf"
+                )
+        }),
+        _ => false,
+    })
+}
+
 #[test]
-fn fused_row_identity_survives_eliminated_sort() {
+fn fused_row_identity_declared_under_the_fused_score_sort() {
     let ranked = || {
         let arm = IRExpr::Bm25 {
             field: Box::new(prop("a", "text")),
@@ -515,6 +527,9 @@ fn fused_row_identity_survives_eliminated_sort() {
             vec!["$b.@id"],
         ),
     ] {
+        let aggregate = returns
+            .iter()
+            .any(|expr| matches!(expr, IRExpr::Aggregate { .. }));
         let op = ir(vec![scan("a"), scan("b")], returns, order);
         let logical = resolve(&op, &source()).unwrap();
         let keys = logical
@@ -534,10 +549,10 @@ fn fused_row_identity_survives_eliminated_sort() {
             })
             .unwrap();
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+        assert_eq!(
+            leads_with_fused_score(&plan, "a"),
+            !aggregate,
+            "an aggregate with no key after the fusion stays unordered; every other shape sorts by the fused score first"
         );
     }
 }

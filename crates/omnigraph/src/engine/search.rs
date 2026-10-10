@@ -229,11 +229,11 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k)` as the fusion runs it: the rank constant and the fused rows.
+/// `rrf(a, b, k)` as the fusion runs it: the rank constant. The query's
+/// `limit` cuts the fused rows in the `Sort` above the fusion, never here.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RrfMode {
     pub(super) k: u32,
-    pub(super) limit: usize,
 }
 
 #[derive(Debug, PartialEq)]

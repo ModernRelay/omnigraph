@@ -1047,7 +1047,7 @@ fn lower_projection(expr: &Expr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
             Some((variable, property)) => IRExpr::PropAccess {
                 variable: variable.to_string(),
                 property: property.to_string(),
-                ty: ExprType::from_prop(&PropType::scalar(ScalarType::F32, false)),
+                ty: ExprType::from_prop(&PropType::scalar(expr.score_type(), false)),
             },
             None => lower_expr(expr, ctx)?,
         },

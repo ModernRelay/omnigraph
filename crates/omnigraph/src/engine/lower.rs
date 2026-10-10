@@ -776,16 +776,18 @@ impl Lower for Walk<'_, '_> {
         let RankFuseFields {
             arms,
             k,
-            limit,
+            limit: _,
             row_tiebreak,
         } = fields;
-        let limit = limit.ok_or_else(|| {
-            OmniError::manifest("rrf() ordering requires a limit clause".to_string())
-        })?;
         let k = resolve_rrf_k(k, self.lowering.params())?;
         let id_column = format!(
             "{}.{}",
             arms[0].binding, self.lowering.catalog.system_columns.id
+        );
+        let fused_score = format!(
+            "{}.{}",
+            arms[0].binding,
+            omnigraph_compiler::query::ast::RRF_COLUMN
         );
         let order = |arm: &RankArm| {
             let (property, descending) = arm.kind.score();
@@ -797,8 +799,9 @@ impl Lower for Walk<'_, '_> {
         let fuse = RankFuseExec::new(
             primary,
             secondary,
-            RrfMode { k, limit },
+            RrfMode { k },
             id_column,
+            fused_score,
             [order(&arms[0]), order(&arms[1])],
             row_tiebreak
                 .iter()

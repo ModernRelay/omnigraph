@@ -608,6 +608,21 @@ fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
     }
 }
 
+/// The fused score a `RankFuse` appends under its primary arm's binding,
+/// the key the query's `Sort` leads with (RFC 0047 §Total order).
+fn fused_score(binding: &str) -> IRExpr {
+    IRExpr::PropAccess {
+        variable: binding.to_string(),
+        property: omnigraph_compiler::query::ast::RRF_COLUMN.to_string(),
+        ty: omnigraph_compiler::types::ExprType::from_prop(
+            &omnigraph_compiler::types::PropType::scalar(
+                omnigraph_compiler::types::ScalarType::F64,
+                false,
+            ),
+        ),
+    }
+}
+
 /// A key the type checker bound to a `return` item (T42, RFC
 /// 2026-09-24-shared-expression-model, "Order key binding") as the `AliasRef`
 /// of that item's column; a property or alias key as written.
@@ -1885,16 +1900,9 @@ fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
     }
 }
 
-/// Pass 6 on a query plan. A return column that nothing but the output
-/// reads (a bare `$b.property`, not a key, a `Blob` or a sort alias) leaves
-/// its binding's scan, which reads the binding's row address instead, and a
-/// `HydrateColumns` above the root `Limit` fetches it for the rows the limit
-/// kept. A scan reads (and Lance reads ahead) more rows than the limit keeps
-/// whenever a sort, a filter or a traversal sits below it, so the pass
-/// applies to every binding whose scan's row estimate is above
-/// `HYDRATE_ROW_RATIO` rows per kept row or unknown; a key lookup reads one
-/// row and keeps its columns. Plans that rank by fusion or aggregate keep
-/// theirs.
+/// Pass 6: a return column only the output reads leaves its binding's scan
+/// (row address instead) for a `HydrateColumns` above the root `Limit` when
+/// the scan estimates over `HYDRATE_ROW_RATIO` rows per kept row; a fusion's two arms together.
 fn materialize_returns_late(
     physical: &mut PhysicalPlan,
     logical: &LogicalPlan,
@@ -1924,14 +1932,15 @@ fn materialize_returns_late(
         return Ok(false);
     };
     let return_exprs = return_exprs.clone();
-    if physical.live().any(|(_, node)| {
-        matches!(
-            node,
-            PhysicalNode::RankFuse { .. } | PhysicalNode::Aggregate { .. }
-        )
-    }) {
+    if physical
+        .live()
+        .any(|(_, node)| matches!(node, PhysicalNode::Aggregate { .. }))
+    {
         return Ok(false);
     }
+    let fused = physical
+        .live()
+        .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. }));
     let Some(returned) = logical_return_projection(logical) else {
         return Ok(false);
     };
@@ -1949,8 +1958,20 @@ fn materialize_returns_late(
         }
     };
     for (logical_id, node) in logical.live() {
-        if logical_id != returned {
-            node_reads(node).into_iter().for_each(&mut keep);
+        if logical_id == returned {
+            continue;
+        }
+        match node {
+            LogicalNode::RankFuse {
+                reads,
+                row_tiebreak,
+                ..
+            } => reads
+                .iter()
+                .chain(row_tiebreak.iter())
+                .cloned()
+                .for_each(&mut keep),
+            node => node_reads(node).into_iter().for_each(&mut keep),
         }
     }
     let mut candidates: BTreeMap<String, Vec<HydratedColumn>> = BTreeMap::new();
@@ -1997,18 +2018,34 @@ fn materialize_returns_late(
             })
             .map(|(scan, _)| scan)
             .collect();
-        let [scan] = scans[..] else {
-            continue;
+        let ranked_arms = fused
+            && scans.len() == 2
+            && scans.iter().all(|scan| {
+                matches!(
+                    physical.node(*scan),
+                    Some(PhysicalNode::Scan {
+                        ranked: Some(_),
+                        ..
+                    })
+                )
+            });
+        let scan = match scans[..] {
+            [scan] => scan,
+            [scan, _] if ranked_arms => scan,
+            _ => continue,
         };
         let Some(PhysicalNode::Scan {
             spec,
-            ranked: None,
+            ranked,
             keys_only: false,
             ..
         }) = physical.node(scan)
         else {
             continue;
         };
+        if ranked.is_some() && !ranked_arms {
+            continue;
+        }
         let Some(projection) = spec.projection.as_ref() else {
             continue;
         };
@@ -2053,7 +2090,7 @@ fn materialize_returns_late(
         if !read.iter().any(|column| column == ROW_ADDR) {
             read.push(ROW_ADDR.to_string());
         }
-        rewrites.push((scan, read));
+        rewrites.extend(scans.iter().map(|scan| (*scan, read.clone())));
         bindings.push(HydratedBinding {
             binding,
             table: spec.table.clone(),
@@ -2184,10 +2221,11 @@ struct Lowering<'a> {
 }
 
 /// What a leading search function became in the physical plan: the score
-/// keys the query's `Sort` leads with, or a fusion, which orders its own rows.
+/// keys the query's `Sort` leads with, one per ranked scan or the fused
+/// score column a `RankFuse` appends.
 enum Ranking {
     Scores(Vec<IROrdering>),
-    Fused,
+    Fused(IROrdering),
 }
 
 impl Lowering<'_> {
@@ -2472,27 +2510,47 @@ impl Lowering<'_> {
             })
     }
 
-    /// The `Sort` a query's return runs under: the user's keys, led by the
-    /// score keys of a ranking below; `None` where nothing runs it (a fusion
-    /// orders its own rows, an aggregate carries no score column).
+    /// The `Sort` a query's return runs under (RFC 0047 §One total order):
+    /// the ranking's score keys then the user's; over an aggregate the user's
+    /// keys then every group key ascending, or none when the user wrote none.
     fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
-        match &self.ranking {
-            None => Some(order_by.to_vec()),
-            Some(Ranking::Fused) => None,
-            Some(Ranking::Scores(_))
-                if matches!(
-                    self.physical.node(input),
-                    Some(PhysicalNode::Aggregate { .. })
-                ) =>
-            {
-                None
+        let Some(ranking) = &self.ranking else {
+            return Some(order_by.to_vec());
+        };
+        if let Some(PhysicalNode::Aggregate {
+            return_exprs,
+            aggregates,
+            ..
+        }) = self.physical.node(input)
+        {
+            if order_by.is_empty() {
+                return None;
             }
-            Some(Ranking::Scores(scores)) => {
-                let mut keys = scores.clone();
-                keys.extend(order_by.iter().cloned());
-                Some(keys)
+            let mut keys = order_by.to_vec();
+            for (projection, aggregate) in return_exprs.iter().zip(aggregates) {
+                if aggregate.is_some() {
+                    continue;
+                }
+                let column = result_column(projection);
+                let written = keys.iter().any(|key| match &key.expr {
+                    IRExpr::AliasRef(alias, _) => *alias == column,
+                    expr => *expr == projection.expr,
+                });
+                if !written {
+                    keys.push(IROrdering {
+                        expr: IRExpr::AliasRef(column, projection.ty.clone()),
+                        descending: false,
+                    });
+                }
             }
+            return Some(keys);
         }
+        let mut keys = match ranking {
+            Ranking::Scores(scores) => scores.clone(),
+            Ranking::Fused(fused) => vec![fused.clone()],
+        };
+        keys.extend(order_by.iter().cloned());
+        Some(keys)
     }
 
     fn lower(&mut self, id: LogicalId) -> Result<NodeId, PlanError> {
@@ -2806,7 +2864,10 @@ impl Lowering<'_> {
                 )?;
                 let [primary_arm, secondary_arm] = <[RankArm; 2]>::try_from(lowered_arms)
                     .map_err(|_| PlanError::Internal("an rrf has two arms".to_string()))?;
-                self.ranking = Some(Ranking::Fused);
+                self.ranking = Some(Ranking::Fused(IROrdering {
+                    expr: fused_score(&primary_arm.binding),
+                    descending: true,
+                }));
                 Ok(self.physical.add(PhysicalNode::RankFuse {
                     arms: [primary_arm, secondary_arm],
                     k: k.clone(),
@@ -3289,8 +3350,9 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
 /// no limit.
 const RRF_NEAREST_ARM_K: usize = 100;
 
-/// The ordering a ranked scan or a fusion carries: `nearest` ranks by
-/// ascending `_distance`, `bm25` by descending `_score`, `rrf` by the fused rank.
+/// The ordering a ranked scan carries: `nearest` ranks by ascending
+/// `_distance`, `bm25` by descending `_score`. A `RankFuse` carries none: it
+/// appends the fused score as a column and the `Sort` above orders by it.
 fn search_ordering(node: &PhysicalNode) -> Option<Vec<String>> {
     match node {
         PhysicalNode::Scan {
@@ -3300,10 +3362,6 @@ fn search_ordering(node: &PhysicalNode) -> Option<Vec<String>> {
         } => {
             let binding = spec.binding.as_deref()?;
             Some(vec![ordering_text(&ranked.ordering(binding))])
-        }
-        PhysicalNode::RankFuse { arms, .. } => {
-            let targets: Vec<String> = arms.iter().map(|arm| format!("${}", arm.binding)).collect();
-            Some(vec![format!("rrf({}) desc", targets.join(", "))])
         }
         _ => None,
     }
@@ -3352,7 +3410,6 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
         | PhysicalNode::Page { input, .. }
         | PhysicalNode::Limit { input, .. }
         | PhysicalNode::Projection { input, .. } => declared_ordering(plan, *input),
-        node @ PhysicalNode::RankFuse { .. } => search_ordering(node),
         PhysicalNode::Sort {
             input, order_by, ..
         } => Some(sorted_ordering(declared_ordering(plan, *input), order_by)),
@@ -3363,6 +3420,7 @@ pub fn declared_ordering(plan: &PhysicalPlan, id: NodeId) -> Option<Vec<String>>
         | PhysicalNode::Filter { .. }
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
+        | PhysicalNode::RankFuse { .. }
         | PhysicalNode::Aggregate { .. } => None,
     }
 }
@@ -3695,18 +3753,12 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::RankFuse { arms, limit, .. } => {
+            PhysicalNode::RankFuse { arms, .. } => {
                 let input = props(plan, arms[0].input)?;
-                let rows = match (input.rows, limit) {
-                    (Estimate::Known(rows), Some(limit)) => {
-                        Estimate::Known(rows.min(*limit as u64))
-                    }
-                    (rows, _) => rows,
-                };
                 Properties {
                     schema: input.schema.clone(),
-                    ordering: search_ordering(&node),
-                    rows,
+                    ordering: None,
+                    rows: input.rows,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
                     sources: Vec::new(),

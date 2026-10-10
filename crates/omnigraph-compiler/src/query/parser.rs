@@ -1293,8 +1293,12 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let first = inner
         .next()
         .ok_or_else(|| CompilerError::Parse("ordering cannot be empty".to_string()))?;
-    let (expr, descending) = match first.as_rule() {
-        Rule::nearest_ordering => (parse_nearest_ordering(first, NameScope::Alias)?, false),
+    let (expr, descending, explicit) = match first.as_rule() {
+        Rule::nearest_ordering => (
+            parse_nearest_ordering(first, NameScope::Alias)?,
+            false,
+            false,
+        ),
         Rule::expr => {
             let expr = parse_expr(first, NameScope::Alias)?;
             let direction = inner.next();
@@ -1306,8 +1310,9 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
                     direction,
                 ));
             }
+            let explicit = direction.is_some();
             let descending = direction.is_some_and(|p| p.as_str() == "desc");
-            (expr, descending)
+            (expr, descending, explicit)
         }
         other => {
             return Err(CompilerError::Parse(format!(
@@ -1317,7 +1322,11 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         }
     };
 
-    Ok(Ordering { expr, descending })
+    Ok(Ordering {
+        expr,
+        descending,
+        explicit,
+    })
 }
 
 fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Result<Expr> {

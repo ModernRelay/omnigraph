@@ -1,0 +1,70 @@
+# issue: 787
+# red_on: 2026-10-09, upstream main: every step returned the primary arm's row order; RankFuseExec sorted by the fused sum alone and truncated entities, so keys after a leading rrf() never reached a Sort.
+# notes: Keys after a leading rrf() apply as secondary sorts, then the entity id breaks ties (RFC 0047 §One total order; docs/user/queries/index.md, search/index.md Hybrid ranking).
+# notes: aa and zz swap ranks between the alpha and beta arms, so they tie exactly on the fused score; step 1 orders the tie by `$d.slug desc` (zz), step 2 by the id alone (aa).
+# notes: Step 3: one fused entity fans out to two rows, which `$c.slug desc` must order (zz) before the limit.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"aa","text":"alpha alpha beta"}}
+{"type":"Doc","data":{"slug":"zz","text":"alpha beta beta"}}
+{"type":"Doc","data":{"slug":"hub","text":"needle"}}
+{"edge":"Cites","from":"hub","to":"aa"}
+{"edge":"Cites","from":"hub","to":"zz"}
+
+--- query
+query secondary_key_breaks_fused_tie() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(bm25($d.text, "alpha"), bm25($d.text, "beta")), $d.slug desc }
+    limit 1
+}
+
+--- expect ordered
+{"d.slug":"zz"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query id_breaks_fused_tie() {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(bm25($d.text, "beta"), bm25($d.text, "alpha")) }
+    limit 1
+}
+
+--- expect ordered
+{"d.slug":"aa"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query secondary_key_orders_fanout_rows() {
+    match {
+        $d: Doc
+        $d cites $c
+    }
+    return { $c.slug }
+    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle")), $c.slug desc }
+    limit 1
+}
+
+--- expect ordered
+{"c.slug":"zz"}
+
+--- expect shape
+c.slug: String

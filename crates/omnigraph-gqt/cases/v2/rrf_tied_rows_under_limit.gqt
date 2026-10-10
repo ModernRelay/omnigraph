@@ -1,6 +1,7 @@
 # issue: none
-# notes: Reverse insertion order exposes missing identity ordering among tied joined rows before LIMIT.
-# notes: Explicit ID and returned-property trailing keys retain that ordering when their Sort is removed.
+# red_on: 2026-10-10, upstream 58f1fcc6: step 1 returned p63..p59, the primary arm's insertion order; RankFuseExec cut entities and planned no Sort, so the tied joined rows reached the limit unordered.
+# notes: Every Probe joins the one matching Doc, so all 64 rows tie on the fused score; the Sort above the fusion orders the tie by the implicit ids ($d.@id, $p.@id) and `limit` cuts rows, so the five smallest Probe ids come back in id order (RFC 0047 §One total order).
+# notes: Reverse insertion order is the seed so an unordered pass-through is visibly wrong; explicit ID and returned-property trailing keys keep the RankFuse row tie-break.
 # notes: Frozen v1 retains insertion order for tied joined rows; the explicit v2 expectations own this case.
 
 --- runner
@@ -104,7 +105,7 @@ query fused_v2($t: String) {
 --- params
 {"t":"needle"}
 
---- expect unordered
+--- expect ordered
 {"p.slug":"p00"}
 {"p.slug":"p01"}
 {"p.slug":"p02"}

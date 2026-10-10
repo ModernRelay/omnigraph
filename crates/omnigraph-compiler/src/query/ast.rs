@@ -661,12 +661,16 @@ impl std::fmt::Display for Expr {
 pub const DISTANCE_COLUMN: &str = "_distance";
 /// See [`DISTANCE_COLUMN`].
 pub const SCORE_COLUMN: &str = "_score";
+/// The fused score `RankFuse` appends under the primary arm's binding
+/// (`{var}._rrf`, RFC 0047 §One total order), reserved like the two above.
+pub const RRF_COLUMN: &str = "_rrf";
 
 impl Expr {
     /// The `(binding, column)` a projected rank expression reads: the score
     /// the executed retrieval wrote for that binding (RFC 0047 §Metric
-    /// projection). `None` for every expression that is not a single-source
-    /// rank expression over a property.
+    /// projection); an `rrf()` reads the fused score under its primary arm's
+    /// binding. `None` for every expression that is not a rank expression
+    /// over a property.
     pub fn score_column(&self) -> Option<(&str, &'static str)> {
         match self {
             Expr::Nearest { variable, .. } => Some((variable, DISTANCE_COLUMN)),
@@ -674,7 +678,19 @@ impl Expr {
                 Expr::PropAccess { variable, .. } => Some((variable, SCORE_COLUMN)),
                 _ => None,
             },
+            Expr::Rrf { primary, .. } => primary
+                .score_column()
+                .map(|(variable, _)| (variable, RRF_COLUMN)),
             _ => None,
+        }
+    }
+
+    /// The scalar type of the column `score_column` names: Lance writes
+    /// `F32` scores and distances, the fusion an `F64` sum.
+    pub(crate) fn score_type(&self) -> ScalarType {
+        match self {
+            Expr::Rrf { .. } => ScalarType::F64,
+            _ => ScalarType::F32,
         }
     }
 }
@@ -859,6 +875,9 @@ pub struct Projection {
 pub struct Ordering {
     pub expr: Expr,
     pub descending: bool,
+    /// Whether the query wrote `asc` or `desc` after the key; a bare key
+    /// reads as ascending, a bare rank key as the rank's own direction.
+    pub explicit: bool,
 }
 
 #[derive(Debug, Clone)]
