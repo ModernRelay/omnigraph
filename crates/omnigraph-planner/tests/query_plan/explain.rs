@@ -459,7 +459,8 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
         omnigraph_planner::RouteOverride::Registry,
         &bounds(),
     );
-    let explain = decision.explain();
+    let decision = futures::executor::block_on(decision.finalize(&source()));
+    let explain = decision.explain().unwrap();
     assert_eq!(explain.route, "engine");
     assert!(explain.physical_plan.is_some());
     assert!(explain.pipelines.is_none());

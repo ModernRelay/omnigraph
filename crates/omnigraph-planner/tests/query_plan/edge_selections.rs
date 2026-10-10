@@ -195,7 +195,9 @@ fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
         descending: false,
     }];
     let source = source().with_traversal_work_limit(100);
-    let mut plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let mut plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let (fuse_id, secondary_input) = plan
         .live()
         .find_map(|(id, node)| match node {
@@ -604,7 +606,9 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
         .with_edge_version("knows", 5)
         .with_edge_version("likes", 9)
         .with_traversal_work_limit(123);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let expands: Vec<_> = plan
         .live()
         .filter_map(|(_, node)| match node {
@@ -714,7 +718,9 @@ fn named_query_ignores_a_source_selection_allowance() {
     let source = source()
         .with_traversal_work_limit(0)
         .with_traversal(Traversal::Csr);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert_eq!(plan.assumptions().traversal_work_limit, None);
     assert!(plan.live().any(|(_, node)| matches!(
         node,
@@ -900,7 +906,9 @@ fn issue_659_empty_wildcard_retains_historical_refusal_marker() {
         vec![],
     ));
     let source = source().with_traversal_work_limit(100);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert!(plan.assumptions().has_wildcard_traversal);
     assert!(
         plan.assumptions()

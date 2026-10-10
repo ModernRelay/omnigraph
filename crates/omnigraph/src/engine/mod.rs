@@ -44,7 +44,7 @@ mod expr;
 mod graph;
 mod lower;
 mod operators;
-mod plan_source;
+pub(crate) mod plan_source;
 /// The push-based pipeline for change-feed and merge plans; the planner's
 /// registry routes neither operation to it.
 #[expect(
@@ -281,7 +281,7 @@ pub(crate) async fn execute_query(
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
     let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let physical = plan_query(&source)?;
+    let physical = plan_query(&source).await?;
     let bound = bind(physical, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
@@ -306,7 +306,7 @@ pub(crate) async fn execute_query_inspected(
     settings: &SessionSettings,
 ) -> Result<Executed> {
     let source = QuerySource::gather(ir, catalog, snapshot, params, settings).await?;
-    let ExplainedQuery { explain, physical } = explain_query(&source)?;
+    let ExplainedQuery { explain, physical } = explain_query(&source).await?;
     let bound = bind(physical, &source, embedding).await?;
     let context = EngineContext {
         snapshot,
@@ -718,6 +718,7 @@ mod traversal_admission_tests {
         *plan.node_mut(input).unwrap() = PhysicalNode::Scan {
             source: ScanInput::Table,
             spec: Box::new(ScanSpec {
+                access: None,
                 side: SideId::Base,
                 table: TableRef {
                     type_key: "node:Person".into(),

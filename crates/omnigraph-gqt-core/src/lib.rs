@@ -36,12 +36,14 @@ pub mod concurrent;
 mod generate;
 mod host;
 pub mod runner_config;
+mod served;
 mod yaml;
 pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
 pub use generate::{Generated, Seed};
 pub use host::{ExecutionHost, PlainHost};
 use omnigraph::storage::StorageAdapter;
 pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
+pub use served::{ServerTarget, admit_served, execute_steps_served};
 
 mod plan;
 mod report;
@@ -60,8 +62,8 @@ pub struct Case {
     pub seams: BTreeMap<usize, Vec<SeamDirective>>,
     pub source_lines: BTreeMap<usize, usize>,
     pub fixture: Option<Fixture>,
-    /// The `# traversal:` pin: the harness-only traversal field on the case
-    /// session plus the expand-path check; `None` leaves it at `auto`.
+    /// The harness-only traversal setting; any header requests index preparation.
+    /// `auto` retains cost selection, while `indexed` and `csr` check the forced path.
     traversal: Option<&'static str>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
@@ -455,11 +457,12 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "notes" => {}
             "traversal" => {
                 traversal = Some(match value {
+                    "auto" => "auto",
                     "indexed" => "indexed",
                     "csr" => "csr",
                     other => {
                         return Err(format!(
-                            "line {}: `# traversal:` takes `indexed` or `csr`, got `{other}`",
+                            "line {}: `# traversal:` takes `auto`, `indexed` or `csr`, got `{other}`",
                             idx + 1
                         ));
                     }
@@ -2756,6 +2759,26 @@ fn check_rows(
     let Value::Array(actual) = rows else {
         return Err(fail("engine returned a non-array row set".into()));
     };
+    check_rows_json(host, label, &actual, ordered, body_raw, span, binding)
+}
+
+/// `check_rows` on rows already rendered as JSON objects: the in-process
+/// path renders them from the `QueryResult`, the served path reads them off
+/// the wire, and both judge the expect body here.
+fn check_rows_json(
+    host: &impl ExecutionHost,
+    label: &str,
+    actual: &[Value],
+    ordered: bool,
+    body_raw: &str,
+    span: BodySpan,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let fail = |message: String| StepFail {
+        label: label.to_string(),
+        message,
+        bless_lines: None,
+    };
     host.observe(|| {
         let mut rows = actual.iter().map(Value::to_string).collect::<Vec<_>>();
         if !ordered {
@@ -2764,7 +2787,7 @@ fn check_rows(
         format!("{label} rows: {rows:?}")
     });
     let expected = parse_expect_rows(&substitute(body_raw, binding)).map_err(&fail)?;
-    compare_rows(&expected, &actual, ordered).map_err(|(message, rows)| StepFail {
+    compare_rows(&expected, actual, ordered).map_err(|(message, rows)| StepFail {
         label: label.to_string(),
         message,
         bless_lines: Some((span, rows)),
@@ -3310,44 +3333,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.record(
-                    "expectation",
-                    || match step {
-                        Step::Query(q) => {
-                            let mut evidence = read_expect_evidence(&q.expect);
-                            if let Some(plan) = &q.plan {
-                                evidence["plan"] = serde_json::json!(plan.lines);
-                            }
-                            evidence
-                        }
-                        Step::List(l) => read_expect_evidence(&l.expect),
-                        Step::Mutate(m) => match &m.expect {
-                            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
-                            MutateExpect::Affected { nodes, edges } => {
-                                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
-                            }
-                            MutateExpect::Error { needle } => {
-                                serde_json::json!({"kind": "error", "contains": needle})
-                            }
-                        },
-                        Step::Load(step) => serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)}),
-                        Step::Control(c) => {
-                            serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
-                        }
-                        Step::Settings(s) => {
-                            serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
-                        }
-                        Step::Show(s) => read_expect_evidence(&s.expect),
-                        Step::Restart { .. } => {
-                            serde_json::json!({"kind": "restart", "storage": "preserved"})
-                        }
-                        Step::Concurrent(c) => serde_json::json!({
-                            "kind": "concurrent",
-                            "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
-                            "order": c.order.iter().map(|e| format!("{} {}", c.sessions[e.session].label, e.event)).collect::<Vec<_>>(),
-                        }),
-                    },
-                );
+                host.record("expectation", || expectation_evidence(step));
                 let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
                 let armed = host.arm_seams(seams, step)?;
                 let lifetime_before = host.lifetime_counts();
@@ -3483,6 +3469,46 @@ async fn execute_steps_inner<H: ExecutionHost>(
         }
     }
     Err(detail)
+}
+
+/// The `expectation` evidence of a step, recorded before it runs on either
+/// executor.
+fn expectation_evidence(step: &Step) -> Value {
+    match step {
+        Step::Query(q) => {
+            let mut evidence = read_expect_evidence(&q.expect);
+            if let Some(plan) = &q.plan {
+                evidence["plan"] = serde_json::json!(plan.lines);
+            }
+            evidence
+        }
+        Step::List(l) => read_expect_evidence(&l.expect),
+        Step::Mutate(m) => match &m.expect {
+            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
+            MutateExpect::Affected { nodes, edges } => {
+                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+            }
+            MutateExpect::Error { needle } => {
+                serde_json::json!({"kind": "error", "contains": needle})
+            }
+        },
+        Step::Load(step) => {
+            serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)})
+        }
+        Step::Control(c) => {
+            serde_json::json!({"control": c.name, "expectation": format!("{:?}", c.write)})
+        }
+        Step::Settings(s) => {
+            serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
+        }
+        Step::Show(s) => read_expect_evidence(&s.expect),
+        Step::Restart { .. } => serde_json::json!({"kind": "restart", "storage": "preserved"}),
+        Step::Concurrent(c) => serde_json::json!({
+            "kind": "concurrent",
+            "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
+            "order": c.order.iter().map(|e| format!("{} {}", c.sessions[e.session].label, e.event)).collect::<Vec<_>>(),
+        }),
+    }
 }
 
 fn read_expect_evidence(expect: &QueryExpect) -> Value {

@@ -13,6 +13,7 @@ use super::*;
 /// with the bound query value and this pass's widening and gate verdicts.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SearchMode {
+    pub(super) scalar_index: Option<bool>,
     /// Vector ANN search on the scan's binding.
     pub(super) nearest: Option<NearestTarget>,
     /// Maximum number of IVF payload partitions a nearest scan may search,

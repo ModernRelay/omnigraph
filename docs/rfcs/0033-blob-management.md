@@ -27,9 +27,10 @@ and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
 **Current rollout:** Phases 0, 1, 2A (HTTP read delivery), and 2B (CLI read
-delivery) are implemented on the v0.10 development line. Phase 3 (mutation),
-Phase 4 (measured optimization), and the production delivery telemetry named
-in §11 remain open.
+delivery) are implemented on the v0.10 development line. Phase 3 (mutation) is
+planned against current main in §13, with its decisions in the 2026-10-08
+decision-log entry. Phase 4 (measured optimization) and the production delivery
+telemetry named in §11 remain open.
 
 This RFC is the required successor to an earlier reverted blob-delivery
 experiment. The relevant evidence and decisions are restated here; no untracked
@@ -446,7 +447,9 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
         cell: BlobCell,
     ) -> Result<BlobRead>;
+}
 
+impl Session {
     pub async fn put_blob_at_as(
         &self,
         branch: &str,
@@ -468,7 +471,9 @@ impl Omnigraph {
 
 Phase 1 implements the read types and `read_blob_at` only. The PUT/clear types
 and methods shown above remain the normative Phase 3 shape; they are not exposed
-early merely to reserve names.
+early merely to reserve names. The write methods belong to `Session`, beside
+`mutate_as`, `load_as` and `branch_merge_as`: every door that publishes graph
+lineage takes its history-release and staging settings from the session.
 
 `BlobReader` is an engine-owned `Send + Sync` abstraction with `len()` and
 bounded `read_range(Range<u64>)`. Ranges are half-open and valid exactly when
@@ -486,8 +491,8 @@ An implementation may wrap Lance `read_blob_ranges`, `read_blobs`, or
 `take_blobs`, but Lance types do not appear in public signatures.
 Every complete-payload read uses Lance's batched `read_blobs` API on managed
 rows with an explicit I/O buffer, through one engine helper: a carried update or
-merge cell, the bounded rewrite stream and the schema-apply rewrite each pass
-one batch's managed stable row ids to one streamed call. Export and the
+merge cell and the bounded rewrite stream each pass one batch's managed stable
+row ids to one streamed call. Export and the
 change-feed baseline do the same for each batch of rows they walk, one call per
 Blob column, and consume the stream row by row, so one row's values and each
 call's bounded I/O buffer are resident however many rows the batch holds.
@@ -555,22 +560,80 @@ These methods require an exact-ID, update-only preparation path; they are not
 implemented by synthesizing a `.gq` update. The implementation may be a focused
 adapter or a refactored shared Mutation primitive, but it must supply the target
 managed value/null directly, materialize only untouched sibling Blob cells, and
-support node and edge cells with identical semantics.
+support node and edge cells with identical semantics. The target value is built
+from the caller's bytes without a `base64:` round trip. An edge row keeps its
+`__src` and `__dst`, so the upsert-by-id validation of endpoints and
+cardinality runs and cannot change its answer; `.gq` keeps refusing an edge
+`update` (T16), and this adapter does not lift that refusal.
 
-The raw managed payload limit is 32 MiB inclusive. The engine rejects a larger
-value before any staged fragment, transaction, manifest update, or
-lineage row. The existing writer may need to materialize other Blob cells on the
-same row in order to carry the row through Lance. Those bytes remain charged to
-the same operation-wide 32 MiB pre-effect budget. Therefore a near-limit target
-can be refused when the row has other large Blob cells. This is an explicit V1
-limitation, not hidden behavior.
+Lance 11 cannot rewrite one Blob cell of a row on its own. `UpdateBuilder`
+refuses a Blob v2 column, a `RewriteColumns` merge-insert refuses a source that
+holds one, `DataReplacement` replaces a whole column of a fragment, and a stored
+descriptor names a sidecar or inline buffer of its own data file, so it cannot
+be moved into a new one. The write therefore replaces the whole row through the
+keyed update path, with a full-schema source and the whole-row merge-insert, and
+carries every untouched Blob cell by value under the rule a `.gq` `update`
+already follows. A managed sibling is re-materialized byte-identical through the
+one batched `read_blobs` call. An external sibling is admitted by the graph's
+current external-Blob policy, read, and stored as managed bytes: Lance's
+merge-insert writes with default `WriteParams`, which refuse an external URI
+outside the dataset's own bases, so the reference cannot be re-sent as one.
+Under a denying policy the write fails with `StoredExternalBlobDenied` naming
+the sibling. A row holding two external cells under a denying policy therefore
+cannot have one of them replaced or cleared alone. The V1 escape is a `merge`
+load of the whole row, which replaces a node or an edge from its input without
+reading its stored cells; for a node, a `.gq` `update` that assigns both cells
+also works, while an edge has no `.gq` `update` (T16). Keeping a sibling's reference needs a Lance
+merge-insert that accepts the external mode and outside-base admission of
+`WriteParams`, plus a surface guard; that belongs to the descriptor-preserving
+item of Phase 4, not to Phase 3.
+
+The raw managed payload limit is 32 MiB inclusive, counted in payload bytes. The
+engine rejects a larger value before it opens the table, so before any staged
+fragment, transaction, manifest update, or lineage row. The carried siblings'
+payload bytes, by declared logical length, are charged with the target to the
+same operation-wide 32 MiB pre-effect payload budget. Therefore a near-limit
+target can be refused when the row has other large Blob cells. This is an
+explicit V1 limitation, not hidden behavior.
+
+Payload bytes and the batch around them have separate budgets. Every keyed
+write (load, `.gq` mutation, branch merge and these methods) charges each
+managed Blob value's logical length to the payload budget and every other byte
+of its batches, the Blob columns' offsets, validity and descriptor framing
+included, to the existing keyed-write byte ceilings in Arrow memory. One shared
+accounting function applies both. A single budget cannot keep the inclusive
+promise: a one-row batch holding a 33,554,432-byte value and an `id` measures
+33,555,112 bytes in Arrow memory (arrow 58.3), so the old combined ceiling
+refused every exact-limit value, from `blob put`, an embedded `.gq` parameter, a
+carried cell or a load alike. The bound per operation is the sum of the two
+budgets.
+
+The boundaries in front of the batch keep their own units. The compatibility
+loader (`load`) parses a stream with no line limit and forecasts each keyed row
+before decoding it (`account_keyed_json_row`), charging a `base64:` value by its
+decoded length; that forecast is the pre-Arrow owner of the same budgets and
+splits the same way, so it admits an exact-limit value. The strict NDJSON loader
+(`load_graph_batch`) bounds each encoded line at 32 MiB, and a 32 MiB value is
+44,739,244 bytes of `base64:` text, so that loader keeps a smaller effective
+payload, about 24 MiB. HTTP bodies stay bounded in encoded bytes: §5.2 for PUT,
+and each load route by its own limit. The inclusive guarantee therefore covers
+`blob put`, embedded `.gq` parameters, carried cells and the compatibility
+loader.
 
 The target cell's old payload is not read or charged before replacement. A
-replacement may reprepare after an ordinary pre-effect conflict only while the
-branch incarnation and accepted-schema identity are unchanged: it captures a
-fresh base, re-locates the row, re-evaluates the precondition, and rebuilds the
-attempt. An incarnation/schema change fails closed rather than retargeting a
+predicate `.gq` update is not replayed after a pre-effect `ReadSetChanged`,
+because its read-modify-write plan would rebase; these methods are, because the
+target value is the caller's, not a function of the read. A replacement or clear
+therefore re-prepares within the bounded attempt count of an insert-only
+mutation: each attempt captures a fresh base, re-locates the row, re-evaluates
+the precondition, and re-carries the siblings from that base. It continues only
+while the branch incarnation and accepted-schema identity equal the first
+attempt's; an incarnation/schema change fails closed rather than retargeting a
 stale plan.
+
+A clear whose fresh base already holds null stages nothing and returns
+`Null { commit: None }`. With a precondition it fails instead, because a null
+cell satisfies neither form below.
 
 `BlobPrecondition` is transport-neutral:
 
@@ -593,9 +656,14 @@ typed terminal decision mapped to HTTP 412. It does not reuse the graph-head
 
 After the exact table effect and before graph publication, a successful managed
 write gathers all fallible evidence needed for its validator: table version,
-immutable-manifest `transaction_file`, and resulting row ID. It retains that
-request-local evidence across the manifest CAS; after a successful CAS, forming
-the outcome performs no storage read. The publisher returns the exact
+immutable-manifest `transaction_file`, and resulting row ID. The table version is
+the detached version the pin stages, which is the version a read at the returned
+snapshot opens, not the pin's published linear version. Both it and the
+`transaction_file` come from the dataset the detached commit returns, and the row
+ID is read back from that dataset by id; Lance keeps a merge-insert-updated row's
+stable row id, and a surface guard pins that. It retains that request-local
+evidence across the manifest CAS; after a successful CAS, forming the outcome
+performs no storage read. The publisher returns the exact
 `GraphCommit`, and the ETag equals a GET at that snapshot. Neither value may be
 reconstructed from branch HEAD, so a later write cannot change the first result.
 
@@ -628,6 +696,11 @@ checks its schema token before entering the engine. The engine write:
 7. returns the exact commit plus same-publication Blob state, preserving exact
    publication evidence and explicitly reporting an unknown outcome when it
    cannot establish one; uncertainty never permits replay.
+
+Cedar evaluates the normalized logical branch name. Every refusal raised before
+an effect carries the before-effect classification that the server's owned
+operation runtime reads, so a refused Blob write is never counted as an
+uncertain outcome that closes admission.
 
 No per-table publish, direct Lance commit, server-only writer, or Blob-specific
 recovery record is permitted. `forbidden_apis.rs` classifies the public Blob
@@ -665,6 +738,11 @@ closed lane fails before target work with the shared lifecycle 503; a fresh
 schema-token mismatch returns the shared stale-generation outcome and notifies
 the designated owner. It neither retries the request nor initiates inline repair.
 Middleware never reloads the registry and silently switches generations.
+The capture is implemented: routing takes the `GraphRequest` lease, and the
+response body holds it through EOF, error, or drop. No route, `/mutate`
+included, checks a schema token yet, and no shared stale-generation outcome
+exists. Blob routes inherit that check when the runtime adds it for every
+route; this RFC adds no Blob-specific stale outcome.
 
 For managed content:
 
@@ -724,13 +802,26 @@ their existing typed mappings.
 
 PUT accepts a branch only (default `main`); `snapshot` is invalid. The body is
 raw `application/octet-stream`, not JSON or base64. Its route-specific body
-limit is 32 MiB inclusive. After effect-free authentication, bounded parsing,
-and preliminary authorization, the request prepares the bytes, selector,
-precondition, server-resolved actor, exact generation, and workload guard, then
-enters the proposed atomic write-admission boundary. That operation acquires
-the write-lifetime permit, registers, and spawns on the same generation with no
-I/O/await gap. Oversize input fails before handoff/effect; afterward a disconnect
-loses delivery only and never cancels or replays the write.
+limit is 32 MiB inclusive. PUT is a raw ingress route, like `/load/ndjson`:
+another `Content-Type` returns 415, a declared `Content-Length` above the limit
+returns 413 before any body byte is read, and the body is collected
+incrementally into a buffer sized from a bounded `Content-Length`, after which
+the ingress reservation shrinks to the received size. The route and the engine
+adapter add no payload copy of their own: Arrow's `Buffer` adopts the collected
+`bytes::Bytes`, and any copy inside the shared keyed-write staging is the one
+every keyed write makes, under the same budgets. The body
+deadline and the per-request ingress reservation are the shared ones, so an
+upload holds its generation lease while it arrives, as a `/load` body does, and
+an expired deadline returns 408.
+
+After effect-free authentication, bounded parsing, and preliminary
+authorization of Cedar `change` on the branch, which runs before the body is
+read, the request prepares the bytes, selector, precondition, server-resolved
+actor, exact generation, and workload guard. It then admits the actor's
+workload and submits the engine call as an owned write, registered before it is
+spawned and on the same generation, with no I/O/await gap, as `/mutate` does.
+Oversize input fails before handoff/effect; afterward a disconnect loses
+delivery only and never cancels or replays the write.
 
 `If-Match` is optional. The boundary parses `*` as `AnyExisting` and a comma-
 separated entity-tag list as `Tags`; weak tags do not participate in strong
@@ -745,6 +836,8 @@ manifest CAS, not a branch-head reconstruction. Missing row returns 404, invalid
 property/target returns 400, Blob precondition failure returns 412 with the
 current managed ETag header when one exists and additive
 `blob_precondition_failure { current_etag }`; admission saturation returns 429.
+`ErrorCode` is a closed set, so the Blob 412 is an additive detail on the
+existing conflict code, and the handler sets the `ETag` header itself.
 
 ### 5.3 `DELETE`
 
@@ -755,7 +848,8 @@ or ETag. Effectful clear carries its exact `CommitOutput`; clearing an
 already-null cell is idempotent, produces no graph commit, and returns
 `commit: null`. A matching entity row is still required. A non-nullable Blob
 returns 400. A successful clear of managed content makes the previous ETag
-stale.
+stale. With `If-Match`, an already-null cell fails with 412 instead, because a
+null cell satisfies neither precondition form.
 
 The server OpenAPI describes the binary PUT body, all query parameters,
 redirect, range, conditional, exact receipt, Blob-precondition detail, shared
@@ -812,12 +906,24 @@ silently ignoring a client-supplied actor.
   separately and exactly echoed in `target.snapshot`.
 - `put` reads one file or stdin, never both. Input is retained only within the
   32 MiB envelope and passed as raw bytes. It never base64-encodes the payload.
-  Its structured result carries the exact commit and managed ETag.
-- `clear` asks for confirmation only according to the CLI's existing
-  destructive-operation rules; it does not require the graph-cleanup `--confirm`
-  flag because this is an ordinary audited mutation, not physical GC. Structured
-  output distinguishes an effectful clear from an already-null no-op through the
-  exact commit versus `commit: null`.
+  Without `--file` it reads stdin and refuses an interactive terminal rather than
+  waiting on one. An oversize or malformed input is refused before scope
+  resolution, so neither arm starts. Its structured result carries the exact
+  commit and managed ETag.
+- `clear` is not gated by a confirmation prompt. The CLI's destructive-operation
+  rules gate overwrite `load`, `branch delete` and `cleanup`; an ordinary
+  mutation that deletes rows or sets a property to null is not gated, and
+  `clear` is that kind of audited mutation, not physical GC. Structured output
+  distinguishes an effectful clear from an already-null no-op through the exact
+  commit versus `commit: null`.
+- `put` and `clear` accept `--as` for an embedded write and refuse it for a
+  served one, as every other write does; the server resolves the actor. `get`
+  and `stat` keep refusing `--as`. The CLI's outcome classification treats a
+  Blob 412 as it treats a graph-head precondition failure, and both verbs are
+  submit-once: an unknown remote outcome is reported, never resent.
+- One `If-Match` parser and formatter lives in the API types and serves the
+  CLI and the server's GET, HEAD, PUT and DELETE: `*` is `AnyExisting`, a list
+  is strong `Tags` with weak tags excluded, and malformed input is refused.
 
 The remote client disables automatic redirects for Blob calls. `stat` reports a
 whole-object external URI without following it. `get` refuses that external
@@ -1040,19 +1146,16 @@ Every path that carries an existing Blob cell uses the central descriptor
 decoder and accounts `BlobReader::len()` before payload allocation. Zero-length
 managed values participate as values. A nullable cell alone is skipped.
 
-Schema apply carries a whole-object external descriptor without probing or
-reading its target. Lance's current logical Blob input cannot express an
-existing external offset/length range, so schema apply refuses such a valid
-ranged descriptor before recovery arm or table movement; it never silently
-widens the cell to the whole object. Supporting descriptor-preserving ranged
-schema rewrites remains part of the future ownership-proof optimization below.
+Schema apply never rewrites a Blob cell. Adding, renaming or dropping a
+property is a metadata-only Lance commit that keeps every data file, so managed
+values of every placement, null and valid-empty cells and external descriptors,
+whole-object or ranged, stay exactly as stored, and an added Blob property reads
+as null in every existing row. Schema apply reads no payload and probes no
+external target, so it needs no Blob byte budget and cannot widen a range.
 
-The current materializing rewrite is a V1 implementation, not an ideal
-physical plan, and the schema-apply rewrite is not bounded: it scans the whole
-table into one batch and holds every managed payload of a rewritten Blob column
-in memory before staging. Mutation and merge carries stay under their operation
-budget (§10). A bounded, streamed schema-apply rewrite is required future work.
-A future optimization may carry immutable
+The materializing rewrite of mutation and merge carries is a V1
+implementation, not an ideal physical plan, and stays under its operation
+budget (§10). A future optimization may carry immutable
 prepared descriptors for unchanged cells only after a Lance surface guard proves
 that references cannot escape their source dataset/incarnation and recovery can
 account for every file. Correctness and ownership proof come before avoiding the
@@ -1132,8 +1235,8 @@ Physical row addresses never become public stable identity.
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
-| Oversize upload | Route and engine 32 MiB inclusive limits; refusal before effect |
-| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. The schema-apply rewrite has no byte ceiling yet (§8.4) |
+| Oversize upload | Route and engine 32 MiB inclusive limits in payload bytes, separate from the batch framing budget (§4.3); refusal before effect |
+| Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. Schema apply reads no Blob payload: its column changes are metadata-only (§8.4) |
 | Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
 | Engine read memory | `BlobReader::read_range` returns at most `BLOB_READ_RANGE_MAX_BYTES` (4 MiB); larger values require consecutive calls and there is no unbounded full-read method |
@@ -1152,6 +1255,61 @@ show that long-lived Blob streams can starve ordinary reads, a separate workload
 permit may be added without changing byte, snapshot, or generation semantics;
 it still needs a cost/latency test before becoming a default.
 
+### 10.1 Beyond the 32 MiB envelope
+
+The 32 MiB ceilings are a resource envelope, not a limit of the data model.
+They exist for three reasons:
+
+- Lance's merge-insert runs its join with an unbounded memory pool, so a
+  transaction's memory is bounded only by bounding its input (RFC 0023);
+- a mutation or load holds its batches in memory until its one publication;
+- Lance writes a Blob value from an in-memory Arrow array.
+
+The ceilings are not a setting. The evidence behind the figure is
+[RFC 0023's cost gate](0023-key-conflict-fencing.md#114-cost-gate): paired
+peak-RSS overhead of bounded fenced transactions under the old combined 32 MiB
+accounting, for the workloads that gate names. It is not a workload-independent
+process-memory bound, and it does not qualify the split envelope of §4.3, up to
+32 MiB of payload plus 32 MiB of framing; qualifying that remains open work for
+the same gate. A setting without such a measured multiplier would promise a
+bound it cannot keep. Going beyond the ceilings means keeping large data out of
+the write path's memory. There are three separate limits, each with its own dependency
+and trigger:
+
+1. **Large objects by reference.** An external reference has no size limit, and
+   reads redirect without touching it. Today only an overwrite load keeps a
+   source-supplied reference; every incremental write copies the object, because
+   Lance's merge-insert writes with default `WriteParams` and refuses a reference
+   outside the dataset's bases. The missing piece is a merge-insert that accepts
+   write parameters ([lance#6426](https://github.com/lance-format/lance/issues/6426),
+   implemented by the open [lance#7969](https://github.com/lance-format/lance/pull/7969)).
+   [lance#9532](https://github.com/lance-format/lance/pull/9532), merged for
+   Lance 13, already keeps a reference that merge-insert carries for a Blob
+   column the source omits. Whether that carry bounds the payload of a managed
+   column it also carries must be checked before OmniGraph relies on it. Once
+   both are available:
+   - incremental writes can store a source-supplied reference without copying it;
+   - updates and `blob put` can carry a sibling's reference instead of reading
+     it, which also removes the denying-policy case in §4.3.
+
+   Trigger: the Lance release that ships the write parameters.
+2. **Managed values above 32 MiB.** The pinned Lance 11 already exports a
+   streaming `DedicatedBlobWriter`, which takes a value in successive chunks and
+   returns its descriptor, and writer-prepared descriptor columns
+   (`BlobDescriptorArrayBuilder`), so a value can be written without holding it
+   in memory. But a dedicated sidecar's path is bound to the data file it belongs
+   to, and merge-insert names its own data files. Using it therefore means a
+   single-row replacement that writes its own data file outside the key-fenced
+   merge-insert RFC 0023 requires for keyed writes, and that replacement must
+   compose with conflict checks, detached staging, publication and collection.
+   That design, not a Lance version, is the blocker, and it needs its own RFC.
+   The PUT wire shape, a raw body, already allows a higher limit without change.
+3. **Atomic operations above 32 MiB.** Mutation and load would stage a bounded
+   chain of Lance transactions under one publication, as branch merge does, and
+   validation would have to stream. Deferred until a workload needs an atomic
+   write larger than the envelope; until then a large load is split into several
+   commits, or replaces whole types with an overwrite load.
+
 ## 11. Error and observability contract
 
 New errors use existing structured families where possible. The public contract
@@ -1166,11 +1324,13 @@ depends on typed code and fields, not an opaque Lance string.
 | Update must carry a stored external reference the graph's policy refuses | `StoredExternalBlobDenied`, naming type, id, and property | 400 |
 | External source missing/unreadable | typed external source error | 424 Failed Dependency; never generic 500 |
 | Upload/rewrite budget exceeded | `resource_limit` with limit/observed | 413 |
+| PUT body is not `application/octet-stream` | route refusal before the body is read | 415 |
+| PUT body deadline expired before the body arrived | shared ingress deadline | 408, not started |
 | Managed HTTP range exceeds 4 MiB | consecutive bounded engine reads | 200/206; the 4 MiB ceiling bounds each payload read, not the requested representation |
 | Valid but unsatisfiable HTTP range | `BlobRangeNotSatisfiable { start, end, length }` details | 416 plus `Content-Range: bytes */N` and `blob_range` |
 | Blob write If-Match failed | `BlobWritePreconditionFailed { current_etag }` | 412 plus `blob_precondition_failure`; never graph `precondition_failure` |
 | Generation lane closed before operation | shared proposed lifecycle detail | 503, not started |
-| Captured generation schema token is stale | shared proposed stale-generation outcome | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
+| Captured generation schema token is stale | shared stale-generation outcome, once the runtime checks it on every route (§5.1) | shared refusal and designated-owner notification; no Blob-specific error or inline repair |
 | Publication or control completion uncertain | exact engine outcome and retained publication evidence | existing mapping; never permission to replay |
 | Owned write panics or has no knowable terminal outcome | shared proposed unknown-outcome class | 500; never success or replay |
 | Persisted table/Blob integrity contradiction | `BlobIntegrity { reason }` | exhaustive server mapping is 5xx |
@@ -1268,9 +1428,24 @@ The implementation extends existing owners before creating new fixtures, per
   reference, proving that target payload is not read while the untouched sibling
   remains byte-identical. Every refusal proves table HEAD, manifest, lineage,
   and accepted state unchanged.
+- `writes.rs` also owns the payload/framing split (§4.3): an exact 32 MiB PUT is
+  accepted and one more byte is refused by the payload limit, not by a framing
+  ceiling; a 32 MiB value carried by an update, one inserted through an
+  embedded `.gq` parameter and one loaded by the compatibility loader are
+  accepted where the combined ceiling refused them, while the strict NDJSON
+  loader still refuses that value's encoded line at its line limit; and a
+  framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
+  too: an external sibling becomes managed under an admitting policy (visible
+  through `stat`), fails with `StoredExternalBlobDenied` naming the sibling under
+  a denying one, and on a row with two external cells under a denying policy a
+  PUT or clear of either is refused, for a node and for an edge, while a
+  `merge` load of the whole row succeeds for both and a `.gq` update assigning
+  both cells succeeds for the node.
 - Phase 3 extends the existing Mutation rendezvous owner: a competing write
-  forces fresh If-Match evaluation, a post-publication write cannot alter the
-  first receipt/ETag, and branch ABA fails closed. The proposed serving-view owner
+  forces fresh If-Match evaluation and a re-carry of the siblings from the fresh
+  base within the bounded attempt count, a post-publication write cannot alter
+  the first receipt/ETag, and branch ABA or an accepted-schema change between
+  attempts fails closed. The proposed serving-view owner
   adds a Blob representative for stale-schema refusal and wholly-G1 execution.
 - Later merge/mutation work in `branching.rs` retains merge preservation of
   empty bytes, operation-wide managed-plus-exact-range accounting, the 8,192
@@ -1316,6 +1491,14 @@ The implementation extends existing owners before creating new fixtures, per
   durable ref and does not widen cleanup's cross-process contract: readers must
   be quiesced before destructive GC; a raced read may return its captured bytes
   or fail loudly, but never switch versions.
+- Phase 3 adds two surface guards. One pins that a whole-row merge-insert update
+  on a stable-row-id table keeps the updated row's stable row id, which the
+  write's ETag evidence reads back (§4.3). The other pins that the merge-insert
+  writer refuses an external URI outside the dataset's bases, because it writes
+  with default `WriteParams`; it goes red when merge-insert stores such a
+  reference, which reopens carrying a sibling's reference (§4.3, Phase 4). A
+  Lance release that lets a caller pass `WriteParams` to merge-insert reopens it
+  too, through the dependency bump review.
 
 ### 12.4 Server, CLI, parity, and cost
 
@@ -1365,6 +1548,17 @@ The implementation extends existing owners before creating new fixtures, per
   redirect paths also release exactly one read-lifetime permit.
   These deterministic counters, rather than a platform-noisy RSS number, are the
   acceptance gate.
+- Phase 3 extends `data_routes.rs` for the raw PUT route: a wrong
+  `Content-Type` returns 415, a declared `Content-Length` over the limit returns
+  413 before any body byte is read, a body of exactly 32 MiB is admitted and one
+  more byte refused, an expired body deadline returns 408, and the ingress
+  reservation shrinks to the received size. A refusal raised before an effect
+  leaves admission open.
+- Phase 3 makes the CLI's managed HTTP test proxy carry binary request bodies
+  above its current 1 MiB cap and inject faults on PUT and DELETE `/blob`, so the
+  `system_remote` lost-delivery matrix covers both verbs. Parity rows normalize
+  the ETag, which hashes a transaction file name holding a per-commit UUID, and
+  write into copied twins, never the hard-linked read fixture.
 - Extend the proposed real HTTP cancellation owner with Blob PUT and DELETE after
   write admission: HTTP/1 disconnect, supported HTTP/2 reset, and request timeout
   may lose delivery but the owned work remains registered through settlement,
@@ -1477,23 +1671,34 @@ correctness gate.
 
 ### Phase 3 — mutation
 
-- **Served-read prerequisite:** when the proposed operation ownership and serving
-  views land, retrofit the already shipped GET/HEAD routes with exact-generation
-  read lifetime before adding any Blob write route.
-- **3A — engine:** add the dedicated exact-ID PUT/clear adapter through the shared
-  Mutation staging/publication tail. Return the exact commit and same-publication Blob
-  evidence; do not heal inline or synthesize `.gq`.
-- **3B — HTTP:** after the proposed operation ownership and serving-view capture
-  land, add PUT/DELETE through owned execution and pin receipts, distinct Blob
-  preconditions, lifecycle errors, OpenAPI, cancellation, and failpoint behavior.
+- **Served-read prerequisite:** met. The routed `GraphRequest` lease and the
+  read observer are held by the GET/HEAD response through EOF; the bounded
+  transport tests of §12.4 that assert it for Blob land with 3B. The schema-token
+  check of §5.1 is the runtime's, for every route.
+- **3-pre — accounting:** one shared function charges managed Blob payloads by
+  logical length to the payload budget and every other batch byte by Arrow
+  memory to the keyed-write ceilings (§4.3), for every keyed writer and for the
+  compatibility loader's pre-decode forecast; plus the two §12.3 surface
+  guards. This lands first because it changes load and
+  mutation limits on its own, and the inclusive PUT bound depends on it.
+- **3A — engine:** add `Session::put_blob_at_as` and `clear_blob_at_as` through
+  the shared Mutation staging/publication tail: a kind-agnostic exact-ID adapter
+  generalized from the update path, the publish tail extracted so Mutation keeps
+  one publisher call site, `commit_all` returning per-table detached evidence,
+  and the bounded re-prepare loop of §4.3. Return the exact commit and
+  same-publication Blob evidence; do not heal inline or synthesize `.gq`.
+- **3B — HTTP:** add PUT/DELETE through owned execution and pin receipts, the raw
+  ingress route of §5.2, distinct Blob preconditions, lifecycle errors, OpenAPI,
+  cancellation, and failpoint behavior, with the shared `If-Match` parser in the
+  API types.
 - **3C — CLI:** add put/clear with embedded/remote exact-receipt and
   structured-error parity.
 
 ### Phase 4 — measured optimization
 
 - Batched reads (`read_blobs`) landed for materializing rewrites, export, the
-  change-feed baseline, change images and entity reads (§4). Remaining: make the
-  schema-apply rewrite bounded and streamed (§8.4), then benchmark. Tuning is
+  change-feed baseline, change images and entity reads (§4), and schema apply
+  stopped rewriting Blob columns (§8.4). Remaining: benchmark. Tuning is
   optional and may not weaken the batched contract or change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
@@ -1725,6 +1930,77 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-08: Phase 3 is planned against current main, after checking every
+  substrate and code assumption it makes.
+  - Payload bytes and batch framing get separate budgets for every keyed writer
+    (§4.3). A one-row batch holding a 33,554,432-byte value measures 33,555,112
+    bytes in Arrow memory, so the combined 32 MiB ceiling refused every
+    exact-limit value from a PUT, an embedded `.gq` parameter, a carried
+    cell or a load; the inclusive promise is kept by counting payloads by
+    logical length. The compatibility loader's pre-decode forecast splits the
+    same way; the strict NDJSON loader keeps its 32 MiB encoded-line limit and
+    HTTP bodies their encoded limits, so those paths admit less.
+  - Untouched sibling Blob cells are carried by value under the `.gq` update
+    rule, including an external sibling becoming managed, or
+    `StoredExternalBlobDenied` under a denying policy (§4.3). Lance 11 offers no
+    single-cell Blob write, its stored descriptors are bound to their data file,
+    and its merge-insert writes with default `WriteParams`; a row with two
+    external cells under a denying policy is changed by a `merge` load of the
+    whole row, for a node or an edge, or for a node by an update that assigns
+    both. Keeping a sibling's reference stays in Phase 4, behind a
+    guard that goes red when merge-insert stores an outside-base reference.
+  - The write methods are `Session` methods; edges are written by the same
+    exact-ID adapter while `.gq` keeps refusing an edge `update`.
+  - Put and clear re-prepare after a pre-effect conflict, unlike a predicate
+    update, because the target value does not depend on the read; the ETag uses
+    the detached version the pin stages, read from the commit's own dataset.
+  - PUT is a raw ingress route like `/load/ndjson`, adding 415 and 408, and the
+    served-read prerequisite is met; no route checks a schema token yet, so the
+    stale-generation outcome stays with the runtime for every route.
+  - `clear` is not gated by a CLI confirmation; `If-Match` has one parser in the
+    API types.
+  - The 32 MiB ceilings stay as the Phase 3 envelope. §10.1 records the three
+    paths beyond it (references, streamed managed values, atomic chains), what
+    blocks each, and its trigger.
+
+  Superseded: §4's `impl Omnigraph` placement of the write methods; §4.3's "The
+  raw managed payload limit is 32 MiB inclusive. The engine rejects a larger
+  value before any staged fragment" paragraph and its "A replacement may
+  reprepare after an ordinary pre-effect conflict" paragraph; §5.2's "enters the
+  proposed atomic write-admission boundary. That operation acquires the
+  write-lifetime permit, registers, and spawns on the same generation";
+  §6's "`clear` asks for confirmation only according to the CLI's existing
+  destructive-operation rules"; and §13's Phase 3 bullets, including "when the
+  proposed operation ownership and serving views land".
+- 2026-10-04: Schema apply's column changes became metadata-only Lance
+  commits: renames and drops as a detached `Project`, additions as a detached
+  `Merge` over the unchanged fragments, keeping every data file. The rewrite
+  had held every managed payload of a table in memory inside the server's
+  deployment path. Superseded sentences: §4's "a carried update or merge cell,
+  the bounded rewrite stream and the schema-apply rewrite each pass one
+  batch's managed stable row ids to one streamed call" (the schema-apply
+  rewrite is gone); §8.4's "Lance's current logical Blob input cannot express
+  an existing external offset/length range, so schema apply refuses such a
+  valid ranged descriptor before recovery arm or table movement; it never
+  silently widens the cell to the whole object.", "Supporting
+  descriptor-preserving ranged schema rewrites remains part of the future
+  ownership-proof optimization below.", "The current materializing rewrite is
+  a V1 implementation, not an ideal physical plan, and the schema-apply
+  rewrite is not bounded: it scans the whole table into one batch and holds
+  every managed payload of a rewritten Blob column in memory before staging."
+  and "A bounded, streamed schema-apply rewrite is required future work."
+  (a ranged descriptor is now kept as stored, and no rewrite remains to
+  bound); §10's rewrite-amplification sentence "The schema-apply rewrite has
+  no byte ceiling yet (§8.4)"; and Phase 4's "make the schema-apply rewrite
+  bounded and streamed (§8.4)". A dropped Blob property's managed bytes now
+  stay with their data files until the next `optimize`, which rewrites every
+  fragment still holding a dropped column without reading it (the
+  `compaction_memory.rs` erasure instrument measured 34.1 MiB at its peak on 64
+  rows of a kept and a dropped 1 MiB value, under the 42 MiB compaction bound),
+  and `cleanup` then deletes them once no retained version names them. The
+  `lance_surface_guards.rs` evolution guard pins the Lance facts; the
+  `compaction_memory.rs` instrument measured schema apply's peak at 72.1 and
+  136.1 MiB on 64 and 128 MiB Blob tables before, and 5.1 MiB on both after.
 - 2026-10-08: Export, the change-feed baseline, change-feed images and entity
   reads read managed payloads through the batched `read_blobs` helper the
   materializing rewrites use, closing that Phase 4 item. Export and the

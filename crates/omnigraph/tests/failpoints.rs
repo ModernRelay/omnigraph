@@ -5,6 +5,7 @@ mod helpers;
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
@@ -13,7 +14,9 @@ use omnigraph::db::{
     GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, StagingVerdict,
 };
 use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
-use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::instrumentation::{
+    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
@@ -211,6 +214,9 @@ fn rfc023_external_writer_process() {
             match action.as_str() {
                 "load" => {
                     db.load("main", &payload, mode).await.unwrap();
+                }
+                "load_feature" => {
+                    db.load("feature", &payload, mode).await.unwrap();
                 }
                 "schema_apply_company" => {
                     db.apply_schema(&payload).await.unwrap();
@@ -917,17 +923,10 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A fork collision must be classified by the manifest authority, not by Lance
-// branch versions. When a concurrent first-write legitimately wins the fork
-// race, the loser sees a changed read set — but that is a safe pre-effect
-// retry for Insert. RFC-022 discards and reprepares it automatically, never
-// misclassifying the live fork as an orphan that needs cleanup.
-//
-// Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
-// it parks the first arrival (writer A) at the fork point until released; later
-// arrivals (writer B) fall through. The test waits on the reached condition,
-// lets B win and commit the fork, then releases A.
-#[tokio::test(flavor = "multi_thread")]
+/// A fork collision is classified by the manifest authority, not by Lance
+/// branch versions: the first write that loses the fork race sees a changed
+/// read set and reprepares against the live fork instead of cleaning it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let _scenario = FailScenario::setup();
@@ -938,42 +937,50 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     main.branch_create("feature").await.unwrap();
 
     let rv = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
+    let probes = QueryIoProbes::default();
 
     let uri_a = uri.clone();
+    let writer_probes = probes.clone();
     let writer_a = tokio::spawn(async move {
         let a = helpers::session(Omnigraph::open(&uri_a).await.unwrap());
-        helpers::mutate_branch(
-            &a,
-            "feature",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        with_query_io_probes(
+            writer_probes,
+            helpers::mutate_branch(
+                &a,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            ),
         )
         .await
     });
 
-    // Wait until A is parked at the fork point.
     rv.wait_until_reached().await;
 
-    // B wins the fork and commits it.
-    let b = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    helpers::mutate_branch(
-        &b,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
+    let external_uri = uri.clone();
+    let external = tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            external_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"Frank","age":41}}"#.to_string(),
+            "load_feature",
+        )
+    })
+    .await;
 
-    // Release A; it resumes, sees that B changed branch authority, discards its
-    // stale attempt, and reprepares Eve against the now-live feature fork.
     rv.release();
-    writer_a
-        .await
+    let writer_result = writer_a.await;
+    external.unwrap().expect("B must publish while A is parked");
+    assert!(!rv.timed_out(), "A must stay parked until B publishes");
+    writer_result
         .unwrap()
         .expect("A's retryable insert must reprepare after B wins the fork");
+    assert_eq!(
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        1,
+        "A must discard its stale attempt after the foreign writer publishes"
+    );
 
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -2696,7 +2703,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_no_recovery_sidecars(dir.path());
     assert_no_staging_files(dir.path());
 
-    // The Person rewrite is a detached version and the Tag create is an
+    // The Person column add is a detached version and the Tag create is an
     // unregistered dataset: nothing moved the manifest or any linear HEAD,
     // so reopening has nothing to roll back.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -2720,7 +2727,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_eq!(
         person_head.version().version,
         person_head_before,
-        "a detached rewrite never moves the linear HEAD"
+        "a detached schema evolution never moves the linear HEAD"
     );
     assert!(snapshot.dataset("node:Tag").is_none());
     let live_schema = db.schema_source();
@@ -2729,7 +2736,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
 
     db.apply_schema(&v2_schema)
         .await
-        .expect("the retry rewrites from the pin and reclaims the Tag leftover");
+        .expect("the retry evolves from the pin and reclaims the Tag leftover");
     assert!(db.schema_source().contains("city: String?"));
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
@@ -3071,7 +3078,7 @@ edge WorksAt: Human -> Company
         let error = db
             .apply_schema(desired)
             .await
-            .expect_err("rename+rewrite must stop after its detached table effect");
+            .expect_err("rename + key-property rename must stop after its detached table effect");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial rename error: {error}"
@@ -3081,8 +3088,8 @@ edge WorksAt: Human -> Company
     assert_no_staging_files(dir.path());
     drop(db);
 
-    // The rewrite is a detached version behind the source alias's pin; the
-    // rename was never published. Reopening finds the graph untouched.
+    // The column rename is a detached Project behind the source alias's pin;
+    // the type rename was never published. Reopening finds the graph untouched.
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let snapshot = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -3099,7 +3106,7 @@ edge WorksAt: Human -> Company
     recovered
         .apply_schema(desired)
         .await
-        .expect("the retry publishes the rename and rewrite");
+        .expect("the retry publishes the type and property renames");
     assert_eq!(
         helpers::count_rows(&recovered, "node:Human").await,
         people_before
@@ -3164,7 +3171,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
         assert_eq!(
             head.version().version,
             heads_before[type_name],
-            "{type_name}: a detached rewrite never moves the linear HEAD"
+            "{type_name}: a detached schema evolution never moves the linear HEAD"
         );
     }
     assert_eq!(
@@ -3270,7 +3277,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
             .version()
             .version,
         winner_lance_head,
-        "the abandoned detached rewrite never moved the linear HEAD"
+        "the abandoned detached schema evolution never moved the linear HEAD"
     );
     assert_eq!(
         branch_head_commit_id(dir.path(), "main").await.unwrap(),
@@ -8799,4 +8806,61 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
             .unwrap(),
         2
     );
+}
+
+/// A storage failure met while planning a read (opening a table for its
+/// index facts, or for the scan-access split) reaches the query door as the
+/// injected `Manifest` error itself, not a planner-error wrapper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn planning_source_failures_keep_their_error_class() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Planned")], &[("$age", 7)]),
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    let lookup = params(&[("$name", "Planned")]);
+    for seam in [
+        &catalog::QUERY_INDEX_FACTS_PRE_LOAD,
+        &catalog::QUERY_SCAN_ACCESS_PRE_TABLE_OPEN,
+    ] {
+        let _failpoint = seam.fire_always();
+        let error = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            )
+            .await
+            .expect_err("the injected planning failure must surface");
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::BadRequest
+                        && manifest.message
+                            == format!("injected failpoint triggered: {}", seam.name())
+            ),
+            "{}: {error}",
+            seam.name()
+        );
+    }
+    let rows = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &lookup,
+        )
+        .await
+        .expect("the next read plans and runs");
+    assert_eq!(rows.num_rows(), 1);
 }

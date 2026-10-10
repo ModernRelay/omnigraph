@@ -1,0 +1,13 @@
+# `Test Workspace` runs the workspace graph with `cargo nextest run --profile ci`
+# (ci.yml): one scheduler over every test of every binary, a process per test.
+# The JUnit report is what `scripts/check-workspace-test-owners.py` reads for
+# each required owner's verdict and for the captured output of the upgrade
+# journeys, in place of grepping a `--nocapture` log.
+[profile.ci]
+fail-fast = true
+
+[profile.ci.junit]
+path = "junit.xml"
+report-name = "test-workspace"
+store-success-output = true
+store-failure-output = true
