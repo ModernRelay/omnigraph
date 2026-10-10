@@ -2703,7 +2703,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_no_recovery_sidecars(dir.path());
     assert_no_staging_files(dir.path());
 
-    // The Person rewrite is a detached version and the Tag create is an
+    // The Person column add is a detached version and the Tag create is an
     // unregistered dataset: nothing moved the manifest or any linear HEAD,
     // so reopening has nothing to roll back.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -2727,7 +2727,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_eq!(
         person_head.version().version,
         person_head_before,
-        "a detached rewrite never moves the linear HEAD"
+        "a detached schema evolution never moves the linear HEAD"
     );
     assert!(snapshot.dataset("node:Tag").is_none());
     let live_schema = db.schema_source();
@@ -2736,7 +2736,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
 
     db.apply_schema(&v2_schema)
         .await
-        .expect("the retry rewrites from the pin and reclaims the Tag leftover");
+        .expect("the retry evolves from the pin and reclaims the Tag leftover");
     assert!(db.schema_source().contains("city: String?"));
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
@@ -3078,7 +3078,7 @@ edge WorksAt: Human -> Company
         let error = db
             .apply_schema(desired)
             .await
-            .expect_err("rename+rewrite must stop after its detached table effect");
+            .expect_err("rename + key-property rename must stop after its detached table effect");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial rename error: {error}"
@@ -3088,8 +3088,8 @@ edge WorksAt: Human -> Company
     assert_no_staging_files(dir.path());
     drop(db);
 
-    // The rewrite is a detached version behind the source alias's pin; the
-    // rename was never published. Reopening finds the graph untouched.
+    // The column rename is a detached Project behind the source alias's pin;
+    // the type rename was never published. Reopening finds the graph untouched.
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let snapshot = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -3106,7 +3106,7 @@ edge WorksAt: Human -> Company
     recovered
         .apply_schema(desired)
         .await
-        .expect("the retry publishes the rename and rewrite");
+        .expect("the retry publishes the type and property renames");
     assert_eq!(
         helpers::count_rows(&recovered, "node:Human").await,
         people_before
@@ -3171,7 +3171,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
         assert_eq!(
             head.version().version,
             heads_before[type_name],
-            "{type_name}: a detached rewrite never moves the linear HEAD"
+            "{type_name}: a detached schema evolution never moves the linear HEAD"
         );
     }
     assert_eq!(
@@ -3277,7 +3277,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
             .version()
             .version,
         winner_lance_head,
-        "the abandoned detached rewrite never moved the linear HEAD"
+        "the abandoned detached schema evolution never moved the linear HEAD"
     );
     assert_eq!(
         branch_head_commit_id(dir.path(), "main").await.unwrap(),
