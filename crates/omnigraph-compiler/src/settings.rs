@@ -111,6 +111,17 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         doc: "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
     },
     SettingSpec {
+        name: "write_max_bytes",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(33_554_432),
+        },
+        default: "33554432",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_WRITE_MAX_BYTES",
+        doc: "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes",
+    },
+    SettingSpec {
         name: "history_release_bytes",
         kind: SettingKind::Integer {
             min: 1024,
@@ -132,6 +143,7 @@ pub enum SettingId {
     AnnNprobes,
     StageWriteConcurrency,
     TraversalWorkLimit,
+    WriteMaxBytes,
     HistoryReleaseBytes,
 }
 
@@ -144,6 +156,7 @@ impl SettingId {
         SettingId::AnnNprobes,
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
+        SettingId::WriteMaxBytes,
         SettingId::HistoryReleaseBytes,
     ];
 
@@ -355,6 +368,7 @@ pub struct SessionSettings {
     ann_nprobes: Option<usize>,
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
+    write_max_bytes: u64,
     history_release_bytes: usize,
 }
 
@@ -370,6 +384,7 @@ impl Default for SessionSettings {
             ann_nprobes: None,
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
+            write_max_bytes: 1,
             history_release_bytes: 1024,
         };
         for id in SettingId::ALL {
@@ -436,6 +451,10 @@ impl SessionSettings {
                 self.stage_write_concurrency =
                     usize::try_from(width).expect("invariant: the row's range is 1..=64");
             }
+            SettingId::WriteMaxBytes => {
+                self.write_max_bytes = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=33554432");
+            }
             SettingId::HistoryReleaseBytes => {
                 self.history_release_bytes = usize::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1024..=262144");
@@ -456,6 +475,7 @@ impl SessionSettings {
             SettingId::StageWriteConcurrency => {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
+            SettingId::WriteMaxBytes => self.write_max_bytes = from.write_max_bytes,
             SettingId::HistoryReleaseBytes => {
                 self.history_release_bytes = from.history_release_bytes;
             }
@@ -471,6 +491,7 @@ impl SessionSettings {
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
+            SettingId::WriteMaxBytes => self.write_max_bytes.to_string(),
             SettingId::HistoryReleaseBytes => self.history_release_bytes.to_string(),
         }
     }
@@ -522,6 +543,11 @@ impl SessionSettings {
 
     pub fn stage_write_concurrency(&self) -> usize {
         self.stage_write_concurrency
+    }
+
+    /// The independent row-data and Blob-payload allowances for bounded writes.
+    pub fn write_max_bytes(&self) -> u64 {
+        self.write_max_bytes
     }
 
     /// The byte budget of a branch's buffer of unreleased commits for this
@@ -731,6 +757,44 @@ mod tests {
     }
 
     #[test]
+    fn write_max_bytes_row_bounds_and_environment() {
+        let id = SettingId::parse("write_max_bytes").unwrap();
+        let defaults = SessionSettings::default();
+        assert_eq!(defaults.get(id), "33554432");
+        id.refuse_from_request().unwrap();
+        for value in ["1", "4093", "33554432"] {
+            let changed = defaults.clone().with("write_max_bytes", value).unwrap();
+            assert_eq!(changed.get(id), value);
+            let mut copied = defaults.clone();
+            copied.copy_field(&changed, id);
+            assert_eq!(copied, changed);
+        }
+        for value in ["0", "-1", "33554433", "9223372036854775808"] {
+            let error = defaults.clone().with("write_max_bytes", value).unwrap_err();
+            assert!(error.to_string().contains("an integer in 1..=33554432"));
+        }
+        for value in ["many", "\"4093\""] {
+            assert!(defaults.clone().with("write_max_bytes", value).is_err());
+        }
+        let (environment, sources) =
+            from_env_with(|name| (name == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "4093".to_string()))
+                .unwrap();
+        assert_eq!(environment.get(id), "4093");
+        assert_eq!(sources[id as usize], Source::Env);
+        assert_eq!(
+            environment
+                .with("write_max_bytes", "33554432")
+                .unwrap()
+                .get(id),
+            "33554432"
+        );
+        let error =
+            from_env_with(|name| (name == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "0".to_string()))
+                .unwrap_err();
+        assert!(error.to_string().contains("OMNIGRAPH_WRITE_MAX_BYTES"));
+    }
+
+    #[test]
     fn history_release_bytes_row_bounds() {
         let defaults = SessionSettings::default();
         assert_eq!(defaults.history_release_bytes(), 262_144);
@@ -802,7 +866,7 @@ mod tests {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, history_release_bytes"
+            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, history_release_bytes"
         );
         let err = SessionSettings::default().with("engine", "v1").unwrap_err();
         assert_eq!(
