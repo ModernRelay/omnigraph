@@ -66,7 +66,48 @@ ENGINE_CASES = (
     "interrupted::interruption_boundaries_retry_from_stamp_9",
     "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock",
     "interrupted::interruption_boundaries_retry_from_stamp_8",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_legacy",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_before_activation",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_activation",
     "interrupted::a_fenced_stamp_8_or_9_rerun_reads_the_archived_contract_not_the_root_objects",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_widened_pg",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_corrupt_ir",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg",
+    "interrupted::a_fenced_locked_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg",
+    "interrupted::a_fenced_stamp_8_rerun_reads_the_archived_contract_not_a_respelled_root",
     "interrupted::a_fenced_stamp_9_rerun_without_its_archived_contract_asks_for_the_backup",
     "interrupted::partial_legacy_write_is_completed_on_retry",
     "interrupted::resume_after_directory_skips_census",
@@ -421,11 +462,13 @@ class GuardTests(unittest.TestCase):
             self.assertIn("db::upgrade::tests::" + name, engine)
 
     def test_every_named_case_exists_in_its_source(self):
+        # A case is an `fn` or a `name: …;` row of the `retry_journeys!` macro.
         for scope, cases in (("crossversion", CASES), ("engine", ENGINE_CASES)):
             source = (ROOT / SCOPES[scope][1]).read_text()
             for name in cases:
                 with self.subTest(name=name):
-                    self.assertRegex(source, rf"\bfn {name.rsplit('::', 1)[-1]}\(")
+                    bare = name.rsplit("::", 1)[-1]
+                    self.assertRegex(source, rf"(?m)\bfn {bare}\(|^\s+{bare}: ", msg=name)
 
     def test_log_requires_every_case_and_positive_unskipped_summary(self):
         good = "test alpha ... ok\ntest beta ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"

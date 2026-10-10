@@ -1062,7 +1062,7 @@ async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
             retained.push(chunk);
         }
         assert!(
-            tokio::time::timeout(Duration::from_millis(500), stream.try_next())
+            tokio::time::timeout(Duration::from_millis(300), stream.try_next())
                 .await
                 .is_err(),
             "{door}: admitted transport backpressure must remain pending"

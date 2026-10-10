@@ -52,6 +52,18 @@ fn query_shape_cases() -> impl Iterator<Item = (&'static str, bool)> {
         .chain(TRAVERSAL_SHAPES)
 }
 
+macro_rules! scenario_tests {
+    ($run:ident, $covered:ident, [$($test:ident => $name:literal),* $(,)?]) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                $run($name).await;
+            }
+        )*
+        const $covered: &[&str] = &[$($name),*];
+    };
+}
+
 fn catalog() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks")
 }
@@ -259,27 +271,58 @@ fn end_to_end_catalog_selects_complete_public_operations() {
     }
 }
 
-#[tokio::test]
-async fn end_to_end_catalog_executes_exact_rows_and_fresh_handle_isolation() {
-    for (name, kind) in END_TO_END {
-        let p = plan(name);
-        let (sample, _) = run_sample(&p)
-            .await
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(sample.outcome, "expectations-passed", "{name}");
-        assert!(sample.verification.selected_assertion_passed, "{name}");
-        assert!(sample.verification.following_assertions > 0, "{name}");
-        assert_eq!(
-            sample.steps.iter().filter(|step| step.ordinal == 1).count(),
-            1,
-            "{name}: one complete public operation is measured"
-        );
-        assert_eq!(
-            sample.merge.is_some(),
-            kind == StepKind::BranchMerge,
-            "{name}"
-        );
-    }
+async fn end_to_end_scenario(name: &str) {
+    let kind = END_TO_END
+        .iter()
+        .find(|(id, _)| *id == name)
+        .unwrap_or_else(|| panic!("{name}: not an END_TO_END scenario"))
+        .1;
+    let p = plan(name);
+    let (sample, _) = run_sample(&p)
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert_eq!(sample.outcome, "expectations-passed", "{name}");
+    assert!(sample.verification.selected_assertion_passed, "{name}");
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    assert_eq!(
+        sample.steps.iter().filter(|step| step.ordinal == 1).count(),
+        1,
+        "{name}: one complete public operation is measured"
+    );
+    assert_eq!(
+        sample.merge.is_some(),
+        kind == StepKind::BranchMerge,
+        "{name}"
+    );
+}
+
+scenario_tests!(
+    end_to_end_scenario,
+    END_TO_END_SCENARIO_TESTS,
+    [
+        end_to_end_e2e_merge_all_changed => "e2e-merge-all-changed",
+        end_to_end_e2e_merge_all_new => "e2e-merge-all-new",
+        end_to_end_e2e_merge_diverged_updates => "e2e-merge-diverged-updates",
+        end_to_end_e2e_mixed_load => "e2e-mixed-load",
+        end_to_end_e2e_branch_create => "e2e-branch-create",
+        end_to_end_e2e_branch_create_from => "e2e-branch-create-from",
+        end_to_end_e2e_branch_list => "e2e-branch-list",
+        end_to_end_e2e_branch_delete => "e2e-branch-delete",
+        end_to_end_e2e_branch_adopt_untouched => "e2e-branch-adopt-untouched",
+        end_to_end_e2e_branch_adopt_written => "e2e-branch-adopt-written",
+        end_to_end_e2e_branch_first_write => "e2e-branch-first-write",
+        end_to_end_e2e_nearest_prefilter => "e2e-nearest-prefilter",
+        end_to_end_e2e_nearest_nprobes_one => "e2e-nearest-nprobes-one",
+        end_to_end_e2e_rrf_traversal => "e2e-rrf-traversal",
+    ]
+);
+
+#[test]
+fn end_to_end_scenario_tests_cover_every_catalog_scenario() {
+    assert_eq!(
+        END_TO_END_SCENARIO_TESTS,
+        END_TO_END.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -369,27 +412,58 @@ fn query_shape_catalog_selects_complete_queries_with_bounded_plans() {
     }
 }
 
-#[tokio::test]
-async fn query_shape_catalog_executes_exact_rows_and_fresh_handle_isolation() {
-    for (name, _) in query_shape_cases() {
-        let p = plan(name);
-        let (sample, _) = run_sample(&p)
-            .await
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert_eq!(sample.outcome, "expectations-passed", "{name}");
-        assert!(sample.verification.selected_assertion_passed, "{name}");
-        assert!(sample.verification.following_assertions > 0, "{name}");
-        assert_eq!(
-            sample
-                .steps
-                .iter()
-                .filter(|step| step.ordinal == p.definition.workload.measured_step.ordinal)
-                .count(),
-            1,
-            "{name}: one complete query is measured"
-        );
-        assert!(sample.merge.is_none(), "{name}");
-    }
+async fn query_shape_scenario(name: &str) {
+    let p = plan(name);
+    let (sample, _) = run_sample(&p)
+        .await
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert_eq!(sample.outcome, "expectations-passed", "{name}");
+    assert!(sample.verification.selected_assertion_passed, "{name}");
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    assert_eq!(
+        sample
+            .steps
+            .iter()
+            .filter(|step| step.ordinal == p.definition.workload.measured_step.ordinal)
+            .count(),
+        1,
+        "{name}: one complete query is measured"
+    );
+    assert!(sample.merge.is_none(), "{name}");
+}
+
+scenario_tests!(
+    query_shape_scenario,
+    QUERY_SHAPE_SCENARIO_TESTS,
+    [
+        query_shape_e2e_query_scan => "e2e-query-scan",
+        query_shape_e2e_query_wide_scan => "e2e-query-wide-scan",
+        query_shape_e2e_query_filter => "e2e-query-filter",
+        query_shape_e2e_query_lookup => "e2e-query-lookup",
+        query_shape_e2e_query_count => "e2e-query-count",
+        query_shape_e2e_query_grouped => "e2e-query-grouped",
+        query_shape_e2e_query_top_people => "e2e-query-top-people",
+        query_shape_e2e_query_friends => "e2e-query-friends",
+        query_shape_e2e_query_filtered_friends => "e2e-query-filtered-friends",
+        query_shape_e2e_query_no_friends => "e2e-query-no-friends",
+        query_shape_e2e_query_count_bare => "e2e-query-count-bare",
+        query_shape_e2e_query_destination_projection => "e2e-query-destination-projection",
+        query_shape_e2e_query_grouped_fanout => "e2e-query-grouped-fanout",
+        query_shape_e2e_query_destination_search => "e2e-query-destination-search",
+        query_shape_e2e_traversal_hop1 => "e2e-traversal-hop1",
+        query_shape_e2e_traversal_hop2 => "e2e-traversal-hop2",
+        query_shape_e2e_traversal_hop3 => "e2e-traversal-hop3",
+        query_shape_e2e_traversal_selective_csr => "e2e-traversal-selective-csr",
+        query_shape_e2e_traversal_selective_indexed => "e2e-traversal-selective-indexed",
+    ]
+);
+
+#[test]
+fn query_shape_scenario_tests_cover_every_catalog_scenario() {
+    assert_eq!(
+        QUERY_SHAPE_SCENARIO_TESTS,
+        query_shape_cases().map(|(id, _)| id).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -503,43 +577,62 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         assert!(sample.merge.is_none());
     }
 }
+async fn bounded_scenario(name: &str) -> crate::dataset_identity::DatasetLogicalV1 {
+    let p = plan(name);
+    let (sample, _, logical) = run_sample_with_logical(&p)
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert!(sample.verification.following_assertions > 0, "{name}");
+    let main = logical.branches.iter().find(|b| b.name == "main").unwrap();
+    if name.starts_with("very-long-history-32-") {
+        assert_eq!(main.history_commits, 34, "{name}");
+    }
+    logical
+}
+
+scenario_tests!(
+    bounded_scenario,
+    BOUNDED_SCENARIO_TESTS,
+    [
+        bounded_very_long_history_32_read => "very-long-history-32-read",
+        bounded_very_long_history_32_write => "very-long-history-32-write",
+        bounded_very_long_history_32_reopen => "very-long-history-32-reopen",
+        bounded_hot_table_idle_base => "hot-table-idle-base",
+        bounded_hot_table_idle_tables_4 => "hot-table-idle-tables-4",
+        bounded_hot_table_idle_branches_4 => "hot-table-idle-branches-4",
+        bounded_hot_table_idle_branches_4_aged => "hot-table-idle-branches-4-aged",
+        bounded_parallel_tables_1 => "parallel-tables-1",
+        bounded_parallel_tables_2 => "parallel-tables-2",
+        bounded_parallel_tables_4 => "parallel-tables-4",
+        bounded_identity_lifecycle => "identity-lifecycle",
+        bounded_repeated_deletion_recreation_rows => "repeated-deletion-recreation-rows",
+        bounded_repeated_deletion_recreation_branches => "repeated-deletion-recreation-branches",
+        bounded_threshold_crossings_before => "threshold-crossings-before",
+        bounded_threshold_crossings_at => "threshold-crossings-at",
+        bounded_threshold_crossings_after => "threshold-crossings-after",
+        bounded_threshold_crossings_production_control => "threshold-crossings-production-control",
+    ]
+);
+
+/// Equal current content across three different histories is one claim, so
+/// the three `equal-current-*` scenarios stay in one test.
 #[tokio::test]
-async fn bounded_scenario_catalog_executes_exact_postconditions_and_retained_history() {
+async fn bounded_equal_current_histories_share_content_identity() {
+    assert!(
+        BOUNDED_SCENARIO_TESTS
+            .iter()
+            .all(|name| !name.starts_with("equal-current-")),
+        "an equal-current scenario outside this test loses its cross-history claim"
+    );
     let mut equal_current = Vec::new();
     for name in [
-        "very-long-history-32-read",
-        "very-long-history-32-write",
-        "very-long-history-32-reopen",
-        "hot-table-idle-base",
-        "hot-table-idle-tables-4",
-        "hot-table-idle-branches-4",
-        "hot-table-idle-branches-4-aged",
-        "parallel-tables-1",
-        "parallel-tables-2",
-        "parallel-tables-4",
-        "identity-lifecycle",
-        "repeated-deletion-recreation-rows",
-        "repeated-deletion-recreation-branches",
-        "threshold-crossings-before",
-        "threshold-crossings-at",
-        "threshold-crossings-after",
-        "threshold-crossings-production-control",
         "equal-current-narrow-one-batch",
         "equal-current-wide-one-batch",
         "equal-current-wide-four-batches",
     ] {
-        let p = plan(name);
-        let (sample, _, logical) = run_sample_with_logical(&p)
-            .await
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(sample.verification.following_assertions > 0, "{name}");
+        let logical = bounded_scenario(name).await;
         let main = logical.branches.iter().find(|b| b.name == "main").unwrap();
-        if name.starts_with("very-long-history-32-") {
-            assert_eq!(main.history_commits, 34, "{name}");
-        }
-        if name.starts_with("equal-current-") {
-            equal_current.push((name, main.clone()));
-        }
+        equal_current.push((name, main.clone()));
     }
     assert_eq!(equal_current.len(), 3);
     let narrow = &equal_current[0].1;

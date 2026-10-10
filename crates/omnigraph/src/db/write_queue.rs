@@ -51,6 +51,8 @@ use tokio::sync::{
     RwLock as AsyncRwLock,
 };
 
+use crate::seams::{DecideSeam, decide_seam};
+
 /// DST seam: one write-queue slot — the lock plus its RELEASE EPOCH.
 /// The epoch closes an arrival-order leak: without it the mutex RELEASE
 /// is an ungated event, so a contender's retry races the holder's guard
@@ -225,18 +227,44 @@ impl Drop for SchemaExclusivePermit {
     }
 }
 
+decide_seam! {
+    /// An exclusive acquisition whose first attempt found the gate held, so
+    /// the caller is about to queue behind the holder; crossed once per
+    /// acquisition, outside any turn. An observation site: the acquire has
+    /// no outcome to give a fired effect, so a test arms `observe` or `hold`
+    /// here to see a queued writer instead of timing its absence.
+    pub static SCHEMA_GATE_EXCLUSIVE_QUEUED = ("write_queue.schema_gate_exclusive_queued", Unreachable, [Fail]);
+}
+
+/// Cross an observation seam; the decision is read and passed.
+fn observed(seam: &'static DecideSeam) {
+    #[cfg(feature = "failpoints")]
+    let _ = seam.crossed();
+    #[cfg(not(feature = "failpoints"))]
+    let _ = seam;
+}
+
 /// One side of the schema gate on the [`scheduled_lock`] protocol: plain
-/// blocking acquire uninstalled; installed, try only when the release
-/// epoch moved, yielding every turn.
+/// blocking acquire uninstalled; installed, try only when the release epoch
+/// moved, yielding every turn. `queued` is crossed once the first try fails.
 async fn scheduled_schema_permit<G>(
     slot: &SchemaGateSlot,
     acquire: impl AsyncFnOnce(Arc<AsyncRwLock<()>>) -> G,
     try_acquire: impl Fn(Arc<AsyncRwLock<()>>) -> Option<G>,
+    mut queued: Option<&'static DecideSeam>,
 ) -> G {
     let mut wait_epoch: Option<u64> = None;
     loop {
         match crate::dst_gate::turn() {
-            None => return acquire(Arc::clone(&slot.lock)).await,
+            None => {
+                if let Some(guard) = try_acquire(Arc::clone(&slot.lock)) {
+                    return guard;
+                }
+                if let Some(seam) = queued.take() {
+                    observed(seam);
+                }
+                return acquire(Arc::clone(&slot.lock)).await;
+            }
             Some(_turn) => {
                 let epoch_now = slot.releases.load(std::sync::atomic::Ordering::SeqCst);
                 if wait_epoch.is_none_or(|e| epoch_now != e) {
@@ -248,6 +276,11 @@ async fn scheduled_schema_permit<G>(
                 // else: no release since the failed attempt — a no-op turn.
             }
         }
+        if wait_epoch.is_some()
+            && let Some(seam) = queued.take()
+        {
+            observed(seam);
+        }
         tokio::task::yield_now().await;
     }
 }
@@ -257,6 +290,7 @@ async fn scheduled_schema_shared(slot: Arc<SchemaGateSlot>) -> SchemaSharedPermi
         &slot,
         async |lock| lock.read_owned().await,
         |lock| lock.try_read_owned().ok(),
+        None,
     )
     .await;
     SchemaSharedPermit {
@@ -270,6 +304,7 @@ async fn scheduled_schema_exclusive(slot: Arc<SchemaGateSlot>) -> SchemaExclusiv
         &slot,
         async |lock| lock.write_owned().await,
         |lock| lock.try_write_owned().ok(),
+        Some(&SCHEMA_GATE_EXCLUSIVE_QUEUED),
     )
     .await;
     SchemaExclusivePermit {

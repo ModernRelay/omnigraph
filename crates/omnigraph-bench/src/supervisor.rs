@@ -59,6 +59,8 @@ pub(crate) struct SupervisionInput {
     pub deadline: Option<Duration>,
     #[cfg(test)]
     pub auxiliary_deadline_override: Option<Duration>,
+    #[cfg(test)]
+    pub post_settle_deadline_override: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +210,12 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
     }
 
     let auxiliary_deadline = auxiliary_deadline(&input);
+    #[cfg(test)]
+    let post_settle_deadline = input
+        .post_settle_deadline_override
+        .unwrap_or(auxiliary_deadline);
+    #[cfg(not(test))]
+    let post_settle_deadline = auxiliary_deadline;
     let ready = match worker.receive(auxiliary_deadline) {
         Ok(frame) => frame,
         Err(ReceiveFailure::Timeout) => {
@@ -387,7 +395,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         );
     }
 
-    let complete = match worker.receive(auxiliary_deadline) {
+    let complete = match worker.receive(post_settle_deadline) {
         Ok(frame) => frame,
         Err(ReceiveFailure::Timeout) => {
             return worker.kill_error(
@@ -396,7 +404,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
                 format!(
                     "repetition {} settled but did not finish exact verification within {} seconds",
                     input.repetition,
-                    auxiliary_deadline.as_secs()
+                    post_settle_deadline.as_secs()
                 ),
             );
         }
@@ -459,7 +467,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         return worker.kill_error("finalize-protocol", "worker_protocol_error", message);
     }
 
-    let child_exit = match worker.wait_for_exit(auxiliary_deadline) {
+    let child_exit = match worker.wait_for_exit(post_settle_deadline) {
         Ok(child_exit) => child_exit,
         Err(message) => {
             return worker.kill_error("exit-timeout", "worker_exit_timeout", message);
@@ -1383,6 +1391,7 @@ mod tests {
     const TEST_ELAPSED_US: u64 = 0;
     const QUICK_DEADLINE: Duration = Duration::from_millis(250);
     const BOUNDED_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
+    const BOUNDED_POST_SETTLE_DEADLINE: Duration = Duration::from_millis(500);
     const GENEROUS_DEADLINE: Duration = Duration::from_secs(10);
     const GENEROUS_AUXILIARY_DEADLINE: Duration = Duration::from_secs(10);
     static WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1486,6 +1495,7 @@ mod tests {
             metadata_digest: metadata_digest(),
             deadline: Some(GENEROUS_DEADLINE),
             auxiliary_deadline_override: Some(GENEROUS_AUXILIARY_DEADLINE),
+            post_settle_deadline_override: None,
         };
         (workspace, input)
     }
@@ -1691,7 +1701,7 @@ mod tests {
         input.auxiliary_deadline_override = Some(Duration::from_secs(5));
         let expected = valid_sample(&input);
         let body = format!(
-            "printf '%s\\n' \"$$\" >> \"$0.pids\"\nsleep 1\n{}",
+            "printf '%s\\n' \"$$\" >> \"$0.pids\"\nwhile [ \"$(grep -c '' \"$0.pids\")\" -lt 2 ]; do sleep 0.01; done\n{}",
             normal_exchange(&input, complete_frame(&input, expected.clone()))
         );
         let (_guard, _directory, worker) = worker_script(&body);
@@ -1779,6 +1789,7 @@ mod tests {
         let placeholder = PathBuf::from("/placeholder");
         let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
+        input.post_settle_deadline_override = Some(BOUNDED_POST_SETTLE_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}sleep 300\n",
             emit(&ready_frame(&input)),
@@ -1801,6 +1812,7 @@ mod tests {
         let placeholder = PathBuf::from("/placeholder");
         let (_workspace, mut input) = supervision_input(placeholder);
         input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
+        input.post_settle_deadline_override = Some(BOUNDED_POST_SETTLE_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));
         body.push_str("sleep 300\n");

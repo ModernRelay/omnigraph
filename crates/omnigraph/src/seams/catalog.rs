@@ -31,6 +31,7 @@ omnigraph_seams::catalog! {
     crate::db::upgrade::UPGRADE_AFTER_LEGACY,
     crate::db::upgrade::UPGRADE_AFTER_STAGE,
     crate::db::upgrade::UPGRADE_BEFORE_ACTIVATION,
+    crate::db::write_queue::SCHEMA_GATE_EXCLUSIVE_QUEUED,
     crate::db::omnigraph::BRANCH_CONTROL_PRE_GATES,
     crate::db::omnigraph::BRANCH_DELETE_POST_TABLE_GATES,
     crate::db::omnigraph::CHANGE_FEED_POST_CAPTURE,

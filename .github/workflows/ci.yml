@@ -721,6 +721,9 @@ jobs:
           # draining one binary at a time. The `ci` profile
           # (.config/nextest.toml) writes the JUnit report with captured
           # output; the owner check below reads it in place of a log.
+          # Warm the executables built by the preceding debug test build.
+          target/debug/omnigraph-bench --version
+          target/debug/omnigraph --version
           cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
             --profile ci ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
             --features "$FAILPOINT_FEATURES"
@@ -732,12 +735,14 @@ jobs:
           # The two upgrade journeys and these real CLI/server/proxy journeys
           # must execute in the ordinary workspace gate. A removed, filtered or
           # re-ignored owner is not green, and a journey that skipped its
-          # released binary is not green either.
+          # released binary is not green either. The live-apply journey
+          # (`cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart`)
+          # waits on the CLI's real 500 ms poll interval for about 30 s, so it
+          # is a `nightly:` owner of `tests-slow-nightly.yml` instead.
           owners=()
           for test_name in \
             current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end \
             current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \
-            cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
             remote_server_and_cli_end_to_end_flow \
             remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
             remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph \
@@ -745,6 +750,7 @@ jobs:
             remote_read_preserves_projection_order_in_json_and_csv \
             remote_branch_create_list_merge_flow \
             remote_merge_delivery_loss_never_replays_committed_effect \
+            remote_merge_statement_delivery_loss_never_replays_committed_effect \
             remote_deployment_delivery_loss_preserves_owned_completion \
             remote_branch_delete_removes_branch \
             remote_export_round_trips_full_branch_graph \

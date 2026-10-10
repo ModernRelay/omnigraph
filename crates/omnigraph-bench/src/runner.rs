@@ -2351,6 +2351,8 @@ fn run_supervised_repetitions(
                 .map(Duration::from_secs),
             #[cfg(test)]
             auxiliary_deadline_override: None,
+            #[cfg(test)]
+            post_settle_deadline_override: None,
         });
 
         if result
