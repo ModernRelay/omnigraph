@@ -234,7 +234,25 @@ jobs:
         if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'served'
         env:
           RUSTFLAGS: ""
-        run: cargo test -p omnigraph-gqt-served --locked --timings -- --nocapture
+        run: cargo test -p omnigraph-gqt-served -p omnigraph-cli -p omnigraph-server -p omnigraph-gqt --locked --timings --test gqt_served_conformance --test gqt_served_count -- --nocapture
+
+      # `cargo test --no-run` builds the binaries in the same dev-dependency
+      # feature world as the two test steps; `cargo build --bins` would resolve
+      # omnigraph-cluster without failpoints and test-util and compile it again.
+      - name: Build the served command-line binaries
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'served'
+        env:
+          RUSTFLAGS: ""
+        run: cargo test -p omnigraph-gqt-served -p omnigraph-cli -p omnigraph-server -p omnigraph-gqt --no-run --locked --timings
+
+      - name: Run the served command-line smoke
+        if: needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode == 'served'
+        env:
+          RUSTFLAGS: ""
+        run: |
+          set -euo pipefail
+          cargo test -p omnigraph-gqt-served -p omnigraph-cli -p omnigraph-server -p omnigraph-gqt --test gqt_served_smoke --locked --timings gqt_server_binary_round_trip -- --exact --include-ignored --nocapture | tee target/gqt-served-smoke.log
+          grep -Fx 'test gqt_server_binary_round_trip ... ok' target/gqt-served-smoke.log
 
       - name: Retain GQT invocation reports
         if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy' && matrix.mode != 'served'

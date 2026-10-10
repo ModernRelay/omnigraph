@@ -5601,6 +5601,7 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
+ "url",
 ]
 
 [[package]]

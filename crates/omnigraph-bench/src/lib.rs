@@ -23,9 +23,12 @@ pub mod fixture_reference;
 pub mod fixture_worker;
 pub mod gqt_case;
 #[doc(hidden)]
+pub mod gqt_evidence;
+#[doc(hidden)]
 pub mod gqt_protocol;
 pub mod gqt_record;
 pub mod gqt_runner;
+pub mod gqt_served;
 mod gqt_supervisor;
 #[doc(hidden)]
 pub mod gqt_worker;
