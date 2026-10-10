@@ -376,14 +376,17 @@ fn read_queries_build_an_engine_plan_without_a_registry_entry() {
         RouteOverride::ForceExecutor,
         RouteOverride::ForcePlanner,
     ] {
-        let Decision::Engine { plan, explain, .. } = route(&op, &source, override_, &BOUNDS) else {
+        let Decision::Engine { plan, explain, .. } =
+            futures::executor::block_on(route(&op, &source, override_, &BOUNDS).finalize(&source))
+        else {
             panic!("read query did not build an engine plan under {override_:?}");
         };
         let Operation::Query(query) = &op else {
             unreachable!()
         };
         let execution =
-            omnigraph_planner::plan_query(query, &source, &BOUNDS).expect("execution plan");
+            futures::executor::block_on(omnigraph_planner::plan_query(query, &source, &BOUNDS))
+                .expect("execution plan");
         assert_eq!(execution.to_json(), plan.to_json());
         assert!(plan.node(plan.root()).is_some());
         assert_eq!(explain.route, "engine");
@@ -405,11 +408,14 @@ fn physical_ids(node: &serde_json::Value, out: &mut Vec<u64>) {
 #[test]
 fn explain_version_is_four_and_every_physical_node_carries_its_id() {
     assert_eq!(omnigraph_planner::explain::EXPLAIN_VERSION, 4);
-    let Decision::Engine { plan, explain, .. } = route(
-        &documents_query(),
-        &doc_source(),
-        RouteOverride::Registry,
-        &BOUNDS,
+    let Decision::Engine { plan, explain, .. } = futures::executor::block_on(
+        route(
+            &documents_query(),
+            &doc_source(),
+            RouteOverride::Registry,
+            &BOUNDS,
+        )
+        .finalize(&doc_source()),
     ) else {
         panic!("read query did not build an engine plan");
     };

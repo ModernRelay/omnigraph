@@ -1204,7 +1204,7 @@ impl<'a> BlobDescriptorDecoder<'a> {
     /// resolves managed (inline/packed/dedicated) bytes from the row's owning
     /// data file, then `position`/`size`/`blob_id` within it. So the identity
     /// must be qualified by *which* data file. It uses the file's stable path
-    /// (`data_file_path`) — a per-file v4 UUID Lance mints once and never
+    /// (`managed_data_file`) — a per-file v4 UUID Lance mints once and never
     /// rewrites; compaction, `Overwrite`, and per-branch writes all produce a
     /// NEW UUID. Unlike the numeric fragment id, this is globally unique: it
     /// does not restart at 0 on `Overwrite` and is not branch-local, so equal
@@ -1213,7 +1213,16 @@ impl<'a> BlobDescriptorDecoder<'a> {
     /// placement, so their identity is source-independent. Null uses the
     /// classified state, never sentinel child values, so the two physical null
     /// encodings share one identity.
-    pub(crate) fn physical_identity(&self, row: usize, data_file_path: &str) -> Result<String> {
+    ///
+    /// `managed_data_file` is called only for a managed descriptor. A null or
+    /// external identity names no file, and a fragment written before its Blob
+    /// column was added has no data file for that column at all: Lance reads
+    /// the column there as null.
+    pub(crate) fn physical_identity<'path>(
+        &self,
+        row: usize,
+        managed_data_file: impl FnOnce() -> Result<&'path str>,
+    ) -> Result<String> {
         match self.classify(row)? {
             BlobDescriptor::Null => Ok("null".to_string()),
             BlobDescriptor::External {
@@ -1225,7 +1234,8 @@ impl<'a> BlobDescriptorDecoder<'a> {
                 length.map(|len| len.to_string()).unwrap_or_default(),
             )),
             BlobDescriptor::Managed { .. } => Ok(format!(
-                "mgd:{data_file_path}:{}:{}:{}:{}",
+                "mgd:{}:{}:{}:{}:{}",
+                managed_data_file()?,
                 self.kinds.value(row),
                 self.positions.value(row),
                 self.sizes.value(row),
@@ -2473,6 +2483,55 @@ mod tests {
                 offset: 0,
                 length: None,
             }
+        );
+    }
+
+    /// Only a managed identity names its owning data file. A null or external
+    /// descriptor never asks for one, since a fragment written before its Blob
+    /// column was added has none; a managed descriptor whose file cannot be
+    /// resolved keeps the resolver's integrity error.
+    #[test]
+    fn physical_identity_resolves_a_data_file_only_for_managed_descriptors() {
+        let no_file =
+            || -> Result<&'static str> { panic!("a null or external identity names no data file") };
+        let null = StructArray::new_null(fields(), 1);
+        assert_eq!(
+            BlobDescriptorDecoder::try_new(&null)
+                .unwrap()
+                .physical_identity(0, no_file)
+                .unwrap(),
+            "null"
+        );
+        let external = descriptor(
+            Some(3),
+            Some(4),
+            Some(8),
+            Some(0),
+            Some("s3://bucket/object"),
+        );
+        assert_eq!(
+            BlobDescriptorDecoder::try_new(&external)
+                .unwrap()
+                .physical_identity(0, no_file)
+                .unwrap(),
+            "ext:4:8:s3://bucket/object"
+        );
+
+        let managed = descriptor(Some(1), Some(16), Some(8), Some(2), Some(""));
+        let decoder = BlobDescriptorDecoder::try_new(&managed).unwrap();
+        assert_eq!(
+            decoder.physical_identity(0, || Ok("a.lance")).unwrap(),
+            "mgd:a.lance:1:16:8:2"
+        );
+        assert_blob_integrity(
+            decoder
+                .physical_identity(0, || {
+                    Err(OmniError::blob_integrity(
+                        "fragment 0 has no data file for blob field 3",
+                    ))
+                })
+                .unwrap_err(),
+            "has no data file",
         );
     }
 

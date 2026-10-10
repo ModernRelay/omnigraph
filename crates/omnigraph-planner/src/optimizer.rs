@@ -10,11 +10,13 @@ use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
+use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR,
-    HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path, choose_expand_mode,
-    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    AccessPath, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
+    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
+    choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
+    scan_row_estimate,
 };
 use crate::error::PlanError;
 use crate::logical::{
@@ -311,6 +313,7 @@ fn resolve_pipeline(
                     LogicalNode::TableScan {
                         input: None,
                         spec: Box::new(ScanSpec {
+                            access: None,
                             side,
                             table,
                             version,
@@ -388,6 +391,7 @@ fn resolve_pipeline(
                     LogicalNode::TableScan {
                         input: Some(expand),
                         spec: Box::new(ScanSpec {
+                            access: None,
                             side,
                             table,
                             version,
@@ -848,6 +852,7 @@ fn scan(
         LogicalNode::TableScan {
             input: None,
             spec: Box::new(ScanSpec {
+                access: None,
                 side: side_id,
                 table: side.table.clone(),
                 version: Some(side.version),
@@ -1734,6 +1739,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
     match node {
         LogicalNode::TableScan { input: _, spec } => {
             let ScanSpec {
+                access: _,
                 side: _,
                 table: _,
                 version: _,
@@ -2034,7 +2040,7 @@ fn materialize_returns_late(
                 "{} rows, limit {limit}, ratio {HYDRATE_ROW_RATIO}",
                 rows.map_or_else(|| "unknown".to_string(), |rows| rows.to_string())
             ),
-            origin: "manifest row count, at most one row under a key equality",
+            origin: "manifest row count, at most one row under a key equality".to_string(),
         });
         if rows.is_some_and(|rows| rows <= threshold) {
             continue;
@@ -2623,7 +2629,7 @@ impl Lowering<'_> {
             } => {
                 let lowered = self.lower(*input)?;
                 let (mode, frontier_estimate, policy) =
-                    self.expand_mode(*input, edges, *min_hops, *max_hops)?;
+                    self.expand_mode(*input, edges, src_type, *min_hops, *max_hops)?;
                 let versions = edges
                     .members()
                     .iter()
@@ -2912,7 +2918,7 @@ impl Lowering<'_> {
                 self.decisions.push(StatisticSource {
                     statistic: "merge_side_shape".to_string(),
                     value: "keys then take-by-address on every side".to_string(),
-                    origin: "fixed rule",
+                    origin: "fixed rule".to_string(),
                 });
                 let [base, source, target] = sides;
                 self.join_algorithm = true;
@@ -2960,6 +2966,7 @@ impl Lowering<'_> {
         &mut self,
         input: LogicalId,
         edges: &EdgeSelection,
+        src_type: &str,
         min_hops: u32,
         max_hops: Option<u32>,
     ) -> Result<(ExpandMode, Option<u64>, ExpandPolicy), PlanError> {
@@ -2981,6 +2988,17 @@ impl Lowering<'_> {
             Traversal::Auto => None,
         };
         let input_rows = estimate_rows(self.logical, input, self.source);
+        let columns = self.source.node_type(src_type)?.columns;
+        let facts = self.source.index_facts(&format!("edge:{edge_type}"));
+        let covered = |column| {
+            let mut candidates = facts.iter().filter(|fact| fact.column == column).peekable();
+            candidates.peek().is_some() && candidates.all(|fact| fact.fully_covers_btree(column))
+        };
+        let full_coverage = match direction {
+            Direction::Out => covered(columns.src),
+            Direction::In => covered(columns.dst),
+            Direction::Both => covered(columns.src) && covered(columns.dst),
+        };
         let cost = self
             .source
             .expand_statistics(edge_type, direction)
@@ -2991,7 +3009,12 @@ impl Lowering<'_> {
                 effective_max_hops: executed_hops(min_hops, max_hops),
                 max_hops_cap: statistics.max_hops_cap,
                 max_frontier_cap: statistics.max_frontier_cap,
-                coverage: IndexCoverage::Indexed,
+                coverage: if full_coverage {
+                    IndexCoverage::Indexed
+                } else {
+                    IndexCoverage::Degraded
+                },
+                coverage_provenance: CoverageProvenance::PinnedIndexFacts,
                 csr_cached: self.csr_cached,
                 probe_factor: direction_probe_factor(direction),
             });
@@ -3037,7 +3060,7 @@ impl Lowering<'_> {
                 Some(bytes) => format!("{bytes} estimated, budget {budget}"),
                 None => format!("unknown, budget {budget}"),
             },
-            origin: "projected widths and storage statistics",
+            origin: "projected widths and storage statistics".to_string(),
         });
         Ok(access)
     }
@@ -3094,7 +3117,7 @@ impl Lowering<'_> {
                             spec.side, fragment.id
                         ),
                         value: "unknown".to_string(),
-                        origin: "manifest",
+                        origin: "manifest".to_string(),
                     });
                     return true;
                 };
@@ -3114,7 +3137,7 @@ impl Lowering<'_> {
                 self.bounds.ordered_scan_memory_bytes,
                 self.bounds.ordered_scan_max_input_batch_bytes
             ),
-            origin: "manifest",
+            origin: "manifest".to_string(),
         });
         spills || refused
     }
@@ -3398,7 +3421,7 @@ fn derive_properties(
                 sources.push(StatisticSource {
                     statistic: "key_width_bytes".to_string(),
                     value: bounds.key_width_bytes.to_string(),
-                    origin: "engine constant",
+                    origin: "engine constant".to_string(),
                 });
                 Properties {
                     schema: key_schema(spec),
@@ -3470,7 +3493,7 @@ fn derive_properties(
                             vec![StatisticSource {
                                 statistic: "build_side_key_bytes".to_string(),
                                 value: limit.to_string(),
-                                origin: "manifest rows times key width",
+                                origin: "manifest rows times key width".to_string(),
                             }],
                         )
                     }
@@ -3479,7 +3502,7 @@ fn derive_properties(
                         vec![StatisticSource {
                             statistic: "build_side_key_bytes".to_string(),
                             value: "unknown".to_string(),
-                            origin: "manifest holds no row count for a build fragment",
+                            origin: "manifest holds no row count for a build fragment".to_string(),
                         }],
                     ),
                 };
@@ -3509,7 +3532,7 @@ fn derive_properties(
                     sources: vec![StatisticSource {
                         statistic: "retained_limit".to_string(),
                         value: bounds.hydration_chunk_hard_bytes.to_string(),
-                        origin: "HYDRATION_CHUNK_HARD_BYTES",
+                        origin: "HYDRATION_CHUNK_HARD_BYTES".to_string(),
                     }],
                 }
             }
@@ -3525,7 +3548,7 @@ fn derive_properties(
                     sources: vec![StatisticSource {
                         statistic: "retained_limit".to_string(),
                         value: retained.to_string(),
-                        origin: "query memory pool / 8",
+                        origin: "query memory pool / 8".to_string(),
                     }],
                 }
             }
@@ -3711,7 +3734,7 @@ fn query_scan_rows(spec: &ScanSpec, source: &dyn PlanSource) -> (Estimate, Vec<S
             Estimate::Known(rows) => rows.to_string(),
             Estimate::Unknown => "unknown".to_string(),
         },
-        origin: "manifest row count, at most one row under a key equality",
+        origin: "manifest row count, at most one row under a key equality".to_string(),
     }];
     (rows, sources)
 }
@@ -3741,7 +3764,7 @@ fn scan_rows(spec: &ScanSpec, source: &dyn PlanSource) -> (Estimate, Vec<Statist
             Estimate::Known(rows) => rows.to_string(),
             Estimate::Unknown => "unknown".to_string(),
         },
-        origin: "manifest",
+        origin: "manifest".to_string(),
     }];
     (rows, sources)
 }
