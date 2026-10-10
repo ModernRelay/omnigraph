@@ -343,7 +343,7 @@ impl Estimate {
 pub struct StatisticSource {
     pub statistic: String,
     pub value: String,
-    pub origin: &'static str,
+    pub origin: String,
 }
 
 /// The properties a physical node declares: derived after selection,
@@ -889,6 +889,9 @@ impl PhysicalPlan {
                 ranked,
             } => {
                 let mut value = scan_json("Scan", spec);
+                if let Some(access) = &spec.access {
+                    access.explain(&mut value);
+                }
                 if let ScanInput::Dependent { .. } = source {
                     value["id_restriction"] = json!("input");
                     value["access"] = json!(AccessPath::IdLookup);

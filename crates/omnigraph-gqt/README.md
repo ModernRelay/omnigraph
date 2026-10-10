@@ -56,8 +56,40 @@ or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and
 automatic index building; ordinary steps may change the supplied store.
 `--store` refuses files with schema and seed, DST and server targets, seams,
-and concurrent blocks. Server targets, direct-engine memory storage and
-cloud fixture initialization fail admission explicitly.
+and concurrent blocks. Direct-engine memory storage and cloud fixture
+initialization fail admission explicitly.
+
+With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
+token-protected deployment), the declared `omnigraph-server` environments run
+against that server and nothing else is selected: each step travels to the
+route that already serves it (`--- query` and `branch list`/`show` to
+`POST /query`, `--- mutate` and the branch statements to `POST /mutate`,
+`--- load` and the seed to `POST /load`) and is judged from the answer the way
+the in-process path judges the engine. The server's graph must already carry
+the case's schema (`GET /schema` is compared; a cluster-backed graph refuses a
+remote schema apply), and the seed loads through `/load`, so the graph should
+be fresh. Without `--server`, an `omnigraph-server` environment is planned
+but not selected (the report says `partial`); the corpus therefore runs
+in-process as before, and the served conformance test in
+`crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs` runs every case
+that declares the target against an in-process server and requires a green
+in-process verdict and the same served verdict; `gqt_served_count.rs` totals
+the served and skipped cases and refuses an empty served set. A declared
+`omnigraph-server-dst` environment is refused at admission on every run: no
+runner implements it. The declared `storage` is recorded, not checked: no
+route reports the server's backend. Refused before any request, by name: `--- restart`,
+`--- concurrent`, seam directives, settings steps and settings prefixes on a
+control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`nearest`, `rrf`). The `--- expect shape` section is not judged under a
+server target: it holds the executor's Arrow schema against the compiler's,
+which no wire answer carries. `--server` is exclusive with `--store`, and a
+served run never blesses. `--server` selects exactly one `omnigraph-server`
+environment (`--storage` picks when several are declared), since every pass
+would share the one graph. Parameters travel as the case spells them and the
+server judges them, so a parameter error is the server's text. A served report
+carries no bearer token and does not replay: the server's state is not frozen
+in it, as an external `--store`'s is not.
 
 External workers inherit only the selected backend's storage configuration:
 `AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,
@@ -438,6 +470,11 @@ resolved member list and per-member directions. Selection kinds are `named`,
 canonical catalog names, with JSON quotes available for a member name. An
 endpoint-only `expand $a $b: mode indexed_scan` applies to every Expand between
 those bindings, including selections.
+The optional `# traversal: auto` header prepares indexes while leaving mode
+selection to the cost model. Without a traversal header or another index
+requirement, a fixture does not build indexes. `indexed` and `csr` prepare
+indexes and force their respective paths.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -446,7 +483,7 @@ plan or its mode differs. A `scan <Type>[ as $var]: access id_lookup` line
 selects the physical scans of that type (or the one bound to that binding)
 and claims each is a traversal's destination read once per slice of at most
 256 input rows; it fails when no such scan is in the physical plan, the scan
-is a table scan (no access path) or the build side of a hash join. A `hash
+has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
@@ -461,6 +498,12 @@ of the scan, the candidates it asks the index for and, on a `nearest` scan,
 the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
 setting does). Nothing is compared as rendered text, so a planner that
 reaches the same facts by another route keeps the case green.
+
+A `scan <Type>[ as $var]: access sequential` line requires the recorded
+sequential choice. `access index_probe <physical-column>` requires a probe
+with that physical column in a leaf of `index_query`; it does not compare
+rendered search text, residuals or index names. `pass scan_access` records
+completed finalization; `pass key_to_id` records a safe key narrowing.
 
 ## Reference comparison
 

@@ -1,0 +1,70 @@
+# issue: none
+# traversal: auto
+# notes: The narrowed __id literal must equal the stored id exactly; any trim, normalization or truncation drops the row or matches a neighbour.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":1}}
+{"type":"Person","data":{"slug":"alpha ","age":2}}
+{"type":"Person","data":{"slug":"team/alpha","age":3}}
+{"type":"Person","data":{"slug":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz-a","age":4}}
+{"type":"Person","data":{"slug":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz-b","age":5}}
+
+--- query
+set engine = v2;
+query trailing($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "alpha "}
+--- expect unordered
+{"p.age":2}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+
+--- query
+set engine = v2;
+query slashed($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "team/alpha"}
+--- expect unordered
+{"p.age":3}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+
+--- query
+set engine = v2;
+query long_key($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz-b"}
+--- expect unordered
+{"p.age":5}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id

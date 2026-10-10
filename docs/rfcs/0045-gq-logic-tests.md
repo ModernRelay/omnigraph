@@ -460,9 +460,9 @@ list; no line ever continues a previous entry); a key given twice is
 refused, except `# notes:`, which repeats to carry a multi-line note;
 `# notes:` and `# traversal:` are optional. `# issue:` takes a number in canonical
 spelling (no sign, no leading zeros) or `none`; any other spelling is
-refused. `# traversal:` takes `indexed` or `csr` and pins every
-declaration step to that mode, for cases whose subject is one traversal
-path (Execution semantics owns the default); a statement step traverses
+refused. `# traversal:` takes `auto`, `indexed` or `csr` and prepares indexes.
+`indexed` and `csr` pin every declaration step to that mode; `auto` retains
+cost-based selection. A statement step traverses
 nothing and runs outside the pin. `# traversal:` in a file that names a
 server API (Execution routes, below) is refused: the pin is a task-local seam of the runner process.
 
