@@ -23,8 +23,8 @@
 use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use crate::storage_layer::{
-    IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
+    IndexBuildSpec, KEYED_BLOB_PAYLOAD_MAX_BYTES, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
+    KeyedBytes, KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
 };
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
@@ -253,19 +253,90 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
     None
 }
 
+/// A keyed batch charges a managed Blob value's logical length to the payload
+/// ceiling and the Arrow bytes around it to the framing ceiling, so a value of
+/// exactly the payload ceiling fits, though the batch's whole Arrow size is over
+/// it, and one more byte is refused by the payload ceiling. An external
+/// reference's URI is framing: it carries no payload.
+#[test]
+fn keyed_bytes_split_blob_payload_from_framing() {
+    let limit = usize::try_from(KEYED_BLOB_PAYLOAD_MAX_BYTES).unwrap();
+    let exact = blob_person_pk_batch("alice", &vec![7_u8; limit]);
+    let bytes = KeyedBytes::of(&exact).unwrap();
+    assert_eq!(bytes.payload, KEYED_BLOB_PAYLOAD_MAX_BYTES);
+    assert!(bytes.framing > 0, "the batch around a value is never empty");
+    assert_eq!(
+        bytes.framing + bytes.payload,
+        u64::try_from(exact.get_array_memory_size()).unwrap()
+    );
+    assert!(bytes.framing + bytes.payload > KEYED_WRITE_MAX_BYTES);
+    assert_eq!(
+        bytes
+            .ensure_fits("keyed write bytes for node:Person")
+            .unwrap(),
+        bytes
+    );
+
+    let over = blob_person_pk_batch("alice", &vec![7_u8; limit + 1]);
+    match KeyedBytes::of(&over)
+        .unwrap()
+        .ensure_fits("keyed write bytes for node:Person")
+    {
+        Err(OmniError::ResourceLimitExceeded {
+            resource,
+            limit,
+            actual,
+        }) => {
+            assert_eq!(resource, "keyed write Blob payload bytes for node:Person");
+            assert_eq!(
+                (limit, actual),
+                (
+                    KEYED_BLOB_PAYLOAD_MAX_BYTES,
+                    KEYED_BLOB_PAYLOAD_MAX_BYTES + 1
+                )
+            );
+        }
+        other => panic!("one payload byte over must be refused, got {other:?}"),
+    }
+
+    let mut external = lance::blob::BlobArrayBuilder::new(1);
+    external.push_uri("s3://bucket/object.bin").unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let reference = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["bob"])) as _,
+            external.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let bytes = KeyedBytes::of(&reference).unwrap();
+    assert_eq!(bytes.payload, 0);
+    assert_eq!(
+        bytes.framing,
+        u64::try_from(reference.get_array_memory_size()).unwrap()
+    );
+}
+
 #[test]
 fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
     PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
         KEYED_WRITE_MAX_ROWS as u64,
-        KEYED_WRITE_MAX_BYTES,
+        KeyedBytes {
+            framing: KEYED_WRITE_MAX_BYTES,
+            payload: KEYED_BLOB_PAYLOAD_MAX_BYTES,
+        },
     ))
-    .expect("the exact keyed row/byte limits are inclusive");
+    .expect("the exact keyed row, framing and payload limits are inclusive");
 
     let row_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
         KEYED_WRITE_MAX_ROWS as u64 + 1,
-        0,
+        KeyedBytes::default(),
     ))
     .err()
     .expect("one row over must be rejected");
@@ -281,7 +352,7 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
     let byte_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
         0,
-        KEYED_WRITE_MAX_BYTES + 1,
+        KeyedBytes::framing(KEYED_WRITE_MAX_BYTES + 1),
     ))
     .err()
     .expect("one byte over must be rejected");
@@ -293,6 +364,23 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
             actual,
         } if resource == "retained keyed batch bytes per operation"
             && actual == KEYED_WRITE_MAX_BYTES + 1
+    ));
+
+    let payload_error = PendingScanAccount::new(PendingScanBudget::new(
+        "test:people",
+        0,
+        KeyedBytes::payload(KEYED_BLOB_PAYLOAD_MAX_BYTES + 1),
+    ))
+    .err()
+    .expect("one payload byte over must be rejected");
+    assert!(matches!(
+        payload_error,
+        OmniError::ResourceLimitExceeded {
+            ref resource,
+            limit: KEYED_BLOB_PAYLOAD_MAX_BYTES,
+            actual,
+        } if resource == "retained keyed batch Blob payload bytes per operation"
+            && actual == KEYED_BLOB_PAYLOAD_MAX_BYTES + 1
     ));
 }
 
@@ -1452,7 +1540,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 0, 0),
+            PendingScanBudget::new("test:people", 0, KeyedBytes::default()),
         )
         .await
         .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
@@ -1474,7 +1562,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8190, 0),
+            PendingScanBudget::new("test:people", 8190, KeyedBytes::default()),
         )
         .await
         .expect("projection containing key_column must succeed");
@@ -1495,7 +1583,7 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8191, 0),
+            PendingScanBudget::new("test:people", 8191, KeyedBytes::default()),
         )
         .await
         .expect_err("pending + unshadowed committed output must share the row budget");

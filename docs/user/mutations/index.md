@@ -149,9 +149,12 @@ Loads preserve supplied embeddings and do not generate them. Results report
 
 Insert/update mutations and incremental keyed loads are bounded to 8,192
 entities and 32 MiB per touched type, plus 32 MiB of retained Arrow batches
-across all touched types in one operation. Keyed loads also have a separate
-32 MiB parsed-payload estimate across types. External Blob payloads that require
-copying count toward the aggregate allowance. Every strict load retains its
+across all touched types in one operation. Managed Blob payloads are not part of
+those bytes: they have their own 32 MiB per touched type and across all touched
+types, so a single 32 MiB value fits beside its row. Keyed loads also have a
+separate 32 MiB parsed-payload estimate across types, split the same way.
+External Blob payloads that require copying count toward the payload
+allowance. Every strict load retains its
 projected in-memory size check. Blob values have further limits; see
 [Blob limits](../blobs.md#limits).
 

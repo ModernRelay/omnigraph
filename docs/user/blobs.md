@@ -152,7 +152,8 @@ and retry.
 |---|---|---|
 | 32 MiB of decoded `base64:` bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
 | 32 MiB of decoded `base64:` bytes | One `base64:` value, in a load or in an insert or update mutation | `decoded blob input bytes` |
-| 32 MiB per touched type, and 32 MiB across all touched types, Blob bytes included | Incremental writes: `append` and `merge` loads, inserts and updates. External bytes copied in and Blob values carried unchanged by an update count | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
+| 32 MiB per touched type, and 32 MiB across all touched types, Blob payloads excluded | Incremental writes: `append` and `merge` loads, inserts, updates and branch merges. Every byte of the rows except managed Blob payloads counts, URIs and Blob framing included | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation` |
+| 32 MiB of managed Blob payload per touched type, and 32 MiB across all touched types, inclusive | The same writes. Each Blob value counts its length; external bytes copied in and Blob values carried unchanged by an update count. A single value of exactly 32 MiB fits beside its row | the same names with `Blob payload bytes` in place of `bytes`, for example `keyed entity Blob payload bytes for <table>` |
 | 32 MiB of external payload copied into managed storage | One incremental write operation across all its types, and each type within it: two types copying 20 MiB each exceed it although each fits its per-type limit | `materialized external blob payload bytes` |
 | 32 MiB of Blob payload | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
 | 8,192 external references | One write operation or merge | `external Blob reference cells` |
@@ -165,7 +166,10 @@ and retry.
 
 The HTTP load request body is also capped at 32 MiB. That cap counts the
 encoded request, so one request carries about 24 MiB of decoded `base64:`
-data. Every HTTP request other than a load (`/load` and `/load/ndjson`) is bounded by the default 1 MiB request body limit, so a `base64:`
+data. The NDJSON loader that `omnigraph load` and `/load/ndjson` use caps each
+encoded line at 32 MiB the same way. The embedded `load` API checks each row's
+decoded size instead and has no line cap, so it admits a 32 MiB value; over
+HTTP, `/load` keeps its 32 MiB body cap. Every HTTP request other than a load (`/load` and `/load/ndjson`) is bounded by the default 1 MiB request body limit, so a `base64:`
 literal in an HTTP mutation hits that limit first.
 
 Values larger than these limits stay readable. The CLI and the HTTP server
