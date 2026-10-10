@@ -113,14 +113,16 @@ enum Command {
         no_build: bool,
         #[arg(long = "fixture")]
         fixtures: Vec<String>,
+        #[command(flatten)]
+        server_args: ServerArgs,
         #[arg(long)]
         archive: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     /// Private one-repetition worker endpoint used by the supervising runner.
-    #[command(name = "__gqt-worker-v1", hide = true)]
-    WorkerV1,
+    #[command(name = "__gqt-worker-v2", hide = true)]
+    WorkerV2,
     /// Private bounded fixture-builder endpoint used by the supervising runner.
     #[command(name = "__dataset-worker-v1", hide = true)]
     FixtureWorkerV1 { request: PathBuf, result: PathBuf },
@@ -237,8 +239,8 @@ async fn run_dataset(command: DatasetCommand) -> ExitCode {
             );
         }
         match load_case(&input).into_result() {
-            Ok(c) => match c.gqt() {
-                Ok(p) => p.dataset_build_plan(),
+            Ok(c) => match c.gqt().and_then(|p| p.dataset_build_plan()) {
+                Ok(p) => p,
                 Err(e) => {
                     return print_cli_failure(
                         Diagnostic::error("invalid_case", "dataset", e),
@@ -384,6 +386,48 @@ enum SuiteCommand {
 }
 
 #[derive(Debug, clap::Args)]
+struct ServerArgs {
+    /// Address of the already provisioned read-only benchmark server.
+    #[arg(long, requires_all = ["graph", "server_receipt"])]
+    server: Option<String>,
+    /// Graph ID on the server; must equal the deployment receipt's graph.
+    #[arg(long, requires = "server")]
+    graph: Option<String>,
+    /// Bounded deployment receipt with declared build and dataset identity.
+    #[arg(long, requires = "server")]
+    server_receipt: Option<PathBuf>,
+    /// Name of the environment variable containing the bearer token.
+    #[arg(long, requires = "server")]
+    server_token_env: Option<String>,
+}
+
+impl ServerArgs {
+    fn resolve(self) -> Result<Option<omnigraph_bench::gqt_served::ServedInput>, Diagnostic> {
+        let Some(server) = self.server else {
+            return Ok(None);
+        };
+        let graph = self.graph.ok_or_else(|| {
+            Diagnostic::error("invalid_server_input", "graph", "--graph is required")
+        })?;
+        let receipt = self.server_receipt.ok_or_else(|| {
+            Diagnostic::error(
+                "invalid_server_input",
+                "server-receipt",
+                "--server-receipt is required",
+            )
+        })?;
+        omnigraph_bench::gqt_served::ServedInput::from_cli(
+            &server,
+            &graph,
+            &receipt,
+            self.server_token_env.as_deref(),
+        )
+        .map(Some)
+        .map_err(|e| Diagnostic::error("invalid_server_input", e.path, e.message))
+    }
+}
+
+#[derive(Debug, clap::Args)]
 struct SuiteRunArgs {
     file: Option<PathBuf>,
     #[arg(long, requires = "queries", conflicts_with = "file")]
@@ -412,6 +456,8 @@ struct SuiteRunArgs {
     no_build: bool,
     #[arg(long = "fixture")]
     fixtures: Vec<String>,
+    #[command(flatten)]
+    server_args: ServerArgs,
     /// Publish complete immutable run records under this archive root.
     #[arg(long)]
     archive: Option<PathBuf>,
@@ -550,7 +596,7 @@ async fn main() -> ExitCode {
         Command::Suite { command } => run_suite(command).await,
         Command::Archive { command } => run_archive(command),
         Command::Projection { command } => run_projection(command).await,
-        Command::WorkerV1 => omnigraph_bench::gqt_worker::run_worker_stdio_v1().await,
+        Command::WorkerV2 => omnigraph_bench::gqt_worker::run_worker_stdio_v2().await,
         Command::FixtureWorkerV1 { request, result } => {
             omnigraph_bench::dataset_worker::run_dataset_worker_files_v1(&request, &result).await
         }
@@ -564,9 +610,14 @@ async fn main() -> ExitCode {
             dataset_cache,
             no_build,
             fixtures,
+            server_args,
             archive,
             json,
         } => {
+            let served = match server_args.resolve() {
+                Ok(input) => input,
+                Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
+            };
             let legacy = if config.is_none() {
                 match case.as_deref().map(bench_cli::legacy_input).transpose() {
                     Ok(legacy) => legacy.unwrap_or(false),
@@ -615,6 +666,7 @@ async fn main() -> ExitCode {
                     None,
                     RunOptions {
                         dataset_cache: Some(dataset_cache),
+                        served,
                         no_build,
                         fixture_bindings: fixtures,
                         worker_executable: std::env::current_exe().ok(),
@@ -685,6 +737,7 @@ async fn main() -> ExitCode {
                 None,
                 RunOptions {
                     dataset_cache: Some(dataset_cache),
+                    served,
                     no_build,
                     fixture_bindings: fixtures,
                     worker_executable: std::env::current_exe().ok(),
@@ -1213,6 +1266,7 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 dataset_cache,
                 no_build,
                 fixtures,
+                server_args,
                 archive,
                 json,
                 dataset,
@@ -1223,7 +1277,12 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 deadline_seconds,
                 filesystem,
             } = *args;
+            let served = match server_args.resolve() {
+                Ok(input) => input,
+                Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
+            };
             let options = RunOptions {
+                served,
                 scratch_root,
                 dataset_cache: dataset_cache.or_else(|| Some(PathBuf::from("target/gqt-datasets"))),
                 no_build,
@@ -1252,6 +1311,16 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                         "--case",
                         "case selectors require a suite path",
                     ),
+                    json,
+                );
+            }
+            if options.served.is_some() {
+                return bench_cli::failure(
+                    vec![Diagnostic::error(
+                        "invalid_server_input",
+                        "server",
+                        "served runs select a catalog scenario whose YAML declares the server environment; explicit pairs are embedded only",
+                    )],
                     json,
                 );
             }
@@ -1559,6 +1628,18 @@ async fn run_resolved_suite(
         Ok(selected) => selected,
         Err(diagnostic) => return print_cli_failure(diagnostic, json),
     };
+    for run in &selected {
+        let validation = run.case.gqt().map_err(|e| e.to_string()).and_then(|plan| {
+            omnigraph_bench::gqt_runner::validate_run_options(plan, &options)
+                .map_err(|e| e.to_string())
+        });
+        if let Err(message) = validation {
+            return bench_cli::failure(
+                vec![Diagnostic::error("invalid_run_input", "run", message)],
+                json,
+            );
+        }
+    }
     let recording = match archive {
         Some(root) => match RecordingContext::new(root.clone()) {
             Ok(context) => Some(context),
@@ -1778,8 +1859,17 @@ fn print_run_execution(run: &RunExecution) {
         run.samples.len(),
         run.wall_clock.p50_us,
         run.point_id,
-        run.fixture.handoff.summary.logical_content_sha256,
+        run.fixture
+            .as_ref()
+            .map(|f| f.handoff.summary.logical_content_sha256.as_str())
+            .or_else(|| run
+                .server_receipt
+                .as_ref()
+                .map(|r| r.dataset.logical_content_sha256.as_str()))
+            .unwrap_or("absent"),
         run.dataset_cache_hit
+            .map(|hit| hit.to_string())
+            .unwrap_or_else(|| "not-applicable".into())
     );
 }
 
