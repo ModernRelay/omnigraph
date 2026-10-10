@@ -12,10 +12,10 @@ pub struct IntentApiFixture {
     requests: std::sync::Arc<std::sync::Mutex<Vec<IntentRequest>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    reply_count: usize,
+    reply_count: Option<usize>,
     graph: bool,
     session: Option<std::sync::Arc<std::sync::Mutex<Value>>>,
-    forwarded_merges: std::sync::Arc<std::sync::Mutex<Vec<IntentReply>>>,
+    forwarded_responses: std::sync::Arc<std::sync::Mutex<Vec<IntentReply>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,28 @@ pub enum MergeDeliveryFault {
     Truncate,
     GatewayTimeout,
     CallerWait,
+}
+
+/// Faults on a real deployment submission; all observation requests pass through.
+#[derive(Debug, Clone, Copy)]
+pub enum DeploymentDeliveryFault {
+    PassThrough,
+    DisconnectBeforeAcceptance,
+    DisconnectAfterAcceptance,
+    WaitAfterAcceptance,
+}
+
+enum Forwarding {
+    Merge(String, MergeDeliveryFault),
+    Deployment(String, DeploymentDeliveryFault),
+}
+
+impl Forwarding {
+    fn upstream(&self) -> &str {
+        match self {
+            Self::Merge(upstream, _) | Self::Deployment(upstream, _) => upstream,
+        }
+    }
 }
 
 impl IntentReply {
@@ -89,7 +111,17 @@ impl IntentApiFixture {
             None,
             Duration::ZERO,
             true,
-            Some((upstream.to_owned(), fault)),
+            Some(Forwarding::Merge(upstream.to_owned(), fault)),
+        )
+    }
+
+    pub fn graph_deployment_proxy(upstream: &str, fault: DeploymentDeliveryFault) -> Self {
+        Self::start_with_origin(
+            |_| Vec::new(),
+            None,
+            Duration::ZERO,
+            true,
+            Some(Forwarding::Deployment(upstream.to_owned(), fault)),
         )
     }
 
@@ -112,7 +144,7 @@ impl IntentApiFixture {
         session: Option<Value>,
         delay: Duration,
         graph: bool,
-        forwarding: Option<(String, MergeDeliveryFault)>,
+        forwarding: Option<Forwarding>,
     ) -> Self {
         use std::io::Write;
         use std::sync::atomic::Ordering;
@@ -122,10 +154,10 @@ impl IntentApiFixture {
         listener.set_nonblocking(true).unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let replies = replies(&origin);
-        let reply_count = if forwarding.is_some() {
-            1
-        } else {
-            replies.len()
+        let reply_count = match &forwarding {
+            Some(Forwarding::Merge(..)) => Some(1),
+            Some(Forwarding::Deployment(..)) => None,
+            None => Some(replies.len()),
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let received = requests.clone();
@@ -133,8 +165,8 @@ impl IntentApiFixture {
         let stopped = stop.clone();
         let session = session.map(|s| Arc::new(Mutex::new(s)));
         let session_response = session.clone();
-        let forwarded_merges = Arc::new(Mutex::new(Vec::new()));
-        let captured_merges = forwarded_merges.clone();
+        let forwarded_responses = Arc::new(Mutex::new(Vec::new()));
+        let captured_responses = forwarded_responses.clone();
         let thread = std::thread::spawn(move || {
             let mut replies = std::collections::VecDeque::from(replies);
             let upstream_client = forwarding.as_ref().map(|_| {
@@ -204,7 +236,78 @@ impl IntentApiFixture {
                 if !discovery {
                     sleep(delay);
                 }
-                let mut reply = if let Some((upstream, fault)) = &forwarding {
+                let mut reply = if let Some(forwarding) = &forwarding {
+                    let upstream = forwarding.upstream();
+                    let deployment =
+                        request.method == "POST" && request.path == "/cluster/deployments";
+                    if deployment
+                        && matches!(
+                            forwarding,
+                            Forwarding::Deployment(
+                                _,
+                                DeploymentDeliveryFault::DisconnectBeforeAcceptance
+                            )
+                        )
+                    {
+                        // Write a complete real request, then close the upstream
+                        // socket only after the server owns it and is draining.
+                        // The test retains a graph request so acceptance cannot race ahead.
+                        let url = url::Url::parse(upstream).unwrap();
+                        assert_eq!(url.scheme(), "http");
+                        let mut upstream_socket = std::net::TcpStream::connect((
+                            url.host_str().unwrap(),
+                            url.port_or_known_default().unwrap(),
+                        ))
+                        .unwrap();
+                        upstream_socket
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        write!(upstream_socket, "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n", request.path, &url[url::Position::BeforeHost..url::Position::AfterPort], request.raw_body.len()).unwrap();
+                        for (name, value) in &request.headers {
+                            if !matches!(name.as_str(), "host" | "connection" | "content-length") {
+                                write!(upstream_socket, "{name}: {value}\r\n").unwrap();
+                            }
+                        }
+                        upstream_socket.write_all(b"\r\n").unwrap();
+                        upstream_socket.write_all(&request.raw_body).unwrap();
+                        let id = request.body["deployment_id"].as_str().unwrap();
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        loop {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "server must own the pre-acceptance request"
+                            );
+                            let mut status = upstream_client
+                                .as_ref()
+                                .unwrap()
+                                .get(format!("{upstream}/cluster/deployments/{id}"))
+                                .timeout(Duration::from_secs(2))
+                                .header(
+                                    omnigraph_api_types::HTTP_API_CONTRACT_HEADER,
+                                    omnigraph_api_types::HTTP_API_CONTRACT,
+                                );
+                            if let Some(token) = request.headers.get("authorization") {
+                                status = status.header("authorization", token);
+                            }
+                            let status: Value = status
+                                .send()
+                                .unwrap()
+                                .error_for_status()
+                                .unwrap()
+                                .json()
+                                .unwrap();
+                            if status["in_progress"] == true {
+                                assert_eq!(
+                                    status["deployment"]["status"], "not_recorded",
+                                    "{status}"
+                                );
+                                break;
+                            }
+                            sleep(Duration::from_millis(2));
+                        }
+                        upstream_socket.shutdown(std::net::Shutdown::Both).unwrap();
+                        continue;
+                    }
                     let mut forwarded = upstream_client.as_ref().unwrap().request(
                         request.method.parse::<reqwest::Method>().unwrap(),
                         format!("{}{}", upstream.trim_end_matches('/'), request.path),
@@ -243,12 +346,13 @@ impl IntentApiFixture {
                         headers,
                         body,
                     };
-                    if request.method == "POST"
+                    if let Forwarding::Merge(_, fault) = forwarding
+                        && request.method == "POST"
                         && (request.path.ends_with("/branches/merge")
                             || request.path.ends_with("/mutate"))
                     {
                         assert_eq!(reply.status, 200, "upstream merge must succeed");
-                        captured_merges.lock().unwrap().push(reply.clone());
+                        captured_responses.lock().unwrap().push(reply.clone());
                         match fault {
                             MergeDeliveryFault::Disconnect => continue,
                             MergeDeliveryFault::Truncate => {
@@ -271,6 +375,28 @@ impl IntentApiFixture {
                                 }
                                 continue;
                             }
+                        }
+                    }
+                    if deployment && let Forwarding::Deployment(_, fault) = forwarding {
+                        assert!(
+                            matches!(reply.status, 200 | 202),
+                            "upstream acceptance: {}",
+                            String::from_utf8_lossy(&reply.body)
+                        );
+                        captured_responses.lock().unwrap().push(reply.clone());
+                        match fault {
+                            DeploymentDeliveryFault::DisconnectAfterAcceptance => continue,
+                            DeploymentDeliveryFault::WaitAfterAcceptance => {
+                                let until = std::time::Instant::now() + Duration::from_secs(4);
+                                while !stopped.load(Ordering::SeqCst)
+                                    && std::time::Instant::now() < until
+                                {
+                                    sleep(Duration::from_millis(2));
+                                }
+                                continue;
+                            }
+                            DeploymentDeliveryFault::PassThrough => {}
+                            DeploymentDeliveryFault::DisconnectBeforeAcceptance => unreachable!(),
                         }
                     }
                     reply
@@ -324,7 +450,7 @@ impl IntentApiFixture {
             reply_count,
             graph,
             session,
-            forwarded_merges,
+            forwarded_responses,
         }
     }
 
@@ -332,8 +458,8 @@ impl IntentApiFixture {
         self.requests.lock().unwrap().clone()
     }
 
-    pub fn forwarded_merges(&self) -> Vec<IntentReply> {
-        self.forwarded_merges.lock().unwrap().clone()
+    pub fn forwarded_responses(&self) -> Vec<IntentReply> {
+        self.forwarded_responses.lock().unwrap().clone()
     }
 
     pub fn workflow_requests(&self) -> Vec<IntentRequest> {
@@ -353,11 +479,23 @@ impl IntentApiFixture {
     }
 
     pub fn assert_complete(&self) {
-        assert_eq!(
-            self.workflow_requests().len(),
-            self.reply_count,
-            "HTTP fixture request/reply count"
-        );
+        if let Some(expected) = self.reply_count {
+            assert_eq!(
+                self.workflow_requests().len(),
+                expected,
+                "HTTP fixture request/reply count"
+            );
+        } else {
+            assert_eq!(
+                self.requests()
+                    .iter()
+                    .filter(|request| request.method == "POST"
+                        && request.path == "/cluster/deployments")
+                    .count(),
+                1,
+                "a deployment is submitted once, regardless of lost delivery"
+            );
+        }
     }
 }
 

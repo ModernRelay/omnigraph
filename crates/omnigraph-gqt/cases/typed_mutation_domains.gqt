@@ -1,0 +1,84 @@
+# issue: none
+# notes: Mutation predicates use the same explicit numeric conversions as reads.
+# notes: Constant parameter expressions execute declared F32 rounding before comparison or assignment.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Number {
+    key: String @key
+    f: F32
+    small: I32
+    marked: Bool
+    rounded: Bool
+}
+
+--- seed
+{"type":"Number","data":{"key":"a","f":0.1,"small":2,"marked":false,"rounded":false}}
+{"type":"Number","data":{"key":"b","f":0.5,"small":3,"marked":false,"rounded":false}}
+
+--- mutate
+query literal_does_not_narrow_lossily() {
+    update Number set { marked: true } where f = 0.1
+}
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query omitted_nullable_bound($bound: F64?) {
+    update Number set { marked: true } where f = $bound
+}
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query declared_parameter($bound: F32) {
+    update Number set { marked: true } where f = $bound
+}
+--- params
+{"bound":0.1}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query fractional_bound() {
+    update Number set { marked: true } where small > 2.5
+}
+--- expect affected: nodes=1 edges=0
+
+--- query
+set engine = v2;
+query marked_rows() {
+    match { $x: Number }
+    return { $x.key, $x.marked }
+}
+--- expect unordered
+{"x.key":"a","x.marked":true}
+{"x.key":"b","x.marked":true}
+--- expect shape
+x.key: String
+x.marked: Bool
+
+--- mutate
+query parameter_assignment_rounding($small: F32, $wide: F64) {
+    update Number set { rounded: $small = $wide } where key = "a"
+}
+--- params
+{"small":16777217.0,"wide":16777216.0}
+--- expect affected: nodes=1 edges=0
+
+--- query
+set engine = v2;
+query assigned_rounding() {
+    match { $x: Number }
+    return { $x.key, $x.rounded }
+}
+--- expect unordered
+{"x.key":"a","x.rounded":true}
+{"x.key":"b","x.rounded":false}
+--- expect shape
+x.key: String
+x.rounded: Bool

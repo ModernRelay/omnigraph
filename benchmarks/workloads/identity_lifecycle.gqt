@@ -1,0 +1,86 @@
+# issue: none
+# notes: First write on recreated feature; exact main and retained old-child isolation before/after reopen.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate branch: feature
+query new_lifetime_write() { update Item set { value: 1 } where key = "alice" }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":0}
+{"key":"new_main","value":20}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: feature
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":1}
+{"key":"new_main","value":20}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: old_child
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":0}
+{"key":"old_only","value":10}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"feature"}
+{"name":"old_child"}
+--- expect shape
+name: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":0}
+{"key":"new_main","value":20}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: feature
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":1}
+{"key":"new_main","value":20}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: old_child
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"alice","value":0}
+{"key":"old_only","value":10}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"feature"}
+{"name":"old_child"}
+--- expect shape
+name: String

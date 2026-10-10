@@ -2,7 +2,10 @@
 //! behind `PlanSource`, the parameters behind the scanner's pushability
 //! verdict, and the physical plan the engine's runner executes.
 
-use std::collections::{BTreeSet, HashMap};
+mod indexes;
+mod scan_access;
+
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -16,18 +19,33 @@ use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
     AdjacencyProof, Bounds, DatasetPin, Decision, EXPAND_INDEXED_MAX_FRONTIER_ENV,
-    EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics, Explain, FragmentStat, GatePolicy, NodeTypeSpec,
-    Operation, PhysicalPlan, PlanError, PlanSource, PrefilterMode, RouteOverride, SideId, TableRef,
-    Unrouted,
+    EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics, Explain, FragmentStat, GatePolicy, IndexFact,
+    NodeTypeSpec, Operation, PhysicalPlan, PlanError, PlanSource, PrefilterMode, RouteOverride,
+    SideId, TableRef, Unrouted,
 };
 
 use super::ResolvedParams;
 use super::scan::ir_expr_to_df_expr;
-use super::search::check_param_date_literals;
+use super::{fill_declared_params, validate_params};
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
+use crate::seams::{decide_seam, fail};
 
 const KEY_WIDTH_BYTES: u64 = 8 + 8 + 32;
+
+decide_seam! {
+    /// Planning is about to open a query table to load its index metadata.
+    /// Tests fail here to prove gathering fails rather than planning on an
+    /// empty catalog.
+    pub static QUERY_INDEX_FACTS_PRE_LOAD = ("query_index_facts.pre_load", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// The planner asked the source to split a filtered scan and the pinned
+    /// table is not open yet. Tests fail here to prove the source's own error
+    /// class reaches the caller.
+    pub static QUERY_SCAN_ACCESS_PRE_TABLE_OPEN = ("query_scan_access.pre_table_open", Unreachable, [Fail]);
+}
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
 /// Larger frontiers fall back to the in-memory CSR (dense / whole-graph). See
@@ -100,11 +118,15 @@ pub(crate) struct QuerySource<'a> {
     gate_policy: GatePolicy,
     expand_caps: ExpandCaps,
     table_stats: HashMap<String, TableStatistics>,
+    /// The error the source met answering the planner's last lookup, handed
+    /// back to the caller in place of the planner's wrapper.
+    source_failure: std::sync::Mutex<Option<OmniError>>,
 }
 
 struct TableStatistics {
     file_bytes: Option<u64>,
     column_bytes: HashMap<String, u64>,
+    index_facts: Vec<IndexFact>,
 }
 
 impl<'a> QuerySource<'a> {
@@ -120,7 +142,7 @@ impl<'a> QuerySource<'a> {
     ) -> Result<QuerySource<'a>> {
         let params = resolve_params(ir, params)?;
         let ir = super::constant::fold_query_constants(ir, params.shared())?;
-        let table_stats = destination_table_statistics(&ir, snapshot).await?;
+        let table_stats = query_table_statistics(&ir, snapshot).await?;
         let mut source = QuerySource {
             ir,
             catalog,
@@ -131,6 +153,7 @@ impl<'a> QuerySource<'a> {
             gate_policy: gate_policy(settings),
             expand_caps: ExpandCaps::from_env(),
             table_stats,
+            source_failure: std::sync::Mutex::new(None),
         };
         source
             .load_column_statistics(&Operation::Query(Box::new(source.ir.clone())))
@@ -152,6 +175,13 @@ impl<'a> QuerySource<'a> {
             query_memory_pool_bytes: self.memory_limit,
             late_materialization_only: false,
         }
+    }
+
+    fn take_source_failure(&self) -> Option<OmniError> {
+        self.source_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     async fn load_column_statistics(&mut self, operation: &Operation) -> Result<()> {
@@ -190,6 +220,92 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
+    fn canonical_key_id(
+        &self,
+        type_key: &str,
+        value: &IRExpr,
+    ) -> std::result::Result<Option<String>, PlanError> {
+        use omnigraph_compiler::{ExprType, ScalarType};
+        let Some(node) = type_key
+            .strip_prefix("node:")
+            .and_then(|name| self.catalog.node_types.get(name))
+        else {
+            return Ok(None);
+        };
+        let Some([key]) = node.key.as_deref() else {
+            return Ok(None);
+        };
+        if !node
+            .properties
+            .get(key)
+            .is_some_and(|ty| ty.scalar == ScalarType::String && !ty.list)
+            || !matches!(
+                value.ty(),
+                ExprType::Value {
+                    scalar: ScalarType::String,
+                    list: false,
+                    ..
+                }
+            )
+        {
+            return Ok(None);
+        }
+        let literal = match value {
+            IRExpr::Literal(value, _) => Some(value),
+            IRExpr::Param(name, _) => self.params.shared().get(name),
+            _ => None,
+        };
+        let Some(literal @ Literal::String(_)) = literal else {
+            return Ok(None);
+        };
+        let array = super::typed_value::typed_literal_to_array(literal, value.ty(), 1)
+            .map_err(|error| PlanError::Internal(error.to_string()))?;
+        crate::loader::canonical_key_id(&[array], 0)
+            .map_err(|error| PlanError::Internal(error.to_string()))
+    }
+
+    fn scan_runtime_input(
+        &self,
+        scan: &omnigraph_planner::ScanSpec,
+    ) -> Option<omnigraph_planner::RuntimeInput> {
+        scan.filter
+            .as_ref()
+            .is_some_and(|predicate| {
+                predicate
+                    .gq_filters()
+                    .iter()
+                    .any(super::search::is_search_filter)
+            })
+            .then_some(omnigraph_planner::RuntimeInput::SearchFilter)
+    }
+
+    fn index_split<'a>(
+        &'a self,
+        scan: &'a omnigraph_planner::ScanSpec,
+    ) -> omnigraph_planner::IndexSplitFuture<'a> {
+        Box::pin(async move {
+            let split = async {
+                fail(&QUERY_SCAN_ACCESS_PRE_TABLE_OPEN)?;
+                scan_access::index_split(self, scan).await
+            };
+            split.await.map_err(|error| {
+                let detail = error.to_string();
+                *self
+                    .source_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                PlanError::Source { detail }
+            })
+        })
+    }
+
+    fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
+        self.table_stats
+            .get(dataset_key)
+            .map(|stats| stats.index_facts.clone())
+            .unwrap_or_default()
+    }
+
     fn traversal_work_limit(&self) -> Option<u64> {
         self.ir
             .has_edge_selections()
@@ -274,6 +390,12 @@ impl PlanSource for QuerySource<'_> {
                 .node_object_fields()
                 .map(|field| field.name().clone())
                 .collect(),
+            object_fields: node_type
+                .node_object_members()
+                .map(|(member, field)| {
+                    arrow_schema::Field::new(member, field.data_type().clone(), field.is_nullable())
+                })
+                .collect(),
             row_count,
         })
     }
@@ -313,7 +435,6 @@ impl PlanSource for QuerySource<'_> {
             edge_count,
             src_node_count: node_count(src_type)?,
             dst_node_count: node_count(dst_type)?,
-            same_type: edge_def.from_type == edge_def.to_type,
             max_frontier_cap: self.expand_caps.max_frontier,
             max_hops_cap: self.expand_caps.max_hops,
         })
@@ -363,23 +484,8 @@ fn no_plan(reason: impl std::fmt::Display) -> OmniError {
 /// `now()` bound to the clock; an omitted required one is the error the query
 /// answers.
 fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
-    check_param_date_literals(params, &ir.params)?;
-    let mut resolved_params = None;
-    for param in &ir.params {
-        if !params.contains_key(&param.name) {
-            if param.nullable {
-                resolved_params
-                    .get_or_insert_with(|| params.clone())
-                    .insert(param.name.clone(), Literal::Null);
-            } else {
-                return Err(OmniError::manifest(format!(
-                    "parameter '{}' not provided",
-                    param.name
-                )));
-            }
-        }
-    }
-    let mut resolved = resolved_params.unwrap_or_else(|| params.clone());
+    let mut resolved = params.clone();
+    fill_declared_params(&mut resolved, &ir.params)?;
     let now_name = omnigraph_compiler::query::ast::NOW_PARAM_NAME;
     if resolved.contains_key(now_name) {
         return Err(OmniError::manifest(format!(
@@ -391,17 +497,21 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
     resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    validate_params(&resolved, &ir.params)?;
     Ok(ResolvedParams(Arc::new(resolved)))
 }
 
 /// Build the physical plan for execution without explain diagnostics.
-pub(crate) fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
-    omnigraph_planner::plan_query(&source.ir, source, &source.bounds()).map_err(|reason| {
-        match reason {
-            Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
-            reason => no_plan(reason.to_json()),
-        }
-    })
+pub(crate) async fn plan_query(source: &QuerySource<'_>) -> Result<PhysicalPlan> {
+    omnigraph_planner::plan_query(&source.ir, source, &source.bounds())
+        .await
+        .map_err(|reason| match source.take_source_failure() {
+            Some(error) => error,
+            None => match reason {
+                Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
+                reason => no_plan(reason.to_json()),
+            },
+        })
 }
 
 /// What the gate built for one compiled query: its explain document and the
@@ -413,23 +523,29 @@ pub(crate) struct ExplainedQuery {
 
 /// A read query always gets a plan; a gate answer other than `Engine` is a
 /// planner defect, never a fallback.
-pub(crate) fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> {
+pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> {
     let operation = Operation::Query(Box::new(source.ir.clone()));
     match omnigraph_planner::route(
         &operation,
         source,
         RouteOverride::Registry,
         &source.bounds(),
-    ) {
+    )
+    .finalize(source)
+    .await
+    {
         Decision::Engine { plan, explain, .. } => Ok(ExplainedQuery {
             explain,
             physical: plan,
         }),
+        Decision::PendingQuery(_) => Err(no_plan("query finalization remained pending")),
         Decision::Executor {
             reason: Unrouted::UnsupportedQuery { diagnostic },
             ..
         } => Err(unsupported_query(diagnostic)),
-        Decision::Executor { reason, .. } => Err(no_plan(reason.to_json())),
+        Decision::Executor { reason, .. } => Err(source
+            .take_source_failure()
+            .unwrap_or_else(|| no_plan(reason.to_json()))),
         Decision::Routed { entry, .. } => Err(OmniError::manifest_internal(format!(
             "the registry routed a GQ query through entry `{}`; a read query runs only \
              the planner's own plan",
@@ -438,28 +554,56 @@ pub(crate) fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> 
     }
 }
 
-async fn destination_table_statistics(
+async fn query_table_statistics(
     ir: &QueryIR,
     snapshot: &Snapshot,
 ) -> Result<HashMap<String, TableStatistics>> {
-    fn destinations(ops: &[IROp], types: &mut BTreeSet<String>) {
+    let mut types = BTreeMap::new();
+    let mut pending = vec![ir.pipeline.as_slice()];
+    while let Some(ops) = pending.pop() {
         for op in ops {
             match op {
-                IROp::Expand { dst_type, .. } => {
-                    types.insert(format!("node:{dst_type}"));
+                IROp::NodeScan {
+                    type_name,
+                    variable: _,
+                    filters: _,
+                } => {
+                    types.entry(format!("node:{type_name}")).or_insert(false);
                 }
-                IROp::AntiJoin { inner, .. } => destinations(inner, types),
-                _ => {}
+                IROp::Expand {
+                    edges,
+                    src_type,
+                    dst_type,
+                    src_var: _,
+                    dst_var: _,
+                    min_hops: _,
+                    max_hops: _,
+                    dst_filters: _,
+                    edge_binding: _,
+                } => {
+                    types.entry(format!("node:{src_type}")).or_insert(false);
+                    types.insert(format!("node:{dst_type}"), true);
+                    for member in edges.members() {
+                        types
+                            .entry(format!("edge:{}", member.edge_type))
+                            .or_insert(false);
+                    }
+                }
+                IROp::AntiJoin {
+                    inner,
+                    outer_var: _,
+                    predicate: _,
+                } => pending.push(inner),
+                IROp::Filter(_) => {}
             }
         }
     }
-    let mut types = BTreeSet::new();
-    destinations(&ir.pipeline, &mut types);
     let mut bytes = HashMap::new();
-    for type_key in types {
+    for (type_key, destination) in types {
         if snapshot.dataset(&type_key).is_none() {
             continue;
         }
+        fail(&QUERY_INDEX_FACTS_PRE_LOAD)?;
         let dataset = snapshot.open_lance_dataset(&type_key).await?;
         let size = dataset
             .get_fragments()
@@ -473,8 +617,9 @@ async fn destination_table_statistics(
         bytes.insert(
             type_key,
             TableStatistics {
-                file_bytes: size,
+                file_bytes: destination.then_some(size).flatten(),
                 column_bytes: HashMap::new(),
+                index_facts: indexes::gather(&dataset).await?,
             },
         );
     }
@@ -541,6 +686,78 @@ query people() { match { $p: Person } return { count($p) as n } }
         omnigraph_compiler::lower_query(catalog, statement.decl(), &checked).unwrap()
     }
 
+    /// GQT cannot inspect gathered facts or the catalog's version origin.
+    #[tokio::test]
+    async fn index_facts_cover_root_edge_and_nested_reads_at_the_pinned_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                .await
+                .unwrap(),
+        );
+        let session = crate::Session::from_defaults(Arc::clone(&db), SessionSettings::default());
+        session
+            .load_jsonl(
+                concat!(
+                    "{\"type\":\"Person\",\"data\":{\"name\":\"a\",\"age\":1}}\n",
+                    "{\"type\":\"Doc\",\"data\":{\"title\":\"d\"}}\n",
+                    "{\"edge\":\"Likes\",\"from\":\"a\",\"to\":\"d\"}\n"
+                ),
+                crate::loader::LoadMode::Overwrite,
+            )
+            .await
+            .unwrap();
+        session.ensure_indices().await.unwrap();
+        let settings = SessionSettings::default();
+        let (view, catalog) = db
+            .capture_read_view(ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        for (name, expected) in [
+            ("people", vec!["node:Person"]),
+            ("liked", vec!["edge:Likes", "node:Doc", "node:Person"]),
+            (
+                "likes_nothing",
+                vec!["edge:Likes", "node:Doc", "node:Person"],
+            ),
+        ] {
+            let ir = compile(&catalog, name);
+            let source =
+                QuerySource::gather(&ir, &catalog, &view.snapshot, &ParamMap::new(), &settings)
+                    .await
+                    .unwrap();
+            let mut keys: Vec<_> = source.table_stats.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, expected, "{name}");
+            let operation = Operation::Query(Box::new(source.ir.clone()));
+            let decision = omnigraph_planner::route(
+                &operation,
+                &source,
+                omnigraph_planner::RouteOverride::Registry,
+                &source.bounds(),
+            );
+            let decision = decision.finalize(&source).await;
+            let statistics = decision.explain().unwrap().statistics.as_ref().unwrap();
+            for key in expected {
+                let facts = source.index_facts(key);
+                assert!(!facts.is_empty(), "{name} {key}");
+                let statistic = statistics
+                    .iter()
+                    .filter(|s| s.statistic == format!("index_facts({key})"))
+                    .collect::<Vec<_>>();
+                assert_eq!(statistic.len(), 1, "{name} {key}");
+                assert_eq!(
+                    serde_json::from_str::<Vec<IndexFact>>(&statistic[0].value).unwrap(),
+                    facts
+                );
+                assert!(statistic[0].origin.contains(&format!(
+                    "version {}",
+                    super::super::dataset_pin(view.snapshot.dataset(key).unwrap()).version
+                )));
+            }
+        }
+    }
+
     /// Rust and not `.gqt`: the claim is which map the lowering projects a bare
     /// binding through, and rows cannot tell the plan's map from the IR's.
     #[tokio::test]
@@ -565,7 +782,7 @@ query people() { match { $p: Person } return { count($p) as n } }
                 QuerySource::gather(&ir, &catalog, &view.snapshot, &ParamMap::new(), &settings)
                     .await
                     .unwrap();
-            let plan = plan_query(&source).unwrap();
+            let plan = plan_query(&source).await.unwrap();
             let mut from_ir = HashMap::new();
             collect_node_bindings(&ir.pipeline, &mut from_ir);
             assert_eq!(from_ir.len(), bound, "{name}");
@@ -601,7 +818,7 @@ query people() { match { $p: Person } return { count($p) as n } }
         with_query_memory_limit(2 * CAPTURED, async {
             assert_eq!(source.bounds().query_memory_pool_bytes, CAPTURED);
             assert_eq!(source.query_memory_pool_bytes(), CAPTURED);
-            let plan = plan_query(&source).unwrap();
+            let plan = plan_query(&source).await.unwrap();
             assert_eq!(plan.assumptions().memory_limit, CAPTURED);
             let bound = crate::engine::bind::bind(plan, &source, &EmbeddingResolver::explain())
                 .await
@@ -644,3 +861,6 @@ query people() { match { $p: Person } return { count($p) as n } }
         );
     }
 }
+
+#[cfg(test)]
+mod key_tests;

@@ -8,7 +8,6 @@
 
 #![cfg(feature = "failpoints")]
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,15 +81,9 @@ async fn offline_fixture() -> tempfile::TempDir {
         config.split("policies:").next().unwrap(),
     )
     .unwrap();
-    let applied = apply_deployment(
-        dir.path(),
-        None,
-        &deployment_owner(),
-        &BTreeMap::new(),
-        |_, _, _| {},
-    )
-    .await
-    .unwrap();
+    let applied = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+        .await
+        .unwrap();
     assert!(
         matches!(applied, DeploymentLookup::Complete { ref result } if result.converged),
         "{applied:?}"
@@ -169,7 +162,6 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
                 dir.path(),
                 None,
                 &deployment_owner(),
-                &Default::default(),
                 |issued, _, _| id = issued.into(),
             ))
             .await
@@ -273,24 +265,242 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
             "lookup wrote another publication"
         );
     }
+    // Deletion is completion work, unlike replaying a schema invocation. The
+    // original accepted root survives both lost acknowledgement and a partial
+    // purge whose manifest can no longer be opened.
+    for (seam, damage) in [
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_ACCEPTANCE,
+            "none",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED,
+            "none",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED,
+            "partial",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED,
+            "foreign",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED,
+            "older_schema",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_ACCEPTANCE,
+            "older_schema_before_started",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_SCHEMA,
+            "none",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_BEFORE_RESULT,
+            "none",
+        ),
+        (
+            &omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_RESULT,
+            "none",
+        ),
+    ] {
+        let dir = offline_fixture().await;
+        let root = dir.path().to_str().unwrap();
+        let graph = dir.path().join("graphs/knowledge.omni");
+        if damage.starts_with("older_schema") {
+            // Commit a new schema before deleting. A partial
+            // prefix purge may remove its newest manifest while older versions
+            // still expose this same graph lifetime's previous schema.
+            let evolved = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+                .await
+                .unwrap();
+            assert!(
+                matches!(evolved, DeploymentLookup::Complete { ref result } if result.converged)
+            );
+            unlock_offline(dir.path()).await;
+        }
+        let contract = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .schema_contract_digest();
+        fs::write(dir.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
+        let mut id = String::new();
+        {
+            let _fail = seam.fire_always();
+            let error = apply_deployment(dir.path(), None, &deployment_owner(), |issued, _, _| {
+                id = issued.into()
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                "injected_failpoint",
+                "{}: {error:?}",
+                seam.name()
+            );
+        }
+        let status = omnigraph_cluster::deployment_status(root, Some(&id), &deployment_owner())
+            .await
+            .unwrap();
+        if status.outstanding_id.is_some() {
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(state_path(dir.path())).unwrap()).unwrap();
+            assert!(
+                state["applied_revision"]["resources"]
+                    .get("graph.knowledge")
+                    .is_some()
+            );
+            assert!(
+                state["outstanding"]["graphs"]["knowledge"]["delete"]["root"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/graphs/knowledge.omni")
+            );
+            unlock_offline(dir.path()).await;
+        }
+        match damage {
+            "older_schema" | "older_schema_before_started" => {
+                let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                    .await
+                    .unwrap();
+                let version = db
+                    .graph_manifest_version_of(omnigraph::db::ReadTarget::branch("main"))
+                    .await
+                    .unwrap();
+                drop(db);
+                // Lance 11 V2 manifests invert the version for lexical ordering.
+                let latest = graph
+                    .join("__manifest/_versions")
+                    .join(format!("{:020}.manifest", u64::MAX - version));
+                assert!(latest.exists());
+                // Model an interruption after the sequential lexicographic
+                // object-store purge has removed every file through this key,
+                // including __history and __manifest/_transactions.
+                fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+                    for entry in fs::read_dir(dir).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            files(&path, out);
+                        } else {
+                            out.push(path);
+                        }
+                    }
+                }
+                let mut inventory = Vec::new();
+                files(&graph, &mut inventory);
+                inventory.sort();
+                let prefix = inventory
+                    .into_iter()
+                    .take_while(|path| path <= &latest)
+                    .collect::<Vec<_>>();
+                assert!(prefix.contains(&latest));
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|path| path.starts_with(graph.join("__history")))
+                );
+                assert!(
+                    prefix
+                        .iter()
+                        .any(|path| path.starts_with(graph.join("__manifest/_transactions")))
+                );
+                for path in prefix {
+                    fs::remove_file(path).unwrap();
+                }
+                let older = Omnigraph::open_read_only(graph.to_str().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(older.schema_source().as_str(), SCHEMA);
+                assert_eq!(
+                    older.schema_contract_digest().schema_identity_domain,
+                    contract.schema_identity_domain
+                );
+                assert_ne!(older.schema_contract_digest(), contract);
+            }
+            "partial" => fs::remove_dir_all(graph.join("__manifest")).unwrap(),
+            "foreign" => {
+                fs::remove_dir_all(&graph).unwrap();
+                Omnigraph::init(graph.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+        fs::remove_file(dir.path().join("people.pg")).unwrap();
+        let recovered = reconcile_deployment(root, &id, true, &deployment_owner()).await;
+        if matches!(damage, "foreign" | "older_schema_before_started") {
+            assert_eq!(recovered.unwrap_err().code, "deployment_outcome_unknown");
+            assert!(graph.exists());
+            assert_eq!(
+                omnigraph_cluster::deployment_status(root, Some(&id), &deployment_owner())
+                    .await
+                    .unwrap()
+                    .outstanding_id
+                    .as_deref(),
+                Some(id.as_str())
+            );
+            continue;
+        }
+        let DeploymentLookup::Complete { result } = recovered.unwrap() else {
+            panic!("not complete")
+        };
+        assert!(result.converged);
+        assert!(
+            matches!(&result.graphs["knowledge"], GraphDeploymentResult::Deleted { contract: deleted } if deleted == &contract)
+        );
+        assert!(!graph.exists(), "{} {damage}", seam.name());
+        let snapshot = omnigraph_cluster::read_serving_snapshot_from_storage(root)
+            .await
+            .unwrap();
+        assert!(snapshot.graphs.is_empty());
+        assert!(snapshot.applied_graphs.is_empty());
+        fs::create_dir(&graph).unwrap();
+        fs::write(graph.join("new-object"), "keep").unwrap();
+        let repeated = reconcile_deployment(root, &id, false, &deployment_owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(repeated).unwrap(),
+            serde_json::to_value(DeploymentLookup::Complete { result }).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(graph.join("new-object")).unwrap(),
+            "keep"
+        );
+    }
 }
 
 #[tokio::test]
 #[serial]
 async fn offline_preacceptance_id_never_aliases_a_later_nonce() {
-    use omnigraph_cluster::{DeploymentLookup, apply_deployment, deployment_status};
+    use omnigraph_cluster::{
+        ClusterAdmissionPurpose, DeploymentLookup, acquire_cluster_admission,
+        apply_captured_deployment, apply_deployment, capture_deployment, deployment_status,
+    };
     let _scenario = FailScenario::setup();
     let dir = offline_fixture().await;
     let root = dir.path().to_str().unwrap();
     let mut unaccepted = String::new();
     {
+        let admission = acquire_cluster_admission(root, ClusterAdmissionPurpose::Deployment)
+            .await
+            .unwrap()
+            .unwrap();
+        let bundle = capture_deployment(dir.path()).unwrap();
+        let mut effects = false;
         let _fail = omnigraph_cluster::seams::catalog::DEPLOYMENT_BEFORE_ACCEPTANCE.fire_always();
-        Box::pin(apply_deployment(
-            dir.path(),
+        Box::pin(apply_captured_deployment(
+            &bundle,
             None,
             &deployment_owner(),
-            &Default::default(),
+            &admission,
+            &std::collections::BTreeMap::new(),
             |id, _, _| unaccepted = id.into(),
+            |_| panic!("pre-acceptance failure cannot acknowledge acceptance"),
+            &mut effects,
         ))
         .await
         .unwrap_err();
@@ -306,7 +516,6 @@ async fn offline_preacceptance_id_never_aliases_a_later_nonce() {
         dir.path(),
         None,
         &deployment_owner(),
-        &Default::default(),
         |id, _, _| accepted = id.into(),
     ))
     .await
@@ -340,15 +549,9 @@ async fn offline_partial_result_allows_corrective_successor_without_replay() {
     fs::write(dir.path().join("cluster.yaml"), &config).unwrap();
     // Reuse the existing v1 bootstrap/apply fixture; conversion starts only
     // after both graphs and their serving resources actually exist.
-    let applied = apply_deployment(
-        dir.path(),
-        None,
-        &deployment_owner(),
-        &BTreeMap::new(),
-        |_, _, _| {},
-    )
-    .await
-    .unwrap();
+    let applied = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+        .await
+        .unwrap();
     assert!(
         matches!(applied, DeploymentLookup::Complete { ref result } if result.converged),
         "{applied:?}"
@@ -368,7 +571,6 @@ async fn offline_partial_result_allows_corrective_successor_without_replay() {
             dir.path(),
             None,
             &deployment_owner(),
-            &Default::default(),
             |id, _, _| original_id = id.into(),
         ))
         .await
@@ -436,7 +638,6 @@ async fn offline_partial_result_allows_corrective_successor_without_replay() {
         dir.path(),
         None,
         &deployment_owner(),
-        &Default::default(),
         |_, _, _| {},
     ))
     .await
@@ -498,7 +699,6 @@ fn offline_deployment_child_process() {
                     Path::new(&root),
                     None,
                     &deployment_owner(),
-                    &Default::default(),
                     |id, _, _| {
                         fs::write(Path::new(&root).join("deployment-child-id"), id).unwrap();
                     },
@@ -517,7 +717,7 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
         DeploymentLookup, apply_deployment, deployment_status, reconcile_deployment,
     };
     let _scenario = FailScenario::setup();
-    for window in [
+    for (window, deleting) in [
         "deployment.before_acceptance",
         "deployment.after_acceptance",
         "deployment.after_started",
@@ -526,8 +726,27 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
         "publish.post_merge_pre_ack",
         "deployment.before_result",
         "deployment.after_result",
-    ] {
+    ]
+    .into_iter()
+    .map(|window| (window, false))
+    .chain([
+        ("deployment.after_started", true),
+        ("deployment.before_result", true),
+    ]) {
         let dir = offline_fixture().await;
+        let deleted_contract = if deleting {
+            fs::write(dir.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
+            Some(
+                Omnigraph::open_read_only(
+                    dir.path().join("graphs/knowledge.omni").to_str().unwrap(),
+                )
+                .await
+                .unwrap()
+                .schema_contract_digest(),
+            )
+        } else {
+            None
+        };
         let root = dir.path().to_str().unwrap();
         let mut id = String::new();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -548,7 +767,6 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
                     dir.path(),
                     None,
                     &deployment_owner(),
-                    &Default::default(),
                     |issued, _, _| id = issued.into(),
                 ))
                 .await
@@ -606,7 +824,6 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
                 dir.path(),
                 None,
                 &deployment_owner(),
-                &Default::default(),
                 |issued, _, _| accepted = issued.into(),
             ))
             .await
@@ -660,6 +877,10 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
             } else {
                 None
             };
+            if deleting {
+                fs::remove_file(dir.path().join("cluster.yaml")).unwrap();
+                fs::remove_file(dir.path().join("people.pg")).unwrap();
+            }
             // This is local process-crash evidence. Killing a remote writer alone
             // would not establish accepted object-store I/O quiescence.
             let result = Box::pin(reconcile_deployment(root, &id, true, &deployment_owner()))
@@ -669,6 +890,28 @@ async fn offline_deployment_process_death_preserves_intent_and_fence() {
                 panic!("{result:?}");
             };
             assert_eq!(result.id, id);
+            if let Some(contract) = deleted_contract {
+                assert!(result.converged);
+                assert!(
+                    matches!(&result.graphs["knowledge"], omnigraph_cluster::GraphDeploymentResult::Deleted { contract: actual } if actual == &contract)
+                );
+                assert!(!graph_uri.exists());
+                assert!(
+                    deployment_status(root, Some(&id), &deployment_owner())
+                        .await
+                        .unwrap()
+                        .outstanding_id
+                        .is_none()
+                );
+                let repeated = reconcile_deployment(root, &id, false, &deployment_owner())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(repeated).unwrap(),
+                    serde_json::to_value(DeploymentLookup::Complete { result }).unwrap()
+                );
+                continue;
+            }
             assert_eq!(
                 result.converged,
                 matches!(
@@ -744,23 +987,24 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
     use omnigraph_cluster::{GraphDeploymentResult, reconcile_deployment};
     let _scenario = FailScenario::setup();
     for (seam, created, replace) in [
+        (&seams::DEPLOYMENT_AFTER_ACCEPTANCE, false, false),
         (&seams::DEPLOYMENT_AFTER_STARTED, false, false),
         (&seams::DEPLOYMENT_AFTER_SCHEMA, true, false),
         (&seams::DEPLOYMENT_AFTER_SCHEMA, true, true),
+        (
+            &omnigraph::seams::catalog::INIT_TABLE_CREATE_POST_NATIVE,
+            false,
+            false,
+        ),
     ] {
         let dir = fixture();
         let root = dir.path().to_str().unwrap();
-        let first = apply_deployment(
-            dir.path(),
-            None,
-            &deployment_owner(),
-            &BTreeMap::new(),
-            |_, _, _| {},
-        )
-        .await
-        .unwrap();
+        let first = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+            .await
+            .unwrap();
         assert!(matches!(first, DeploymentLookup::Complete { ref result } if result.converged));
         unlock_offline(dir.path()).await;
+        let target = "second";
         let path = dir.path().join("cluster.yaml");
         let source = fs::read_to_string(&path).unwrap();
         fs::write(
@@ -771,20 +1015,23 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
         let mut id = String::new();
         {
             let _failure = seam.fire_always();
-            let error = apply_deployment(
-                dir.path(),
-                None,
-                &deployment_owner(),
-                &BTreeMap::new(),
-                |issued, _, _| id = issued.into(),
-            )
+            let error = apply_deployment(dir.path(), None, &deployment_owner(), |issued, _, _| {
+                id = issued.into()
+            })
             .await
             .unwrap_err();
-            assert_eq!(error.code, "injected_failpoint");
+            assert_eq!(
+                error.code,
+                if seam.name() == "init.table_create_post_native" {
+                    "deployment_outcome_unknown"
+                } else {
+                    "injected_failpoint"
+                }
+            );
         }
         unlock_offline(dir.path()).await;
         if replace {
-            let graph = dir.path().join("graphs/second.omni");
+            let graph = dir.path().join(format!("graphs/{target}.omni"));
             fs::remove_dir_all(&graph).unwrap();
             Omnigraph::init(graph.to_str().unwrap(), SCHEMA)
                 .await
@@ -806,16 +1053,50 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
             };
             assert_eq!(result.converged, created);
             assert_eq!(
-                matches!(
-                    result.graphs["second"],
-                    GraphDeploymentResult::Created { .. }
-                ),
+                matches!(result.graphs[target], GraphDeploymentResult::Created { .. }),
                 created
             );
             assert!(matches!(
-                result.graphs["second"],
-                GraphDeploymentResult::Created { .. } | GraphDeploymentResult::Refused { .. }
+                result.graphs[target],
+                GraphDeploymentResult::Created { .. }
+                    | GraphDeploymentResult::Refused { .. }
+                    | GraphDeploymentResult::NotAttempted
             ));
+            if seam.name() == "init.table_create_post_native" {
+                // Exact unpublished cleanup has completed. A new
+                // invocation should be able to create the declared graph.
+                let graph = dir.path().join(format!("graphs/{target}.omni"));
+                assert!(graph.is_dir());
+                let mut dirs = vec![graph.clone()];
+                let mut files = Vec::new();
+                while let Some(dir) = dirs.pop() {
+                    for entry in fs::read_dir(dir).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            dirs.push(path);
+                        } else {
+                            files.push(path);
+                        }
+                    }
+                }
+                assert!(files.is_empty(), "cleanup left files: {files:?}");
+                Omnigraph::prepare_graph_create(graph.to_str().unwrap(), SCHEMA)
+                    .await
+                    .unwrap();
+                unlock_offline(dir.path()).await;
+                fs::write(
+                    &path,
+                    source.replace("graphs:\n", "graphs:\n  second:\n    schema: ./people.pg\n"),
+                )
+                .unwrap();
+                fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
+                let retry =
+                    apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {}).await;
+                assert!(
+                    matches!(retry, Ok(DeploymentLookup::Complete { ref result }) if result.converged),
+                    "cleaned abandoned creation must permit fresh apply: {retry:?}"
+                );
+            }
         }
     }
 }
@@ -841,15 +1122,9 @@ async fn authenticated_bootstrap_reconciles_only_its_original_identity() {
     let mut id = String::new();
     {
         let _fail = omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_STARTED.fire_always();
-        apply_deployment(
-            dir.path(),
-            None,
-            &caller,
-            &BTreeMap::new(),
-            |issued, _, _| id = issued.into(),
-        )
-        .await
-        .unwrap_err();
+        apply_deployment(dir.path(), None, &caller, |issued, _, _| id = issued.into())
+            .await
+            .unwrap_err();
     }
     let root = dir.path().to_str().unwrap();
     let status = omnigraph_cluster::deployment_status(root, Some(&id), &caller)
@@ -860,15 +1135,9 @@ async fn authenticated_bootstrap_reconciles_only_its_original_identity() {
         Some(DeploymentLookup::Outstanding { .. })
     ));
     assert!(matches!(
-        apply_deployment(
-            dir.path(),
-            Some(&id),
-            &caller,
-            &BTreeMap::new(),
-            |_, _, _| {}
-        )
-        .await
-        .unwrap(),
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| {})
+            .await
+            .unwrap(),
         DeploymentLookup::Outstanding { .. }
     ));
     let wrong = DeploymentCaller::AuthenticatedIdentity(
@@ -902,7 +1171,7 @@ async fn authenticated_bootstrap_reconciles_only_its_original_identity() {
     let ordinary = DeploymentCaller::AuthenticatedIdentity(
         IdentityAuthorization::authenticated("creator").unwrap(),
     );
-    let successor = apply_deployment(dir.path(), None, &ordinary, &BTreeMap::new(), |_, _, _| {})
+    let successor = apply_deployment(dir.path(), None, &ordinary, |_, _, _| {})
         .await
         .unwrap();
     assert!(matches!(successor, DeploymentLookup::Complete { result } if result.converged));
@@ -913,15 +1182,9 @@ async fn authenticated_bootstrap_reconciles_only_its_original_identity() {
 async fn graph_creation_partial_result_keeps_only_achieved_policy_bindings() {
     let _scenario = FailScenario::setup();
     let dir = fixture();
-    apply_deployment(
-        dir.path(),
-        None,
-        &deployment_owner(),
-        &BTreeMap::new(),
-        |_, _, _| {},
-    )
-    .await
-    .unwrap();
+    apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+        .await
+        .unwrap();
     unlock_offline(dir.path()).await;
     let config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap()
         .replace("graphs:\n", "providers:\n  embedding:\n    added:\n      kind: mock\n      model: test\ngraphs:\n  second:\n    schema: ./people.pg\n    embedding_provider: added\n  third:\n    schema: ./people.pg\n    embedding_provider: added\n")
@@ -930,13 +1193,9 @@ async fn graph_creation_partial_result_keeps_only_achieved_policy_bindings() {
     let mut id = String::new();
     {
         let _fail = omnigraph_cluster::seams::catalog::DEPLOYMENT_AFTER_SCHEMA.fire_always();
-        apply_deployment(
-            dir.path(),
-            None,
-            &deployment_owner(),
-            &BTreeMap::new(),
-            |issued, _, _| id = issued.into(),
-        )
+        apply_deployment(dir.path(), None, &deployment_owner(), |issued, _, _| {
+            id = issued.into()
+        })
         .await
         .unwrap_err();
     }
@@ -974,15 +1233,9 @@ async fn graph_creation_partial_result_keeps_only_achieved_policy_bindings() {
     );
     assert!(!dir.path().join("graphs/third.omni").exists());
     unlock_offline(dir.path()).await;
-    let successor = apply_deployment(
-        dir.path(),
-        None,
-        &deployment_owner(),
-        &BTreeMap::new(),
-        |_, _, _| {},
-    )
-    .await
-    .unwrap();
+    let successor = apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
+        .await
+        .unwrap();
     let DeploymentLookup::Complete { result } = successor else {
         panic!("{successor:?}");
     };

@@ -9,6 +9,7 @@ use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
@@ -16,6 +17,7 @@ use crate::logical::{
     tiebreak_text,
 };
 use crate::mirror::EdgeSelectionMirror;
+use crate::operation::TableRef;
 use crate::source::SideId;
 use omnigraph_compiler::query::codes::{P002, P003};
 
@@ -66,7 +68,7 @@ pub struct GatePolicy {
 
 /// Prefilter admission ratio: the gate's selective plan runs when
 /// |eligible| / corpus is at or below this. It is the conservative crossover
-/// of the `rrf-gate` bench (`benches/scenarios.rs`) across both corpora.
+/// of the historical `rrf-gate` corpora retained under `benchmarks/deferred/`.
 pub const DEFAULT_GATE_RATIO: f64 = 0.10;
 
 /// Absolute ceiling on the eligible-id in-list: the in-list probe cost
@@ -233,6 +235,7 @@ pub struct RankedAccess {
     pub kind: RankKind,
     pub property: String,
     pub query: IRExpr,
+    pub score: IRExpr,
     /// Candidates the scan asks the index for; `None` is every match.
     pub fetch: Option<usize>,
     /// The IVF partitions a `nearest` scan may probe per index delta, the
@@ -251,13 +254,10 @@ pub struct RankedAccess {
 
 impl RankedAccess {
     /// The score ordering this ranking imposes on `binding`'s rows.
-    pub fn ordering(&self, binding: &str) -> IROrdering {
-        let (property, descending) = self.kind.score();
+    pub fn ordering(&self, _binding: &str) -> IROrdering {
+        let (_, descending) = self.kind.score();
         IROrdering {
-            expr: IRExpr::PropAccess {
-                variable: binding.to_string(),
-                property: property.to_string(),
-            },
+            expr: self.score.clone(),
             descending,
         }
     }
@@ -267,6 +267,8 @@ impl RankedAccess {
             "kind": self.kind,
             "property": self.property,
             "query": self.query.to_string(),
+            "typed_query": crate::typed::expr(&self.query),
+            "typed_score": crate::typed::expr(&self.score),
             "fetch": self.fetch,
             "scope": self.scope,
         });
@@ -348,7 +350,7 @@ impl Estimate {
 pub struct StatisticSource {
     pub statistic: String,
     pub value: String,
-    pub origin: &'static str,
+    pub origin: String,
 }
 
 /// The properties a physical node declares: derived after selection,
@@ -365,8 +367,8 @@ pub struct Properties {
 }
 
 impl Properties {
-    /// A query plan prints no `schema`: its run-time schemas are the
-    /// engine's to derive, and the planner's are conservative input schemas.
+    /// Result nodes declare their typed columns separately. Pipeline schemas
+    /// remain conservative input schemas and are omitted for query plans.
     fn to_json(&self, query: bool) -> Value {
         let mut value = json!({
             "ordering": self.ordering,
@@ -386,6 +388,29 @@ impl Properties {
         }
         value
     }
+}
+
+/// The prefix of the column a query's return projection carries for a
+/// `HydrateColumns` above it: `^n` holds binding `n`'s row address. No GQ
+/// alias or `binding.property` name starts with it.
+pub const ROW_ADDRESS_PREFIX: &str = "^";
+
+/// One binding whose return columns a `HydrateColumns` fetches: its pinned
+/// table and the columns, each with the return position it fills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedBinding {
+    pub binding: String,
+    pub table: TableRef,
+    pub columns: Vec<HydratedColumn>,
+}
+
+/// One deferred return item: `binding.property` under `output`, the return
+/// column at `position`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedColumn {
+    pub position: usize,
+    pub output: String,
+    pub property: String,
 }
 
 /// The operator catalog. The change-feed and merge nodes (`Scan`,
@@ -440,6 +465,15 @@ pub enum PhysicalNode {
         input: NodeId,
         side: SideId,
     },
+    /// Pass 6 on a query: the return columns only the output reads, fetched
+    /// for the rows that reached it by each binding's row address (the
+    /// `ROW_ADDRESS_PREFIX` column the projection below carries) from the
+    /// binding's pinned table, in bounded chunks, and placed at their return
+    /// positions between the input's other columns.
+    HydrateColumns {
+        input: NodeId,
+        bindings: Vec<HydratedBinding>,
+    },
     RowCompare {
         input: NodeId,
     },
@@ -472,6 +506,7 @@ pub enum PhysicalNode {
         right: NodeId,
         haystack: (String, String),
         needle: (String, String),
+        conjunct: IRExpr,
         residual: Vec<IRExpr>,
     },
     /// The in-memory arm of a GQ filter: the conjuncts the placement pass
@@ -503,6 +538,7 @@ pub enum PhysicalNode {
         inner: NodeId,
         outer_var: String,
         predicate: SubqueryPredicate,
+        aggregate: Option<AggregateSpec>,
     },
     /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
     OuterReference {
@@ -522,10 +558,13 @@ pub enum PhysicalNode {
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Aggregate {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        aggregates: Vec<Option<AggregateSpec>>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Sort {
         input: NodeId,
@@ -544,6 +583,7 @@ impl PhysicalNode {
             Self::MetadataCount { .. } => "MetadataCount",
             Self::HashJoin { .. } => "HashJoin",
             Self::HydrateByAddress { .. } => "HydrateByAddress",
+            Self::HydrateColumns { .. } => "HydrateColumns",
             Self::SortMergeJoin { .. } => "SortMergeJoin",
             Self::RowCompare { .. } => "RowCompare",
             Self::ClassifyThreeWay { .. } => "ClassifyThreeWay",
@@ -564,6 +604,7 @@ impl PhysicalNode {
     pub fn inputs(&self) -> Vec<NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -589,6 +630,7 @@ impl PhysicalNode {
     fn inputs_mut(&mut self) -> Vec<&mut NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -647,6 +689,7 @@ impl<'a> TextContains<'a> {
             left,
             op: BinaryOp::Compare(CompOp::StringContains),
             right,
+            ..
         } = conjunct
         else {
             return None;
@@ -655,10 +698,12 @@ impl<'a> TextContains<'a> {
             IRExpr::PropAccess {
                 variable: haystack,
                 property: searched,
+                ty: _,
             },
             IRExpr::PropAccess {
                 variable: needle,
                 property: sought,
+                ty: _,
             },
         ) = (left.as_ref(), right.as_ref())
         else {
@@ -851,6 +896,9 @@ impl PhysicalPlan {
                 ranked,
             } => {
                 let mut value = scan_json("Scan", spec);
+                if let Some(access) = &spec.access {
+                    access.explain(&mut value);
+                }
                 if let ScanInput::Dependent { .. } = source {
                     value["id_restriction"] = json!("input");
                     value["access"] = json!(AccessPath::IdLookup);
@@ -879,6 +927,21 @@ impl PhysicalPlan {
                 "node": "HydrateByAddress",
                 "side": side,
             }),
+            PhysicalNode::HydrateColumns { bindings, .. } => json!({
+                "node": "HydrateColumns",
+                "bindings": bindings
+                    .iter()
+                    .map(|binding| json!({
+                        "binding": binding.binding,
+                        "table": binding.table.type_key,
+                        "columns": binding
+                            .columns
+                            .iter()
+                            .map(|column| column.property.as_str())
+                            .collect::<Vec<&str>>(),
+                    }))
+                    .collect::<Vec<Value>>(),
+            }),
             PhysicalNode::HashJoin {
                 binding, fallback, ..
             } => json!({
@@ -903,6 +966,7 @@ impl PhysicalPlan {
             PhysicalNode::Filter { filters, .. } => json!({
                 "node": "Filter",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::Expand {
                 src,
@@ -936,11 +1000,15 @@ impl PhysicalPlan {
             PhysicalNode::AntiJoin {
                 outer_var,
                 predicate,
+                aggregate,
                 ..
             } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
                 "predicate": predicate.to_string(),
+                "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
+                "typed_left": crate::typed::block(&predicate.left),
+                "typed_right": crate::typed::expr(&predicate.right),
             }),
             PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
@@ -959,12 +1027,37 @@ impl PhysicalPlan {
                     .map(|arm| json!({ "binding": arm.binding, "kind": arm.kind }))
                     .collect::<Vec<Value>>(),
                 "k": k.as_ref().map(ToString::to_string),
+                "typed_k": k.as_ref().map(crate::typed::expr),
                 "limit": limit,
                 "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
-            PhysicalNode::Projection { return_exprs, .. }
-            | PhysicalNode::Aggregate { return_exprs, .. } => json!({
+            PhysicalNode::Aggregate {
+                return_exprs,
+                aggregates,
+                ..
+            } => json!({
                 "node": node.name(),
+                "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
+                "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
+                    match (&projection.expr, spec) {
+                        (IRExpr::Aggregate { func, signature, .. }, Some(spec)) => json!({
+                            "column": crate::optimizer::result_column(projection),
+                            "func": func.to_string(),
+                            "input": signature.arg.spelling(),
+                            "accumulator": spec.accumulator,
+                            "overflow": spec.overflow,
+                            "result": signature.result.spelling(),
+                        }),
+                        _ => Value::Null,
+                    }
+                }).collect::<Vec<_>>(),
+            }),
+            PhysicalNode::Projection { return_exprs, .. } => json!({
+                "node": node.name(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
                 "exprs": return_exprs
                     .iter()
                     .map(|projection| projection.expr.to_string())
@@ -978,16 +1071,19 @@ impl PhysicalPlan {
             } => json!({
                 "node": "Sort",
                 "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
                 "fetch": fetch,
                 "tiebreak": tiebreak_text(tiebreak),
             }),
             PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
                 "node": "CrossJoin",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::ContainsJoin {
                 haystack,
                 needle,
+                conjunct,
                 residual,
                 ..
             } => json!({
@@ -995,6 +1091,8 @@ impl PhysicalPlan {
                 "haystack": column_text(haystack),
                 "needle": column_text(needle),
                 "residual": filters_json(residual),
+                "typed_residual": crate::typed::exprs(residual),
+                "typed_conjunct": crate::typed::expr(conjunct),
             }),
             other => json!({ "node": other.name() }),
         };
@@ -1154,6 +1252,7 @@ impl PhysicalPlan {
             }
             PhysicalNode::RowCompare { input }
             | PhysicalNode::ClassifyThreeWay { input }
+            | PhysicalNode::HydrateColumns { input, .. }
             | PhysicalNode::Page { input, .. }
             | PhysicalNode::Limit { input, .. }
             | PhysicalNode::Filter { input, .. }

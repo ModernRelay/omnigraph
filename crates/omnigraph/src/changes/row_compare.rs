@@ -24,7 +24,7 @@ use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
 use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
 use crate::db::{
-    LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, export_blob_values,
+    LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, row_blob_values,
 };
 use crate::error::{OmniError, Result};
 use crate::ordered_cursor::{KeyFilter, KeyOrder, OrderedRowCursor, WalkSubject};
@@ -288,15 +288,19 @@ impl BatchCursor {
                 .downcast_ref::<StructArray>()
                 .expect("Blob descriptor shape was validated when the batch arrived");
             let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
-            let fragment_id = row_addresses
-                .expect("Blob batches carry row addresses")
-                .value(row)
-                >> 32;
-            let data_file_path =
-                data_file_path_for_field(dataset.fragments(), fragment_id, blob_column.field_id)?;
+            // Only a managed descriptor names a data file. A fragment written
+            // before this Blob column was added has none for it, and its
+            // descriptor is the null Lance reads there.
+            let identity = decoder.physical_identity(row, || {
+                let fragment_id = row_addresses
+                    .expect("Blob batches carry row addresses")
+                    .value(row)
+                    >> 32;
+                data_file_path_for_field(dataset.fragments(), fragment_id, blob_column.field_id)
+            })?;
             blob_signatures.push(BlobColumnSig {
                 name: blob_column.name.clone(),
-                identity: decoder.physical_identity(row, data_file_path)?,
+                identity,
                 managed: matches!(decoder.classify(row)?, BlobDescriptor::Managed { .. }),
             });
         }
@@ -429,7 +433,9 @@ impl OrderedRows {
 
 /// Resolve the immutable data-file path that holds `field_id` in the fragment
 /// owning a row — the stable UUID qualifier for a managed-Blob identity. Reads
-/// only the in-memory manifest.
+/// only the in-memory manifest. Called for managed descriptors only, so a
+/// fragment without a data file for the field is an integrity failure: the
+/// descriptor claims bytes nothing stores.
 fn data_file_path_for_field(
     fragments: &[lance_table::format::Fragment],
     fragment_id: u64,
@@ -592,8 +598,9 @@ async fn rows_equal_by_column(
 }
 
 /// Managed Blob bytes for one row's selected columns, read through the same
-/// helper export uses. Only columns managed on both sides reach this: external
-/// and null cells are decided by descriptor identity in [`rows_equal_by_column`].
+/// batched reader export uses. Only columns managed on both sides reach this:
+/// external and null cells are decided by descriptor identity in
+/// [`rows_equal_by_column`].
 async fn blob_values_for(
     dataset: &Dataset,
     slice: &RecordBatch,
@@ -604,10 +611,10 @@ async fn blob_values_for(
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| OmniError::manifest_internal("change row is missing _rowid"))?
         .value(0);
-    export_blob_values(
+    row_blob_values(
         dataset,
         slice,
-        &[row_id],
+        row_id,
         columns,
         RangedExternalBlobs::Describe,
     )

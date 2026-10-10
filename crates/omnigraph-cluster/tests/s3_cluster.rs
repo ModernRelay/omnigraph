@@ -1,6 +1,6 @@
 //! Cluster ledger v2 on object storage: bootstrap, graph creation, catalog
 //! publication, serving snapshots from config and bare storage roots, schema
-//! evolution, exact admission handoff, and unsupported graph-deletion refusal.
+//! evolution, exact admission handoff, and exact managed-root graph deletion.
 //!
 //! Each provider is independently gated. S3 skips unless
 //! `OMNIGRAPH_S3_TEST_BUCKET` is set; Azure skips unless
@@ -86,7 +86,7 @@ policies:
 
 async fn deploy_fixture(dir: &std::path::Path, root: &str) -> omnigraph_cluster::DeploymentResult {
     let caller = DeploymentCaller::storage_owner(Some("act-admin".into()));
-    let applied = apply_deployment(dir, None, &caller, &Default::default(), |_, _, _| {})
+    let applied = apply_deployment(dir, None, &caller, |_, _, _| {})
         .await
         .unwrap();
     let DeploymentLookup::Complete { result } = applied else {
@@ -284,34 +284,50 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         serde_json::from_str(&adapter.read_text(&ledger_path).await.unwrap()).unwrap();
     let evolved_revision = evolved["state_revision"].as_u64().unwrap();
 
-    // Inventory deletion is an explicit refusal, never a recursive erase.
-    let before_delete = adapter.read_text(&ledger_path).await.unwrap();
+    // An omitted declaration authorizes the whole exact managed root, while
+    // neighboring prefixes and shared external objects remain untouched.
+    let contract = Omnigraph::open_read_only(&graph_root)
+        .await
+        .unwrap()
+        .schema_contract_digest();
+    let neighbor = format!("{graph_root}-neighbor/keep");
+    let external_blob = format!("{root}/shared-blobs/keep");
+    adapter.write_text(&neighbor, "neighbor").await.unwrap();
+    adapter
+        .write_text(&external_blob, "external")
+        .await
+        .unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
         format!("version: 1\nstorage: {root}\ngraphs: {{}}\n"),
     )
     .unwrap();
-    let refused = apply_deployment(
-        dir.path(),
-        None,
+    let deleted = deploy_fixture(dir.path(), root).await;
+    assert!(
+        matches!(&deleted.graphs["knowledge"], omnigraph_cluster::GraphDeploymentResult::Deleted { contract: old } if old == &contract)
+    );
+    assert!(!adapter.exists(&graph_root).await.unwrap());
+    assert_eq!(adapter.read_text(&neighbor).await.unwrap(), "neighbor");
+    assert_eq!(adapter.read_text(&external_blob).await.unwrap(), "external");
+    let snapshot = read_serving_snapshot_from_storage(root).await.unwrap();
+    assert!(snapshot.graphs.is_empty());
+    assert!(snapshot.applied_graphs.is_empty());
+    assert!(snapshot.state_revision > evolved_revision);
+    let ledger = adapter.read_text(&ledger_path).await.unwrap();
+    let lookup = omnigraph_cluster::reconcile_deployment(
+        root,
+        &deleted.id,
+        false,
         &DeploymentCaller::storage_owner(Some("act-admin".into())),
-        &Default::default(),
-        |_, _, _| {},
     )
     .await
-    .unwrap_err();
-    assert_eq!(refused.code, "deployment_scope");
-    assert_eq!(
-        adapter.read_text(&ledger_path).await.unwrap(),
-        before_delete
-    );
-    let snapshot = read_serving_snapshot_from_storage(root).await.unwrap();
-    assert_eq!(snapshot.graphs.len(), 1);
-    assert_eq!(snapshot.state_revision, evolved_revision);
+    .unwrap();
+    assert!(matches!(lookup, DeploymentLookup::Complete { result } if result.id == deleted.id));
+    assert_eq!(adapter.read_text(&ledger_path).await.unwrap(), ledger);
     adapter.delete_prefix(root).await.unwrap();
 }
 
-/// Same fixture and backend matrix as the v1 lifecycle above. This checks the
+/// Same fixture and backend matrix as the lifecycle above. This checks the
 /// actual object-store CAS and retained-lock contract, not live-Azure fencing.
 async fn object_storage_offline_deployment(root: &str) {
     let dir = tempfile::tempdir().unwrap();
@@ -356,17 +372,13 @@ async fn object_storage_offline_deployment(root: &str) {
     let query = FIND_PERSON_GQ.replace("return { $p.name }", "return { $p.name, $p.title }");
     fs::write(dir.path().join("queries/people.gq"), &query).unwrap();
     let mut reported = None;
-    let DeploymentLookup::Complete { result } = apply_deployment(
-        dir.path(),
-        None,
-        &caller,
-        &Default::default(),
-        |id, _, lock| {
+    let DeploymentLookup::Complete { result } =
+        apply_deployment(dir.path(), None, &caller, |id, _, lock| {
             reported = Some((id.to_string(), lock.to_string()));
-        },
-    )
-    .await
-    .unwrap() else {
+        })
+        .await
+        .unwrap()
+    else {
         panic!("expected durable deployment receipt");
     };
     let (id, lock) = reported.unwrap();
@@ -394,13 +406,9 @@ async fn object_storage_offline_deployment(root: &str) {
         Some(lock.as_str())
     );
     assert!(matches!(
-        apply_deployment(
-            dir.path(),
-            Some(&id),
-            &caller,
-            &Default::default(),
-            |_, _, _| panic!("same ID cannot execute twice")
-        )
+        apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
+            "same ID cannot execute twice"
+        ))
         .await
         .unwrap(),
         DeploymentLookup::Complete { .. }
@@ -439,7 +447,7 @@ async fn object_storage_offline_deployment(root: &str) {
     let ledger = adapter.read_text(&ledger_uri).await.unwrap();
     adapter.write_text(&bundle_uri, "{}").await.unwrap();
     assert_eq!(
-        apply_deployment(dir.path(), None, &caller, &Default::default(), |_, _, _| {})
+        apply_deployment(dir.path(), None, &caller, |_, _, _| {})
             .await
             .unwrap_err()
             .code,

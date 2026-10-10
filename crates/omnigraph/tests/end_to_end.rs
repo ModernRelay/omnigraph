@@ -1415,6 +1415,74 @@ async fn blob_read_returns_bytes() {
         "one byte over the public range ceiling must be refused, got {limit_error:?}"
     );
 
+    // Export and entity reads render the same bytes through the batched
+    // managed read. The Document cells span three fragments and the edge
+    // payload its own table; a hydrated chunk's managed cells share one read.
+    let encoded = |bytes: &[u8]| {
+        serde_json::json!(format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    };
+    let probes = MergeWriteProbes::default();
+    let exported = with_merge_write_probes(probes.clone(), db.export_jsonl("main", &[]))
+        .await
+        .unwrap();
+    let lines = exported
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let document_content = |id: &str| {
+        lines
+            .iter()
+            .find(|line| line["type"] == "Document" && line["id"] == id)
+            .unwrap()["data"]["content"]
+            .clone()
+    };
+    assert_eq!(document_content("readme"), encoded(b"Hello World"));
+    assert_eq!(document_content("empty"), encoded(b""));
+    assert!(document_content("null").is_null());
+    assert_eq!(document_content(metacharacter_id), encoded(b"Meta"));
+    assert_eq!(document_content("large"), encoded(&large_payload));
+    let attachment = lines
+        .iter()
+        .find(|line| line["edge"] == "Attachment")
+        .unwrap();
+    assert_eq!(attachment["data"]["payload"], encoded(b"Edge"));
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        5,
+        "readme, empty, the metacharacter row, large and the edge payload"
+    );
+    assert!(
+        probes.blob_managed_batch_read_calls() <= probes.ordered_cursor_hydration_calls(),
+        "at most one read per hydrated chunk of a table with one Blob column"
+    );
+    assert!(
+        probes.blob_managed_batch_read_calls() < probes.blob_payload_read_calls(),
+        "managed cells of one chunk share a read"
+    );
+    let probes = MergeWriteProbes::default();
+    let entity = with_merge_write_probes(
+        probes.clone(),
+        db.entity_at_target(
+            ReadTarget::branch("main"),
+            "edge:Attachment",
+            "attachment-1",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(entity["payload"], encoded(b"Edge"));
+    assert_eq!(
+        (
+            probes.blob_managed_batch_read_calls(),
+            probes.blob_payload_read_calls()
+        ),
+        (1, 1)
+    );
+
     // ETags identify the exact table snapshot, not only the payload bytes:
     // repeating the same read is stable; advancing this node table changes its
     // tag; the untouched edge table retains its exact tag.
@@ -2295,8 +2363,26 @@ async fn assert_graph_root_refuses_overlapping_bases(
         matches!(error, OmniError::ExternalBlobPolicy { .. }),
         "unexpected error: {error}"
     );
-    drop(db);
+    assert_eq!(graph_state(graph_uri.clone()).await, before);
+    let payload = external.join("content.bin");
+    std::fs::write(&payload, [1_u8, 2, 3]).unwrap();
+    let row = serde_json::json!({"type":"Document", "data": {
+        "title":"external", "content":url::Url::from_file_path(&payload).unwrap().to_string()
+    }})
+    .to_string();
+    let denied = helpers::session(
+        db.with_runtime_bindings(None, None, ExternalBlobPolicy::Deny)
+            .unwrap(),
+    );
+    assert!(db.shares_runtime_owner(&denied));
+    assert!(matches!(
+        denied.load_jsonl(&row, LoadMode::Merge).await.unwrap_err(),
+        OmniError::ExternalBlobPolicy { .. }
+    ));
     assert_eq!(graph_state(graph_uri).await, before);
+    // The old admitted view keeps its allow-list; the replacement denies new
+    // external ingestion without changing the old policy or graph ownership.
+    db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────

@@ -3,9 +3,9 @@
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::{
-    ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId, PhysicalNode,
-    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields,
+    AggregateFields, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, HydratedBinding,
+    Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields,
+    RankKind, RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -83,6 +83,15 @@ impl Lower for Trace {
         input: String,
     ) -> Result<String, PlanError> {
         self.call("hydrate_by_address", id, &[&input])
+    }
+
+    fn hydrate_columns(
+        &mut self,
+        id: NodeId,
+        _: &[HydratedBinding],
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("hydrate_columns", id, &[&input])
     }
 
     fn row_compare(&mut self, id: NodeId, input: String) -> Result<String, PlanError> {
@@ -181,7 +190,7 @@ impl Lower for Trace {
     fn aggregate(
         &mut self,
         id: NodeId,
-        _: &[IRProjection],
+        _: AggregateFields<'_>,
         input: String,
     ) -> Result<String, PlanError> {
         self.call("aggregate", id, &[&input])
@@ -227,7 +236,11 @@ fn every_input_is_lowered_before_its_consumer_and_finish_runs_last() {
         input: filter,
         rows: 3,
     });
-    plan.set_root(limit);
+    let hydrate = plan.add(PhysicalNode::HydrateColumns {
+        input: limit,
+        bindings: Vec::new(),
+    });
+    plan.set_root(hydrate);
 
     let mut trace = Trace::default();
     plan.lower(&mut trace).expect("the plan lowers");
@@ -240,7 +253,8 @@ fn every_input_is_lowered_before_its_consumer_and_finish_runs_last() {
             "cross_join#2(outer_reference#0(),outer_reference#1())",
             "filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))",
             "limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1())))",
-            "finish#4(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))))",
+            "hydrate_columns#5(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1()))))",
+            "finish#5(hydrate_columns#5(limit#4(filter#3(cross_join#2(outer_reference#0(),outer_reference#1())))))",
         ]
     );
 }
@@ -252,6 +266,7 @@ fn a_hash_join_lowers_its_probe_then_its_build_scan_then_itself() {
     let build = plan.add(PhysicalNode::Scan {
         source: ScanInput::Table,
         spec: Box::new(ScanSpec {
+            access: None,
             side: SideId::Base,
             table: omnigraph_planner::TableRef {
                 type_key: "node:Doc".to_string(),
@@ -333,6 +348,7 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
         inner,
         outer_var: "o".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+        aggregate: None,
     });
     plan.set_root(anti);
 

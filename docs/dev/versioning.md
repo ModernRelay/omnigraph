@@ -9,7 +9,7 @@ version axes. Never derive one axis from another.
 | Axis | Policy | Guard |
 |---|---|---|
 | Release | Published workspace artifacts move in lockstep. | Workspace manifests, lockfile, generated metadata, release automation. |
-| CLI ↔ server wire | One v0.12 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
+| CLI ↔ server wire | One v0.13 contract; coordinated client/server upgrades. Exact request admission and CLI discovery/response validation. | Shared contract header, DTOs, HTTP refusal tests and OpenAPI drift tests. |
 | Graph storage | Closed stamp range `[MIN_SUPPORTED, CURRENT]`, independent of system column vintage; a standalone graph at stamp 8, 9 or 13 is converted by the offline `omnigraph upgrade`, a graph at any other stamp is rebuilt by export and load; no open-time migration. | Main-manifest stamp guard on both bounds. |
 | Lance dependency and file format | One deliberately pinned Lance family and explicit stable file version. | Lockfile, write parameters, and Lance surface guards. |
 
@@ -340,7 +340,7 @@ points are refused
 
 ## Wire compatibility
 
-The v0.12 HTTP boundary requires `Omnigraph-Http-Api: 0.12` exactly once on
+The v0.13 HTTP boundary requires `Omnigraph-Http-Api: 0.13` exactly once on
 protected graph and registry requests. Authentication precedes contract admission;
 missing, duplicate or unsupported values return typed 400 `api_contract_mismatch`
 before graph resolution or body execution. Ordinary responses carry the same

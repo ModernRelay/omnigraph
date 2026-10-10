@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
@@ -8,8 +10,14 @@ use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlanError;
+use crate::logical::{RuntimeInput, ScanAccess, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{DatasetPin, GatePolicy};
+
+/// The source's answer to `PlanSource::index_split`, awaited by the
+/// finalization stage both query entry points share.
+pub type IndexSplitFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ScanAccess, PlanError>> + Send + 'a>>;
 
 /// Which pinned image a scan reads. `Parent` is the before side (`from`),
 /// `Child` the after side (`to`); a three-way merge adds `Base`. A GQ query
@@ -49,6 +57,8 @@ pub struct NodeTypeSpec {
     pub schema: SchemaRef,
     pub key: Vec<String>,
     pub object_columns: Vec<String>,
+    /// The projected node members, with logical names such as `@id`.
+    pub object_fields: arrow_schema::Fields,
     /// The table's manifest-resident row count (`entity_count`); `None` when
     /// the table is absent from the pinned snapshot.
     pub row_count: Option<u64>,
@@ -72,7 +82,6 @@ pub struct ExpandStatistics {
     pub edge_count: u64,
     pub src_node_count: u64,
     pub dst_node_count: u64,
-    pub same_type: bool,
     pub max_frontier_cap: u64,
     pub max_hops_cap: u32,
 }
@@ -84,6 +93,42 @@ pub struct FragmentStat {
     pub id: u64,
     pub rows: Option<u64>,
     pub bytes: Option<u64>,
+}
+
+/// One logical index at the table's pinned version, across all its segments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFact {
+    pub name: String,
+    pub column: String,
+    #[serde(flatten)]
+    pub kind: IndexKind,
+    pub coverage: Option<FragmentCoverage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IndexKind {
+    Btree { usable: bool },
+    Inverted,
+    Vector,
+    Unknown,
+}
+
+/// Coverage counts current fragments, not rows; absence means unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentCoverage {
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl IndexFact {
+    pub fn fully_covers_btree(&self, column: &str) -> bool {
+        self.column == column
+            && matches!(self.kind, IndexKind::Btree { usable: true })
+            && self
+                .coverage
+                .is_some_and(|coverage| coverage.total > 0 && coverage.covered == coverage.total)
+    }
 }
 
 /// The proof the engine's candidate path captured for one interval: the
@@ -104,6 +149,27 @@ pub struct AdjacencyProof {
 /// The planner's whole view of the store. Implemented by the engine over its
 /// pinned snapshot; implemented in memory by the planner's own tests.
 pub trait PlanSource {
+    /// Render a key value only when its identity agrees with supported persisted rows.
+    fn canonical_key_id(
+        &self,
+        _type_key: &str,
+        _value: &IRExpr,
+    ) -> Result<Option<String>, PlanError> {
+        Ok(None)
+    }
+
+    fn scan_runtime_input(&self, _scan: &ScanSpec) -> Option<RuntimeInput> {
+        None
+    }
+
+    fn index_split<'a>(&'a self, _scan: &'a ScanSpec) -> IndexSplitFuture<'a> {
+        Box::pin(async { Ok(ScanAccess::Sequential) })
+    }
+
+    fn index_facts(&self, _dataset_key: &str) -> Vec<IndexFact> {
+        Vec::new()
+    }
+
     /// Whether `property` holds at most one row per value in the table
     /// `type_key` names, beyond the `@key` columns `NodeTypeSpec::key` lists.
     fn is_unique_property(&self, _type_key: &str, _property: &str) -> bool {
@@ -196,6 +262,7 @@ pub trait PlanSource {
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySource {
+    index_facts: HashMap<String, Vec<IndexFact>>,
     schemas: HashMap<SideId, SchemaRef>,
     fragments: HashMap<SideId, Vec<FragmentStat>>,
     proof: Option<AdjacencyProof>,
@@ -211,6 +278,11 @@ pub struct MemorySource {
 }
 
 impl MemorySource {
+    pub fn with_index_facts(mut self, dataset_key: &str, facts: Vec<IndexFact>) -> Self {
+        self.index_facts.insert(dataset_key.to_string(), facts);
+        self
+    }
+
     pub fn with_query_memory_pool_bytes(mut self, bytes: u64) -> Self {
         self.query_memory_pool_bytes = bytes;
         self
@@ -289,6 +361,13 @@ impl MemorySource {
 }
 
 impl PlanSource for MemorySource {
+    fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
+        self.index_facts
+            .get(dataset_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn schema(&self, side: SideId) -> Result<SchemaRef, PlanError> {
         self.schemas
             .get(&side)

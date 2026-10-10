@@ -29,7 +29,8 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `tests/support/mod.rs` |
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `lane_b.rs`, `torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
-| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus in-source format self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
+| `omnigraph-gqt-core` | In-source format, expectation and ordinary execution tests | Shared parser and executor used by the GQT runner and benchmark harness |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -59,7 +60,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Export and lineage | `export.rs`, `lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints` |
-| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, the ignored `manifest_history_curve.rs` instruments (requests, bytes and retained `__manifest` and `__history` bytes across history and independent schema-source/IR sizes), the ignored `compaction_memory.rs` instrument (peak heap allocation of Blob-table compaction), and `benchmark_scenario_contract.rs` |
+| Cost and benchmark contracts | `write_cost.rs`, `write_cost_s3.rs`, `warm_read_cost.rs`, `branch_control_cost.rs`, `merge_cost.rs`, `changes_cost.rs`, the checkpoint/head lookup instruments, and the GQT benchmark adapter tests in `omnigraph-bench` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
@@ -103,6 +104,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `end_to_end.rs`, `branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- engine `export.rs` owns export's batched managed Blob read (one read per Blob column per batch, in request order, shared by the change-feed baseline) and `changes.rs` the change images' reads;
 - engine `maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `data_routes.rs`, `auth_policy.rs`, and `openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
@@ -125,20 +127,44 @@ The guards pin only substrate behavior OmniGraph actually depends on: version an
 CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
 workspace gate; its required-cell checks reject removed or ignored cases. The
 lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge.
+timeout without replaying a committed merge. Its deployment matrix holds a real
+admitted request through drain, disconnects or times out the caller before
+durable acceptance, and loses replies after acceptance. Exact-ID observation
+must finish with one ledger result, one schema publication and the same server
+PID; neither apply nor recovery polling may resubmit.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
 Per-graph serving transitions extend these owners: in-source `registry` tests
-own capture/close ordering, deadlines, schema identity and candidate bounds;
+own capture/close ordering, drain-only deployment deadlines, affected activation
+scope, schema identity and candidate bounds;
 `operations`, `ingress` and `mcp` own detached execution and output lifetimes.
 `stored_queries` parks a request before engine capture, `data_routes` retains
 disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
 availability. The same owners cover coherent schema/query batch activation; these assertions
 are not generic native settlement. Server `boot_settings` exercises authenticated
-submission, parked requests, caller disconnect, pre-effect refusal and historical
-ID observation. CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement and graph addition while an unaffected peer keeps serving.
+submission, parked requests, caller disconnect, pre-effect refusal, durable
+acceptance before completion, activation-in-progress observation and exact receipt
+access after management handoff. It also holds a merge across served schema
+planning to prove preview does not wait for the graph gate. In-source
+`deployment` tests suspend observer read futures across owner start, finish and complete
+turnover, exercising bounded re-observation for aggregate and exact status.
+CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
+retries, malformed-receipt refusal, terminal outcomes and caller timeout without
+replay. Its managed fixtures cover status/history scope and filters, explicit
+`--managed` selection, and wrong-mode refusals before context or external access.
+Direct apply must ignore both valid and malformed managed folder context.
+CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
+replacement, graph addition, policy grant/revocation and management handoff;
+the original submitter retains only its exact receipt access after restart.
+Extend that same journey for graph deletion, proving target storage/history
+removal, peer preservation and unchanged PID/listener, including a served deletion
+preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks
+the achieved configuration again after restart. The local journey also exercises
+counted embedding-provider replacement, external-Blob admission changes, catalog
+integrity reporting, schema-drift refusal and missing-root refusal. S3/Azure wrappers
+share the transport-independent phases; local success does not qualify their
+storage-fault paths. CI requires the local journey to execute successfully.
 
 CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
 
@@ -146,7 +172,10 @@ Deployment tests extend these owners: cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
 exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
 exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
-interruption windows, killed-process recovery and corrective successors;
+interruption windows, killed-process recovery and corrective successors, including
+deletion before start, during partial removal, after root absence and before
+terminal ledger acknowledgement, same-lifetime older manifest survivors,
+replacement refusal and corrective creation in empty local settlement residue;
 `tests/identity_recovery.rs` owns current-actor authorization and adoption of a
 persisted settlement without replacing its author. CLI
 `tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
@@ -253,6 +282,41 @@ reads. The catalog tests own row uniqueness, projection and validation;
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
 
+### Manual 0.12 cluster upgrade qualification
+
+`genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment` is an ignored,
+Unix-only release qualification test. It creates genuine 0.12 receipts, stops
+the old server, converts the ledger, checks data/history/schema identity and
+historical reads, then applies live schema and policy changes. Storage stays at
+format 14. Ordinary CI keeps current-version live-deployment coverage; it does
+not download 0.12 or run this journey.
+
+Run explicitly from the repository root when qualifying that upgrade path,
+using a native build with Cargo's default `target/` directory.
+Both predecessor variables are required; missing binaries fail. The installer
+verifies the official archive checksum. Copy the freshly built candidate server
+so another build cannot replace it during qualification:
+
+```bash
+set -euo pipefail
+qualification_dir=$(mktemp -d)
+REPO_SLUG=ModernRelay/omnigraph VERSION=v0.12.0 INSTALL_DIR="$qualification_dir/v012" bash scripts/install.sh
+qualification_features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+cargo build --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster --features "$qualification_features"
+cp target/debug/omnigraph-server "$qualification_dir/omnigraph-server"
+env RUST_MIN_STACK=16777216 \
+  OMNIGRAPH_V012_BIN="$qualification_dir/v012/omnigraph" \
+  OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
+  "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
+  cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
+    --features "$qualification_features" --test crossversion_upgrade \
+    genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment \
+    -- --exact --ignored --test-threads=1 --nocapture
+```
+
+Qualification requires `1 passed; 0 failed; 0 ignored`; an empty or ignored run
+is not evidence. Keep its output with the release qualification record.
+
 ## Commands
 
 Focused iteration:
@@ -275,8 +339,18 @@ cargo test -p omnigraph-gqt --test gq_logic_tests issue_563      # matching case
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list      # one line per case
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure   # store requests per step under DST
 cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/concurrent_read_beside_publish.gqt --measure   # a `--- concurrent` block: sessions overlap under an `order:` line, one cost row per session
-cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases --measure --baseline /tmp/gqt-cost.tsv --write-baseline   # record a cost baseline anywhere on disk; --baseline alone prints the delta
+cargo run -p omnigraph-gqt --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure --baseline /tmp/gqt-cost.tsv --write-baseline   # record a cost baseline anywhere on disk; --baseline alone prints the delta
+cargo run -p omnigraph-gqt --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 ```
+
+Schema and seed are optional together; a file without them needs `--store`
+and belongs outside the automatically discovered corpus. Dataset-only files
+with schema and seed may have zero steps. `--store` opens the supplied root,
+skips fixture preparation, and runs ordinary steps, including writes and
+restart, on that root. Its backend must match the declared direct-engine
+environment; DST and server targets are refused. External-store reports
+cannot replay because the data is not frozen. `--measure` requires at least
+one selected DST environment; direct-only selections fail before execution.
 
 Discovery includes every `.gqt` file below `cases/`, recursively. Shared
 cases live at its root; v2-specific cases live in `v2/`, and plan assertions
@@ -321,10 +395,24 @@ format can express it, and a symptom the format cannot express belongs in a
 that matches no case is libtest's ordinary green zero-test run; read the
 `filtered out` count.
 
+GQT plan assertions also pin stored expression types and conversions:
+`type $p.age: I64?`, `cast $p.age: I64? -> F64?`, and `no cast $p.age`.
+Positive type claims require a match and compare every non-cast node with the
+same rendered expression; cast claims compare the child and target types.
+Every successful rows step validates the typed explain trees and compares
+explain before and after the executed bound plan's serialization round trip.
+The root and node-object schema checks remain direct stored-field comparisons.
+`block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?`
+pins the block's leaf implementation independently from comparison casts.
+Every rows step also requires both `typed_left` and `typed_right`, validates
+block signature/spec agreement, and directly compares the stored block tree
+and spec after serialization. Planner saved-plan tests mutate CountRows types,
+aggregate signatures, specs, comparison casts and bounds without reading rows.
+
 Canonical workspace graph:
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
@@ -341,13 +429,13 @@ S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS
 
 ### Plan replay
 
-Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a v2 run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door, and the GQT runner applies no replay check of its own to a step (its own checks are the report-shape parse of the `ran` lines' input, `schema_drift` and `check_pin`). The runner once replayed every v2 step against its report (two per-case replay invariants); that fence went when the plan started carrying everything execution reads, because a per-case replay in the same process found nothing the tests below do not find once, and cost every case a second run. The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
+Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a v2 run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door. On every successful rows step, the GQT runner checks the report shape, `schema_drift`, `check_pin`, and the plan root's complete declared result schema against both independent compiler inference and the executed columns. Inference compares nullability flags; execution compares names in order, full Arrow types (including node Struct members), and null cells in declared non-null results. It also serializes and deserializes the executed `BoundPlan`, requires equal physical explain documents, and directly compares stored schemas, return declarations, named node-object types and complete block predicates/specs. This checks that the plan's stored decisions survive the mirror without executing another query. The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
 
-`crates/omnigraph/tests/engine_v2_plan_replay.rs` owns the replay. Each test gathers one query through `Session::query_inspected`, serializes the `BoundPlan` it emitted through the planner's mirrors, reads it back (it must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that takes the bound plan and the engine context and nothing else about the query. Each replay must return the run's rows and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot.
+`crates/omnigraph/tests/engine_v2_plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the `BoundPlan` it emitted through the planner's mirrors, reads it back (it must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that takes the bound plan and the engine context and nothing else about the query. Each replay must return the run's rows and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot.
 
 The scrubbed side is `crates/omnigraph/tests/engine_v2_scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/v2/planner/input_*.gqt` (`engine`, `ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `engine_v2_plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
 
-The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
+The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
 
 ### GQT execution through DST
 
@@ -374,151 +462,67 @@ Commit the generated file with the API change. CI checks drift; it never updates
 
 ## Cost tests and benchmarks
 
-The ignored `parity_matrix::http_soak::mixed_http_soak` instrument reuses the
-CLI parity fixture to drive a real HTTP server with light reads, unique writes,
-and export/baseline consumers that throttle, pause and abandon bodies. Run
-`OMNIGRAPH_HTTP_SOAK_SECONDS=60 cargo test -p omnigraph-cli --locked --test parity_matrix http_soak::mixed_http_soak -- --exact --ignored --nocapture`.
-The duration accepts 10–600 seconds; final requests have bounded deadlines.
-It checks complete snapshots, baseline cursors, exact final writes against
-received receipts, all three consumer modes and peer progress during admitted
-streams. A structured `stream_export_slots` refusal is counted as refused work;
-other unexpected failures remain failures. The final read-only export waits at
-most 20 seconds for that exact refusal after abandoned consumers, and reports
-its refusal count and admission wait; mutations are never retried.
-Its `HTTP_SOAK` JSON reports every attempt
-(including refusals, unknown outcomes and intentional abandonment), latency
-percentiles (including client delays and validation), isolated/recovery reads
-and sampled server RSS with quarter medians where available.
-This local, closed-loop diagnostic establishes neither capacity/fairness bounds,
-a memory envelope, backend qualification nor an authoritative benchmark record.
+The active performance workload definitions live in GQT under
+[`benchmarks/`](../../benchmarks/README.md). Unsupported maintenance, real
+concurrency, HTTP and streaming instruments are preserved in
+[`benchmarks/deferred/`](../../benchmarks/deferred/README.md), outside Cargo
+discovery. Cleanup and optimization belong in GQ before GQT can exercise them.
+Historical HTTP records remain readable by `scripts/analyze-http-perf.py` and
+`scripts/analyze-http-retention.py`; acquisition is deferred.
 
-`parity_matrix::http_bench::controlled_http_comparison` is the companion fixed-state
-diagnostic. Set `OMNIGRAPH_HTTP_BENCH_CONFIG` to a JSON file naming an empty output
-directory, explicit baseline/current server executables and fixture CLI, each
-with a release build receipt whose `binary_sha256` matches the executable.
-The config also declares `abba_blocks`, `query_samples` and `export_samples`
-(the full comparison uses 3, 500 and 8). It builds equal-content bulk,
-1,000-commit fragmented and publicly optimized fixtures, then restores identical
-bytes at one stable path for both servers. Every fresh process runs 25 query
-and two export warmups before serial timed requests; client verification is
-outside timing. Per-repetition JSON retains raw durations, validation counts,
-RSS phases, post-idle observations and physical/logical identities. The optimized
-state is a maintenance bundle, not an isolated compaction treatment. Copies,
-byte verification and warmups condition caches; OS cache residency is unproved.
-This local diagnostic is not an RFC 0039 archive record or a CI performance gate.
-Children clear the inherited environment and use an explicit 100 MiB Lance pool
-for both server arms and fixture preparation; the session records this environment.
-Do not compare its numbers directly with a Cargo-launched soak using the
-workspace's 1 GiB pool.
+Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; deterministic engine cost contracts remain in `crates/omnigraph/tests/`.
 
-For example, save this as `/tmp/http-comparison.json`, substituting absolute
-paths to the release binaries and their build receipts. Receipts also record
-clean source commit/tree, compiler and build command, features/profile,
-Cargo lock/config digests and Rust flags; the analyzer checks their consistency.
-The output directory must be new or empty. Build each revision in a clean
-checkout with identical settings, then preserve its binaries and receipt before
-building the other revision. Clear workspace test-only Rust flags for the SUT:
+The benchmark runner executes `gqt-v1` dataset/query pairs through the same
+production core used by GQT correctness tests. It selects one engine operation
+by ordinal and exact header/body echo, then closes its clock and logical
+counters before expectations and subsequent explicit verification. Reads,
+mutations, branch controls, single-call generated loads, and engine restart
+use the same adapter. Bench wall-clock still requires a qualified release
+binary; GQT correctness and DST execution do not acquire benchmark timings.
 
-```bash
-env -u CARGO_ENCODED_RUSTFLAGS RUSTFLAGS= cargo build --release --locked -p omnigraph-server -p omnigraph-cli
-```
-
-```json
-{
-  "output": "/tmp/http-comparison",
-  "baseline": {"binary": "/abs/baseline/omnigraph-server", "receipt": "/abs/baseline/server-build.json"},
-  "current": {"binary": "/abs/current/omnigraph-server", "receipt": "/abs/current/server-build.json"},
-  "fixture_cli": {"binary": "/abs/current/omnigraph", "receipt": "/abs/current/cli-build.json"},
-  "abba_blocks": 3,
-  "query_samples": 500,
-  "export_samples": 8
-}
-```
-
-```bash
-OMNIGRAPH_HTTP_BENCH_CONFIG=/tmp/http-comparison.json cargo test -p omnigraph-cli --locked --test parity_matrix http_bench::controlled_http_comparison -- --exact --ignored --nocapture
-python3 scripts/analyze-http-perf.py /tmp/http-comparison
-```
-
-Use `abba_blocks: 1`, `query_samples: 20`, `export_samples: 1` for a driver
-smoke check, with a separate output directory. Analysis writes `analysis.json`
-and `analysis.md` beside the raw records; smoke data is descriptive only.
-
-The separate `http_bench::retention::fixed_state_http_retention` instrument reuses
-a completed comparison's fragmented fixture and current executable. Its
-`OMNIGRAPH_HTTP_RETENTION_CONFIG` JSON contains `fixture_session`, a new empty
-`output`, `seconds` and `repetitions`; use 300 seconds and two repetitions
-(10 seconds and one repetition are allowed for smoke checks). Two serial readers
-run alongside one export/baseline consumer cycling fast, paused and abandoned
-responses, with no writes. Each fresh process records raw reader durations,
-stream outcomes, RSS timestamps, final snapshot admission wait, recovery reads
-and ten seconds of idle sampling. Both instruments fail on incomplete content
-or physical fixture changes. Retention samples describe this bounded workload;
-they do not establish a leak rate or memory bound.
-
-After the comparison completes, save `/tmp/http-retention.json`:
-
-```json
-{
-  "fixture_session": "/tmp/http-comparison",
-  "output": "/tmp/http-retention",
-  "seconds": 300,
-  "repetitions": 2
-}
-```
-
-```bash
-OMNIGRAPH_HTTP_RETENTION_CONFIG=/tmp/http-retention.json cargo test -p omnigraph-cli --locked --test parity_matrix http_bench::retention::fixed_state_http_retention -- --exact --ignored --nocapture
-python3 scripts/analyze-http-retention.py /tmp/http-retention
-```
-
-Keep the source fixture directory at its original path and run its consumers
-sequentially: both instruments restore the same active graph URI.
-
-Correctness tests may assert deterministic logical or object-store operation counts when the count is part of the design contract. Wall time and peak RSS depend on the host and belong in the `omnigraph-bench` scenario harness; benchmark results are evidence rather than pass/fail assertions. Declarative benchmark cases and suites live under `benchmarks/`; the engine's deterministic benchmark contracts remain in `crates/omnigraph/tests/`.
-
-The current runner executes the narrow, fail-closed local envelope documented
-in `crates/omnigraph-bench/README.md`. It requires a release binary, restores
-every repetition at the fixture's stable path from a never-opened APFS
-clonefile template or a verified Linux/XFS plain-copy template. Plain-copy
-reads fixture bytes before measurement and declares the page cache uncontrolled.
-The runner contains each measured merge in a fresh SHA-attested,
-hard-deadline worker process, and verifies exact target/source/main state.
-Fixture and repetition children clear the host environment, pin locale, and
-receive protocol-owned scratch siblings as `TMPDIR` and cwd; measured workers
-also use their per-repetition scratch as `OMNIGRAPH_MERGE_STAGING_DIR`. The only
-inherited engine setting is the modeled `LANCE_MEM_POOL_SIZE`; Tokio/Rayon
-thread-count overrides are refused before execution. A
-run without `--archive` emits diagnostic output only. The empty `RUSTFLAGS`
-clears the workspace's development `--cfg tokio_unstable`; the runner refuses
-a build whose build script saw encoded Rust flags:
+Every repetition uses a fresh SHA-attested process and restores the dataset
+at its stable active path from a never-opened APFS clonefile or verified
+Linux/XFS copy. The persistent dataset cache holds its lock through worker
+verification and containment. Index requirements are unioned across dataset
+and queries and applied with the seed before updates/deletes. This ordering
+is exercised by the shipped stale-index pairs.
 
 ```bash
 RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
-  suite run benchmarks/suites/local-smoke.suite-v1.yaml
+  run local-fast --dataset-cache /qualified/cache
 ```
 
-The imported-fixture `fixture run-graph` path is separate from durable suite
-execution. Its fixed FinGraph node-and-edge merge adapter supports qualified
-macOS/APFS clonefiles or Linux/XFS directly backed by EC2 instance-store NVMe;
-EBS is refused. The registered source stays quiescent and is never opened as a
-database. Every repetition restores the prepared physical tree at the exact
-same active path. Source and scratch ownership must remain exclusive:
-metadata-only checks detect observable stat drift, not every same-length
-rewrite within a filesystem timestamp tick. Byte identity comes from the
-verified copy or forced-clone contract. Before freezing, Linux requires free
-space for one more prepared-tree copy plus 1 GiB. Use a dedicated benchmark
-mount: this path calls `syncfs` after freezing and after every restore, outside
-timing, to finish data and directory writeback across that filesystem. It records a distinct
-`xfs-plain-copy-syncfs-same-active-path` reset, not the durable suite's existing
-plain-copy treatment. Fresh workers attest matching process-effective machine
-identities; copying leaves the OS page cache uncontrolled. Reports remain
-`claim_eligible: false` and `durable_record: false`, with no archive publication
-or AWS dispatch. Commands live in the
-[FinGraph diagnostic guide](../../benchmarks/README.md#fingraph-diagnostic-runner).
-Within `omnigraph-bench`, `reset.rs` owns copy/path integrity tests,
-`environment.rs` owns backend qualification, and `real_graph_run.rs` owns the
-platform, capacity, writeback, worker-identity, and native merge regressions.
+The empty `RUSTFLAGS` clears the workspace development cfg; the existing
+release guard refuses encoded flags and unmodeled runtime overrides.
+Children clear their environment, pin locale, and use protocol-owned scratch
+siblings for `TMPDIR` and merge staging. Containment must be proved before
+cleanup; a later assertion or protocol failure cannot turn Settled timing
+into a passing sample.
+
+`gqt_tests.rs` owns public pair/directory discovery, selection, engine receipts,
+index preparation, and mixed archive/projection coverage. `dataset_identity`,
+`dataset_cache`, and `dataset_worker` own logical history, cache integrity,
+and contained building; `gqt_runner`, `gqt_supervisor`, and `gqt_protocol` own
+operation boundaries and worker admission. `registered_fixture`, `reset`, and
+`environment` retain byte-copy, stable-path, and backend qualification checks.
+The retired `real_graph_run` and Rust fixture builder remain test oracles,
+with no production execution route.
+
+The slow nightly GQT workflow also explicitly selects the 21 ordinary `benchmarks/fixtures` recipes, including the
+full 800,000-row D50 dataset and its 64-commit history variant with post-build assertions. Reduced legacy parity
+cases validate generator equivalence but do not stand in for that scale.
+Dataset/query catalog parsing is a normal correctness test; selected-operation
+wall-clock and unpinned benchmark counters remain report-only. The new D50
+warm prefix is 24 authored aggregate reads, a distinct cache program from
+the retired Rust scans.
+
+Registered FinBench uses the ordinary `gqt-v1` suite with a logical reference,
+schema-less GQT preparation, and `--fixture ID=BUNDLE`. `fixture run-graph` and
+its run YAML are retired. Current registered sources must be main-only,
+relocation-self-contained, and have deterministic node keys. Original source
+IDs are additionally hashed before preparation; generated transfer IDs use
+explicit logical equivalence. Commands and limits are in the
+[benchmark catalog](../../benchmarks/README.md#registered-finbench-merge).
 
 Do not archive diagnostic JSON as telemetry. To publish authoritative
 `suite run` records, first commit the exact source under test, build the release binary from

@@ -1,29 +1,44 @@
-//! Live cluster deployment over the versioned, non-retrying server protocol.
+//! Live cluster deployment: submit once, then observe the original identity.
 
 use std::path::Path;
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, bail};
-use omnigraph_cluster::{DeploymentLookup, DeploymentStatus};
-use reqwest::Method;
+use omnigraph_cluster::{CapturedDeployment, DeploymentLookup, DeploymentStatus};
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::cli::{Cli, ClusterCommand, Command};
-use crate::graph_http::GraphHttpClient;
+use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
-    apply_bearer_token, remote_response_json_bounded, remote_url, resolve_remote_bearer_token,
-    resolve_server_flag,
+    RemoteErrorCli, apply_bearer_token, remote_response_json_bounded, remote_url,
+    resolve_remote_bearer_token, resolve_server_flag,
 };
 
 const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
-const REQUEST_DEADLINE: Duration = Duration::from_secs(300);
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+const DEFAULT_WAIT: Duration = Duration::from_secs(300);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The caller's budget expired; it did not cancel the server's operation.
+/// The response has already been emitted, so main supplies only exit status 5.
+#[derive(Debug)]
+pub(crate) struct WaitTimeout;
+impl std::fmt::Display for WaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("deployment observation timed out; inspect the original deployment ID")
+    }
+}
+impl std::error::Error for WaitTimeout {}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusResponse {
     status: DeploymentStatus,
     active: bool,
+    in_progress: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +46,88 @@ struct StatusResponse {
 struct ApplyResponse {
     deployment: DeploymentLookup,
     active: bool,
+    in_progress: bool,
+}
+
+impl ApplyResponse {
+    fn verify(&self, id: &str) -> Result<()> {
+        if matches!(&self.deployment, DeploymentLookup::Complete { result } if result.id != id)
+            || matches!(&self.deployment, DeploymentLookup::Outstanding { id: returned, .. } if returned != id)
+            || (self.active
+                && !matches!(&self.deployment, DeploymentLookup::Complete { result } if result.converged))
+        {
+            bail!(
+                "invalid deployment receipt; inspect the original Deployment-ID; never replay unknown work"
+            );
+        }
+        Ok(())
+    }
+
+    fn accepted(&self) -> bool {
+        matches!(
+            self.deployment,
+            DeploymentLookup::Outstanding { .. } | DeploymentLookup::Complete { .. }
+        )
+    }
+
+    fn verify_input(&self, expected: &str) -> Result<()> {
+        let recorded = match &self.deployment {
+            DeploymentLookup::Outstanding { input_digest, .. } => input_digest,
+            DeploymentLookup::Complete { result } => &result.input_digest,
+            _ => return Ok(()),
+        };
+        if recorded != expected {
+            bail!(
+                "deployment receipt input digest differs from the submitted input; inspect the original Deployment-ID; never replay unknown work"
+            );
+        }
+        Ok(())
+    }
+
+    fn pending(&self) -> bool {
+        self.in_progress
+            && !self.active
+            && matches!(
+                self.deployment,
+                DeploymentLookup::NotRecorded
+                    | DeploymentLookup::Outstanding { .. }
+                    | DeploymentLookup::Complete { .. }
+            )
+    }
+
+    fn finish(&self, acceptance_only: bool) -> Result<()> {
+        crate::print_json(self)?;
+        if self.active
+            || (acceptance_only
+                && self.in_progress
+                && (matches!(&self.deployment, DeploymentLookup::Outstanding { .. })
+                    || matches!(&self.deployment, DeploymentLookup::Complete { result } if result.converged)))
+        {
+            return Ok(());
+        }
+        let message = match &self.deployment {
+            DeploymentLookup::Outstanding { .. } => {
+                "deployment requires recovery; observe and reconcile its original identity"
+            }
+            DeploymentLookup::Complete { result } if !result.converged => {
+                "deployment partially converged; inspect its achieved result before a corrective deployment"
+            }
+            DeploymentLookup::Complete { .. } => {
+                "deployment completed but is not active in this process; inspect the original receipt"
+            }
+            DeploymentLookup::NotRecorded => {
+                "deployment acceptance is not recorded; this does not authorize replay"
+            }
+            DeploymentLookup::ResultExpired { .. } => {
+                "deployment receipt expired; its outcome is unknown and must not be replayed"
+            }
+            DeploymentLookup::IdentityMismatch => {
+                "deployment identity differs from the recorded attempt"
+            }
+            DeploymentLookup::DifferentLedger => "deployment belongs to a different ledger",
+        };
+        bail!("{message}")
+    }
 }
 
 struct RemoteCluster {
@@ -56,42 +153,50 @@ impl RemoteCluster {
         method: Method,
         segments: &[&str],
         body: Option<Value>,
+        deadline: Instant,
     ) -> Result<T> {
         let url = remote_url(&self.root, segments, &[])?;
-        let request = apply_bearer_token(self.client.request(method, url), self.token.as_deref())
-            .timeout(REQUEST_DEADLINE);
+        let request = apply_bearer_token(
+            self.client.request(method.clone(), url),
+            self.token.as_deref(),
+        );
+        // GETs are individually bounded. POST acceptance can wait for drain
+        // and preflight, but never beyond the caller's total observation budget.
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let timeout = if method == Method::GET {
+            timeout.min(REQUEST_DEADLINE)
+        } else {
+            timeout
+        };
+        let request = request.timeout(timeout);
         let request = match body {
             Some(body) => request.json(&body),
             None => request,
         };
-        remote_response_json_bounded(
-            self.client.send(request).await?,
-            self.token.as_deref(),
-            Some(RESPONSE_LIMIT),
-        )
-        .await
+        tokio::time::timeout_at(deadline, async {
+            remote_response_json_bounded(
+                self.client.send(request).await?,
+                self.token.as_deref(),
+                Some(RESPONSE_LIMIT),
+            )
+            .await
+        })
+        .await?
     }
 
-    async fn apply(
+    async fn capture(
         &self,
         config: &Path,
-        requested_id: Option<&str>,
-        correction: Option<&Path>,
         json_output: bool,
-    ) -> Result<()> {
-        let corrections = crate::read_schema_corrections(correction)?;
+        deadline: Instant,
+    ) -> Result<(StatusResponse, CapturedDeployment)> {
         let status: StatusResponse = self
-            .request(Method::GET, &["cluster", "deployments"], None)
+            .request(Method::GET, &["cluster", "deployments"], None, deadline)
             .await?;
-        // Only source files belong to the caller's filesystem. Bind their
-        // captured bytes to the authenticated server's root without opening
-        // that storage root or resolving it on the client.
+        // Source files belong to the caller. The authenticated server owns
+        // storage resolution; the CLI never opens its storage root.
         let deployment = crate::core_deployment_result(
-            omnigraph_cluster::capture_deployment_for_server(
-                config,
-                &corrections,
-                &status.status.canonical_root,
-            ),
+            omnigraph_cluster::capture_deployment_for_server(config, &status.status.canonical_root),
             json_output,
         )?;
         if status.status.canonical_root != deployment.canonical_root() {
@@ -99,6 +204,93 @@ impl RemoteCluster {
                 "cluster config addresses a different storage root from the selected server; no deployment was sent"
             );
         }
+        Ok((status, deployment))
+    }
+
+    async fn plan(&self, config: &Path, json_output: bool) -> Result<()> {
+        let deadline = Instant::now() + DEFAULT_WAIT;
+        let (_, deployment) = self.capture(config, json_output, deadline).await?;
+        let plan: Value = self
+            .request(
+                Method::POST,
+                &["cluster", "plan"],
+                Some(json!({"deployment": deployment})),
+                deadline,
+            )
+            .await?;
+        crate::print_json(&plan)?;
+        if plan.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("deployment plan refused; inspect its diagnostics");
+        }
+        Ok(())
+    }
+
+    async fn observe(&self, id: &str, deadline: Instant) -> Result<ApplyResponse> {
+        let response: ApplyResponse = self
+            .request(Method::GET, &["cluster", "deployments", id], None, deadline)
+            .await?;
+        response.verify(id)?;
+        Ok(response)
+    }
+
+    async fn wait(
+        &self,
+        id: &str,
+        mut last: Option<ApplyResponse>,
+        deadline: Instant,
+        acceptance_only: bool,
+        expected_input: Option<&str>,
+    ) -> Result<()> {
+        loop {
+            if let Some(response) = &last {
+                if let Some(expected) = expected_input {
+                    response.verify_input(expected)?;
+                }
+                if (acceptance_only && response.accepted()) || !response.pending() {
+                    return response.finish(acceptance_only);
+                }
+            }
+            if Instant::now() >= deadline {
+                return wait_timeout(Some(id), last.as_ref());
+            }
+            tokio::time::sleep_until((Instant::now() + POLL_INTERVAL).min(deadline)).await;
+            if Instant::now() >= deadline {
+                return wait_timeout(Some(id), last.as_ref());
+            }
+            match self.observe(id, deadline).await {
+                Ok(response) => last = Some(response),
+                Err(error) if retry_observation(&error) => {
+                    if Instant::now() >= deadline {
+                        return wait_timeout(Some(id), last.as_ref());
+                    }
+                }
+                Err(error) => {
+                    // Preserve the caller's recovery identity even if access
+                    // or the protocol changes while observing the operation.
+                    eprintln!(
+                        "Deployment-ID: {id}; observation failed; never resubmit unknown work"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn apply(
+        &self,
+        config: &Path,
+        requested_id: Option<&str>,
+        json_output: bool,
+        no_wait: bool,
+        timeout: Option<u64>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout.map(Duration::from_secs).unwrap_or(DEFAULT_WAIT);
+        let (status, deployment) = match self.capture(config, json_output, deadline).await {
+            Ok(captured) => captured,
+            Err(error) if is_wait_timeout(&error, deadline) => return wait_timeout(None, None),
+            Err(error) => return Err(error),
+        };
+        let input_digest = crate::core_deployment_result(deployment.input_digest(), json_output)?;
         if requested_id.is_none()
             && let Some(id) = &status.status.outstanding_id
         {
@@ -112,54 +304,99 @@ impl RemoteCluster {
         if id.is_empty() || id.len() > 75 || id.chars().any(char::is_control) {
             bail!("invalid deployment identity; no deployment was sent");
         }
-        // The original ID is recoverable even if the caller disappears while
-        // the server-owned operation continues or its receipt is lost.
         eprintln!("Deployment-ID: {id}");
-        let result: ApplyResponse = match self
-            .request(
+        // Exactly one submission. A lost response only permits GET observation.
+        let response = self
+            .request::<ApplyResponse>(
                 Method::POST,
                 &["cluster", "deployments"],
                 Some(json!({"deployment_id": id, "deployment": deployment})),
+                deadline,
             )
-            .await
-        {
-            Ok(result) => result,
+            .await;
+        match response {
+            Ok(response) => {
+                response.verify(&id)?;
+                self.wait(&id, Some(response), deadline, no_wait, Some(&input_digest))
+                    .await
+            }
+            Err(error) if is_wait_timeout(&error, deadline) => wait_timeout(Some(&id), None),
+            Err(error) if retry_observation(&error) => {
+                self.wait(&id, None, deadline, no_wait, Some(&input_digest))
+                    .await
+            }
             Err(error) => {
                 eprintln!(
-                    "Inspect cluster status --server <SERVER> --deployment-id {id}; a lost response does not authorize a new deployment or replay."
+                    "Inspect cluster status --server <SERVER> --deployment-id {id}; a lost response does not authorize replay."
                 );
-                return Err(error);
+                Err(error)
             }
-        };
-        if matches!(&result.deployment, DeploymentLookup::Complete { result } if result.id != id)
-            || matches!(&result.deployment, DeploymentLookup::Outstanding { id: returned, .. } if returned != &id)
-        {
-            bail!(
-                "server returned a different deployment identity; effects are unknown; inspect the original Deployment-ID"
-            );
         }
-        crate::print_json(&result)?;
-        if !result.active
-            || !matches!(&result.deployment, DeploymentLookup::Complete { result } if result.converged)
-        {
-            bail!(
-                "deployment is not fully active; inspect the original identity, never replay unknown work"
-            );
-        }
-        Ok(())
     }
+}
+
+fn is_wait_timeout(error: &color_eyre::Report, deadline: Instant) -> bool {
+    error.is::<tokio::time::error::Elapsed>() || Instant::now() >= deadline
+}
+
+fn retry_observation(error: &color_eyre::Report) -> bool {
+    error.is::<tokio::time::error::Elapsed>()
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_body()
+                // Response::chunk classifies a truncated transport body as
+                // decoding; parsed JSON/protocol failures are separate errors.
+                || error.is_decode()
+                || error.is_request()
+        })
+        || error.downcast_ref::<RemoteErrorCli>().is_some_and(|error| {
+            matches!(
+                error.status,
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            )
+        })
+        || error
+            .downcast_ref::<ApiContractError>()
+            .is_some_and(|error| {
+                !error.request_dispatched
+                    && (error.http_status.is_none() || matches!(error.http_status, Some(502..=504)))
+            })
+}
+
+fn wait_timeout(id: Option<&str>, last: Option<&ApplyResponse>) -> Result<()> {
+    crate::print_json(&json!({
+        "deployment_id": id,
+        "outcome": "wait_timeout",
+        "last_observation": last,
+    }))?;
+    if id.is_some() {
+        eprintln!(
+            "Caller wait deadline reached; server work was not cancelled. Observe the original Deployment-ID before taking further action."
+        );
+    } else {
+        eprintln!("Caller wait deadline reached before submission; no deployment was sent.");
+    }
+    Err(WaitTimeout.into())
 }
 
 pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
     let Some(server) = cli.server.as_deref() else {
         return Ok(false);
     };
-    let Command::Cluster { command } = &cli.command else {
+    let Command::Cluster {
+        managed: false,
+        command,
+    } = &cli.command
+    else {
         return Ok(false);
     };
     if !matches!(
         command,
-        ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+        ClusterCommand::Plan { .. } | ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
     ) {
         return Ok(false);
     }
@@ -172,68 +409,60 @@ pub(crate) async fn dispatch(cli: &Cli) -> Result<bool> {
             "--as cannot be used with --server; the server resolves the actor from the bearer token"
         );
     }
-    match command {
+    if matches!(
+        command,
         ClusterCommand::Apply {
-            plan,
-            managed,
-            writers_stopped,
+            writers_stopped: true,
             ..
-        } => {
-            if *writers_stopped {
-                bail!("--writers-stopped cannot be used with --server");
-            }
-            if plan.is_some()
-                || managed.no_wait
-                || managed.timeout.is_some()
-                || managed.idempotency_key.is_some()
-            {
-                bail!("live Core apply does not accept managed run arguments");
-            }
         }
-        ClusterCommand::Status {
-            run_id,
-            operation,
-            api,
-            wait,
-            timeout,
-            ..
-        } => {
-            if run_id.is_some()
-                || operation.is_some()
-                || api.is_some()
-                || *wait
-                || timeout.is_some()
-            {
-                bail!("live Core status does not accept managed run/operation arguments");
-            }
-        }
-        _ => unreachable!(),
+    ) {
+        bail!("--writers-stopped cannot be used with --server");
     }
     let remote = RemoteCluster::new(server)?;
     match command {
+        ClusterCommand::Plan { config, json, .. } => remote.plan(config, *json).await?,
         ClusterCommand::Apply {
             config,
             deployment_id,
-            schema_correction,
             json,
+            run,
             ..
         } => {
             remote
                 .apply(
                     config,
                     deployment_id.as_deref(),
-                    schema_correction.as_deref(),
                     *json,
+                    run.no_wait,
+                    run.timeout,
                 )
-                .await?;
+                .await?
         }
-        ClusterCommand::Status { deployment_id, .. } => {
-            let mut segments = vec!["cluster", "deployments"];
+        ClusterCommand::Status {
+            deployment_id,
+            wait,
+            timeout,
+            ..
+        } => {
+            let deadline =
+                Instant::now() + timeout.map(Duration::from_secs).unwrap_or(DEFAULT_WAIT);
             if let Some(id) = deployment_id {
-                segments.push(id);
+                let response = match remote.observe(id, deadline).await {
+                    Ok(response) => Some(response),
+                    Err(error) if *wait && retry_observation(&error) => None,
+                    Err(error) => return Err(error),
+                };
+                if *wait {
+                    remote.wait(id, response, deadline, false, None).await?;
+                } else {
+                    crate::print_json(&response.unwrap())?;
+                }
+            } else {
+                let status: StatusResponse = remote
+                    .request(Method::GET, &["cluster", "deployments"], None, deadline)
+                    .await?;
+                crate::print_json(&status)?;
             }
-            let status: StatusResponse = remote.request(Method::GET, &segments, None).await?;
-            crate::print_json(&status)?;
         }
         _ => unreachable!(),
     }

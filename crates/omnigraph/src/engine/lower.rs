@@ -24,18 +24,20 @@ use omnigraph_compiler::ir::SubqueryPredicate;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
-    BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields, HashJoinFields, Lower, NodeId,
-    PhysicalNode, PhysicalPlan, PlanError, Predicate, RankArm, RankFuseFields, RankKind,
-    RankedAccess, RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId,
-    SortMergeJoinFields, ValueTable,
+    Accumulator, AggregateFields, BoundPlan, ColumnRef, ContainsJoinFields, ExpandFields,
+    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
+    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
+    RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
+use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, ContainsJoinExec, CrossJoinExec, ExpandExec, ExpandExecution,
-    ExpandStep, FilterExec, GraphEnv, HashJoinExec, LimitExec, LookupSpec, MetadataCountExec,
-    OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
-    ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
+    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LimitExec, LookupSpec,
+    MetadataCountExec, OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec,
+    RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey, fresh_tag_column, tagged_schema,
 };
 use super::*;
 
@@ -45,9 +47,6 @@ type Plan = Arc<dyn ExecutionPlan>;
 /// it and the sort drops; no GQ alias or `binding.property` name starts with
 /// it.
 pub(super) const HIDDEN: &str = "~";
-
-/// The rank constant of an `rrf()` that names none.
-const RRF_DEFAULT_K: u32 = 60;
 
 pub(super) struct Lowering<'a> {
     pub(super) plan: &'a PhysicalPlan,
@@ -107,6 +106,7 @@ impl<'a> Lowering<'a> {
 
     /// The whole tree for one pass, executable under the query's context.
     pub(super) fn lower_query(&self, pass: &Pass) -> Result<Lowered> {
+        super::typed_value::validate_plan_values(self.plan, self.params(), self.catalog)?;
         let mut walk = Walk::new(self, pass);
         let root = self
             .plan
@@ -163,9 +163,7 @@ impl<'a> Lowering<'a> {
                 mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
             }
             RankKind::Bm25 => {
-                let text = resolve_to_string(&ranked.query, self.params()).ok_or_else(|| {
-                    OmniError::manifest("bm25 query must resolve to a string".to_string())
-                })?;
+                let text = resolve_to_string(&ranked.query, self.params())?;
                 mode.bm25 = Some(Bm25Target {
                     property: ranked.property.clone(),
                     text,
@@ -206,7 +204,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    fn scan(&self, source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+    fn scan(&self, mut source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+        if let ScanSource::Table { mode, .. } = &mut source {
+            mode.scalar_index = spec
+                .access
+                .as_ref()
+                .and_then(|access| access.use_scalar_index());
+        }
         let lookup = self.lookup(spec)?;
         ScanExec::try_new(
             source,
@@ -298,6 +302,35 @@ impl<'a> Lowering<'a> {
             _ => None,
         }
     }
+
+    /// The rows of the `Limit` directly over the projection over scan `id`:
+    /// the scan sends its first batch once it has that many rows instead of
+    /// gathering a full batch. Batch size never changes which rows reach the
+    /// limit, only how many are read before it stops.
+    fn limit_over_scan(&self, id: NodeId) -> Option<usize> {
+        let projection = self.plan.parent_of(id)?;
+        let Some(PhysicalNode::Projection { .. }) = self.plan.node(projection) else {
+            return None;
+        };
+        match self.plan.node(self.plan.parent_of(projection)?)? {
+            PhysicalNode::Limit { rows, .. } => Some(*rows),
+            _ => None,
+        }
+    }
+
+    /// The bindings a `HydrateColumns` over node `id` (through the `Sort`s
+    /// and the `Limit` above it) fetches: the projection skips their columns
+    /// and carries each binding's row address instead.
+    fn hydration_above(&self, mut id: NodeId) -> &'a [HydratedBinding] {
+        while let Some(parent) = self.plan.parent_of(id) {
+            match self.plan.node(parent) {
+                Some(PhysicalNode::Sort { .. } | PhysicalNode::Limit { .. }) => id = parent,
+                Some(PhysicalNode::HydrateColumns { bindings, .. }) => return bindings,
+                _ => break,
+            }
+        }
+        &[]
+    }
 }
 
 /// The engine's error with the planner walk's own refusals folded in.
@@ -388,10 +421,48 @@ impl<'l, 'a> Walk<'l, 'a> {
     }
 
     /// The one operator of node `id`.
-    fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Plan {
+    fn built(&mut self, id: NodeId, operator: impl ExecutionPlan) -> Lowers<Plan> {
         let plan: Plan = Arc::new(operator);
+        let node = self.lowering.node(id)?;
+        if matches!(
+            node,
+            PhysicalNode::Projection { .. }
+                | PhysicalNode::Aggregate { .. }
+                | PhysicalNode::MetadataCount { .. }
+                | PhysicalNode::HydrateColumns { .. }
+        ) {
+            let declared = self.lowering.plan.properties(id).ok_or_else(|| {
+                OmniError::manifest_internal("return operator has no declared schema")
+            })?;
+            let hidden = matches!(
+                node,
+                PhysicalNode::Projection { .. } | PhysicalNode::HydrateColumns { .. }
+            );
+            // A projection under `HydrateColumns` carries every declared
+            // column but the deferred ones, which the hydration above adds.
+            let deferred: Vec<usize> = if matches!(node, PhysicalNode::Projection { .. }) {
+                self.lowering
+                    .hydration_above(id)
+                    .iter()
+                    .flat_map(|binding| binding.columns.iter().map(|column| column.position))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let carried = Schema::new(
+                declared
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !deferred.contains(position))
+                    .map(|(_, field)| Arc::clone(field))
+                    .collect::<Vec<_>>(),
+            );
+            super::typed_value::check_output_schema(plan.schema().as_ref(), &carried, hidden)?;
+        }
         self.operators.insert(id, Arc::clone(&plan));
-        plan
+        Ok(plan)
     }
 }
 
@@ -413,7 +484,7 @@ impl Lower for Walk<'_, '_> {
             self.lowering.snapshot.clone(),
             Arc::clone(&properties.schema),
         );
-        Ok(self.built(id, count))
+        self.built(id, count)
     }
 
     fn scan(
@@ -459,11 +530,14 @@ impl Lower for Walk<'_, '_> {
             }
         };
         let mut scan = self.lowering.scan(source, spec)?;
+        if let Some(rows) = self.lowering.limit_over_scan(id) {
+            scan = scan.with_gather_rows(rows);
+        }
         if let Some(filter) = runtime {
             scan = scan.with_runtime_filter(Some(Arc::clone(&filter)));
             self.runtime_filters.insert(id, filter);
         }
-        Ok(self.built(id, scan))
+        self.built(id, scan)
     }
 
     fn hash_join(
@@ -482,7 +556,7 @@ impl Lower for Walk<'_, '_> {
             .into());
         }
         let join = HashJoinExec::try_new(probe, build, fields.fallback, lookup)?;
-        Ok(self.built(id, join))
+        self.built(id, join)
     }
 
     fn sort_merge_join(
@@ -499,6 +573,28 @@ impl Lower for Walk<'_, '_> {
         Err(Self::not_a_pipeline_node("HydrateByAddress"))
     }
 
+    fn hydrate_columns(
+        &mut self,
+        id: NodeId,
+        bindings: &[HydratedBinding],
+        input: Plan,
+    ) -> Lowers<Plan> {
+        if !self.outers.is_empty() {
+            return Err(Self::not_a_pipeline_node("HydrateColumns"));
+        }
+        let declared = self.lowering.plan.properties(id).ok_or_else(|| {
+            OmniError::manifest_internal("`HydrateColumns` has no declared schema")
+        })?;
+        let hydrate = HydrateExec::try_new(
+            input,
+            bindings.to_vec(),
+            self.lowering.snapshot.clone(),
+            self.lowering.catalog,
+            declared.schema.as_ref(),
+        )?;
+        self.built(id, hydrate)
+    }
+
     fn row_compare(&mut self, _id: NodeId, _input: Plan) -> Lowers<Plan> {
         Err(Self::not_a_pipeline_node("RowCompare"))
     }
@@ -508,7 +604,7 @@ impl Lower for Walk<'_, '_> {
     }
 
     fn limit(&mut self, id: NodeId, rows: usize, input: Plan) -> Lowers<Plan> {
-        Ok(self.built(id, LimitExec::new(input, rows)))
+        self.built(id, LimitExec::new(input, rows))
     }
 
     fn page(
@@ -538,7 +634,7 @@ impl Lower for Walk<'_, '_> {
             filters.to_vec(),
             Arc::clone(self.lowering.params()),
         )?;
-        Ok(self.built(id, join))
+        self.built(id, join)
     }
 
     /// The `contains` conjunct and the residual ones all run in the join.
@@ -576,7 +672,7 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(self.lowering.params()),
             filter,
         )?;
-        Ok(self.built(id, join))
+        self.built(id, join)
     }
 
     fn filter(&mut self, id: NodeId, filters: &[IRExpr], input: Plan) -> Lowers<Plan> {
@@ -584,7 +680,7 @@ impl Lower for Walk<'_, '_> {
             self.in_memory_filters += filters.len();
         }
         let filter = FilterExec::new(input, filters.to_vec(), Arc::clone(self.lowering.params()));
-        Ok(self.built(id, filter))
+        self.built(id, filter)
     }
 
     fn expand(&mut self, id: NodeId, fields: ExpandFields<'_>, input: Plan) -> Lowers<Plan> {
@@ -602,7 +698,7 @@ impl Lower for Walk<'_, '_> {
             frontier_estimate: fields.frontier_estimate,
         };
         let expand = ExpandExec::try_new(input, step, Arc::clone(&self.scope.env))?;
-        Ok(self.built(id, expand))
+        self.built(id, expand)
     }
 
     fn anti_join_outer(&mut self, _id: NodeId, _outer_var: &str, outer: &Plan) -> Lowers<()> {
@@ -623,11 +719,21 @@ impl Lower for Walk<'_, '_> {
         let PhysicalNode::AntiJoin {
             inner: inner_id,
             predicate,
+            aggregate,
             ..
         } = self.lowering.node(id)?
         else {
             return Err(Self::not_a_pipeline_node("AntiJoin"));
         };
+        predicate.check_types().map_err(OmniError::from)?;
+        let expected = omnigraph_planner::plan_block_aggregate(&predicate.left)
+            .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
+        if *aggregate != expected {
+            return Err(OmniError::manifest_internal(
+                "block aggregate specification differs from its signature",
+            )
+            .into());
+        }
         let bulk = self
             .lowering
             .bulk_row_count(*inner_id, outer_var, predicate)?;
@@ -636,13 +742,14 @@ impl Lower for Walk<'_, '_> {
             inner,
             outer_var.to_string(),
             predicate.clone(),
+            *aggregate,
             Arc::clone(self.lowering.params()),
             scope.tag_column,
             scope.slot,
             bulk,
             Arc::clone(&self.scope.env),
         );
-        Ok(self.built(id, mask))
+        self.built(id, mask)
     }
 
     fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Lowers<Plan> {
@@ -656,7 +763,7 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(&scope.slot),
             Arc::clone(&scope.schema),
         );
-        Ok(self.built(id, leaf))
+        self.built(id, leaf)
     }
 
     fn rank_fuse(
@@ -675,10 +782,7 @@ impl Lower for Walk<'_, '_> {
         let limit = limit.ok_or_else(|| {
             OmniError::manifest("rrf() ordering requires a limit clause".to_string())
         })?;
-        let k = k
-            .and_then(|k| resolve_to_int(k, self.lowering.params()))
-            .map(|k| u32::try_from(k).unwrap_or(u32::MAX))
-            .unwrap_or(RRF_DEFAULT_K);
+        let k = resolve_rrf_k(k, self.lowering.params())?;
         let id_column = format!(
             "{}.{}",
             arms[0].binding, self.lowering.catalog.system_columns.id
@@ -701,7 +805,7 @@ impl Lower for Walk<'_, '_> {
                 .map(|key| tiebreak_column(key, self.lowering.catalog.system_columns.id))
                 .collect::<Result<Vec<_>>>()?,
         );
-        Ok(self.built(id, fuse))
+        self.built(id, fuse)
     }
 
     /// The return expressions, each under its alias or its own name, and
@@ -719,12 +823,33 @@ impl Lower for Walk<'_, '_> {
             return Err(OmniError::manifest("query has no return projections".to_string()).into());
         }
         let input_schema = input.schema();
+        let hydrated = self.lowering.hydration_above(id);
+        let deferred: Vec<usize> = hydrated
+            .iter()
+            .flat_map(|binding| binding.columns.iter().map(|column| column.position))
+            .collect();
         let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-            Vec::with_capacity(return_exprs.len());
-        for proj in return_exprs {
-            let projected = Projected::Expression(proj.expr.clone());
-            let name = return_name(proj)?;
+            Vec::with_capacity(return_exprs.len() + hydrated.len());
+        for (position, proj) in return_exprs.iter().enumerate() {
+            if deferred.contains(&position) {
+                continue;
+            }
+            let projected = Projected::Expression(proj.expr.clone(), proj.ty.clone());
+            let name = return_name(proj);
             exprs.push((self.lowering.projection(projected, &self.scope), name));
+        }
+        for binding in hydrated {
+            let name = format!("{}.{}", binding.binding, lance_core::ROW_ADDR);
+            let (index, _) = input_schema.column_with_name(&name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the scan of `${}` carries no row address for `HydrateColumns`",
+                    binding.binding
+                ))
+            })?;
+            exprs.push((
+                Arc::new(Column::new(&name, index)),
+                format!("{ROW_ADDRESS_PREFIX}{}", binding.binding),
+            ));
         }
         if let Some((keys, tiebreak)) = self.lowering.sort_above(id) {
             let hidden = hidden_columns(
@@ -744,45 +869,89 @@ impl Lower for Walk<'_, '_> {
             }
         }
         let projection = ProjectionExec::try_new(exprs, input).map_err(OmniError::datafusion)?;
-        Ok(self.built(id, projection))
+        self.built(id, projection)
     }
 
-    /// `AggregateExec` (`Single`) over GQ group keys and arguments (`sum`/`avg`
-    /// inputs cast to `Float64` as v1 computes them); it emits groups first
-    /// and `run_plan` restores the return order.
-    fn aggregate(
-        &mut self,
-        id: NodeId,
-        return_exprs: &[IRProjection],
-        input: Plan,
-    ) -> Lowers<Plan> {
+    /// Execute the declared aggregate arithmetic; `AggregateExec` emits groups
+    /// first and `run_plan` restores the return order.
+    fn aggregate(&mut self, id: NodeId, fields: AggregateFields<'_>, input: Plan) -> Lowers<Plan> {
         if !self.outers.is_empty() {
             return Err(Self::not_a_pipeline_node("Aggregate"));
         }
         let input_schema = input.schema();
         let mut groups: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
         let mut aggregates = Vec::new();
-        for proj in return_exprs {
-            let name = return_name(proj)?;
-            match &proj.expr {
-                IRExpr::Aggregate { func, arg } => {
-                    let projected = aggregate_argument(func, arg);
+        if fields.return_exprs.len() != fields.aggregates.len() {
+            return Err(OmniError::manifest_internal(
+                "aggregate specification count differs from return expressions",
+            )
+            .into());
+        }
+        for (proj, spec) in fields.return_exprs.iter().zip(fields.aggregates) {
+            let name = return_name(proj);
+            match (&proj.expr, spec) {
+                (
+                    IRExpr::Aggregate {
+                        func,
+                        arg,
+                        signature,
+                    },
+                    Some(spec),
+                ) => {
+                    let projected = aggregate_argument(func, arg, &signature.arg);
                     let mut argument = self.lowering.projection(projected, &self.scope);
                     let data_type = argument
                         .data_type(&input_schema)
                         .map_err(OmniError::datafusion)?;
-                    if matches!(func, AggFunc::Sum | AggFunc::Avg)
-                        && data_type.is_numeric()
-                        && data_type != DataType::Float64
-                    {
-                        argument = Arc::new(CastExpr::new(argument, DataType::Float64, None));
+                    if let Some(expected) = signature.arg.to_arrow() {
+                        if data_type != expected {
+                            return Err(OmniError::manifest_internal(format!(
+                                "aggregate argument has {data_type}, declared {expected}"
+                            ))
+                            .into());
+                        }
                     }
-                    let udaf = match func {
-                        AggFunc::Count => count_udaf(),
-                        AggFunc::Sum => sum_udaf(),
-                        AggFunc::Avg => avg_udaf(),
-                        AggFunc::Min => min_udaf(),
-                        AggFunc::Max => max_udaf(),
+                    let result = signature.result.to_arrow().ok_or_else(|| {
+                        OmniError::manifest_internal("aggregate result must be scalar")
+                    })?;
+                    let udaf = match (func, spec.accumulator) {
+                        (AggFunc::Count, Accumulator::Count) => count_udaf(),
+                        (AggFunc::Sum, Accumulator::ExactInteger) => {
+                            argument = Arc::new(CastExpr::new(argument, EXACT_CARRIER, None));
+                            Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                                ExactIntegerUdaf::new(result.clone()),
+                            ))
+                        }
+                        (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
+                            argument = Arc::new(CastExpr::new(argument, DataType::Float64, None));
+                            if *func == AggFunc::Sum {
+                                sum_udaf()
+                            } else {
+                                avg_udaf()
+                            }
+                        }
+                        (AggFunc::Min, Accumulator::Extremum) => min_udaf(),
+                        (AggFunc::Max, Accumulator::Extremum) => max_udaf(),
+                        (
+                            AggFunc::Count,
+                            Accumulator::ExactInteger
+                            | Accumulator::Float64
+                            | Accumulator::Extremum,
+                        )
+                        | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
+                        | (
+                            AggFunc::Avg,
+                            Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
+                        )
+                        | (
+                            AggFunc::Min | AggFunc::Max,
+                            Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
+                        ) => {
+                            return Err(OmniError::manifest_internal(
+                                "aggregate function disagrees with declared accumulator",
+                            )
+                            .into());
+                        }
                     };
                     let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
                         .schema(Arc::clone(&input_schema))
@@ -790,10 +959,62 @@ impl Lower for Walk<'_, '_> {
                         .build()
                         .map(Arc::new)
                         .map_err(OmniError::datafusion)?;
+                    if aggregate.field().data_type() != &result {
+                        return Err(OmniError::manifest_internal(format!(
+                            "aggregate result has {}, declared {result}",
+                            aggregate.field().data_type()
+                        ))
+                        .into());
+                    }
                     aggregates.push(aggregate);
                 }
-                _ => {
-                    let projected = Projected::Expression(proj.expr.clone());
+                (IRExpr::Aggregate { .. }, None) => {
+                    return Err(
+                        OmniError::manifest_internal("aggregate has no specification").into(),
+                    );
+                }
+                (
+                    IRExpr::PropAccess { .. }
+                    | IRExpr::Nearest { .. }
+                    | IRExpr::Search { .. }
+                    | IRExpr::Fuzzy { .. }
+                    | IRExpr::MatchText { .. }
+                    | IRExpr::Bm25 { .. }
+                    | IRExpr::Rrf { .. }
+                    | IRExpr::Variable(_, _)
+                    | IRExpr::Param(_, _)
+                    | IRExpr::Literal(_, _)
+                    | IRExpr::AliasRef(_, _)
+                    | IRExpr::Binary { .. }
+                    | IRExpr::Not(_, _)
+                    | IRExpr::Cast { .. }
+                    | IRExpr::IsNull { .. },
+                    Some(_),
+                ) => {
+                    return Err(OmniError::manifest_internal(
+                        "group key has an aggregate specification",
+                    )
+                    .into());
+                }
+                (
+                    IRExpr::PropAccess { .. }
+                    | IRExpr::Nearest { .. }
+                    | IRExpr::Search { .. }
+                    | IRExpr::Fuzzy { .. }
+                    | IRExpr::MatchText { .. }
+                    | IRExpr::Bm25 { .. }
+                    | IRExpr::Rrf { .. }
+                    | IRExpr::Variable(_, _)
+                    | IRExpr::Param(_, _)
+                    | IRExpr::Literal(_, _)
+                    | IRExpr::AliasRef(_, _)
+                    | IRExpr::Binary { .. }
+                    | IRExpr::Not(_, _)
+                    | IRExpr::Cast { .. }
+                    | IRExpr::IsNull { .. },
+                    None,
+                ) => {
+                    let projected = Projected::Expression(proj.expr.clone(), proj.ty.clone());
                     groups.push((self.lowering.projection(projected, &self.scope), name));
                 }
             }
@@ -808,7 +1029,7 @@ impl Lower for Walk<'_, '_> {
             input_schema,
         )
         .map_err(OmniError::datafusion)?;
-        Ok(self.built(id, aggregate))
+        self.built(id, aggregate)
     }
 
     /// The node's keys over the columns its input carries (hidden under the
@@ -839,7 +1060,11 @@ impl Lower for Walk<'_, '_> {
         let mut keys = Vec::with_capacity(order_by.len() + tiebreak.len());
         for key in order_by {
             let column = match &key.expr {
-                IRExpr::PropAccess { variable, property } => {
+                IRExpr::PropAccess {
+                    variable,
+                    property,
+                    ty: _,
+                } => {
                     let name = format!("{variable}.{property}");
                     carried(&name).ok_or_else(|| {
                         OmniError::manifest_internal(format!(
@@ -847,12 +1072,25 @@ impl Lower for Walk<'_, '_> {
                         ))
                     })?
                 }
-                IRExpr::AliasRef(alias) => carried(alias).ok_or_else(|| {
+                IRExpr::AliasRef(alias, _) => carried(alias).ok_or_else(|| {
                     OmniError::manifest_internal(format!(
                         "the planned sort alias '{alias}' is not in the sort input"
                     ))
                 })?,
-                _ => {
+                IRExpr::Nearest { .. }
+                | IRExpr::Search { .. }
+                | IRExpr::Fuzzy { .. }
+                | IRExpr::MatchText { .. }
+                | IRExpr::Bm25 { .. }
+                | IRExpr::Rrf { .. }
+                | IRExpr::Variable(_, _)
+                | IRExpr::Param(_, _)
+                | IRExpr::Literal(_, _)
+                | IRExpr::Aggregate { .. }
+                | IRExpr::Binary { .. }
+                | IRExpr::Not(_, _)
+                | IRExpr::Cast { .. }
+                | IRExpr::IsNull { .. } => {
                     return Err(OmniError::manifest_internal(
                         "the planned sort key is not a property or an alias".to_string(),
                     )
@@ -879,7 +1117,7 @@ impl Lower for Walk<'_, '_> {
             });
         }
         let sort = SortExec::try_new(input, keys, fetch)?;
-        Ok(self.built(id, sort))
+        self.built(id, sort)
     }
 
     fn finish(&mut self, _root: NodeId, op: Plan) -> Lowers<Plan> {
@@ -889,23 +1127,37 @@ impl Lower for Walk<'_, '_> {
 
 /// The argument a GQ aggregate runs over: `count($v)` counts the binding's
 /// identity, every other aggregate its expression.
-fn aggregate_argument(func: &AggFunc, arg: &IRExpr) -> Projected {
-    match (func, arg) {
-        (AggFunc::Count, IRExpr::Variable(variable)) => Projected::Identity(variable.clone()),
-        _ => Projected::Expression(arg.clone()),
+fn aggregate_argument(
+    func: &AggFunc,
+    arg: &IRExpr,
+    ty: &omnigraph_compiler::types::ExprType,
+) -> Projected {
+    match arg {
+        IRExpr::Variable(variable, _) if *func == AggFunc::Count => {
+            Projected::Identity(variable.clone())
+        }
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Search { .. }
+        | IRExpr::Fuzzy { .. }
+        | IRExpr::MatchText { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::Cast { .. }
+        | IRExpr::IsNull { .. } => Projected::Expression(arg.clone(), ty.clone()),
     }
 }
 
-/// The output column name of one return projection: its alias, else the
-/// name its expression (or aggregate argument) projects under.
-fn return_name(proj: &IRProjection) -> Result<String> {
-    match &proj.alias {
-        Some(alias) => Ok(alias.clone()),
-        None => match &proj.expr {
-            IRExpr::Aggregate { func, arg } => aggregate_argument(func, arg).name(),
-            expr => Projected::Expression(expr.clone()).name(),
-        },
-    }
+/// The compiler-owned column name of a return projection.
+fn return_name(proj: &IRProjection) -> String {
+    proj.column.clone()
 }
 
 /// The wide columns the return projection carries for the sort above it, each
@@ -920,7 +1172,11 @@ fn hidden_columns(
     let mut hidden: Vec<String> = Vec::new();
     for key in keys {
         match &key.expr {
-            IRExpr::PropAccess { variable, property } => {
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } => {
                 let name = format!("{variable}.{property}");
                 if input_schema.column_with_name(&name).is_none() {
                     return Err(OmniError::manifest_internal(format!(
@@ -931,8 +1187,21 @@ fn hidden_columns(
                     hidden.push(name);
                 }
             }
-            IRExpr::AliasRef(_) => {}
-            _ => {
+            IRExpr::AliasRef(_, _) => {}
+            IRExpr::Nearest { .. }
+            | IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::Binary { .. }
+            | IRExpr::Not(_, _)
+            | IRExpr::Cast { .. }
+            | IRExpr::IsNull { .. } => {
                 return Err(OmniError::manifest_internal(
                     "the planned sort key is not a property or an alias".to_string(),
                 ));
@@ -989,16 +1258,10 @@ pub(super) fn in_order(batch: RecordBatch, names: &[String]) -> Result<RecordBat
 }
 
 /// The return's column names in return order, for the root of `plan`.
-pub(super) fn return_order(plan: &PhysicalPlan) -> Result<Option<Vec<String>>> {
-    let Some(returns) = plan.live().find_map(|(_, node)| match node {
+pub(super) fn return_order(plan: &PhysicalPlan) -> Option<Vec<String>> {
+    let returns = plan.live().find_map(|(_, node)| match node {
         PhysicalNode::Aggregate { return_exprs, .. } => Some(return_exprs),
         _ => None,
-    }) else {
-        return Ok(None);
-    };
-    returns
-        .iter()
-        .map(return_name)
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
+    })?;
+    Some(returns.iter().map(return_name).collect())
 }

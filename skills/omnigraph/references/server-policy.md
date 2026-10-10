@@ -46,7 +46,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{id}/export` | Stream a branch snapshot |
 
 Every request to a graph, registry or deployment route must carry exactly one
-`Omnigraph-Http-Api: 0.12` header; a missing, repeated or other value is
+`Omnigraph-Http-Api: 0.13` header; a missing, repeated or other value is
 refused with `400 api_contract_mismatch` before graph access. Responses carry
 the same header. `/healthz`, `/readyz` and `/openapi.json` need none. Upgrade
 the CLI, server and HTTP clients together.
@@ -106,7 +106,7 @@ Cedar policy, or every graph request is denied; an identity credential can
 still list graph ids through `GET /graphs/discovery`. Trust changes need a
 restart.
 Control-plane login does not grant data access. See
-[managed data credentials](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/cli/managed-data.md).
+[managed data credentials](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-data.md).
 
 ## Cedar actions
 
@@ -199,5 +199,5 @@ does not recreate server authorization. Protect raw graph storage with object
 store IAM/ACLs and restrict who can run direct maintenance. Served writes reject
 client-supplied actor identity because only the token may select it.
 
-Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/operations/server.md)
-and [authorization](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/operations/policy.md).
+Canonical contracts: [server operations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/server.md)
+and [authorization](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/policy.md).

@@ -16,12 +16,14 @@ use crate::explain::{EntrySummary, Explain, OperationSummary};
 use crate::logical::{Census, LogicalPlan};
 use crate::operation::Operation;
 use crate::optimizer::{Bounds, Optimized, physical_plan, resolve, rewrite};
-use crate::physical::{Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan};
+use crate::physical::{
+    Assumptions, DatasetPin, GatePolicy, NodeId, PhysicalNode, PhysicalPlan, StatisticSource,
+};
 use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, IndexFact, NodeTypeSpec, PlanSource, SideId,
 };
 
 /// A `PlanSource` that records what the planner read through it: the
@@ -52,9 +54,29 @@ impl<'s> Recorded<'s> {
         assumptions.memory_limit = bounds.query_memory_pool_bytes;
         assumptions
     }
+
+    fn index_statistics(&self) -> Vec<StatisticSource> {
+        self.read
+            .borrow()
+            .datasets
+            .iter()
+            .map(|(key, pin)| StatisticSource {
+                statistic: format!("index_facts({key})"),
+                value: json!(self.source.index_facts(key)).to_string(),
+                origin: match pin {
+                    Some(pin) => format!("{} at version {}", pin.dataset_path, pin.version),
+                    None => "table absent at the pinned snapshot".to_string(),
+                },
+            })
+            .collect()
+    }
 }
 
 impl PlanSource for Recorded<'_> {
+    fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
+        self.source.index_facts(dataset_key)
+    }
+
     fn is_unique_property(&self, type_key: &str, property: &str) -> bool {
         self.source.is_unique_property(type_key, property)
     }
@@ -164,13 +186,13 @@ impl PlanSource for Recorded<'_> {
 /// Every parameter name `expr` names.
 fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
     match expr {
-        IRExpr::Param(name) => {
+        IRExpr::Param(name, _) => {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Search { field, query }
-        | IRExpr::MatchText { field, query }
-        | IRExpr::Bm25 { field, query } => {
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
         }
@@ -178,6 +200,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             field,
             query,
             max_edits,
+            ..
         } => {
             params_of_expr(field, out);
             params_of_expr(query, out);
@@ -189,6 +212,7 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             primary,
             secondary,
             k,
+            ..
         } => {
             params_of_expr(primary, out);
             params_of_expr(secondary, out);
@@ -201,11 +225,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
             params_of_expr(left, out);
             params_of_expr(right, out);
         }
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Not(inner, _)
+        | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
         IRExpr::PropAccess { .. }
-        | IRExpr::Variable(_)
-        | IRExpr::Literal(_)
-        | IRExpr::AliasRef(_) => {}
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::AliasRef(_, _) => {}
     }
 }
 
@@ -234,6 +260,9 @@ pub enum Unrouted {
     UnsupportedQuery {
         diagnostic: Box<omnigraph_compiler::QueryDiagnostic>,
     },
+    /// The plan source failed while answering a lookup
+    /// (`PlanError::Source`); the engine returns the source's own error.
+    SourceError { message: String },
 }
 
 impl Unrouted {
@@ -242,6 +271,7 @@ impl Unrouted {
     fn of(error: PlanError) -> Self {
         match error {
             PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
+            PlanError::Source { detail } => Self::SourceError { message: detail },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -257,6 +287,7 @@ impl Unrouted {
             Self::Override => "override",
             Self::PlannerError { .. } => "planner_error",
             Self::UnsupportedQuery { .. } => "unsupported_query",
+            Self::SourceError { .. } => "source_error",
         }
     }
 
@@ -269,7 +300,9 @@ impl Unrouted {
             Self::RegistryRouteExecutor { entry } => json!({ "kind": self.kind(), "entry": entry }),
             Self::DeclaredBytesOverBound { node } => json!({ "kind": self.kind(), "node": node }),
             Self::Override => json!({ "kind": self.kind() }),
-            Self::PlannerError { message } => json!({ "kind": self.kind(), "message": message }),
+            Self::PlannerError { message } | Self::SourceError { message } => {
+                json!({ "kind": self.kind(), "message": message })
+            }
             Self::UnsupportedQuery { diagnostic } => json!({
                 "kind": self.kind(),
                 "code": diagnostic.code.as_str(),
@@ -281,6 +314,7 @@ impl Unrouted {
 
 #[derive(Debug, Clone)]
 pub enum Decision {
+    PendingQuery(Box<PreparedQuery>),
     /// A registered change-feed or merge shape: the engine's push operators
     /// (`engine/push/`) run `plan`.
     Routed {
@@ -305,32 +339,79 @@ pub enum Decision {
 }
 
 impl Decision {
-    pub fn explain(&self) -> &Explain {
+    pub fn explain(&self) -> Option<&Explain> {
         match self {
+            Self::PendingQuery(_) => None,
             Self::Routed { explain, .. }
             | Self::Engine { explain, .. }
-            | Self::Executor { explain, .. } => explain,
+            | Self::Executor { explain, .. } => Some(explain),
+        }
+    }
+
+    pub async fn finalize(self, source: &(dyn PlanSource + Sync)) -> Self {
+        let Self::PendingQuery(query) = self else {
+            return self;
+        };
+        let PreparedQuery {
+            logical,
+            mut optimized,
+            operation,
+            override_,
+        } = *query;
+        if let Err(error) = crate::scan_access::finalize_scan_access(&mut optimized, source).await {
+            return executor(
+                Unrouted::of(error),
+                Explain::without_plan(operation, override_),
+                logical,
+            );
+        }
+        let mut explain = LogicalView::of(&logical)
+            .explain(
+                operation,
+                override_,
+                None,
+                Some(&optimized),
+                &optimized.fired,
+            )
+            .engine();
+        explain.pipelines = None;
+        Self::Engine {
+            plan: optimized.physical,
+            logical,
+            explain,
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    logical: LogicalPlan,
+    optimized: Optimized,
+    operation: OperationSummary,
+    override_: RouteOverride,
+}
+
 /// Build an executable read plan without rendering explain diagnostics.
-pub fn plan_query(
+pub async fn plan_query(
     query: &QueryIR,
-    source: &dyn PlanSource,
+    source: &(dyn PlanSource + Sync),
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
-    let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source, query.has_wildcard_traversal());
-    let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
-    crate::optimizer::optimize(&mut logical, &recorded, bounds)
-        .map(|mut optimized| {
-            optimized
-                .physical
-                .set_assumptions(recorded.assumptions(bounds));
-            optimized.physical
-        })
-        .map_err(Unrouted::of)
+    let mut optimized = {
+        let operation = Operation::Query(Box::new(query.clone()));
+        let recorded = Recorded::new(source, query.has_wildcard_traversal());
+        let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
+        let mut optimized =
+            crate::optimizer::optimize(&mut logical, &recorded, bounds).map_err(Unrouted::of)?;
+        optimized
+            .physical
+            .set_assumptions(recorded.assumptions(bounds));
+        optimized
+    };
+    crate::scan_access::finalize_scan_access(&mut optimized, source)
+        .await
+        .map_err(Unrouted::of)?;
+    Ok(optimized.physical)
 }
 
 /// Decide the route of one operation. The census is computed from the
@@ -368,25 +449,22 @@ pub fn route(
     };
     if matches!(op, Operation::Query(_)) {
         let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
-        let logical = LogicalView::of(&plan);
         return match lowered {
             Ok(mut optimized) => {
                 optimized
                     .physical
                     .set_assumptions(recorded.assumptions(bounds));
-                let mut explain = logical
-                    .explain(operation, override_, None, Some(&optimized), &fired)
-                    .engine();
-                explain.pipelines = None;
-                Decision::Engine {
-                    plan: optimized.physical,
+                optimized.statistics.extend(recorded.index_statistics());
+                Decision::PendingQuery(Box::new(PreparedQuery {
                     logical: plan,
-                    explain,
-                }
+                    optimized,
+                    operation,
+                    override_,
+                }))
             }
             Err(error) => executor(
                 Unrouted::of(error),
-                logical.explain(operation, override_, None, None, &fired),
+                LogicalView::of(&plan).explain(operation, override_, None, None, &fired),
                 plan,
             ),
         };
@@ -558,6 +636,7 @@ mod tests {
                 schema: Arc::new(Schema::new(vec![Field::new("__id", DataType::Utf8, false)])),
                 key: vec![],
                 object_columns: vec!["__id".into()],
+                object_fields: vec![Field::new("@id", DataType::Utf8, false)].into(),
                 row_count: None,
             },
         );
@@ -570,14 +649,24 @@ mod tests {
                 filters: vec![],
             }],
             return_exprs: vec![IRProjection {
-                expr: IRExpr::Variable("d".into()),
+                expr: IRExpr::Variable(
+                    "d".into(),
+                    omnigraph_compiler::ExprType::Node {
+                        type_name: "Doc".into(),
+                    },
+                ),
                 alias: None,
+                column: "d".into(),
+                ty: omnigraph_compiler::ExprType::Node {
+                    type_name: "Doc".into(),
+                },
             }],
             order_by: vec![],
             limit: None,
         };
         EXPLAIN_RENDERS.with(|count| count.set(0));
-        let physical = plan_query(&query, &source, &BOUNDS).expect("read plan");
+        let physical =
+            futures::executor::block_on(plan_query(&query, &source, &BOUNDS)).expect("read plan");
         assert_eq!(
             EXPLAIN_RENDERS.with(|count| count.get()),
             0,
@@ -589,13 +678,16 @@ mod tests {
             RouteOverride::Registry,
             &BOUNDS,
         );
+        assert!(decision.explain().is_none());
+        assert_eq!(EXPLAIN_RENDERS.with(|count| count.get()), 0);
+        let decision = futures::executor::block_on(decision.finalize(&source));
         assert_eq!(
             EXPLAIN_RENDERS.with(|count| count.get()),
             1,
             "explicit explain must render diagnostics"
         );
         assert_eq!(
-            decision.explain().physical_plan.as_ref(),
+            decision.explain().unwrap().physical_plan.as_ref(),
             Some(&physical.to_json())
         );
         let missing = MemorySource::default();
@@ -608,6 +700,29 @@ mod tests {
         let Decision::Executor { reason, .. } = expected else {
             panic!("missing type must fail planning")
         };
-        assert_eq!(plan_query(&query, &missing, &BOUNDS).unwrap_err(), reason);
+        assert_eq!(
+            futures::executor::block_on(plan_query(&query, &missing, &BOUNDS)).unwrap_err(),
+            reason
+        );
+    }
+}
+
+#[cfg(test)]
+mod cast_parameter_tests {
+    use super::*;
+    use omnigraph_compiler::{ExprType, PropType, ScalarType};
+
+    #[test]
+    fn a_cast_keeps_its_parameter_dependency() {
+        let expr = IRExpr::Cast {
+            expr: Box::new(IRExpr::Param(
+                "age".into(),
+                ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+            )),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::F64, true)),
+        };
+        let mut names = BTreeSet::new();
+        params_of_expr(&expr, &mut names);
+        assert_eq!(names, BTreeSet::from(["age".to_string()]));
     }
 }

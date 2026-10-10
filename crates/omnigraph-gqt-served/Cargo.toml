@@ -1,0 +1,32 @@
+[package]
+name = "omnigraph-gqt-served"
+version = "0.13.0"
+edition = "2024"
+description = "Served GQT conformance: the corpus run against an in-process omnigraph-server."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+publish = false
+
+# Tests only. The crate exists so that `omnigraph-server` carries no GQT
+# dev-dependency: `Test Workspace` excludes this crate beside `omnigraph-gqt`,
+# and the `GQT (served)` cell is the one job that builds it.
+[dependencies]
+
+[dev-dependencies]
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.13.0" }
+omnigraph-server = { path = "../omnigraph-server", version = "0.13.0" }
+omnigraph-gqt = { path = "../omnigraph-gqt" }
+omnigraph-gqt-core = { path = "../omnigraph-gqt-core" }
+axum = { workspace = true }
+datatest-stable = "0.3"
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+# One libtest test per `omnigraph-gqt/cases/**/*.gqt` that declares the
+# `omnigraph-server` target: the served verdict must equal the in-process one.
+[[test]]
+name = "gqt_served_conformance"
+harness = false
+
+[lints]
+workspace = true

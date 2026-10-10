@@ -2,50 +2,55 @@
 //! `or`, `not` or null test whose operands are all `Literal` folds to its
 //! value as the tree is built, so `{ adult: true or false }` reaches the IR as
 //! `true` (RFC 2026-09-24-shared-expression-model). The rules are the
-//! three-valued ones, and the engine's `evaluate_constant` applies the same
-//! `evaluate` at run time to the parameter-bearing rest; what these rules do
-//! not decide (a Date or DateTime comparison, an operand the type checker
-//! refuses) stays as written here and is the engine's to order or refuse.
+//! three-valued ones. Coercion runs first; Cast trees stay intact for the
+//! engine's typed evaluator, as do Date and DateTime comparisons.
 
 use std::cmp::Ordering;
 
 use crate::query::ast::{BinaryOp, CompOp, Literal};
 
 use super::IRExpr;
+use crate::types::{ExprType, PropType, ScalarType};
 
 /// `left <op> right`, folded when both operands are literals.
 pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
-    if let (IRExpr::Literal(l), IRExpr::Literal(r)) = (&left, &right)
+    if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
         && let Some(value) = evaluate(op, l, r)
     {
-        return IRExpr::Literal(value);
+        return IRExpr::Literal(
+            value,
+            ExprType::from_prop(&PropType::scalar(
+                ScalarType::Bool,
+                left.ty().nullable() || right.ty().nullable(),
+            )),
+        );
     }
-    IRExpr::Binary {
-        left: Box::new(left),
-        op,
-        right: Box::new(right),
-    }
+    IRExpr::binary(left, op, right)
 }
 
 /// `not <inner>`, folded over a Boolean or null literal.
 pub(super) fn not(inner: IRExpr) -> IRExpr {
     match inner {
-        IRExpr::Literal(Literal::Bool(value)) => IRExpr::Literal(Literal::Bool(!value)),
-        IRExpr::Literal(Literal::Null) => IRExpr::Literal(Literal::Null),
-        other => IRExpr::Not(Box::new(other)),
+        IRExpr::Literal(Literal::Bool(value), ty) => IRExpr::Literal(
+            Literal::Bool(!value),
+            ExprType::from_prop(&PropType::scalar(ScalarType::Bool, ty.nullable())),
+        ),
+        IRExpr::Literal(Literal::Null, _) => IRExpr::Literal(
+            Literal::Null,
+            ExprType::from_prop(&PropType::scalar(ScalarType::Bool, true)),
+        ),
+        other => IRExpr::logical_not(other),
     }
 }
 
 /// `<expr> is null` / `is not null`, folded over any literal.
 pub(super) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
     match expr {
-        IRExpr::Literal(literal) => {
-            IRExpr::Literal(Literal::Bool(matches!(literal, Literal::Null) != negated))
-        }
-        other => IRExpr::IsNull {
-            expr: Box::new(other),
-            negated,
-        },
+        IRExpr::Literal(literal, _) => IRExpr::Literal(
+            Literal::Bool(matches!(literal, Literal::Null) != negated),
+            ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
+        ),
+        other => IRExpr::null_test(other, negated),
     }
 }
 
@@ -139,7 +144,10 @@ mod tests {
     use super::*;
 
     fn lit(literal: Literal) -> IRExpr {
-        IRExpr::Literal(literal)
+        let ty = ExprType::from_prop(
+            &crate::query::typecheck::literal_type(&literal).expect("valid test literal"),
+        );
+        IRExpr::Literal(literal, ty)
     }
 
     fn compared(left: Literal, op: CompOp, right: Literal) -> IRExpr {
@@ -250,7 +258,10 @@ mod tests {
                 t,
             ),
         ] {
-            assert_eq!(expression, lit(expected));
+            let IRExpr::Literal(actual, _) = expression else {
+                panic!("expected a folded literal")
+            };
+            assert_eq!(actual, expected);
         }
     }
 
@@ -268,9 +279,12 @@ mod tests {
         let kept = compared(Literal::Integer(1), CompOp::Eq, text("1"));
         assert!(matches!(kept, IRExpr::Binary { .. }));
         let kept = not(lit(Literal::Integer(1)));
-        assert!(matches!(kept, IRExpr::Not(_)));
+        assert!(matches!(kept, IRExpr::Not(_, _)));
         let kept = binary(
-            IRExpr::Param("flag".to_string()),
+            IRExpr::Param(
+                "flag".to_string(),
+                ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
+            ),
             BinaryOp::Or,
             lit(Literal::Bool(true)),
         );

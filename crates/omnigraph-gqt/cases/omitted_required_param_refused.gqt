@@ -8,6 +8,8 @@ timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- schema
 node Thing {
@@ -89,6 +91,13 @@ query insert_thing_without_params($id: String) {
 }
 
 --- expect error: parameter 'id' not provided
+
+--- mutate
+query unused_required_mutation_param($unused: I32) {
+    update Thing set { name: "changed" } where id = "missing"
+}
+
+--- expect error: parameter 'unused' not provided
 
 --- query
 query all_things_untouched() {
