@@ -771,9 +771,9 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
 /// The put carries 2 MiB of raw bytes, past the JSON request bound.
 #[test]
 fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
+    use crate::support::managed_http::{IntentApiFixture, MergeDeliveryFault};
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    use crate::support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
     let temp = tempfile::tempdir().unwrap();
     let (cluster_dir, _) = blob_parity_config(temp.path(), &temp.path().join("local.omni"));
