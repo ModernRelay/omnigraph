@@ -19,11 +19,11 @@ use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
-    AcceptInput, AcceptedBoundPlan, AcceptedPlan, AdjacencyProof, Bounds, ConstantEvaluator,
-    DatasetPin, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    Explain, FragmentStat, FullTextCoverage, GatePolicy, IndexFact, NodeTypeSpec, Operation,
-    PlanError, PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef, Unrouted,
-    ValidationLimits,
+    AcceptInput, AcceptedBoundPlan, AcceptedPlan, AdjacencyProof, Bounds, DatasetPin,
+    EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics, Explain,
+    FragmentStat, FullTextCoverage, GatePolicy, IndexFact, KeyIds, NodeTypeSpec, Operation,
+    PlanError, PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef,
+    Unrouted, ValidationLimits,
 };
 
 use super::ResolvedParams;
@@ -124,9 +124,6 @@ pub(crate) struct QuerySource<'a> {
     gate_policy: GatePolicy,
     expand_caps: ExpandCaps,
     table_stats: HashMap<String, TableStatistics>,
-    /// The full-text coverage of every property a `bm25()` order key ranks,
-    /// by `(table key, property)`, read at the pinned dataset version.
-    full_text: HashMap<(String, String), FullTextCoverage>,
     /// The error the source met answering the planner's last lookup, handed
     /// back to the caller in place of the planner's wrapper.
     source_failure: std::sync::Mutex<Option<OmniError>>,
@@ -152,7 +149,6 @@ impl<'a> QuerySource<'a> {
         let params = resolve_params(&query.ir, params)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
         let table_stats = query_table_statistics(&ir, snapshot).await?;
-        let full_text = ranked_full_text_coverage(&ir, snapshot).await?;
         let mut source = QuerySource {
             ir,
             checked: query.checked.clone(),
@@ -164,7 +160,6 @@ impl<'a> QuerySource<'a> {
             gate_policy: gate_policy(settings),
             expand_caps: ExpandCaps::from_env(),
             table_stats,
-            full_text,
             source_failure: std::sync::Mutex::new(None),
         };
         source
@@ -233,10 +228,7 @@ impl<'a> QuerySource<'a> {
 
 impl PlanSource for QuerySource<'_> {
     fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        self.full_text
-            .get(&(type_key.to_string(), property.to_string()))
-            .copied()
-            .unwrap_or(FullTextCoverage::Absent)
+        FullTextCoverage::of_facts(&self.index_facts(type_key), property)
     }
 
     fn canonical_key_id(
@@ -244,42 +236,15 @@ impl PlanSource for QuerySource<'_> {
         type_key: &str,
         value: &IRExpr,
     ) -> std::result::Result<Option<String>, PlanError> {
-        use omnigraph_compiler::{ExprType, ScalarType};
-        let Some(node) = type_key
-            .strip_prefix("node:")
-            .and_then(|name| self.catalog.node_types.get(name))
-        else {
-            return Ok(None);
-        };
-        let Some([key]) = node.key.as_deref() else {
-            return Ok(None);
-        };
-        if !node
-            .properties
-            .get(key)
-            .is_some_and(|ty| ty.scalar == ScalarType::String && !ty.list)
-            || !matches!(
-                value.ty(),
-                ExprType::Value {
-                    scalar: ScalarType::String,
-                    list: false,
-                    ..
-                }
-            )
-        {
-            return Ok(None);
-        }
         let literal = match value {
             IRExpr::Literal(value, _) => Some(value),
             IRExpr::Param(name, _) => self.params.shared().get(name),
             _ => None,
         };
-        let Some(literal @ Literal::String(_)) = literal else {
+        let Some(literal) = literal else {
             return Ok(None);
         };
-        let array = super::typed_value::typed_literal_to_array(literal, value.ty(), 1)
-            .map_err(|error| PlanError::Internal(error.to_string()))?;
-        crate::loader::canonical_key_id(&[array], 0)
+        canonical_key_id_of(self.catalog, type_key, literal, value.ty())
             .map_err(|error| PlanError::Internal(error.to_string()))
     }
 
@@ -520,13 +485,60 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
     Ok(ResolvedParams(Arc::new(resolved)))
 }
 
-/// The engine's constant evaluator for acceptance: the rules its own
-/// constant folding applied to the IR, under the same bound parameters.
-struct BoundConstants<'p>(&'p ParamMap);
+/// The canonical id of the node of `type_key` whose single String key is
+/// `value` (typed `ty`), as every write path derives it; `None` when the
+/// type is not keyed by one String property or the value is no String.
+fn canonical_key_id_of(
+    catalog: &Catalog,
+    type_key: &str,
+    value: &Literal,
+    ty: &omnigraph_compiler::ExprType,
+) -> Result<Option<String>> {
+    use omnigraph_compiler::{ExprType, ScalarType};
+    let Some(node) = type_key
+        .strip_prefix("node:")
+        .and_then(|name| catalog.node_types.get(name))
+    else {
+        return Ok(None);
+    };
+    let Some([key]) = node.key.as_deref() else {
+        return Ok(None);
+    };
+    let string_key = node
+        .properties
+        .get(key)
+        .is_some_and(|property| property.scalar == ScalarType::String && !property.list);
+    let string_value = matches!(
+        ty,
+        ExprType::Value {
+            scalar: ScalarType::String,
+            list: false,
+            ..
+        }
+    );
+    if !string_key || !string_value || !matches!(value, Literal::String(_)) {
+        return Ok(None);
+    }
+    let array = super::typed_value::typed_literal_to_array(value, ty, 1)?;
+    crate::loader::canonical_key_id(&[array], 0)
+}
 
-impl ConstantEvaluator for BoundConstants<'_> {
-    fn evaluate(&self, expr: &IRExpr) -> Option<Literal> {
-        super::constant::evaluate_constant(expr, self.0).ok()
+/// Acceptance's derivation of a key's canonical id: the same function the
+/// plan source narrows a key with, so a narrowed id is re-derived. A value
+/// the derivation fails on yields no id, so acceptance refuses the narrowed
+/// conjunct rather than admitting it.
+struct CatalogKeys<'c>(&'c Catalog);
+
+impl KeyIds for CatalogKeys<'_> {
+    fn canonical_key_id(
+        &self,
+        type_key: &str,
+        value: &Literal,
+        ty: &omnigraph_compiler::ExprType,
+    ) -> Option<String> {
+        canonical_key_id_of(self.0, type_key, value, ty)
+            .ok()
+            .flatten()
     }
 }
 
@@ -554,13 +566,13 @@ impl QuerySource<'_> {
             .unwrap_or_else(|| unaccepted(reason))
     }
 
-    fn accept_input<'s>(&'s self, constants: &'s BoundConstants<'s>) -> AcceptInput<'s> {
+    fn accept_input<'s>(&'s self, keys: &'s CatalogKeys<'s>) -> AcceptInput<'s> {
         AcceptInput {
             checked: &self.checked,
             catalog: self.catalog,
             ir: &self.ir,
             params: self.params.shared(),
-            constants,
+            keys,
             limits: ValidationLimits::DEFAULT,
         }
     }
@@ -568,8 +580,8 @@ impl QuerySource<'_> {
 
 /// Plan the read and accept the plan, without explain diagnostics.
 pub(crate) async fn accept_query(source: &QuerySource<'_>) -> Result<AcceptedPlan> {
-    let constants = BoundConstants(source.params.shared());
-    omnigraph_planner::accept_query(&source.accept_input(&constants), source, &source.bounds())
+    let keys = CatalogKeys(source.catalog);
+    omnigraph_planner::accept_query(&source.accept_input(&keys), source, &source.bounds())
         .await
         .map_err(|reason| source.unaccepted(reason))
 }
@@ -584,13 +596,13 @@ pub(crate) fn accept_replay(
 ) -> Result<AcceptedBoundPlan> {
     let params = Arc::clone(&envelope.plan.values.params);
     let ir = super::constant::fold_query_constants(&query.ir, &params)?;
-    let constants = BoundConstants(&params);
+    let keys = CatalogKeys(catalog);
     let input = AcceptInput {
         checked: &query.checked,
         catalog,
         ir: &ir,
         params: &params,
-        constants: &constants,
+        keys: &keys,
         limits: ValidationLimits::DEFAULT,
     };
     omnigraph_planner::accept_replay(envelope, &input).map_err(replay_refused)
@@ -620,7 +632,7 @@ pub(crate) async fn replayed_coverage_holds(
         let actual = match snapshot.dataset(type_key) {
             Some(_) => {
                 let dataset = snapshot.open_lance_dataset(type_key).await?;
-                crate::table_store::TableStore::fts_coverage(&dataset, property).await?
+                FullTextCoverage::of_facts(&indexes::gather(&dataset).await?, property)
             }
             None => FullTextCoverage::Absent,
         };
@@ -665,77 +677,15 @@ pub(crate) struct ExplainedQuery {
 /// [`accept_query`] with the accepted plan's explain document, rendered from
 /// the same planning run; it validates exactly what a run validates.
 pub(crate) async fn explain_query(source: &QuerySource<'_>) -> Result<ExplainedQuery> {
-    let constants = BoundConstants(source.params.shared());
+    let keys = CatalogKeys(source.catalog);
     let (accepted, explain) = omnigraph_planner::accept_query_explained(
-        &source.accept_input(&constants),
+        &source.accept_input(&keys),
         source,
         &source.bounds(),
     )
     .await
     .map_err(|reason| source.unaccepted(reason))?;
     Ok(ExplainedQuery { explain, accepted })
-}
-
-/// The full-text coverage of every property the leading `order` key ranks
-/// by `bm25()` (alone or as an `rrf()` arm), at the snapshot's pinned
-/// version: the fact that decides where the ranked scan applies its
-/// eligibility.
-async fn ranked_full_text_coverage(
-    ir: &QueryIR,
-    snapshot: &Snapshot,
-) -> Result<HashMap<(String, String), FullTextCoverage>> {
-    fn bm25_targets(expr: &IRExpr, out: &mut Vec<(String, String)>) {
-        match expr {
-            IRExpr::Bm25 { field, .. } => {
-                if let IRExpr::PropAccess { variable, property } = field.as_ref() {
-                    out.push((variable.clone(), property.clone()));
-                }
-            }
-            IRExpr::Rrf {
-                primary, secondary, ..
-            } => {
-                bm25_targets(primary, out);
-                bm25_targets(secondary, out);
-            }
-            _ => {}
-        }
-    }
-    fn binding_type(ops: &[IROp], binding: &str) -> Option<String> {
-        ops.iter().find_map(|op| match op {
-            IROp::NodeScan {
-                variable,
-                type_name,
-                ..
-            } if variable == binding => Some(type_name.clone()),
-            IROp::Expand {
-                dst_var, dst_type, ..
-            } if dst_var == binding => Some(dst_type.clone()),
-            _ => None,
-        })
-    }
-    let mut targets = Vec::new();
-    if let Some(leading) = ir.order_by.first() {
-        bm25_targets(&leading.expr, &mut targets);
-    }
-    let mut coverage = HashMap::new();
-    for (binding, property) in targets {
-        let Some(type_name) = binding_type(&ir.pipeline, &binding) else {
-            continue;
-        };
-        let type_key = format!("node:{type_name}");
-        if coverage.contains_key(&(type_key.clone(), property.clone())) {
-            continue;
-        }
-        let known = match snapshot.dataset(&type_key) {
-            Some(_) => {
-                let dataset = snapshot.open_lance_dataset(&type_key).await?;
-                crate::table_store::TableStore::fts_coverage(&dataset, &property).await?
-            }
-            None => FullTextCoverage::Absent,
-        };
-        coverage.insert((type_key, property), known);
-    }
-    Ok(coverage)
 }
 
 async fn query_table_statistics(

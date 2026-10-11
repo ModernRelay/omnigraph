@@ -755,7 +755,6 @@ gateway_surfaces! {
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
-        "fts_coverage",
         "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",

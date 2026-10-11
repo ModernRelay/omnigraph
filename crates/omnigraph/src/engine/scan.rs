@@ -126,6 +126,7 @@ impl<'n> NodeRead<'n> {
             scalar_index: Some(true),
             columns,
             proven_empty: false,
+            filter_after_scoring: false,
         })
     }
 

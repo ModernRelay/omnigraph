@@ -410,14 +410,10 @@ pub(crate) async fn execute(
     accepted: AcceptedBoundPlan,
     context: &EngineContext<'_>,
 ) -> Result<PlanRun> {
+    // Acceptance checked the plan's aggregate specs, output schemas and
+    // fusion row keys; only what depends on this run's admission is left.
     let (bound, evidence) = accepted.into_parts();
-    omnigraph_planner::validate_aggregate_specs(&bound.plan)
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
-    omnigraph_planner::validate_output_schemas(&bound.plan)
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let traversal_limit = validate_traversal_admission(&bound.plan)?;
-    omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks(&bound.plan)
-        .map_err(|error| OmniError::manifest_internal(error.to_string()))?;
     let ctx =
         QueryContext::with_traversal_limit(bound.plan.assumptions().memory_limit, traversal_limit)?;
     ctx.run_owned(execute_with_context(bound, evidence, context, &ctx))

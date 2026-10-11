@@ -70,7 +70,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
-    user_indices_for_column, validate_full_text_demand, validate_full_text_scan,
+    validate_full_text_demand, validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -5094,60 +5094,6 @@ impl TableStore {
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_fts_index_on(ds, column).await
-    }
-
-    /// Metadata-only read (no data IO) of how far the FTS (inverted) index
-    /// entries on `column` together cover `ds`'s current fragments: every
-    /// fragment, some (an entry exists, but the bitmaps do not prove every
-    /// fragment), or no full-text entry at all. The FTS twin of
-    /// `dataset_index::key_column_index_coverage`, read while planning: rows
-    /// in fragments no entry covers are scored by a filter-dependent
-    /// batch-derived scorer instead of the index-global BM25 statistics
-    /// (lance `inverted/index.rs`), so a filter applied before scoring would
-    /// change their scores. Coverage is the UNION across same-column
-    /// entries: index optimization creates delta entries each covering a
-    /// disjoint fragment subset, and demanding one all-covering entry would
-    /// permanently rule out filtering before scoring on exactly the append +
-    /// optimize maintenance schedule production tables follow. Anything
-    /// short of full is always safe — eligibility then applies after
-    /// scoring and the gates run their postfilter plans — so every
-    /// unprovable case (an entry without a fragment bitmap) is partial.
-    pub(crate) async fn fts_coverage(
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<omnigraph_planner::FullTextCoverage> {
-        use omnigraph_planner::FullTextCoverage;
-        let indices = user_indices_for_column(ds, column).await?;
-        let fts_entries: Vec<_> = indices
-            .iter()
-            .filter(|index| {
-                index
-                    .index_details
-                    .as_ref()
-                    .map(|details| IndexDetails(details.clone()).supports_fts())
-                    .unwrap_or(false)
-            })
-            .collect();
-        if fts_entries.is_empty() {
-            return Ok(FullTextCoverage::Absent);
-        }
-        let fts_bitmaps: Vec<_> = fts_entries
-            .iter()
-            .filter_map(|index| index.fragment_bitmap.as_ref())
-            .collect();
-        if fts_bitmaps.is_empty() {
-            return Ok(FullTextCoverage::Partial);
-        }
-        let covered = ds.fragments().iter().all(|f| {
-            fts_bitmaps
-                .iter()
-                .any(|bitmap| bitmap.contains(f.id as u32))
-        });
-        Ok(if covered {
-            FullTextCoverage::Full
-        } else {
-            FullTextCoverage::Partial
-        })
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {

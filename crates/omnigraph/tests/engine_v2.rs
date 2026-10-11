@@ -1011,12 +1011,11 @@ edge Likes: Person -> Doc
     .await
     .unwrap();
     db.ensure_indices().await.unwrap();
-    for (source, name, values) in [
-        (ADULTS, "adults", vec![("min", "18")]),
-        (RANKED, "ranked", vec![("q", "graph")]),
-        (LIKED, "liked", vec![]),
+    for (source, name, params) in [
+        (ADULTS, "adults", int_params(&[("min", 18)])),
+        (RANKED, "ranked", params(&[("q", "graph")])),
+        (LIKED, "liked", params(&[])),
     ] {
-        let params = params(&values);
         let main = || ReadTarget::branch("main");
         let document = db
             .explain_query(main(), source, name, &params)

@@ -706,6 +706,8 @@ struct Replayed {
     plan: omnigraph_planner::BoundPlan,
     rows: Vec<Value>,
     search: Vec<Value>,
+    /// The run's replay envelope.
+    envelope: Vec<u8>,
 }
 
 /// One inspected run and two replays of its plan through the door (the plan
@@ -738,7 +740,17 @@ async fn replayed(db: &Session, source: &str, name: &str, params: &ParamMap) -> 
         plan: run.plan,
         rows,
         search,
+        envelope,
     }
+}
+
+/// `envelope` with its plan replaced by `plan` (a serialized `BoundPlan`),
+/// as a saved plan edited after its run arrives at the replay door: the
+/// run's query, scope and schema with an edited plan.
+fn with_plan(envelope: &[u8], plan: Value) -> Vec<u8> {
+    let mut edited: Value = serde_json::from_slice(envelope).unwrap();
+    edited["plan"] = plan;
+    serde_json::to_vec(&edited).unwrap()
 }
 
 #[tokio::test]
@@ -782,6 +794,7 @@ async fn legacy_two_hop_plan_corrects_assumed_coverage_before_execution() {
     );
     let result = rows_of(&run.result);
     assert_eq!(result, vec![serde_json::json!({"b.slug":"d01"})]);
+    let envelope = run.replay_envelope(query, "two_hops");
     let mut plan = run.plan;
     for id in plan.plan.post_order() {
         if let Some(PhysicalNode::Expand { mode, policy, .. }) = plan.plan.node_mut(id) {
@@ -807,8 +820,10 @@ async fn legacy_two_hop_plan_corrects_assumed_coverage_before_execution() {
             }
         });
         assert_eq!(changed, 1);
-        let restored = serde_json::from_value(encoded).unwrap();
-        let replay = db.replay_bound_plan("main", restored).await.unwrap();
+        let replay = db
+            .replay_bound_plan("main", &with_plan(&envelope, encoded))
+            .await
+            .unwrap();
         assert_eq!(rows_of(&replay.result), result);
         assert!(
             sides(&report_rows(&replay.report))
@@ -940,26 +955,14 @@ async fn a_marker_that_disagrees_with_its_contains_join_refuses_the_replay() {
 /// conjunct is refused by acceptance, which finds the predicate gone.
 #[tokio::test]
 async fn a_marker_with_no_contains_join_refuses_the_replay() {
-    use omnigraph_compiler::ir::IRExpr;
-    use omnigraph_compiler::query::ast::CompOp;
-    use omnigraph_planner::mirror::ExprMirror;
     for keep_conjunct in [true, false] {
         let error = edited_replay_refusal(&mut |object| {
             if object.get("node") != Some(&Value::from("ContainsJoin")) {
                 return;
             }
-            let side = |key: &str| {
-                let pair = object[key].as_array().unwrap();
-                IRExpr::PropAccess {
-                    variable: pair[0].as_str().unwrap().to_string(),
-                    property: pair[1].as_str().unwrap().to_string(),
-                }
-            };
-            let conjunct =
-                IRExpr::comparison(side("haystack"), CompOp::StringContains, side("needle"));
             let mut filters = Vec::new();
             if keep_conjunct {
-                filters.push(serde_json::to_value(ExprMirror::from(&conjunct)).unwrap());
+                filters.push(object["conjunct"].clone());
             }
             filters.extend(object["residual"].as_array().cloned().unwrap_or_default());
             object.retain(|key, _| matches!(key.as_str(), "node" | "left" | "right"));
@@ -970,7 +973,7 @@ async fn a_marker_with_no_contains_join_refuses_the_replay() {
         let expected = if keep_conjunct {
             "carries a runtime filter no contains join fills"
         } else {
-            "predicate retention: the plan tests no conjunct for `$p.text contains $m.number`"
+            "predicate retention: the plan tests no conjunct for"
         };
         assert!(error.to_string().contains(expected), "{error}");
     }
@@ -1015,8 +1018,12 @@ async fn saved_contains_conjunct_refuses_pairing_and_leaf_type_drift() {
             _ => None,
         })
         .expect("the fixture plans a ContainsJoin");
+    let envelope = first.replay_envelope(CITATION_QUERIES, "cited");
     let replay = db
-        .replay_bound_plan("main", restored.clone())
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&restored).unwrap()),
+        )
         .await
         .unwrap();
     assert_eq!(rows_of(&replay.result), rows_of(&first.result));
@@ -1087,34 +1094,28 @@ async fn saved_contains_conjunct_refuses_pairing_and_leaf_type_drift() {
             panic!("the saved join exists");
         };
         *saved = conjunct;
-        let altered = serde_json::from_value(serde_json::to_value(altered).unwrap()).unwrap();
-        let error = match db.replay_bound_plan("main", altered).await {
+        let error = match db
+            .replay_bound_plan(
+                "main",
+                &with_plan(&envelope, serde_json::to_value(altered).unwrap()),
+            )
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("{label}: inconsistent ContainsJoin conjunct replayed"),
         };
-        let (compiler_refusal, diagnostic) = match label {
-            "haystack scalar" => (true, "string predicate needs scalar String operands"),
-            "needle list" => (true, "comparison operands have incompatible list shapes"),
-            "haystack nullability" => (
-                false,
-                "property p.text leaf type String disagrees with its catalog owner",
-            ),
-            "operator" | "swapped columns" | "other haystack" | "other needle"
-            | "non-comparison" => (
-                false,
-                "contains join conjunct disagrees with its matcher columns",
-            ),
-            other => panic!("unclassified corruption {other}"),
-        };
-        if compiler_refusal {
-            assert!(matches!(&error, OmniError::Compiler(_)), "{label}: {error}");
-        } else {
-            assert!(
-                matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::Internal),
-                "{label}: {error}"
-            );
-        }
-        assert!(error.to_string().contains(diagnostic), "{label}: {error}");
+        // Acceptance refuses every corruption at the envelope door, before
+        // execution: whatever replaced it, the written conjunct is gone.
+        let check = "predicate retention";
+        assert!(
+            matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+            "{label}: {error}"
+        );
+        assert!(
+            error.to_string().contains("the saved plan is not accepted")
+                && error.to_string().contains(check),
+            "{label}: {error}"
+        );
     }
 }
 
@@ -1144,8 +1145,12 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
         .filter_map(|(id, node)| node.ranked().map(|ranked| (id, ranked.kind)))
         .collect();
     assert_eq!(scans.len(), 2);
+    let envelope = first.replay_envelope(DOC_QUERIES, "fused");
     let replay = db
-        .replay_bound_plan("main", restored.clone())
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&restored).unwrap()),
+        )
         .await
         .unwrap();
     assert_eq!(rows_of(&replay.result), rows_of(&first.result));
@@ -1187,8 +1192,13 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
                 panic!("the saved ranked scan exists");
             };
             ranked.score = replacement;
-            let altered = serde_json::from_value(serde_json::to_value(altered).unwrap()).unwrap();
-            let error = match db.replay_bound_plan("main", altered).await {
+            let error = match db
+                .replay_bound_plan(
+                    "main",
+                    &with_plan(&envelope, serde_json::to_value(altered).unwrap()),
+                )
+                .await
+            {
                 Err(error) => error,
                 Ok(_) => panic!("{kind:?} {label}: inconsistent ranked score replayed"),
             };
@@ -1210,6 +1220,7 @@ async fn a_nearest_ladder_replays_the_same_rungs() {
         plan,
         rows,
         search,
+        ..
     } = replayed(&db, DOC_QUERIES, "nearest_with_edge", &params).await;
     assert_eq!(result.len(), 3);
     let decided: Vec<(&str, u64)> = search
@@ -1297,8 +1308,9 @@ async fn a_hydrating_top_k_replays() {
         order { $d.slug desc }
         limit 2
     }"#;
-    let Replayed { result, plan, rows } =
-        replayed(&db, source, "two_texts", &ParamMap::new()).await;
+    let Replayed {
+        result, plan, rows, ..
+    } = replayed(&db, source, "two_texts", &ParamMap::new()).await;
     assert_eq!(
         result,
         [
@@ -1337,8 +1349,12 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
         replayed(&db, PEOPLE_QUERIES, "count_by_age", &ParamMap::new()).await;
     assert_eq!(result.len(), 3);
     assert!(rows.iter().any(|row| row["operator"] == "AggregateExec"));
-    let Replayed { result, plan, .. } =
-        replayed(&db, PEOPLE_QUERIES, "sum_ages", &ParamMap::new()).await;
+    let Replayed {
+        result,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, PEOPLE_QUERIES, "sum_ages", &ParamMap::new()).await;
     assert_eq!(result, vec![serde_json::json!({"total": 120.0})]);
     let explain = plan.plan.to_json();
     assert_eq!(
@@ -1370,8 +1386,10 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
             .find(|node| node["node"] == "Aggregate")
             .unwrap();
         node["aggregates"] = replacement;
-        let bound = serde_json::from_value(altered).unwrap();
-        let error = match db.replay_bound_plan("main", bound).await {
+        let error = match db
+            .replay_bound_plan("main", &with_plan(&envelope, altered))
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("{label}: malformed aggregate specification replayed"),
         };
@@ -1390,6 +1408,7 @@ async fn invalid_aggregate_vector_dimensions_refuse_replay_issue_858() {
         .query_inspected("main", PEOPLE_QUERIES, "count_by_age", &ParamMap::new())
         .await
         .unwrap();
+    let envelope = first.replay_envelope(PEOPLE_QUERIES, "count_by_age");
     let encoded = serde_json::to_value(first.plan).unwrap();
     for dimension in [0_u32, i32::MAX as u32 + 1, u32::MAX] {
         let mut altered = encoded.clone();
@@ -1402,8 +1421,10 @@ async fn invalid_aggregate_vector_dimensions_refuse_replay_issue_858() {
         node["return_exprs"][0]["expr"]["signature"]["arg"] = serde_json::json!({
             "kind": "value", "scalar": {"Vector": dimension}, "list": false, "nullable": false
         });
-        let bound = serde_json::from_value(altered).unwrap();
-        let error = match db.replay_bound_plan("main", bound).await {
+        let error = match db
+            .replay_bound_plan("main", &with_plan(&envelope, altered))
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("invalid vector dimension {dimension} replayed"),
         };
@@ -1432,13 +1453,20 @@ async fn metadata_count_with_an_aggregate_signature_refuses_replay_issue_858() {
             _ => None,
         })
         .unwrap();
+    let envelope = count.replay_envelope(PEOPLE_QUERIES, "count_people");
     let mut bound = count.plan;
     let root = bound.plan.root();
     let Some(PhysicalNode::MetadataCount { return_exprs, .. }) = bound.plan.node_mut(root) else {
         panic!("count_people must use MetadataCount");
     };
     *return_exprs = replacement;
-    let error = match db.replay_bound_plan("main", bound).await {
+    let error = match db
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&bound).unwrap()),
+        )
+        .await
+    {
         Err(error) => error,
         Ok(_) => panic!("MetadataCount accepted a sum signature"),
     };
@@ -2083,6 +2111,8 @@ async fn a_replay_rechecks_recorded_full_text_coverage() {
             && error.to_string().contains("full-text coverage"),
         "{error}"
     );
+}
+
 #[tokio::test]
 async fn saved_result_schemas_and_node_declarations_refuse_drift() {
     let dir = tempfile::tempdir().unwrap();
@@ -2093,10 +2123,13 @@ async fn saved_result_schemas_and_node_declarations_refuse_drift() {
         .query_inspected("main", query, "nodes", &ParamMap::new())
         .await
         .unwrap();
+    let envelope = run.replay_envelope(query, "nodes");
     let expected = rows_of(&run.result);
     let encoded = serde_json::to_value(&run.plan).unwrap();
-    let restored = serde_json::from_value(encoded.clone()).unwrap();
-    let replay = db.replay_bound_plan("main", restored).await.unwrap();
+    let replay = db
+        .replay_bound_plan("main", &with_plan(&envelope, encoded.clone()))
+        .await
+        .unwrap();
     assert_eq!(rows_of(&replay.result), expected);
     let result_node = encoded["body"]["plan"]["slots"]
         .as_array()
@@ -2151,8 +2184,10 @@ async fn saved_result_schemas_and_node_declarations_refuse_drift() {
                 _ => unreachable!(),
             }
         }
-        let bound = serde_json::from_value(altered).unwrap();
-        let error = match db.replay_bound_plan("main", bound).await {
+        let error = match db
+            .replay_bound_plan("main", &with_plan(&envelope, altered))
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("{label}: altered result declaration replayed"),
         };
@@ -2170,6 +2205,7 @@ async fn saved_result_schemas_and_node_declarations_refuse_drift() {
         .query_inspected("main", PEOPLE_QUERIES, "count_people", &ParamMap::new())
         .await
         .unwrap();
+    let envelope = run.replay_envelope(PEOPLE_QUERIES, "count_people");
     let root = run.plan.plan.root();
     assert!(
         run.plan
@@ -2182,8 +2218,10 @@ async fn saved_result_schemas_and_node_declarations_refuse_drift() {
     );
     let mut encoded = serde_json::to_value(run.plan).unwrap();
     encoded["body"]["plan"]["properties"][root]["schema"][0]["nullable"] = serde_json::json!(false);
-    let malformed = serde_json::from_value(encoded).unwrap();
-    let error = match db.replay_bound_plan("main", malformed).await {
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, encoded))
+        .await
+    {
         Err(error) => error,
         Ok(_) => panic!("MetadataCount accepted a different declared nullability"),
     };
@@ -2241,10 +2279,13 @@ query skipped() {
             .query_inspected("main", queries, name, &ParamMap::new())
             .await
             .unwrap();
+        let envelope = run.replay_envelope(queries, name);
         assert_eq!(run.result.num_rows(), rows, "{name}");
         let encoded = serde_json::to_value(&run.plan).unwrap();
-        let restored = serde_json::from_value(encoded.clone()).unwrap();
-        let replay = db.replay_bound_plan("main", restored).await.unwrap();
+        let replay = db
+            .replay_bound_plan("main", &with_plan(&envelope, encoded.clone()))
+            .await
+            .unwrap();
         assert_eq!(rows_of(&replay.result), rows_of(&run.result), "{name}");
         for (label, ty) in [
             (
@@ -2300,9 +2341,8 @@ query skipped() {
                     })
                     .sum();
                 assert_eq!(changed, 1, "{name}: the age predicate must reach the scan");
-                let bound = serde_json::from_value(altered).unwrap();
                 let error = db
-                    .replay_bound_plan("main", bound)
+                    .replay_bound_plan("main", &with_plan(&envelope, altered))
                     .await
                     .err()
                     .unwrap_or_else(|| {
@@ -2310,35 +2350,21 @@ query skipped() {
                             "{name}: replay accepted forged property {label}, coherent={coherent}"
                         )
                     });
-                let diagnostic = if coherent {
-                    assert!(
-                        matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::Internal),
-                        "{name}/{label}, coherent={coherent}: {error}"
-                    );
-                    "property p.age leaf type"
-                } else {
-                    assert!(
-                        matches!(&error, OmniError::Compiler(_)),
-                        "{name}/{label}: {error}"
-                    );
-                    match label {
-                        "scalar" => "comparison operands need explicit casts to one stored domain",
-                        "nullability" => "stored expression result type violates its local rule",
-                        other => panic!("unclassified corruption {other}"),
-                    }
-                };
+                // Acceptance refuses the forged leaf at the envelope door,
+                // whether or not its local types cohere: the stored conjunct
+                // is not the query's typed lowering.
                 assert!(
-                    error.to_string().contains(diagnostic),
+                    matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
                     "{name}/{label}, coherent={coherent}: {error}"
                 );
-                if coherent {
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("disagrees with its catalog owner"),
-                        "{name}/{label}: {error}"
-                    );
-                }
+                assert!(
+                    error.to_string().contains(
+                        "the saved plan is not accepted: predicate retention: the plan tests `$p.age >"
+                    ) && error
+                        .to_string()
+                        .contains("with stored types the query does not give it"),
+                    "{name}/{label}, coherent={coherent}: {error}"
+                );
             }
         }
     }
@@ -2361,12 +2387,15 @@ async fn saved_count_variable_types_refuse_drift_with_metadata_or_empty_aggregat
             .query_inspected("main", source, name, &ParamMap::new())
             .await
             .unwrap();
+        let envelope = run.replay_envelope(source, name);
         if name == "empty_count" {
             assert_eq!(rows_of(&run.result), vec![serde_json::json!({"n":0})]);
         }
         let mut altered = serde_json::to_value(&run.plan).unwrap();
-        let restored = serde_json::from_value(altered.clone()).unwrap();
-        let replay = db.replay_bound_plan("main", restored).await.unwrap();
+        let replay = db
+            .replay_bound_plan("main", &with_plan(&envelope, altered.clone()))
+            .await
+            .unwrap();
         assert_eq!(rows_of(&replay.result), rows_of(&run.result), "{name}");
         let node = altered["body"]["plan"]["slots"]
             .as_array_mut()
@@ -2386,9 +2415,8 @@ async fn saved_count_variable_types_refuse_drift_with_metadata_or_empty_aggregat
             1
         );
         assert_eq!(node["return_exprs"][0]["expr"]["signature"], signature);
-        let bound = serde_json::from_value(altered).unwrap();
         let error = db
-            .replay_bound_plan("main", bound)
+            .replay_bound_plan("main", &with_plan(&envelope, altered))
             .await
             .err()
             .unwrap_or_else(|| panic!("{name}: replay accepted a count of a different node type"));
@@ -2417,11 +2445,11 @@ async fn saved_sort_alias_type_refuses_drift_even_when_limit_skips_input() {
         .query_inspected("main", source, "sorted", &ParamMap::new())
         .await
         .unwrap();
+    let envelope = run.replay_envelope(source, "sorted");
     assert_eq!(run.result.num_rows(), 0);
     let mut altered = serde_json::to_value(&run.plan).unwrap();
-    let restored = serde_json::from_value(altered.clone()).unwrap();
     assert_eq!(
-        db.replay_bound_plan("main", restored)
+        db.replay_bound_plan("main", &with_plan(&envelope, altered.clone()))
             .await
             .unwrap()
             .result
@@ -2444,13 +2472,21 @@ async fn saved_sort_alias_type_refuses_drift_even_when_limit_skips_input() {
         ),
         1
     );
-    let bound = serde_json::from_value(altered).unwrap();
     let error = db
-        .replay_bound_plan("main", bound)
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
         .await
         .err()
         .expect("a sort alias must agree with its retained return type");
-    assert!(error.to_string().contains("alias"), "{error}");
+    assert!(
+        matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(
+            "the saved plan is not accepted: order: the final sort orders by years desc with stored types"
+        ),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -2473,13 +2509,18 @@ async fn saved_temporal_params_keep_fresh_shape_refusals_on_empty_input() {
                 .query_inspected("main", &source, "temporal", &params)
                 .await
                 .unwrap();
+            let envelope = run.replay_envelope(&source, "temporal");
             assert_eq!(
                 run.result.num_rows(),
                 if predicate.ends_with("100") { 0 } else { 3 }
             );
-            let restored =
-                serde_json::from_value(serde_json::to_value(&run.plan).unwrap()).unwrap();
-            let replay = db.replay_bound_plan("main", restored).await.unwrap();
+            let replay = db
+                .replay_bound_plan(
+                    "main",
+                    &with_plan(&envelope, serde_json::to_value(&run.plan).unwrap()),
+                )
+                .await
+                .unwrap();
             assert_eq!(rows_of(&replay.result), rows_of(&run.result));
             let invalid = Literal::List(vec![Literal::Null]);
             let fresh = db
@@ -2494,9 +2535,11 @@ async fn saved_temporal_params_keep_fresh_shape_refusals_on_empty_input() {
                 .expect("fresh binding refuses the invalid temporal list");
             let mut altered = run.plan;
             std::sync::Arc::make_mut(&mut altered.values.params).insert("values".into(), invalid);
-            let bound = serde_json::from_value(serde_json::to_value(altered).unwrap()).unwrap();
             let replay = db
-                .replay_bound_plan("main", bound)
+                .replay_bound_plan(
+                    "main",
+                    &with_plan(&envelope, serde_json::to_value(altered).unwrap()),
+                )
                 .await
                 .err()
                 .expect("replay must preserve the fresh temporal parameter contract");
@@ -2526,11 +2569,11 @@ async fn saved_return_leaf_types_refuse_drift_when_limit_skips_input() {
         .query_inspected("main", source, "returned", &params)
         .await
         .unwrap();
+    let envelope = run.replay_envelope(source, "returned");
     assert_eq!(run.result.num_rows(), 0);
     let encoded = serde_json::to_value(&run.plan).unwrap();
-    let restored = serde_json::from_value(encoded.clone()).unwrap();
     assert_eq!(
-        db.replay_bound_plan("main", restored)
+        db.replay_bound_plan("main", &with_plan(&envelope, encoded.clone()))
             .await
             .unwrap()
             .result
@@ -2560,10 +2603,10 @@ async fn saved_return_leaf_types_refuse_drift_when_limit_skips_input() {
             projection["ty"], declared,
             "only the expression leaf changes"
         );
-        match serde_json::from_value::<omnigraph_planner::BoundPlan>(altered) {
+        match serde_json::from_value::<omnigraph_planner::BoundPlan>(altered.clone()) {
             Err(_) => {}
-            Ok(bound) => {
-                db.replay_bound_plan("main", bound)
+            Ok(_) => {
+                db.replay_bound_plan("main", &with_plan(&envelope, altered))
                     .await
                     .err()
                     .unwrap_or_else(|| panic!("{column}: a skipped return accepted a leaf type different from its result type"));
