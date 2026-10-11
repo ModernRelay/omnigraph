@@ -8,6 +8,11 @@
 # notes: text_search_no_results, fuzzy_search_tolerates_typos, fuzzy_does_not_match_under_default_tokenizer,
 # notes: phrase_search_matches_exact_phrase, phrase_search_is_documented_fts_fallback and
 # notes: match_text_matches_exact_set_excludes_unrelated (search.rs).
+# notes: `Fresh` stays empty through seed preparation, so its first rows arrive after the
+# notes: indexes are built: `search` must still match them with the index's analyzer
+# notes: (lowercased, stemmed), not Lance's bare no-index tokenizer that misses "Deep Learning".
+# notes: The update and the delete that follow keep the analyzer: no write re-declares it, so
+# notes: each relies on the table keeping its untrained segment.
 
 --- runner
 timeout_ms: 10000
@@ -21,6 +26,10 @@ node Doc {
     title: String @index
     body: String @index
     embedding: Vector(4)
+}
+node Fresh {
+    slug: String @key
+    body: String @index
 }
 
 --- seed
@@ -143,3 +152,85 @@ query phrase_search_one_token($q: String) {
 --- expect shape
 d.slug: String
 d.title: String
+
+--- mutate
+query add_fresh() {
+    insert Fresh { slug: "fresh-1", body: "Deep Learning" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query fresh_search($q: String) {
+    match {
+        $f: Fresh
+        search($f.body, $q)
+    }
+    return { $f.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect unordered
+{"f.slug": "fresh-1"}
+
+--- expect shape
+f.slug: String
+
+--- mutate
+query retitle_fresh() {
+    update Fresh set { body: "Deep Learning Systems" } where slug = "fresh-1"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query fresh_search($q: String) {
+    match {
+        $f: Fresh
+        search($f.body, $q)
+    }
+    return { $f.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect unordered
+{"f.slug": "fresh-1"}
+
+--- expect shape
+f.slug: String
+
+--- mutate
+query add_second_fresh() {
+    insert Fresh { slug: "fresh-2", body: "Deep Dive" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query drop_first_fresh() {
+    delete Fresh where slug = "fresh-1"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query fresh_search($q: String) {
+    match {
+        $f: Fresh
+        search($f.body, $q)
+    }
+    return { $f.slug }
+}
+
+--- params
+{"q": "deep"}
+
+--- expect unordered
+{"f.slug": "fresh-2"}
+
+--- expect shape
+f.slug: String

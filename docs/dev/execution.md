@@ -551,7 +551,7 @@ them) and, per `nearest` scan, its query vector keyed by node id. `bind`
 client is used; explain binds with a resolver that refuses the client, which
 is how a `nearest()` over a string query reads `unavailable`. A bound plan
 serializes through planner-owned mirror types (`mirror.rs`) and reads back
-equal (`omnigraph-planner/tests/bound_plan.rs`); the `SearchMode` of a
+equal (`omnigraph-planner/tests/integration/bound_plan.rs`); the `SearchMode` of a
 ranked scan is built from the plan node, the value table and the pass, never
 from the `QueryIR`.
 

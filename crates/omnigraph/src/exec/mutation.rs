@@ -2015,6 +2015,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             name: "q".into(),
             params: Vec::new(),
             ops: vec![op],
+            as_commit: false,
         };
         for (ir, is_insert) in [
             (

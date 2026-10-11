@@ -256,7 +256,7 @@ The v8 storage fence keeps older binaries from exposing retired branches.
   visibility, a partial legacy write completed on retry, a resume after the
   directory running no census, and the `recovery_required` reports for a
   foreign intent, a changed source and a modified legacy object.
-- `crates/omnigraph/tests/recovery.rs` owns manifest-only contract admission,
+- `crates/omnigraph/tests/integration/recovery.rs` owns manifest-only contract admission,
   ignored orphan schema artifacts, read-only opens without writes, and legacy
   sidecars refusing read-write but not read-only open.
 - The initialization cells in `failpoints.rs` own exact-genesis recovery,

@@ -177,7 +177,7 @@ edge Knows: Person -> Person {}
         .expect("the right branch owns e");
     let (written, identity) = reader
         .storage()
-        .commit_staged_detached(base, staged, &witness)
+        .commit_staged_detached(base, staged, &witness, &[])
         .await
         .unwrap();
     assert_eq!(identity.read_version, right_people.version().version);
@@ -734,15 +734,8 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
     );
 }
 
-// The full operator upgrade narrative in one flow: load data → export → a graph from
-// an older release (simulated by rewinding the stamp below CURRENT) is refused with
-// the export/import nudge → rebuild via fresh `init` + `load` → the data is present
-// and the rebuilt graph opens. The refusal is **stamp-only** (read before any data),
-// so a stamp-rewound graph is a faithful stand-in for a real older-release graph
-// without needing a second binary — the on-disk layout is never reached. Data
-// fidelity for vector / blob columns is covered by the export round-trip tests in
-// `tests/export.rs`; this test composes the refusal with the rebuild so the operator
-// path proven in the docs (`docs/user/operations/upgrade.md`) is exercised end to end.
+/// Exercises export/import after a stamp-only refusal, before any data is read.
+/// Vector and Blob fidelity are covered in `tests/integration/export.rs`.
 #[tokio::test]
 async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     use crate::db::Omnigraph;

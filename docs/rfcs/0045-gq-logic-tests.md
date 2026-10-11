@@ -275,10 +275,13 @@ existing, test-attributed, and given an added line carrying an
 alphanumeric character, not a comment or an attribute, inside its body;
 `N` must be followed by a non-digit or by the end of the line (Rust
 shape) (`issue_5630` never matches issue 563;
-`issue_563_underfill` does). The Rust shape matches only in top-level
+`issue_563_underfill` does). The Rust shape matches in top-level
 test targets, `crates/*/tests/<name>.rs` and `tools/*/tests/<name>.rs`,
-and in-source modules, `crates/*/src/**` and `tools/*/src/**`; helper and
-fixture modules under `tests/` never match (a helper named for an issue
+their `tests/integration/main.rs` roots and direct modules with a bare,
+top-level `mod <name>;` declaration in that root at the head commit, and
+in-source modules, `crates/*/src/**` and `tools/*/src/**`. Attributed
+declarations, path overrides and deeper integration modules are not resolved;
+other helper and fixture modules under `tests/` never match (a helper named for an issue
 is not a test). A plain function, however named, never satisfies the
 gate; an added definition is skipped when its name starts with `_`, when
 the line is a declaration ending in `;`, or when the same name is

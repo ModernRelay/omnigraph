@@ -189,6 +189,7 @@ pub struct CheckedMutationQuery {
     pub(crate) name: String,
     pub(crate) params: Vec<CheckedParam>,
     pub(crate) ops: Vec<CheckedMutationOp>,
+    pub(crate) as_commit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -664,6 +665,7 @@ pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<Chec
             name: query.name.clone(),
             params,
             ops,
+            as_commit: query.as_commit,
         }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
