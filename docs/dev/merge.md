@@ -87,6 +87,10 @@ filter-bearing Update shape. It performs no target MergeInsert join or target
 ID preflight. The marker is not a signature and raw Lance writers remain
 unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
+The effective `write_max_bytes` is captured once. It accompanies the exact
+planned chunk rows through staging and publication, so scanner batch choices
+cannot change the admitted transaction boundaries.
+
 ## General route
 
 The `merge_lineage` session setting at `on` (the release default, `verify` in
@@ -116,8 +120,9 @@ the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
   row-width shape — the width estimate that plans chunk sizes only reduces
   retries, it is never load-bearing for the bound. A single indivisible row
   wider than the ceiling still hydrates alone;
-- Blob columns hydrate as descriptors; Blob-bearing rows are materialized
-  under the same operation budget;
+- Blob columns hydrate as descriptors; materialized Blob payloads share one
+  operation-wide `write_max_bytes` allowance (default 32 MiB), independent of
+  the row-and-descriptor allowance used for each write chunk;
 - selected new IDs stage as strict inserts, existing IDs as known-present
   updates, and removals as deletes;
 - the transaction plan is pre-minted and bounded before recovery arm;

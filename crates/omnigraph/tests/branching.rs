@@ -2,7 +2,6 @@ mod helpers;
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Write;
 
 use arrow_array::{Array, Int32Array, StringArray, StructArray, UInt64Array};
 use futures::TryStreamExt;
@@ -136,18 +135,10 @@ node Asset {
 }
 "#;
 
+/// A sparse file of `bytes` zeros: its readers assert a length and a pointer
+/// switch reads no payload, so no byte is ever written.
 fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
-    const BLOCK_BYTES: usize = 1024 * 1024;
-
-    let mut file = fs::File::create(path).unwrap();
-    let block = vec![0x5a_u8; BLOCK_BYTES];
-    let mut remaining = bytes;
-    while remaining > 0 {
-        let write = remaining.min(BLOCK_BYTES as u64) as usize;
-        file.write_all(&block[..write]).unwrap();
-        remaining -= write as u64;
-    }
-    file.flush().unwrap();
+    fs::File::create(path).unwrap().set_len(bytes).unwrap();
 }
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Session {
@@ -521,43 +512,6 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     .await
     .unwrap();
 
-    // Keep one out-of-line payload lazy until after the source branch tree is
-    // reclaimed. A returned reader is pinned and can never retarget, but it is
-    // not a durable lease over destructive branch deletion.
-    let deletion_payload = vec![0x5a_u8; BLOB_READ_RANGE_MAX_BYTES as usize + 1];
-    let deletion_encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &deletion_payload,
-    );
-    let deletion_value = format!("base64:{deletion_encoded}");
-    mutate_branch(
-        &feature,
-        "feature",
-        BLOB_MUTATIONS,
-        "insert_doc",
-        &params(&[
-            ("$title", "delete-boundary"),
-            ("$content", deletion_value.as_str()),
-            ("$note", "unread before delete"),
-        ]),
-    )
-    .await
-    .unwrap();
-    let deletion_read = feature
-        .read_blob_at(
-            ReadTarget::branch("feature"),
-            node_blob_cell("Document", "delete-boundary", "content"),
-        )
-        .await
-        .unwrap();
-    let BlobContent::Managed {
-        reader: deletion_reader,
-        ..
-    } = deletion_read.content
-    else {
-        panic!("expected managed branch-deletion fixture")
-    };
-
     let readme_cell = node_blob_cell("Document", "readme", "content");
     let feature_read = feature
         .read_blob_at(ReadTarget::branch("feature"), readme_cell.clone())
@@ -612,16 +566,6 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
 
     let merged_snapshot = main.resolve_snapshot("main").await.unwrap();
     main.branch_delete("feature").await.unwrap();
-    match deletion_reader
-        .read_range(BLOB_READ_RANGE_MAX_BYTES..BLOB_READ_RANGE_MAX_BYTES + 1)
-        .await
-    {
-        Ok(bytes) => assert_eq!(&bytes[..], &[0x5a]),
-        Err(OmniError::Storage(_)) => {}
-        Err(other) => panic!(
-            "destructive branch reclamation may return old bytes or fail loudly, never retarget; got {other:?}"
-        ),
-    }
     let readme = main
         .read_blob_at(ReadTarget::branch("main"), readme_cell.clone())
         .await
@@ -740,6 +684,82 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
         ),
         "the advanced branch must observe the deletion, got {deleted:?}"
     );
+}
+
+/// A returned managed reader is pinned and can never retarget, but it is no
+/// lease over destructive branch deletion: once the source branch tree is
+/// reclaimed, an out-of-line read returns the old bytes or fails loudly.
+#[tokio::test]
+async fn branch_merge_with_blob_columns_keeps_a_lazy_reader_honest_across_branch_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let main = helpers::session(Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap());
+    main.load_jsonl(
+        "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    main.branch_create("feature").await.unwrap();
+    let feature = helpers::session(Omnigraph::open(uri).await.unwrap());
+    mutate_main(
+        &main,
+        BLOB_MUTATIONS,
+        "update_doc_note",
+        &params(&[("$title", "main-doc"), ("$note", "updated on main")]),
+    )
+    .await
+    .unwrap();
+
+    let deletion_payload = vec![0x5a_u8; BLOB_READ_RANGE_MAX_BYTES as usize + 1];
+    let deletion_encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &deletion_payload,
+    );
+    let deletion_value = format!("base64:{deletion_encoded}");
+    mutate_branch(
+        &feature,
+        "feature",
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[
+            ("$title", "delete-boundary"),
+            ("$content", deletion_value.as_str()),
+            ("$note", "unread before delete"),
+        ]),
+    )
+    .await
+    .unwrap();
+    let deletion_read = feature
+        .read_blob_at(
+            ReadTarget::branch("feature"),
+            node_blob_cell("Document", "delete-boundary", "content"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        reader: deletion_reader,
+        ..
+    } = deletion_read.content
+    else {
+        panic!("expected managed branch-deletion fixture")
+    };
+
+    assert_eq!(
+        main.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    main.branch_delete("feature").await.unwrap();
+    match deletion_reader
+        .read_range(BLOB_READ_RANGE_MAX_BYTES..BLOB_READ_RANGE_MAX_BYTES + 1)
+        .await
+    {
+        Ok(bytes) => assert_eq!(&bytes[..], &[0x5a]),
+        Err(OmniError::Storage(_)) => {}
+        Err(other) => panic!(
+            "destructive branch reclamation may return old bytes or fail loudly, never retarget; got {other:?}"
+        ),
+    }
 }
 
 /// Adding a nullable Blob property writes no data, so rows written before the
@@ -1547,128 +1567,161 @@ async fn branch_merge_pointer_only_external_blob_needs_no_source_io_body() {
     assert_eq!(read_probes.external_blob_payload_read_calls(), 0);
 }
 
-/// External payloads past the 32 MiB materialization ceiling, in one cell,
-/// one row, or two tables, merge onto main by pointer switch: no payload is
-/// read and the descriptors stay external.
+/// The external materialization ceiling the oversized pointer-switch cases
+/// sit past.
+const OVERSIZED_EXTERNAL_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// An external payload past the 32 MiB materialization ceiling in one cell
+/// merges onto main by pointer switch: no payload is read and the descriptor
+/// stays external.
 #[tokio::test]
 async fn branch_merge_onto_main_switches_oversized_external_blob_pointers() {
-    Box::pin(branch_merge_onto_main_switches_oversized_external_blob_pointers_body()).await;
+    Box::pin(oversized_external_blob_pointer_switch(
+        "single",
+        OVERSIZED_EXTERNAL_LIMIT + 1,
+        None,
+        false,
+    ))
+    .await;
 }
 
-async fn branch_merge_onto_main_switches_oversized_external_blob_pointers_body() {
-    const LIMIT: u64 = 32 * 1024 * 1024;
+/// Two external payloads whose sum passes the ceiling in one row.
+#[tokio::test]
+async fn branch_merge_onto_main_switches_cumulative_oversized_external_blob_pointers() {
+    Box::pin(oversized_external_blob_pointer_switch(
+        "cumulative",
+        OVERSIZED_EXTERNAL_LIMIT / 2 + 1,
+        Some(OVERSIZED_EXTERNAL_LIMIT / 2 + 1),
+        false,
+    ))
+    .await;
+}
 
-    for (case, first_bytes, second_bytes, split_across_tables) in [
-        ("single", LIMIT + 1, None, false),
-        ("cumulative", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), false),
-        ("cross-table", LIMIT / 2 + 1, Some(LIMIT / 2 + 1), true),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        // The graph root must lie outside every external base.
-        let graph_dir = tempfile::tempdir().unwrap();
-        let graph_path = graph_dir.path().join("graph");
-        let graph_uri = graph_path.to_str().unwrap();
-        let first_path = dir.path().join("first.blob");
-        write_sized_external_blob(&first_path, first_bytes);
-        let first_uri = format!("file://{}", first_path.display());
+/// Two external payloads whose sum passes the ceiling across two tables.
+#[tokio::test]
+async fn branch_merge_onto_main_switches_cross_table_oversized_external_blob_pointers() {
+    Box::pin(oversized_external_blob_pointer_switch(
+        "cross-table",
+        OVERSIZED_EXTERNAL_LIMIT / 2 + 1,
+        Some(OVERSIZED_EXTERNAL_LIMIT / 2 + 1),
+        true,
+    ))
+    .await;
+}
 
-        let mut wide_data = serde_json::Map::new();
-        wide_data.insert(
-            "title".to_string(),
-            serde_json::Value::String(format!("wide-{case}")),
-        );
-        wide_data.insert("first".to_string(), serde_json::Value::String(first_uri));
-        let second_uri = if let Some(second_bytes) = second_bytes {
-            let second_path = dir.path().join("second.blob");
-            write_sized_external_blob(&second_path, second_bytes);
-            let uri = format!("file://{}", second_path.display());
-            if !split_across_tables {
-                wide_data.insert("second".to_string(), serde_json::Value::String(uri.clone()));
-            }
-            Some(uri)
-        } else {
-            None
-        };
-        let document_row = serde_json::json!({
-            "type": "Document",
-            "data": serde_json::Value::Object(wide_data),
-        })
+/// One oversized case: `first_bytes` in `Document.first`, `second_bytes` in
+/// `Document.second` or, split across tables, in `Asset.payload`; the graph
+/// root lies outside every external base.
+async fn oversized_external_blob_pointer_switch(
+    case: &str,
+    first_bytes: u64,
+    second_bytes: Option<u64>,
+    split_across_tables: bool,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let graph_uri = graph_path.to_str().unwrap();
+    let first_path = dir.path().join("first.blob");
+    write_sized_external_blob(&first_path, first_bytes);
+    let first_uri = format!("file://{}", first_path.display());
+
+    let mut wide_data = serde_json::Map::new();
+    wide_data.insert(
+        "title".to_string(),
+        serde_json::Value::String(format!("wide-{case}")),
+    );
+    wide_data.insert("first".to_string(), serde_json::Value::String(first_uri));
+    let second_uri = if let Some(second_bytes) = second_bytes {
+        let second_path = dir.path().join("second.blob");
+        write_sized_external_blob(&second_path, second_bytes);
+        let uri = format!("file://{}", second_path.display());
+        if !split_across_tables {
+            wide_data.insert("second".to_string(), serde_json::Value::String(uri.clone()));
+        }
+        Some(uri)
+    } else {
+        None
+    };
+    let document_row = serde_json::json!({
+        "type": "Document",
+        "data": serde_json::Value::Object(wide_data),
+    })
+    .to_string();
+    let selected_rows = if split_across_tables {
+        format!(
+            "{document_row}\n{}",
+            serde_json::json!({
+                "type": "Asset",
+                "data": {
+                    "name": "wide-asset",
+                    "payload": second_uri.expect("cross-table case has second payload"),
+                }
+            })
+        )
+    } else {
+        document_row
+    };
+
+    let base_uri = url::Url::from_directory_path(dir.path())
+        .expect("external blob base is absolute")
         .to_string();
-        let selected_rows = if split_across_tables {
-            format!(
-                "{document_row}\n{}",
-                serde_json::json!({
-                    "type": "Asset",
-                    "data": {
-                        "name": "wide-asset",
-                        "payload": second_uri.expect("cross-table case has second payload"),
-                    }
-                })
-            )
-        } else {
-            document_row
-        };
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = helpers::session(
+        Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let base = r#"{"type":"Document","data":{"title":"base"}}"#;
+    db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.load(
+        "feature",
+        &format!("{base}\n{selected_rows}"),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
 
-        let base_uri = url::Url::from_directory_path(dir.path())
-            .expect("external blob base is absolute")
-            .to_string();
-        let policy = ExternalBlobPolicy::allow(vec![
-            ExternalBlobBase::new(base_uri, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
-        ])
+    let before_tables = pointer_switch_tables(&db).await;
+    let probes = MergeWriteProbes::default();
+    let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
+        .await
         .unwrap();
-        let db = helpers::session(
-            Omnigraph::init(graph_uri, WIDE_BLOB_SCHEMA)
-                .await
-                .unwrap()
-                .with_external_blob_policy(policy)
-                .unwrap(),
-        );
-        let base = r#"{"type":"Document","data":{"title":"base"}}"#;
-        db.load_jsonl(base, LoadMode::Overwrite).await.unwrap();
-        db.branch_create("feature").await.unwrap();
-        db.load(
-            "feature",
-            &format!("{base}\n{selected_rows}"),
-            LoadMode::Overwrite,
+    assert_eq!(outcome.outcome, MergeOutcome::FastForward, "{case}");
+    assert_pointer_switch_onto_main(&db, &probes, before_tables, case).await;
+    assert_eq!(count_rows(&db, "node:Document").await, 2);
+    assert_eq!(
+        count_rows(&db, "node:Asset").await,
+        usize::from(split_across_tables)
+    );
+    let first = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", format!("wide-{case}"), "first"),
         )
         .await
         .unwrap();
-
-        let before_tables = pointer_switch_tables(&db).await;
-        let probes = MergeWriteProbes::default();
-        let outcome = with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
-            .await
-            .unwrap();
-        assert_eq!(outcome.outcome, MergeOutcome::FastForward, "{case}");
-        assert_pointer_switch_onto_main(&db, &probes, before_tables, case).await;
-        assert_eq!(count_rows(&db, "node:Document").await, 2);
-        assert_eq!(
-            count_rows(&db, "node:Asset").await,
-            usize::from(split_across_tables)
-        );
-        let first = db
-            .read_blob_at(
-                ReadTarget::branch("main"),
-                node_blob_cell("Document", format!("wide-{case}"), "first"),
-            )
-            .await
-            .unwrap();
-        let BlobContent::External(first) = first.content else {
-            panic!("{case}: a pointer switch keeps the external descriptor as written")
-        };
-        assert_eq!(
-            first.uri,
-            url::Url::from_file_path(fs::canonicalize(&first_path).unwrap())
-                .unwrap()
-                .to_string()
-        );
-        assert_eq!(first.offset, 0);
-        let recovery_dir = graph_path.join("__recovery");
-        assert!(
-            !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
-            "{case}: a pointer switch leaves no recovery sidecar"
-        );
-    }
+    let BlobContent::External(first) = first.content else {
+        panic!("{case}: a pointer switch keeps the external descriptor as written")
+    };
+    assert_eq!(
+        first.uri,
+        url::Url::from_file_path(fs::canonicalize(&first_path).unwrap())
+            .unwrap()
+            .to_string()
+    );
+    assert_eq!(first.offset, 0);
+    let recovery_dir = graph_path.join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "{case}: a pointer switch leaves no recovery sidecar"
+    );
 }
 
 /// Main's `node:Document` and `node:Asset` before a merge from `feature`:
@@ -1960,9 +2013,14 @@ async fn branch_merge_applies_node_insert_to_main() {
 /// `merge_adopt_*.gqt`. Both named targets adopt the exact source registration.
 #[tokio::test]
 async fn branch_merge_preserves_state_when_pins_differ() {
-    for lazy_target in [false, true] {
-        assert_native_version_case(8, lazy_target).await;
-    }
+    assert_native_version_case(1, false).await;
+}
+
+/// The lazy-target arm: main carries the history and a fresh child of main,
+/// with no materialized graph-head row, adopts the source's pin.
+#[tokio::test]
+async fn branch_merge_preserves_state_when_pins_differ_on_a_lazy_target() {
+    assert_native_version_case(1, true).await;
 }
 
 // Construct the composed case in its own stack frame, then poll its heap-held

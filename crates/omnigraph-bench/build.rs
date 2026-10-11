@@ -829,7 +829,11 @@ fn emit_gqt_engine_digest(root: &Path) {
     use sha2::{Digest, Sha256};
     fn collect(path: &Path, files: &mut Vec<PathBuf>) {
         if path.file_name().is_some_and(|n| {
-            n == "tests" || n == "tests.rs" || n == "gqt_tests.rs" || n == "branch_merge_oracle.rs"
+            n == "tests"
+                || n == "tests.rs"
+                || n == "gqt_tests.rs"
+                || n == "gqt_served_tests.rs"
+                || n == "branch_merge_oracle.rs"
         }) {
             return;
         }

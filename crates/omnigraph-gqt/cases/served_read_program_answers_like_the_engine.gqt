@@ -1,0 +1,63 @@
+# issue: none
+# notes: 0322.2 P5/P2: served workloads keep the measured query text and row expectations of the embedded ones;
+# notes: a warm-up read, the measured read and an explicit verification read answer the same rows served and in-process.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+
+--- query
+query count_all() { match { $p: Person } return { count($p) as n } }
+
+--- expect unordered
+{"n": 4}
+
+--- expect shape
+n: I64
+
+--- query
+query count_all() { match { $p: Person } return { count($p) as n } }
+
+--- expect unordered
+{"n": 4}
+
+--- expect shape
+n: I64
+
+--- query
+query older_than_27() {
+    match {
+        $p: Person
+        $p.age > 27
+    }
+    return { $p.name as name, $p.age as age }
+}
+
+--- expect unordered
+{"name": "Alice", "age": 30}
+{"name": "Charlie", "age": 35}
+{"name": "Diana", "age": 28}
+
+--- expect shape
+name: String
+age: I64

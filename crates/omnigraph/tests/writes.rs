@@ -891,24 +891,17 @@ edge LinkZ: Zed -> Zed { n: I32? }
     );
 }
 
-/// 24 MiB of external payload plus 10 MiB of retained rows fit per type, not together.
-/// Rust, not GQT: MiB-scale inputs and the payload-read probe are outside the case format.
+/// The read probe distinguishes payload admission from a late staging refusal.
 #[tokio::test]
-async fn external_blob_bytes_join_the_operation_allowance_before_any_payload_read() {
-    const SCHEMA: &str = "\
-node Document { title: String @key content: Blob? note: String? }
-node Image { title: String @key content: Blob? note: String? }
-";
-
+async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_reading() {
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? note: String? }\nnode Image { title: String @key content: Blob? }";
     let dir = tempfile::tempdir().unwrap();
     let external_path = dir.path().join("payload.blob");
-    let file = std::fs::File::create(&external_path).unwrap();
-    file.set_len(12 * 1024 * 1024).unwrap();
-    drop(file);
+    std::fs::write(&external_path, vec![0; 2048]).unwrap();
     let external_uri = format!("file://{}", external_path.display());
     let policy = ExternalBlobPolicy::allow(vec![
         ExternalBlobBase::new(
-            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            url::Url::from_directory_path(dir.path()).unwrap(),
             ExternalBlobExecutionScope::EmbeddedOnly,
         )
         .unwrap(),
@@ -923,131 +916,78 @@ node Image { title: String @key content: Blob? note: String? }
             .with_external_blob_policy(policy)
             .unwrap(),
     );
-    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
     let files = files_under(&graph_path);
-
-    let note = "x".repeat(5 * 1024 * 1024);
     let stage_probes = StageWriteProbes::rendezvous(1);
     let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let source = r#"set write_max_bytes = 8191;
+        query mixed($uri: String, $inline: Blob) {
+            insert Document { title: "one", content: $uri }
+            insert Document { title: "two", content: $uri }
+            insert Image { title: "three", content: $inline }
+        }"#;
+    use base64::Engine as _;
+    let inline = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4096])
+    );
     let error = with_stage_write_probes(
         stage_probes.clone(),
         omnigraph::instrumentation::with_merge_write_probes(
             read_probes.clone(),
             db.mutate(
                 "main",
-                r#"query wide($uri: String, $note: String) {
-                    insert Document { title: "one", content: $uri, note: $note }
-                    insert Image { title: "two", content: $uri, note: $note }
-                }"#,
-                "wide",
-                &params(&[("$uri", &external_uri), ("$note", &note)]),
+                source,
+                "mixed",
+                &params(&[("$uri", &external_uri), ("$inline", &inline)]),
             ),
         ),
     )
     .await
-    .expect_err("external payloads and retained rows must share one operation allowance");
+    .unwrap_err();
     assert!(
-        operation_refusal(&error, KEYED_BATCH_BYTES),
-        "unexpected refusal: {error:?}"
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                limit: 8191,
+                actual: 8192,
+                ..
+            }
+        ),
+        "{error:?}"
     );
     assert_eq!(
         read_probes.blob_payload_read_calls(),
         0,
-        "aggregate admission must precede every external payload read"
+        "inline and external admission precedes GET"
     );
-    assert_eq!(read_probes.blob_managed_batch_read_calls(), 0);
     assert_eq!(stage_probes.entered(), 0);
     assert_eq!(files_under(&graph_path), files);
     assert_eq!(
         snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before_manifest
+        before
     );
-    let accepted = db
-        .mutate(
+
+    let inline = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![0; 4095])
+    );
+    let accepted = omnigraph::instrumentation::with_merge_write_probes(
+        read_probes.clone(),
+        db.mutate(
             "main",
-            r#"query small($uri: String) {
-                insert Document { title: "one", content: $uri }
-            }"#,
-            "small",
-            &params(&[("$uri", &external_uri)]),
-        )
-        .await
-        .expect("one 12 MiB external payload fits after the refusal");
-    assert_eq!(accepted.affected_nodes, 1);
-}
-
-/// Three equal payloads leave a LargeBinary buffer at 4/3 of its content: predicted
-/// 24.4 MiB, materialized 32.5 MiB. Rust, not GQT: MiB-scale inputs, builder capacity.
-#[tokio::test]
-async fn materialized_blob_batches_are_rechecked_against_the_operation_allowance_before_staging() {
-    const SCHEMA: &str = "\
-node Document { title: String @key content: Blob? }
-node Image { title: String @key content: Blob? }
-";
-
-    let dir = tempfile::tempdir().unwrap();
-    let external_path = dir.path().join("payload.blob");
-    let file = std::fs::File::create(&external_path).unwrap();
-    file.set_len(4 * 1024 * 1024 + 64 * 1024).unwrap();
-    drop(file);
-    let external_uri = format!("file://{}", external_path.display());
-    let policy = ExternalBlobPolicy::allow(vec![
-        ExternalBlobBase::new(
-            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
-            ExternalBlobExecutionScope::EmbeddedOnly,
-        )
-        .unwrap(),
-    ])
-    .unwrap();
-    let graph_dir = tempfile::tempdir().unwrap();
-    let graph_path = graph_dir.path().join("graph");
-    let db = helpers::session(
-        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
-            .await
-            .unwrap()
-            .with_external_blob_policy(policy)
-            .unwrap(),
-    );
-    let before_manifest = snapshot_main(&db).await.unwrap().graph_manifest_version();
-    let files = files_under(&graph_path);
-
-    let stage_probes = StageWriteProbes::rendezvous(1);
-    let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
-    let error = with_stage_write_probes(
-        stage_probes.clone(),
-        omnigraph::instrumentation::with_merge_write_probes(
-            read_probes.clone(),
-            db.mutate(
-                "main",
-                r#"query thrice($uri: String) {
-                    insert Document { title: "a", content: $uri }
-                    insert Document { title: "b", content: $uri }
-                    insert Document { title: "c", content: $uri }
-                    insert Image { title: "a", content: $uri }
-                    insert Image { title: "b", content: $uri }
-                    insert Image { title: "c", content: $uri }
-                }"#,
-                "thrice",
-                &params(&[("$uri", &external_uri)]),
-            ),
+            source,
+            "mixed",
+            &params(&[("$uri", &external_uri), ("$inline", &inline)]),
         ),
     )
     .await
-    .expect_err("materialized batches must be summed across tables before staging");
-    assert!(
-        operation_refusal(&error, KEYED_BATCH_BYTES),
-        "unexpected refusal: {error:?}"
-    );
+    .expect("8191 payload bytes plus independent scalar rows fit");
+    assert_eq!(accepted.affected_nodes, 3);
     assert_eq!(
         read_probes.blob_payload_read_calls(),
-        2,
-        "the pre-read estimate admits this operation; only the re-check after reading refuses"
-    );
-    assert_eq!(stage_probes.entered(), 0);
-    assert_eq!(files_under(&graph_path), files);
-    assert_eq!(
-        snapshot_main(&db).await.unwrap().graph_manifest_version(),
-        before_manifest
+        1,
+        "fetch caching preserves repeated-reference charging"
     );
 }
 
@@ -1223,7 +1163,7 @@ query update_note($note: String) {
                 ref resource,
                 limit: LIMIT,
                 actual,
-            } if resource == "retained keyed batch bytes per operation" && actual > LIMIT
+            } if resource == "materialized blob payload bytes" && actual > LIMIT
         ),
         "oversized update blob must be rejected before payload read, got {error:?}"
     );

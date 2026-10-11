@@ -181,7 +181,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::S3Versioning => {
+        ResetMode::None | ResetMode::S3Versioning => {
             return failure(
                 "unsupported_runner_axis",
                 "local fixture worker cannot freeze an S3 reset template",
@@ -1132,7 +1132,9 @@ mod tests {
                     .unwrap()
                     .restore_active()
                     .unwrap(),
-                    ResetMode::S3Versioning => panic!("test helper does not support S3 reset"),
+                    ResetMode::None | ResetMode::S3Versioning => {
+                        panic!("test helper does not support S3 reset")
+                    }
                 };
                 assert_eq!(restored.root(), active);
                 verify_physical_tree(&active, &physical, TraversalLimits::default()).unwrap();

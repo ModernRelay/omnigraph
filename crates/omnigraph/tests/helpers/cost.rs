@@ -42,6 +42,11 @@ use omnigraph::settings::SessionSettings;
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
+/// The deep point of every depth-swept cost gate (the shallow point stays per
+/// test): a per-commit regression over the span to this depth still exceeds
+/// every gate's slack, and each gate builds in well under a second.
+pub const DEEP_HISTORY_DEPTH: u64 = 40;
+
 /// Open a Lance dataset with its object-store tracker installed before the
 /// first manifest load. Cost fixtures must use this seam for cold-open evidence;
 /// wrapping an already-open handle misses latest-manifest resolution entirely.

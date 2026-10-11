@@ -735,6 +735,336 @@ scenarios:
           }
           return { $b.name }
       }
+- id: e2e-query-scan-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_scan_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query scan() { match { $p: Person } return { $p.name } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-wide-scan-served
+  fixture: fixtures/e2e_query_wide.gqt
+  workload: workloads/e2e_query_wide_scan_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query wide_scan() { match { $p: Person } return { $p } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-filter-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_filter_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-lookup-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_lookup_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-count-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_count_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query count_all() { match { $p: Person } return { count($p) as n } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-grouped-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_grouped_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query grouped() {
+          match { $p: Person }
+          return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-top-people-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_top_people_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query top_people() {
+          match { $p: Person }
+          return { $p.name, $p.age }
+          order { $p.age desc, $p.name asc }
+          limit 20
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-friends-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_friends_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-filtered-friends-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_filtered_friends_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query filtered_friends() {
+          match { $p: Person $p.age >= 90 $p knows $q }
+          return { $p.name, $q.name }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-no-friends-served
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_no_friends_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-count-bare-served
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_count_bare_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query count_bare() { match { $p: Person } return { count($p) as n } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-destination-projection-served
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_destination_projection_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-query-grouped-fanout-served
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_grouped_fanout_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query grouped_fanout() {
+          match { $p: Person $p knows $q }
+          return { $p.team, count($q) as n }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-traversal-hop1-served
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop1_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop1() {
+          match {
+              $a: Person
+              $b: Person
+              $a knows $b
+          }
+          return { $a.name, $b.name }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-traversal-hop2-served
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop2_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop2() {
+          match {
+              $a: Person
+              $b: Person
+              $c: Person
+              $a knows $b
+              $b knows $c
+          }
+          return { $a.name, $c.name }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+- id: e2e-traversal-hop3-served
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop3_served.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop3() {
+          match {
+              $a: Person
+              $b: Person
+              $c: Person
+              $d: Person
+              $a knows $b
+              $b knows $c
+              $c knows $d
+          }
+          return { $a.name, $d.name }
+      }
+  environment:
+    target: omnigraph-server
+    network_position: same-host
+    backend:
+      kind: local-fs
+      filesystem: apfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: none
+    attribution: off
+
 groups:
   end-to-end:
   - e2e-merge-all-changed
@@ -823,5 +1153,23 @@ groups:
   - e2e-traversal-hop3
   - e2e-traversal-selective-csr
   - e2e-traversal-selective-indexed
+  query-shapes-served:
+  - e2e-query-scan-served
+  - e2e-query-wide-scan-served
+  - e2e-query-filter-served
+  - e2e-query-lookup-served
+  - e2e-query-count-served
+  - e2e-query-grouped-served
+  - e2e-query-top-people-served
+  - e2e-query-friends-served
+  - e2e-query-filtered-friends-served
+  - e2e-query-no-friends-served
+  - e2e-query-count-bare-served
+  - e2e-query-destination-projection-served
+  - e2e-query-grouped-fanout-served
+  traversal-served:
+  - e2e-traversal-hop1-served
+  - e2e-traversal-hop2-served
+  - e2e-traversal-hop3-served
 run:
 - local-fast

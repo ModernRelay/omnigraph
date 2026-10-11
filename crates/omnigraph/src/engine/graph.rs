@@ -73,13 +73,31 @@ impl<'a> EmbeddingResolver<'a> {
     }
 }
 
+/// The fusion's output schema: the arm's columns, then the fused score.
+pub(super) fn fused_schema(
+    arm: &arrow_schema::SchemaRef,
+    fused_score: &str,
+) -> arrow_schema::SchemaRef {
+    let mut fields: Vec<arrow_schema::FieldRef> = arm.fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        fused_score,
+        arrow_schema::DataType::Float64,
+        false,
+    )));
+    Arc::new(arrow_schema::Schema::new(fields))
+}
+
 /// Fuse arms sorted by search score and identity; BM25 arms must be uncapped.
-/// Rank each entity once and retain each winning entity's downstream rows.
+/// Rank each entity once, sum `1 / (k + rank)` over the arms that hold it,
+/// and emit every one of its rows with that sum in `fused_score`; the
+/// `Sort` above orders by the sum and the query's `limit` cuts rows there
+/// (RFC 0047 §Total order).
 pub(super) fn fuse_arms(
     primary_batch: &RecordBatch,
     secondary_batch: &RecordBatch,
     rrf: &RrfMode,
     id_col_name: &str,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -131,7 +149,7 @@ pub(super) fn fuse_arms(
     }
 
     let k = rrf.k as f64;
-    let mut scored: Vec<(String, f64)> = all_ids
+    let scored: Vec<(String, f64)> = all_ids
         .iter()
         .map(|id| {
             let p = primary_rank
@@ -145,10 +163,6 @@ pub(super) fn fuse_arms(
             (id.clone(), p + s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(rrf.limit);
-
-    let winning_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
 
     let mut primary_rows: HashMap<String, Vec<u32>> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
@@ -160,11 +174,12 @@ pub(super) fn fuse_arms(
     }
 
     build_fused_batch(
-        &winning_ids,
+        &scored,
         primary_batch,
         &primary_rows,
         secondary_batch,
         &secondary_rows,
+        fused_score,
         memory,
     )
 }
@@ -183,14 +198,15 @@ pub(super) fn extract_id_column_by_name(
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
-/// Gather all rows for `ordered_ids` in entity order, preferring the primary
-/// arm for shared entities and preserving each entity's row order.
-pub(super) fn build_fused_batch(
-    ordered_ids: &[String],
+/// Gather primary rows, then secondary-only rows, in scored entity order
+/// within each arm, preserving each entity's row order and fused score.
+fn build_fused_batch(
+    scored: &[(String, f64)],
     primary_batch: &RecordBatch,
     primary_rows: &HashMap<String, Vec<u32>>,
     secondary_batch: &RecordBatch,
     secondary_rows: &HashMap<String, Vec<u32>>,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -198,40 +214,70 @@ pub(super) fn build_fused_batch(
         .map_err(|error| memory.error(error))?;
     let memory = &work;
     memory.check().map_err(|error| memory.error(error))?;
-    if ordered_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+    let empty = || RecordBatch::new_empty(fused_schema(&primary_batch.schema(), fused_score));
+    if scored.is_empty() {
+        return Ok(empty());
     }
 
-    memory
-        .entries::<RecordBatch>(
-            primary_batch
-                .num_rows()
-                .saturating_add(secondary_batch.num_rows()),
-        )
-        .map_err(|error| memory.error(error))?;
-    let mut row_slices: Vec<RecordBatch> = Vec::with_capacity(ordered_ids.len());
-    for id in ordered_ids {
+    let selected_rows = |id| match (primary_rows.get(id), secondary_rows.get(id)) {
+        (Some(rows), _) => Some((0, rows)),
+        (None, Some(rows)) => Some((1, rows)),
+        (None, None) => None,
+    };
+    let mut counts = [0usize; 2];
+    for (id, _) in scored {
         memory.check().map_err(|error| memory.error(error))?;
-        if let Some(rows) = primary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(primary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
-        } else if let Some(rows) = secondary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(secondary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
+        if let Some((arm, rows)) = selected_rows(id) {
+            counts[arm] = counts[arm].saturating_add(rows.len());
         }
+    }
+    let rows = counts[0].saturating_add(counts[1]);
+    memory
+        .entries::<RecordBatch>(2)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<u32>(rows)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<f64>(rows)
+        .map_err(|error| memory.error(error))?;
+    let mut arms = counts.map(|count| {
+        (
+            Vec::<u32>::with_capacity(count),
+            Vec::<f64>::with_capacity(count),
+        )
+    });
+    for (id, score) in scored {
+        memory.check().map_err(|error| memory.error(error))?;
+        let Some((arm, rows)) = selected_rows(id) else {
+            continue;
+        };
+        let (indices, scores) = &mut arms[arm];
+        indices.extend_from_slice(rows);
+        scores.extend(std::iter::repeat_n(*score, rows.len()));
+    }
+
+    let schema = fused_schema(&primary_batch.schema(), fused_score);
+    let mut row_slices = Vec::with_capacity(2);
+    for (batch, (indices, scores)) in [primary_batch, secondary_batch].into_iter().zip(arms) {
+        if indices.is_empty() {
+            continue;
+        }
+        let gathered = memory
+            .take(batch, &UInt32Array::from(indices))
+            .map_err(|error| memory.error(error))?;
+        let mut columns = gathered.columns().to_vec();
+        columns.push(Arc::new(arrow_array::Float64Array::from(scores)));
+        row_slices.push(
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(OmniError::arrow_internal)?,
+        );
     }
 
     if row_slices.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+        return Ok(empty());
     }
 
-    let schema = row_slices[0].schema();
     memory
         .concat(&schema, &row_slices)
         .map_err(|error| memory.error(error))

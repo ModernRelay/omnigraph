@@ -9,6 +9,6 @@ mod helpers;
 #[ignore = "heavy-repro: 753664 parallel transfers grouped within a fixed 16 MiB query pool"]
 async fn grouped_transfer_aggregation_streams_at_scale_issue_723() {
     let dir = tempfile::tempdir().unwrap();
-    let db = helpers::transfer_aggregation::fixture(&dir, 8).await;
-    helpers::transfer_aggregation::assert_streaming_contract(&db, 8, 16 * 1024 * 1024).await;
+    let db = helpers::transfer_aggregation::fixture(&dir, 8, 1).await;
+    helpers::transfer_aggregation::assert_streaming_contract(&db, 8, 1, 16 * 1024 * 1024).await;
 }

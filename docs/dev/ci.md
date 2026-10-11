@@ -151,7 +151,8 @@ features are reused.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
-Current-version live schema and policy deployment remains required by `Test Workspace`.
+The complete current-version live-apply CLI journey runs in `Tests slow nightly`.
+`Test Workspace` retains the focused deployment and delivery-loss tests.
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating four qualification jobs. `GQT (ordinary)` checks
@@ -179,9 +180,18 @@ every corpus case that declares the `omnigraph-server` target runs again
 through an in-process server, its in-process verdict must be green and its
 served verdict must equal it; `gqt_served_count.rs` in the same job totals
 the served and skipped cases and fails when no case is served.
-It selects the tests-only crate `omnigraph-gqt-served` under an empty
-`RUSTFLAGS`, the one job that builds that crate, so `Test Workspace` excludes
-it beside `omnigraph-gqt` and shares no engine build with it. All
+The same cell builds `omnigraph`, `omnigraph-server` and `omnigraph-gqt`, then
+explicitly runs `omnigraph-cli/tests/gqt_served_smoke.rs`. That test reuses the
+CLI's cluster/server process helpers and runs a corpus case through the GQT
+command with a bearer token. It requires one passing served attempt, token
+redaction in the retained report and replay refusal. It is ignored outside this
+cell because the GQT binary must be built first.
+All three steps select the same four packages under an empty `RUSTFLAGS`, and
+the binaries are built with `cargo test --no-run` so every step resolves the
+same dev-dependency feature world (`cargo build --bins` would compile
+`omnigraph-cluster` again without `failpoints` and `test-util`).
+This is the one job that builds the tests-only `omnigraph-gqt-served` crate,
+so `Test Workspace` excludes it beside `omnigraph-gqt`. All
 four run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
 Each job has its own 60-minute budget and cache key. The budget is at least
@@ -499,6 +509,13 @@ unavailable-runtime refusal test does not replace executing the DST cases.
 `crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
 a time; it is not a required context, and it is its own workflow because the
 GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
+`tests-slow-nightly.yml` (cron 04:15 UTC + manual dispatch) runs the
+`#[ignore]`d Rust tests enrolled by exact name in its list, the `nightly:`
+deadline and journey tests and the `heavy-repro:` scale repros (`AGENTS.md`,
+ignore species), through `cargo nextest run --run-ignored only` on the
+workspace graph with `--no-fail-fast`, then `check-workspace-test-owners.py`
+over its JUnit report, so an enrolled test that was renamed, filtered out or
+red fails the run; it is not a required context.
 
 ## Local pre-push checks
 
