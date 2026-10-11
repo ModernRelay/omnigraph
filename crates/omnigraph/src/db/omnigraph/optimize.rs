@@ -26,7 +26,7 @@
 use std::time::Duration;
 
 use futures::stream::StreamExt;
-use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, plan_compaction};
+use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
