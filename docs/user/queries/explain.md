@@ -106,9 +106,13 @@ carries no `runtime_filter` key unless a `ContainsJoin` marked it. A physical
 `table` and the `columns` the output alone reads, which the scans below no
 longer project (they read the row address instead) and which are fetched by
 row address for the rows the root `limit` kept. Its `properties` carry
-`retained_limit`, the bytes hydration may hold at once: a quarter for what
-the storage layer reads ahead, the rest for one chunk's fetched rows and
-their copies. Then one
+`retained_limit`, hydration's chunk budget: a quarter for what the storage
+layer may read ahead, the rest for one chunk's fetched rows and their copies.
+It is a budget, not a cap on all memory: the row that crosses it, up to eight
+decoded rows waiting to be charged and the storage layer's soft read-ahead,
+which can pass its share by one coalesced read, all come on top, as
+[execution.md](../../dev/execution.md#v2-plan-lowering-one-node-one-operator)
+states. Then one
 `plan` row per optimizer pass that fired (`node` `pass`), and one per
 remaining field of the explain document: `route` (the engine route the plan
 describes), `logical_hash` (the structural hash of the logical plan),
