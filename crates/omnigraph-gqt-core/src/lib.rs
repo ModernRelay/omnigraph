@@ -2949,7 +2949,7 @@ async fn run_query_step(
             }
             let catalog = session.catalog();
             let inferred = typecheck_query(&catalog, &step.decl)
-                .and_then(|ctx| infer_query_result_schema(&catalog, &step.decl, &ctx))
+                .and_then(|checked| infer_query_result_schema(&catalog, &checked))
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
             if let Some(run) = &inspection {
                 check_inferred_results(&step.decl, &inferred, &run.plan).map_err(&fail)?;

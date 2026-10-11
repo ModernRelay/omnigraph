@@ -47,38 +47,460 @@ impl BoundVariable {
     }
 }
 
+/// The checker's scope while it walks one read query: the variables bound
+/// so far and the return aliases an `order` key may name. It never leaves
+/// the checker; the completed scope is a [`CheckedScope`].
 #[derive(Debug, Clone)]
-pub struct TypeContext {
-    pub bindings: HashMap<String, BoundVariable>,
-    pub aliases: HashMap<String, ResolvedType>,
-    pub traversals: Vec<ResolvedTraversal>,
-    pub(crate) subqueries: Vec<CheckedSubquery>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CheckedSubquery {
-    pub outer_bindings: HashMap<String, BoundVariable>,
-    pub inner: TypeContext,
+struct TypeContext {
+    bindings: HashMap<String, BoundVariable>,
+    aliases: HashMap<String, ResolvedType>,
 }
 
 impl TypeContext {
     /// No bindings, no aliases: the read context of a mutation scope, where
     /// every name resolves through the scope instead.
-    pub(crate) fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             bindings: HashMap::new(),
             aliases: HashMap::new(),
-            traversals: Vec::new(),
-            subqueries: Vec::new(),
         }
     }
 }
 
+/// A read query after type checking: every expression occurrence resolved
+/// once and retained with its type, the match scope completed, the
+/// parameters parsed. Only [`typecheck_query`] and [`typecheck_query_decl`]
+/// construct one; lowering and result-schema inference read it.
+#[derive(Debug, Clone)]
+pub struct CheckedReadQuery {
+    pub(crate) name: String,
+    pub(crate) params: Vec<CheckedParam>,
+    pub(crate) scope: CheckedScope,
+    pub(crate) returns: Vec<CheckedReturn>,
+    pub(crate) orders: Vec<CheckedOrder>,
+    pub(crate) limit: Option<u64>,
+}
+
+/// A declared parameter and the type selected for its name (the last
+/// declaration of a repeated name wins, as the checker's lookup does).
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedParam {
+    pub(crate) declaration: Param,
+    pub(crate) ty: PropType,
+}
+
+/// A completed match scope: the bindings visible at its end and its clauses
+/// in source order, each carrying what the checker resolved for it.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedScope {
+    pub(crate) bindings: HashMap<String, BoundVariable>,
+    pub(crate) clauses: Vec<CheckedClause>,
+}
+
+impl CheckedScope {
+    pub(crate) fn traversals(&self) -> impl Iterator<Item = &ResolvedTraversal> {
+        self.clauses.iter().filter_map(|clause| match clause {
+            CheckedClause::Traversal(traversal) => Some(traversal),
+            CheckedClause::Binding(_) | CheckedClause::Filter(_) | CheckedClause::Block(_) => None,
+        })
+    }
+
+    pub(crate) fn blocks(&self) -> impl Iterator<Item = &CheckedBlock> {
+        self.clauses.iter().filter_map(|clause| match clause {
+            CheckedClause::Block(block) => Some(block.as_ref()),
+            CheckedClause::Binding(_) | CheckedClause::Traversal(_) | CheckedClause::Filter(_) => {
+                None
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CheckedClause {
+    Binding(CheckedBinding),
+    Traversal(ResolvedTraversal),
+    /// A Boolean expression with every bare search call among its top-level
+    /// conjuncts spelled `call = true`, the one shape lowering emits.
+    Filter(TypedExpr),
+    Block(Box<CheckedBlock>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedBinding {
+    pub(crate) variable: String,
+    pub(crate) type_name: String,
+    pub(crate) matches: Vec<CheckedPropMatch>,
+}
+
+/// An inline binding match: the matched property's declared type (a list
+/// property matches by membership) and the constant checked against it.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedPropMatch {
+    pub(crate) property: String,
+    pub(crate) prop_type: PropType,
+    pub(crate) value: TypedExpr,
+}
+
+/// A correlated block: the outer bindings it may read, its completed inner
+/// scope, and the comparison of its aggregate with `right`.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedBlock {
+    pub(crate) outer_bindings: HashMap<String, BoundVariable>,
+    pub(crate) inner: CheckedScope,
+    pub(crate) aggregate: CheckedBlockAggregate,
+    pub(crate) op: CompOp,
+    pub(crate) right: TypedExpr,
+}
+
+/// The aggregate side of a block comparison: the row count (`not`,
+/// `exists`, `count { … }`, `count($node) { … }`) or a column aggregate.
+#[derive(Debug, Clone)]
+pub(crate) enum CheckedBlockAggregate {
+    RowCount,
+    Aggregate {
+        func: AggFunc,
+        arg: TypedExpr,
+        signature: AggSignature,
+    },
+}
+
+/// A return item: its typed expression, its alias, and the two names the
+/// result carries (`projection_name` for the inferred schema and
+/// descriptors, `executed_column_name` for the executed batch), computed
+/// once from the source spelling.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedReturn {
+    pub(crate) expr: TypedExpr,
+    pub(crate) alias: Option<String>,
+    pub(crate) inferred_name: String,
+    pub(crate) executed_column: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedOrder {
+    pub(crate) expr: TypedExpr,
+    pub(crate) descending: bool,
+}
+
+/// A mutation query after type checking: its parameters parsed once and
+/// each statement retained with its target namespace and typed constants.
+#[derive(Debug, Clone)]
+pub struct CheckedMutationQuery {
+    pub(crate) name: String,
+    pub(crate) params: Vec<CheckedParam>,
+    pub(crate) ops: Vec<CheckedMutationOp>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CheckedMutationOp {
+    Insert {
+        target: MutationTarget,
+        assignments: Vec<CheckedAssignment>,
+    },
+    Update {
+        target: MutationTarget,
+        assignments: Vec<CheckedAssignment>,
+        predicate: TypedExpr,
+    },
+    Delete {
+        target: MutationTarget,
+        predicate: TypedExpr,
+    },
+}
+
+impl CheckedMutationOp {
+    pub(crate) fn target(&self) -> &MutationTarget {
+        match self {
+            Self::Insert { target, .. }
+            | Self::Update { target, .. }
+            | Self::Delete { target, .. } => target,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedAssignment {
+    pub(crate) property: String,
+    pub(crate) value: TypedExpr,
+}
+
+/// An expression after resolution: one node per [`Expr`] node, every child
+/// retained, every node carrying the type the checker resolved for it. An
+/// `Aggregate` carries its signature and derives its type from it.
+#[derive(Debug, Clone)]
+pub(crate) enum TypedExpr {
+    Now {
+        ty: ResolvedType,
+    },
+    PropAccess {
+        variable: String,
+        property: String,
+        ty: ResolvedType,
+    },
+    Nearest {
+        variable: String,
+        property: String,
+        query: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Search {
+        field: Box<TypedExpr>,
+        query: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Fuzzy {
+        field: Box<TypedExpr>,
+        query: Box<TypedExpr>,
+        max_edits: Option<Box<TypedExpr>>,
+        ty: ResolvedType,
+    },
+    MatchText {
+        field: Box<TypedExpr>,
+        query: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Bm25 {
+        field: Box<TypedExpr>,
+        query: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Rrf {
+        primary: Box<TypedExpr>,
+        secondary: Box<TypedExpr>,
+        k: Option<Box<TypedExpr>>,
+        ty: ResolvedType,
+    },
+    /// A declared parameter (`Scalar`) or a node binding (`Node`); the
+    /// checker resolves a parameter name first, so the type says which.
+    Variable {
+        name: String,
+        ty: ResolvedType,
+    },
+    Literal {
+        literal: Literal,
+        ty: ResolvedType,
+    },
+    Aggregate {
+        func: AggFunc,
+        arg: Box<TypedExpr>,
+        signature: AggSignature,
+    },
+    AliasRef {
+        name: String,
+        ty: ResolvedType,
+    },
+    Binary {
+        left: Box<TypedExpr>,
+        op: BinaryOp,
+        right: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    Not {
+        inner: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+    IsNull {
+        inner: Box<TypedExpr>,
+        negated: bool,
+        ty: ResolvedType,
+    },
+    In {
+        needle: Box<TypedExpr>,
+        list: Box<TypedExpr>,
+        ty: ResolvedType,
+    },
+}
+
+impl TypedExpr {
+    /// The type the checker resolved for this node.
+    pub(crate) fn ty(&self) -> ResolvedType {
+        match self {
+            Self::Now { ty }
+            | Self::PropAccess { ty, .. }
+            | Self::Nearest { ty, .. }
+            | Self::Search { ty, .. }
+            | Self::Fuzzy { ty, .. }
+            | Self::MatchText { ty, .. }
+            | Self::Bm25 { ty, .. }
+            | Self::Rrf { ty, .. }
+            | Self::Variable { ty, .. }
+            | Self::Literal { ty, .. }
+            | Self::AliasRef { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Not { ty, .. }
+            | Self::IsNull { ty, .. }
+            | Self::In { ty, .. } => ty.clone(),
+            Self::Aggregate { signature, .. } => ResolvedType::Aggregate(signature.result.clone()),
+        }
+    }
+
+    /// The IR type of a completed node. A retained tree holds no
+    /// `ForwardAlias` (`completed` refuses one at the root and every parent
+    /// rule refuses one as a child), so the conversion is total.
+    pub(crate) fn expr_type(&self) -> ExprType {
+        match self.ty() {
+            ResolvedType::Scalar(prop) => ExprType::from_prop(&prop),
+            ResolvedType::Node(type_name) => ExprType::Node { type_name },
+            ResolvedType::Aggregate(ty) => ty,
+            ResolvedType::ForwardAlias => {
+                unreachable!("a completed expression never retains a forward alias")
+            }
+        }
+    }
+
+    /// Replace the resolved type of a literal whose type another operand
+    /// decided (a direct null, an empty or all-null list).
+    fn set_ty(&mut self, resolved: ResolvedType) {
+        match self {
+            Self::Now { ty }
+            | Self::PropAccess { ty, .. }
+            | Self::Nearest { ty, .. }
+            | Self::Search { ty, .. }
+            | Self::Fuzzy { ty, .. }
+            | Self::MatchText { ty, .. }
+            | Self::Bm25 { ty, .. }
+            | Self::Rrf { ty, .. }
+            | Self::Variable { ty, .. }
+            | Self::Literal { ty, .. }
+            | Self::AliasRef { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Not { ty, .. }
+            | Self::IsNull { ty, .. }
+            | Self::In { ty, .. } => *ty = resolved,
+            Self::Aggregate { .. } => {
+                unreachable!("an aggregate's type is its signature's result")
+            }
+        }
+    }
+
+    /// Whether `self` is a `search`, `fuzzy` or `match_text` call.
+    pub(crate) fn is_search_call(&self) -> bool {
+        matches!(
+            self,
+            Self::Search { .. } | Self::Fuzzy { .. } | Self::MatchText { .. }
+        )
+    }
+
+    /// [`Expr::score_column`] over the typed tree.
+    pub(crate) fn score_column(&self) -> Option<(&str, &'static str)> {
+        match self {
+            Self::Nearest { variable, .. } => Some((variable, DISTANCE_COLUMN)),
+            Self::Bm25 { field, .. } => match field.as_ref() {
+                Self::PropAccess { variable, .. } => Some((variable, SCORE_COLUMN)),
+                _ => None,
+            },
+            Self::Rrf { primary, .. } => primary
+                .score_column()
+                .map(|(variable, _)| (variable, RRF_COLUMN)),
+            _ => None,
+        }
+    }
+
+    /// The scalar type of the column `score_column` names: Lance writes
+    /// `F32` scores and distances, the fusion an `F64` sum.
+    pub(crate) fn score_type(&self) -> ScalarType {
+        match self {
+            Self::Rrf { .. } => ScalarType::F64,
+            _ => ScalarType::F32,
+        }
+    }
+
+    /// The alias an unaliased meta-field projection needs: the executor keys
+    /// a projection by its physical column, which is vintage-specific, so the
+    /// logical `var.@id` rides as the alias and result columns read as the
+    /// query wrote them.
+    pub(crate) fn meta_field_result_key(&self) -> Option<String> {
+        match self {
+            Self::PropAccess {
+                variable, property, ..
+            } if property.starts_with('@') => Some(format!("{variable}.{property}")),
+            Self::Aggregate { arg, .. } => arg.meta_field_result_key(),
+            _ => None,
+        }
+    }
+
+    /// The variable a `search`, `fuzzy` or `match_text` call reads, anywhere
+    /// in the expression.
+    pub(crate) fn text_search_subject(&self) -> Option<&str> {
+        match self {
+            Self::Search { field, .. }
+            | Self::Fuzzy { field, .. }
+            | Self::MatchText { field, .. } => match field.as_ref() {
+                Self::PropAccess { variable, .. } => Some(variable.as_str()),
+                _ => None,
+            },
+            Self::Binary { left, right, .. }
+            | Self::In {
+                needle: left,
+                list: right,
+                ..
+            } => left
+                .text_search_subject()
+                .or_else(|| right.text_search_subject()),
+            Self::Not { inner, .. } | Self::IsNull { inner, .. } => inner.text_search_subject(),
+            _ => None,
+        }
+    }
+
+    /// The first variable name the expression's leaves read, operand by
+    /// operand in written order.
+    pub(crate) fn first_variable(&self) -> Option<&str> {
+        match self {
+            Self::Now { .. } | Self::Literal { .. } | Self::AliasRef { .. } => None,
+            Self::Binary { left, right, .. }
+            | Self::In {
+                needle: left,
+                list: right,
+                ..
+            } => left.first_variable().or_else(|| right.first_variable()),
+            Self::Not { inner, .. } | Self::IsNull { inner, .. } => inner.first_variable(),
+            Self::PropAccess { variable, .. } | Self::Nearest { variable, .. } => Some(variable),
+            Self::Variable { name, .. } => Some(name),
+            Self::Search { field, query, .. }
+            | Self::MatchText { field, query, .. }
+            | Self::Bm25 { field, query, .. } => {
+                field.first_variable().or_else(|| query.first_variable())
+            }
+            Self::Fuzzy {
+                field,
+                query,
+                max_edits,
+                ..
+            } => field
+                .first_variable()
+                .or_else(|| query.first_variable())
+                .or_else(|| max_edits.as_deref().and_then(Self::first_variable)),
+            Self::Rrf {
+                primary,
+                secondary,
+                k,
+                ..
+            } => primary
+                .first_variable()
+                .or_else(|| secondary.first_variable())
+                .or_else(|| k.as_deref().and_then(Self::first_variable)),
+            Self::Aggregate { arg, .. } => arg.first_variable(),
+        }
+    }
+}
+
+/// A resolved expression about to be retained by a clause: its root may not
+/// be a forward alias. Every parent rule already refuses one as a child, so
+/// this check completes the tree without walking it.
+fn completed(expr: TypedExpr) -> Result<TypedExpr> {
+    if matches!(expr.ty(), ResolvedType::ForwardAlias) {
+        return Err(CompilerError::Plan(
+            "unresolved forward alias retained by a checked clause".into(),
+        ));
+    }
+    Ok(expr)
+}
+
 /// Where an expression stands. Every scope resolves through the one
-/// `resolve_expr_type`; the scope decides what a bare name means and which
+/// `resolve_expr`; the scope decides what a bare name means and which
 /// node kinds are refused, one binder per clause over one expression type.
 #[derive(Clone, Copy)]
-pub(crate) enum Scope<'a> {
+enum Scope<'a> {
     /// A read clause over the match bindings.
     Read,
     /// A mutation `where`: a bare name is a property of the target.
@@ -92,7 +514,7 @@ pub(crate) enum Scope<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum ConstantClause {
+enum ConstantClause {
     Assignment,
     BindingMatch,
 }
@@ -223,30 +645,32 @@ impl MutationTarget {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct MutationTypeContext {
-    pub targets: Vec<MutationTarget>,
-}
-
+/// A query after type checking, read or mutation. The two lowerers each
+/// take their own kind, so a checked query cannot reach the wrong one.
 #[derive(Debug, Clone)]
 pub enum CheckedQuery {
-    Read(TypeContext),
-    Mutation(MutationTypeContext),
+    Read(CheckedReadQuery),
+    Mutation(CheckedMutationQuery),
 }
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
     if !query.mutations.is_empty() {
-        let mut targets = Vec::with_capacity(query.mutations.len());
+        let (params, param_types) = checked_params(&query.params)?;
+        let mut ops = Vec::with_capacity(query.mutations.len());
         for mutation in &query.mutations {
-            targets.push(typecheck_mutation(catalog, mutation, &query.params)?);
+            ops.push(typecheck_mutation(catalog, mutation, &param_types)?);
         }
-        Ok(CheckedQuery::Mutation(MutationTypeContext { targets }))
+        Ok(CheckedQuery::Mutation(CheckedMutationQuery {
+            name: query.name.clone(),
+            params,
+            ops,
+        }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
     }
 }
 
-pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
+pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedReadQuery> {
     if !query.mutations.is_empty() {
         return Err(CompilerError::Plan(
             "mutation query cannot be typechecked with read-query API".to_string(),
@@ -255,27 +679,30 @@ pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeConte
     typecheck_read_query(catalog, query)
 }
 
-pub fn infer_query_result_schema(
-    catalog: &Catalog,
-    query: &QueryDecl,
-    ctx: &TypeContext,
-) -> Result<SchemaRef> {
-    let params = parse_declared_param_types(&query.params)?;
-    let mut fields = Vec::with_capacity(query.return_clause.len());
-
-    for projection in &query.return_clause {
-        let field = infer_projection_field(
-            catalog,
-            &projection.expr,
-            projection.alias.as_deref(),
-            &query.order_clause,
-            ctx,
-            &params,
-        )?;
-        fields.push(field);
-    }
-
+/// The Arrow schema of a checked read's result, from the types its return
+/// items retained; nothing is resolved again.
+pub fn infer_query_result_schema(catalog: &Catalog, query: &CheckedReadQuery) -> Result<SchemaRef> {
+    let fields = query
+        .returns
+        .iter()
+        .map(|item| projection_field(catalog, &item.inferred_name, &item.expr.expr_type()))
+        .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The declarations in source order, each with the type selected for its
+/// name, and the name lookup the checker resolves variables through. A
+/// repeated name keeps every declaration and the last one's type.
+fn checked_params(params: &[Param]) -> Result<(Vec<CheckedParam>, HashMap<String, PropType>)> {
+    let types = parse_declared_param_types(params)?;
+    let checked = params
+        .iter()
+        .map(|declaration| CheckedParam {
+            declaration: declaration.clone(),
+            ty: types[&declaration.name].clone(),
+        })
+        .collect();
+    Ok((checked, types))
 }
 
 fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropType>> {
@@ -336,14 +763,14 @@ fn refuse_reserved_variable_names(clauses: &[Clause]) -> Result<()> {
     Ok(())
 }
 
-fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
+fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedReadQuery> {
     let mut ctx = TypeContext::empty();
-    let params = parse_declared_param_types(&query.params)?;
+    let (checked_params, params) = checked_params(&query.params)?;
 
     refuse_reserved_variable_names(&query.match_clause)?;
 
     // Typecheck match clauses
-    typecheck_clauses(
+    let clauses = typecheck_clauses(
         catalog,
         &query.match_clause,
         &mut ctx,
@@ -353,16 +780,19 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
 
     // Typecheck return projections
     let mut result_columns: HashSet<String> = HashSet::new();
+    let mut returns = Vec::with_capacity(query.return_clause.len());
     for proj in &query.return_clause {
-        let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params, Scope::Read)?;
+        let alias = proj.alias.as_deref();
+        let typed = resolve_expr(catalog, &proj.expr, &ctx, &params, Scope::Read)?;
+        let resolved = typed.ty();
         reject_blob_read_value(&resolved, &proj.expr)?;
-        check_projection(&proj.expr, proj.alias.as_deref(), &query.order_clause)?;
+        check_projection(&proj.expr, alias, &query.order_clause)?;
         // T25: one result column per name. The executor emits a batch with
         // every projection's column under its executed name; two columns of
         // one name survive the batch (Arrow allows it) and every reader that
         // keys a row by column name keeps the last one, so the first value
         // is lost without an error.
-        let column = executed_column_name(&proj.expr, proj.alias.as_deref());
+        let column = executed_column_name(&proj.expr, alias);
         if !result_columns.insert(column.clone()) {
             return Err(CompilerError::typed(
                 T25,
@@ -374,12 +804,19 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
         }
+        returns.push(CheckedReturn {
+            expr: completed(typed)?,
+            alias: proj.alias.clone(),
+            inferred_name: projection_name(&proj.expr, alias),
+            executed_column: column,
+        });
     }
 
     // Typecheck order expressions
+    let mut orders = Vec::with_capacity(query.order_clause.len());
     for (index, ord) in query.order_clause.iter().enumerate() {
-        let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
-        reject_blob_read_value(&resolved, &ord.expr)?;
+        let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
+        reject_blob_read_value(&typed.ty(), &ord.expr)?;
         bind_order_key(index, &ord.expr, &query.return_clause, &ctx)?;
         if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
             && ord.explicit
@@ -393,6 +830,10 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
                 ),
             ));
         }
+        orders.push(CheckedOrder {
+            expr: completed(typed)?,
+            descending: ord.descending,
+        });
     }
 
     let has_standalone_nearest = query
@@ -451,7 +892,17 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         }
     }
 
-    Ok(ctx)
+    Ok(CheckedReadQuery {
+        name: query.name.clone(),
+        params: checked_params,
+        scope: CheckedScope {
+            bindings: ctx.bindings,
+            clauses,
+        },
+        returns,
+        orders,
+        limit: query.limit,
+    })
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
@@ -489,10 +940,8 @@ fn bind_order_key(
 fn typecheck_mutation(
     catalog: &Catalog,
     mutation: &Mutation,
-    params: &[Param],
-) -> Result<MutationTarget> {
-    let param_types = parse_declared_param_types(params)?;
-
+    param_types: &HashMap<String, PropType>,
+) -> Result<CheckedMutationOp> {
     match mutation {
         Mutation::Insert(insert) => {
             if insert.assignments.is_empty() {
@@ -505,6 +954,7 @@ fn typecheck_mutation(
             ensure_no_duplicate_assignment_names(&insert.assignments)?;
 
             if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
+                let mut assignments = Vec::with_capacity(insert.assignments.len());
                 for assignment in &insert.assignments {
                     let prop_type =
                         node_type
@@ -521,13 +971,13 @@ fn typecheck_mutation(
                                     ),
                                 )
                             })?;
-                    typecheck_assignment(
+                    assignments.push(typecheck_assignment(
                         catalog,
                         assignment,
-                        &param_types,
+                        param_types,
                         prop_type,
                         &insert.type_name,
-                    )?;
+                    )?);
                 }
 
                 let assigned_props: HashSet<&str> = insert
@@ -564,14 +1014,18 @@ fn typecheck_mutation(
                         ),
                     ));
                 }
-                return Ok(MutationTarget::Node {
-                    type_name: insert.type_name.clone(),
+                return Ok(CheckedMutationOp::Insert {
+                    target: MutationTarget::Node {
+                        type_name: insert.type_name.clone(),
+                    },
+                    assignments,
                 });
             }
 
             if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
                 let mut has_from = false;
                 let mut has_to = false;
+                let mut assignments = Vec::with_capacity(insert.assignments.len());
 
                 for assignment in &insert.assignments {
                     let prop_type = match assignment.property.as_str() {
@@ -599,13 +1053,13 @@ fn typecheck_mutation(
                             })?
                             .clone(),
                     };
-                    typecheck_assignment(
+                    assignments.push(typecheck_assignment(
                         catalog,
                         assignment,
-                        &param_types,
+                        param_types,
                         &prop_type,
                         &insert.type_name,
-                    )?;
+                    )?);
                 }
 
                 if !has_from {
@@ -641,8 +1095,11 @@ fn typecheck_mutation(
                         ));
                     }
                 }
-                return Ok(MutationTarget::Edge {
-                    type_name: insert.type_name.clone(),
+                return Ok(CheckedMutationOp::Insert {
+                    target: MutationTarget::Edge {
+                        type_name: insert.type_name.clone(),
+                    },
+                    assignments,
                 });
             }
 
@@ -677,6 +1134,7 @@ fn typecheck_mutation(
             }
             ensure_no_duplicate_assignment_names(&update.assignments)?;
 
+            let mut assignments = Vec::with_capacity(update.assignments.len());
             for assignment in &update.assignments {
                 let prop_type =
                     node_type
@@ -693,20 +1151,25 @@ fn typecheck_mutation(
                                 ),
                             )
                         })?;
-                typecheck_assignment(
+                assignments.push(typecheck_assignment(
                     catalog,
                     assignment,
-                    &param_types,
+                    param_types,
                     prop_type,
                     &update.type_name,
-                )?;
+                )?);
             }
 
             let target = MutationTarget::Node {
                 type_name: update.type_name.clone(),
             };
-            typecheck_mutation_where(catalog, &target, &update.predicate, &param_types)?;
-            Ok(target)
+            let predicate =
+                typecheck_mutation_where(catalog, &target, &update.predicate, param_types)?;
+            Ok(CheckedMutationOp::Update {
+                target,
+                assignments,
+                predicate,
+            })
         }
         Mutation::Delete(delete) => {
             let target = if catalog.node_types.contains_key(&delete.type_name) {
@@ -723,8 +1186,9 @@ fn typecheck_mutation(
                     format!("unknown node/edge type `{}`", delete.type_name),
                 ));
             };
-            typecheck_mutation_where(catalog, &target, &delete.predicate, &param_types)?;
-            Ok(target)
+            let predicate =
+                typecheck_mutation_where(catalog, &target, &delete.predicate, param_types)?;
+            Ok(CheckedMutationOp::Delete { target, predicate })
         }
     }
 }
@@ -878,7 +1342,7 @@ fn typecheck_mutation_where(
     target: &MutationTarget,
     predicate: &Expr,
     params: &HashMap<String, PropType>,
-) -> Result<()> {
+) -> Result<TypedExpr> {
     let shadowed: Vec<&str> = ["true", "false"]
         .into_iter()
         .filter(|name| declared_property(catalog, target, name).is_some())
@@ -896,13 +1360,14 @@ fn typecheck_mutation_where(
             ),
         ));
     }
-    let resolved = resolve_expr_type(
+    let typed = resolve_expr(
         catalog,
         predicate,
         &TypeContext::empty(),
         params,
         Scope::MutationWhere(target),
     )?;
+    let resolved = typed.ty();
     if boolean_scalar(&resolved).is_none() {
         return Err(CompilerError::typed(
             T41,
@@ -912,7 +1377,7 @@ fn typecheck_mutation_where(
             ),
         ));
     }
-    Ok(())
+    completed(typed)
 }
 
 /// The first bare `true` or `false` in written order, through the Boolean
@@ -936,8 +1401,8 @@ fn typecheck_assignment(
     params: &HashMap<String, PropType>,
     expected: &PropType,
     type_name: &str,
-) -> Result<()> {
-    typecheck_constant(
+) -> Result<CheckedAssignment> {
+    let value = typecheck_constant(
         catalog,
         &assignment.value,
         params,
@@ -945,7 +1410,11 @@ fn typecheck_assignment(
         &assignment.property,
         ConstantClause::Assignment,
         type_name,
-    )
+    )?;
+    Ok(CheckedAssignment {
+        property: assignment.property.clone(),
+        value,
+    })
 }
 
 /// A constant against the property it is assigned to or matched with: the
@@ -959,9 +1428,23 @@ fn typecheck_constant(
     property: &str,
     clause: ConstantClause,
     type_name: &str,
-) -> Result<()> {
+) -> Result<TypedExpr> {
     let scope = Scope::Constant { clause, type_name };
-    let resolved = resolve_expr_type(catalog, value, &TypeContext::empty(), params, scope)?;
+    let typed = resolve_expr(catalog, value, &TypeContext::empty(), params, scope)?;
+    check_constant(&typed, expected, property, clause)?;
+    completed(typed)
+}
+
+/// The clause rules over an already resolved constant: a literal against
+/// the property by its retained literal type and payload, `now()` against
+/// DateTime, a parameter by compatibility.
+fn check_constant(
+    value: &TypedExpr,
+    expected: &PropType,
+    property: &str,
+    clause: ConstantClause,
+) -> Result<()> {
+    let resolved = value.ty();
     let ResolvedType::Scalar(actual) = &resolved else {
         return Err(CompilerError::typed(
             T7,
@@ -972,13 +1455,13 @@ fn typecheck_constant(
         ));
     };
     match (clause, value) {
-        (ConstantClause::Assignment, Expr::Literal(lit)) => {
-            check_literal_type(lit, expected, property)
+        (ConstantClause::Assignment, TypedExpr::Literal { literal, .. }) => {
+            check_literal_type(literal, actual, expected, property)
         }
-        (ConstantClause::BindingMatch, Expr::Literal(lit)) => {
-            check_binding_literal_type(lit, expected, property)
+        (ConstantClause::BindingMatch, TypedExpr::Literal { literal, .. }) => {
+            check_binding_literal_type(literal, actual, expected, property)
         }
-        (_, Expr::Now) => check_now_match_value_type(expected, property),
+        (_, TypedExpr::Now { .. }) => check_now_match_value_type(expected, property),
         (ConstantClause::Assignment, _) => {
             if !assignment_compatible(actual, expected) {
                 return Err(CompilerError::typed(
@@ -1013,26 +1496,37 @@ fn check_now_match_value_type(expected: &PropType, property: &str) -> Result<()>
     Ok(())
 }
 
+/// The clauses of one scope, checked in source order and retained with what
+/// each resolved; binding matches are typed in a prepass over the bindings
+/// (a traversal may name a binding declared after it) and moved in once.
 fn typecheck_clauses(
     catalog: &Catalog,
     clauses: &[Clause],
     ctx: &mut TypeContext,
     params: &HashMap<String, PropType>,
     declared_nodes: &mut HashSet<String>,
-) -> Result<()> {
+) -> Result<Vec<CheckedClause>> {
     let mut declarations = TypeContext {
         bindings: ctx.bindings.clone(),
         ..TypeContext::empty()
     };
     let mut local_declared = declared_nodes.clone();
+    let mut typed_matches = Vec::new();
     for clause in clauses {
         if let Clause::Binding(binding) = clause {
-            typecheck_binding(catalog, binding, &mut declarations, params)?;
+            typed_matches.push(typecheck_binding(
+                catalog,
+                binding,
+                &mut declarations,
+                params,
+            )?);
             if binding.variable != "_" {
                 local_declared.insert(binding.variable.clone());
             }
         }
     }
+    let mut typed_matches = typed_matches.into_iter();
+    let mut checked = Vec::with_capacity(clauses.len());
     for clause in clauses {
         match clause {
             Clause::Binding(binding) => {
@@ -1040,18 +1534,31 @@ fn typecheck_clauses(
                 if binding.variable != "_" {
                     declared_nodes.insert(binding.variable.clone());
                 }
+                checked.push(CheckedClause::Binding(CheckedBinding {
+                    variable: binding.variable.clone(),
+                    type_name: binding.type_name.clone(),
+                    matches: typed_matches
+                        .next()
+                        .expect("every binding clause was typed in the prepass"),
+                }));
             }
-            Clause::Traversal(t) => {
-                typecheck_traversal(catalog, t, ctx, &local_declared, &declarations.bindings)?
-            }
-            Clause::Filter(f) => typecheck_filter(catalog, f, ctx, params)?,
+            Clause::Traversal(t) => checked.push(CheckedClause::Traversal(typecheck_traversal(
+                catalog,
+                t,
+                ctx,
+                &local_declared,
+                &declarations.bindings,
+            )?)),
+            Clause::Filter(f) => checked.push(CheckedClause::Filter(typecheck_filter(
+                catalog, f, ctx, params,
+            )?)),
             Clause::Subquery(subquery) => {
                 let outer_vars: Vec<String> = ctx.bindings.keys().cloned().collect();
                 let mut inner_ctx = TypeContext {
                     bindings: ctx.bindings.clone(),
                     ..TypeContext::empty()
                 };
-                typecheck_clauses(
+                let inner_clauses = typecheck_clauses(
                     catalog,
                     &subquery.clauses,
                     &mut inner_ctx,
@@ -1071,15 +1578,23 @@ fn typecheck_clauses(
                         ),
                     ));
                 }
-                typecheck_subquery_predicate(catalog, subquery, &inner_ctx, ctx, params)?;
-                ctx.subqueries.push(CheckedSubquery {
+                let (aggregate, right) =
+                    typecheck_subquery_predicate(catalog, subquery, &inner_ctx, ctx, params)?;
+                checked.push(CheckedClause::Block(Box::new(CheckedBlock {
                     outer_bindings: ctx.bindings.clone(),
-                    inner: inner_ctx,
-                });
+                    inner: CheckedScope {
+                        bindings: inner_ctx.bindings,
+                        clauses: inner_clauses,
+                    },
+                    aggregate,
+                    op: subquery.op,
+                    right,
+                })));
             }
         }
     }
-    validate_traversal_anchors(clauses, &declarations.bindings)
+    validate_traversal_anchors(clauses, &declarations.bindings)?;
+    Ok(checked)
 }
 
 fn validate_traversal_anchors(
@@ -1140,26 +1655,31 @@ fn block_references_outer(clauses: &[Clause], outer_vars: &[String]) -> bool {
 }
 
 /// The checked owner of a block aggregate. Counting a node binding uses the
-/// row-count path; column aggregates retain the ordinary nullable signature.
-pub(crate) fn block_aggregate_signature(
+/// row-count path, its argument validated once and then dropped; column
+/// aggregates retain their argument and the ordinary nullable signature.
+fn typecheck_block_aggregate(
     catalog: &Catalog,
     subquery: &Subquery,
     inner_ctx: &TypeContext,
     params: &HashMap<String, PropType>,
-) -> Result<Option<AggSignature>> {
+) -> Result<CheckedBlockAggregate> {
     match &subquery.arg {
-        None if subquery.func == AggFunc::Count => Ok(None),
+        None if subquery.func == AggFunc::Count => Ok(CheckedBlockAggregate::RowCount),
         None => Err(CompilerError::typed(
             T40,
             "a block aggregate without an argument must count rows",
         )),
         Some(arg) => {
-            let signature =
-                aggregate_signature(catalog, subquery.func, arg, inner_ctx, params, true)?;
+            let (arg, signature) =
+                resolve_aggregate(catalog, subquery.func, arg, inner_ctx, params, true)?;
             if subquery.func == AggFunc::Count && matches!(signature.arg, ExprType::Node { .. }) {
-                Ok(None)
+                Ok(CheckedBlockAggregate::RowCount)
             } else {
-                Ok(Some(signature))
+                Ok(CheckedBlockAggregate::Aggregate {
+                    func: subquery.func,
+                    arg,
+                    signature,
+                })
             }
         }
     }
@@ -1174,7 +1694,7 @@ fn typecheck_subquery_predicate(
     inner_ctx: &TypeContext,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
-) -> Result<()> {
+) -> Result<(CheckedBlockAggregate, TypedExpr)> {
     let func = subquery.func;
     if matches!(
         subquery.op,
@@ -1185,17 +1705,18 @@ fn typecheck_subquery_predicate(
             "a block comparison requires equality or ordering",
         ));
     }
-    let result = match block_aggregate_signature(catalog, subquery, inner_ctx, params)? {
-        None => PropType::scalar(ScalarType::I64, false),
-        Some(signature) => match signature.result {
+    let aggregate = typecheck_block_aggregate(catalog, subquery, inner_ctx, params)?;
+    let result = match &aggregate {
+        CheckedBlockAggregate::RowCount => PropType::scalar(ScalarType::I64, false),
+        CheckedBlockAggregate::Aggregate { signature, .. } => match &signature.result {
             ExprType::Value {
                 scalar,
                 list,
                 nullable,
             } => PropType {
-                scalar,
-                nullable,
-                list,
+                scalar: *scalar,
+                nullable: *nullable,
+                list: *list,
                 enum_values: None,
             },
             ExprType::Node { type_name } => {
@@ -1221,19 +1742,19 @@ fn typecheck_subquery_predicate(
             format!("{func} over a block compares with a literal, now() or a parameter"),
         ));
     }
-    let right = resolve_expr_type(catalog, &subquery.right, ctx, params, Scope::Read)?;
-    let right = contextual_literal_type(
-        &subquery.right,
-        &ResolvedType::Scalar(result.clone()),
-        Some(false),
-    )
-    .unwrap_or(right);
-    let ResolvedType::Scalar(r) = &right else {
+    let mut right = resolve_expr(catalog, &subquery.right, ctx, params, Scope::Read)?;
+    if let Some(contextual) =
+        contextual_literal_type(&right, &ResolvedType::Scalar(result.clone()), Some(false))
+    {
+        right.set_ty(contextual);
+    }
+    let right_type = right.ty();
+    let ResolvedType::Scalar(r) = &right_type else {
         return Err(CompilerError::typed(
             T40,
             format!(
                 "{func} over a block compares with a scalar, got {}",
-                right.display_name()
+                right_type.display_name()
             ),
         ));
     };
@@ -1247,15 +1768,17 @@ fn typecheck_subquery_predicate(
             ),
         ));
     }
-    Ok(())
+    Ok((aggregate, completed(right)?))
 }
 
+/// T1 through T3 over one binding, then its declaration; returns the typed
+/// value of each inline match, in source order.
 fn typecheck_binding(
     catalog: &Catalog,
     binding: &Binding,
     ctx: &mut TypeContext,
     params: &HashMap<String, PropType>,
-) -> Result<()> {
+) -> Result<Vec<CheckedPropMatch>> {
     // T1: binding type must exist in catalog
     if !catalog.node_types.contains_key(&binding.type_name) {
         return Err(CompilerError::typed(
@@ -1267,6 +1790,7 @@ fn typecheck_binding(
     let node_type = &catalog.node_types[&binding.type_name];
 
     // T2 + T3: property match fields must exist and have correct types
+    let mut matches = Vec::with_capacity(binding.prop_matches.len());
     for pm in &binding.prop_matches {
         let prop = node_type.properties.get(&pm.prop_name).ok_or_else(|| {
             CompilerError::typed(
@@ -1297,7 +1821,7 @@ fn typecheck_binding(
             ));
         }
 
-        typecheck_constant(
+        let value = typecheck_constant(
             catalog,
             &pm.value,
             params,
@@ -1306,9 +1830,15 @@ fn typecheck_binding(
             ConstantClause::BindingMatch,
             &binding.type_name,
         )?;
+        matches.push(CheckedPropMatch {
+            property: pm.prop_name.clone(),
+            prop_type: prop.clone(),
+            value,
+        });
     }
 
-    bind_node(binding, ctx)
+    bind_node(binding, ctx)?;
+    Ok(matches)
 }
 
 fn bind_node(binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
@@ -1356,9 +1886,16 @@ fn bind_node(binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
     Ok(())
 }
 
-fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str) -> Result<()> {
+/// A literal matched against a property: a list property matches by
+/// membership of a scalar literal. `lit_type` is the type the resolver
+/// computed for `lit`.
+fn check_binding_literal_type(
+    lit: &Literal,
+    lit_type: &PropType,
+    expected: &PropType,
+    property: &str,
+) -> Result<()> {
     if expected.list {
-        let lit_type = literal_type(lit)?;
         if lit_type.list {
             return Err(CompilerError::typed(
                 T3,
@@ -1370,7 +1907,7 @@ fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str
         }
 
         let expected_member = PropType::scalar(expected.scalar, expected.nullable);
-        if !types_compatible(&lit_type, &expected_member) {
+        if !types_compatible(lit_type, &expected_member) {
             return Err(CompilerError::typed(
                 T3,
                 format!(
@@ -1384,7 +1921,7 @@ fn check_binding_literal_type(lit: &Literal, expected: &PropType, property: &str
         return Ok(());
     }
 
-    check_literal_type(lit, expected, property)
+    check_literal_type(lit, lit_type, expected, property)
 }
 
 fn check_binding_variable_type(
@@ -1438,7 +1975,7 @@ fn typecheck_traversal(
     ctx: &mut TypeContext,
     declared_nodes: &HashSet<String>,
     declarations: &HashMap<String, BoundVariable>,
-) -> Result<()> {
+) -> Result<ResolvedTraversal> {
     if matches!(traversal.selector, EdgeSelector::Wildcard)
         && (!declared_nodes.contains(&traversal.src) || !declared_nodes.contains(&traversal.dst))
     {
@@ -1494,8 +2031,7 @@ fn typecheck_traversal(
                 });
         }
     }
-    ctx.traversals.push(resolved);
-    Ok(())
+    Ok(resolved)
 }
 
 fn resolve_traversal(
@@ -1761,13 +2297,14 @@ fn endpoint_type_error(var: &str, type_name: &str, edge: &EdgeType) -> CompilerE
 }
 
 /// A match filter is an expression the checker proves Boolean; a search
-/// call stands only as a top-level conjunct, bare or `= true` (T38).
+/// call stands only as a top-level conjunct, bare or `= true` (T38), and the
+/// retained filter spells every bare call `call = true`, both non-null Bool.
 fn typecheck_filter(
     catalog: &Catalog,
     filter: &Expr,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
-) -> Result<()> {
+) -> Result<TypedExpr> {
     if filter
         .conjuncts()
         .into_iter()
@@ -1775,14 +2312,44 @@ fn typecheck_filter(
     {
         return Err(CompilerError::typed(T38, SEARCH_PREDICATE_SHAPE));
     }
-    let resolved = resolve_expr_type(catalog, filter, ctx, params, Scope::Read)?;
+    let typed = resolve_expr(catalog, filter, ctx, params, Scope::Read)?;
+    let resolved = typed.ty();
     if boolean_scalar(&resolved).is_none() {
         return Err(CompilerError::typed(
             T41,
             format!("a filter must be Boolean, got {}", resolved.display_name()),
         ));
     }
-    Ok(())
+    Ok(spell_search_predicates(completed(typed)?))
+}
+
+/// The filter with every bare search call among its top-level conjuncts
+/// spelled `call = true`.
+fn spell_search_predicates(filter: TypedExpr) -> TypedExpr {
+    let boolean = || ResolvedType::Scalar(PropType::scalar(ScalarType::Bool, false));
+    match filter {
+        call if call.is_search_call() => TypedExpr::Binary {
+            left: Box::new(call),
+            op: BinaryOp::Compare(CompOp::Eq),
+            right: Box::new(TypedExpr::Literal {
+                literal: Literal::Bool(true),
+                ty: boolean(),
+            }),
+            ty: boolean(),
+        },
+        TypedExpr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+            ty,
+        } => TypedExpr::Binary {
+            left: Box::new(spell_search_predicates(*left)),
+            op: BinaryOp::And,
+            right: Box::new(spell_search_predicates(*right)),
+            ty,
+        },
+        other => other,
+    }
 }
 
 const SEARCH_PREDICATE_SHAPE: &str =
@@ -1833,17 +2400,16 @@ fn boolean_scalar(resolved: &ResolvedType) -> Option<&PropType> {
 
 /// Infer a type for direct nulls and empty/all-null literal lists from another operand.
 fn contextual_literal_type(
-    expr: &Expr,
+    expr: &TypedExpr,
     other: &ResolvedType,
     list: Option<bool>,
 ) -> Option<ResolvedType> {
-    let nullable = match expr {
-        Expr::Literal(Literal::Null) => true,
-        Expr::Literal(Literal::List(items))
-            if items.iter().all(|item| matches!(item, Literal::Null)) =>
-        {
-            false
-        }
+    let TypedExpr::Literal { literal, .. } = expr else {
+        return None;
+    };
+    let nullable = match literal {
+        Literal::Null => true,
+        Literal::List(items) if items.iter().all(|item| matches!(item, Literal::Null)) => false,
         _ => return None,
     };
     let ResolvedType::Scalar(other) = other else {
@@ -1851,45 +2417,61 @@ fn contextual_literal_type(
     };
     let mut prop = other.clone();
     prop.nullable = nullable;
-    prop.list = matches!(expr, Expr::Literal(Literal::List(_))) || list.unwrap_or(other.list);
+    prop.list = matches!(literal, Literal::List(_)) || list.unwrap_or(other.list);
     prop.enum_values = None;
     Some(ResolvedType::Scalar(prop))
 }
 
-fn contextual_boolean(expr: &Expr, resolved: ResolvedType, scope: Scope<'_>) -> ResolvedType {
-    if matches!(scope, Scope::Read) && matches!(expr, Expr::Literal(Literal::Null)) {
-        ResolvedType::Scalar(PropType::scalar(ScalarType::Bool, true))
-    } else {
-        resolved
+/// A direct null under a Boolean operator in a read is a nullable Bool.
+fn contextual_boolean(expr: &mut TypedExpr, scope: Scope<'_>) {
+    if matches!(scope, Scope::Read)
+        && matches!(
+            expr,
+            TypedExpr::Literal {
+                literal: Literal::Null,
+                ..
+            }
+        )
+    {
+        expr.set_ty(ResolvedType::Scalar(PropType::scalar(
+            ScalarType::Bool,
+            true,
+        )));
     }
 }
 
-/// `left <op> right`: the operand rules of a comparison (T7, T38) and its
-/// type, `Bool`, nullable when an operand is; in a mutation `where`, a target
-/// property against a literal, a parameter or `now()` keeps the T3/T7 texts.
+/// `left <op> right` over two resolved operands: the operand rules of a
+/// comparison (T7, T38) and its type, `Bool`, nullable when an operand is; in
+/// a mutation `where`, a target property against a constant keeps the T3/T7 texts.
 fn typecheck_comparison(
-    catalog: &Catalog,
-    left: &Expr,
+    left: &mut TypedExpr,
     op: CompOp,
-    right: &Expr,
-    ctx: &TypeContext,
-    params: &HashMap<String, PropType>,
+    right: &mut TypedExpr,
     scope: Scope<'_>,
 ) -> Result<PropType> {
-    let mut left_type = resolve_expr_type(catalog, left, ctx, params, scope)?;
-    let mut right_type = resolve_expr_type(catalog, right, ctx, params, scope)?;
+    let mut left_type = left.ty();
+    let mut right_type = right.ty();
     if matches!(scope, Scope::Read) {
+        let left_is_null = matches!(
+            left,
+            TypedExpr::Literal {
+                literal: Literal::Null,
+                ..
+            }
+        );
         let member = op == CompOp::Contains
             && !matches!(&left_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })
-                if !matches!(left, Expr::Literal(Literal::Null))
+                if !left_is_null
                     || matches!(&right_type, ResolvedType::Scalar(PropType { scalar: ScalarType::String, list: false, .. })));
         if let Some(contextual) = contextual_literal_type(left, &right_type, member.then_some(true))
         {
+            left.set_ty(contextual.clone());
             left_type = contextual;
         }
         if let Some(contextual) =
             contextual_literal_type(right, &left_type, member.then_some(false))
         {
+            right.set_ty(contextual.clone());
             right_type = contextual;
         }
     }
@@ -1897,31 +2479,34 @@ fn typecheck_comparison(
     if (left.is_search_call() || right.is_search_call())
         && !(left.is_search_call()
             && op == CompOp::Eq
-            && matches!(right, Expr::Literal(Literal::Bool(true))))
+            && matches!(
+                right,
+                TypedExpr::Literal {
+                    literal: Literal::Bool(true),
+                    ..
+                }
+            ))
     {
         return Err(CompilerError::typed(T38, SEARCH_PREDICATE_SHAPE));
     }
 
     if let Scope::MutationWhere(target) = scope
-        && let Expr::PropAccess { variable, property } = left
+        && let TypedExpr::PropAccess {
+            variable, property, ..
+        } = &*left
         && variable == target.type_name()
         && !matches!(
             op,
             CompOp::Contains | CompOp::StartsWith | CompOp::StringContains
         )
-        && matches!(right, Expr::Literal(_) | Expr::Variable(_) | Expr::Now)
+        && matches!(
+            right,
+            TypedExpr::Literal { .. } | TypedExpr::Variable { .. } | TypedExpr::Now { .. }
+        )
         && let (ResolvedType::Scalar(expected), ResolvedType::Scalar(actual)) =
             (&left_type, &right_type)
     {
-        typecheck_constant(
-            catalog,
-            right,
-            params,
-            expected,
-            property,
-            ConstantClause::Assignment,
-            target.type_name(),
-        )?;
+        check_constant(right, expected, property, ConstantClause::Assignment)?;
         return Ok(PropType::scalar(
             ScalarType::Bool,
             expected.nullable || actual.nullable,
@@ -1981,8 +2566,13 @@ fn typecheck_comparison(
                 ));
             }
 
-            let empty_list_literal =
-                matches!(left, Expr::Literal(Literal::List(items)) if items.is_empty());
+            let empty_list_literal = matches!(
+                left,
+                TypedExpr::Literal {
+                    literal: Literal::List(items),
+                    ..
+                } if items.is_empty()
+            );
             let expected_member = PropType::scalar(l.scalar, l.nullable);
             if !empty_list_literal && !types_compatible(&expected_member, r) {
                 return Err(CompilerError::typed(
@@ -2153,15 +2743,18 @@ fn read_property_type(
     Ok(prop.clone())
 }
 
-pub(crate) fn aggregate_signature(
+/// An aggregate's argument resolved once, with the signature derived from
+/// its type (T8); the result is `nullable` as the caller's position demands.
+fn resolve_aggregate(
     catalog: &Catalog,
     func: AggFunc,
     arg: &Expr,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
     nullable: bool,
-) -> Result<AggSignature> {
-    let resolved_arg = resolve_expr_type(catalog, arg, ctx, params, Scope::Read)?;
+) -> Result<(TypedExpr, AggSignature)> {
+    let typed_arg = resolve_expr(catalog, arg, ctx, params, Scope::Read)?;
+    let resolved_arg = typed_arg.ty();
     reject_blob_read_value(&resolved_arg, arg)?;
     let arg = check_aggregate_argument(&func, arg, &resolved_arg)?;
     let scalar = func.result_type(&arg).ok_or_else(|| {
@@ -2170,69 +2763,66 @@ pub(crate) fn aggregate_signature(
             arg.spelling()
         ))
     })?;
-    Ok(AggSignature {
-        arg,
-        result: ExprType::from_prop(&PropType::scalar(scalar, nullable)),
-    })
+    Ok((
+        typed_arg,
+        AggSignature {
+            arg,
+            result: ExprType::from_prop(&PropType::scalar(scalar, nullable)),
+        },
+    ))
 }
 
-/// The checked expression type consumed by lowering in its original scope.
-pub(crate) fn expression_type(
+/// The one recursive resolver: every expression occurrence passes through
+/// here exactly once per checking invocation and comes back as a typed node
+/// that retains its children; helpers read a child's type, never resolve it again.
+fn resolve_expr(
     catalog: &Catalog,
     expr: &Expr,
     ctx: &TypeContext,
     params: &HashMap<String, PropType>,
     scope: Scope<'_>,
-) -> Result<ExprType> {
-    match resolve_expr_type(catalog, expr, ctx, params, scope)? {
-        ResolvedType::Scalar(prop) => Ok(ExprType::from_prop(&prop)),
-        ResolvedType::Node(type_name) => Ok(ExprType::Node { type_name }),
-        ResolvedType::Aggregate(ty) => Ok(ty),
-        ResolvedType::ForwardAlias => Err(CompilerError::Plan(
-            "unresolved forward alias during lowering".into(),
-        )),
-    }
-}
-
-fn resolve_expr_type(
-    catalog: &Catalog,
-    expr: &Expr,
-    ctx: &TypeContext,
-    params: &HashMap<String, PropType>,
-    scope: Scope<'_>,
-) -> Result<ResolvedType> {
+) -> Result<TypedExpr> {
+    visits::expr(expr);
     if let Some(keyword) = call_keyword(expr)
         && let Some(refusal) = scope.call_refusal(&keyword)
     {
         return Err(refusal);
     }
+    let scalar = |scalar: ScalarType, nullable: bool| {
+        ResolvedType::Scalar(PropType::scalar(scalar, nullable))
+    };
     match expr {
-        Expr::Now => Ok(ResolvedType::Scalar(PropType::scalar(
-            ScalarType::DateTime,
-            false,
-        ))),
-        Expr::PropAccess { variable, property } => match scope {
-            Scope::Read => {
-                let prop = read_property_type(catalog, ctx, variable, property)?;
-                if matches!(prop.scalar, ScalarType::Blob) {
-                    return Err(CompilerError::typed(
-                        T24,
-                        format!(
-                            "Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
-                            variable, property
-                        ),
-                    ));
+        Expr::Now => Ok(TypedExpr::Now {
+            ty: scalar(ScalarType::DateTime, false),
+        }),
+        Expr::PropAccess { variable, property } => {
+            let ty = match scope {
+                Scope::Read => {
+                    let prop = read_property_type(catalog, ctx, variable, property)?;
+                    if matches!(prop.scalar, ScalarType::Blob) {
+                        return Err(CompilerError::typed(
+                            T24,
+                            format!(
+                                "Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
+                                variable, property
+                            ),
+                        ));
+                    }
+                    ResolvedType::Scalar(prop)
                 }
-                Ok(ResolvedType::Scalar(prop))
-            }
-            Scope::MutationWhere(target) => {
-                mutation_property_type(catalog, target, variable, property)
-                    .map(ResolvedType::Scalar)
-            }
-            Scope::Constant { type_name, .. } => {
-                Err(constant_leaf_refusal(type_name, variable, property))
-            }
-        },
+                Scope::MutationWhere(target) => ResolvedType::Scalar(mutation_property_type(
+                    catalog, target, variable, property,
+                )?),
+                Scope::Constant { type_name, .. } => {
+                    return Err(constant_leaf_refusal(type_name, variable, property));
+                }
+            };
+            Ok(TypedExpr::PropAccess {
+                variable: variable.clone(),
+                property: property.clone(),
+                ty,
+            })
+        }
         Expr::Nearest {
             variable,
             property,
@@ -2294,9 +2884,12 @@ fn resolve_expr_type(
                 ));
             }
 
-            if let Expr::Literal(lit) = query.as_ref()
-                && let Some(dim) = numeric_vector_literal_dim(lit)
-            {
+            let query = resolve_expr(catalog, query, ctx, params, scope)?;
+            let literal_dim = match &query {
+                TypedExpr::Literal { literal, .. } => numeric_vector_literal_dim(literal),
+                _ => None,
+            };
+            if let Some(dim) = literal_dim {
                 if dim != vector_dim {
                     return Err(CompilerError::typed(
                         T15,
@@ -2306,59 +2899,56 @@ fn resolve_expr_type(
                         ),
                     ));
                 }
-                return Ok(ResolvedType::Scalar(PropType::scalar(
-                    ScalarType::F32,
-                    false,
-                )));
-            }
-
-            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
-            match query_type {
-                ResolvedType::Scalar(s) if matches!(s.scalar, ScalarType::Vector(_)) && !s.list => {
-                    let qdim = match s.scalar {
-                        ScalarType::Vector(dim) => dim,
-                        _ => unreachable!(),
-                    };
-                    if qdim != vector_dim {
+            } else {
+                match query.ty() {
+                    ResolvedType::Scalar(s)
+                        if matches!(s.scalar, ScalarType::Vector(_)) && !s.list =>
+                    {
+                        let qdim = match s.scalar {
+                            ScalarType::Vector(dim) => dim,
+                            _ => unreachable!(),
+                        };
+                        if qdim != vector_dim {
+                            return Err(CompilerError::typed(
+                                T15,
+                                format!(
+                                    "nearest vector dimension mismatch: property is Vector({}), query is Vector({})",
+                                    vector_dim, qdim
+                                ),
+                            ));
+                        }
+                    }
+                    ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                    ResolvedType::Scalar(s) => {
                         return Err(CompilerError::typed(
                             T15,
                             format!(
-                                "nearest vector dimension mismatch: property is Vector({}), query is Vector({})",
-                                vector_dim, qdim
+                                "nearest query must be Vector({}) or String, got {}",
+                                vector_dim,
+                                s.display_name()
                             ),
                         ));
                     }
-                }
-                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {
-                    // query-time string embedding is supported by the runtime executor
-                }
-                ResolvedType::Scalar(s) => {
-                    return Err(CompilerError::typed(
-                        T15,
-                        format!(
-                            "nearest query must be Vector({}) or String, got {}",
-                            vector_dim,
-                            s.display_name()
-                        ),
-                    ));
-                }
-                _ => {
-                    return Err(CompilerError::typed(
-                        T15,
-                        "nearest query must be a scalar expression".to_string(),
-                    ));
+                    _ => {
+                        return Err(CompilerError::typed(
+                            T15,
+                            "nearest query must be a scalar expression".to_string(),
+                        ));
+                    }
                 }
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F32,
-                false,
-            )))
+            Ok(TypedExpr::Nearest {
+                variable: variable.clone(),
+                property: property.clone(),
+                query: Box::new(query),
+                ty: scalar(ScalarType::F32, false),
+            })
         }
         Expr::Search { field, query } => {
             reject_edge_binding_search_field(ctx, field, "search")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
-            match field_type {
+            let field = resolve_expr(catalog, field, ctx, params, scope)?;
+            match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2374,8 +2964,8 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
-            match query_type {
+            let query = resolve_expr(catalog, query, ctx, params, scope)?;
+            match query.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2391,10 +2981,11 @@ fn resolve_expr_type(
                 }
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                false,
-            )))
+            Ok(TypedExpr::Search {
+                field: Box::new(field),
+                query: Box::new(query),
+                ty: scalar(ScalarType::Bool, false),
+            })
         }
         Expr::Fuzzy {
             field,
@@ -2402,8 +2993,8 @@ fn resolve_expr_type(
             max_edits,
         } => {
             reject_edge_binding_search_field(ctx, field, "fuzzy")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
-            match field_type {
+            let field = resolve_expr(catalog, field, ctx, params, scope)?;
+            match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2419,8 +3010,8 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
-            match query_type {
+            let query = resolve_expr(catalog, query, ctx, params, scope)?;
+            match query.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2436,10 +3027,10 @@ fn resolve_expr_type(
                 }
             }
 
+            let mut max_edits_typed = None;
             if let Some(max_edits_expr) = max_edits {
-                let max_edits_type =
-                    resolve_expr_type(catalog, max_edits_expr, ctx, params, scope)?;
-                match max_edits_type {
+                let max_edits = resolve_expr(catalog, max_edits_expr, ctx, params, scope)?;
+                match max_edits.ty() {
                     ResolvedType::Scalar(s)
                         if !s.list
                             && matches!(
@@ -2465,17 +3056,20 @@ fn resolve_expr_type(
                         ));
                     }
                 }
+                max_edits_typed = Some(Box::new(max_edits));
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                false,
-            )))
+            Ok(TypedExpr::Fuzzy {
+                field: Box::new(field),
+                query: Box::new(query),
+                max_edits: max_edits_typed,
+                ty: scalar(ScalarType::Bool, false),
+            })
         }
         Expr::MatchText { field, query } => {
             reject_edge_binding_search_field(ctx, field, "match_text")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
-            match field_type {
+            let field = resolve_expr(catalog, field, ctx, params, scope)?;
+            match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2491,8 +3085,8 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
-            match query_type {
+            let query = resolve_expr(catalog, query, ctx, params, scope)?;
+            match query.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2508,15 +3102,16 @@ fn resolve_expr_type(
                 }
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                false,
-            )))
+            Ok(TypedExpr::MatchText {
+                field: Box::new(field),
+                query: Box::new(query),
+                ty: scalar(ScalarType::Bool, false),
+            })
         }
         Expr::Bm25 { field, query } => {
             reject_edge_binding_search_field(ctx, field, "bm25")?;
-            let field_type = resolve_expr_type(catalog, field, ctx, params, scope)?;
-            match field_type {
+            let field = resolve_expr(catalog, field, ctx, params, scope)?;
+            match field.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2532,8 +3127,8 @@ fn resolve_expr_type(
                 }
             }
 
-            let query_type = resolve_expr_type(catalog, query, ctx, params, scope)?;
-            match query_type {
+            let query = resolve_expr(catalog, query, ctx, params, scope)?;
+            match query.ty() {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
                 ResolvedType::Scalar(s) => {
                     return Err(CompilerError::typed(
@@ -2549,10 +3144,11 @@ fn resolve_expr_type(
                 }
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F32,
-                false,
-            )))
+            Ok(TypedExpr::Bm25 {
+                field: Box::new(field),
+                query: Box::new(query),
+                ty: scalar(ScalarType::F32, false),
+            })
         }
         Expr::Rrf {
             primary,
@@ -2572,10 +3168,10 @@ fn resolve_expr_type(
                 ));
             }
 
-            let primary_ty = resolve_expr_type(catalog, primary, ctx, params, scope)?;
-            let secondary_ty = resolve_expr_type(catalog, secondary, ctx, params, scope)?;
+            let primary = resolve_expr(catalog, primary, ctx, params, scope)?;
+            let secondary = resolve_expr(catalog, secondary, ctx, params, scope)?;
 
-            for ty in [primary_ty, secondary_ty] {
+            for ty in [primary.ty(), secondary.ty()] {
                 match ty {
                     ResolvedType::Scalar(s) if s.scalar == ScalarType::F32 && !s.list => {}
                     ResolvedType::Scalar(s) => {
@@ -2596,9 +3192,10 @@ fn resolve_expr_type(
                 }
             }
 
+            let mut k_typed = None;
             if let Some(k_expr) = k {
-                let k_type = resolve_expr_type(catalog, k_expr, ctx, params, scope)?;
-                match k_type {
+                let k = resolve_expr(catalog, k_expr, ctx, params, scope)?;
+                match k.ty() {
                     ResolvedType::Scalar(s)
                         if !s.list
                             && matches!(
@@ -2621,7 +3218,10 @@ fn resolve_expr_type(
                         ));
                     }
                 }
-                if let Expr::Literal(Literal::Integer(v)) = k_expr.as_ref()
+                if let TypedExpr::Literal {
+                    literal: Literal::Integer(v),
+                    ..
+                } = &k
                     && *v <= 0
                 {
                     return Err(CompilerError::typed(
@@ -2629,71 +3229,110 @@ fn resolve_expr_type(
                         "rrf k must be greater than 0".to_string(),
                     ));
                 }
+                k_typed = Some(Box::new(k));
             }
 
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::F64,
-                false,
-            )))
+            Ok(TypedExpr::Rrf {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+                k: k_typed,
+                ty: scalar(ScalarType::F64, false),
+            })
         }
         Expr::Variable(name) => {
             // Could be a query parameter or a bound variable
-            if let Some(prop_type) = params.get(name) {
-                Ok(ResolvedType::Scalar(prop_type.clone()))
+            let ty = if let Some(prop_type) = params.get(name) {
+                ResolvedType::Scalar(prop_type.clone())
             } else if !matches!(scope, Scope::Read) {
-                Err(scope.undeclared_parameter(name))
+                return Err(scope.undeclared_parameter(name));
             } else if let Some(bv) = ctx.bindings.get(name) {
                 match bv {
-                    BoundVariable::Node { type_name } => Ok(ResolvedType::Node(type_name.clone())),
-                    BoundVariable::Edge { .. } => Err(CompilerError::typed(
-                        T23,
-                        format!(
-                            "edge binding `${}` cannot be used bare; access one of its properties (`${}.{{prop}}`)",
-                            name, name
-                        ),
-                    )),
+                    BoundVariable::Node { type_name } => ResolvedType::Node(type_name.clone()),
+                    BoundVariable::Edge { .. } => {
+                        return Err(CompilerError::typed(
+                            T23,
+                            format!(
+                                "edge binding `${}` cannot be used bare; access one of its properties (`${}.{{prop}}`)",
+                                name, name
+                            ),
+                        ));
+                    }
                 }
             } else {
-                Err(CompilerError::typed(
+                return Err(CompilerError::typed(
                     T6,
                     format!("variable `${}` is not bound", name),
-                ))
-            }
+                ));
+            };
+            Ok(TypedExpr::Variable {
+                name: name.clone(),
+                ty,
+            })
         }
-        Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
+        Expr::Literal(lit) => Ok(TypedExpr::Literal {
+            literal: lit.clone(),
+            ty: ResolvedType::Scalar(literal_type(lit)?),
+        }),
         Expr::Aggregate { func, arg } => {
-            let signature = aggregate_signature(catalog, *func, arg, ctx, params, true)?;
-            Ok(ResolvedType::Aggregate(signature.result))
+            let (arg, signature) = resolve_aggregate(catalog, *func, arg, ctx, params, true)?;
+            Ok(TypedExpr::Aggregate {
+                func: *func,
+                arg: Box::new(arg),
+                signature,
+            })
         }
-        Expr::AliasRef(name) => match scope {
-            Scope::Read => Ok(ctx
-                .aliases
-                .get(name)
-                .cloned()
-                .unwrap_or(ResolvedType::ForwardAlias)),
-            Scope::MutationWhere(target) => {
-                mutation_property_type(catalog, target, target.type_name(), name)
-                    .map(ResolvedType::Scalar)
-            }
-            Scope::Constant { type_name, .. } => {
-                Err(constant_leaf_refusal(type_name, type_name, name))
-            }
-        },
+        Expr::AliasRef(name) => {
+            let ty = match scope {
+                Scope::Read => ctx
+                    .aliases
+                    .get(name)
+                    .cloned()
+                    .unwrap_or(ResolvedType::ForwardAlias),
+                Scope::MutationWhere(target) => ResolvedType::Scalar(mutation_property_type(
+                    catalog,
+                    target,
+                    target.type_name(),
+                    name,
+                )?),
+                Scope::Constant { type_name, .. } => {
+                    return Err(constant_leaf_refusal(type_name, type_name, name));
+                }
+            };
+            Ok(TypedExpr::AliasRef {
+                name: name.clone(),
+                ty,
+            })
+        }
         Expr::Binary {
             left,
             op: BinaryOp::Compare(op),
             right,
-        } => Ok(ResolvedType::Scalar(typecheck_comparison(
-            catalog, left, *op, right, ctx, params, scope,
-        )?)),
+        } => {
+            let mut left = resolve_expr(catalog, left, ctx, params, scope)?;
+            let mut right = resolve_expr(catalog, right, ctx, params, scope)?;
+            let ty = typecheck_comparison(&mut left, *op, &mut right, scope)?;
+            Ok(TypedExpr::Binary {
+                left: Box::new(left),
+                op: BinaryOp::Compare(*op),
+                right: Box::new(right),
+                ty: ResolvedType::Scalar(ty),
+            })
+        }
         Expr::In { needle, list } => {
             if let Some(refusal) = membership_over_a_node(catalog, needle, list, ctx, params) {
                 return Err(refusal);
             }
-            let list_type = resolve_expr_type(catalog, list, ctx, params, scope)?;
+            let mut list = resolve_expr(catalog, list, ctx, params, scope)?;
+            let list_type = list.ty();
             if !matches!(&list_type, ResolvedType::Scalar(list) if list.list)
                 && !(matches!(scope, Scope::Read)
-                    && matches!(list.as_ref(), Expr::Literal(Literal::Null)))
+                    && matches!(
+                        list,
+                        TypedExpr::Literal {
+                            literal: Literal::Null,
+                            ..
+                        }
+                    ))
             {
                 return Err(CompilerError::typed(
                     T7,
@@ -2703,27 +3342,20 @@ fn resolve_expr_type(
                     ),
                 ));
             }
-            Ok(ResolvedType::Scalar(typecheck_comparison(
-                catalog,
-                list,
-                CompOp::Contains,
-                needle,
-                ctx,
-                params,
-                scope,
-            )?))
+            let mut needle = resolve_expr(catalog, needle, ctx, params, scope)?;
+            let ty = typecheck_comparison(&mut list, CompOp::Contains, &mut needle, scope)?;
+            Ok(TypedExpr::In {
+                needle: Box::new(needle),
+                list: Box::new(list),
+                ty: ResolvedType::Scalar(ty),
+            })
         }
         Expr::Binary { left, op, right } => {
-            let left_type = contextual_boolean(
-                left,
-                resolve_expr_type(catalog, left, ctx, params, scope)?,
-                scope,
-            );
-            let right_type = contextual_boolean(
-                right,
-                resolve_expr_type(catalog, right, ctx, params, scope)?,
-                scope,
-            );
+            let mut left = resolve_expr(catalog, left, ctx, params, scope)?;
+            contextual_boolean(&mut left, scope);
+            let mut right = resolve_expr(catalog, right, ctx, params, scope)?;
+            contextual_boolean(&mut right, scope);
+            let (left_type, right_type) = (left.ty(), right.ty());
             let (Some(l), Some(r)) = (boolean_scalar(&left_type), boolean_scalar(&right_type))
             else {
                 return Err(CompilerError::typed(
@@ -2735,17 +3367,18 @@ fn resolve_expr_type(
                     ),
                 ));
             };
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                l.nullable || r.nullable,
-            )))
+            let ty = scalar(ScalarType::Bool, l.nullable || r.nullable);
+            Ok(TypedExpr::Binary {
+                left: Box::new(left),
+                op: *op,
+                right: Box::new(right),
+                ty,
+            })
         }
         Expr::Not(inner) => {
-            let inner_type = contextual_boolean(
-                inner,
-                resolve_expr_type(catalog, inner, ctx, params, scope)?,
-                scope,
-            );
+            let mut inner = resolve_expr(catalog, inner, ctx, params, scope)?;
+            contextual_boolean(&mut inner, scope);
+            let inner_type = inner.ty();
             let Some(b) = boolean_scalar(&inner_type) else {
                 return Err(CompilerError::typed(
                     T41,
@@ -2755,22 +3388,36 @@ fn resolve_expr_type(
                     ),
                 ));
             };
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                b.nullable,
-            )))
+            let ty = scalar(ScalarType::Bool, b.nullable);
+            Ok(TypedExpr::Not {
+                inner: Box::new(inner),
+                ty,
+            })
         }
-        Expr::IsNull { expr: inner, .. } => {
-            if let Scope::Read = scope
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => {
+            let inner = if let Scope::Read = scope
                 && let Expr::PropAccess { variable, property } = inner.as_ref()
-                && read_property_type(catalog, ctx, variable, property)?.scalar == ScalarType::Blob
             {
-                return Err(CompilerError::typed(
-                    T7,
-                    "blob comparisons in filters are not supported".to_string(),
-                ));
-            }
-            let inner_type = resolve_expr_type(catalog, inner, ctx, params, scope)?;
+                visits::expr(inner);
+                let prop = read_property_type(catalog, ctx, variable, property)?;
+                if prop.scalar == ScalarType::Blob {
+                    return Err(CompilerError::typed(
+                        T7,
+                        "blob comparisons in filters are not supported".to_string(),
+                    ));
+                }
+                TypedExpr::PropAccess {
+                    variable: variable.clone(),
+                    property: property.clone(),
+                    ty: ResolvedType::Scalar(prop),
+                }
+            } else {
+                resolve_expr(catalog, inner, ctx, params, scope)?
+            };
+            let inner_type = inner.ty();
             if !matches!(inner_type, ResolvedType::Scalar(_)) {
                 return Err(CompilerError::typed(
                     T41,
@@ -2780,10 +3427,11 @@ fn resolve_expr_type(
                     ),
                 ));
             }
-            Ok(ResolvedType::Scalar(PropType::scalar(
-                ScalarType::Bool,
-                false,
-            )))
+            Ok(TypedExpr::IsNull {
+                inner: Box::new(inner),
+                negated: *negated,
+                ty: scalar(ScalarType::Bool, false),
+            })
         }
     }
 }
@@ -2911,54 +3559,6 @@ fn rank_keyword(expr: &Expr) -> &'static str {
         | Expr::IsNull { .. }
         | Expr::In { .. } => "expression",
     }
-}
-
-fn infer_projection_field(
-    catalog: &Catalog,
-    expr: &Expr,
-    alias: Option<&str>,
-    order_clause: &[Ordering],
-    ctx: &TypeContext,
-    params: &HashMap<String, PropType>,
-) -> Result<Field> {
-    let ty = projection_type(catalog, expr, alias, order_clause, ctx, params)?;
-    projection_field(catalog, &projection_name(expr, alias), &ty)
-}
-
-/// The declared type of a return item, shared by inference and IR lowering.
-pub(crate) fn projection_type(
-    catalog: &Catalog,
-    expr: &Expr,
-    alias: Option<&str>,
-    order_clause: &[Ordering],
-    ctx: &TypeContext,
-    params: &HashMap<String, PropType>,
-) -> Result<ExprType> {
-    let ty = match expr {
-        Expr::Aggregate { func, arg } => {
-            aggregate_signature(catalog, *func, arg, ctx, params, true)?.result
-        }
-        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
-            resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
-            ExprType::from_prop(&PropType::scalar(ScalarType::F32, false))
-        }
-        _ => {
-            let resolved = resolve_expr_type(catalog, expr, ctx, params, Scope::Read)?;
-            reject_blob_read_value(&resolved, expr)?;
-            match resolved {
-                ResolvedType::Scalar(prop) => ExprType::from_prop(&prop),
-                ResolvedType::Node(type_name) => ExprType::Node { type_name },
-                ResolvedType::Aggregate(ty) => ty,
-                ResolvedType::ForwardAlias => {
-                    return Err(CompilerError::Plan(
-                        "unresolved forward alias in projection".into(),
-                    ));
-                }
-            }
-        }
-    };
-    check_projection(expr, alias, order_clause)?;
-    Ok(ty)
 }
 
 /// The column name a projection carries in the executed result batch
@@ -3120,7 +3720,10 @@ fn membership_over_a_node(
     ))
 }
 
-pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
+/// The type of a literal payload, computed once per occurrence (list
+/// elements included) and retained on the typed node.
+fn literal_type(lit: &Literal) -> Result<PropType> {
+    visits::literal(lit);
     match lit {
         // Null is compatible with any nullable type; default to String for inference.
         Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
@@ -3141,10 +3744,10 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
         Literal::List(items) => {
             let mut scalar = None;
             for item in items {
+                let item_type = literal_type(item)?;
                 if matches!(item, Literal::Null) {
                     continue;
                 }
-                let item_type = literal_type(item)?;
                 if item_type.list {
                     return Err(CompilerError::typed(
                         T52,
@@ -3175,7 +3778,15 @@ pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
     }
 }
 
-fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Result<()> {
+/// A literal against the property it is assigned to or matched with;
+/// `lit_type` is the type the resolver computed for `lit`, so the payload
+/// is inspected here (null, vector width, enum values) but never typed again.
+fn check_literal_type(
+    lit: &Literal,
+    lit_type: &PropType,
+    expected: &PropType,
+    prop_name: &str,
+) -> Result<()> {
     // Null is compatible with any nullable property type.
     if matches!(lit, Literal::Null) {
         return if expected.nullable {
@@ -3204,8 +3815,7 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
         ));
     }
 
-    let lit_type = literal_type(lit)?;
-    if !types_compatible(&lit_type, expected) {
+    if !types_compatible(lit_type, expected) {
         return Err(CompilerError::typed(
             T3,
             format!(
@@ -3405,6 +4015,60 @@ fn expr_contains_rrf(expr: &Expr) -> bool {
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_contains_rrf(inner),
         _ => false,
     }
+}
+
+/// Test-only record of the resolution work one checking invocation does:
+/// the address of every `Expr` the resolver enters and of every `Literal`
+/// payload `literal_type` types. Thread-local, so a test owns its own run;
+/// no production semantics.
+#[cfg(test)]
+pub(crate) mod visits {
+    use std::cell::RefCell;
+
+    use super::{Expr, Literal};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub(crate) enum Visit {
+        Expr(usize),
+        Literal(usize),
+    }
+
+    thread_local! {
+        static RECORDER: RefCell<Option<Vec<Visit>>> = const { RefCell::new(None) };
+    }
+
+    /// Start recording on this thread, discarding any earlier record.
+    pub(crate) fn start() {
+        RECORDER.with(|recorder| *recorder.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and return the visits in order.
+    pub(crate) fn finish() -> Vec<Visit> {
+        RECORDER.with(|recorder| recorder.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn expr(expr: &Expr) {
+        record(Visit::Expr(expr as *const Expr as usize));
+    }
+
+    pub(super) fn literal(literal: &Literal) {
+        record(Visit::Literal(literal as *const Literal as usize));
+    }
+
+    fn record(visit: Visit) {
+        RECORDER.with(|recorder| {
+            if let Some(visits) = recorder.borrow_mut().as_mut() {
+                visits.push(visit);
+            }
+        });
+    }
+}
+
+#[cfg(not(test))]
+mod visits {
+    pub(super) fn expr(_: &super::Expr) {}
+
+    pub(super) fn literal(_: &super::Literal) {}
 }
 
 #[cfg(test)]
