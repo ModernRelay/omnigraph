@@ -25,6 +25,27 @@ fn build_provenance_keeps_directory_and_narrow_git_watches() {
 }
 
 #[test]
+fn build_provenance_watches_only_paths_that_exist() {
+    let output = std::path::Path::new(env!("OUT_DIR")).with_file_name("output");
+    let directives = std::fs::read_to_string(&output)
+        .unwrap_or_else(|error| panic!("read {}: {error}", output.display()));
+    let watched = directives
+        .lines()
+        .filter_map(|line| line.strip_prefix("cargo:rerun-if-changed="))
+        .collect::<Vec<_>>();
+    assert!(!watched.is_empty(), "no watch in {}", output.display());
+    let missing = watched
+        .into_iter()
+        .filter(|path| !std::path::Path::new(path).exists())
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "cargo counts a missing watched path as changed, so the build script reruns \
+         and this crate relinks on every cargo call: {missing:?}"
+    );
+}
+
+#[test]
 fn build_provenance_parsing_and_subprocesses_fail_closed() {
     assert!(BUILD_SCRIPT.contains("toml::from_str::<toml::Value>(source)"));
     assert!(!BUILD_SCRIPT.contains("split_once('=')"));

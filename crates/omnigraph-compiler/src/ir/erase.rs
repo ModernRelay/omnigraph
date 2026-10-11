@@ -458,22 +458,43 @@ mod tests {
                 },
             ));
         }
-        for literal in [
-            Literal::Null,
-            Literal::String("quoted\"\ntext".into()),
-            Literal::Integer(i64::MIN),
-            Literal::Float(-0.0),
-            Literal::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
-            Literal::Bool(true),
-            Literal::Date("2026-10-05".into()),
-            Literal::DateTime("2026-10-05T10:00:00Z".into()),
-            Literal::List(vec![Literal::Integer(9_007_199_254_740_993), Literal::Null]),
+        for (literal, ty) in [
+            (Literal::Null, PropType::scalar(ScalarType::String, true)),
+            (
+                Literal::String("quoted\"\ntext".into()),
+                PropType::scalar(ScalarType::String, false),
+            ),
+            (
+                Literal::Integer(i64::MIN),
+                PropType::scalar(ScalarType::I64, false),
+            ),
+            (
+                Literal::Float(-0.0),
+                PropType::scalar(ScalarType::F64, false),
+            ),
+            (
+                Literal::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+                PropType::scalar(ScalarType::F64, false),
+            ),
+            (
+                Literal::Bool(true),
+                PropType::scalar(ScalarType::Bool, false),
+            ),
+            (
+                Literal::Date("2026-10-05".into()),
+                PropType::scalar(ScalarType::Date, false),
+            ),
+            (
+                Literal::DateTime("2026-10-05T10:00:00Z".into()),
+                PropType::scalar(ScalarType::DateTime, false),
+            ),
+            (
+                Literal::List(vec![Literal::Integer(9_007_199_254_740_993), Literal::Null]),
+                PropType::list_of(ScalarType::I64, false),
+            ),
         ] {
             cases.push((
-                IRExpr::Literal(
-                    literal.clone(),
-                    ExprType::from_prop(&crate::query::typecheck::literal_type(&literal).unwrap()),
-                ),
+                IRExpr::Literal(literal.clone(), ExprType::from_prop(&ty)),
                 untyped::IRExpr::Literal(literal),
             ));
         }

@@ -69,7 +69,9 @@ fn main() {
             repository.join(".gitattributes"),
             repository.join(".gitignore"),
         ] {
-            println!("cargo:rerun-if-changed={}", input.display());
+            if input.exists() {
+                println!("cargo:rerun-if-changed={}", input.display());
+            }
         }
         emit_git_rerun_paths(repository);
     }

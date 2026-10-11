@@ -3459,7 +3459,7 @@
           "commits"
         ],
         "summary": "List commits, most recent first.",
-        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`.",
         "operationId": "cluster_listCommits",
         "parameters": [
           {
@@ -3480,6 +3480,15 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "name": "unpublished",
+            "in": "query",
+            "description": "`true` lists the unpublished commits whose recorded target is `branch`\n(writes `as commit` awaiting `commit publish`), newest first, instead\nof the branch's history.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -3836,6 +3845,199 @@
             "bearer_token": []
           }
         ]
+      },
+      "delete": {
+        "tags": [
+          "commits"
+        ],
+        "summary": "Drop an unpublished commit.",
+        "description": "**Irreversible.** Runs under `commit_drop` on the commit's recorded target\nbranch; a denial answers the 404 an unknown id answers. A published commit\nis never dropped (409). The GQ statement `commit drop \"<id>\"` on\n`POST /mutate` runs the same body.",
+        "operationId": "cluster_dropCommit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "commit_id",
+            "in": "path",
+            "description": "Unpublished commit identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Commit dropped: its id stops resolving and its held merge inputs are released",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Commit not found, or its drop is not permitted",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The commit is published",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
       }
     },
     "/graphs/{graph_id}/commits/{commit_id}/changes": {
@@ -4158,6 +4360,229 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/commits/{commit_id}/publish": {
+      "post": {
+        "tags": [
+          "commits"
+        ],
+        "summary": "Publish an unpublished commit onto its recorded target branch.",
+        "description": "The target is the branch the commit recorded when it was written `as\ncommit`, so the request carries no body. Runs under `commit_publish` on\nthat branch; a denial answers the 404 an unknown id answers. The GQ\nstatement `commit publish \"<id>\"` on `POST /mutate` runs the same body.",
+        "operationId": "cluster_publishCommit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "commit_id",
+            "in": "path",
+            "description": "Unpublished commit identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The commit as published on its recorded target branch; a published id is answered as it stands",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Commit not found, or its publication is not permitted",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The target's state moved under the proposal's authority",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "The target head moved past the commit's captured parent; the commit can only be dropped",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header; Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "An overlapping durable recovery intent must be resolved before retry; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
                 }
               }
             }
@@ -7419,6 +7844,10 @@
           "source"
         ],
         "properties": {
+          "as_commit": {
+            "type": "boolean",
+            "description": "Publish the merge as an unpublished commit (`branch merge … as commit`):\nthe target head is unchanged until `commit publish`. Refused together\nwith `delete_branch`, whose source the proposal still holds."
+          },
           "delete_branch": {
             "type": "boolean",
             "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error_details` on the response\nand never fails the already-landed merge."
@@ -7515,6 +7944,40 @@
               },
               "target": {
                 "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`commit publish`: the receipt's `commit` is the now-published commit.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "published"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`commit drop`: the unpublished commit `graph_commit_id` is gone.",
+            "required": [
+              "graph_commit_id",
+              "kind"
+            ],
+            "properties": {
+              "graph_commit_id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "dropped"
+                ]
               }
             }
           }
@@ -8043,6 +8506,10 @@
               "string",
               "null"
             ]
+          },
+          "published": {
+            "type": "boolean",
+            "description": "`false` for an unpublished commit (a write `as commit`): readable by\nits id, invisible to every branch read, until `commit publish`.\n`graph_manifest_version` is then the detached version holding it."
           }
         }
       },

@@ -328,6 +328,7 @@ mod tests {
             merged_parent_commit_id: None,
             actor_id: None,
             created_at: 0,
+            published: true,
         }
     }
     #[test]

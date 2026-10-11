@@ -2886,6 +2886,7 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         merged_parent_commit_id: Some(longest_published("Y")),
         actor_id: Some(actor.clone()),
         created_at: i64::MIN,
+        published: true,
     };
     // Decode the engine's opaque type, so a new serialized token field makes
     // this bound review fail instead of silently remaining absent from a mock.

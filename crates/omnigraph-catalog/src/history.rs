@@ -3496,6 +3496,57 @@ pub async fn read_lineage_of_bounded_in(
     read_lineage_selected(root_uri, session, ids, Some(max_bytes), Some(cache)).await
 }
 
+/// The lineage row at `slot` of `block` through `cache`: the block's one
+/// object when it is complete, else the narrowest listed extent holding the
+/// slot. `None` when no extent holds it. What the merge-base walk reads for a
+/// base it reached through a registry run, by no id.
+pub async fn read_commit_at_slot_in(
+    root_uri: &str,
+    session: &Arc<lance::session::Session>,
+    cache: &ExtentCache,
+    block: Ulid,
+    slot: u16,
+    max_bytes: usize,
+) -> Result<Option<GraphLineageRow>> {
+    let (store, base) = store(root_uri, session).await?;
+    let mut selection = Selection {
+        scheduler: scheduler(&store),
+        store,
+        base,
+        lineage_only: true,
+        budget: Some(max_bytes),
+        cache: Some(cache),
+        memo: LegacyMemo::default(),
+    };
+    let slots = BTreeSet::from([slot]);
+    let at_slot = |rows: &Rows| -> Result<Option<GraphLineageRow>> {
+        for commit in rows.commits() {
+            let id = parse_history_block_id(&commit.graph_commit_id)?;
+            if id.is_some_and(|id| id.block == block && id.slot == slot) {
+                return Ok(Some(commit.clone()));
+            }
+        }
+        Ok(None)
+    };
+    let full = ExtentKey::Full { block };
+    let direct = selection.read(&full, Narrow::All).await?;
+    if let Some(rows) = &direct
+        && let Some(commit) = at_slot(rows)?
+    {
+        return Ok(Some(commit));
+    }
+    for key in list_extents(&selection.store, &selection.base, Some((block, &slots))).await? {
+        if key == full && direct.is_some() {
+            continue;
+        }
+        let rows = selection.listed(&key, Narrow::Slots(&slots)).await?;
+        if let Some(commit) = at_slot(&rows)? {
+            return Ok(Some(commit));
+        }
+    }
+    Ok(None)
+}
+
 async fn read_lineage_selected(
     root_uri: &str,
     session: &Arc<lance::session::Session>,

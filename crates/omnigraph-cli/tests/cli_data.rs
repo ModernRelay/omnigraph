@@ -3354,7 +3354,11 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 "{body}: {output:?}"
             );
             if valid {
-                assert_eq!(parse_stdout_json(&output), body);
+                let mut shown = body.clone();
+                if let Some(commit) = shown.get_mut("commit").filter(|commit| commit.is_object()) {
+                    commit["published"] = json!(true);
+                }
+                assert_eq!(parse_stdout_json(&output), shown);
             } else {
                 assert!(
                     !stdout_string(&output).contains("graph_commit_id"),
@@ -3434,7 +3438,11 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 "{body}: {output:?}"
             );
             if valid {
-                assert_eq!(parse_stdout_json(&output), body);
+                let mut shown = body.clone();
+                if let Some(commit) = shown.get_mut("commit").filter(|commit| commit.is_object()) {
+                    commit["published"] = json!(true);
+                }
+                assert_eq!(parse_stdout_json(&output), shown);
             }
             server.assert_complete();
             assert_eq!(server.workflow_requests().len(), 1);

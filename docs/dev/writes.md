@@ -148,6 +148,7 @@ physical-effect proofs:
 | BranchMerge | Onto main: a pointer switch, main's registration taking the source's pin. Into a named branch: a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table (Lance's plan plus every fragment still holding a dropped column), chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
+| Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
@@ -466,9 +467,13 @@ carried stored external reference the policy refuses fails as
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
+| `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
+| `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
+| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
 
 An acknowledgement is returned only after the manifest commit is durable and
-visible.
+visible; for a write `as commit`, after the proposal tag is durable and the
+captured target authority was re-probed unchanged.
 
 ## Policy and attribution
 

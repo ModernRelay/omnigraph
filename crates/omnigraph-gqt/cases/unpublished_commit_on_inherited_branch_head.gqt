@@ -1,0 +1,97 @@
+# issue: none
+# notes: P2: publish installs on the recorded target. P3: the precondition is the target's captured head and incarnation, so a write on main
+# notes: (a different branch that shares the inherited head) must not expire a proposal recorded on feature.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $bob
+
+--- query branch: feature
+query names_on_feature_before() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $bob
+query names_at_bob() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query add_carol_on_main() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+commit publish "${bob}"
+
+--- expect ok
+
+--- query branch: feature
+query names_on_feature_after() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
