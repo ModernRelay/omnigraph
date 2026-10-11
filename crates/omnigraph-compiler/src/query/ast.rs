@@ -684,15 +684,6 @@ impl Expr {
             _ => None,
         }
     }
-
-    /// The scalar type of the column `score_column` names: Lance writes
-    /// `F32` scores and distances, the fusion an `F64` sum.
-    pub(crate) fn score_type(&self) -> ScalarType {
-        match self {
-            Expr::Rrf { .. } => ScalarType::F64,
-            _ => ScalarType::F32,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -16,6 +16,20 @@ A query runs against one resolved `ReadTarget`:
 5. Execute the IR against the same snapshot.
 6. Serialize result batches at the calling boundary.
 
+Type checking constructs a complete `CheckedReadQuery` or
+`CheckedMutationQuery`. Its private fields retain typed expressions, scopes,
+parameter declarations and operation metadata. Each input expression and
+literal payload is resolved once per successful checking invocation, including
+null members of literal lists. Equal expressions at different source locations
+are separate occurrences.
+
+Lowering and result-schema inference consume the checked value and read its
+retained types. Callers use the same accepted catalog for checking, lowering
+and schema inference. Lowering still inserts comparison casts, folds constants
+and substitutes search scores; validation of the resulting IR remains fallible.
+The compiler's occurrence tests check resolution counts independently and
+assert that lowering and schema inference perform no further resolution.
+
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
 branch reads may reuse version-keyed derived state.
