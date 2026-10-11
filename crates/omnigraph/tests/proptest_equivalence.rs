@@ -142,11 +142,16 @@ fn arb_graph() -> impl Strategy<Value = GenGraph> {
     })
 }
 
+/// `PROPTEST_CASES` when set (`Config::default()` reads it), 12 otherwise;
+/// the nightly runs this binary at 48.
 fn config() -> Config {
-    Config {
-        cases: 48,
-        ..Config::default()
-    }
+    let defaults = Config::default();
+    let cases = if std::env::var_os("PROPTEST_CASES").is_some() {
+        defaults.cases
+    } else {
+        12
+    };
+    Config { cases, ..defaults }
 }
 
 async fn load_graph(graph: &GenGraph) -> (tempfile::TempDir, Session) {

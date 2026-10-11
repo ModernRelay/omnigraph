@@ -2034,18 +2034,20 @@ async fn sibling_branch_creates_exclude_at_the_schema_gate() {
     let first = tokio::spawn(async move { first_db.branch_create("feature").await });
     after_inventory.wait_until_reached().await;
 
+    let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let second_db = std::sync::Arc::clone(&db);
-    let mut second = tokio::spawn(async move {
+    let second = tokio::spawn(async move {
         second_db
             .branch_create_from(ReadTarget::branch("b"), "feature/x")
             .await
     });
-    let overtaking = tokio::time::timeout(std::time::Duration::from_secs(1), &mut second).await;
+    queued.wait_until_reached().await;
     assert!(
-        overtaking.is_err(),
+        !second.is_finished(),
         "a sibling create must wait at the schema gate while the first create sits \
          between its inventory and its native create"
     );
+    queued.release();
 
     after_inventory.release();
     first

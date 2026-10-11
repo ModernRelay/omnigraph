@@ -48,8 +48,10 @@ fn account(index: usize) -> String {
     format!("account-{index}-{}", "x".repeat(54))
 }
 
-pub async fn fixture(dir: &tempfile::TempDir, scale: usize) -> Session {
-    assert!(scale > 0);
+/// Every sender's edge count is `EDGE_COUNTS[sender] * scale / divisor`,
+/// appended in loads of `KEYED_WRITE_MAX_ROWS` (8,192) edges, the ingress cap.
+pub async fn fixture(dir: &tempfile::TempDir, scale: usize, divisor: usize) -> Session {
+    assert!(scale > 0 && divisor > 0);
     let db = session(
         Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
             .await
@@ -66,10 +68,10 @@ pub async fn fixture(dir: &tempfile::TempDir, scale: usize) -> Session {
     let destination = account(EDGE_COUNTS.len());
     for (sender, edges) in EDGE_COUNTS.into_iter().enumerate() {
         let source = account(sender);
-        let edges = edges.checked_mul(scale).unwrap();
-        for start in (0..edges).step_by(4_096) {
+        let edges = edges.checked_mul(scale).unwrap() / divisor;
+        for start in (0..edges).step_by(8_192) {
             let mut lines = Vec::new();
-            for edge in start..(start + 4_096).min(edges) {
+            for edge in start..(start + 8_192).min(edges) {
                 let data = if edge % 4 == 0 {
                     serde_json::json!({})
                 } else {
@@ -122,12 +124,12 @@ fn rows(batches: &[RecordBatch]) -> Vec<(String, i64, u64)> {
     result
 }
 
-pub async fn assert_streaming_contract(db: &Session, scale: usize, limit: u64) {
+pub async fn assert_streaming_contract(db: &Session, scale: usize, divisor: usize, limit: u64) {
     let expected: Vec<_> = EDGE_COUNTS
         .into_iter()
         .enumerate()
         .map(|(sender, edges)| {
-            let count = edges.checked_mul(scale).unwrap() / 4 * 3;
+            let count = edges.checked_mul(scale).unwrap() / divisor / 4 * 3;
             let count = i64::try_from(count).unwrap();
             (account(sender), count, (count as f64 * 2.0).to_bits())
         })
@@ -151,9 +153,8 @@ pub async fn assert_streaming_contract(db: &Session, scale: usize, limit: u64) {
     assert_eq!(rows(result.batches()), expected);
     let total_edges = EDGE_COUNTS
         .iter()
-        .sum::<usize>()
-        .checked_mul(scale)
-        .unwrap();
+        .map(|edges| edges.checked_mul(scale).unwrap() / divisor)
+        .sum::<usize>();
     let metrics = probes.execution_metrics();
     let expand = metrics
         .iter()
