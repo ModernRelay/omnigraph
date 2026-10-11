@@ -538,8 +538,8 @@ pub enum PhysicalNode {
         outer_var: String,
     },
     /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
-    /// ranked scan, fused by reciprocal rank; `k` as the query wrote it (`None`
-    /// the default), `limit` the fused rows, `prefilter` feeds the `bm25` arms.
+    /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
+    /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
     RankFuse {
         arms: [RankArm; 2],
         k: Option<IRExpr>,

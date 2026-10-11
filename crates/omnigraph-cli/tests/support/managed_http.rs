@@ -367,12 +367,7 @@ impl IntentApiFixture {
                                     br#"{"error":"proxy lost upstream response"}"#.to_vec();
                             }
                             MergeDeliveryFault::CallerWait => {
-                                let until = std::time::Instant::now() + Duration::from_secs(32);
-                                while !stopped.load(Ordering::SeqCst)
-                                    && std::time::Instant::now() < until
-                                {
-                                    sleep(Duration::from_millis(2));
-                                }
+                                hold_consumed_reply(&mut stream, &stopped, Duration::from_secs(32));
                                 continue;
                             }
                         }
@@ -387,12 +382,7 @@ impl IntentApiFixture {
                         match fault {
                             DeploymentDeliveryFault::DisconnectAfterAcceptance => continue,
                             DeploymentDeliveryFault::WaitAfterAcceptance => {
-                                let until = std::time::Instant::now() + Duration::from_secs(4);
-                                while !stopped.load(Ordering::SeqCst)
-                                    && std::time::Instant::now() < until
-                                {
-                                    sleep(Duration::from_millis(2));
-                                }
+                                hold_consumed_reply(&mut stream, &stopped, Duration::from_secs(4));
                                 continue;
                             }
                             DeploymentDeliveryFault::PassThrough => {}
@@ -495,6 +485,34 @@ impl IntentApiFixture {
                 1,
                 "a deployment is submitted once, regardless of lost delivery"
             );
+        }
+    }
+}
+
+/// Hold a consumed upstream reply until the caller hangs up, the fixture
+/// stops, or `bound` elapses: the caller's abandonment ends it, not a timer.
+fn hold_consumed_reply(
+    stream: &mut std::net::TcpStream,
+    stopped: &std::sync::atomic::AtomicBool,
+    bound: Duration,
+) {
+    use std::sync::atomic::Ordering;
+
+    let until = std::time::Instant::now() + bound;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(2)))
+        .unwrap();
+    let mut probe = [0u8; 64];
+    while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        match stream.read(&mut probe) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
         }
     }
 }

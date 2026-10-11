@@ -151,7 +151,8 @@ features are reused.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
-Current-version live schema and policy deployment remains required by `Test Workspace`.
+The complete current-version live-apply CLI journey runs in `Tests slow nightly`.
+`Test Workspace` retains the focused deployment and delivery-loss tests.
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating four qualification jobs. `GQT (ordinary)` checks
@@ -508,6 +509,13 @@ unavailable-runtime refusal test does not replace executing the DST cases.
 `crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
 a time; it is not a required context, and it is its own workflow because the
 GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
+`tests-slow-nightly.yml` (cron 04:15 UTC + manual dispatch) runs the
+`#[ignore]`d Rust tests enrolled by exact name in its list, the `nightly:`
+deadline and journey tests and the `heavy-repro:` scale repros (`AGENTS.md`,
+ignore species), through `cargo nextest run --run-ignored only` on the
+workspace graph with `--no-fail-fast`, then `check-workspace-test-owners.py`
+over its JUnit report, so an enrolled test that was renamed, filtered out or
+red fails the run; it is not a required context.
 
 ## Local pre-push checks
 

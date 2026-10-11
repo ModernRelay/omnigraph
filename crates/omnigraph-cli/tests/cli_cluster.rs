@@ -71,6 +71,7 @@ fn lifecycle_fixture(replies: Vec<IntentReply>) -> IntentApiFixture {
 /// The source directory belongs to the caller; the file storage root belongs
 /// to the server. An absent client-side mount must not prevent HTTP submission.
 #[test]
+#[ignore = "nightly: six live-apply modes on the real 500 ms poll interval and a 1 s --timeout"]
 fn core_live_apply_captures_server_file_root_without_local_storage_access() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
@@ -787,6 +788,7 @@ fn managed_lifecycle_delete_and_undo_send_exact_authority_targets() {
 }
 
 #[test]
+#[ignore = "nightly: two real 2 s managed poll intervals"]
 fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
     let temp = tempdir().unwrap();
     let tombstone = lifecycle_envelope("delete", "running", "tombstoned");
@@ -856,6 +858,7 @@ fn managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity() {
 }
 
 #[test]
+#[ignore = "nightly: a real 1 s --timeout slept to the deadline"]
 fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
     let temp = tempdir().unwrap();
     let mut bad = lifecycle_envelope("create", "proposed", "provisioning");
@@ -1811,6 +1814,7 @@ fn managed_plan_and_apply_submit_exact_intent_without_waiting() {
 }
 
 #[test]
+#[ignore = "nightly: a real 2 s managed poll and a 1 s --timeout"]
 fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
     for timeout in [false, true] {
         let temp = tempdir().unwrap();

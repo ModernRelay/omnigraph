@@ -114,10 +114,13 @@ query relevant($q: String) {
 the projected `bm25(...)` must repeat the leading `order` key (`T33`), and
 `nearest(...)` projects its distance the same way; that distance is the
 squared L2 distance Lance ranks by. Without an alias the column is
-`d._score` or `d._distance`. `rrf(...)` in `return` is refused until the
-fused score becomes a column (`T37`), and so is a `nearest(...)` or
-`bm25(...)` that appears only as an `rrf` arm, and so are the predicates
-`search(...)`, `fuzzy(...)` and `match_text(...)` (`T35`).
+`d._score` or `d._distance`. `rrf(...)` projects the fused score under the
+same rule, an `F64` named `d._rrf` after its first arm's binding without an
+alias. A `nearest(...)` or `bm25(...)` that appears only as an `rrf` arm is
+refused (`T33`), and so are the predicates `search(...)`, `fuzzy(...)` and
+`match_text(...)` (`T35`). A relevance ranking orders most relevant first:
+`asc` on a `bm25(...)` or `rrf(...)` order key is refused (`T54`), as any
+modifier on `nearest(...)` is at parse time.
 
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with`, or literal substring `contains`.
@@ -138,7 +141,10 @@ query hybrid($vector: Vector(4), $text: String) {
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
-secondary keys and the entity-id tie-break applied after the score. The full
+secondary keys and the entity-id tie-break applied after the score. A fused
+order sorts every row by the fused score, then the keys written after
+`rrf(...)`, then every binding's id, and `limit` counts rows after that order;
+an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
 ## Indexes
