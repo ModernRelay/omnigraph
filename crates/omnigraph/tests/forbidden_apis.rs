@@ -259,6 +259,9 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication") => ["settle_prepared_schema_as"],
     "db/omnigraph.rs" => SYSTEM_COLUMNS_V9 => ["upgrade_system_columns", "upgrade_system_columns_as"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
+    "exec/merge.rs" => WriteProtocol::Composed("Merge v9, published either as the target head or as an unpublished commit that keeps its merge-input tags") => ["branch_merge_as_with_options"],
+    "db/omnigraph.rs" => WriteProtocol::Exact("unpublished commit publication: the proposal's recorded changes replayed through the manifest publisher under its captured authority, required to allocate the proposal's own id") => ["publish_commit_as"],
+    "db/omnigraph.rs" => WriteProtocol::Composed("proposal tag removal confirmed by a readback, then merge-input tag release") => ["drop_commit_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
         "ensure_indices", "ensure_indices_on",
         "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
@@ -322,7 +325,9 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
+    ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    ("db/omnigraph.rs", "list_unpublished_commits"),
     ("exec/query_doors.rs", "query"),
     ("exec/query_doors.rs", "query_with_head"),
     ("exec/query_doors.rs", "run_query_at"),
@@ -548,6 +553,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
+        "read_rows_at",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
         "record_in_live_branches",
     ),
     (
@@ -569,6 +579,21 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "list_graph_branches",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "unpublished_commit",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "unpublished_from_tag",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "list_unpublished",
     ),
 ];
 
@@ -632,6 +657,46 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "ManifestCoordinator",
         "delete_branch_with_expected",
         WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "propose_changes",
+        WriteProtocol::Exact(
+            "unpublished commit gateway: candidate rows detached under the exact captured authority, head unchanged",
+        ),
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "publish_unpublished",
+        WriteProtocol::Exact(
+            "publication of an unpublished commit through the shared publisher gateway",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "propose_changes",
+        WriteProtocol::Exact(
+            "unpublished commit gateway: candidate rows detached under the exact captured authority, head unchanged",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "publish_unpublished",
+        WriteProtocol::Exact(
+            "publication of an unpublished commit through the lowest manifest publisher gateway, required to allocate the candidate's own id",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "drop_unpublished",
+        WriteProtocol::Composed(
+            "proposal tag removal confirmed by a readback, then merge-input tag release",
+        ),
     ),
 ];
 
@@ -809,6 +874,9 @@ gateway_surfaces! {
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("manifest publisher gateway")) => [
         "publish_with_precondition",
     ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("unpublished commit gateway: the candidate rows as a detached `__manifest` version under the exact captured authority, addressed by a put-if-absent proposal tag; the branch head is unchanged")) => [
+        "write_candidate",
+    ],
     "omnigraph-catalog/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
     ],
@@ -840,7 +908,7 @@ durable_calls! {
     // deletion is last, so interrupted settlement can safely finish later.
     ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
     ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
-    ("db/upgrade.rs", "CommitBuilder::new(", 3, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent")),
+    ("db/upgrade.rs", "CommitBuilder::new(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the v14 to v15 route")),
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
@@ -855,9 +923,13 @@ durable_calls! {
     ("omnigraph-catalog/history.rs", ".put_if_absent(", 2, WriteProtocol::Composed("create-only puts of immutable `__history` objects: an extent of settled commit records (`write_extent`), issued by the publisher before its `__manifest` CAS and by branch deletion before the ref is retired, and a schema content object named by its hash")),
     ("omnigraph-catalog/publisher.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-catalog/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
+    ("omnigraph-catalog/publisher.rs", ".tags(", 2, WriteProtocol::Composed("proposal tag put-if-absent at the detached candidate version, and its readback when the creation reports a conflict")),
+    ("omnigraph-catalog/unpublished.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unpublished.rs", ".tags(", 3, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unpublished.rs", ".delete(", 1, WriteProtocol::Composed("release one proposal tag: after its publication, on an acknowledged drop, or by cleanup of an expired proposal; absence is the completed outcome")),
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or
@@ -914,7 +986,7 @@ durable_calls! {
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
-    ("exec/merge.rs", ".dataset()", 4, WriteProtocol::Exact("RFC 0067 detached merge chain")),
+    ("exec/merge.rs", ".dataset()", 5, WriteProtocol::Exact("RFC 0067 detached merge chain, and the held source coordinates a merge `as commit` records")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached metadata-only schema evolution + incompatible original-empty-table retry")),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
@@ -926,18 +998,18 @@ durable_calls! {
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
     ("db/omnigraph.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher wrapper")),
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
-    ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
+    ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply/settlement.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication")),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/unpublished.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("publication of an unpublished commit: its recorded changes through the ordinary publisher under the captured authority, required to allocate the candidate's own id")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
     ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap init claim + owned local-root create-if-absent probe")),
     ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init claim release + owned local-root probe removal")),
     ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
-    ("db/omnigraph/optimize.rs", "compact_files(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", ".commit_staged_detached(", 3, WriteProtocol::Exact("RFC 0067 detached compaction rewrite, index fold and deferred index build")),
     ("db/omnigraph/optimize.rs", "commit_updates_on_branch_with_expected(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
@@ -987,7 +1059,7 @@ durable_calls! {
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 8, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup, including the release of expired proposal tags")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }

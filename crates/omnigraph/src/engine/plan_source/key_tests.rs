@@ -62,7 +62,7 @@ async fn run_with_access(
         let checked =
             omnigraph_compiler::query::typecheck::typecheck_query(catalog, statement.decl())
                 .unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, statement.decl(), &checked).unwrap();
+        let ir = omnigraph_compiler::lower_query(catalog, &checked).unwrap();
         let settings = SessionSettings::default();
         let source = QuerySource::gather(&ir, catalog, &snapshot, params, &settings)
             .await

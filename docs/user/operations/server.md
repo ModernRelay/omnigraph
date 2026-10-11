@@ -230,14 +230,14 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
 | `/graphs/{id}/branches` | Branch management and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
 `/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
-`/mutate` serves `branch create`, `branch delete`, and `branch merge`.
-See [Branching](../branching/index.md).
+`/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
+and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).

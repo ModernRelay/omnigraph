@@ -800,6 +800,17 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
             target,
             merge,
         }) => println!("merged {source} into {target}: {}", merge.as_str()),
+        Some(BranchOutcomeOutput::Published) => println!(
+            "published commit {} on {}",
+            output
+                .commit
+                .as_ref()
+                .map_or("?", |commit| commit.graph_commit_id.as_str()),
+            output.branch
+        ),
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
+            println!("dropped commit {graph_commit_id} on {}", output.branch)
+        }
         None => println!(
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
@@ -834,6 +845,9 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
         commit.graph_branch.as_deref().unwrap_or("main")
     );
     println!("graph_manifest_version: {}", commit.graph_manifest_version);
+    if !commit.published {
+        println!("published: false");
+    }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);
     }

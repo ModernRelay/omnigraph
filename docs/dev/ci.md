@@ -218,9 +218,12 @@ workflow carries the `Classify Changes` copy under the name
 (`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
 regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
 `issue_N` function, added or strengthened, in a top-level test target
-(`tests/<name>.rs`) or `src/` module under `crates/*` or `tools/*` (an owner
+(`tests/<name>.rs`), `tests/integration/main.rs` or its direct modules, or a
+`src/` module under `crates/*` or `tools/*` (an owner
 test not yet named for the issue is renamed to carry `issue_N` when
-extended). A PR whose diff changes no path under `crates/` or `tools/`
+extended). An integration module requires a bare, top-level `mod <name>;`
+declaration in that root at the range's head commit. Attributed declarations,
+path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/` or `tools/`
 (Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
 passes unexamined, with a notice annotation saying so: a fix in a workflow, a
 script, a document, or a deployment file has no logic or Rust test that could
@@ -247,8 +250,42 @@ characters with no whitespace but the plain space; `docs(rfc):` is refused in fa
 `Revert "…"` title in favour of `revert: …` (the rule and its examples:
 [CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests).
 `scripts/check-pr-title.py` is the check; it runs its `--self-test` first and
-prints one actionable failure line with the accepted shape and two examples,
-as a log line and as a GitHub error annotation. It is a policy check on
+prints each independently detectable problem with a stable diagnostic code
+and a repair instruction, both in the log and in a GitHub error annotation.
+Length failures include the actual length, the limit and how many characters
+must be removed. Text output uses red failures, yellow repairs and green
+successes on a terminal or in Actions. Use `--color never` or set `NO_COLOR`
+to a nonempty value to disable automatic color; `--color always` forces it.
+Agents can use `--format json` with either input option for one JSON object.
+Version 1 carries `schema_version`, `offset_unit`, `input_kind`, `valid`,
+`title`, `length`, `max_length`, `excess` and `errors`. Each error has a closed
+`code`, its `field`, a `span` with `start` and `end`, the exact `found` text,
+`expected`, `message` and `fix`. Ranges are zero-based, end-exclusive Unicode
+code-point offsets in the checked `title`; for a squash message, that means
+the extracted title. A zero-width range marks a missing token; an unclosed
+scope marks its unmatched opening parenthesis. The human report names the
+same range using one-based character positions, or an insertion offset.
+`--schema` prints the JSON Schema with the allowed codes, fields and record
+shapes. Enum types close the code, field, input, format and color sets;
+immutable records validate ranges and their original-title slices at runtime.
+Numeric facts and the validity flag are derived from the report.
+JSON contains no color or Actions annotations.
+Both formats exit 0 for an accepted title and 1 for a refused title;
+invalid command-line arguments exit 2. For example:
+
+```bash
+python3 scripts/check-pr-title.py --title "fix(merge): find the merge base over contracted lineage" --format json
+python3 scripts/check-pr-title.py --schema
+```
+
+The check uses Python 3.11 or later and the standard library. Its `--self-test`
+entry point runs `scripts/test_check_pr_title.py`, including an exact range
+and field fixture for every error code, Unicode/length boundaries, parser
+refusals, runtime type invariants and each output/CLI mode. When editing the
+checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
+development environment with mypy installed. The enum dispatches are exhaustive.
+
+It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
 and the pull request head is never fetched. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`
@@ -383,6 +420,14 @@ the job requires by name (the two upgrade journeys and the CLI/server/proxy
 journeys listed in the step) and for the upgrade journeys' captured notices,
 in place of grepping a `--nocapture` log. The local command in
 [testing.md](testing.md) stays `cargo test`; the two run the same binaries.
+
+Every run, red or green, uploads that report as `test-workspace-junit` and
+the compile step's `--timings` page as `test-workspace-build-timings`, both
+kept 14 days: per-test durations and per-crate compile and link times on the
+hosted runner, which any change to this job's scheduling is sized from. The
+`ci` profile terminates a test that runs ten minutes (`slow-timeout`), so a
+hang fails as a named test instead of holding the job to its 60-minute limit,
+and a test still running after one minute is reported as `SLOW` in the log.
 
 The `main` run also seeds the dependency cache that pull requests restore.
 Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and

@@ -1071,8 +1071,13 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
+                let publication = if ir.as_commit {
+                    crate::db::omnigraph::Publication::Propose(None)
+                } else {
+                    crate::db::omnigraph::Publication::Publish
+                };
                 let commit = self
-                    .publish_committed_mutation(committed, &txn, actor_id)
+                    .publish_committed_mutation(committed, &txn, actor_id, publication)
                     .await?;
                 Ok(crate::MutationReceipt {
                     result: total,
@@ -1111,13 +1116,14 @@ impl Omnigraph {
         })
     }
 
-    /// The second half of the Mutation protocol's tail: publish every detached
-    /// effect in one manifest CAS. This is the protocol's one publisher call.
+    /// Finish the Mutation protocol's tail through the selected publication
+    /// mode. This is the protocol's one publisher call.
     pub(super) async fn publish_committed_mutation(
         &self,
         committed: CommittedStagedMutation,
         txn: &crate::db::WriteTxn,
         actor_id: Option<&str>,
+        publication: crate::db::omnigraph::Publication,
     ) -> Result<crate::db::GraphCommit> {
         let CommittedStagedMutation {
             committed:
@@ -1151,6 +1157,7 @@ impl Omnigraph {
             actor_id,
             txn,
             lineage_intent,
+            publication,
         )
         .await
     }
@@ -1182,7 +1189,7 @@ impl Omnigraph {
             }
         };
 
-        let ir = lower_mutation_query(catalog, &query_decl, &mutation_ctx)?;
+        let ir = lower_mutation_query(catalog, &mutation_ctx)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
         Ok(ir)
@@ -1946,8 +1953,11 @@ mod literal_narrowing_tests {
 mod target_tests {
     use super::*;
     use crate::loader::LoadMode;
-    use omnigraph_compiler::query::typecheck::MutationTypeContext;
+    use omnigraph_compiler::ir::coerce;
+    use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationIR};
+    use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
     use omnigraph_compiler::settings::SessionSettings;
+    use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     #[tokio::test]
     async fn retained_edge_target_selects_edge_staging() {
@@ -1983,21 +1993,50 @@ edge Shared: Endpoint -> Endpoint { label: String }
         let target = MutationTarget::Edge {
             type_name: "Shared".into(),
         };
-        let ctx = MutationTypeContext {
-            targets: vec![target.clone()],
+        let string_type = || ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
+        let string = |text: &str| IRExpr::Literal(Literal::String(text.into()), string_type());
+        let assignment = |property: &str, text: &str| IRAssignment {
+            property: property.into(),
+            value: string(text),
         };
-        for (source, is_insert) in [
+        let label_is = |text: &str| {
+            coerce::binary(
+                IRExpr::PropAccess {
+                    variable: "Shared".into(),
+                    property: "label".into(),
+                    ty: string_type(),
+                },
+                BinaryOp::Compare(CompOp::Eq),
+                string(text),
+            )
+            .unwrap()
+        };
+        let mutation = |op: MutationOpIR| MutationIR {
+            name: "q".into(),
+            params: Vec::new(),
+            ops: vec![op],
+            as_commit: false,
+        };
+        for (ir, is_insert) in [
             (
-                r#"query q() { insert Shared { from: "a", to: "b", label: "new" } }"#,
+                mutation(MutationOpIR::Insert {
+                    target: target.clone(),
+                    assignments: vec![
+                        assignment("from", "a"),
+                        assignment("to", "b"),
+                        assignment("label", "new"),
+                    ],
+                }),
                 true,
             ),
             (
-                r#"query q() { delete Shared where label = "existing" }"#,
+                mutation(MutationOpIR::Delete {
+                    target: target.clone(),
+                    predicate: label_is("existing"),
+                }),
                 false,
             ),
         ] {
-            let decl = omnigraph_compiler::find_named_query(source, "q").unwrap();
-            let ir = lower_mutation_query(&txn.catalog, &decl, &ctx).unwrap();
             let retained = match &ir.ops[0] {
                 MutationOpIR::Insert { target, .. } | MutationOpIR::Delete { target, .. } => target,
                 other => panic!("unexpected operation: {other:?}"),
@@ -2029,12 +2068,11 @@ edge Shared: Endpoint -> Endpoint { label: String }
             }
         }
 
-        let decl = omnigraph_compiler::find_named_query(
-            r#"query q() { update Shared set { label: "changed" } where label = "existing" }"#,
-            "q",
-        )
-        .unwrap();
-        let ir = lower_mutation_query(&txn.catalog, &decl, &ctx).unwrap();
+        let ir = mutation(MutationOpIR::Update {
+            target: target.clone(),
+            assignments: vec![assignment("label", "changed")],
+            predicate: label_is("existing"),
+        });
         let MutationOpIR::Update {
             target: retained, ..
         } = &ir.ops[0]

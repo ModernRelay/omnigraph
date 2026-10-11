@@ -427,7 +427,12 @@ impl Omnigraph {
             BlobCellValue::Null => None,
         };
         let commit = self
-            .publish_committed_mutation(committed, &txn, actor_id)
+            .publish_committed_mutation(
+                committed,
+                &txn,
+                actor_id,
+                crate::db::omnigraph::Publication::Publish,
+            )
             .await?;
         Ok(match managed {
             Some((length, etag)) => BlobWriteOutcome::Managed {

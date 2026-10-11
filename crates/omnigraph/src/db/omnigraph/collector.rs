@@ -179,6 +179,10 @@ pub struct CollectorReport {
     /// Nonce-owned tags whose target can no longer publish, released only by
     /// destructive cleanup after planning. Inspection never mutates storage.
     pub(crate) expired_merge_input_tags: Vec<String>,
+    /// Proposal tags whose unpublished commit can no longer be published
+    /// (RFC "Unpublished graph commits"), released beside the merge-input
+    /// tags by destructive cleanup.
+    pub(crate) expired_unpublished_tags: Vec<String>,
     /// Owners visible in the same graph cut as every physical root.
     pub(crate) live_branch_incarnations: HashSet<String>,
     /// Retired graph trees still supplying an exact root or imported lineage.
@@ -929,6 +933,26 @@ pub(crate) async fn plan_collection(
     }
     let live_count = captured_lineages.len();
     for (name, tag) in &tags.tags {
+        if crate::db::manifest::is_unpublished_tag(name) {
+            let candidate =
+                crate::db::manifest::UnpublishedCommit::from_inventory(&tags, db.root_uri(), name)
+                    .await?;
+            report.cost.manifest_snapshots += 1;
+            match candidate.lifetime {
+                crate::db::manifest::UnpublishedLifetime::Expired(_) => {
+                    report.expired_unpublished_tags.push(name.clone());
+                }
+                crate::db::manifest::UnpublishedLifetime::Live
+                | crate::db::manifest::UnpublishedLifetime::Undecidable(_) => {
+                    report
+                        .protected_manifest_branches
+                        .extend(tag.branch.iter().cloned());
+                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    record_roots(db, &snapshot, &mut roots, &mut tables);
+                }
+            }
+            continue;
+        }
         let dead = if let Some(owner) = merge_input_owner(name)? {
             if let Some(view) = views
                 .iter_mut()

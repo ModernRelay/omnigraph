@@ -34,8 +34,9 @@ A closed issue N is satisfied by a regression that is added or
 strengthened. Corpus shape: a regular `.gqt` case named `issue_N_*` anywhere
 under the logic-test corpus, with no hidden path components. It must be new
 or modified with at least one added body line (a line that is neither a `#` header line nor a `//` comment).
-Rust shapes, in a top-level test target `<crates|tools>/*/tests/<name>.rs`
-or an in-source module under `<crates|tools>/*/src/`: an added test
+Rust shapes, in a top-level test target `<crates|tools>/*/tests/<name>.rs`,
+`tests/integration/main.rs` or its directly declared modules, or an
+in-source module under `<crates|tools>/*/src/`: an added test
 definition, a function whose name carries `issue_N`, with an added
 `#[test]` or `#[<path>::test]` attribute line (`#[tokio::test(...)]`
 included) directly above it in the same hunk, other `#[...]` attribute
@@ -47,8 +48,11 @@ function whose name carries `issue_N`, located by the hunk's new-file line
 number in the file at the head commit. An owner test not named for the
 issue is extended by renaming it to carry `issue_N` in the same change
 (the rename alone never counts; the rename plus the assertion does).
-Helper and fixture modules under `tests/<dir>/` never match, and a plain
-function, however named, never matches. Owners the gate does not
+Integration modules require a bare, top-level `mod <name>;` declaration in
+`tests/integration/main.rs` at the head commit; attributed declarations,
+path overrides and deeper modules are not resolved. Other helper and fixture
+modules under `tests/<dir>/` never match, and a plain function, however named,
+never matches. Owners the gate does not
 recognize inside the code paths (a helper or fixture module, a script
 under a crate, a rustdoc-only change) satisfy it only through the
 `no-repro` label, which a maintainer applies. What a match guarantees
@@ -118,8 +122,7 @@ WORKSPACE_MEMBERS = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DO
 # accepts it (`crates/omnigraph-gqt-core/src/lib.rs`, `parse_header`).
 CASE_ISSUE_HEADER = re.compile(r"^# issue: ([1-9]\d*)$")
 CASE_ISSUE_STEM = re.compile(r"^issue[_-]?0*(\d+)[_-]?", re.IGNORECASE)
-# A Rust file under a crate's `tests/<dir>/`: a helper or fixture module,
-# never a top-level target.
+# Nested Rust test paths need owner discovery before crediting a regression.
 RUST_NESTED_TEST_PATH = re.compile(r"^(?:crates|tools)/[^/]+/tests/[^/]+/.+\.rs$")
 CORPUS_PATH_SENTENCE = "crates/omnigraph-gqt/cases/"
 WAIVER_LABEL = "no-repro"
@@ -145,6 +148,9 @@ CORPUS_DIR_PREFIX = "crates/omnigraph-gqt/cases/"
 # One path segment after `tests/` (a top-level target) or any `.rs` under
 # `src/`, in a `crates/` or `tools/` workspace member.
 RUST_FN_PATH = re.compile(r"^(?:crates|tools)/[^/]+/(?:tests/[^/]+\.rs|src/.+\.rs)$")
+RUST_INTEGRATION_PATH = re.compile(
+    r"^((?:crates|tools)/[^/]+/tests/integration)/([A-Za-z_][A-Za-z0-9_]*)\.rs$"
+)
 RUST_FN_DEF = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
     r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z0-9_]+)'
@@ -157,6 +163,44 @@ ATTR_OR_COMMENT = re.compile(r"^\s*(?:#\[|//)")
 # Inserted into the added-line list at every hunk header, so the lookback
 # never joins lines that are not adjacent in the new file.
 HUNK_BREAK = ("", "")
+
+
+def rust_test_owner(path: str, read_file=None) -> bool:
+    """Resolve the canonical integration root's bare module declarations at HEAD.
+
+    Attribute-bearing declarations are deliberately excluded, including path
+    overrides that attach helpers from outside the integration directory.
+    Like the test-body parser, this is not a full Rust parser: raw strings and
+    nested block comments stay with review.
+    """
+    if RUST_FN_PATH.match(path):
+        return True
+    match = RUST_INTEGRATION_PATH.match(path)
+    if match is None or read_file is None:
+        return False
+    root = read_file(f"{match.group(1)}/main.rs")
+    if root is None:
+        return False
+    if match.group(2) == "main":
+        return True
+    source = re.sub(r"/\*.*?\*/", "", "\n".join(root), flags=re.DOTALL)
+    depth = 0
+    attributed = False
+    attribute_depth = 0
+    for line in source.splitlines():
+        code = line.split("//", 1)[0].strip()
+        if not code:
+            continue
+        if attribute_depth or (depth == 0 and code.startswith("#[")):
+            attributed = True
+            brackets = BRACE_NOISE.sub("", line)
+            attribute_depth += brackets.count("[") - brackets.count("]")
+            continue
+        if depth == 0 and code == f"mod {match.group(2)};":
+            return not attributed
+        depth -= brace_delta(line)
+        attributed = False
+    return False
 
 
 def git_diff(*args: str) -> str:
@@ -309,7 +353,7 @@ def issue_satisfied(
                 and Path(path).name.startswith(f"issue_{n}_")
             ):
                 return True
-        elif RUST_FN_PATH.match(path):
+        elif rust_test_owner(path, read_file):
             m = RUST_FN_DEF.match(text)
             if (
                 m
@@ -322,13 +366,14 @@ def issue_satisfied(
                 return True
     if read_file is not None:
         for path, lineno, text in positioned:
-            if RUST_FN_PATH.match(path) and strengthens_test(token, path, lineno, text, read_file):
+            if rust_test_owner(path, read_file) and strengthens_test(token, path, lineno, text, read_file):
                 return True
     return False
 
 
 def near_misses(
-    n: str, lines: list[tuple[str, str]], removed_fns: frozenset[str] | set[str] = frozenset()
+    n: str, lines: list[tuple[str, str]], removed_fns: frozenset[str] | set[str] = frozenset(),
+    read_file=None,
 ) -> list[str]:
     """What the diff holds that almost satisfies issue `n`, named in the
     failure and never credited: a corpus case whose header says
@@ -366,11 +411,12 @@ def near_misses(
                 continue
             fn = m.group(1)
             attributed = test_attributed(lines, i)
-            if RUST_NESTED_TEST_PATH.match(path):
+            if not rust_test_owner(path, read_file):
                 if token.search(fn) and attributed:
                     hints.append(
-                        f"`fn {fn}` in `{path}` sits in a helper or fixture module; only a "
-                        f"top-level target `tests/<name>.rs` or a `src/` module counts"
+                        f"`fn {fn}` in `{path}` sits in an unrecognized helper or fixture module; "
+                        f"use a top-level target `tests/<name>.rs`, a bare module declared by "
+                        f"`tests/integration/main.rs`, that root itself, or a `src/` module"
                     )
             elif token.search(fn) and fn.startswith("_") and attributed:
                 hints.append(f"`fn {fn}` in `{path}` starts with `_`; drop the underscore")
@@ -408,7 +454,7 @@ def failure_message(n: str, code_paths: list[str], hints: list[str]) -> str:
         f"    1. add {CORPUS_DIR_PREFIX}issue_{n}_<short_name>.gqt: the query that went wrong "
         "before the fix, with the rows it returns after (the corpus runs it on every PR)",
         f"    2. add a #[test] function named for issue_{n} in crates/*/tests/<name>.rs, "
-        "tools/*/tests/<name>.rs, or their src/",
+        "tools/*/tests/<name>.rs, their tests/integration/main.rs or its bare declared modules, or their src/",
         f"    3. extend an existing test: rename it to carry issue_{n} and add the assertion",
         f"    4. no test can exist (perf-only, a race, a removal, a docs-only change inside "
         f"a crate such as rustdoc): ask a maintainer for the `{WAIVER_LABEL}` label",
@@ -630,7 +676,7 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
         return 1
     removed_fns = removed_fn_names(removed)
     read_file = head_file_reader(range_)
-    for path in sorted({p for p, _, _ in positioned if RUST_FN_PATH.match(p)}):
+    for path in sorted({p for p, _, _ in positioned if rust_test_owner(p, read_file)}):
         if read_file(path) is None:
             print(
                 f"warn: {path} could not be read at the head commit; an added line "
@@ -640,14 +686,75 @@ def run_gate(body: str, labels: list[str], range_: str, repo: str | None) -> int
         if issue_satisfied(n, files, lines, removed_fns, positioned, read_file, corpus_files):
             print(f"ok: issue #{n} has a matching regression addition")
         else:
-            message = failure_message(n, code_paths, near_misses(n, lines, removed_fns))
+            message = failure_message(n, code_paths, near_misses(n, lines, removed_fns, read_file))
             print(message)
             annotate("error", message)
             ok = False
     return 0 if ok else 1
 
 
+def self_test_integration_owners() -> None:
+    test = ["#[test]", "fn check_issue_563() {", "    assert_eq!(1, 1);", "}"]
+    for home in ("crates/engine", "tools/checker"):
+        root = f"{home}/tests/integration/main.rs"
+        owner = f"{home}/tests/integration/search.rs"
+        sources = {root: ["mod search;"], owner: test}
+        reader = sources.get
+        added = list(zip([owner] * len(test), test))
+        assert rust_test_owner(root, reader)
+        assert issue_satisfied("563", [], added, read_file=reader)
+        assert near_misses("563", added, read_file=reader) == []
+        assert not issue_satisfied("563", [], added)
+        assert not issue_satisfied("563", [], added, read_file=lambda _: None)
+        assert not rust_test_owner(root, lambda _: None)
+        assert issue_satisfied(
+            "563", [], [], positioned=[(owner, 3, test[2])], read_file=reader
+        )
+        assert not issue_satisfied(
+            "563", [], added[:2], removed_fns={"check_issue_563"}, read_file=reader
+        )
+        assert issue_satisfied(
+            "563", [], added[:2], removed_fns={"check_issue_563"},
+            positioned=[(owner, 3, test[2])], read_file=reader,
+        )
+        hints = near_misses(
+            "563", [(owner, "#[test]"), (owner, "fn check_563() {")], read_file=reader
+        )
+        assert len(hints) == 1 and "bare number" in hints[0], hints
+        for declaration in (
+            [],
+            ["mod other;"],
+            ["// mod search;"],
+            ["/*", "mod search;", "*/"],
+            ["mod nested {", "mod search;", "}"],
+            ['#[path = "../support/mod.rs"]', "mod search;"],
+            ['#[path = "../support/mod.rs"]', "", "// owner", "mod search;"],
+            ["#[cfg_attr(", '    test, path = "../support/mod.rs"', ")]", "mod search;"],
+        ):
+            sources[root] = declaration
+            assert not issue_satisfied("563", [], added, read_file=reader), declaration
+            assert not issue_satisfied(
+                "563", [], [], positioned=[(owner, 3, test[2])], read_file=reader
+            ), declaration
+            hints = near_misses("563", added, read_file=reader)
+            assert len(hints) == 1 and "unrecognized" in hints[0], hints
+        sources[root] = ['#[path = "../support/mod.rs"]', "mod support;", "mod search;"]
+        assert issue_satisfied("563", [], added, read_file=reader)
+        for path in (
+            f"{home}/tests/integration/support.rs",
+            f"{home}/tests/integration/search/deeper.rs",
+            f"{home}/tests/helpers/mod.rs",
+            f"{home}/tests/fixtures/example.rs",
+        ):
+            assert not issue_satisfied(
+                "563", [], list(zip([path] * len(test), test)), read_file=reader
+            ), path
+        sources[root] = test
+        assert issue_satisfied("563", [], list(zip([root] * len(test), test)), read_file=reader)
+
+
 def self_test() -> int:
+    self_test_integration_owners()
     cases = [
         ("Closes #563", ["563"]),
         ("closes: #12 and fixes #7", ["7", "12"]),

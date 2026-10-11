@@ -203,6 +203,12 @@ fn crosses(op: omnigraph::seams::Op, step: Option<&crate::Step>) -> bool {
                 write: crate::ControlWrite::Delete { .. },
                 ..
             })),
+        ) | (
+            Op::AnyWrite,
+            Some(crate::Step::Control(crate::ControlStep {
+                write: crate::ControlWrite::Publish { .. } | crate::ControlWrite::Drop { .. },
+                ..
+            })),
         )
     )
 }
@@ -210,7 +216,7 @@ fn crosses(op: omnigraph::seams::Op, step: Option<&crate::Step>) -> bool {
 /// Admission of one seam directive against the registries and the step it
 /// precedes: the name must resolve, the action must be among what the entry
 /// or row declares, and the step must be of a kind that crosses the seam's
-/// operation (any mutate, load or branch step for a store place).
+/// operation (any mutate, load, branch or commit step for a store place).
 pub(crate) fn admit_seam(
     seam: &SeamDirective,
     step: Option<&crate::Step>,

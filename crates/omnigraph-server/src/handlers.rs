@@ -40,10 +40,11 @@ where
 
 mod dispatch;
 use dispatch::{
-    Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
+    CommitControlOutcome, Door, ReadDispatch, classify, commit_control_body,
+    commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
     read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, session_with_prefix,
-    show_at_write_door,
+    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
+    session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -1564,6 +1565,18 @@ pub(crate) async fn run_mutate(
                 BranchStmt::List => Err(read_at_write_door()),
             };
         }
+        FileBody::Commit(write) => {
+            if door == Door::Query {
+                return Err(commit_write_at_read_door(&write));
+            }
+            refuse_statement_envelope(
+                branch.is_some(),
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return run_commit_statement(&state, &handle, &session, actor, ingress, write).await;
+        }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
         FileBody::Explain(_) => {
             refuse_explain(door)?;
@@ -1667,6 +1680,14 @@ pub(crate) async fn run_query(
                 )),
                 BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
             };
+        }
+        FileBody::Commit(write) => {
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return Err(commit_write_at_read_door(&write));
         }
         FileBody::Show(id) => {
             refuse_statement_envelope(
@@ -2804,6 +2825,11 @@ pub(crate) async fn server_branch_merge(
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid branch merge request", rejection))?;
+    if request.as_commit && request.delete_branch {
+        return Err(ApiError::bad_request(
+            "a merge `as_commit` keeps its source until the commit is published or dropped; drop `delete_branch`",
+        ));
+    }
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, request.settings.as_ref())?;
@@ -2813,10 +2839,11 @@ pub(crate) async fn server_branch_merge(
         .operations
         .submit((admission, ingress, handle.clone()), async move {
             let result = match session
-                .branch_merge_as(
+                .branch_merge_as_with_options(
                     &request.source,
                     &target,
                     actor.as_ref().map(|actor| actor.actor_id.as_ref()),
+                    request.as_commit,
                 )
                 .await
                 .map_err(ApiError::from_omni)
@@ -2858,6 +2885,7 @@ pub(crate) async fn server_branch_merge(
 /// Body shared by `POST /branches/merge` and the `branch merge` statement:
 /// the `branch_merge` check on (`source`, `target`), admission, the engine
 /// call. A conflict surfaces as `ApiError::merge_conflict` (409).
+#[allow(clippy::too_many_arguments)]
 async fn branch_merge_body(
     state: &AppState,
     handle: &GraphRequest,
@@ -2866,6 +2894,7 @@ async fn branch_merge_body(
     ingress: IngressLease,
     source: &str,
     target: &str,
+    as_commit: bool,
 ) -> std::result::Result<MergeResult, ApiError> {
     let admission = admit_branch_merge(state, handle, actor, source, target)?;
     let session = session.clone();
@@ -2874,7 +2903,7 @@ async fn branch_merge_body(
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
     owned_write(state, admission, ingress, handle.clone(), async move {
         session
-            .branch_merge_as(&source, &target, actor_id.as_deref())
+            .branch_merge_as_with_options(&source, &target, actor_id.as_deref(), as_commit)
             .await
             .map_err(ApiError::from_omni)
     })
@@ -2965,6 +2994,10 @@ async fn delete_merged_source_branch(
 /// contract — newest first by (graph-manifest version, created-at, commit id) — and
 /// a future `cursor`/`limit` pagination will be keyset-based on that same
 /// order. Read-only.
+///
+/// `unpublished=true` lists instead the unpublished commits whose recorded
+/// target is `branch` (writes `as commit` awaiting `commit publish`), newest
+/// first; each carries `published: false`.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -2983,12 +3016,13 @@ pub(crate) async fn server_commit_list(
             target_branch: None,
         },
     )?;
-    let commits = {
-        let db = &handle.engine;
-        db.list_commits(Some(branch.as_str()))
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let db = &handle.engine;
+    let commits = if query.unpublished {
+        db.list_unpublished_commits(Some(branch.as_str())).await
+    } else {
+        db.list_commits(Some(branch.as_str())).await
+    }
+    .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
         commits: commits.iter().map(api::commit_output).collect(),
     }))
@@ -3043,6 +3077,103 @@ pub(crate) async fn server_commit_show(
             .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::commit_output(&commit)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/commits/{commit_id}/publish",
+    tag = "commits",
+    operation_id = "publishCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 200, description = "The commit as published on its recorded target branch; a published id is answered as it stands", body = api::CommitOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its publication is not permitted", body = ErrorOutput),
+        (status = 409, description = "The target's state moved under the proposal's authority", body = ErrorOutput),
+        (status = 412, description = "The target head moved past the commit's captured parent; the commit can only be dropped", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Publish an unpublished commit onto its recorded target branch.
+///
+/// The target is the branch the commit recorded when it was written `as
+/// commit`, so the request carries no body. Runs under `commit_publish` on
+/// that branch; a denial answers the 404 an unknown id answers. The GQ
+/// statement `commit publish "<id>"` on `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_publish(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    let CommitControlOutcome { commit, .. } = commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Publish {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    commit
+        .map(Json)
+        .ok_or_else(|| ApiError::internal("commit publish answered no commit"))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/commits/{commit_id}",
+    tag = "commits",
+    operation_id = "dropCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 204, description = "Commit dropped: its id stops resolving and its held merge inputs are released"),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its drop is not permitted", body = ErrorOutput),
+        (status = 409, description = "The commit is published", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Drop an unpublished commit.
+///
+/// **Irreversible.** Runs under `commit_drop` on the commit's recorded target
+/// branch; a denial answers the 404 an unknown id answers. A published commit
+/// is never dropped (409). The GQ statement `commit drop "<id>"` on
+/// `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_drop(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Drop {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) fn read_target_from_request(

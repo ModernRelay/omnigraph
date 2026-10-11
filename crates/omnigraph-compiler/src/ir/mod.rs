@@ -80,6 +80,9 @@ pub struct MutationIR {
     pub name: String,
     pub params: Vec<IRParam>,
     pub ops: Vec<MutationOpIR>,
+    /// The declaration's `as commit` clause: its result is published as an
+    /// unpublished commit, the branch head unchanged.
+    pub as_commit: bool,
 }
 
 #[derive(Debug, Clone)]
