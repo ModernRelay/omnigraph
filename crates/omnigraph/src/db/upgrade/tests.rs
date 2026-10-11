@@ -764,49 +764,64 @@ async fn check_has_no_local_store_effects() {
     }
 }
 
-#[tokio::test]
-async fn a_source_root_is_converted_once_and_is_then_current() {
+/// A source stamped `stamp` converts once, with the work the check reported
+/// and the six legacy files the route archives; a rerun, with or without
+/// `--check`, is AlreadyCurrent and writes nothing.
+async fn converted_once(stamp: u32) {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
-    for stamp in [13, 9, 8] {
-        let source = source(stamp).await;
-        let checked = check(&source.root).await.work;
-        let report = execute(&source.root).await;
-        assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
-        assert!(report.findings.is_empty() && report.recovery.is_none());
-        assert_eq!(report.observed_format, Some(stamp));
-        assert_eq!(report.route, [route_name(stamp)]);
-        assert_eq!(report.completed_handlers, [route_name(stamp)]);
-        assert_eq!(
-            report.last_durable_completed_boundary.as_deref(),
-            Some("activated")
-        );
-        assert_eq!(report.work, checked);
-        assert_converted(&source).await;
+    let source = source(stamp).await;
+    let checked = check(&source.root).await.work;
+    let report = execute(&source.root).await;
+    assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+    assert!(report.findings.is_empty() && report.recovery.is_none());
+    assert_eq!(report.observed_format, Some(stamp));
+    assert_eq!(report.route, [route_name(stamp)]);
+    assert_eq!(report.completed_handlers, [route_name(stamp)]);
+    assert_eq!(
+        report.last_durable_completed_boundary.as_deref(),
+        Some("activated")
+    );
+    assert_eq!(report.work, checked);
+    assert_converted(&source).await;
 
-        let files = stored_files(source.dir.path());
-        let legacy: Vec<&str> = files
-            .keys()
-            .filter_map(|name| name.strip_prefix("__history/legacy/"))
-            .collect();
-        assert_eq!(
-            legacy,
-            [
-                "data/00000000.lance",
-                "data/00000001.lance",
-                "data/00000002.lance",
-                "locator/directory.oglx",
-                "locator/ids/00000000.oglx",
-                "locator/writers/00000000.oglx",
-            ],
-            "v{stamp}"
-        );
-        for again in [check(&source.root).await, execute(&source.root).await] {
-            assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
-            assert_eq!(again.observed_format, Some(14));
-        }
-        assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
+    let files = stored_files(source.dir.path());
+    let legacy: Vec<&str> = files
+        .keys()
+        .filter_map(|name| name.strip_prefix("__history/legacy/"))
+        .collect();
+    assert_eq!(
+        legacy,
+        [
+            "data/00000000.lance",
+            "data/00000001.lance",
+            "data/00000002.lance",
+            "locator/directory.oglx",
+            "locator/ids/00000000.oglx",
+            "locator/writers/00000000.oglx",
+        ],
+        "v{stamp}"
+    );
+    for again in [check(&source.root).await, execute(&source.root).await] {
+        assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
+        assert_eq!(again.observed_format, Some(14));
     }
+    assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
+}
+
+#[tokio::test]
+async fn a_source_root_is_converted_once_and_is_then_current() {
+    converted_once(13).await;
+}
+
+#[tokio::test]
+async fn a_stamp_9_source_root_is_converted_once_and_is_then_current() {
+    converted_once(9).await;
+}
+
+#[tokio::test]
+async fn a_stamp_8_source_root_is_converted_once_and_is_then_current() {
+    converted_once(8).await;
 }
 
 #[tokio::test]
@@ -1317,15 +1332,17 @@ async fn recovery_sidecars_refuse_under_the_route_of_the_stamp() {
 async fn a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read() {
     #[cfg(feature = "failpoints")]
     let _scenario = crate::seams::FailScenario::setup();
-    for (stamp, name) in [8, 9, 9].into_iter().zip(root_schema::SCHEMA_FILENAMES) {
-        let source = source(stamp).await;
+    let stamp_8 = source(8).await;
+    let stamp_9 = source(9).await;
+    let [pg, ir, state] = root_schema::SCHEMA_FILENAMES;
+    for (source, name) in [(&stamp_8, pg), (&stamp_9, ir), (&stamp_9, state)] {
         let staging = format!("{name}.staging");
         std::fs::write(source.dir.path().join(&staging), "staged").unwrap();
         let before = stored_files(source.dir.path());
         for report in [check(&source.root).await, execute(&source.root).await] {
             assert_source_recovery(
                 &report,
-                route_name(stamp),
+                route_name(source.stamp),
                 &format!(
                     "schema object `{staging}` at the graph root is the unfinished part of \
                      a schema apply by omnigraph 0.11.x; it must be resolved before the \
@@ -1340,6 +1357,7 @@ async fn a_staged_schema_object_at_the_root_refuses_before_the_contract_is_read(
         }
         assert_eq!(stored_files(source.dir.path()), before);
         assert_eq!(manifest_version(&source.root).await, 4);
+        std::fs::remove_file(source.dir.path().join(&staging)).unwrap();
     }
 }
 
@@ -1472,9 +1490,10 @@ async fn an_unreadable_root_contract_refuses_as_unsupported_source() {
             &["schema-contract source no longer matches the accepted compiled schema"],
         ),
     ];
+    let source = source(9).await;
+    let contract = source.root_contract.as_ref().unwrap();
     for (damage, causes) in cases {
-        let source = source(9).await;
-        damage(source.dir.path(), source.root_contract.as_ref().unwrap());
+        damage(source.dir.path(), contract);
         let before = stored_files(source.dir.path());
         for report in [check(&source.root).await, execute(&source.root).await] {
             assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
@@ -1502,6 +1521,12 @@ async fn an_unreadable_root_contract_refuses_as_unsupported_source() {
         }
         assert_eq!(stored_files(source.dir.path()), before);
         assert_eq!(manifest_version(&source.root).await, 4);
+        write_root_schema(source.dir.path(), contract);
+        assert_eq!(
+            root_objects(source.dir.path()),
+            root_objects_of(&source),
+            "the root objects are restored for the next case"
+        );
     }
 }
 
@@ -1752,8 +1777,7 @@ async fn stamp_8_refuses_v3_system_columns_and_stamp_9_converts_the_legacy_ones(
 }
 
 /// The lock a killed 0.11.x schema apply left on an otherwise clean root is
-/// retired by the upgrade as the completed apply would have retired it; a
-/// lock the apply did retire converts as any retired ref.
+/// retired by the upgrade as the completed apply would have retired it.
 #[tokio::test]
 async fn a_live_schema_apply_lock_is_retired_and_a_retired_one_converts() {
     #[cfg(feature = "failpoints")]
@@ -1787,7 +1811,13 @@ async fn a_live_schema_apply_lock_is_retired_and_a_retired_one_converts() {
     assert_eq!(report.findings[0].message, message);
     assert_eq!(report.work, checked.work);
     assert_converted(&locked).await;
+}
 
+/// A lock the 0.11.x schema apply did retire converts as any retired ref.
+#[tokio::test]
+async fn a_retired_schema_apply_lock_converts_as_any_retired_ref() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
     let mut released = source(9).await;
     let lock = native(SCHEMA_APPLY_LOCK_BRANCH);
     assert_eq!(released.history.fork(None, &lock).await.unwrap(), 4);
@@ -1921,6 +1951,22 @@ async fn a_root_contract_whose_columns_the_tables_lack_refuses_before_any_write(
     assert!(!main.schema().metadata.contains_key(UPGRADE_PENDING_KEY));
 }
 
+/// Check and execute both refuse `source` as the unsupported source `message`,
+/// writing nothing and leaving main unfenced.
+async fn assert_refused_as_unsupported_source(source: &Source, message: &str) {
+    let before = stored_files(source.dir.path());
+    for report in [check(&source.root).await, execute(&source.root).await] {
+        assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
+        assert_eq!(codes(&report), ["unsupported_source"]);
+        assert_eq!(report.findings[0].message, message);
+        assert!(report.recovery.is_none() && report.last_durable_completed_boundary.is_none());
+        assert_eq!(report.work, UpgradeWork::default());
+    }
+    assert_eq!(stored_files(source.dir.path()), before);
+    let main = open_manifest_dataset(&source.root, None).await.unwrap();
+    assert!(!main.schema().metadata.contains_key(UPGRADE_PENDING_KEY));
+}
+
 #[tokio::test]
 async fn a_root_contract_that_does_not_describe_a_live_ref_refuses() {
     #[cfg(feature = "failpoints")]
@@ -1942,7 +1988,20 @@ async fn a_root_contract_that_does_not_describe_a_live_ref_refuses() {
             .unwrap(),
         6
     );
+    assert_refused_as_unsupported_source(
+        &wider,
+        &format!(
+            "ref '{feature}' registers tables the schema contract at the graph root does \
+             not describe: node:Extra"
+        ),
+    )
+    .await;
+}
 
+#[tokio::test]
+async fn a_root_contract_describing_a_table_main_dropped_refuses() {
+    #[cfg(feature = "failpoints")]
+    let _scenario = crate::seams::FailScenario::setup();
     let mut narrower = source(9).await;
     let dropping = LegacyPublish {
         drops: vec![(narrower.firm, 1)],
@@ -1950,34 +2009,12 @@ async fn a_root_contract_that_does_not_describe_a_live_ref_refuses() {
         ..Default::default()
     };
     assert_eq!(narrower.history.publish(None, dropping).await.unwrap(), 5);
-
-    for (source, message) in [
-        (
-            &wider,
-            format!(
-                "ref '{feature}' registers tables the schema contract at the graph root does \
-                 not describe: node:Extra"
-            ),
-        ),
-        (
-            &narrower,
-            "main does not register table node:Firm, which the schema contract at the graph \
-             root describes"
-                .to_string(),
-        ),
-    ] {
-        let before = stored_files(source.dir.path());
-        for report in [check(&source.root).await, execute(&source.root).await] {
-            assert_eq!(report.outcome, UpgradeOutcome::CheckFailed, "{report:?}");
-            assert_eq!(codes(&report), ["unsupported_source"]);
-            assert_eq!(report.findings[0].message, message);
-            assert!(report.recovery.is_none() && report.last_durable_completed_boundary.is_none());
-            assert_eq!(report.work, UpgradeWork::default());
-        }
-        assert_eq!(stored_files(source.dir.path()), before);
-        let main = open_manifest_dataset(&source.root, None).await.unwrap();
-        assert!(!main.schema().metadata.contains_key(UPGRADE_PENDING_KEY));
-    }
+    assert_refused_as_unsupported_source(
+        &narrower,
+        "main does not register table node:Firm, which the schema contract at the graph \
+         root describes",
+    )
+    .await;
 }
 
 /// Create the Lance table of `registration` at `root` as the 0.11.0 respelling
@@ -3127,10 +3164,26 @@ mod interrupted {
         Some(source)
     }
 
+    /// A seam the upgrade crosses, with how often the upgrade of any source
+    /// here crosses it.
+    type Seam = (&'static DecideSeam, u64);
+    const AFTER_FENCE: Seam = (&catalog::UPGRADE_AFTER_FENCE, 1);
+    const BETWEEN_LEGACY_FILES: Seam = (&catalog::UPGRADE_BETWEEN_LEGACY_FILES, 5);
+    const AFTER_LEGACY: Seam = (&catalog::UPGRADE_AFTER_LEGACY, 1);
+    const AFTER_STAGE: Seam = (&catalog::UPGRADE_AFTER_STAGE, 4);
+    const AFTER_BRANCH: Seam = (&catalog::UPGRADE_AFTER_BRANCH, 4);
+    const BEFORE_ACTIVATION: Seam = (&catalog::UPGRADE_BEFORE_ACTIVATION, 1);
+    const AFTER_ACTIVATION: Seam = (&catalog::UPGRADE_AFTER_ACTIVATION, 1);
+    /// The work of a completed rerun of any source here: legacy commits, data
+    /// files, id shards, writer shards.
+    const WORK: (u64, u64, u64, u64) = (6, 3, 1, 1);
+
+    /// The fence of the stamp-13 journey; the other seams of the journey are
+    /// the `interruption_boundaries_retry_without_mixed_visibility_*` tests.
     #[tokio::test]
     async fn interruption_boundaries_retry_without_mixed_visibility() {
         let _scenario = FailScenario::setup();
-        interruption_boundaries_retry(13, false, [1, 5, 1, 4, 4, 1, 1], (6, 3, 1, 1)).await;
+        retry_crossings(13, false, AFTER_FENCE, 1, 1).await;
     }
 
     /// The seams and the work of the stamp-9 source are counted on their own:
@@ -3139,7 +3192,7 @@ mod interrupted {
     #[tokio::test]
     async fn interruption_boundaries_retry_from_stamp_9() {
         let _scenario = FailScenario::setup();
-        interruption_boundaries_retry(9, false, [1, 5, 1, 4, 4, 1, 1], (6, 3, 1, 1)).await;
+        retry_crossings(9, false, AFTER_FENCE, 1, 1).await;
     }
 
     /// A stamp-9 source with the lock of a killed schema apply crosses the same
@@ -3148,7 +3201,7 @@ mod interrupted {
     #[tokio::test]
     async fn interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock() {
         let _scenario = FailScenario::setup();
-        interruption_boundaries_retry(9, true, [1, 5, 1, 4, 4, 1, 1], (6, 3, 1, 1)).await;
+        retry_crossings(9, true, AFTER_FENCE, 1, 1).await;
     }
 
     /// The stamp-8 source, whose root contract spells the legacy system
@@ -3156,99 +3209,228 @@ mod interrupted {
     #[tokio::test]
     async fn interruption_boundaries_retry_from_stamp_8() {
         let _scenario = FailScenario::setup();
-        interruption_boundaries_retry(8, false, [1, 5, 1, 4, 4, 1, 1], (6, 3, 1, 1)).await;
+        retry_crossings(8, false, AFTER_FENCE, 1, 1).await;
     }
 
-    /// Stop the upgrade of a source stamped `stamp` at each of the `crossings`
-    /// of every seam: no reader opens the graph, and the rerun completes with
-    /// `work` (commits, data files, id shards, writer shards).
-    async fn interruption_boundaries_retry(
-        stamp: u32,
-        lock: bool,
-        crossings: [u64; 7],
-        work: (u64, u64, u64, u64),
-    ) {
-        let seams = [
-            &catalog::UPGRADE_AFTER_FENCE,
-            &catalog::UPGRADE_BETWEEN_LEGACY_FILES,
-            &catalog::UPGRADE_AFTER_LEGACY,
-            &catalog::UPGRADE_AFTER_STAGE,
-            &catalog::UPGRADE_AFTER_BRANCH,
-            &catalog::UPGRADE_BEFORE_ACTIVATION,
-            &catalog::UPGRADE_AFTER_ACTIVATION,
-        ];
-        for (seam, crossings) in seams.into_iter().zip(crossings) {
-            let mut occurrence = 1;
-            while let Some(source) = interrupt_from(stamp, lock, seam, occurrence).await {
-                let context = format!("{} at {occurrence}", seam.name());
-                let root = source.root.as_str();
-                let main = open(root, None).await.unwrap();
-                let activated = seam.name() == catalog::UPGRADE_AFTER_ACTIVATION.name();
-                assert_eq!(
-                    main.schema().metadata.contains_key(UPGRADE_PENDING_KEY),
-                    !activated,
-                    "{context}"
-                );
-                let checked = check(root).await;
-                if activated {
-                    assert_eq!(checked.outcome, UpgradeOutcome::AlreadyCurrent, "{context}");
-                } else {
-                    let refusal = guard_stamp(&main).unwrap_err().to_string();
-                    assert!(
-                        refusal.contains("storage upgrade recovery required")
-                            && refusal.contains("rerun `omnigraph upgrade <graph>` without"),
-                        "{context}: {refusal}"
-                    );
-                    assert_eq!(codes(&checked), ["pending_upgrade"], "{context}");
-                    assert_remedy(&checked, route_name(stamp), RERUN);
-                    assert!(
-                        refusal.contains(&checked.findings[0].message),
-                        "{context}: {checked:?}"
-                    );
+    /// The seams after the fence, one test per journey (`stamp`, `lock`) and
+    /// seam, the seams crossed most often split by crossing range.
+    macro_rules! retry_journeys {
+        ($($name:ident: $stamp:literal, $lock:literal, $seam:ident, $first:literal..=$last:literal;)+) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    let _scenario = FailScenario::setup();
+                    retry_crossings($stamp, $lock, $seam, $first, $last).await;
                 }
-                let before_legacy = seam.name() == catalog::UPGRADE_AFTER_FENCE.name()
-                    || seam.name() == catalog::UPGRADE_BETWEEN_LEGACY_FILES.name();
+            )+
+        };
+    }
 
-                let resumed = execute(root).await;
-                assert!(resumed.success(), "{context}: {resumed:?}");
-                let expected_codes: &[&str] = if lock && !activated {
-                    &["schema_apply_lock_retired"]
-                } else {
-                    &[]
-                };
-                assert_eq!(codes(&resumed), expected_codes, "{context}: {resumed:?}");
-                assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
-                if !activated {
-                    assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
-                    assert_eq!(resumed.observed_format, Some(14), "{context}");
-                    assert_eq!(resumed.route, [route_name(stamp)], "{context}");
-                    assert_eq!(
-                        resumed.work.census_reads > 0,
-                        before_legacy,
-                        "{context}: {:?}",
-                        resumed.work
-                    );
-                    assert_eq!(
-                        (
-                            resumed.work.legacy_commits,
-                            resumed.work.data_files,
-                            resumed.work.id_shards,
-                            resumed.work.writer_shards
-                        ),
-                        work,
-                        "{context}"
-                    );
-                }
-                assert_converted(&source).await;
+    retry_journeys! {
+        interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_1_to_3: 13, false, BETWEEN_LEGACY_FILES, 1..=3;
+        interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_4_to_5: 13, false, BETWEEN_LEGACY_FILES, 4..=5;
+        interruption_boundaries_retry_without_mixed_visibility_after_legacy: 13, false, AFTER_LEGACY, 1..=1;
+        interruption_boundaries_retry_without_mixed_visibility_after_stage_1_to_2: 13, false, AFTER_STAGE, 1..=2;
+        interruption_boundaries_retry_without_mixed_visibility_after_stage_3_to_4: 13, false, AFTER_STAGE, 3..=4;
+        interruption_boundaries_retry_without_mixed_visibility_after_branch_1_to_2: 13, false, AFTER_BRANCH, 1..=2;
+        interruption_boundaries_retry_without_mixed_visibility_after_branch_3_to_4: 13, false, AFTER_BRANCH, 3..=4;
+        interruption_boundaries_retry_without_mixed_visibility_before_activation: 13, false, BEFORE_ACTIVATION, 1..=1;
+        interruption_boundaries_retry_without_mixed_visibility_after_activation: 13, false, AFTER_ACTIVATION, 1..=1;
+
+        interruption_boundaries_retry_from_stamp_9_between_legacy_files_1_to_3: 9, false, BETWEEN_LEGACY_FILES, 1..=3;
+        interruption_boundaries_retry_from_stamp_9_between_legacy_files_4_to_5: 9, false, BETWEEN_LEGACY_FILES, 4..=5;
+        interruption_boundaries_retry_from_stamp_9_after_legacy: 9, false, AFTER_LEGACY, 1..=1;
+        interruption_boundaries_retry_from_stamp_9_after_stage_1_to_2: 9, false, AFTER_STAGE, 1..=2;
+        interruption_boundaries_retry_from_stamp_9_after_stage_3_to_4: 9, false, AFTER_STAGE, 3..=4;
+        interruption_boundaries_retry_from_stamp_9_after_branch_1_to_2: 9, false, AFTER_BRANCH, 1..=2;
+        interruption_boundaries_retry_from_stamp_9_after_branch_3_to_4: 9, false, AFTER_BRANCH, 3..=4;
+        interruption_boundaries_retry_from_stamp_9_before_activation: 9, false, BEFORE_ACTIVATION, 1..=1;
+        interruption_boundaries_retry_from_stamp_9_after_activation: 9, false, AFTER_ACTIVATION, 1..=1;
+
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_1_to_3: 9, true, BETWEEN_LEGACY_FILES, 1..=3;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_4_to_5: 9, true, BETWEEN_LEGACY_FILES, 4..=5;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_legacy: 9, true, AFTER_LEGACY, 1..=1;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_1_to_2: 9, true, AFTER_STAGE, 1..=2;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_3_to_4: 9, true, AFTER_STAGE, 3..=4;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_1_to_2: 9, true, AFTER_BRANCH, 1..=2;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_3_to_4: 9, true, AFTER_BRANCH, 3..=4;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_before_activation: 9, true, BEFORE_ACTIVATION, 1..=1;
+        interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_activation: 9, true, AFTER_ACTIVATION, 1..=1;
+
+        interruption_boundaries_retry_from_stamp_8_between_legacy_files_1_to_3: 8, false, BETWEEN_LEGACY_FILES, 1..=3;
+        interruption_boundaries_retry_from_stamp_8_between_legacy_files_4_to_5: 8, false, BETWEEN_LEGACY_FILES, 4..=5;
+        interruption_boundaries_retry_from_stamp_8_after_legacy: 8, false, AFTER_LEGACY, 1..=1;
+        interruption_boundaries_retry_from_stamp_8_after_stage_1_to_2: 8, false, AFTER_STAGE, 1..=2;
+        interruption_boundaries_retry_from_stamp_8_after_stage_3_to_4: 8, false, AFTER_STAGE, 3..=4;
+        interruption_boundaries_retry_from_stamp_8_after_branch_1_to_2: 8, false, AFTER_BRANCH, 1..=2;
+        interruption_boundaries_retry_from_stamp_8_after_branch_3_to_4: 8, false, AFTER_BRANCH, 3..=4;
+        interruption_boundaries_retry_from_stamp_8_before_activation: 8, false, BEFORE_ACTIVATION, 1..=1;
+        interruption_boundaries_retry_from_stamp_8_after_activation: 8, false, AFTER_ACTIVATION, 1..=1;
+    }
+
+    /// Stop the upgrade of a source stamped `stamp` (locked when `lock`) at the
+    /// crossings `first..=last` of `seam`: no reader opens the graph, the rerun
+    /// completes with [`WORK`], and a run past the last crossing completes.
+    async fn retry_crossings(stamp: u32, lock: bool, seam: Seam, first: u64, last: u64) {
+        let (seam, crossings) = seam;
+        assert!(
+            (1..=last).contains(&first) && last <= crossings,
+            "{first}..={last} of {crossings} crossings"
+        );
+        for occurrence in first..=last {
+            let context = format!("v{stamp} {} at {occurrence}", seam.name());
+            let source = interrupt_from(stamp, lock, seam, occurrence)
+                .await
+                .unwrap_or_else(|| panic!("{context}: the upgrade completed before the seam"));
+            let root = source.root.as_str();
+            let main = open(root, None).await.unwrap();
+            let activated = seam.name() == catalog::UPGRADE_AFTER_ACTIVATION.name();
+            assert_eq!(
+                main.schema().metadata.contains_key(UPGRADE_PENDING_KEY),
+                !activated,
+                "{context}"
+            );
+            let checked = check(root).await;
+            if activated {
+                assert_eq!(checked.outcome, UpgradeOutcome::AlreadyCurrent, "{context}");
+            } else {
+                let refusal = guard_stamp(&main).unwrap_err().to_string();
+                assert!(
+                    refusal.contains("storage upgrade recovery required")
+                        && refusal.contains("rerun `omnigraph upgrade <graph>` without"),
+                    "{context}: {refusal}"
+                );
+                assert_eq!(codes(&checked), ["pending_upgrade"], "{context}");
+                assert_remedy(&checked, route_name(stamp), RERUN);
+                assert!(
+                    refusal.contains(&checked.findings[0].message),
+                    "{context}: {checked:?}"
+                );
+            }
+            let before_legacy = seam.name() == catalog::UPGRADE_AFTER_FENCE.name()
+                || seam.name() == catalog::UPGRADE_BETWEEN_LEGACY_FILES.name();
+
+            let resumed = execute(root).await;
+            assert!(resumed.success(), "{context}: {resumed:?}");
+            let expected_codes: &[&str] = if lock && !activated {
+                &["schema_apply_lock_retired"]
+            } else {
+                &[]
+            };
+            assert_eq!(codes(&resumed), expected_codes, "{context}: {resumed:?}");
+            assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
+            if !activated {
+                assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
+                assert_eq!(resumed.observed_format, Some(14), "{context}");
+                assert_eq!(resumed.route, [route_name(stamp)], "{context}");
                 assert_eq!(
-                    execute(root).await.outcome,
-                    UpgradeOutcome::AlreadyCurrent,
+                    resumed.work.census_reads > 0,
+                    before_legacy,
+                    "{context}: {:?}",
+                    resumed.work
+                );
+                assert_eq!(
+                    (
+                        resumed.work.legacy_commits,
+                        resumed.work.data_files,
+                        resumed.work.id_shards,
+                        resumed.work.writer_shards
+                    ),
+                    WORK,
                     "{context}"
                 );
-                occurrence += 1;
             }
-            assert_eq!(occurrence - 1, crossings, "v{stamp} {}", seam.name());
+            assert_converted(&source).await;
+            assert_eq!(
+                execute(root).await.outcome,
+                UpgradeOutcome::AlreadyCurrent,
+                "{context}"
+            );
         }
+        assert!(
+            last < crossings
+                || interrupt_from(stamp, lock, seam, crossings + 1)
+                    .await
+                    .is_none(),
+            "v{stamp} {} is crossed more than {crossings} times",
+            seam.name()
+        );
+    }
+
+    fn remove_pg(dir: &std::path::Path) {
+        std::fs::remove_file(dir.join(root_schema::SCHEMA_SOURCE_FILENAME)).unwrap()
+    }
+
+    fn widen_pg(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join(root_schema::SCHEMA_SOURCE_FILENAME),
+            "node Person {\n    name: String @key\n    age: I64\n}\nnode Firm { name: String @key }\n",
+        )
+        .unwrap()
+    }
+
+    fn corrupt_ir(dir: &std::path::Path) {
+        std::fs::write(dir.join(root_schema::SCHEMA_IR_FILENAME), "{").unwrap()
+    }
+
+    fn stage_pg(dir: &std::path::Path) {
+        std::fs::write(
+            dir.join(format!("{}.staging", root_schema::SCHEMA_SOURCE_FILENAME)),
+            "staged",
+        )
+        .unwrap()
+    }
+
+    fn respell_root(dir: &std::path::Path) {
+        write_root_schema(dir, &root_contract(9).0)
+    }
+
+    /// A source stamped `stamp` (locked when `lock`), fenced at its first
+    /// crossing and its root objects then `damage`d, converts on the rerun from
+    /// the archived contract, reading and writing no root object.
+    async fn fenced_rerun(stamp: u32, lock: bool, damage: fn(&std::path::Path)) {
+        let source = interrupt_from(stamp, lock, &catalog::UPGRADE_AFTER_FENCE, 1)
+            .await
+            .unwrap();
+        damage(source.dir.path());
+        let damaged = root_objects(source.dir.path());
+        let context = format!("v{stamp} lock {lock}");
+        let resumed = execute(&source.root).await;
+        assert_eq!(
+            resumed.outcome,
+            UpgradeOutcome::Completed,
+            "{context}: {resumed:?}"
+        );
+        let expected_codes: &[&str] = if lock {
+            &["schema_apply_lock_retired"]
+        } else {
+            &[]
+        };
+        assert_eq!(codes(&resumed), expected_codes, "{context}: {resumed:?}");
+        assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
+        assert!(
+            resumed.work.census_reads > 0,
+            "{context}: {:?}",
+            resumed.work
+        );
+        assert_eq!(resumed.work.table_opens, 0, "{context}: {:?}", resumed.work);
+        assert_eq!(resumed.route, [route_name(stamp)], "{context}");
+        let main = open(&source.root, None).await.unwrap();
+        let (_, converted) = read_converted_state(&main).await.unwrap();
+        assert_eq!(Some(&converted), source.root_contract.as_ref(), "{context}");
+        assert_eq!(
+            root_objects(source.dir.path()),
+            damaged,
+            "{context}: the rerun reads and writes no root object"
+        );
+        if let Some(lock) = &source.lock {
+            assert_lock_retired(&source.root, lock).await;
+        }
+        assert_eq!(
+            execute(&source.root).await.outcome,
+            UpgradeOutcome::AlreadyCurrent,
+            "{context}"
+        );
     }
 
     /// Once main is fenced, the contract of an 8/9 source is the archive the
@@ -3257,78 +3439,37 @@ mod interrupted {
     #[tokio::test]
     async fn a_fenced_stamp_8_or_9_rerun_reads_the_archived_contract_not_the_root_objects() {
         let _scenario = FailScenario::setup();
-        type Damage = fn(&std::path::Path);
-        let remove_pg: Damage =
-            |dir| std::fs::remove_file(dir.join(root_schema::SCHEMA_SOURCE_FILENAME)).unwrap();
-        let widen_pg: Damage = |dir| {
-            std::fs::write(
-                dir.join(root_schema::SCHEMA_SOURCE_FILENAME),
-                "node Person {\n    name: String @key\n    age: I64\n}\nnode Firm { name: String @key }\n",
-            )
-            .unwrap()
-        };
-        let corrupt_ir: Damage =
-            |dir| std::fs::write(dir.join(root_schema::SCHEMA_IR_FILENAME), "{").unwrap();
-        let stage_pg: Damage = |dir| {
-            std::fs::write(
-                dir.join(format!("{}.staging", root_schema::SCHEMA_SOURCE_FILENAME)),
-                "staged",
-            )
-            .unwrap()
-        };
-        let respell_root: Damage = |dir| write_root_schema(dir, &root_contract(9).0);
-        let cases: [(u32, bool, Damage); 6] = [
-            (9, false, remove_pg),
-            (9, false, widen_pg),
-            (9, false, corrupt_ir),
-            (9, false, stage_pg),
-            (9, true, stage_pg),
-            (8, false, respell_root),
-        ];
-        for (stamp, lock, damage) in cases {
-            let source = interrupt_from(stamp, lock, &catalog::UPGRADE_AFTER_FENCE, 1)
-                .await
-                .unwrap();
-            damage(source.dir.path());
-            let damaged = root_objects(source.dir.path());
-            let context = format!("v{stamp} lock {lock}");
-            let resumed = execute(&source.root).await;
-            assert_eq!(
-                resumed.outcome,
-                UpgradeOutcome::Completed,
-                "{context}: {resumed:?}"
-            );
-            let expected_codes: &[&str] = if lock {
-                &["schema_apply_lock_retired"]
-            } else {
-                &[]
-            };
-            assert_eq!(codes(&resumed), expected_codes, "{context}: {resumed:?}");
-            assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
-            assert!(
-                resumed.work.census_reads > 0,
-                "{context}: {:?}",
-                resumed.work
-            );
-            assert_eq!(resumed.work.table_opens, 0, "{context}: {:?}", resumed.work);
-            assert_eq!(resumed.route, [route_name(stamp)], "{context}");
-            let main = open(&source.root, None).await.unwrap();
-            let (_, converted) = read_converted_state(&main).await.unwrap();
-            assert_eq!(Some(&converted), source.root_contract.as_ref(), "{context}");
-            assert_eq!(
-                root_objects(source.dir.path()),
-                damaged,
-                "{context}: the rerun reads and writes no root object"
-            );
-            if let Some(lock) = &source.lock {
-                assert_lock_retired(&source.root, lock).await;
-            }
-            assert_eq!(
-                execute(&source.root).await.outcome,
-                UpgradeOutcome::AlreadyCurrent,
-                "{context}"
-            );
-        }
+        fenced_rerun(9, false, remove_pg).await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_widened_pg() {
+        let _scenario = FailScenario::setup();
+        fenced_rerun(9, false, widen_pg).await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_corrupt_ir() {
+        let _scenario = FailScenario::setup();
+        fenced_rerun(9, false, corrupt_ir).await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg() {
+        let _scenario = FailScenario::setup();
+        fenced_rerun(9, false, stage_pg).await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_locked_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg() {
+        let _scenario = FailScenario::setup();
+        fenced_rerun(9, true, stage_pg).await;
+    }
+
+    #[tokio::test]
+    async fn a_fenced_stamp_8_rerun_reads_the_archived_contract_not_a_respelled_root() {
+        let _scenario = FailScenario::setup();
+        fenced_rerun(8, false, respell_root).await;
     }
 
     /// The archive the intent binds is the one thing a fenced stamp-9 rerun

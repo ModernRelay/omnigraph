@@ -1881,7 +1881,7 @@ mod tests {
                 GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&peer)]).unwrap(),
             );
             let operations = OperationRuntime::new();
-            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            let deadline = Instant::now() + std::time::Duration::from_millis(100);
             let transition = registry
                 .prepare_deployment_transition(
                     &operations,
@@ -2131,7 +2131,7 @@ mod tests {
             GraphRegistry::from_handles(vec![Arc::clone(&alpha), Arc::clone(&beta)]).unwrap(),
         );
         let operations = OperationRuntime::new();
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
         let transition = registry
             .prepare_same_view(&operations, &alpha.key, deadline)
             .unwrap()

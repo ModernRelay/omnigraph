@@ -1,6 +1,6 @@
 # issue: none
 # notes: A search order is an access path of the ranked binding's scan: the physical Scan row carries `ranked` with the index, the candidates asked for and the scope, and an rrf() plans one scan per arm.
-# red_on: 2026-09-21, task 0226 PR A tree (branch v2-plan-lower-trait before PR B): every step failed `expect plan` with `the scan of Doc is not ranked`; ranking rode beside the plan in SearchMode, so no Scan row carried `ranked`.
+# red_on: 2026-09-21, v2-plan-lower-trait working tree: every step failed `expect plan` with `the scan of Doc is not ranked`; ranking rode beside the plan in SearchMode, so no Scan row carried `ranked`.
 
 --- runner
 timeout_ms: 10000
@@ -86,7 +86,7 @@ query fused($q: Vector(4), $t: String) {
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
---- expect unordered
+--- expect ordered
 {"d.slug":"d000"}
 {"d.slug":"d001"}
 {"d.slug":"d002"}
