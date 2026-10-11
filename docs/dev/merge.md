@@ -15,6 +15,23 @@ uses the full lineage reader. A successful proof does not validate unread
 history: missing, malformed, or conflicting settled records outside the proof
 may remain undetected until a history read reaches them.
 
+The inconclusive case walks the commit graph from both heads by generation
+(`commit_graph.rs`, `lazy_merge_base_search`), reading a commit it does not
+hold from its `__history` block. Each branch's `__manifest` also carries a
+block registry (`history_block` and `history_merge` rows, storage format 15):
+one row per released first-parent run of a block, with its slot range, the
+generation and parent of its first slot, and one row per merge commit inside
+the run. The walk crosses a registered block from its last slot to its first
+without a read and reads blocks for commits no row covers and for final
+candidates tied on distance and generation. The publisher writes the rows when it releases
+a run and refuses a run whose commits are not the chain their ids claim, so a
+block without rows is walked from its records. Registry rows past
+`REGISTRY_HOT_ROWS` live in cold fragments of `__manifest` that a publish
+reuses by reference. A registry push repacks smaller cold fragments; a merge
+caches them by data-file path and imports only rows absent from the target.
+`optimize` preserves this fragment layout; only the catalog publisher repacks it.
+See the [block registry RFC](../rfcs/2026-10-10-merge-base-block-registry.md).
+
 ## Per-table decision
 
 For every table lifetime present in the accepted catalogs, merge compares:

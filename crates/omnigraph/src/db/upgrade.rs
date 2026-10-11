@@ -1,5 +1,5 @@
 //! `omnigraph upgrade`: the offline conversion of a standalone root to storage
-//! format 14 from each [`UpgradeSource`], by two routes: from 13, whose schema
+//! format 15 from each [`UpgradeSource`], by two routes: from 13, whose schema
 //! contract is a row of `__manifest`, and from 8 or 9, whose contract is read
 //! from the graph root (`root_schema`) until the fence binds it. The upgrade
 //! reads every ref of `__manifest` at a pinned version, fences main with its
@@ -36,9 +36,10 @@ use crate::db::manifest::legacy::{
 };
 use crate::db::manifest::migrations::{
     INTERNAL_MANIFEST_SCHEMA_VERSION, INTERNAL_SCHEMA_VERSION_KEY, MAX_BRANCHES, MAX_INTENT_BYTES,
-    SourceBranch, SourceLock, UPGRADE_PENDING_KEY, UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY,
-    UPGRADE_SOURCE_FORMATS, UpgradeIntent, UpgradeSchemaContract, UpgradeSource, branch_completed,
-    fence_operation, guard_stamp, intent_from, read_stamp, receipt, recovery_guidance,
+    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, SourceBranch, SourceLock, UPGRADE_PENDING_KEY,
+    UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY, UPGRADE_SOURCE_FORMATS, UpgradeIntent,
+    UpgradeSchemaContract, UpgradeSource, branch_completed, fence_operation, guard_stamp,
+    intent_from, read_stamp, receipt, recovery_guidance,
 };
 use crate::db::manifest::retention::retired_manifest_branches;
 use crate::db::manifest::state::{SchemaContractRow, TablePin, TableState, read_converted_state};
@@ -53,7 +54,7 @@ mod root_schema;
 /// What a report names when the run stopped before the stamp of the source
 /// told the route: the pending intent is unreadable, or main carries a stamp
 /// no route converts.
-const UNROUTED_HANDLER: &str = "history-lance-files-to-v14";
+const UNROUTED_HANDLER: &str = "history-lance-files-to-v15";
 /// The logical name of the ref a 0.11.x schema apply holds while it runs.
 const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 /// The release whose roots are stamped 8 or 9, as a refusal names it.
@@ -509,7 +510,8 @@ async fn run(
             format!(
                 "this binary converts storage formats v{oldest}, v{older} and v{newest} to \
                  v{INTERNAL_MANIFEST_SCHEMA_VERSION} and serves \
-                 v{INTERNAL_MANIFEST_SCHEMA_VERSION} alone; `--to-format` accepts \
+                 v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION} and \
+                 v{INTERNAL_MANIFEST_SCHEMA_VERSION}; `--to-format` accepts \
                  {INTERNAL_MANIFEST_SCHEMA_VERSION} only"
             ),
         );
@@ -1800,7 +1802,7 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
         .map_err(OmniError::storage)
 }
 
-/// Overwrite the head of a live ref with its stamp-14 rows under its receipt
+/// Overwrite the head of a live ref with its stamp-15 rows under its receipt
 /// (and, on main, the pending key) in one commit that is never retried.
 async fn publish_conversion(
     root: &str,

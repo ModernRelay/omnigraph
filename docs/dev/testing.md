@@ -287,8 +287,9 @@ The system tests start workspace binaries on ephemeral localhost ports. Set `OMN
 `genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment` is an ignored,
 Unix-only release qualification test. It creates genuine 0.12 receipts, stops
 the old server, converts the ledger, checks data/history/schema identity and
-historical reads, then applies live schema and policy changes. Storage stays at
-format 14. Ordinary CI keeps current-version live-deployment coverage; it does
+historical reads, then applies live schema and policy changes. Storage is
+served at format 14 until the candidate's first publish stamps a branch 15.
+Ordinary CI keeps current-version live-deployment coverage; it does
 not download 0.12 or run this journey.
 
 Run explicitly from the repository root when qualifying that upgrade path,

@@ -521,7 +521,7 @@ restore same-process progress; unverifiable or unsupported cases remain blocked.
 Optimize, rebuild and cleanup use the same designated writer, admission and
 operation ownership. Productive user-table maintenance stages detached versions
 and publishes their pins in one graph commit; promotion preserves that result.
-Physical compaction of main's `__manifest` preserves content outside that publication, and
+Automatic-cleanup configuration removal preserves main's `__manifest` content outside that publication, and
 cleanup does not manufacture a graph-content commit. An independent optimizer process, even in the
 same container, is another writer and cannot rely on server-local locks.
 

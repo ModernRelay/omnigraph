@@ -42,7 +42,7 @@ async fn manifest_version(uri: &str) -> u64 {
 
 const RERUN: (&str, &str) = (
     "this omnigraph executable",
-    "then rerun `omnigraph upgrade <graph> --to-format 14` without `--check`",
+    "then rerun `omnigraph upgrade <graph> --to-format 15` without `--check`",
 );
 const PRESERVE_AND_CHECK: (&str, &str) = (
     "the omnigraph executable that started the conversion",
@@ -58,10 +58,10 @@ const FENCING_EXECUTABLE: (&str, &str) = (
 
 /// The route names a report carries, spelled out: a change of `handler` is a
 /// change of what operators and their tooling read.
-const UNROUTED: &str = "history-lance-files-to-v14";
-const FROM_8: &str = "history-lance-files-v8-to-v14";
-const FROM_9: &str = "history-lance-files-v9-to-v14";
-const FROM_13: &str = "history-lance-files-v13-to-v14";
+const UNROUTED: &str = "history-lance-files-to-v15";
+const FROM_8: &str = "history-lance-files-v8-to-v15";
+const FROM_9: &str = "history-lance-files-v9-to-v15";
+const FROM_13: &str = "history-lance-files-v13-to-v15";
 
 fn route_name(stamp: u32) -> &'static str {
     match stamp {
@@ -493,7 +493,7 @@ async fn served(root: &str, native: Option<&str>) -> (Vec<String>, Vec<(String, 
     (keys, heads)
 }
 
-/// Every live ref of `source` is converted: served under stamp 14 with its
+/// Every live ref of `source` is converted: served under stamp 15 with its
 /// own head alone, and main is activated three versions above its source.
 async fn assert_converted(source: &Source) {
     let root = source.root.as_str();
@@ -618,8 +618,8 @@ async fn a_target_other_than_the_served_format_is_unsupported() {
         assert_eq!(codes(&report), ["unsupported_target"]);
         assert_eq!(
             report.findings[0].message,
-            "this binary converts storage formats v8, v9 and v13 to v14 and serves v14 alone; \
-             `--to-format` accepts 14 only"
+            "this binary converts storage formats v8, v9 and v13 to v15 and serves v14 and v15; \
+             `--to-format` accepts 15 only"
         );
         assert_eq!(report.target_format, target);
         assert!(!report.target_defaulted);
@@ -692,7 +692,7 @@ async fn a_pending_conversion_with_a_valid_intent_is_reported_by_check_as_pendin
         let guidance = pending_report(&json, true, "pending_upgrade", handler).await;
         assert!(
             guidance.contains(&format!(
-                "the pending storage conversion of attempt {attempt} to format v14"
+                "the pending storage conversion of attempt {attempt} to format v15"
             )) && guidance.contains(
                 "rerun `omnigraph upgrade <graph>` without `--check` with this executable"
             ),
@@ -804,7 +804,7 @@ async fn converted_once(stamp: u32) {
     );
     for again in [check(&source.root).await, execute(&source.root).await] {
         assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
-        assert_eq!(again.observed_format, Some(14));
+        assert_eq!(again.observed_format, Some(15));
     }
     assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
 }
@@ -3321,7 +3321,7 @@ mod interrupted {
             assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
             if !activated {
                 assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
-                assert_eq!(resumed.observed_format, Some(14), "{context}");
+                assert_eq!(resumed.observed_format, Some(15), "{context}");
                 assert_eq!(resumed.route, [route_name(stamp)], "{context}");
                 assert_eq!(
                     resumed.work.census_reads > 0,

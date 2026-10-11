@@ -5046,7 +5046,8 @@ impl Omnigraph {
             });
         }
         let head_is_base = base_commit.graph_commit_id == target_head_commit_id;
-        let merged_parent = source_commits.into_records(&base_commit.graph_commit_id);
+        let merged_parent =
+            source_commits.into_records(&base_commit.graph_commit_id, &target_commits);
         if merged_parent.head.commit.graph_commit_id != source_head_commit_id {
             return Err(OmniError::manifest_internal(format!(
                 "the captured source head record names commit '{}', and the captured source \

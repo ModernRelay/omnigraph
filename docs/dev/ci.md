@@ -247,8 +247,42 @@ characters with no whitespace but the plain space; `docs(rfc):` is refused in fa
 `Revert "…"` title in favour of `revert: …` (the rule and its examples:
 [CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests).
 `scripts/check-pr-title.py` is the check; it runs its `--self-test` first and
-prints one actionable failure line with the accepted shape and two examples,
-as a log line and as a GitHub error annotation. It is a policy check on
+prints each independently detectable problem with a stable diagnostic code
+and a repair instruction, both in the log and in a GitHub error annotation.
+Length failures include the actual length, the limit and how many characters
+must be removed. Text output uses red failures, yellow repairs and green
+successes on a terminal or in Actions. Use `--color never` or set `NO_COLOR`
+to a nonempty value to disable automatic color; `--color always` forces it.
+Agents can use `--format json` with either input option for one JSON object.
+Version 1 carries `schema_version`, `offset_unit`, `input_kind`, `valid`,
+`title`, `length`, `max_length`, `excess` and `errors`. Each error has a closed
+`code`, its `field`, a `span` with `start` and `end`, the exact `found` text,
+`expected`, `message` and `fix`. Ranges are zero-based, end-exclusive Unicode
+code-point offsets in the checked `title`; for a squash message, that means
+the extracted title. A zero-width range marks a missing token; an unclosed
+scope marks its unmatched opening parenthesis. The human report names the
+same range using one-based character positions, or an insertion offset.
+`--schema` prints the JSON Schema with the allowed codes, fields and record
+shapes. Enum types close the code, field, input, format and color sets;
+immutable records validate ranges and their original-title slices at runtime.
+Numeric facts and the validity flag are derived from the report.
+JSON contains no color or Actions annotations.
+Both formats exit 0 for an accepted title and 1 for a refused title;
+invalid command-line arguments exit 2. For example:
+
+```bash
+python3 scripts/check-pr-title.py --title "fix(merge): find the merge base over contracted lineage" --format json
+python3 scripts/check-pr-title.py --schema
+```
+
+The check uses Python 3.11 or later and the standard library. Its `--self-test`
+entry point runs `scripts/test_check_pr_title.py`, including an exact range
+and field fixture for every error code, Unicode/length boundaries, parser
+refusals, runtime type invariants and each output/CLI mode. When editing the
+checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
+development environment with mypy installed. The enum dispatches are exhaustive.
+
+It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
 and the pull request head is never fetched. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`

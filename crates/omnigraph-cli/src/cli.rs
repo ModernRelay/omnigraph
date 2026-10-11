@@ -290,7 +290,7 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the format this binary serves (v14); other formats are rebuilt by export and load
+    /// the current format this binary serves (v15); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
@@ -857,7 +857,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store
