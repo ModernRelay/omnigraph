@@ -2,7 +2,7 @@
 //! owner is engine_v2_memory.rs; rows and nulls are covered by
 //! omnigraph-gqt/cases/v2/planner/issue_723_grouped_transfer_aggregation.gqt.
 
-mod helpers;
+use crate::helpers;
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]

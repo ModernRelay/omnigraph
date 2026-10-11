@@ -3532,13 +3532,8 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     );
 }
 
-/// Test C (S3 variant, bucket-gated): the same two-disjoint-writers +
-/// `LineageIntent` race as Test A, but on a real object store so the one-winner
-/// behaviour exercises the genuine conditional-put CAS on `__manifest` rather
-/// than the local content-token emulation. Skips with a log when
-/// `OMNIGRAPH_S3_TEST_BUCKET` is unset (the `tests/s3_storage.rs` gate); the
-/// rustfs CI job sets it. Asserts the same end-state: both commit, single linear
-/// chain.
+/// Exercises object-store conditional PUTs; the local variant uses content tokens.
+/// Shares the bucket gate with `tests/integration/s3_storage.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {

@@ -5,10 +5,8 @@ use std::fs;
 
 use tempfile::tempdir;
 
-mod support;
-
-use support::managed_http::{IntentApiFixture, IntentReply, IntentRequest};
-use support::*;
+use crate::support::managed_http::{IntentApiFixture, IntentReply, IntentRequest};
+use crate::support::*;
 
 fn managed_envelope(kind: &str, state: &str) -> serde_json::Value {
     let outcome = if ["proposed", "offered", "running"].contains(&state) {

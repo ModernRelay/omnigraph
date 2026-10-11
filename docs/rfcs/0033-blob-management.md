@@ -1578,7 +1578,7 @@ transports.
 The object-store cost evidence is explicitly on-demand and is not implied by the
 canonical local test graph. Follow the current
 [deployment guide](../user/deployment.md),
-run `cargo test -p omnigraph-engine --test write_cost_s3` with the documented
+run `cargo test -p omnigraph-engine --test integration write_cost_s3::` with the documented
 bucket, endpoint, and credential environment, and attach the untruncated test log
 plus the non-secret endpoint configuration to the implementation PR.
 

@@ -15,11 +15,14 @@ The invariants behind these rules are in [invariants.md](invariants.md). Lance-d
 ## Test layout
 
 Loose integration suites share a `tests/integration/main.rs` root, with one
-`mod <name>;` per suite. Run one suite with `--test integration <name>::`.
-Targets selected by CI, custom harnesses, and tests that need process isolation
-remain under `tests/` as separate binaries. In particular, the server's
-`multi_graph.rs` exhausts the process-wide export budget and must not share a
-binary with the other export tests.
+`mod <name>;` per suite. Run one suite with `--test integration <name>::`, and
+one test with `--test integration <name>::<test> -- --exact`; a CI job that
+needs a module's test names it that way too, since nextest and libtest report
+it as `<name>::<test>`. Custom harnesses and tests that need process isolation
+remain under `tests/` as separate binaries: a file that arms failpoints for the
+whole process, re-executes its own binary (`current_exe`), mutates the process
+environment, or, for the server's `multi_graph.rs`, exhausts the process-wide
+export budget and must not share a binary with the other export tests.
 
 | Package | Primary owners | Shared support |
 |---|---|---|
@@ -52,22 +55,22 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `integration/lifecycle.rs`, `integration/end_to_end.rs`, `integration/composite_flow.rs`, `integration/consistency.rs` |
-| Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
-| V2 execution and memory | `integration/engine_v2.rs`, `integration/engine_v2_memory.rs`; `repro_issue_703.rs` and `repro_issue_723.rs` own ignored scale symptoms |
+| Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `integration/proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| V2 execution and memory | `integration/engine_v2.rs`, `integration/engine_v2_memory.rs`; `integration/repro_issue_703.rs` and `integration/repro_issue_723.rs` own ignored scale symptoms |
 | Frozen engine v1, the reference | `crates/omnigraph-reference-engine/tests/frozen.rs` pins every source file's bytes; `forbidden_apis.rs` owns that `omnigraph-gqt` is the crate's only dependent and that its source names neither the engine nor the planner; the crate has no other tests, and a `.gqt` step's `--- expect same as v1` compares v2's rows with its answer |
 | V2 plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/integration/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
 | V2 plan sufficiency: the bound plan alone reproduces a run | `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` (see [Plan replay](#plan-replay)): one query per node kind with a switch or a ladder, replayed twice through `Session::replay_bound_plan` from the serialized `BoundPlan`, equal rows and the same trace required; `crates/omnigraph-planner/tests/integration/bound_plan.rs` owns the serialized form; in-source `engine/search.rs` tests own the declared ladder's stepping; `engine/plan_source.rs` tests own that the assumed memory limit sizes the plan, the lowering and the pool |
 | V2 scrubbed replay: no input beside the bound plan and the snapshot reaches execution | `engine_v2_scrubbed_replay.rs` owns the mechanism (the `std::env` grep over `crates/omnigraph/src/engine/`, the replay under an ambient memory limit and an ambient `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` the plan did not capture, `ann_nprobes` as a plan field, the `profile` rows); `integration/engine_v2_plan_replay.rs` owns the snapshot pins (an edge write or an insert after planning refuses the replay); the inventory cases `cases/v2/planner/input_*.gqt` own one input class each (`engine`, `ann_nprobes`, index build state), and the clock class is owned by `integration/engine_v2_plan_replay.rs`; `integration/engine_v2_memory.rs` owns `ran id_lookup` under a refused build |
 | V2 declared switches: the report names the side a run took | `cases/v2/planner/switch_ran_on_the_report.gqt` (the `ran` line of `--- expect plan`); in-source `engine/report/tests.rs` owns the switch's row and a scan whose plan declares no fallback |
-| Search and physical indexes | `search.rs`, `integration/scalar_indexes.rs`, `lance_surface_guards.rs`, `integration/rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
+| Search and physical indexes | `search.rs`, `integration/scalar_indexes.rs`, `lance_surface_guards.rs`, `integration/rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `integration/repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `integration/validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
-| Branches, snapshots, diffs, and merges | `integration/branching.rs`, `integration/point_in_time.rs`, `integration/changes.rs`, `integration/merge_truth_table.rs`, `merge_fast_forward.rs` |
+| Branches, snapshots, diffs, and merges | `integration/branching.rs`, `integration/point_in_time.rs`, `integration/changes.rs`, `integration/merge_truth_table.rs`, `integration/merge_fast_forward.rs` |
 | Recovery and crash windows | `integration/recovery.rs`, `failpoints.rs` (including the `live_handle_*` liveness owners: a live handle writes again once faults stop, without reopening), `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix over the insert, multi-table, load, cleanup, ensure-indices, full-text-rebuild, merge, schema-apply, optimize, system-column-upgrade and Blob put and clear writers; the same-handle liveness actor runs by default and `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors), in-source manifest/recovery tests |
-| Maintenance and substrate fences | `integration/maintenance.rs`, `lance_surface_guards.rs`, `lance_version_columns.rs`, `forbidden_apis.rs` |
+| Maintenance and substrate fences | `integration/maintenance.rs`, `lance_surface_guards.rs`, `integration/lance_version_columns.rs`, `forbidden_apis.rs` |
 | Export and lineage | `integration/export.rs`, `integration/lineage_projection.rs` |
 | Legacy-vintage graphs (`id`/`src`/`dst` spellings, born at the current stamp) | `integration/legacy_columns.rs` — load, query, export round trip, evolution; needs `--features failpoints` |
 | System-column upgrade (RFC 0040 step 3: respelling in place on a supported standalone graph; vintage is independent of the storage stamp) | `system_column_upgrade.rs`: check and execute, preflight refusals, every window before the manifest commit leaving no residue, a complete contract and table state after a post-commit failure, same-handle retry, the control-object cost; needs `--features failpoints` |
-| Cost and benchmark contracts | `integration/write_cost.rs`, `write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, and the GQT benchmark adapter tests in `omnigraph-bench` |
+| Cost and benchmark contracts | `integration/write_cost.rs`, `integration/write_cost_s3.rs`, `integration/warm_read_cost.rs`, `integration/branch_control_cost.rs`, `integration/merge_cost.rs`, `integration/changes_cost.rs`, the checkpoint/head lookup instruments, and the GQT benchmark adapter tests in `omnigraph-bench` |
 
 Use `tests/helpers/mod.rs` for the standard graph, snapshots, row reads, Blob selectors, and bounded Blob collection. Recovery helpers belong in `tests/helpers/recovery.rs`; object-store counters belong in `tests/helpers/cost.rs`; graphs whose rows trip the ordered-scan sorter cap belong in `tests/helpers/wide_rows.rs`.
 
@@ -115,7 +118,7 @@ Blob coverage is deliberately split:
 - engine `integration/maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `integration/maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `integration/maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
 - server `integration/data_routes.rs`, `integration/auth_policy.rs`, and `integration/openapi.rs` own GET/HEAD, auth, conditions, ranges, redirects, backpressure, and schema drift;
-- CLI `integration/cli_data.rs` owns `blob get/stat/put/clear`; `integration/parity_matrix.rs` compares embedded and remote results; `system_remote.rs` owns a put's or clear's lost delivery through the fault proxy.
+- CLI `integration/cli_data.rs` owns `blob get/stat/put/clear`; `integration/parity_matrix.rs` compares embedded and remote results; `integration/system_remote.rs` owns a put's or clear's lost delivery through the fault proxy.
 
 Do not exercise a server promise solely through the engine facade. The complete contract is summarized in [blob.md](blob.md).
 
@@ -185,24 +188,24 @@ terminal ledger acknowledgement, same-lifetime older manifest survivors,
 replacement refusal and corrective creation in empty local settlement residue;
 `tests/identity_recovery.rs` owns current-actor authorization and adoption of a
 persisted settlement without replacing its author. CLI
-`tests/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
-`tests/cli_cluster.rs` owns CLI admission. Engine `tests/schema_apply.rs` owns
+`tests/integration/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
+`tests/integration/cli_cluster.rs` owns CLI admission. Engine `tests/schema_apply.rs` owns
 strict prepared publication and settlement proofs, with actor checks in
 `tests/policy_engine_chassis.rs`; catalog tests own numeric CAS. The storage
 in-source contract owns bounded same-GET bytes/tokens, and cluster
 `tests/s3_cluster.rs` owns the shared S3/Azure backend journey. Passing Azurite is
 not qualification of live Azure lease-loss or delayed accepted writes.
 
-The cross-version rebuild owner, `crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test crossversion_upgrade` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `integration/crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test integration crossversion_upgrade::` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test crossversion_upgrade current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
+OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test integration crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
 ```
 
 The older seams work the same way with released binaries: `OMNIGRAPH_OLD_BIN` (0.7.2) and `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). `OMNIGRAPH_V6_BIN` (the 0.10.0 release) owns the v6↔v10 fence. RFC 0062 introduced v7's registration clock, RFC 0042's native-ref retirement metadata requires v8, RFC 0040's system columns stamped new graphs v9, and RFC 0067's detached table commits stamp every graph v10. The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
 
 The separate `Storage Upgrade Compatibility` CI job requires the
-`storage_upgrade` cases of `crossversion_upgrade.rs` (the report on a fresh
+`storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
 graph, the cluster-path refusal and the five genuine journeys:
 `genuine_v13_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
@@ -259,10 +262,25 @@ variable says. To run the
 crossversion scope locally, build the stamp-13 predecessor as for the v5 fence
 above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
 and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the three binaries
-in those directories and run:
+in those directories and run the job's sequence (bash: the cases live in the
+CLI's `integration` binary, where a bare `crossversion_upgrade::` filter would
+add the module's other journeys, so the exact names come from the compiled
+listing, discovery must succeed and the list must be nonempty before Cargo runs
+them, and the log must equal the generated file):
 
 ```bash
-cargo test --workspace --locked --test crossversion_upgrade --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints storage_upgrade -- --test-threads=1
+set -euo pipefail
+features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+scratch=$(mktemp -d)
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$features" crossversion_upgrade:: -- --list 2>&1 | tee "$scratch/list.log"
+python3 scripts/check-storage-upgrade-ci.py --list-cases crossversion --compiled "$scratch/list.log" > "$scratch/cases.txt"
+cases=()
+while IFS= read -r name; do
+  cases+=("$name")
+done < "$scratch/cases.txt"
+[ "${#cases[@]}" -gt 0 ]
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$features" -- --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$scratch/run.log"
+python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$scratch/run.log" --cases "$scratch/cases.txt"
 ```
 
 `db/upgrade/tests.rs` owns the `upgrade_storage` protocol over
@@ -317,8 +335,8 @@ env RUST_MIN_STACK=16777216 \
   OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
   "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
   cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
-    --features "$qualification_features" --test crossversion_upgrade \
-    genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment \
+    --features "$qualification_features" --test integration \
+    crossversion_upgrade::genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment \
     -- --exact --ignored --test-threads=1 --nocapture
 ```
 
@@ -398,8 +416,8 @@ time, and a case over budget leaves the corpus: it moves to
 `crates/omnigraph-gqt/cases_slow/`, the nightly slow tier
 ([GQT README](../../crates/omnigraph-gqt/README.md#slow-cases)), when the
 format can express it, and a symptom the format cannot express belongs in a
-`heavy-repro:` `#[ignore]`d test under
-`crates/omnigraph/tests/repro_issue_*.rs`. A name filter
+`heavy-repro:` `#[ignore]`d test in a
+`crates/omnigraph/tests/integration/repro_issue_*.rs` module. A name filter
 that matches no case is libtest's ordinary green zero-test run; read the
 `filtered out` count.
 

@@ -1,10 +1,8 @@
-mod support;
-
 use std::fs;
 
 use serde_json::json;
 
-use support::*;
+use crate::support::*;
 
 /// Graph id every served test addresses (`--server <url> --graph GRAPH_ID`).
 /// RFC-011: the server is cluster-only, so a graph selector is always required
@@ -567,9 +565,9 @@ fn remote_merge_statement_delivery_loss_never_replays_committed_effect() {
 /// One real server, four delivery faults on the verb (`branch merge`) or the
 /// statement (`mutate -e "branch merge …"`) spelling of the same merge.
 fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
+    use crate::support::managed_http::{IntentApiFixture, MergeDeliveryFault};
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
@@ -775,7 +773,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
 fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
+    use crate::support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
     let temp = tempfile::tempdir().unwrap();
     let (cluster_dir, _) = blob_parity_config(temp.path(), &temp.path().join("local.omni"));
@@ -936,10 +934,10 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
 
 #[test]
 fn remote_deployment_delivery_loss_preserves_owned_completion() {
+    use crate::support::managed_http::{DeploymentDeliveryFault, IntentApiFixture};
     use std::io::{BufRead, BufReader, Write};
     use std::net::{Shutdown, TcpStream};
     use std::time::{Duration, Instant};
-    use support::managed_http::{DeploymentDeliveryFault, IntentApiFixture};
 
     const TOKEN: &str = "deployment-wire-token";
     let cluster = converged_loaded_cluster(GRAPH_ID, None);

@@ -6,9 +6,9 @@ use std::fs;
 use omnigraph::db::Omnigraph;
 use tempfile::tempdir;
 
-mod support;
+use crate::support;
 
-use support::*;
+use crate::support::*;
 
 /// A real listener and the real CLI own the restart-free contract. Registry
 /// unit tests own exact epoch/drain/activation races; this verifies the complete
@@ -1436,7 +1436,7 @@ struct LiveBindingsFixture {
 
 impl LiveBindingsFixture {
     fn new() -> Self {
-        use support::managed_http::{IntentApiFixture, IntentReply};
+        use crate::support::managed_http::{IntentApiFixture, IntentReply};
         let embedding = |vector| {
             IntentReply::json(
                 200,
