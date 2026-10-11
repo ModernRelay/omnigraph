@@ -678,7 +678,7 @@ jobs:
       # The run step reuses these binaries (same flags, features, and env).
       - name: Compile the workspace and failpoint test graph
         run: |
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run \
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --timings \
             --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
@@ -768,6 +768,28 @@ jobs:
             --output-lacks "current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=skipping v0.9 upgrade e2e:" \
             --output-has "current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=v0.9 refusal and export/import rebuild completed" \
             --output-lacks "current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10=skipping immediate-predecessor v6 upgrade test"
+
+      # Kept on every run, red or green: per-test durations and the compile's
+      # unit timings are what a change to this job's scheduling is sized from.
+      - name: Retain the nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-workspace-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
+      - name: Retain Cargo build timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-workspace-build-timings
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
 
 

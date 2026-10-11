@@ -340,20 +340,8 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
     })
 }
 
-/// BIRTH-CONTRACT ENUMERATION (`dst_birth_contract_sweep`,
-/// active): kill init at every init-path
-/// window and judge the store against the birth contract (open cleanly, fail
-/// truthfully, or re-init cleanly on the same root). Expected map pins
-/// today's measured truth:
-/// - `post_manifest_create` → DiedThenOpensClean: since #487 the manifest's
-///   whole birth (entries, lineage, stamp) rides the Create commit, and the
-///   #495 fix keeps error-return cleanup on the pre-commit side, so a
-///   born-complete graph survives its init's death.
-/// - `after_coordinator_init` → DiedThenOpensClean: the store is COMPLETE
-///   here; the #495 fix (init cleanup honors the commit point) retired the
-///   cleanup brick (`init_cleanup_destroys_completed_store`) this pin
-///   previously measured (crash-vs-cleanup contrast in `tests/torn_init.rs`).
-/// Each universe runs twice — birth outcomes must replay identically.
+/// Kills init at each window and replays the birth outcome twice.
+/// Error-return cleanup is covered separately in `tests/integration/torn_init.rs`.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]

@@ -493,6 +493,7 @@ async fn maintain_indices_for_branch(
             actor,
             &txn,
             lineage,
+            Publication::Publish,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -1316,9 +1317,55 @@ pub(super) async fn commit_updates(
     commit_prepared_updates(db, &prepared, None).await
 }
 
+/// Where a prepared write's publication lands.
+pub(crate) enum Publication {
+    /// Advance the branch head: the ordinary publish.
+    Publish,
+    /// Write an unpublished commit (RFC "Unpublished graph commits"): the
+    /// branch head is unchanged, and a merge carries its held inputs.
+    Propose(Option<crate::db::manifest::UnpublishedMergeInputs>),
+}
+
+async fn publish_prepared(
+    coordinator: &mut crate::db::graph_coordinator::GraphCoordinator,
+    changes: &[ManifestChange],
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+    lineage_intent: crate::db::manifest::LineageIntent,
+    expectation: crate::db::manifest::GraphHeadExpectation,
+    publication: Publication,
+) -> Result<crate::db::GraphCommit> {
+    match publication {
+        Publication::Publish => {
+            let precondition =
+                crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+            Ok(coordinator
+                .commit_changes_with_intent_and_expected(
+                    changes,
+                    expected_table_versions,
+                    lineage_intent,
+                    &precondition,
+                )
+                .await?
+                .commit)
+        }
+        Publication::Propose(merge) => {
+            coordinator
+                .propose_changes(
+                    changes,
+                    expected_table_versions,
+                    &lineage_intent,
+                    &expectation,
+                    merge,
+                )
+                .await
+        }
+    }
+}
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
+/// `publication` chooses the head-advancing publish or an unpublished commit.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1327,6 +1374,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     actor_id: Option<&str>,
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
+    publication: Publication,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
@@ -1346,7 +1394,6 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.branch_identifier.clone(),
         txn.authority.graph_head.clone(),
     );
-    let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
 
     // Choose and publish through one coordinator lock. A same-name cached
     // coordinator can still hold another incarnation or incomplete lineage,
@@ -1362,14 +1409,15 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             // The publisher still reads fresh authority and applies its CAS.
             *active = db.open_coordinator_for_branch(branch).await?;
         }
-        active
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?
+        publish_prepared(
+            &mut active,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
@@ -1400,18 +1448,19 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // publisher still reads fresh state and enforces ExactGraphHead on
         // every CAS attempt. On error, drop a taken cache view; the next
         // capture must resolve any ambiguous durable publication.
-        let published = coordinator
-            .commit_changes_with_intent_and_expected(
-                &changes,
-                expected_table_versions,
-                lineage_intent,
-                &precondition,
-            )
-            .await?;
+        let published = publish_prepared(
+            &mut coordinator,
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            expectation,
+            publication,
+        )
+        .await?;
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
-    Ok(published.commit)
+    Ok(published)
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

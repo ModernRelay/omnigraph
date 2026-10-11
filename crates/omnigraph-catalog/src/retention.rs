@@ -5,6 +5,7 @@
 //! until the target moves or retires. No table version or graph head changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use lance::Dataset;
 use lance::dataset::refs::{BranchContents, Ref, TagContents};
@@ -45,20 +46,24 @@ impl PinnedGraphManifest {
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<CommitGraph> {
-        let (head, buffer) = match &self.head {
+        let (head, buffer, registry) = match &self.head {
             PinnedHead::Manifest => {
                 let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
-                (rows.head, rows.buffer)
+                (rows.head, rows.buffer, Some(rows.registry))
             }
-            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default()),
+            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default(), None),
         };
-        Ok(CommitGraph::from_head(
+        let graph = CommitGraph::from_head(
             root_uri,
             self.dataset.session(),
             head,
             buffer.commits(),
             history.clone(),
-        ))
+        );
+        Ok(match registry {
+            Some(registry) => graph.with_registry(Arc::new(registry), &self.dataset),
+            None => graph,
+        })
     }
 
     async fn from_dataset(root_uri: &str, dataset: Dataset) -> Result<Self> {
@@ -156,6 +161,11 @@ impl MergeInputGuard {
     pub async fn release(&self) -> Result<()> {
         release_merge_input_tags(&self.dataset, &self.acknowledged_names).await
     }
+
+    /// The tags this guard created, in creation order.
+    pub fn tag_names(&self) -> &[String] {
+        &self.acknowledged_names
+    }
 }
 
 /// Delete only nonce-owned, immutable engine tags. No existence HEAD is
@@ -198,11 +208,16 @@ impl ManifestTagInventory {
         let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
         for name in tags.keys() {
             merge_input_owner(name)?;
+            crate::branch_names::unpublished_tag_commit_id(name)?;
         }
         Ok(Self {
             dataset: dataset.clone(),
             tags: tags.into_iter().collect(),
         })
+    }
+
+    pub(crate) fn dataset(&self) -> &Dataset {
+        &self.dataset
     }
 
     pub async fn snapshot(&self, tag: &TagContents, root_uri: &str) -> Result<PinnedGraphManifest> {
@@ -344,19 +359,23 @@ impl ManifestCoordinator {
                 .await
                 .map_err(OmniError::storage)?;
             let session = dataset.session();
-            let (head, buffer) =
+            let (head, buffer, registry) =
                 match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)
                     .await?
                 {
                     RetiredHead::Rows => {
                         let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
-                        (rows.head, rows.buffer)
+                        (rows.head, rows.buffer, Some(rows.registry))
                     }
-                    RetiredHead::Commit(head) => (*head, Default::default()),
+                    RetiredHead::Commit(head) => (*head, Default::default(), None),
                     RetiredHead::Commitless => continue,
                 };
             let graph =
                 CommitGraph::from_head(root_uri, session, head, buffer.commits(), history.clone());
+            let graph = match registry {
+                Some(registry) => graph.with_registry(Arc::new(registry), &dataset),
+                None => graph,
+            };
             graphs.push((native, graph));
         }
         Ok(graphs)

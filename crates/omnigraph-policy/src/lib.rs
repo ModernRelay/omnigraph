@@ -23,6 +23,13 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
+    /// Publish an unpublished graph commit onto its recorded target branch
+    /// (`commit publish "<id>"`). Target-branch scoped like `branch_merge`:
+    /// the scope is the branch the commit lands on.
+    CommitPublish,
+    /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
+    /// scoped: the branch the proposal would have landed on.
+    CommitDrop,
     /// Reserved for **policy-management** surfaces. Per MR-724 Option A,
     /// this gates operator actions like hot-reloading policy / tokens
     /// (MR-726), querying the audit log (MR-732), and listing /
@@ -87,6 +94,8 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
+            Self::CommitPublish => "commit_publish",
+            Self::CommitDrop => "commit_drop",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
@@ -101,7 +110,12 @@ impl PolicyAction {
     fn uses_target_branch_scope(self) -> bool {
         matches!(
             self,
-            Self::BranchCreate | Self::SchemaApply | Self::BranchDelete | Self::BranchMerge
+            Self::BranchCreate
+                | Self::SchemaApply
+                | Self::BranchDelete
+                | Self::BranchMerge
+                | Self::CommitPublish
+                | Self::CommitDrop
         )
     }
 
@@ -121,6 +135,8 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
+            | Self::CommitPublish
+            | Self::CommitDrop
             | Self::Admin
             | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
@@ -181,6 +197,8 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
+            "commit_publish" => Ok(Self::CommitPublish),
+            "commit_drop" => Ok(Self::CommitDrop),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
@@ -902,6 +920,8 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
@@ -1376,6 +1396,69 @@ rules:
             )
             .unwrap();
         assert!(!deny.allowed);
+    }
+
+    #[test]
+    fn commit_publish_and_drop_use_target_branch_scope() {
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: reviewers-publish
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        for action in [PolicyAction::CommitPublish, PolicyAction::CommitDrop] {
+            let allow = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("main".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(allow.allowed, "{action:?} onto main");
+
+            let deny = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("feature".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(!deny.allowed, "{action:?} onto feature");
+        }
+
+        let branch_scoped: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+rules:
+  - id: bad
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish]
+      branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let err = branch_scoped.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported action"));
     }
 
     // ─── MR-668 — server-scoped action (graph_list) ─

@@ -133,8 +133,9 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
-# Focused examples
-cargo test -p omnigraph-engine --test traversal_indexed
+# Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
+# binary (one link per crate, not one per file); the binaries CI selects by name stay separate files.
+cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
 
