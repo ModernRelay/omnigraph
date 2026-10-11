@@ -218,9 +218,12 @@ workflow carries the `Classify Changes` copy under the name
 (`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
 regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
 `issue_N` function, added or strengthened, in a top-level test target
-(`tests/<name>.rs`) or `src/` module under `crates/*` or `tools/*` (an owner
+(`tests/<name>.rs`), `tests/integration/main.rs` or its direct modules, or a
+`src/` module under `crates/*` or `tools/*` (an owner
 test not yet named for the issue is renamed to carry `issue_N` when
-extended). A PR whose diff changes no path under `crates/` or `tools/`
+extended). An integration module requires a bare, top-level `mod <name>;`
+declaration in that root at the range's head commit. Attributed declarations,
+path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/` or `tools/`
 (Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
 passes unexamined, with a notice annotation saying so: a fix in a workflow, a
 script, a document, or a deployment file has no logic or Rust test that could
