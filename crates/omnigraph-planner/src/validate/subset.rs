@@ -387,6 +387,10 @@ pub enum Rule {
     /// limit places them; `at` `[scan]`, successors the scan and the
     /// hydration.
     HydrateReturnColumns { columns: Vec<HydratedColumn> },
+    /// The physical scan also tests `conjunct`, the canonical identity of a
+    /// written equality on its type's single String key, which the
+    /// validator re-derives; `at` `[scan]`.
+    NarrowKey { conjunct: ExprMirror },
 }
 
 /// One recorded rule application.
@@ -562,6 +566,12 @@ impl Tracer {
             self.next += 1;
         }
         derivation.steps.push(Step { at: indices, rule });
+    }
+
+    /// The derivation recorded so far.
+    #[cfg(test)]
+    pub(crate) fn derivation(&self) -> Option<Derivation> {
+        self.derivation.clone()
     }
 
     pub(crate) fn finish(self) -> Option<Derivation> {
@@ -1109,6 +1119,30 @@ fn apply(
                 columns: columns.clone(),
             };
             vec![(Role::Scan, Some(node)), (Role::Hydrate, Some(hydrate))]
+        }
+        (Rule::NarrowKey { conjunct }, [scan]) => {
+            let mut node = arena.node(*scan, Role::Scan)?.clone();
+            let ChainNode::Scan {
+                type_key,
+                binding,
+                filter,
+                lowered: true,
+                ..
+            } = &mut node
+            else {
+                return Err(invalid("only a physical scan narrows its key".into()));
+            };
+            let derived = IRExpr::from(conjunct.clone());
+            let written: Vec<IRExpr> = filter.iter().cloned().map(IRExpr::from).collect();
+            budget.visit(u64::try_from(written.len()).unwrap_or(u64::MAX))?;
+            if !super::requirements::narrowed_identity(input, type_key, binding, &written, &derived)
+            {
+                return Err(invalid(format!(
+                    "`{derived}` is no canonical identity of a written key equality"
+                )));
+            }
+            filter.push(conjunct.clone());
+            vec![(Role::Scan, Some(node))]
         }
         (rule, at) => {
             return Err(invalid(format!("rule {rule:?} names {} nodes", at.len())));

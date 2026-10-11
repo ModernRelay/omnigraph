@@ -112,11 +112,22 @@ impl Fixture {
     }
 
     fn derivation(&self) -> Option<Derivation> {
-        self.traced().derivation
+        self.traced().derivation()
     }
 
     fn accept(&self, plan: PhysicalPlan) -> Result<AcceptedPlan, ValidationError> {
         self.accept_with(plan, self.derivation())
+    }
+
+    fn input(&self) -> AcceptInput<'_> {
+        AcceptInput {
+            checked: &self.checked,
+            catalog: &self.catalog,
+            ir: &self.ir,
+            params: &self.params,
+            keys: &Keys,
+            limits: ValidationLimits::DEFAULT,
+        }
     }
 
     fn accept_with(
@@ -207,6 +218,7 @@ fn rules(derivation: &Derivation) -> Vec<&'static str> {
             Rule::Lower => "lower",
             Rule::RankBm25Scan { .. } => "rank",
             Rule::HydrateReturnColumns { .. } => "hydrate",
+            Rule::NarrowKey { .. } => "narrow",
         })
         .collect()
 }
@@ -286,9 +298,10 @@ fn a_bm25_rank_before_scoring_needs_full_coverage() {
     );
     let traced = fixture.traced();
     let accepted = fixture
-        .accept_with(traced.optimized.physical.clone(), traced.derivation.clone())
+        .accept_with(traced.optimized.physical.clone(), traced.derivation())
         .expect("full coverage admits filtering before scoring");
     assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+    let derivation = traced.derivation();
     let mut plan = traced.optimized.physical;
     let mut assumptions = plan.assumptions().clone();
     assumptions.full_text.insert(
@@ -296,7 +309,7 @@ fn a_bm25_rank_before_scoring_needs_full_coverage() {
         crate::source::FullTextCoverage::Partial,
     );
     plan.set_assumptions(assumptions);
-    match fixture.accept_with(plan, traced.derivation) {
+    match fixture.accept_with(plan, derivation) {
         Err(ValidationError::Violated { check, detail }) => {
             assert_eq!(check, "prerequisite", "{detail}");
         }
@@ -320,6 +333,233 @@ fn a_dropped_conjunct_fails_predicate_retention() {
     }
     let (check, detail) = fixture.refused(plan);
     assert_eq!(check, "predicate retention", "{detail}");
+}
+
+fn value_type(
+    scalar: omnigraph_compiler::types::ScalarType,
+) -> omnigraph_compiler::types::ExprType {
+    omnigraph_compiler::types::ExprType::Value {
+        scalar,
+        list: false,
+        nullable: false,
+    }
+}
+
+/// `conjunct` appended to the filter of every scan of `plan`.
+fn place_on_scans(plan: &mut PhysicalPlan, conjunct: &IRExpr) {
+    for id in node_ids(plan, |node| matches!(node, PhysicalNode::Scan { .. })) {
+        if let Some(PhysicalNode::Scan { spec, .. }) = plan.node_mut(id) {
+            let added = crate::optimizer::gq_conjunct(conjunct);
+            spec.filter = Some(match spec.filter.take() {
+                Some(filter) => filter.and(added),
+                None => added,
+            });
+        }
+    }
+}
+
+#[test]
+fn an_unwritten_conjunct_fails_predicate_origin() {
+    let fixture = filtered();
+    let mut plan = fixture.plan();
+    place_on_scans(
+        &mut plan,
+        &IRExpr::Literal(
+            Literal::Bool(false),
+            value_type(omnigraph_compiler::types::ScalarType::Bool),
+        ),
+    );
+    let (check, detail) = fixture.refused(plan);
+    assert_eq!(check, "predicate origin", "{detail}");
+}
+
+const KEYED: &str = r#"query q($s: String) {
+    match { $d: Doc { slug: $s } }
+    return { $d.title }
+}"#;
+
+/// The identity equality a key narrowing adds, with `id`.
+fn identity(catalog: &Catalog, id: &str) -> IRExpr {
+    let ty = value_type(omnigraph_compiler::types::ScalarType::String);
+    IRExpr::comparison(
+        IRExpr::PropAccess {
+            variable: "d".to_string(),
+            property: catalog.system_columns.id.to_string(),
+            ty: ty.clone(),
+        },
+        omnigraph_compiler::query::ast::CompOp::Eq,
+        IRExpr::Literal(Literal::String(id.to_string()), ty),
+    )
+}
+
+/// A key narrowing (`scan_access::narrow_key`) is a recorded rule of the
+/// exact fragment and a predicate the invariants re-derive: the planned
+/// narrowing is accepted, a forged id or a narrowing with no written key
+/// equality is refused.
+#[test]
+fn a_key_narrowing_is_accepted_only_with_the_derived_id() {
+    let fixture = Fixture::new(KEYED, &[("s", Literal::String("a".into()))]);
+    let id = fixture.catalog.system_columns.id.to_string();
+    let source = fixture
+        .source
+        .clone()
+        .with_canonical_key_ids(fixture.params.clone())
+        .with_index_facts(
+            "node:Doc",
+            vec![crate::source::IndexFact {
+                name: "id_idx".into(),
+                column: id,
+                kind: crate::source::IndexKind::Btree { usable: true },
+                coverage: Some(crate::source::FragmentCoverage {
+                    covered: 1,
+                    total: 1,
+                }),
+            }],
+        );
+    let accepted = futures::executor::block_on(crate::gate::accept_query(
+        &fixture.input(),
+        &source,
+        &BOUNDS,
+    ))
+    .expect("the narrowed plan is accepted");
+    assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+    let derivation = accepted.evidence().derivation().cloned().unwrap();
+    assert!(rules(&derivation).contains(&"narrow"), "{derivation:?}");
+    let narrowed = identity(&fixture.catalog, "id:a");
+    let placed = node_ids(accepted.plan(), |node| {
+        matches!(node, PhysicalNode::Scan { .. })
+    })
+    .into_iter()
+    .any(|id| match accepted.plan().node(id) {
+        Some(PhysicalNode::Scan { spec, .. }) => spec
+            .filter
+            .as_ref()
+            .is_some_and(|filter| filter.gq_filters().contains(&narrowed)),
+        _ => false,
+    });
+    assert!(placed, "the plan tests the narrowed identity");
+
+    let mut forged = accepted.plan().clone();
+    for id in node_ids(&forged, |node| matches!(node, PhysicalNode::Scan { .. })) {
+        if let Some(PhysicalNode::Scan { spec, .. }) = forged.node_mut(id) {
+            let conjuncts: Vec<IRExpr> = spec
+                .filter
+                .as_ref()
+                .map(|filter| filter.gq_filters())
+                .unwrap_or_default();
+            let mut rebuilt: Option<crate::logical::Predicate> = None;
+            for conjunct in conjuncts {
+                let conjunct = if conjunct == narrowed {
+                    identity(&fixture.catalog, "id:b")
+                } else {
+                    conjunct
+                };
+                let added = crate::optimizer::gq_conjunct(&conjunct);
+                rebuilt = Some(match rebuilt {
+                    Some(filter) => filter.and(added),
+                    None => added,
+                });
+            }
+            spec.filter = rebuilt;
+        }
+    }
+    match fixture.accept_with(forged, Some(derivation)) {
+        Err(ValidationError::Violated { check, detail }) => {
+            assert_eq!(check, "predicate origin", "{detail}");
+        }
+        other => panic!("a forged id was not refused: {other:?}"),
+    }
+
+    let keyless = Fixture::new("query q() { match { $d: Doc } return { $d.title } }", &[]);
+    let mut plan = keyless.plan();
+    place_on_scans(&mut plan, &identity(&keyless.catalog, "id:a"));
+    let (check, detail) = keyless.refused(plan);
+    assert_eq!(check, "predicate origin", "{detail}");
+}
+
+#[test]
+fn edited_hop_bounds_fail_traversal_identity() {
+    let fixture = Fixture::new(
+        "query q() { match { $d: Doc $d cites{1,2} $e } return { $d.slug, $e.slug } }",
+        &[],
+    );
+    let plan = fixture.plan();
+    fixture
+        .accept(plan.clone())
+        .expect("the planned traversal is accepted");
+    let mut plan = plan;
+    for id in node_ids(&plan, |node| matches!(node, PhysicalNode::Expand { .. })) {
+        if let Some(PhysicalNode::Expand { max_hops, .. }) = plan.node_mut(id) {
+            *max_hops = Some(1);
+        }
+    }
+    let (check, detail) = fixture.refused(plan);
+    assert_eq!(check, "traversal identity", "{detail}");
+}
+
+/// The first key of the final sort, removed.
+fn drop_first_sort_key(plan: &mut PhysicalPlan) {
+    for id in node_ids(plan, |node| matches!(node, PhysicalNode::Sort { .. })) {
+        if let Some(PhysicalNode::Sort { order_by, .. }) = plan.node_mut(id) {
+            order_by.remove(0);
+        }
+    }
+}
+
+/// A fused search sorts by `_rrf` descending then its written keys; a
+/// search-led aggregate by its written keys then every group key.
+#[test]
+fn fused_and_grouped_searches_sort_as_the_query_requires() {
+    let q = [("q", Literal::String("graph".into()))];
+    let fused = Fixture::new(
+        "query q($q: String) { match { $d: Doc } return { $d.slug } order { rrf(bm25($d.title, $q), bm25($d.title, $q)), $d.slug desc } limit 2 }",
+        &q,
+    );
+    let grouped = Fixture::new(
+        "query q($q: String) { match { $d: Doc } return { $d.open, count($d) as n } order { bm25($d.title, $q), n desc } }",
+        &q,
+    );
+    for fixture in [fused, grouped] {
+        let plan = fixture.plan();
+        fixture
+            .accept(plan.clone())
+            .expect("the planned order is accepted");
+        let mut plan = plan;
+        drop_first_sort_key(&mut plan);
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "order", "{detail}");
+    }
+}
+
+/// A member whose bare return columns are hydrated by row address keeps its
+/// exact subset through the recorded rule; a hydration that places a column
+/// elsewhere is refused.
+#[test]
+fn a_hydrated_member_keeps_its_exact_subset() {
+    let fixture = Fixture::new(
+        "query q() { match { $d: Doc } return { $d.slug, $d.title } order { $d.year } limit 2 }",
+        &[],
+    );
+    let plan = fixture.plan();
+    assert!(
+        matches!(
+            plan.node(plan.root()),
+            Some(PhysicalNode::HydrateColumns { .. })
+        ),
+        "the fixture hydrates its title"
+    );
+    let accepted = fixture
+        .accept(plan.clone())
+        .expect("a hydrated plan is accepted");
+    assert_eq!(accepted.scope(), ValidationScope::ExactSubset);
+    assert!(rules(accepted.evidence().derivation().unwrap()).contains(&"hydrate"));
+    let mut plan = plan;
+    let root = plan.root();
+    if let Some(PhysicalNode::HydrateColumns { bindings, .. }) = plan.node_mut(root) {
+        bindings[0].columns[0].position = 0;
+    }
+    let (check, detail) = fixture.refused(plan);
+    assert_eq!(check, "hydration", "{detail}");
 }
 
 #[test]
@@ -821,7 +1061,7 @@ fn derivation_cost_grows_with_the_query() {
         );
         let fixture = Fixture::new(&query, &[]);
         let traced = fixture.traced();
-        let derivation = traced.derivation.clone().unwrap();
+        let derivation = traced.derivation().unwrap();
         let bytes = serde_json::to_vec(&derivation).unwrap().len();
         let input = AcceptInput {
             checked: &fixture.checked,

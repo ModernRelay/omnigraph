@@ -298,6 +298,9 @@ pub struct MemorySource {
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
     full_text: HashMap<(String, String), FullTextCoverage>,
+    /// When set, a key's canonical id renders as `id:<value>`, a parameter
+    /// resolved from these values.
+    canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
 }
 
 impl MemorySource {
@@ -309,6 +312,11 @@ impl MemorySource {
     ) -> Self {
         self.full_text
             .insert((type_key.to_string(), property.to_string()), coverage);
+        self
+    }
+
+    pub fn with_canonical_key_ids(mut self, params: omnigraph_compiler::ir::ParamMap) -> Self {
+        self.canonical_keys = Some(params);
         self
     }
 
@@ -395,6 +403,25 @@ impl MemorySource {
 }
 
 impl PlanSource for MemorySource {
+    fn canonical_key_id(
+        &self,
+        _type_key: &str,
+        value: &IRExpr,
+    ) -> Result<Option<String>, PlanError> {
+        let Some(params) = &self.canonical_keys else {
+            return Ok(None);
+        };
+        let literal = match value {
+            IRExpr::Literal(literal, _) => Some(literal),
+            IRExpr::Param(name, _) => params.get(name),
+            _ => None,
+        };
+        Ok(match literal {
+            Some(omnigraph_compiler::query::ast::Literal::String(key)) => Some(format!("id:{key}")),
+            _ => None,
+        })
+    }
+
     fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
         self.index_facts
             .get(dataset_key)

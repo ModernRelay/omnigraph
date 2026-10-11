@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::ast::{CompOp, Expr, Literal, RRF_COLUMN};
+use omnigraph_compiler::query::ast::{Expr, RRF_COLUMN};
 use omnigraph_compiler::query::typecheck::BoundVariable;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
@@ -133,16 +133,6 @@ fn ranked_scans(plan: &PhysicalPlan) -> Vec<(NodeId, &str, &RankedAccess)> {
             _ => None,
         })
         .collect()
-}
-
-/// The type `scan_access::narrow_key` gives the identity column and its
-/// value: a non-null String.
-fn narrowed_type() -> ExprType {
-    ExprType::Value {
-        scalar: ScalarType::String,
-        list: false,
-        nullable: false,
-    }
 }
 
 impl Requirements {
@@ -308,9 +298,8 @@ impl Requirements {
     }
 
     /// Whether `conjunct`, placed on the scan `id`, is the identity equality
-    /// `scan_access::narrow_key` adds for a written equality on the scanned
-    /// type's single String key: the binding's id column equal, as a
-    /// non-null String, to the id the loader derives from the written value.
+    /// the key narrowing adds for a written key equality on the same scan
+    /// ([`super::requirements::narrowed_identity`]).
     fn narrowed_key(
         &self,
         plan: &PhysicalPlan,
@@ -322,70 +311,22 @@ impl Requirements {
         let Some(PhysicalNode::Scan { spec, .. }) = plan.node(id) else {
             return false;
         };
-        let (Some(binding), Some(type_name)) =
-            (spec.binding.as_deref(), spec.table.node_type_name())
-        else {
+        let (Some(binding), Some(filter)) = (spec.binding.as_deref(), spec.filter.as_ref()) else {
             return false;
         };
-        let Some((
-            IRExpr::PropAccess {
-                variable,
-                property,
-                ty,
-            },
-            CompOp::Eq,
-            IRExpr::Literal(Literal::String(narrowed), literal_ty),
-        )) = conjunct.comparison_parts()
-        else {
-            return false;
-        };
-        if variable != binding
-            || property != input.catalog.system_columns.id
-            || *ty != narrowed_type()
-            || *literal_ty != narrowed_type()
-        {
-            return false;
-        }
-        let Some([key]) = input
-            .catalog
-            .node_types
-            .get(type_name)
-            .and_then(|node| node.key.as_deref())
-        else {
-            return false;
-        };
-        let Some(filter) = &spec.filter else {
-            return false;
-        };
-        filter
+        let written: Vec<IRExpr> = filter
             .gq_filters()
             .into_iter()
             .flat_map(IRExpr::into_conjuncts)
             .filter(|written| required.contains(written))
-            .any(|written| {
-                let Some((left, CompOp::Eq, right)) = written.comparison_parts() else {
-                    return false;
-                };
-                [(left, right), (right, left)]
-                    .into_iter()
-                    .any(|(side, value)| {
-                        let keyed = matches!(side, IRExpr::PropAccess { variable, property, .. }
-                        if variable == binding && property == key);
-                        let literal = match value {
-                            IRExpr::Literal(literal, _) => Some(literal),
-                            IRExpr::Param(name, _) => input.params.get(name),
-                            _ => None,
-                        };
-                        keyed
-                            && literal.is_some_and(|literal| {
-                                input
-                                    .keys
-                                    .canonical_key_id(&spec.table.type_key, literal, value.ty())
-                                    .as_deref()
-                                    == Some(narrowed.as_str())
-                            })
-                    })
-            })
+            .collect();
+        super::requirements::narrowed_identity(
+            input,
+            &spec.table.type_key,
+            binding,
+            &written,
+            conjunct,
+        )
     }
 
     /// The correlated blocks of each pipeline the query's rows come from are

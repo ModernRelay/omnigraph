@@ -317,6 +317,78 @@ impl Requirements {
     }
 }
 
+/// Whether `derived` is the identity equality the key narrowing adds to a
+/// scan of `type_key` bound to `binding` whose conjuncts include `written`:
+/// the binding's id column equal, as a non-null String, to the id the
+/// loader derives from the value of a written equality on the type's single
+/// String key. The derivation goes through `AcceptInput::keys`, so a
+/// narrowed id is re-derived, never trusted.
+pub(crate) fn narrowed_identity<'w>(
+    input: &AcceptInput<'_>,
+    type_key: &str,
+    binding: &str,
+    written: impl IntoIterator<Item = &'w IRExpr>,
+    derived: &IRExpr,
+) -> bool {
+    let narrowed_type = ExprType::Value {
+        scalar: omnigraph_compiler::types::ScalarType::String,
+        list: false,
+        nullable: false,
+    };
+    let Some((
+        IRExpr::PropAccess {
+            variable,
+            property,
+            ty,
+        },
+        omnigraph_compiler::query::ast::CompOp::Eq,
+        IRExpr::Literal(Literal::String(id), literal_ty),
+    )) = derived.comparison_parts()
+    else {
+        return false;
+    };
+    if variable != binding
+        || property != input.catalog.system_columns.id
+        || *ty != narrowed_type
+        || *literal_ty != narrowed_type
+    {
+        return false;
+    }
+    let Some([key]) = type_key
+        .strip_prefix("node:")
+        .and_then(|name| input.catalog.node_types.get(name))
+        .and_then(|node| node.key.as_deref())
+    else {
+        return false;
+    };
+    written.into_iter().any(|conjunct| {
+        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+            conjunct.comparison_parts()
+        else {
+            return false;
+        };
+        [(left, right), (right, left)]
+            .into_iter()
+            .any(|(side, value)| {
+                let keyed = matches!(side, IRExpr::PropAccess { variable, property, .. }
+                if variable == binding && property == key);
+                let literal = match value {
+                    IRExpr::Literal(literal, _) => Some(literal),
+                    IRExpr::Param(name, _) => input.params.get(name),
+                    _ => None,
+                };
+                keyed
+                    && literal.is_some_and(|literal| {
+                        input
+                            .keys
+                            .canonical_key_id(type_key, literal, value.ty())
+                            .as_deref()
+                            == Some(id.as_str())
+                    })
+            })
+    })
+}
+
 /// `filters` split at their top-level `and`, a constant `true` left out.
 fn push_conjuncts(out: &mut Vec<IRExpr>, filters: &[IRExpr]) {
     for conjunct in filters.iter().cloned().flat_map(IRExpr::into_conjuncts) {

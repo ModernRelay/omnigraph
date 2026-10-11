@@ -27,7 +27,7 @@ use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
     FragmentStat, FullTextCoverage, IndexFact, NodeTypeSpec, PlanSource, SideId,
 };
-use crate::validate::subset::{Derivation, Tracer};
+use crate::validate::subset::{Role, Rule, Tracer};
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 
 /// A `PlanSource` that records what the planner read through it: the
@@ -466,7 +466,15 @@ pub async fn accept_query_explained(
 pub(crate) struct Traced {
     pub logical: LogicalPlan,
     pub optimized: Optimized,
-    pub derivation: Option<Derivation>,
+    pub tracer: Tracer,
+}
+
+impl Traced {
+    /// The derivation recorded so far.
+    #[cfg(test)]
+    pub(crate) fn derivation(&self) -> Option<crate::validate::subset::Derivation> {
+        self.tracer.derivation()
+    }
 }
 
 pub(crate) fn plan_traced(
@@ -489,7 +497,7 @@ pub(crate) fn plan_traced(
     Ok(Traced {
         logical,
         optimized,
-        derivation: tracer.finish(),
+        tracer,
     })
 }
 
@@ -503,13 +511,24 @@ async fn plan_and_accept(
     let Traced {
         logical,
         mut optimized,
-        derivation,
+        mut tracer,
     } = plan_traced(input.ir, source, bounds)?;
-    // Scan access is part of the plan acceptance checks: a probe or a key
-    // narrowing it adds is validated like any other planned predicate.
-    crate::scan_access::finalize_scan_access(&mut optimized, source)
+    // Scan access is part of the plan acceptance checks: a key narrowing it
+    // adds is a recorded rule of an exact-fragment chain, and a predicate
+    // the invariants re-derive.
+    let narrowed = crate::scan_access::finalize_scan_access(&mut optimized, source)
         .await
         .map_err(Unrouted::of)?;
+    if let [conjunct] = narrowed.as_slice() {
+        tracer.record(
+            &[Role::Scan],
+            Rule::NarrowKey {
+                conjunct: crate::mirror::ExprMirror::from(conjunct),
+            },
+            &[],
+        );
+    }
+    let derivation = tracer.finish();
     let rendered = explain.then(|| {
         LogicalView::of(&logical)
             .explain(
