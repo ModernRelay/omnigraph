@@ -190,6 +190,8 @@ accepted older plans with no provenance default to the legacy runtime probe.
 Execution still adjusts for frontier size and warm CSR state. Explain statistics
 are diagnostics and do not select the replay path. Root scans finalize their access through the same Lance read builder used by
 execution. Static scans record a Boolean index query and residual or disable
-indexing. Dynamic and dependent reads keep their explicit runtime paths.
+indexing. A filtered scan whose table has no fact that could narrow it (no
+index, or only indexes covering no current fragment, such as an untrained
+full-text segment) records sequential access without building that read. Dynamic and dependent reads keep their explicit runtime paths.
 Single String key equality can gain a canonical identity predicate before
 finalization; historical IDs prevent broader key narrowing.
