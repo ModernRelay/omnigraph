@@ -384,12 +384,12 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        14,
-        "fresh graphs are stamped v14: current state in `__manifest`, settled commits in `__history`"
+        15,
+        "fresh graphs are stamped v15: current state in `__manifest`, settled commits in `__history`"
     );
     assert_eq!(
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-        14,
+        15,
         "the writer's stamp constant is the released format number"
     );
     assert_eq!(contract_row.source, TEST_SCHEMA);

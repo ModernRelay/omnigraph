@@ -133,17 +133,22 @@ pub(crate) struct GraphCoordinator {
 pub(crate) struct CapturedLineage {
     head: HistoryRecord,
     buffer: CommitBuffer,
+    /// The block registry of the captured version, hot rows and cold.
+    registry: crate::db::manifest::LineageRegistry,
     pub graph: CommitGraph,
 }
 
 impl CapturedLineage {
     /// The records a merge of the captured branch appends to `__history`: its
-    /// buffered commits after `merge_base`, oldest first, then its head.
-    pub(crate) fn into_records(self, merge_base: &str) -> BranchRecords {
+    /// buffered commits after `merge_base`, oldest first, then its head, and
+    /// the registry rows absent from the captured target.
+    pub(crate) fn into_records(mut self, merge_base: &str, target: &Self) -> BranchRecords {
+        self.registry.retain_missing(&target.registry);
         BranchRecords {
             buffer: self.buffer,
             head: self.head,
             merge_base: Some(merge_base.to_string()),
+            registry: self.registry,
         }
     }
 }
@@ -423,10 +428,12 @@ impl GraphCoordinator {
 
     /// The head this coordinator holds, as a merge captures it.
     pub(crate) async fn captured_lineage(&self) -> Result<CapturedLineage> {
+        let graph = self.manifest.commit_graph();
         Ok(CapturedLineage {
             head: self.manifest.head_record().clone(),
             buffer: self.manifest.buffer().clone(),
-            graph: self.manifest.commit_graph(),
+            registry: graph.registry().await?,
+            graph,
         })
     }
 

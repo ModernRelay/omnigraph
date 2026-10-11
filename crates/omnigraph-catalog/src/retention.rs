@@ -5,6 +5,7 @@
 //! until the target moves or retires. No table version or graph head changes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use lance::Dataset;
 use lance::dataset::refs::{BranchContents, Ref, TagContents};
@@ -45,20 +46,24 @@ impl PinnedGraphManifest {
         root_uri: &str,
         history: &HistoryCache,
     ) -> Result<CommitGraph> {
-        let (head, buffer) = match &self.head {
+        let (head, buffer, registry) = match &self.head {
             PinnedHead::Manifest => {
                 let rows = crate::state::read_manifest_rows_projected(&self.dataset).await?;
-                (rows.head, rows.buffer)
+                (rows.head, rows.buffer, Some(rows.registry))
             }
-            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default()),
+            PinnedHead::Legacy(record) => (record.commit.clone(), Default::default(), None),
         };
-        Ok(CommitGraph::from_head(
+        let graph = CommitGraph::from_head(
             root_uri,
             self.dataset.session(),
             head,
             buffer.commits(),
             history.clone(),
-        ))
+        );
+        Ok(match registry {
+            Some(registry) => graph.with_registry(Arc::new(registry), &self.dataset),
+            None => graph,
+        })
     }
 
     async fn from_dataset(root_uri: &str, dataset: Dataset) -> Result<Self> {
@@ -344,19 +349,23 @@ impl ManifestCoordinator {
                 .await
                 .map_err(OmniError::storage)?;
             let session = dataset.session();
-            let (head, buffer) =
+            let (head, buffer, registry) =
                 match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)
                     .await?
                 {
                     RetiredHead::Rows => {
                         let rows = crate::state::read_manifest_rows_projected(&dataset).await?;
-                        (rows.head, rows.buffer)
+                        (rows.head, rows.buffer, Some(rows.registry))
                     }
-                    RetiredHead::Commit(head) => (*head, Default::default()),
+                    RetiredHead::Commit(head) => (*head, Default::default(), None),
                     RetiredHead::Commitless => continue,
                 };
             let graph =
                 CommitGraph::from_head(root_uri, session, head, buffer.commits(), history.clone());
+            let graph = match registry {
+                Some(registry) => graph.with_registry(Arc::new(registry), &dataset),
+                None => graph,
+            };
             graphs.push((native, graph));
         }
         Ok(graphs)

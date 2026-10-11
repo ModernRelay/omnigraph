@@ -1,0 +1,102 @@
+# issue: 773
+# red_on: 2026-10-10, main 26ef1609: step 10 `branch merge b1` fails with `merge conflicts: … 'alice' (divergent_update)`; steps 1-9 green. Same on 80406fee (2026-09-25).
+# notes: Source-side mirror of issue 773, with an update in place of the delete. b0 forks
+# notes: before main sets alice to 1, b1 after; b1 merges b0, then main sets alice to 2 and
+# notes: merges b1. The base must be b1's fork point (age 1), so main's 2 wins; b0's older
+# notes: fork point (age 0) makes both sides look edited and the merge fails as a conflict.
+# notes: The padding commits are the minimum for the pre-fix distance-sum search to pick the older
+# notes: fork point; with one fewer the sums tie and its version tie-break picks the right base.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate
+query set_alice_1() {
+    update Person set { age: 1 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate branch: b0
+query insert_y() {
+    insert Person { name: "y", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b1
+query insert_x1() {
+    insert Person { name: "x1", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b1
+query insert_x2() {
+    insert Person { name: "x2", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b1
+query insert_x3() {
+    insert Person { name: "x3", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0 into b1
+
+--- expect outcome: merged
+
+--- mutate
+query set_alice_2() {
+    update Person set { age: 2 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b1
+
+--- expect outcome: merged
+
+--- query
+query values_on_main() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.age": 2}
+{"p.name": "x1", "p.age": 0}
+{"p.name": "x2", "p.age": 0}
+{"p.name": "x3", "p.age": 0}
+{"p.name": "y", "p.age": 0}
+
+--- expect shape
+p.name: String
+p.age: I32

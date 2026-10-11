@@ -135,12 +135,12 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. `omnigraph upgrade`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v14, offline and
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v15, offline and
 in place, keeping branches and commit history; stop every process using the
 graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 14 only. `check_passed`, `already_current` (a
-v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 14, `unsupported_target`)
+nothing; `--to-format` accepts 15 only. `check_passed`, `already_current` (a
+v14 or v15 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 15, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster
