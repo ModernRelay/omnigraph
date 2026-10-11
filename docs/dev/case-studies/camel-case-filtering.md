@@ -62,7 +62,7 @@ Lance reads a backtick-quoted identifier as a case-preserving column (its docume
 The protection is intentionally layered:
 
 - the expression unit test proves `repoName` reaches DataFusion unchanged;
-- `literal_filters.rs` proves a camelCase indexed match returns the right row;
+- `integration/literal_filters.rs` proves a camelCase indexed match returns the right row;
 - `writes.rs` proves update/delete and a chained pending-row update preserve case;
 - `lance_surface_guards.rs` proves the camelCase equality still plans through the scalar index and records why `col()` is forbidden here.
 

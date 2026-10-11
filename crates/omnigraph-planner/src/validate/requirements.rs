@@ -151,7 +151,7 @@ impl Requirements {
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
         let decl = input.checked.decl();
-        let types = input.checked.types();
+        let types = input.checked.query();
         let ir = input.ir;
         let mut eligibility = Vec::new();
         let mut traversals = Vec::new();
@@ -164,7 +164,7 @@ impl Requirements {
                     type_name,
                     filters,
                 } => {
-                    match types.bindings.get(variable) {
+                    match types.bindings().get(variable) {
                         Some(BoundVariable::Node {
                             type_name: declared,
                         }) if declared == type_name => {}
@@ -223,7 +223,7 @@ impl Requirements {
             .filter(|clause| matches!(clause, Clause::Subquery(_)))
             .count();
         let counts = [
-            ("traversals", types.traversals.len(), traversals.len()),
+            ("traversals", types.traversals().count(), traversals.len()),
             ("correlated blocks", written_blocks, blocks.len()),
             (
                 "return items",
@@ -250,7 +250,7 @@ impl Requirements {
             ));
         }
         let mut selected_edges = HashSet::new();
-        for traversal in &types.traversals {
+        for traversal in types.traversals() {
             budget.visit(1)?;
             if let Some(edge) = traversal
                 .edge_binding
@@ -295,7 +295,7 @@ impl Requirements {
             .map(|key| key.expr.clone());
         Ok(Self {
             bindings: types
-                .bindings
+                .bindings()
                 .iter()
                 .map(|(name, bound)| (name.clone(), bound.clone()))
                 .collect(),

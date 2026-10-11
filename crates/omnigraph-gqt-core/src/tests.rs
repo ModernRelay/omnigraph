@@ -683,6 +683,7 @@ fn outcome_takes_the_three_merge_words() {
         let ControlWrite::Merge {
             source,
             into,
+            as_commit: _,
             expect: MergeExpect::Outcome(got),
         } = &step.write
         else {
@@ -779,6 +780,154 @@ fn refuses_substitution_marker_in_a_statement_body() {
     assert_eq!(
         refusal("x", &text),
         "line 16: `${` may appear only inside a params or expect body"
+    );
+}
+
+const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n";
+const BIND: &str = "--- bind commit $c\n";
+
+/// `--- bind commit $name` attaches to the write before it, a `snapshot:
+/// $name` header and a quoted `"${name}"` commit operand consume it, and
+/// the `${` fence admits exactly that operand.
+#[test]
+fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- query snapshot: $c\n{}{EXPECT}--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- bind commit $m\n--- mutate\ncommit drop \"${{m}}\"\n{EXPECT_OK}",
+        QUERY.trim_start_matches("--- query\n")
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(propose)),
+        Item::Step(Step::Query(read)),
+        Item::Step(Step::Control(publish)),
+        Item::Step(Step::Control(merge)),
+        Item::Step(Step::Control(drop)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected five steps, got {:?}", case.items);
+    };
+    assert_eq!(propose.bind.as_deref(), Some("c"));
+    assert_eq!(read.snapshot.as_deref(), Some("c"));
+    assert_eq!(read.branch, "main");
+    assert!(matches!(
+        &publish.write,
+        ControlWrite::Publish { graph_commit_id, .. } if graph_commit_id == "${c}"
+    ));
+    assert_eq!(publish.bind, None);
+    assert_eq!(merge.bind.as_deref(), Some("m"));
+    assert!(matches!(
+        &drop.write,
+        ControlWrite::Drop { graph_commit_id, .. } if graph_commit_id == "${m}"
+    ));
+    let mut bindings = Bindings::new();
+    bindings.insert("c".into(), "hb1-c".into());
+    assert_eq!(resolve_operand("${c}", &bindings).unwrap(), "hb1-c");
+    assert_eq!(resolve_operand("literal", &bindings).unwrap(), "literal");
+    assert_eq!(
+        resolve_operand("${m}", &bindings).unwrap_err(),
+        "`${m}` is not bound at this step"
+    );
+    assert_eq!(
+        bound_snapshot(read, &bindings).unwrap().as_deref(),
+        Some("hb1-c")
+    );
+}
+
+/// Every misplacement of a binding is refused with the rule it broke.
+#[test]
+fn bind_commit_refusals() {
+    for (steps, want) in [
+        (
+            format!("{QUERY}{EXPECT}{BIND}"),
+            "`--- bind commit` follows a query step; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{MUTATE}{PARAMS}--- expect error: nope\n{BIND}"),
+            "`--- bind commit` follows a write expected to fail; a refused write binds nothing",
+        ),
+        (
+            format!("{CREATE}{BIND}"),
+            "`--- bind commit` follows `branch create`, which publishes no commit; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{PROPOSE}{BIND}{BIND}"),
+            "`--- bind commit $c` is declared twice; one binding per name",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- bind commit $d\n"),
+            "one write step binds one name",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit c\n"),
+            "`--- bind commit c`: a name is $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("{PROPOSE}--- bind $c\n"),
+            "`--- bind` must be `bind commit $name`",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit $c\nbody\n"),
+            "line 20: `--- bind` carries no body",
+        ),
+        (
+            format!("--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}"),
+            "`${c}` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!(
+                "--- query snapshot: $c\n{}{EXPECT}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`snapshot: $c` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- query snapshot: $c\nbranch list\n{EXPECT}"),
+            "`snapshot:` selects a query declaration's read target; a statement takes no target",
+        ),
+        (
+            format!(
+                "--- mutate snapshot: $c\n{}",
+                MUTATE.trim_start_matches("--- mutate\n")
+            ),
+            "`--- mutate` takes no arguments but `branch: <name>`, got `snapshot: $c`",
+        ),
+        (
+            format!(
+                "--- query snapshot:\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot:` needs a bound name, `$name`",
+        ),
+        (
+            format!(
+                "--- query snapshot: c\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot: c` must name a binding, $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("--- foreach $i a b\n{PROPOSE}{BIND}--- endloop\n"),
+            "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case",
+        ),
+        (
+            BIND.to_string(),
+            "`--- bind commit` has no write step to follow",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{steps}");
+        assert_eq!(refusal("x", &text), want, "{steps}");
+    }
+}
+
+/// The fence still refuses `${` outside a whole quoted commit operand.
+#[test]
+fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\nbranch create \"${{c}}\"\n{EXPECT_OK}"
+    );
+    assert_eq!(
+        refusal("x", &text),
+        "line 21: `${` may appear only inside a params or expect body"
     );
 }
 

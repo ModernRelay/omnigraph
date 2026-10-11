@@ -26,7 +26,7 @@ pub use replay::{
 pub use requirements::{KeyIds, Requirements};
 pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
 
-use omnigraph_compiler::CheckedQuery;
+use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{ParamMap, QueryIR};
 use serde::{Deserialize, Serialize};
@@ -111,7 +111,7 @@ impl std::fmt::Display for ValidationError {
 /// (`now()` among them), the derivation of a key's canonical id, and the
 /// limits.
 pub struct AcceptInput<'a> {
-    pub checked: &'a CheckedQuery,
+    pub checked: &'a CheckedRead,
     pub catalog: &'a Catalog,
     pub ir: &'a QueryIR,
     pub params: &'a ParamMap,

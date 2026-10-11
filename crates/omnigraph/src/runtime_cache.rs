@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Weak};
 
 use lance::session::Session;
-use omnigraph_compiler::CheckedQuery;
+use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::QueryIR;
@@ -355,7 +355,7 @@ pub(crate) struct CompiledQueryKey {
 #[derive(Clone)]
 pub(crate) struct CompiledQuery {
     pub(crate) ir: Arc<QueryIR>,
-    pub(crate) checked: CheckedQuery,
+    pub(crate) checked: CheckedRead,
 }
 
 /// A compiled read statement: a declaration the door runs for rows, or an
@@ -690,9 +690,8 @@ edge Likes: Person -> Person {}
         let (_, built) = db.capture_current_read_view().await.unwrap();
         let compile = |catalog: &Catalog, source: &str, name: &str| {
             let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
-            let checked = CheckedQuery::check(catalog, &decl).unwrap();
-            let ir =
-                omnigraph_compiler::lower_query(catalog, checked.decl(), checked.types()).unwrap();
+            let checked = CheckedRead::check(catalog, &decl).unwrap();
+            let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
             CompiledRead::Query(CompiledQuery {
                 ir: Arc::new(ir),
                 checked,

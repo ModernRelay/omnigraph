@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use omnigraph_compiler::CheckedQuery;
+use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::catalog::{Catalog, build_catalog};
 use omnigraph_compiler::ir::{IRExpr, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::Literal;
@@ -53,7 +53,7 @@ impl KeyIds for Keys {
 
 struct Fixture {
     catalog: Catalog,
-    checked: CheckedQuery,
+    checked: CheckedRead,
     ir: QueryIR,
     params: ParamMap,
     source: MemorySource,
@@ -63,9 +63,8 @@ impl Fixture {
     fn new(query: &str, params: &[(&str, Literal)]) -> Self {
         let catalog = build_catalog(&parse_schema(SCHEMA).unwrap()).unwrap();
         let decl = omnigraph_compiler::find_named_query(query, "q").unwrap();
-        let checked = CheckedQuery::check(&catalog, &decl).unwrap();
-        let ir =
-            omnigraph_compiler::lower_query(&catalog, checked.decl(), checked.types()).unwrap();
+        let checked = CheckedRead::check(&catalog, &decl).unwrap();
+        let ir = omnigraph_compiler::lower_query(&catalog, checked.query()).unwrap();
         let mut source = MemorySource::default().with_edge_version("Cites", 1);
         for (name, node_type) in &catalog.node_types {
             source = source.with_node_type(

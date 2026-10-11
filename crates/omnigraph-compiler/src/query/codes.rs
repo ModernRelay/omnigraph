@@ -20,7 +20,7 @@ codes! {
     Q001 = "the source does not match the grammar at this position";
     Q002 = "a query declaration is missing its parameter list";
     Q003 = "a settings statement is refused";
-    Q004 = "a branch, show or explain statement is misplaced or malformed";
+    Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
 
     // Typechecker.

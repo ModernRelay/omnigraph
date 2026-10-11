@@ -9,7 +9,7 @@ use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_compiler::{CheckedQuery, lower_query};
+use omnigraph_compiler::{CheckedRead, lower_query};
 
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
@@ -355,8 +355,8 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        let checked = CheckedQuery::check(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, checked.decl(), checked.types())?);
+        let checked = CheckedRead::check(catalog, statement.decl())?;
+        let ir = Arc::new(lower_query(catalog, checked.query())?);
         let query = CompiledQuery { ir, checked };
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(query)

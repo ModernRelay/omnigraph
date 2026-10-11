@@ -290,7 +290,7 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the format this binary serves (v14); other formats are rebuilt by export and load
+    /// the current format this binary serves (v15); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
@@ -812,6 +812,11 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Merge into an unpublished commit (`branch merge … as commit`): the
+        /// target head is unchanged until `omnigraph commit publish <id>`.
+        /// Exclusive with --delete-branch, whose source the commit still holds.
+        #[arg(long, conflicts_with = "delete_branch")]
+        as_commit: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
         /// `settings` field (the Session settings RFC).
@@ -857,7 +862,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store
@@ -879,6 +884,29 @@ pub(crate) enum CommitCommand {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// List the unpublished commits whose recorded target is the branch
+        /// (`as commit` writes awaiting `commit publish`) instead of its history
+        #[arg(long)]
+        unpublished: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish an unpublished commit onto its recorded target branch
+    Publish {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop an unpublished commit: its id stops resolving and its held merge
+    /// inputs are released
+    Drop {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
         #[arg(long)]
         json: bool,
     },

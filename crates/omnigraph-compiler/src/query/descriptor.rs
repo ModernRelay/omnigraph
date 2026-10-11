@@ -6,9 +6,9 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::error::{CompilerError, Result};
 
-use super::ast::{Mutation, QueryDecl};
+use super::ast::QueryDecl;
 use super::typecheck::{
-    BoundVariable, CheckedQuery, MutationTarget, TypeContext, projection_field, projection_name,
+    BoundVariable, CheckedMutationOp, CheckedQuery, CheckedScope, MutationTarget, projection_field,
     typecheck_query_decl,
 };
 
@@ -80,44 +80,40 @@ pub fn describe_query_operation(
     query: &QueryDecl,
 ) -> Result<QueryOperationDescriptor> {
     let checked = typecheck_query_decl(catalog, query)?;
-    describe_checked_query_operation(catalog, query, &checked)
+    describe_checked_query_operation(catalog, &checked)
 }
 
 fn describe_checked_query_operation(
     catalog: &Catalog,
-    query: &QueryDecl,
     checked: &CheckedQuery,
 ) -> Result<QueryOperationDescriptor> {
     let mut reads = BTreeSet::new();
     let mut writes = BTreeSet::new();
 
     let result = match checked {
-        CheckedQuery::Read(ctx) => {
-            collect_checked_reads(ctx, &mut reads);
-            let ir = crate::lower_query(catalog, query, ctx)?;
+        CheckedQuery::Read(query) => {
+            collect_checked_reads(&query.scope, &mut reads);
+            let ir = crate::lower_query(catalog, query)?;
             ir.return_exprs
                 .iter()
-                .zip(&query.return_clause)
-                .map(|(projection, ast)| {
-                    let name = projection_name(&ast.expr, ast.alias.as_deref());
-                    let field = projection_field(catalog, &name, &projection.ty)?;
+                .zip(&query.returns)
+                .map(|(projection, item)| {
+                    let field = projection_field(catalog, &item.inferred_name, &projection.ty)?;
                     result_field_descriptor(&field)
                 })
                 .collect::<Result<Vec<_>>>()?
         }
-        CheckedQuery::Mutation(ctx) => {
-            if ctx.targets.len() != query.mutations.len() {
-                return Err(CompilerError::Plan(
-                    "typechecked mutation target count does not match the query".to_string(),
-                ));
-            }
-            for (mutation, target) in query.mutations.iter().zip(&ctx.targets) {
-                let fact = target_fact(target);
+        CheckedQuery::Mutation(query) => {
+            for op in &query.ops {
+                let fact = target_fact(op.target());
                 reads.insert(fact.clone());
                 writes.insert(fact);
 
-                match (mutation, target) {
-                    (Mutation::Insert(_), MutationTarget::Edge { type_name }) => {
+                match op {
+                    CheckedMutationOp::Insert {
+                        target: MutationTarget::Edge { type_name },
+                        ..
+                    } => {
                         let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
                             CompilerError::Plan(format!(
                                 "typechecked edge type `{type_name}` is absent from the catalog"
@@ -126,7 +122,10 @@ fn describe_checked_query_operation(
                         reads.insert(node_fact(&edge.from_type));
                         reads.insert(node_fact(&edge.to_type));
                     }
-                    (Mutation::Delete(_), MutationTarget::Node { type_name }) => {
+                    CheckedMutationOp::Delete {
+                        target: MutationTarget::Node { type_name },
+                        ..
+                    } => {
                         for edge in catalog.edge_types.values().filter(|edge| {
                             edge.from_type == *type_name || edge.to_type == *type_name
                         }) {
@@ -138,7 +137,9 @@ fn describe_checked_query_operation(
                             writes.insert(edge_fact);
                         }
                     }
-                    _ => {}
+                    CheckedMutationOp::Insert { .. }
+                    | CheckedMutationOp::Update { .. }
+                    | CheckedMutationOp::Delete { .. } => {}
                 }
             }
             Vec::new()
@@ -152,15 +153,15 @@ fn describe_checked_query_operation(
     })
 }
 
-fn collect_checked_reads(ctx: &TypeContext, reads: &mut BTreeSet<QueryGraphFact>) {
-    let mut pending = vec![ctx];
+fn collect_checked_reads(scope: &CheckedScope, reads: &mut BTreeSet<QueryGraphFact>) {
+    let mut pending = vec![scope];
     while let Some(scope) = pending.pop() {
         for binding in scope.bindings.values() {
             if let BoundVariable::Node { type_name } = binding {
                 reads.insert(node_fact(type_name));
             }
         }
-        for traversal in &scope.traversals {
+        for traversal in scope.traversals() {
             reads.insert(node_fact(&traversal.src_type));
             reads.insert(node_fact(&traversal.dst_type));
             for member in traversal.edges.members() {
@@ -170,7 +171,7 @@ fn collect_checked_reads(ctx: &TypeContext, reads: &mut BTreeSet<QueryGraphFact>
                 });
             }
         }
-        pending.extend(scope.subqueries.iter().map(|subquery| &subquery.inner));
+        pending.extend(scope.blocks().map(|block| &block.inner));
     }
 }
 

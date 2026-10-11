@@ -2,12 +2,12 @@
 rfc: "2026-10-10-unpublished-graph-commits"
 title: "Unpublished graph commits"
 track: maintainer
-status: draft
-implementation: not-started
+status: accepted
+implementation: partial
 authors:
   - azimafroozeh
 created: 2026-10-10
-updated: 2026-10-10
+updated: 2026-10-11
 discussion: null
 supersedes: []
 superseded_by: []
@@ -259,6 +259,10 @@ are not an independent proposal-existence authority.
    ambiguous response. Before acknowledgement, revalidate target authority;
    never return an already-expired candidate as publishable. A matching tag
    and valid authority establish success; unavailable readback is uncertain.
+   A revalidation that fails after the tag exists releases the tag and is
+   conclusive; when that release fails too the outcome is in doubt and a
+   merge keeps its input holds. It is never a plain failure that releases the
+   holds of a still-addressable candidate.
 6. Transfer the input holds to the proposal lifecycle and return C with
    `published: false` and output `graph_manifest_version: D`.
 
@@ -309,8 +313,12 @@ not proof that the current identity algorithm already meets that gate.
 
 Publish and drop of one candidate share its target branch control gate.
 Drop resolves authoritative publication first, refuses a published C, then
-deletes the candidate tag and releases its input holds. Confirm deletion after
-an ambiguous response before acknowledging it. Within the admitted control
+releases its input holds and deletes the candidate tag, in that order: the
+holds are nonce-owned and idempotent, and a failure between the two steps
+leaves a readable candidate whose retried drop releases them again, whereas
+holds left after the tag is gone have no owner to name them until the target
+head moves. Confirm deletion after an ambiguous response before acknowledging
+it. Within the admitted control
 topology, a completed drop prevents any later publication of that candidate;
 an earlier publication wins and makes drop fail. This does not establish
 distributed fencing for concurrent control processes.
@@ -487,3 +495,19 @@ release storage on an idle graph, revise lifetime and its evidence gate before
 implementation; neither behavior is included implicitly.
 
 ## Decision log
+
+- 2026-10-10: created.
+- 2026-10-11: accepted (maintainer decision) with the implementation PR;
+  `implementation: partial` until the collector retention and reclamation
+  coverage, the served expiry and inherited-head reruns and the cross-version
+  CLI tests named in Evidence and tests are recorded.
+- 2026-10-11: drop order. Supersedes the sentence "then deletes the candidate
+  tag and releases its input holds" in Drop, retirement and collection: the
+  holds are released first, then the tag is deleted. A release failure after
+  the tag deletion left holds the collector keeps while the target head still
+  equals their witness, with no proposal left to name them.
+- 2026-10-11: create step 5 is exact about a failed authority revalidation
+  after the tag exists: the tag is released and the failure is conclusive, or
+  the release fails too and the outcome is in doubt, so a merge keeps its
+  input holds; a plain error there released the holds of a still-addressable
+  candidate.

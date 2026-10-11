@@ -59,8 +59,8 @@ async fn run_with_access(
     let stores = probes.table_stores.clone();
     with_query_io_probes(probes, async {
         let statement = omnigraph_compiler::find_read_statement(text, "lookup").unwrap();
-        let checked = CheckedQuery::check(catalog, statement.decl()).unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, checked.decl(), checked.types()).unwrap();
+        let checked = CheckedRead::check(catalog, statement.decl()).unwrap();
+        let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
         let query = CompiledQuery {
             ir: Arc::new(ir),
             checked,

@@ -6,7 +6,7 @@
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, SettingStmt, show_statement_name,
+    BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
@@ -99,6 +99,15 @@ pub(super) fn classify(query: &str) -> std::result::Result<QueryFile, ApiError> 
 }
 
 pub(super) fn control_write_at_read_door(write: &BranchWrite) -> ApiError {
+    ApiError::bad_request(refusals::with_statement(
+        refusals::CONTROL_WRITE_AT_READ_DOOR,
+        write.statement_name(),
+    ))
+}
+
+/// `commit publish` and `commit drop` are control writes: the refusal a
+/// branch write meets at the read door, under the statement's own name.
+pub(super) fn commit_write_at_read_door(write: &CommitWrite) -> ApiError {
     ApiError::bad_request(refusals::with_statement(
         refusals::CONTROL_WRITE_AT_READ_DOOR,
         write.statement_name(),
@@ -200,10 +209,16 @@ pub(super) async fn run_branch_statement(
                 api::BranchOutcomeOutput::Deleted { name },
             )
         }
-        BranchWrite::Merge { source, into } => {
+        BranchWrite::Merge {
+            source,
+            into,
+            as_commit,
+        } => {
             let target = into.unwrap_or_else(|| "main".to_string());
-            let result =
-                branch_merge_body(state, handle, session, actor, ingress, &source, &target).await?;
+            let result = branch_merge_body(
+                state, handle, session, actor, ingress, &source, &target, as_commit,
+            )
+            .await?;
             let merge = result.outcome.into();
             let commit = result.commit.as_ref().map(api::commit_output);
             (
@@ -225,5 +240,117 @@ pub(super) async fn run_branch_statement(
         actor_id,
         commit,
         outcome: Some(outcome),
+    })
+}
+
+/// Run `commit publish` or `commit drop` as a mutation body: `branch` is the
+/// proposal's recorded target, counts are `0`, `commit` is the published commit
+/// or null after a drop; a policy denial answers the 404 an unknown id yields.
+pub(super) async fn run_commit_statement(
+    state: &AppState,
+    handle: &GraphRequest,
+    session: &Session,
+    actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
+    write: CommitWrite,
+) -> std::result::Result<ChangeOutput, ApiError> {
+    let query_name = write.statement_name().to_string();
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    let CommitControlOutcome {
+        target,
+        commit,
+        outcome,
+    } = commit_control_body(state, handle, session, actor, ingress, write).await?;
+    Ok(ChangeOutput {
+        branch: target,
+        query_name,
+        affected_nodes: 0,
+        affected_edges: 0,
+        actor_id,
+        commit,
+        outcome: Some(outcome),
+    })
+}
+
+/// What a commit control write answered: the proposal's recorded target, the
+/// published commit (null after a drop), the outcome kind.
+pub(super) struct CommitControlOutcome {
+    pub(super) target: String,
+    pub(super) commit: Option<api::CommitOutput>,
+    pub(super) outcome: api::BranchOutcomeOutput,
+}
+
+/// Body shared by `POST /commits/{id}/publish`, `DELETE /commits/{id}` and
+/// the `commit publish` / `commit drop` statements: the target from the
+/// commit itself, the `commit_publish` / `commit_drop` check on it (a denial
+/// answers the 404 an unknown id yields), admission, the engine call.
+pub(super) async fn commit_control_body(
+    state: &AppState,
+    handle: &GraphRequest,
+    session: &Session,
+    actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
+    write: CommitWrite,
+) -> std::result::Result<CommitControlOutcome, ApiError> {
+    let commit_id = write.graph_commit_id().to_string();
+    let target = session
+        .commit_target_branch(&commit_id)
+        .await
+        .map_err(|error| change_route_commit_lookup_error(error, &commit_id))?;
+    let action = match &write {
+        CommitWrite::Publish { .. } => PolicyAction::CommitPublish,
+        CommitWrite::Drop { .. } => PolicyAction::CommitDrop,
+    };
+    match authorize(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action,
+            branch: None,
+            target_branch: Some(target.clone()),
+        },
+    )? {
+        Authz::Allowed => {}
+        Authz::Denied(_) => {
+            return Err(ApiError::not_found(format!(
+                "commit '{commit_id}' not found"
+            )));
+        }
+    }
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, 256)
+        .map_err(ApiError::from_workload_reject)?;
+    let caller = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    let session = session.clone();
+    let (commit, outcome) = owned_write(state, admission, ingress, handle.clone(), async move {
+        match write {
+            CommitWrite::Publish { graph_commit_id } => {
+                let published = session
+                    .publish_commit_as(&graph_commit_id, caller.as_deref())
+                    .await
+                    .map_err(ApiError::from_omni)?;
+                Ok((
+                    Some(api::commit_output(&published)),
+                    api::BranchOutcomeOutput::Published,
+                ))
+            }
+            CommitWrite::Drop { graph_commit_id } => {
+                session
+                    .drop_commit_as(&graph_commit_id, caller.as_deref())
+                    .await
+                    .map_err(ApiError::from_omni)?;
+                Ok((None, api::BranchOutcomeOutput::Dropped { graph_commit_id }))
+            }
+        }
+    })
+    .await?;
+    Ok(CommitControlOutcome {
+        target,
+        commit,
+        outcome,
     })
 }

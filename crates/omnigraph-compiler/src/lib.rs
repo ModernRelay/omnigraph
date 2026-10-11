@@ -37,12 +37,14 @@ pub use ir::ParamMap;
 /// The GQ grammar's version, major when it accepts less or a produced shape
 /// changes, minor when it only accepts more (`docs/rfcs/2026-09-14-compatibility-surfaces.md`);
 /// `(2, 0)` introduced the shared expression model;
-/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`).
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 1);
+/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
+/// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
+/// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`).
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 2);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
-pub use query::checked::CheckedQuery;
+pub use query::checked::CheckedRead;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,

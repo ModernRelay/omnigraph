@@ -12,7 +12,7 @@ use arrow_schema::SchemaRef;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::datatypes::Field;
 use lance_file::version::ConcreteFileVersion;
-use omnigraph_compiler::CheckedQuery;
+use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::Literal;
@@ -115,7 +115,7 @@ pub(crate) struct QuerySource<'a> {
     pub ir: QueryIR,
     /// The declaration `ir` was lowered from, as the type checker accepted
     /// it: acceptance derives the query's requirements from it.
-    pub checked: CheckedQuery,
+    pub checked: CheckedRead,
     pub catalog: &'a Arc<Catalog>,
     pub snapshot: &'a Snapshot,
     pub params: ResolvedParams,
@@ -815,8 +815,8 @@ query people() { match { $p: Person } return { count($p) as n } }
 
     fn compile(catalog: &Catalog, name: &str) -> CompiledQuery {
         let statement = omnigraph_compiler::find_read_statement(QUERIES, name).unwrap();
-        let checked = CheckedQuery::check(catalog, statement.decl()).unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, checked.decl(), checked.types()).unwrap();
+        let checked = CheckedRead::check(catalog, statement.decl()).unwrap();
+        let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
         CompiledQuery {
             ir: Arc::new(ir),
             checked,
