@@ -2478,13 +2478,10 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 }
 
 #[test]
-fn refuses_ordered_expect_on_an_rrf_led_order() {
+fn admits_ordered_expect_on_an_rrf_led_order() {
     let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
-    let message = refusal("x", &text);
-    assert!(message.contains("led by `rrf()`"), "{message}");
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
+                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n    limit 3\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
     parse_case("x", &text).unwrap();
 }
 
@@ -2496,6 +2493,12 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
     assert!(refusal("x", &text).contains("aggregate in its `return` list"));
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
+    parse_case("x", &text).unwrap();
+    let query = "--- query\nquery q($t: String) {\n    match { $p: Person }\n    \
+                 return { $p.name, count($p) as total }\n    order { bm25($p.name, $t), total desc }\n    limit 3\n}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
+    );
     parse_case("x", &text).unwrap();
 }
 

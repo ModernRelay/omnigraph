@@ -381,6 +381,18 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
         reject_blob_read_value(&resolved, &ord.expr)?;
         bind_order_key(index, &ord.expr, &query.return_clause, &ctx)?;
+        if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
+            && ord.explicit
+            && !ord.descending
+        {
+            return Err(CompilerError::typed(
+                T54,
+                format!(
+                    "`{}` ranks most relevant first; its order key does not accept the asc modifier",
+                    rank_keyword(&ord.expr)
+                ),
+            ));
+        }
     }
 
     let has_standalone_nearest = query
@@ -2817,7 +2829,7 @@ fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering])
             }
             inner => check_projection(inner, alias, order_clause),
         },
-        Expr::Nearest { .. } | Expr::Bm25 { .. } => {
+        Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
             let executed = order_clause.first().is_some_and(|lead| &lead.expr == expr);
             if !executed {
                 return Err(CompilerError::typed(
@@ -2839,11 +2851,6 @@ fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering])
             }
             Ok(())
         }
-        Expr::Rrf { .. } => Err(CompilerError::typed(
-            T37,
-            "`rrf` cannot be projected in `return`; order by `rrf(...)` and project plain columns"
-                .to_string(),
-        )),
         Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } => {
             Err(CompilerError::typed(
                 T35,
@@ -2988,11 +2995,11 @@ pub(crate) fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
         Expr::PropAccess { property, .. } => property.clone(),
         Expr::Variable(variable) => variable.clone(),
         Expr::Literal(_) => "literal".to_string(),
-        Expr::Nearest { .. } | Expr::Bm25 { .. } => match expr.score_column() {
+        Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => match expr.score_column() {
             Some((variable, column)) => format!("{variable}.{column}"),
             None => rank_keyword(expr).to_string(),
         },
-        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } | Expr::Rrf { .. } => {
+        Expr::Search { .. } | Expr::Fuzzy { .. } | Expr::MatchText { .. } => {
             rank_keyword(expr).to_string()
         }
         Expr::Aggregate { func, .. } => func.to_string(),

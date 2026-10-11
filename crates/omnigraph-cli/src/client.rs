@@ -1910,47 +1910,53 @@ mod tests {
         };
 
         let target = IntentApiFixture::new(vec![]);
+        let cases: [(u16, Vec<(String, String)>); 9] = [
+            (200, vec![]),
+            (200, vec![(HEADER.into(), "0.11".into())]),
+            (200, vec![(HEADER.into(), "0.12".into())]),
+            (200, vec![(HEADER.into(), "0.14".into())]),
+            (
+                200,
+                vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
+            ),
+            (
+                200,
+                vec![
+                    (HEADER.into(), CONTRACT.into()),
+                    (HEADER.into(), CONTRACT.into()),
+                ],
+            ),
+            (401, vec![(HEADER.into(), CONTRACT.into())]),
+            (503, vec![(HEADER.into(), CONTRACT.into())]),
+            (
+                302,
+                vec![
+                    (HEADER.into(), CONTRACT.into()),
+                    ("Location".into(), target.origin.clone()),
+                ],
+            ),
+        ];
         for managed in [false, true] {
-            for (status, headers) in [
-                (200, vec![]),
-                (200, vec![(HEADER.into(), "0.11".into())]),
-                (200, vec![(HEADER.into(), "0.12".into())]),
-                (200, vec![(HEADER.into(), "0.14".into())]),
-                (
-                    200,
-                    vec![(HEADER.into(), format!("{CONTRACT}, {CONTRACT}"))],
-                ),
-                (
-                    200,
-                    vec![
-                        (HEADER.into(), CONTRACT.into()),
-                        (HEADER.into(), CONTRACT.into()),
-                    ],
-                ),
-                (401, vec![(HEADER.into(), CONTRACT.into())]),
-                (503, vec![(HEADER.into(), CONTRACT.into())]),
-                (
-                    302,
-                    vec![
-                        (HEADER.into(), CONTRACT.into()),
-                        ("Location".into(), target.origin.clone()),
-                    ],
-                ),
-            ] {
-                let server = IntentApiFixture::new(vec![IntentReply {
-                    status,
-                    headers,
-                    body: b"secret untrusted body".to_vec(),
-                }]);
-                let mut endpoint = url::Url::parse(&server.origin).unwrap();
-                endpoint.set_username("secret-user").unwrap();
-                endpoint.set_password(Some("secret-password")).unwrap();
-                let http = if managed {
-                    GraphHttpClient::managed(endpoint.as_str())
-                } else {
-                    GraphHttpClient::new(endpoint.as_str())
-                }
-                .unwrap();
+            let server = IntentApiFixture::new(
+                cases
+                    .iter()
+                    .map(|(status, headers)| IntentReply {
+                        status: *status,
+                        headers: headers.clone(),
+                        body: b"secret untrusted body".to_vec(),
+                    })
+                    .collect(),
+            );
+            let mut endpoint = url::Url::parse(&server.origin).unwrap();
+            endpoint.set_username("secret-user").unwrap();
+            endpoint.set_password(Some("secret-password")).unwrap();
+            let http = if managed {
+                GraphHttpClient::managed(endpoint.as_str())
+            } else {
+                GraphHttpClient::new(endpoint.as_str())
+            }
+            .unwrap();
+            for (i, (status, _)) in cases.iter().enumerate() {
                 let error = remote_json::<Value>(
                     &http,
                     Method::POST,
@@ -1962,15 +1968,15 @@ mod tests {
                 .unwrap_err();
                 let contract = error.downcast_ref::<ApiContractError>().unwrap();
                 assert!(!contract.request_dispatched);
-                assert_eq!(contract.http_status, Some(status));
+                assert_eq!(contract.http_status, Some(*status));
                 assert!(!format!("{error:?}").contains("secret"));
                 let requests = server.requests();
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].method, "HEAD");
-                assert_eq!(requests[0].path, "/healthz");
-                assert!(!requests[0].headers.contains_key("authorization"));
-                server.assert_complete();
+                assert_eq!(requests.len(), i + 1);
+                assert_eq!(requests[i].method, "HEAD");
+                assert_eq!(requests[i].path, "/healthz");
+                assert!(!requests[i].headers.contains_key("authorization"));
             }
+            server.assert_complete();
         }
         assert!(
             target.requests().is_empty(),
@@ -2025,6 +2031,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "nightly: waits out the real 5 s discovery bound"]
     async fn graph_http_discovery_has_its_own_five_second_bound() {
         let server = IntentApiFixture::with_response_delay(
             vec![contract_reply(200, json!(null))],
@@ -2099,16 +2106,17 @@ mod tests {
             branch: None,
             snapshot: None,
         };
-        for form in [
+        let forms = [
             "json",
             "ndjson",
             "baseline",
             "export",
             "blob-get",
             "blob-head",
-        ] {
+        ];
+        let mut replies = Vec::new();
+        for _ in forms {
             for dispatched in [false, true] {
-                let mut replies = Vec::new();
                 if dispatched {
                     replies.push(contract_reply(200, json!(null)));
                 }
@@ -2117,10 +2125,14 @@ mod tests {
                     headers: vec![],
                     body: b"untrusted body must not escape\n".to_vec(),
                 });
-                let server = IntentApiFixture::new(replies);
-                let client =
-                    GraphClient::managed(&server.origin, "knowledge", "data-bearer".into())
-                        .unwrap();
+            }
+        }
+        let server = IntentApiFixture::new(replies);
+        let client =
+            GraphClient::managed(&server.origin, "knowledge", "data-bearer".into()).unwrap();
+        let mut served = 0;
+        for form in forms {
+            for dispatched in [false, true] {
                 let mut output = Vec::new();
                 let result = match form {
                     "json" => client
@@ -2164,14 +2176,11 @@ mod tests {
                     output.is_empty(),
                     "{form} must validate before writing any bytes"
                 );
-                assert_eq!(
-                    server.requests().len(),
-                    if dispatched { 2 } else { 1 },
-                    "{form}"
-                );
-                server.assert_complete();
+                served += if dispatched { 2 } else { 1 };
+                assert_eq!(server.requests().len(), served, "{form}");
             }
         }
+        server.assert_complete();
     }
 
     #[tokio::test]
@@ -2304,6 +2313,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "nightly: waits out the real 30 s managed deadline for five mutation forms"]
     async fn managed_mutations_use_thirty_second_deadline_without_retrying() {
         // Exercise every mutation request owner through actual HTTP. Receipts
         // can arrive after ten seconds, but the total thirty-second deadline
@@ -2441,6 +2451,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "nightly: waits out the real 30 s managed deadline for four read operations"]
     async fn managed_reads_use_thirty_second_deadline_without_retrying() {
         futures::future::join_all(
             ["ad-hoc", "stored", "commit-list", "commit-show"]

@@ -2149,6 +2149,7 @@ fn remote_if_commit_fails_closed_against_an_older_server() {
 fn remote_json_errors_preserve_server_codes_and_details() {
     use support::managed_http::{IntentApiFixture, IntentReply};
 
+    let mut matrix = Vec::new();
     for (arguments, status, body, exit) in [
         (
             vec!["query", "restricted"],
@@ -2230,12 +2231,19 @@ fn remote_json_errors_preserve_server_codes_and_details() {
             &[&["--json"]]
         };
         for format in formats {
+            matrix.push((arguments.clone(), status, body.clone(), exit, *format));
+        }
+    }
+    for_each_concurrently(
+        matrix,
+        CASE_WORKERS,
+        |(arguments, status, body, exit, format)| {
             let server = IntentApiFixture::graph(vec![IntentReply::json(status, body.clone())]);
             let output = cli()
                 .env_remove("OMNIGRAPH_BEARER_TOKEN")
                 .args(["--server", &server.origin, "--graph", "knowledge"])
                 .args(&arguments)
-                .args(*format)
+                .args(format)
                 .output()
                 .unwrap();
             assert_eq!(
@@ -2269,8 +2277,8 @@ fn remote_json_errors_preserve_server_codes_and_details() {
                 "{arguments:?} {format:?}: {output:?}"
             );
             server.assert_complete();
-        }
-    }
+        },
+    );
 }
 
 /// Whole-command retry classification needs real CLI processes and a wire
@@ -2359,8 +2367,14 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
             "recover",
         ),
     ];
-    for arguments in &commands {
-        for (status, body, exit, action) in &cases {
+    let matrix: Vec<_> = commands
+        .iter()
+        .flat_map(|arguments| cases.iter().map(move |case| (arguments, case)))
+        .collect();
+    for_each_concurrently(
+        matrix,
+        CASE_WORKERS,
+        |(arguments, (status, body, exit, action))| {
             let mut reply = IntentReply::json(*status, body.clone());
             reply.headers.push(("Retry-After".into(), "17".into()));
             let server = IntentApiFixture::graph(vec![reply]);
@@ -2405,8 +2419,8 @@ fn data_write_outcomes_and_retry_permission_issue_466() {
                 "one discovery and one submission, without replay"
             );
             server.assert_complete();
-        }
-    }
+        },
+    );
 
     // Both bad JSON and a severed body may follow graph publication. The
     // fixture writes fewer bytes than Content-Length in the second case.
@@ -2445,6 +2459,7 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
     use omnigraph_api_types::{HTTP_API_CONTRACT as CONTRACT, HTTP_API_CONTRACT_HEADER as HEADER};
     use support::managed_http::{IntentApiFixture, IntentReply};
 
+    let mut matrix = Vec::new();
     for (status, headers) in [
         (200, vec![]),
         (403, vec![(HEADER.into(), "0.11".into())]),
@@ -2468,61 +2483,64 @@ fn remote_response_contract_errors_preserve_status_and_hide_untrusted_bodies() {
             vec!["query", "read", "--format", "json"],
             vec!["query", "read", "--format", "jsonl"],
         ] {
-            let server = IntentApiFixture::new(vec![
+            matrix.push((status, headers.clone(), arguments));
+        }
+    }
+    for_each_concurrently(matrix, CASE_WORKERS, |(status, headers, arguments)| {
+        let server = IntentApiFixture::new(vec![
                 IntentReply {
                     status: 200, headers: vec![(HEADER.into(), CONTRACT.into())], body: vec![],
                 },
                 IntentReply {
-                    status, headers: headers.clone(),
+                    status, headers,
                     body: br#"{"error":"untrusted-secret-body","code":"forbidden","rows":[{"success":true}]}"#.to_vec(),
                 },
             ]);
-            let mut command = cli();
-            command
-                .env_remove("OMNIGRAPH_BEARER_TOKEN")
-                .args(["--server", &server.origin, "--graph", "knowledge"])
-                .args(&arguments);
-            let output = command.output().unwrap();
-            assert_eq!(output.status.code(), Some(1));
-            if arguments.len() > 2 {
-                let error = parse_stdout_json(&output);
-                assert_eq!(error["code"], "api_contract_mismatch");
-                assert_eq!(error["http_status"], status);
-                assert_eq!(error["request_dispatched"], true);
-                assert!(
-                    error["error"]
-                        .as_str()
-                        .unwrap()
-                        .contains("effects are unknown")
-                );
-                assert!(output.stderr.is_empty());
-                if arguments.last() == Some(&"jsonl") {
-                    assert_eq!(
-                        stdout_string(&output).lines().count(),
-                        1,
-                        "JSONL contract errors must occupy one line"
-                    );
-                }
-            } else {
-                assert!(output.stdout.is_empty());
-                let error = String::from_utf8_lossy(&output.stderr);
-                assert!(error.contains("effects are unknown"), "{error}");
-                assert!(error.contains(&format!("HTTP {status}")), "{error}");
-            }
-            assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted-secret-body"));
-            assert!(!String::from_utf8_lossy(&output.stderr).contains("untrusted-secret-body"));
-            let requests = server.requests();
-            assert_eq!(
-                requests.len(),
-                2,
-                "no retry or fallback after response mismatch"
+        let mut command = cli();
+        command
+            .env_remove("OMNIGRAPH_BEARER_TOKEN")
+            .args(["--server", &server.origin, "--graph", "knowledge"])
+            .args(&arguments);
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        if arguments.len() > 2 {
+            let error = parse_stdout_json(&output);
+            assert_eq!(error["code"], "api_contract_mismatch");
+            assert_eq!(error["http_status"], status);
+            assert_eq!(error["request_dispatched"], true);
+            assert!(
+                error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("effects are unknown")
             );
-            assert_eq!(requests[0].method, "HEAD");
-            assert_eq!(requests[0].path, "/healthz");
-            assert_eq!(requests[1].headers[HEADER], CONTRACT);
-            server.assert_complete();
+            assert!(output.stderr.is_empty());
+            if arguments.last() == Some(&"jsonl") {
+                assert_eq!(
+                    stdout_string(&output).lines().count(),
+                    1,
+                    "JSONL contract errors must occupy one line"
+                );
+            }
+        } else {
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("effects are unknown"), "{error}");
+            assert!(error.contains(&format!("HTTP {status}")), "{error}");
         }
-    }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("untrusted-secret-body"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("untrusted-secret-body"));
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "no retry or fallback after response mismatch"
+        );
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        assert_eq!(requests[1].headers[HEADER], CONTRACT);
+        server.assert_complete();
+    });
 }
 
 #[test]
@@ -3018,10 +3036,48 @@ fn branch_delete_against_non_local_scope_refuses_without_yes() {
 
 #[test]
 fn branch_delete_against_non_local_scope_passes_gate_with_yes() {
+    use support::managed_http::{IntentApiFixture, IntentReply};
+
     // With --yes the gate is bypassed; the command then fails for an unrelated
     // reason (the fake bucket can't be opened), so the refusal must be ABSENT.
+    let empty_listing = IntentReply {
+        status: 200,
+        headers: Vec::new(),
+        body: br#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>fake-bucket</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#.to_vec(),
+    };
+    let mut replies = vec![empty_listing];
+    replies.extend(vec![
+        IntentReply::json(
+            404,
+            serde_json::json!({"error":"no such key"})
+        );
+        15
+    ]);
+    let bucket = IntentApiFixture::new(replies);
+    let mut command = cli();
+    command.envs([
+        ("AWS_ACCESS_KEY_ID", "gate-test-key"),
+        ("AWS_SECRET_ACCESS_KEY", "gate-test-secret"),
+        ("AWS_SESSION_TOKEN", ""),
+        ("AWS_CONFIG_FILE", "/nonexistent/omnigraph-gate-aws-config"),
+        (
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "/nonexistent/omnigraph-gate-aws-credentials",
+        ),
+        ("AWS_REGION", "us-east-1"),
+        ("AWS_DEFAULT_REGION", "us-east-1"),
+        ("AWS_ENDPOINT", bucket.origin.as_str()),
+        ("AWS_ENDPOINT_URL", bucket.origin.as_str()),
+        ("AWS_ENDPOINT_URL_S3", bucket.origin.as_str()),
+        ("AWS_ALLOW_HTTP", "true"),
+        ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
+        ("AWS_S3_FORCE_PATH_STYLE", "true"),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+        ("OBJECT_STORE_CLIENT_MAX_RETRIES", "0"),
+        ("OBJECT_STORE_CLIENT_RETRY_TIMEOUT", "2"),
+    ]);
     let output = output_failure(
-        cli()
+        command
             .arg("branch")
             .arg("delete")
             .arg("--store")
@@ -3240,6 +3296,7 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
         "merged_parent_commit_id": "source-before", "actor_id": "alice",
         "created_at": 1234567
     });
+    let mut matrix = Vec::new();
     for (statement, padded) in [(false, false), (false, true), (true, false)] {
         let mut cases = vec![
             ("fast_forward", Some(commit.clone()), true),
@@ -3263,6 +3320,13 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             cases.push(("merged", Some(bad_commit), false));
         }
         for (outcome, receipt, valid) in cases {
+            matrix.push((statement, padded, outcome, receipt, valid));
+        }
+    }
+    for_each_concurrently(
+        matrix,
+        CASE_WORKERS,
+        |(statement, padded, outcome, receipt, valid)| {
             let mut body = if statement {
                 json!({"branch":"main", "query_name":"branch merge",
                     "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
@@ -3309,12 +3373,12 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 assert_eq!(requests[0].body["source"], "review");
                 assert_eq!(requests[0].body["target"], "main");
             }
-        }
-    }
+        },
+    );
 
     // Optional deletion has its own required result. An old alias or missing
     // structured failure cannot turn an incomplete response into success.
-    for (deleted, details, legacy, valid) in [
+    let deletions = vec![
         (Some(true), None, None, true),
         (
             Some(false),
@@ -3331,46 +3395,51 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             None,
             false,
         ),
-    ] {
-        let mut body = json!({"source":"review", "target":"main", "outcome":"merged",
+    ];
+    for_each_concurrently(
+        deletions,
+        CASE_WORKERS,
+        |(deleted, details, legacy, valid)| {
+            let mut body = json!({"source":"review", "target":"main", "outcome":"merged",
             "actor_id":"alice", "commit":commit});
-        if let Some(deleted) = deleted {
-            body["branch_deleted"] = json!(deleted);
-        }
-        if let Some(details) = details {
-            body["branch_delete_error_details"] = details;
-        }
-        if let Some(legacy) = legacy {
-            body["branch_delete_error"] = json!(legacy);
-        }
-        let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
-        let output = cli()
-            .args([
-                "--server",
-                &server.origin,
-                "--graph",
-                "knowledge",
-                "branch",
-                "merge",
-                " review ",
-                "--into",
-                " main ",
-                "--delete-branch",
-                "--json",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if valid { 0 } else { 1 }),
-            "{body}: {output:?}"
-        );
-        if valid {
-            assert_eq!(parse_stdout_json(&output), body);
-        }
-        server.assert_complete();
-        assert_eq!(server.workflow_requests().len(), 1);
-    }
+            if let Some(deleted) = deleted {
+                body["branch_deleted"] = json!(deleted);
+            }
+            if let Some(details) = details {
+                body["branch_delete_error_details"] = details;
+            }
+            if let Some(legacy) = legacy {
+                body["branch_delete_error"] = json!(legacy);
+            }
+            let server = IntentApiFixture::graph(vec![IntentReply::json(200, body.clone())]);
+            let output = cli()
+                .args([
+                    "--server",
+                    &server.origin,
+                    "--graph",
+                    "knowledge",
+                    "branch",
+                    "merge",
+                    " review ",
+                    "--into",
+                    " main ",
+                    "--delete-branch",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if valid { 0 } else { 1 }),
+                "{body}: {output:?}"
+            );
+            if valid {
+                assert_eq!(parse_stdout_json(&output), body);
+            }
+            server.assert_complete();
+            assert_eq!(server.workflow_requests().len(), 1);
+        },
+    );
 }
 
 #[test]

@@ -709,85 +709,119 @@ async fn record_state(
     }
 }
 
+/// The four `(layout, depth)` fixtures run at once, each on its own thread and
+/// runtime (the Lance write futures are not `Send`); `point` selects by key, so
+/// the concatenation order of their curves is free.
 async fn run_matrix(base_uri: &str, depths: &[u64], backend: StorageBackend) -> LookupCurve {
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = [HistoryLayout::Uncompacted, HistoryLayout::Compacted]
+            .into_iter()
+            .flat_map(|layout| depths.iter().map(move |&depth| (layout, depth)))
+            .map(|(layout, depth)| {
+                let base_uri = base_uri.to_string();
+                std::thread::Builder::new()
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn_scoped(scope, move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(run_fixture(base_uri, layout, depth, backend))
+                    })
+                    .unwrap()
+            })
+            .collect();
+        threads
+            .into_iter()
+            .flat_map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|payload| resume_unwind(payload))
+            })
+            .collect()
+    })
+}
+
+async fn run_fixture(
+    base_uri: String,
+    layout: HistoryLayout,
+    depth: u64,
+    backend: StorageBackend,
+) -> LookupCurve {
     let mut curve = Vec::new();
-    for layout in [HistoryLayout::Uncompacted, HistoryLayout::Compacted] {
-        for &depth in depths {
-            let uri = format!(
-                "{}/{:?}-{}-{}",
-                base_uri.trim_end_matches('/'),
-                layout,
-                depth,
-                ulid::Ulid::new()
-            );
-            let mut fixture = HeadFixture::create(uri, CATALOG_WIDTH).await;
-            fixture.publish_until(depth).await;
-            if layout == HistoryLayout::Compacted {
-                fixture.compact().await;
-            }
-
-            assert!(fixture.index_coverage().await.is_none());
-            record_state(
-                &mut curve,
-                &fixture,
-                depth,
-                layout,
-                IndexState::Absent,
-                backend,
-            )
-            .await;
-
-            fixture.create_object_id_index().await;
-            assert_eq!(fixture.index_coverage().await.unwrap().1, 0);
-            record_state(
-                &mut curve,
-                &fixture,
-                depth,
-                layout,
-                IndexState::Reconciled,
-                backend,
-            )
-            .await;
-
-            fixture.publish_one().await;
-            assert_eq!(fixture.index_coverage().await.unwrap().1, 1);
-            record_state(
-                &mut curve,
-                &fixture,
-                depth,
-                layout,
-                IndexState::OneUncovered,
-                backend,
-            )
-            .await;
-
-            for _ in 1..UNRECONCILED_TAIL {
-                fixture.publish_one().await;
-            }
-            assert_eq!(fixture.index_coverage().await.unwrap().1, UNRECONCILED_TAIL);
-            record_state(
-                &mut curve,
-                &fixture,
-                depth,
-                layout,
-                IndexState::GrowingTail,
-                backend,
-            )
-            .await;
-
-            fixture.reconcile_object_id_index().await;
-            assert_eq!(fixture.index_coverage().await.unwrap().1, 0);
-            record_state(
-                &mut curve,
-                &fixture,
-                depth,
-                layout,
-                IndexState::ReconciledAfterTail,
-                backend,
-            )
-            .await;
-        }
+    let uri = format!(
+        "{}/{:?}-{}-{}",
+        base_uri.trim_end_matches('/'),
+        layout,
+        depth,
+        ulid::Ulid::new()
+    );
+    let mut fixture = HeadFixture::create(uri, CATALOG_WIDTH).await;
+    fixture.publish_until(depth).await;
+    if layout == HistoryLayout::Compacted {
+        fixture.compact().await;
     }
+
+    assert!(fixture.index_coverage().await.is_none());
+    record_state(
+        &mut curve,
+        &fixture,
+        depth,
+        layout,
+        IndexState::Absent,
+        backend,
+    )
+    .await;
+
+    fixture.create_object_id_index().await;
+    assert_eq!(fixture.index_coverage().await.unwrap().1, 0);
+    record_state(
+        &mut curve,
+        &fixture,
+        depth,
+        layout,
+        IndexState::Reconciled,
+        backend,
+    )
+    .await;
+
+    fixture.publish_one().await;
+    assert_eq!(fixture.index_coverage().await.unwrap().1, 1);
+    record_state(
+        &mut curve,
+        &fixture,
+        depth,
+        layout,
+        IndexState::OneUncovered,
+        backend,
+    )
+    .await;
+
+    for _ in 1..UNRECONCILED_TAIL {
+        fixture.publish_one().await;
+    }
+    assert_eq!(fixture.index_coverage().await.unwrap().1, UNRECONCILED_TAIL);
+    record_state(
+        &mut curve,
+        &fixture,
+        depth,
+        layout,
+        IndexState::GrowingTail,
+        backend,
+    )
+    .await;
+
+    fixture.reconcile_object_id_index().await;
+    assert_eq!(fixture.index_coverage().await.unwrap().1, 0);
+    record_state(
+        &mut curve,
+        &fixture,
+        depth,
+        layout,
+        IndexState::ReconciledAfterTail,
+        backend,
+    )
+    .await;
     curve
 }
 

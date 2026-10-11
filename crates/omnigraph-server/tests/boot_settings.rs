@@ -1549,7 +1549,11 @@ mod owned_shutdown {
         if mode.starts_with("startup-") {
             let mut config = server_config(
                 &root,
-                Duration::from_secs(if mode == "startup-cutoff" { 2 } else { 10 }),
+                if mode == "startup-cutoff" {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(10)
+                },
             );
             config.require_all_graphs = mode.starts_with("startup-strict");
             let omnigraph_server::ServerConfigMode::Multi { server_policy, .. } = &mut config.mode;
@@ -1702,7 +1706,11 @@ mod owned_shutdown {
         });
         let result = omnigraph_server::serve(server_config(
             &root,
-            Duration::from_secs(if cutoff { 2 } else { 10 }),
+            if cutoff {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(10)
+            },
         ))
         .await;
         if let Err(error) = &result {
@@ -1721,138 +1729,48 @@ mod owned_shutdown {
         std::process::exit(0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_listener_reports_progress_and_retains_open_ownership() {
-        for mode in [
-            "startup-progress",
-            "startup-strict",
-            "startup-finish",
-            "startup-cutoff",
-            "startup-panic",
-            "startup-strict-failed",
-            "startup-all-failed",
-        ] {
-            let temp = init_loaded_graph().await;
-            let root = temp.path();
-            let schema = fs::read_to_string(fixture("test.pg")).unwrap();
-            Omnigraph::init(root.join("sibling.omni").to_str().unwrap(), &schema)
-                .await
-                .unwrap();
-            let graph = graph_path(root);
-            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
-                .await
-                .unwrap()
-                .list_commits(None)
-                .await
-                .unwrap();
-            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
-            let started = Instant::now();
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_static("Bearer startup-secret"),
+    async fn startup_listener_reports_progress_and_retains_open_ownership(mode: &str) {
+        let temp = init_loaded_graph().await;
+        let root = temp.path();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        Omnigraph::init(root.join("sibling.omni").to_str().unwrap(), &schema)
+            .await
+            .unwrap();
+        let graph = graph_path(root);
+        let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap();
+        let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+        let started = Instant::now();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer startup-secret"),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        if mode == "startup-panic" {
+            wait_marker(&root.join("fault-reached"), &mut child.0);
+        } else if mode != "startup-all-failed" {
+            wait_marker(&root.join("holder-reached"), &mut child.0);
+            assert_eq!(
+                client
+                    .get(format!("http://{address}/healthz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
             );
-            let client = reqwest::Client::builder()
-                .default_headers(headers)
-                .timeout(Duration::from_secs(2))
-                .build()
-                .unwrap();
-            if mode == "startup-panic" {
-                wait_marker(&root.join("fault-reached"), &mut child.0);
-            } else if mode != "startup-all-failed" {
-                wait_marker(&root.join("holder-reached"), &mut child.0);
-                assert_eq!(
-                    client
-                        .get(format!("http://{address}/healthz"))
-                        .send()
-                        .await
-                        .unwrap()
-                        .status(),
-                    StatusCode::OK
-                );
-                if mode == "startup-progress" {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    loop {
-                        let readiness: Value = client
-                            .get(format!("http://{address}/readyz"))
-                            .send()
-                            .await
-                            .unwrap()
-                            .json()
-                            .await
-                            .unwrap();
-                        if readiness["ready_graph_count"] == 1 {
-                            break;
-                        }
-                        assert!(Instant::now() < deadline, "sibling did not finish opening");
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-                let readiness = client
-                    .get(format!("http://{address}/readyz"))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    readiness.status(),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "{mode}"
-                );
-                let readiness: Value = readiness.json().await.unwrap();
-                assert_eq!(readiness["status"], "loading", "{mode}: {readiness}");
-                assert_eq!(
-                    readiness["ready_graph_count"],
-                    usize::from(mode == "startup-progress")
-                );
-                assert!(readiness["loading_graph_count"].as_u64().unwrap() > 0);
-                assert!(readiness.get("graphs").is_none());
-                let inventory = client
-                    .get(format!("http://{address}/graphs"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(inventory.status(), StatusCode::OK, "{mode}: inventory");
-                let inventory: Value = inventory.json().await.unwrap();
-                let owned = &inventory["graphs"][0];
-                assert_eq!(owned["graph_id"], "owned");
-                assert_eq!(owned["state"], "loading");
-                assert_eq!(owned["action"], "wait_for_startup");
-                assert_eq!(owned["read_available"], false);
-                assert_eq!(owned["write_available"], false);
-                assert!(owned.get("failure").is_none());
-                let response = client
-                    .get(format!("http://{address}/graphs/owned/snapshot"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                assert!(!response.headers().contains_key("retry-after"));
-                let unknown = client
-                    .get(format!("http://{address}/graphs/unknown/snapshot"))
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
-                if matches!(mode, "startup-progress" | "startup-strict") {
-                    let sibling = client
-                        .get(format!("http://{address}/graphs/sibling/snapshot"))
-                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .send()
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        sibling.status(),
-                        if mode == "startup-progress" {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        }
-                    );
-                    fs::write(root.join("release"), b"release").unwrap();
-                    wait_ready(&address, &mut child.0, "serving").await;
+            if mode == "startup-progress" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
                     let readiness: Value = client
                         .get(format!("http://{address}/readyz"))
                         .send()
@@ -1861,241 +1779,376 @@ mod owned_shutdown {
                         .json()
                         .await
                         .unwrap();
-                    assert_eq!(readiness["status"], "serving");
-                    assert_eq!(readiness["ready_graph_count"], 2);
-                    assert_eq!(readiness["loading_graph_count"], 0);
-                }
-                if mode == "startup-strict-failed" {
-                    fs::write(root.join("release"), b"release").unwrap();
-                } else {
-                    assert_eq!(
-                        unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
-                        0
-                    );
-                    if matches!(mode, "startup-finish" | "startup-cutoff") {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        assert!(
-                            !root.join("serve-returned").exists(),
-                            "startup owner was dropped at shutdown"
-                        );
-                        assert!(child.0.try_wait().unwrap().is_none());
-                        if mode == "startup-finish" {
-                            fs::write(root.join("release"), b"release").unwrap();
-                        }
+                    if readiness["ready_graph_count"] == 1 {
+                        break;
                     }
+                    assert!(Instant::now() < deadline, "sibling did not finish opening");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let status = loop {
-                if let Some(status) = child.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "{mode}: startup shutdown exceeded bound"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            };
+            let readiness = client
+                .get(format!("http://{address}/readyz"))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(
-                status.code(),
-                Some(match mode {
-                    "startup-cutoff" | "startup-panic" => 2,
-                    "startup-strict-failed" | "startup-all-failed" => 1,
-                    _ => 0,
-                }),
+                readiness.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
                 "{mode}"
             );
-            if mode == "startup-panic" {
-                assert!(started.elapsed() < Duration::from_secs(5));
-                assert!(!root.join("serve-returned").exists());
-            }
-            output_thread.join().unwrap();
-            let after = Omnigraph::open_read_only(graph.to_str().unwrap())
-                .await
-                .unwrap()
-                .list_commits(None)
-                .await
-                .unwrap();
+            let readiness: Value = readiness.json().await.unwrap();
+            assert_eq!(readiness["status"], "loading", "{mode}: {readiness}");
             assert_eq!(
-                after, before,
-                "startup must not publish graph content: {mode}"
+                readiness["ready_graph_count"],
+                usize::from(mode == "startup-progress")
             );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnected_write_and_shutdown_share_ownership() {
-        for mode in [
-            "finish",
-            "cutoff",
-            "panic-before",
-            "panic-after",
-            "v2-finish",
-            "v2-crash",
-        ] {
-            let cutoff = mode == "cutoff";
-            let panic = mode.starts_with("panic-");
-            let v2 = mode.starts_with("v2-");
-            let temp = if v2 {
-                let temp = converged_cluster_dir("").await;
-                omnigraph_cluster::upgrade_deployment_ledger(
-                    &format!("file://{}", temp.path().display()),
-                    true,
-                    &omnigraph_cluster::DeploymentCaller::storage_owner(None),
-                )
+            assert!(readiness["loading_graph_count"].as_u64().unwrap() > 0);
+            assert!(readiness.get("graphs").is_none());
+            let inventory = client
+                .get(format!("http://{address}/graphs"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
                 .unwrap();
-                temp
-            } else {
-                init_loaded_graph().await
-            };
-            let root = temp.path();
-            let graph = if v2 {
-                root.join("graphs/knowledge.omni")
-            } else {
-                graph_path(root)
-            };
-            let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
-            let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            assert_eq!(inventory.status(), StatusCode::OK, "{mode}: inventory");
+            let inventory: Value = inventory.json().await.unwrap();
+            let owned = &inventory["graphs"][0];
+            assert_eq!(owned["graph_id"], "owned");
+            assert_eq!(owned["state"], "loading");
+            assert_eq!(owned["action"], "wait_for_startup");
+            assert_eq!(owned["read_available"], false);
+            assert_eq!(owned["write_available"], false);
+            assert!(owned.get("failure").is_none());
+            let response = client
+                .get(format!("http://{address}/graphs/owned/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
-                .unwrap()
-                .list_commits(None)
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!response.headers().contains_key("retry-after"));
+            let unknown = client
+                .get(format!("http://{address}/graphs/unknown/snapshot"))
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .send()
                 .await
-                .unwrap()
-                .len();
-            let (mut child, address, output_thread) = spawn_owned_child(root, mode);
-            wait_ready(&address, &mut child.0, "serving").await;
-            let fault_started = Instant::now();
-            let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
-            if v2 {
-                let signal = if mode == "v2-crash" {
-                    libc::SIGKILL
-                } else {
-                    libc::SIGTERM
-                };
-                assert_eq!(
-                    unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
-                    0
-                );
-            } else if panic {
-                let mut response = String::new();
-                // The response may be lost as fatal shutdown begins; the
-                // fault marker and process exit are the independent oracle.
-                let _ = send_mutation(&address, "Uncertain").read_to_string(&mut response);
-                wait_marker(&root.join("fault-reached"), &mut child.0);
-            } else {
-                let socket = send_mutation(&address, "Disconnected");
-                wait_marker(&root.join("http-staged"), &mut child.0);
-                socket.shutdown(Shutdown::Both).unwrap();
-                drop(socket);
-                // Give the real connection closure a turn; the next request must
-                // still find the disconnected write's actor reservation occupied.
-                std::thread::sleep(Duration::from_millis(100));
-                let mut refused = String::new();
-                send_mutation(&address, "MustNotRun")
-                    .read_to_string(&mut refused)
+                .unwrap();
+            assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+            if matches!(mode, "startup-progress" | "startup-strict") {
+                let sibling = client
+                    .get(format!("http://{address}/graphs/sibling/snapshot"))
+                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                    .send()
+                    .await
                     .unwrap();
-                assert!(refused.starts_with("HTTP/1.1 429"), "{refused}");
-                assert!(refused.contains("too_many_requests"), "{refused}");
+                assert_eq!(
+                    sibling.status(),
+                    if mode == "startup-progress" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                );
+                fs::write(root.join("release"), b"release").unwrap();
+                wait_ready(&address, &mut child.0, "serving").await;
+                let readiness: Value = client
+                    .get(format!("http://{address}/readyz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(readiness["status"], "serving");
+                assert_eq!(readiness["ready_graph_count"], 2);
+                assert_eq!(readiness["loading_graph_count"], 0);
+            }
+            if mode == "startup-strict-failed" {
+                fs::write(root.join("release"), b"release").unwrap();
+            } else {
                 assert_eq!(
                     unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
                     0
                 );
-                wait_marker(&root.join("signal-observed"), &mut child.0);
-                std::thread::sleep(Duration::from_millis(100));
-                assert!(
-                    !root.join("serve-returned").exists(),
-                    "serve returned while its disconnected write was pending"
-                );
-                assert!(child.0.try_wait().unwrap().is_none());
-                if !cutoff {
-                    fs::write(root.join("release"), b"release").unwrap();
+                if matches!(mode, "startup-finish" | "startup-cutoff") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    assert!(
+                        !root.join("serve-returned").exists(),
+                        "startup owner was dropped at shutdown"
+                    );
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    if mode == "startup-finish" {
+                        fs::write(root.join("release"), b"release").unwrap();
+                    }
                 }
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            let status = loop {
-                if let Some(status) = child.0.try_wait().unwrap() {
-                    break status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "shutdown did not finish within its process bound"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            if v2 {
-                if mode == "v2-finish" {
-                    assert_eq!(status.code(), Some(0));
-                    assert!(root.join("serve-returned").exists());
-                } else {
-                    use std::os::unix::process::ExitStatusExt;
-                    assert_eq!(status.signal(), Some(libc::SIGKILL));
-                }
-                output_thread.join().unwrap();
-                assert_eq!(
-                    fs::read(root.join("__cluster/lock.json")).unwrap(),
-                    retained_lock.unwrap()
-                );
-                assert_eq!(
-                    fs::read(root.join("__cluster/state.json")).unwrap(),
-                    ledger_before.unwrap()
-                );
-                let refusal = cluster_settings(root).await.unwrap_err();
-                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
-                continue;
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
             }
-            assert_eq!(
-                status.code(),
-                Some(if mode == "finish" { 0 } else { 2 }),
-                "mode={mode}"
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: startup shutdown exceeded bound"
             );
-            if panic {
-                assert!(
-                    fault_started.elapsed() < Duration::from_secs(5),
-                    "fatal completion should exit after known owners drain, before the ten-second watchdog"
-                );
-                assert!(
-                    !root.join("signal-observed").exists(),
-                    "fatal exit must not need SIGTERM"
-                );
-                assert!(
-                    !root.join("serve-returned").exists(),
-                    "uncertain owner must never be a clean serve return"
-                );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            status.code(),
+            Some(match mode {
+                "startup-cutoff" | "startup-panic" => 2,
+                "startup-strict-failed" | "startup-all-failed" => 1,
+                _ => 0,
+            }),
+            "{mode}"
+        );
+        if mode == "startup-panic" {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(!root.join("serve-returned").exists());
+        }
+        output_thread.join().unwrap();
+        let after = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "startup must not publish graph content: {mode}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_progress_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-progress").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_strict_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-strict").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_finish_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_cutoff_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-cutoff").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_panic_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-panic").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_strict_failed_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-strict-failed").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_listener_all_failed_retains_open_ownership() {
+        startup_listener_reports_progress_and_retains_open_ownership("startup-all-failed").await;
+    }
+
+    async fn disconnected_write_and_shutdown_share_ownership(mode: &str) {
+        let cutoff = mode == "cutoff";
+        let panic = mode.starts_with("panic-");
+        let v2 = mode.starts_with("v2-");
+        let temp = if v2 {
+            let temp = converged_cluster_dir("").await;
+            omnigraph_cluster::upgrade_deployment_ledger(
+                &format!("file://{}", temp.path().display()),
+                true,
+                &omnigraph_cluster::DeploymentCaller::storage_owner(None),
+            )
+            .await
+            .unwrap();
+            temp
+        } else {
+            init_loaded_graph().await
+        };
+        let root = temp.path();
+        let graph = if v2 {
+            root.join("graphs/knowledge.omni")
+        } else {
+            graph_path(root)
+        };
+        let ledger_before = v2.then(|| fs::read(root.join("__cluster/state.json")).unwrap());
+        let before = Omnigraph::open_read_only(graph.to_str().unwrap())
+            .await
+            .unwrap()
+            .list_commits(None)
+            .await
+            .unwrap()
+            .len();
+        let (mut child, address, output_thread) = spawn_owned_child(root, mode);
+        wait_ready(&address, &mut child.0, "serving").await;
+        let fault_started = Instant::now();
+        let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
+        if v2 {
+            let signal = if mode == "v2-crash" {
+                libc::SIGKILL
+            } else {
+                libc::SIGTERM
+            };
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, signal) },
+                0
+            );
+        } else if panic {
+            let mut response = String::new();
+            let _lost_as_fatal_shutdown_begins =
+                send_mutation(&address, "Uncertain").read_to_string(&mut response);
+            wait_marker(&root.join("fault-reached"), &mut child.0);
+        } else {
+            let socket = send_mutation(&address, "Disconnected");
+            wait_marker(&root.join("http-staged"), &mut child.0);
+            socket.shutdown(Shutdown::Both).unwrap();
+            drop(socket);
+            std::thread::sleep(Duration::from_millis(100));
+            let mut refused = String::new();
+            send_mutation(&address, "MustNotRun")
+                .read_to_string(&mut refused)
+                .unwrap();
+            assert!(
+                refused.starts_with("HTTP/1.1 429"),
+                "after the connection closed, the next request must still find the \
+                 disconnected write's actor reservation occupied: {refused}"
+            );
+            assert!(refused.contains("too_many_requests"), "{refused}");
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) },
+                0
+            );
+            wait_marker(&root.join("signal-observed"), &mut child.0);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !root.join("serve-returned").exists(),
+                "serve returned while its disconnected write was pending"
+            );
+            assert!(child.0.try_wait().unwrap().is_none());
+            if !cutoff {
+                fs::write(root.join("release"), b"release").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not finish within its process bound"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if v2 {
+            if mode == "v2-finish" {
+                assert_eq!(status.code(), Some(0));
+                assert!(root.join("serve-returned").exists());
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
             }
             output_thread.join().unwrap();
-            if panic {
-                let db = Omnigraph::open_read_only(graph.to_str().unwrap())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    db.list_commits(None).await.unwrap().len(),
-                    before + usize::from(mode == "panic-after"),
-                    "mode={mode}"
-                );
-                continue;
-            }
-            let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
             assert_eq!(
-                db.list_commits(None).await.unwrap().len(),
-                before + if cutoff { 0 } else { 1 }
+                fs::read(root.join("__cluster/lock.json")).unwrap(),
+                retained_lock.unwrap()
             );
-            let rows = db
-                .query(
-                    omnigraph::db::ReadTarget::branch("main"),
-                    "query q() { match { $p: Person } return { $p.name } }",
-                    "q",
-                    &Default::default(),
-                )
-                .await
-                .unwrap();
-            let names = rows.to_rust_json().unwrap().to_string();
-            assert_eq!(names.contains("Disconnected"), !cutoff, "{names}");
+            assert_eq!(
+                fs::read(root.join("__cluster/state.json")).unwrap(),
+                ledger_before.unwrap()
+            );
+            let refusal = cluster_settings(root).await.unwrap_err();
+            assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+            return;
+        }
+        assert_eq!(
+            status.code(),
+            Some(if mode == "finish" { 0 } else { 2 }),
+            "mode={mode}"
+        );
+        if panic {
             assert!(
-                !names.contains("MustNotRun"),
-                "refused work published: {names}"
+                fault_started.elapsed() < Duration::from_secs(5),
+                "fatal completion should exit after known owners drain, before the ten-second watchdog"
+            );
+            assert!(
+                !root.join("signal-observed").exists(),
+                "fatal exit must not need SIGTERM"
+            );
+            assert!(
+                !root.join("serve-returned").exists(),
+                "uncertain owner must never be a clean serve return"
             );
         }
+        output_thread.join().unwrap();
+        if panic {
+            let db = Omnigraph::open_read_only(graph.to_str().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.list_commits(None).await.unwrap().len(),
+                before + usize::from(mode == "panic-after"),
+                "mode={mode}"
+            );
+            return;
+        }
+        let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+        assert_eq!(
+            db.list_commits(None).await.unwrap().len(),
+            before + if cutoff { 0 } else { 1 }
+        );
+        let rows = db
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                "query q() { match { $p: Person } return { $p.name } }",
+                "q",
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let names = rows.to_rust_json().unwrap().to_string();
+        assert_eq!(names.contains("Disconnected"), !cutoff, "{names}");
+        assert!(
+            !names.contains("MustNotRun"),
+            "refused work published: {names}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_finish() {
+        disconnected_write_and_shutdown_share_ownership("finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_cutoff() {
+        disconnected_write_and_shutdown_share_ownership("cutoff").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_panic_before() {
+        disconnected_write_and_shutdown_share_ownership("panic-before").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_panic_after() {
+        disconnected_write_and_shutdown_share_ownership("panic-after").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_finish() {
+        disconnected_write_and_shutdown_share_ownership("v2-finish").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_crash() {
+        disconnected_write_and_shutdown_share_ownership("v2-crash").await;
     }
 }
 
