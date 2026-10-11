@@ -8,7 +8,7 @@ use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
+    BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
 };
 use omnigraph_compiler::settings::SettingId;
 
@@ -591,35 +591,7 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
             }
             _ => text,
         };
-        if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
-                && error
-                    .precondition_failure
-                    .as_ref()
-                    .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
-                && error.code.is_none()
-                && crate::command_outcome::single_request()
-                && {
-                    let mut rest = error.clone();
-                    rest.precondition_failure = None;
-                    crate::command_outcome::is_plain_refusal(&rest)
-                };
-            if verified_precondition {
-                return Err(PreconditionFailedCli {
-                    output: error,
-                    http_status: Some(status.as_u16()),
-                    retry_after,
-                }
-                .into());
-            }
-            return Err(RemoteErrorCli {
-                output: error,
-                status,
-                retry_after,
-            }
-            .into());
-        }
-        bail!("server returned {}: {}", status, text);
+        return Err(remote_refusal(status, text, retry_after, expected_commit));
     }
     if response_limit.is_some() {
         // Serde errors can include rejected field values, including a reflected secret.
@@ -628,6 +600,67 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
     } else {
         Ok(serde_json::from_str(&text)?)
     }
+}
+
+/// A non-success response as the typed refusal every remote call raises: a
+/// verified 412 as [`PreconditionFailedCli`], any other `ErrorOutput` body as
+/// [`RemoteErrorCli`], a body that is not one as the status and text.
+fn remote_refusal(
+    status: reqwest::StatusCode,
+    text: String,
+    retry_after: Option<String>,
+    expected_commit: Option<&str>,
+) -> color_eyre::eyre::Report {
+    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+        let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
+            && error
+                .precondition_failure
+                .as_ref()
+                .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
+            && error.code.is_none()
+            && crate::command_outcome::single_request()
+            && {
+                let mut rest = error.clone();
+                rest.precondition_failure = None;
+                crate::command_outcome::is_plain_refusal(&rest)
+            };
+        if verified_precondition {
+            return PreconditionFailedCli {
+                output: error,
+                http_status: Some(status.as_u16()),
+                retry_after,
+            }
+            .into();
+        }
+        return RemoteErrorCli {
+            output: error,
+            status,
+            retry_after,
+        }
+        .into();
+    }
+    color_eyre::eyre::eyre!("server returned {}: {}", status, text)
+}
+
+/// [`remote_json`] for a route whose success carries no body
+/// (`DELETE /commits/{id}` answers 204): a refusal is raised as there, a
+/// success decodes nothing.
+pub(crate) async fn remote_no_content(
+    client: &crate::graph_http::GraphHttpClient,
+    method: Method,
+    url: String,
+    bearer_token: Option<&str>,
+) -> Result<()> {
+    let request = apply_bearer_token(client.request(method, url), bearer_token);
+    let response = client.send(request).await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry_after = crate::command_outcome::retry_after(response.headers())
+        .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let text = response.text().await?;
+    Err(remote_refusal(status, text, retry_after, None))
 }
 
 /// The graph URI a command addresses (RFC-011): the scope-resolved URI string
@@ -930,6 +963,15 @@ pub(crate) fn query_params_from_json(
 /// rule and its rationale live on `refuse_wrong_door` in
 /// `crates/omnigraph-server/src/handlers/dispatch.rs`; this side only restates it.
 pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
+        write.statement_name(),
+    )
+}
+
+/// The server's refusal for `commit publish` or `commit drop` sent through
+/// `query`: a control write, under the statement's own name.
+pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
     branch_statement_refusals::with_statement(
         branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
         write.statement_name(),

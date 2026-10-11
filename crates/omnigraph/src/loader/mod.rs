@@ -992,6 +992,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
             actor_id,
             &txn,
             lineage_intent,
+            crate::db::omnigraph::Publication::Publish,
         )
         .await;
     let commit = publish_result?;

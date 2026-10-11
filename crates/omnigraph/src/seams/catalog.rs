@@ -25,6 +25,7 @@ omnigraph_seams::catalog! {
     crate::db::manifest::publisher::PUBLISH_POST_MERGE_PRE_ACK,
     crate::db::manifest::publisher::PUBLISH_PRE_MERGE,
     crate::db::manifest::publisher::PUBLISH_READ_BACK,
+    crate::db::manifest::publisher::PROPOSE_POST_CANDIDATE_PRE_TAG,
     crate::db::upgrade::UPGRADE_AFTER_ACTIVATION,
     crate::db::upgrade::UPGRADE_AFTER_BRANCH,
     crate::db::upgrade::UPGRADE_AFTER_FENCE,

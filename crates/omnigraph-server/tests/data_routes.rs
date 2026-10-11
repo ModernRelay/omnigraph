@@ -1561,6 +1561,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (status, body) = json_response(
@@ -2522,6 +2523,183 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
     }
 }
 
+/// A request with no body: the commit control routes take their target from
+/// the commit itself.
+fn bodiless(method: Method, path: &str) -> Request<Body> {
+    Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(g(path))
+        .method(method)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// One mutation `as commit` on main, answered with its unpublished commit.
+async fn propose_person(app: &axum::Router, name: &str) -> Value {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({"query": format!(
+                "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+            )}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commit"]["published"], false, "{body}");
+    body["commit"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_routes_list_publish_and_drop_unpublished_commits() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head_before = main_head_commit_id(&app).await;
+    let pia = propose_person(&app, "Pia").await;
+    let pia_id = pia["graph_commit_id"].as_str().unwrap().to_string();
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+
+    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([pia]));
+    let (status, listed) = get_json(&app, g("/commits?unpublished=true&branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([pia]));
+    let (_, history) = get_json(&app, g("/commits")).await;
+    assert!(
+        history["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|commit| commit["graph_commit_id"] != pia_id),
+        "an unpublished commit is not history: {history}"
+    );
+    let (status, shown) = get_json(&app, g(&format!("/commits/{pia_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown, pia);
+
+    let publish = || bodiless(Method::POST, &format!("/commits/{pia_id}/publish"));
+    let (status, published) = json_response(&app, publish()).await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(published["graph_commit_id"], pia_id);
+    assert_eq!(published["published"], true);
+    assert_eq!(main_head_commit_id(&app).await, pia_id);
+    let (status, again) = json_response(&app, publish()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        again, published,
+        "a repeat publish answers the published commit"
+    );
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([]));
+    let (_, history) = get_json(&app, g("/commits")).await;
+    assert_eq!(history["commits"][0], published);
+    let (status, body) = json_response(
+        &app,
+        bodiless(Method::DELETE, &format!("/commits/{pia_id}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], format!("commit '{pia_id}' is published"));
+
+    let quin = propose_person(&app, "Quin").await;
+    let quin_id = quin["graph_commit_id"].as_str().unwrap().to_string();
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{quin_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.is_empty(), "a drop answers no body: {body:?}");
+    for request in [
+        bodiless(Method::GET, &format!("/commits/{quin_id}")),
+        bodiless(Method::POST, &format!("/commits/{quin_id}/publish")),
+        bodiless(Method::DELETE, &format!("/commits/{quin_id}")),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_publish_refuses_a_moved_head_and_merge_as_commit_excludes_delete_branch() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let pia = propose_person(&app, "Pia").await;
+    let pia_id = pia["graph_commit_id"].as_str().unwrap();
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": MUTATION_QUERIES, "name": "insert_person", "params": {"name": "Rae", "age": 20}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(
+        &app,
+        bodiless(Method::POST, &format!("/commits/{pia_id}/publish")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("precondition failed on branch 'main'"),
+        "{body}"
+    );
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{pia_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "as_commit": true, "delete_branch": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("delete_branch"),
+        "{body}"
+    );
+
+    branch_one_commit_ahead(&app, "feature", "Fay").await;
+    let head_before = main_head_commit_id(&app).await;
+    let (status, merged) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "as_commit": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert_eq!(merged["outcome"], "fast_forward");
+    assert_eq!(merged["commit"]["published"], false);
+    assert_eq!(merged["branch_deleted"], Value::Null);
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+    let merge_id = merged["commit"]["graph_commit_id"].as_str().unwrap();
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([merged["commit"]]));
+    let (status, published) = json_response(
+        &app,
+        bodiless(Method::POST, &format!("/commits/{merge_id}/publish")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{published}");
+    assert_eq!(published["graph_commit_id"], merge_id);
+    assert_eq!(main_head_commit_id(&app).await, merge_id);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_merge_statement_conflict_matches_the_route_409() {
     let temp = divergent_alice_graph().await;
@@ -2535,6 +2713,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (route_status, route_body) = json_response(
@@ -4274,6 +4453,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -4426,6 +4606,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: true,
+        as_commit: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -4485,6 +4666,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
         source: "main".to_string(),
         target: Some("feature".to_string()),
         delete_branch: true,
+        as_commit: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(

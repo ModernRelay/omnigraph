@@ -812,6 +812,11 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Merge into an unpublished commit (`branch merge … as commit`): the
+        /// target head is unchanged until `omnigraph commit publish <id>`.
+        /// Exclusive with --delete-branch, whose source the commit still holds.
+        #[arg(long, conflicts_with = "delete_branch")]
+        as_commit: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
         /// `settings` field (the Session settings RFC).
@@ -879,6 +884,29 @@ pub(crate) enum CommitCommand {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// List the unpublished commits whose recorded target is the branch
+        /// (`as commit` writes awaiting `commit publish`) instead of its history
+        #[arg(long)]
+        unpublished: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish an unpublished commit onto its recorded target branch
+    Publish {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop an unpublished commit: its id stops resolving and its held merge
+    /// inputs are released
+    Drop {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
         #[arg(long)]
         json: bool,
     },

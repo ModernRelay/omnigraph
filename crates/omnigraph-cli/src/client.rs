@@ -41,7 +41,7 @@ use omnigraph_api_types::{
     read_output, schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::BranchWrite;
+use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -56,8 +56,9 @@ use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
     apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
-    remote_json, remote_json_bounded, remote_response_json_bounded, remote_url, resolve_cli_actor,
-    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
+    remote_json, remote_json_bounded, remote_no_content, remote_response_json_bounded, remote_url,
+    resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag,
+    select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
@@ -103,6 +104,7 @@ fn validate_merge_output(
     source: &str,
     target: &str,
     delete_branch: bool,
+    as_commit: bool,
 ) -> Result<()> {
     if output.source != source || output.target != target {
         bail!(
@@ -115,6 +117,15 @@ fn validate_merge_output(
         target,
         output.actor_id.as_deref(),
     )?;
+    if output
+        .commit
+        .as_ref()
+        .is_some_and(|commit| commit.published == as_commit)
+    {
+        bail!(
+            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
+        );
+    }
     match (
         delete_branch,
         output.branch_deleted,
@@ -673,6 +684,52 @@ impl GraphClient {
         }
     }
 
+    /// `commit list --unpublished`: the proposals whose recorded target is
+    /// `branch` (`None` = main), `GET /commits?unpublished=true` or the
+    /// engine's listing.
+    pub(crate) async fn list_unpublished_commits(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<CommitListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let url = match branch {
+                    Some(branch) => remote_url(
+                        base_url,
+                        &["commits"],
+                        &[("branch", branch), ("unpublished", "true")],
+                    )?,
+                    None => remote_url(base_url, &["commits"], &[("unpublished", "true")])?,
+                };
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    url,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_read_session(uri, &[]).await?;
+                let commits = db
+                    .list_unpublished_commits(branch)
+                    .await?
+                    .iter()
+                    .map(commit_output)
+                    .collect::<Vec<_>>();
+                Ok(CommitListOutput { commits })
+            }
+        }
+    }
+
     pub(crate) async fn get_commit(&self, commit_id: &str) -> Result<CommitOutput> {
         match self {
             GraphClient::Remote {
@@ -1113,7 +1170,12 @@ impl GraphClient {
                     *response_limit,
                 )
                 .await?;
-                if let BranchWrite::Merge { source, into } = &write {
+                if let BranchWrite::Merge {
+                    source,
+                    into,
+                    as_commit,
+                } = &write
+                {
                     let target = into.as_deref().unwrap_or("main");
                     let Some(BranchOutcomeOutput::Merged {
                         source: actual_source,
@@ -1137,6 +1199,15 @@ impl GraphClient {
                         target,
                         output.actor_id.as_deref(),
                     )?;
+                    if output
+                        .commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.published == *as_commit)
+                    {
+                        bail!(
+                            "invalid merge response: the commit's publication state contradicts the request; effects are unknown; reconcile before retrying"
+                        );
+                    }
                 }
                 Ok(output)
             }
@@ -1156,12 +1227,21 @@ impl GraphClient {
                         self.branch_delete(&name).await?;
                         (name.clone(), None, BranchOutcomeOutput::Deleted { name })
                     }
-                    BranchWrite::Merge { source, into } => {
+                    BranchWrite::Merge {
+                        source,
+                        into,
+                        as_commit,
+                    } => {
                         let target = into.unwrap_or_else(|| "main".to_string());
                         let mut session = Self::open_write_session(uri, settings).await?;
                         Self::apply_prefix(&mut session, query_source)?;
                         let result = session
-                            .branch_merge_as(&source, &target, actor.as_deref())
+                            .branch_merge_as_with_options(
+                                &source,
+                                &target,
+                                actor.as_deref(),
+                                as_commit,
+                            )
                             .await?;
                         let commit = result.commit.as_ref().map(commit_output);
                         (
@@ -1184,6 +1264,160 @@ impl GraphClient {
                     commit,
                     outcome: Some(outcome),
                 })
+            }
+        }
+    }
+
+    /// A commit statement (`commit publish`, `commit drop`) from `-e`/`--query`:
+    /// `POST /mutate` with the source alone, or the engine call, answered as
+    /// the server answers it (`branch` is the proposal's recorded target, both
+    /// counts `0`, `commit` the published commit or null after a drop).
+    pub(crate) async fn commit_write_statement(
+        &self,
+        query_source: &str,
+        write: CommitWrite,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ChangeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_change_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
+                let output: ChangeOutput = remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["mutate"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await?;
+                let answered = match (&write, &output.outcome, &output.commit) {
+                    (
+                        CommitWrite::Publish { graph_commit_id },
+                        Some(BranchOutcomeOutput::Published),
+                        Some(commit),
+                    ) => commit.published && commit.graph_commit_id == *graph_commit_id,
+                    (
+                        CommitWrite::Drop { graph_commit_id },
+                        Some(BranchOutcomeOutput::Dropped {
+                            graph_commit_id: dropped,
+                        }),
+                        None,
+                    ) => dropped == graph_commit_id,
+                    _ => false,
+                };
+                if !answered {
+                    bail!(
+                        "invalid `{}` response: the outcome does not describe the requested commit; effects are unknown; reconcile before retrying",
+                        write.statement_name()
+                    );
+                }
+                Ok(output)
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let query_name = write.statement_name().to_string();
+                let mut session = Self::open_write_session(uri, settings).await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                let target = session
+                    .get_commit(write.graph_commit_id())
+                    .await?
+                    .graph_branch
+                    .unwrap_or_else(|| "main".to_string());
+                let (commit, outcome) = match write {
+                    CommitWrite::Publish { graph_commit_id } => {
+                        let published = session
+                            .publish_commit_as(&graph_commit_id, actor.as_deref())
+                            .await?;
+                        (
+                            Some(commit_output(&published)),
+                            BranchOutcomeOutput::Published,
+                        )
+                    }
+                    CommitWrite::Drop { graph_commit_id } => {
+                        session
+                            .drop_commit_as(&graph_commit_id, actor.as_deref())
+                            .await?;
+                        (None, BranchOutcomeOutput::Dropped { graph_commit_id })
+                    }
+                };
+                Ok(ChangeOutput {
+                    branch: target,
+                    query_name,
+                    affected_nodes: 0,
+                    affected_edges: 0,
+                    actor_id: actor.clone(),
+                    commit,
+                    outcome: Some(outcome),
+                })
+            }
+        }
+    }
+
+    /// `commit publish <id>`: `POST /commits/{id}/publish`, or the engine
+    /// call; the answer is the published commit, checked to be the one asked.
+    pub(crate) async fn commit_publish(&self, commit_id: &str) -> Result<CommitOutput> {
+        let published: CommitOutput = match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["commits", commit_id, "publish"], &[])?,
+                    None,
+                    token.as_deref(),
+                )
+                .await?
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let session = Self::open_write_session(uri, &[]).await?;
+                commit_output(
+                    &session
+                        .publish_commit_as(commit_id, actor.as_deref())
+                        .await?,
+                )
+            }
+        };
+        if !published.published || published.graph_commit_id != commit_id {
+            bail!(
+                "invalid `commit publish` response: the answer does not describe the requested commit as published; effects are unknown; reconcile before retrying"
+            );
+        }
+        Ok(published)
+    }
+
+    /// `commit drop <id>`: `DELETE /commits/{id}` (204), or the engine call.
+    pub(crate) async fn commit_drop(&self, commit_id: &str) -> Result<()> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_no_content(
+                    http,
+                    Method::DELETE,
+                    remote_url(base_url, &["commits", commit_id], &[])?,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let session = Self::open_write_session(uri, &[]).await?;
+                session
+                    .drop_commit_as(commit_id, actor.as_deref())
+                    .await
+                    .map_err(Into::into)
             }
         }
     }
@@ -1447,6 +1681,7 @@ impl GraphClient {
         source: &str,
         into: &str,
         delete_branch: bool,
+        as_commit: bool,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
         // Use the engine's canonical spelling for dispatch, receipt validation,
@@ -1471,6 +1706,7 @@ impl GraphClient {
                         source: source.to_string(),
                         target: Some(into.to_string()),
                         delete_branch,
+                        as_commit,
                         settings: Self::remote_settings(settings)?,
                     })?),
                     token.as_deref(),
@@ -1480,7 +1716,9 @@ impl GraphClient {
             GraphClient::Embedded { uri, actor } => {
                 let session = Self::open_write_session(uri, settings).await?;
                 let actor = actor.as_deref();
-                let result = session.branch_merge_as(source, into, actor).await?;
+                let result = session
+                    .branch_merge_as_with_options(source, into, actor, as_commit)
+                    .await?;
                 // Composed exactly like the server handler: the merge is
                 // durable, so a deletion refusal/failure is reported in the
                 // payload, never as an error (parity_matrix pins the two
@@ -1507,7 +1745,7 @@ impl GraphClient {
                 }
             }
         };
-        validate_merge_output(&output, source, into, delete_branch)?;
+        validate_merge_output(&output, source, into, delete_branch, as_commit)?;
         Ok(output)
     }
 
@@ -2370,6 +2608,7 @@ mod tests {
                                     BranchWrite::Merge {
                                         source: "review".into(),
                                         into: Some("main".into()),
+                                        as_commit: false,
                                     },
                                     &[],
                                 )
@@ -2600,7 +2839,7 @@ mod tests {
             (
                 "branch merge",
                 client
-                    .branch_merge("review", "main", false, &settings)
+                    .branch_merge("review", "main", false, false, &settings)
                     .await
                     .map(|_| ()),
             ),
@@ -2700,7 +2939,7 @@ mod tests {
             .await
             .unwrap();
         client
-            .branch_merge("review", "main", false, &settings)
+            .branch_merge("review", "main", false, false, &settings)
             .await
             .unwrap();
 

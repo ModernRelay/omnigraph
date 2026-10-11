@@ -1071,8 +1071,13 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
+                let publication = if ir.as_commit {
+                    crate::db::omnigraph::Publication::Propose(None)
+                } else {
+                    crate::db::omnigraph::Publication::Publish
+                };
                 let commit = self
-                    .publish_committed_mutation(committed, &txn, actor_id)
+                    .publish_committed_mutation(committed, &txn, actor_id, publication)
                     .await?;
                 Ok(crate::MutationReceipt {
                     result: total,
@@ -1111,13 +1116,14 @@ impl Omnigraph {
         })
     }
 
-    /// The second half of the Mutation protocol's tail: publish every detached
-    /// effect in one manifest CAS. This is the protocol's one publisher call.
+    /// Finish the Mutation protocol's tail through the selected publication
+    /// mode. This is the protocol's one publisher call.
     pub(super) async fn publish_committed_mutation(
         &self,
         committed: CommittedStagedMutation,
         txn: &crate::db::WriteTxn,
         actor_id: Option<&str>,
+        publication: crate::db::omnigraph::Publication,
     ) -> Result<crate::db::GraphCommit> {
         let CommittedStagedMutation {
             committed:
@@ -1151,6 +1157,7 @@ impl Omnigraph {
             actor_id,
             txn,
             lineage_intent,
+            publication,
         )
         .await
     }

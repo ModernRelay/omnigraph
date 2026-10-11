@@ -5,7 +5,7 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl* ~ missing_param_list?) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | commit_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | query_decl* ~ missing_param_list?) ~ EOI }
 // A declaration whose name is not followed by `(`, matched after the well
 // formed declarations so the parser refuses it at the name's end with the
 // one fix (`query name()`) instead of reporting the file's first position;
@@ -29,16 +29,24 @@ setting_value = { integer | ident | string_lit }
 // is atomic and closed by a word boundary: an identifier character may not
 // follow it (`branch createb0` is a parse error), a quoted name may.
 branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
+// The two control writes on an unpublished commit, named by its full id.
+commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
 // `explain` wraps the one read declaration whose plan is answered as rows.
 explain_stmt  = { kw_explain ~ query_decl }
 // Anything the file holds after its one statement, matched so the parser
 // refuses it by name instead of leaving `EOI` to report the expected tokens.
-statement_trailer = { (setting_stmt | show_stmt | branch_stmt | explain_stmt | query_decl)+ }
+statement_trailer = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | explain_stmt | query_decl)+ }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
 branch_delete = { kw_delete ~ branch_name }
-branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? }
+branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? ~ as_commit_clause? }
 branch_list   = { kw_list }
-branch_name   = { ident | string_lit }
+// A bare `as` followed by `commit` is the clause, never a branch named `as`;
+// quote the name for that.
+branch_name   = { !(kw_as ~ kw_commit) ~ (ident | string_lit) }
+commit_publish = { kw_publish ~ string_lit }
+commit_drop    = { kw_drop ~ string_lit }
+// `as commit`: the write's result is an unpublished commit.
+as_commit_clause = { kw_as ~ kw_commit }
 
 kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -52,9 +60,13 @@ kw_set    = @{ "set" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_reset  = @{ "reset" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_show   = @{ "show" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all    = @{ "all" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_as     = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_commit = @{ "commit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_publish = @{ "publish" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_drop   = @{ "drop" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 query_decl = {
-    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ "{"
+    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ as_commit_clause? ~ "{"
         ~ query_body
     ~ "}"
 }

@@ -1894,6 +1894,7 @@ return { $d.name }
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),
+        as_commit: false,
     };
     let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
     assert_eq!(

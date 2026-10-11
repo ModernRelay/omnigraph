@@ -216,6 +216,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/publish",
     "/graphs/{graph_id}/commits/{commit_id}/changes",
     "/graphs/{graph_id}/changes",
     "/graphs/{graph_id}/changes/baseline",
@@ -895,6 +896,24 @@ fn openapi_commit_show_is_get() {
     assert!(doc["paths"]["/graphs/{graph_id}/commits/{commit_id}"]["get"].is_object());
 }
 
+#[test]
+fn openapi_commit_publish_is_a_bodiless_post_and_drop_a_204_delete() {
+    let doc = openapi_json();
+    let publish = &doc["paths"]["/graphs/{graph_id}/commits/{commit_id}/publish"]["post"];
+    assert!(publish.is_object());
+    assert!(publish.get("requestBody").is_none(), "{publish}");
+    assert_eq!(
+        publish["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/CommitOutput"
+    );
+    assert!(publish["responses"]["412"].is_object());
+    let drop = &doc["paths"]["/graphs/{graph_id}/commits/{commit_id}"]["delete"];
+    assert!(drop.is_object());
+    assert!(drop["responses"]["204"].is_object());
+    assert!(drop["responses"]["204"].get("content").is_none(), "{drop}");
+    assert!(drop["responses"]["409"].is_object());
+}
+
 // ---------------------------------------------------------------------------
 // Schema coverage tests
 // ---------------------------------------------------------------------------
@@ -1141,6 +1160,8 @@ fn branch_outcome_output_schema_is_tagged_by_kind() {
             "created" => &["from", "name"],
             "deleted" => &["name"],
             "merged" => &["merge", "source", "target"],
+            "published" => &[],
+            "dropped" => &["graph_commit_id"],
             other => panic!("unexpected kind {other}"),
         };
         assert_eq!(fields, expected, "{kind} fields");
@@ -1153,7 +1174,10 @@ fn branch_outcome_output_schema_is_tagged_by_kind() {
         seen.push(kind);
     }
     seen.sort_unstable();
-    assert_eq!(seen, ["created", "deleted", "merged"]);
+    assert_eq!(
+        seen,
+        ["created", "deleted", "dropped", "merged", "published"]
+    );
 }
 
 #[test]
@@ -1243,6 +1267,7 @@ fn branch_merge_request_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("source"));
     assert!(props.contains_key("target"));
+    assert!(props.contains_key("as_commit"));
 }
 
 #[test]
@@ -1444,6 +1469,7 @@ fn commit_output_schema_has_expected_fields() {
     assert!(props.contains_key("parent_commit_id"));
     assert!(props.contains_key("actor_id"));
     assert!(props.contains_key("created_at"));
+    assert!(props.contains_key("published"));
 }
 
 #[test]
@@ -1660,6 +1686,8 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/graphs/{graph_id}/branches/merge", "post"),
         ("/graphs/{graph_id}/commits", "get"),
         ("/graphs/{graph_id}/commits/{commit_id}", "get"),
+        ("/graphs/{graph_id}/commits/{commit_id}", "delete"),
+        ("/graphs/{graph_id}/commits/{commit_id}/publish", "post"),
         ("/graphs/{graph_id}/commits/{commit_id}/changes", "get"),
         ("/graphs/{graph_id}/changes", "get"),
         ("/graphs/{graph_id}/changes/baseline", "post"),
@@ -2111,6 +2139,7 @@ const EXPECTED_CLUSTER_PATHS: &[&str] = &[
     "/graphs/{graph_id}/branches/merge",
     "/graphs/{graph_id}/commits",
     "/graphs/{graph_id}/commits/{commit_id}",
+    "/graphs/{graph_id}/commits/{commit_id}/publish",
     "/graphs/{graph_id}/commits/{commit_id}/changes",
     "/graphs/{graph_id}/changes",
     "/graphs/{graph_id}/changes/baseline",
@@ -2189,6 +2218,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
         "/branches/merge",
         "/commits",
         "/commits/{commit_id}",
+        "/commits/{commit_id}/publish",
     ];
     for flat in flat_protected {
         assert!(
@@ -2420,6 +2450,7 @@ async fn served_spec_always_nests_under_cluster_prefix() {
         "/branches/merge",
         "/commits",
         "/commits/{commit_id}",
+        "/commits/{commit_id}/publish",
     ];
     for flat in flat_protected {
         assert!(

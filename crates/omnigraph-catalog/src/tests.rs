@@ -11380,6 +11380,12 @@ fn migrations_intent_validates_every_source_format_and_no_other_route() {
             MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
             INTERNAL_MANIFEST_SCHEMA_VERSION,
         ),
+        (6, 13, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION),
+        (
+            6,
+            INTERNAL_MANIFEST_SCHEMA_VERSION,
+            INTERNAL_MANIFEST_SCHEMA_VERSION,
+        ),
     ] {
         let error = route(protocol, source_format, target_format).unwrap_err();
         assert!(

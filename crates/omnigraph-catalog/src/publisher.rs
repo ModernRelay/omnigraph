@@ -43,7 +43,7 @@ use super::commit;
 use super::history;
 use super::layout::open_manifest_dataset_with_session;
 use super::metadata::parse_namespace_version_request;
-use super::migrations::{INTERNAL_MANIFEST_SCHEMA_VERSION, guard_stamp, read_stamp};
+use super::migrations::{guard_stamp, is_served_stamp, read_stamp, require_unpublished_commits};
 use super::state::{
     BranchRecords, CommitBuffer, GraphLineageRow, HeldRecord, ManifestRows, ManifestState,
     ReplacedRow, ReplacedTable, TablePin, TableRow, TableState, exact_head, manifest_state,
@@ -181,6 +181,26 @@ pub enum PublishPrecondition {
         authority: GraphHeadExpectation,
         version: u64,
     },
+    /// The publication of an unpublished commit: the captured authority as
+    /// `ExactGraphHead`, and the attempt must allocate `graph_commit_id`, the
+    /// id the proposal was inspected under, or it is refused before the CAS.
+    ExactCandidate {
+        authority: GraphHeadExpectation,
+        graph_commit_id: String,
+    },
+}
+
+/// What writing a candidate version established: the proposal's identity
+/// and the physical coordinates its tag names.
+#[derive(Debug, Clone)]
+pub struct CandidateOutcome {
+    pub graph_commit_id: String,
+    /// The detached `__manifest` version holding the candidate rows.
+    pub detached_version: u64,
+    /// The linear version the candidate was captured over.
+    pub captured_manifest_version: u64,
+    pub head: GraphLineageRow,
+    pub tables: Vec<TableRow>,
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
@@ -239,6 +259,22 @@ pub trait ManifestBatchPublisher: Send + Sync {
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome>;
+
+    /// Write `changes` as an unpublished commit: a detached version of the
+    /// bound branch's `__manifest` addressed by its proposal tag, under the
+    /// exact `authority`. Nothing the branch reads changes.
+    async fn write_candidate(
+        &self,
+        _changes: &[ManifestChange],
+        _expected_table_versions: &ExpectedTableVersions,
+        _intent: &LineageIntent,
+        _authority: &GraphHeadExpectation,
+        _merge: Option<super::unpublished::UnpublishedMergeInputs>,
+    ) -> Result<CandidateOutcome> {
+        Err(OmniError::manifest_internal(
+            "this manifest publisher writes no unpublished commits",
+        ))
+    }
 }
 
 pub struct GraphNamespacePublisher {
@@ -269,7 +305,7 @@ impl PublishedRows {
             .saturating_add(location.e_tag.as_ref().map_or(0, String::capacity))
             .saturating_add(std::mem::size_of::<Self>());
         if bytes > PUBLISHED_ROWS_CACHE_BYTES
-            || read_stamp(dataset) != Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+            || !read_stamp(dataset).is_some_and(is_served_stamp)
             || manifest
                 .schema
                 .fields_pre_order()
@@ -353,6 +389,14 @@ decide_seam! {
     /// Readback may be unavailable after a lost acknowledgement. This cannot
     /// turn an indeterminate commit into permission to replay the mutation.
     pub static PUBLISH_READ_BACK = ("publish.read_back", AnyWrite, [Fail]);
+}
+
+decide_seam! {
+    /// After the candidate `__manifest` version of a write `as commit` is
+    /// committed detached and before its proposal tag names it: the branch is
+    /// unchanged and nothing addresses the version, so a failure here leaves
+    /// reclaimable garbage and no unpublished commit.
+    pub static PROPOSE_POST_CANDIDATE_PRE_TAG = ("propose.post_candidate_pre_tag", AnyWrite, [Fail]);
 }
 
 impl GraphNamespacePublisher {
@@ -864,7 +908,11 @@ impl GraphNamespacePublisher {
     ) -> Result<()> {
         let expected = match precondition {
             PublishPrecondition::Any => return Ok(()),
-            PublishPrecondition::ExactGraphHead(expected) => expected,
+            PublishPrecondition::ExactGraphHead(expected)
+            | PublishPrecondition::ExactCandidate {
+                authority: expected,
+                ..
+            } => expected,
             PublishPrecondition::ExactGraphVersion { authority, version } => {
                 if dataset.version().version != *version {
                     return Err(OmniError::manifest_read_set_changed(
@@ -1157,6 +1205,17 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         .to_string(),
                 ));
             }
+            if let PublishPrecondition::ExactCandidate {
+                graph_commit_id, ..
+            } = precondition
+                && next_head.graph_commit_id != *graph_commit_id
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "publishing unpublished commit '{graph_commit_id}' would allocate '{}' \
+                     instead; the candidate is not published",
+                    next_head.graph_commit_id
+                )));
+            }
             let changed = Self::replaced_tables(&tables, &next_tables, new_manifest_version);
             let tables: Vec<TableRow> = tables.into_values().collect();
             let next_tables: Vec<TableRow> = next_tables.into_values().collect();
@@ -1350,6 +1409,137 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             "manifest publish exhausted {} retries against concurrent writers",
             PUBLISHER_RETRY_BUDGET
         )))
+    }
+
+    async fn write_candidate(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: &LineageIntent,
+        authority: &GraphHeadExpectation,
+        merge: Option<super::unpublished::UnpublishedMergeInputs>,
+    ) -> Result<CandidateOutcome> {
+        use super::unpublished::{UnpublishedCommitProperty, unpublished_tag_name};
+        use lance::dataset::refs::Ref;
+
+        let LoadedPublishState {
+            dataset,
+            rows:
+                ManifestRows {
+                    tables,
+                    head,
+                    buffer,
+                    schema_contract,
+                    registry,
+                    ..
+                },
+        } = self.load_publish_state().await?;
+        let stamp = read_stamp(&dataset).ok_or_else(|| {
+            OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
+        })?;
+        require_unpublished_commits(stamp)?;
+        let native_branch = dataset.manifest().branch.clone();
+        let precondition = PublishPrecondition::ExactGraphHead(authority.clone());
+        self.check_publish_precondition(&dataset, &head, &precondition)
+            .await?;
+        let tables: TableRows = tables
+            .into_iter()
+            .map(|table| (table.registration.identity, table))
+            .collect();
+        Self::check_expected_table_versions(&tables, expected_table_versions)?;
+        if changes
+            .iter()
+            .any(|change| matches!(change, ManifestChange::SchemaContract(_)))
+        {
+            return Err(OmniError::manifest(
+                "a schema contract change cannot be written as an unpublished commit".to_string(),
+            ));
+        }
+
+        let captured_manifest_version = dataset.version().version;
+        let candidate_clock = captured_manifest_version + 1;
+        let (next_tables, wrote) = Self::apply_changes(changes, &tables, candidate_clock)?;
+        if !wrote {
+            return Err(OmniError::manifest_internal(
+                "an unpublished commit records at least one table change",
+            ));
+        }
+        let next_head = Self::next_head(
+            intent,
+            &head,
+            &buffer,
+            &tables,
+            native_branch.clone(),
+            candidate_clock,
+        )?;
+        let next_tables: Vec<TableRow> = next_tables.into_values().collect();
+        history::check_head_record(&next_head, &next_tables)?;
+        let property = UnpublishedCommitProperty::new(
+            &next_head,
+            intent,
+            authority,
+            captured_manifest_version,
+            expected_table_versions,
+            merge,
+        )?;
+        let rows = ManifestRows {
+            schema_contract_head: schema_contract.as_ref().map(|row| row.head.clone()),
+            tables: next_tables,
+            head: next_head,
+            buffer: CommitBuffer::default(),
+            schema_contract,
+            registry,
+        };
+        let (detached, _) =
+            commit::overwrite_detached(dataset.clone(), &rows, property.encode()?).await?;
+        let detached_version = detached.version().version;
+        let graph_commit_id = rows.head.graph_commit_id.clone();
+        let name = unpublished_tag_name(&graph_commit_id);
+        let reference = Ref::Version(native_branch.clone(), Some(detached_version));
+        fail(&PROPOSE_POST_CANDIDATE_PRE_TAG)?;
+        if let Err(error) = dataset.tags().create(&name, reference).await {
+            match dataset.tags().get(&name).await {
+                Ok(contents)
+                    if contents.branch == native_branch && contents.version == detached_version => {
+                }
+                Ok(contents) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "proposal tag '{name}' names version {} of {:?}; this attempt wrote \
+                         version {detached_version} of {native_branch:?}",
+                        contents.version, contents.branch
+                    )));
+                }
+                Err(LanceError::RefNotFound { .. }) => return Err(OmniError::storage(error)),
+                Err(readback) => {
+                    return Err(OmniError::manifest_publish_in_doubt(format!(
+                        "the proposal tag of unpublished commit '{graph_commit_id}' may exist: its \
+                         creation failed ({error}) and the readback failed ({readback})"
+                    )));
+                }
+            }
+        }
+        let latest =
+            super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref()).await?;
+        if latest.version != captured_manifest_version
+            || latest.branch_identifier != authority.branch_identifier
+        {
+            if let Err(release) = super::unpublished::release_unpublished_tag(&dataset, &name).await
+            {
+                tracing::warn!(%release, "expired proposal tag left for cleanup");
+            }
+            return Err(OmniError::manifest_read_set_changed(
+                authority.read_set_member(),
+                Some(captured_manifest_version.to_string()),
+                Some(latest.version.to_string()),
+            ));
+        }
+        Ok(CandidateOutcome {
+            graph_commit_id,
+            detached_version,
+            captured_manifest_version,
+            head: rows.head,
+            tables: rows.tables,
+        })
     }
 }
 

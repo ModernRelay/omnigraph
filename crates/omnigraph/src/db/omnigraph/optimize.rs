@@ -334,6 +334,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
                 None,
                 &authority_txn,
                 lineage,
+                super::table_ops::Publication::Publish,
             )
             .await?;
         }
@@ -853,7 +854,7 @@ async fn cleanup_detached_only(
         .buffer_unordered(concurrency)
         .collect()
         .await;
-    if !plan.expired_merge_input_tags.is_empty() {
+    if !plan.expired_merge_input_tags.is_empty() || !plan.expired_unpublished_tags.is_empty() {
         let manifest =
             crate::db::manifest::ManifestCoordinator::collector_branch_under_control_gates(
                 db.root_uri(),
@@ -866,6 +867,10 @@ async fn cleanup_detached_only(
             &plan.expired_merge_input_tags,
         )
         .await?;
+        for name in &plan.expired_unpublished_tags {
+            crate::db::manifest::unpublished::release_unpublished_tag(manifest.dataset(), name)
+                .await?;
+        }
     }
     let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {

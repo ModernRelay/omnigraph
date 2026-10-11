@@ -1,7 +1,7 @@
 //! GQT parsing, expectation checking, and execution over a supplied session.
 #![recursion_limit = "512"]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::FutureExt as _;
-use omnigraph::Session;
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
+use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, Clause, EmptyFile, Expr, FileBody, Literal, Param, QueryDecl,
-    SettingStmt, show_statement_name,
+    BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr, FileBody, Literal, Param,
+    QueryDecl, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -217,6 +217,9 @@ pub struct QueryStep {
     pub name: String,
     /// The `branch: <name>` header argument; `main` when unspelled.
     pub branch: String,
+    /// The `snapshot: $name` header argument: the read runs at the commit
+    /// `--- bind commit $name` captured, not on `branch`.
+    pub snapshot: Option<String>,
     decl: Box<QueryDecl>,
     params_raw: Option<ParamsInput>,
     expect: QueryExpect,
@@ -241,6 +244,9 @@ pub struct MutateStep {
     ast_params: Vec<Param>,
     params_raw: Option<ParamsInput>,
     expect: MutateExpect,
+    /// `--- bind commit $name` after this step: the name the write's commit
+    /// id is bound to for the rest of the case.
+    bind: Option<String>,
 }
 
 /// A `--- mutate` step holding a control write. The expect lives inside
@@ -248,11 +254,14 @@ pub struct MutateStep {
 #[derive(Debug)]
 pub struct ControlStep {
     ordinal: usize,
-    /// The statement's two words, from `BranchWrite::statement_name`.
+    /// The statement's two words, from `BranchWrite::statement_name` or
+    /// `CommitWrite::statement_name`.
     name: &'static str,
     /// The section's `set` and `reset` lines, scoped to this one write.
     prefix: Vec<SettingStmt>,
     pub write: ControlWrite,
+    /// `--- bind commit $name` after a merge or a publish, as `MutateStep::bind`.
+    bind: Option<String>,
 }
 
 #[derive(Debug)]
@@ -269,8 +278,27 @@ pub enum ControlWrite {
     Merge {
         source: String,
         into: Option<String>,
+        /// `as commit`: the merge result is an unpublished commit.
+        as_commit: bool,
         expect: MergeExpect,
     },
+    /// `commit publish "<id>"`.
+    Publish {
+        graph_commit_id: String,
+        expect: WriteExpect,
+    },
+    /// `commit drop "<id>"`.
+    Drop {
+        graph_commit_id: String,
+        expect: WriteExpect,
+    },
+}
+
+/// The parsed statement behind a control step: a branch write or a commit
+/// write, both completed by the same `--- expect` forms.
+enum ControlSource {
+    Branch(BranchWrite),
+    Commit(CommitWrite),
 }
 
 #[derive(Debug)]
@@ -589,6 +617,149 @@ fn parse_step_branch(kind: &str, rest: &str) -> Result<Option<String>, String> {
         return Err(format!("`--- {kind} branch:` needs a branch name"));
     }
     Ok(Some(name.to_string()))
+}
+
+/// A `--- query` header's argument: `branch: <name>`, or `snapshot: $name`
+/// naming a bound commit, as `(branch, snapshot)`; both `None` when bare.
+fn parse_query_target(rest: &str) -> Result<(Option<String>, Option<String>), String> {
+    let trimmed = rest.trim();
+    if trimmed.is_empty() || trimmed.starts_with("branch:") {
+        return Ok((parse_step_branch("query", rest)?, None));
+    }
+    let Some(name) = trimmed.strip_prefix("snapshot:") else {
+        return Err(format!(
+            "`--- query` takes no arguments but `branch: <name>` or `snapshot: $name`, got `{trimmed}`"
+        ));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("`--- query snapshot:` needs a bound name, `$name`".into());
+    }
+    let name = parse_loop_var(name).map_err(|_| {
+        format!("`--- query snapshot: {name}` must name a binding, $[a-z][a-z0-9_]*")
+    })?;
+    Ok((None, Some(name)))
+}
+
+/// The `--- bind commit $name` header: the bound name.
+fn parse_bind_header(rest: &str) -> Result<String, String> {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let ["commit", var] = parts.as_slice() else {
+        return Err("`--- bind` must be `bind commit $name`".into());
+    };
+    parse_loop_var(var).map_err(|_| format!("`--- bind commit {var}`: a name is $[a-z][a-z0-9_]*"))
+}
+
+/// Attach `--- bind commit $name` to the write step before it: a mutation,
+/// a `branch merge`, or a `commit publish`, each expected to succeed.
+fn bind_commit(step: &mut Step, name: &str) -> Result<(), String> {
+    const FAILING: &str =
+        "`--- bind commit` follows a write expected to fail; a refused write binds nothing";
+    let slot = match step {
+        Step::Mutate(MutateStep {
+            expect: MutateExpect::Error { .. },
+            ..
+        }) => return Err(FAILING.into()),
+        Step::Mutate(step) => &mut step.bind,
+        Step::Control(step) => match &step.write {
+            ControlWrite::Merge {
+                expect: MergeExpect::Write(WriteExpect::Error { .. }),
+                ..
+            }
+            | ControlWrite::Publish {
+                expect: WriteExpect::Error { .. },
+                ..
+            } => return Err(FAILING.into()),
+            ControlWrite::Merge { .. } | ControlWrite::Publish { .. } => &mut step.bind,
+            ControlWrite::Create { .. }
+            | ControlWrite::Delete { .. }
+            | ControlWrite::Drop { .. } => {
+                return Err(format!(
+                    "`--- bind commit` follows `{}`, which publishes no commit; bind a mutation, a `branch merge`, or a `commit publish`",
+                    step.name
+                ));
+            }
+        },
+        other => {
+            return Err(format!(
+                "`--- bind commit` follows a {} step; bind a mutation, a `branch merge`, or a `commit publish`",
+                step_kind(other)
+            ));
+        }
+    };
+    if slot.is_some() {
+        return Err("one write step binds one name".into());
+    }
+    *slot = Some(name.to_string());
+    Ok(())
+}
+
+/// The commit ids `--- bind commit $name` captured so far, by name: one map
+/// per case run, kept across a restart.
+pub type Bindings = HashMap<String, String>;
+
+/// The bound name a commit statement's operand names, `"${name}"` whole.
+fn bound_operand(operand: &str) -> Option<&str> {
+    operand
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+}
+
+/// A commit statement's operand with its bound name replaced by the id.
+pub fn resolve_operand(operand: &str, bindings: &Bindings) -> Result<String, String> {
+    match bound_operand(operand) {
+        Some(name) => bindings
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("`${{{name}}}` is not bound at this step")),
+        None => Ok(operand.to_string()),
+    }
+}
+
+/// The commit id a query step's `snapshot: $name` resolves to; `None` for a
+/// branch read.
+pub fn bound_snapshot(step: &QueryStep, bindings: &Bindings) -> Result<Option<String>, String> {
+    step.snapshot
+        .as_ref()
+        .map(|name| {
+            bindings
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("`snapshot: ${name}` is not bound at this step"))
+        })
+        .transpose()
+}
+
+/// A query step's read target: its bound snapshot, else its branch.
+pub fn read_target(step: &QueryStep, bindings: &Bindings) -> Result<ReadTarget, String> {
+    Ok(match bound_snapshot(step, bindings)? {
+        Some(id) => ReadTarget::snapshot(SnapshotId::new(id)),
+        None => ReadTarget::branch(&step.branch),
+    })
+}
+
+/// Record the commit a bound write published; a bound write that published
+/// nothing fails its step.
+fn record_binding(
+    bindings: &mut Bindings,
+    bind: Option<&str>,
+    commit: Option<String>,
+    label: &str,
+) -> Result<(), StepFail> {
+    let Some(name) = bind else {
+        return Ok(());
+    };
+    match commit {
+        Some(id) => {
+            bindings.insert(name.to_string(), id);
+            Ok(())
+        }
+        None => Err(StepFail {
+            label: label.to_string(),
+            message: format!("`--- bind commit ${name}`: the write published no commit"),
+            bless_lines: None,
+        }),
+    }
 }
 
 fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
@@ -1024,7 +1195,7 @@ enum Pending {
     Control {
         ordinal: usize,
         prefix: Vec<SettingStmt>,
-        write: BranchWrite,
+        write: ControlSource,
     },
     Settings {
         ordinal: usize,
@@ -1078,6 +1249,7 @@ struct PendingStep {
     source: String,
     name: String,
     branch: String,
+    snapshot: Option<String>,
     decl: Box<QueryDecl>,
     ordered_refusal: Option<String>,
     expects_expand: bool,
@@ -1294,25 +1466,41 @@ fn complete_merge_expect(
 fn complete_control_step(
     ordinal: usize,
     prefix: Vec<SettingStmt>,
-    write: BranchWrite,
+    write: ControlSource,
     mode: &ExpectHeader,
     section: &Section<'_>,
 ) -> Result<ControlStep, String> {
-    let name = write.statement_name();
+    let name = match &write {
+        ControlSource::Branch(write) => write.statement_name(),
+        ControlSource::Commit(write) => write.statement_name(),
+    };
     let write = match write {
-        BranchWrite::Create { name: branch, from } => ControlWrite::Create {
+        ControlSource::Branch(BranchWrite::Create { name: branch, from }) => ControlWrite::Create {
             name: branch,
             from,
             expect: complete_write_expect(name, mode, section)?,
         },
-        BranchWrite::Delete { name: branch } => ControlWrite::Delete {
+        ControlSource::Branch(BranchWrite::Delete { name: branch }) => ControlWrite::Delete {
             name: branch,
             expect: complete_write_expect(name, mode, section)?,
         },
-        BranchWrite::Merge { source, into } => ControlWrite::Merge {
+        ControlSource::Branch(BranchWrite::Merge {
             source,
             into,
+            as_commit,
+        }) => ControlWrite::Merge {
+            source,
+            into,
+            as_commit,
             expect: complete_merge_expect(mode, section)?,
+        },
+        ControlSource::Commit(CommitWrite::Publish { graph_commit_id }) => ControlWrite::Publish {
+            graph_commit_id,
+            expect: complete_write_expect(name, mode, section)?,
+        },
+        ControlSource::Commit(CommitWrite::Drop { graph_commit_id }) => ControlWrite::Drop {
+            graph_commit_id,
+            expect: complete_write_expect(name, mode, section)?,
         },
     };
     Ok(ControlStep {
@@ -1320,6 +1508,7 @@ fn complete_control_step(
         name,
         prefix,
         write,
+        bind: None,
     })
 }
 
@@ -1383,6 +1572,7 @@ fn complete_decl_step(
                 source: step.source,
                 name: step.name,
                 branch: step.branch,
+                snapshot: step.snapshot,
                 decl: step.decl,
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
@@ -1403,6 +1593,7 @@ fn complete_decl_step(
                     ast_params: step.decl.params,
                     params_raw: step.params_raw,
                     expect: MutateExpect::Error { needle },
+                    bind: None,
                 })
             } else {
                 Step::Query(QueryStep {
@@ -1410,6 +1601,7 @@ fn complete_decl_step(
                     source: step.source,
                     name: step.name,
                     branch: step.branch,
+                    snapshot: step.snapshot,
                     decl: step.decl,
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
@@ -1429,6 +1621,7 @@ fn complete_decl_step(
                 ast_params: step.decl.params,
                 params_raw: step.params_raw,
                 expect: MutateExpect::Ok,
+                bind: None,
             }))
         }
         (ExpectHeader::Affected { nodes, edges }, true) => {
@@ -1444,6 +1637,7 @@ fn complete_decl_step(
                     nodes: *nodes,
                     edges: *edges,
                 },
+                bind: None,
             }))
         }
     }
@@ -1511,6 +1705,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut source_lines = BTreeMap::new();
     let mut awaiting_seam_step = false;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
+    let mut bound_names: HashSet<String> = HashSet::new();
 
     /// The refusal for a rows step whose `--- expect shape` did not arrive
     /// next: any other section, or the end of the file, ends the case here.
@@ -1631,7 +1826,11 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 });
             }
             "query" | "mutate" => {
-                let branch = parse_step_branch(kind, rest)?;
+                let (branch, snapshot) = if kind == "query" {
+                    parse_query_target(rest)?
+                } else {
+                    (parse_step_branch(kind, rest)?, None)
+                };
                 if pending.is_some() {
                     return Err(format!(
                         "line {}: the previous step is missing its `--- expect`",
@@ -1652,6 +1851,19 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 })?;
                 refuse_process_settings(&file.settings, &section.body)?;
                 let empty = file.empty_kind();
+                if let Some(name) = &snapshot {
+                    if !bound_names.contains(name) {
+                        return Err(format!(
+                            "`snapshot: ${name}` is not bound; `--- bind commit ${name}` must precede this step"
+                        ));
+                    }
+                    if !matches!(&file.body, FileBody::Queries(decls) if !decls.is_empty()) {
+                        return Err(
+                            "`snapshot:` selects a query declaration's read target; a statement takes no target"
+                                .into(),
+                        );
+                    }
+                }
                 let decls = match file.body {
                     FileBody::Queries(_) if matches!(empty, Some(EmptyFile::SettingsOnly)) => {
                         if kind == "query" {
@@ -1719,8 +1931,37 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             BranchStmt::Write(write) => Pending::Control {
                                 ordinal,
                                 prefix: file.settings,
-                                write,
+                                write: ControlSource::Branch(write),
                             },
+                        });
+                        continue;
+                    }
+                    FileBody::Commit(write) => {
+                        if kind == "query" {
+                            return Err(
+                                "a control write under `--- query` is refused; use `--- mutate`"
+                                    .into(),
+                            );
+                        }
+                        if branch.is_some() {
+                            return Err(
+                                "a commit statement acts on the commit's recorded target; drop the `branch:` argument"
+                                    .into(),
+                            );
+                        }
+                        if let Some(name) = bound_operand(write.graph_commit_id()) {
+                            if !bound_names.contains(name) {
+                                return Err(format!(
+                                    "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                ));
+                            }
+                            substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                        }
+                        ordinal += 1;
+                        pending = Some(Pending::Control {
+                            ordinal,
+                            prefix: file.settings,
+                            write: ControlSource::Commit(write),
                         });
                         continue;
                     }
@@ -1756,6 +1997,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     source: source.clone(),
                     name: decl.name.clone(),
                     branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                    snapshot,
                     decl: Box::new(decl.clone()),
                     ordered_refusal: ordered_refusal(decl),
                     expects_expand: expects_expand(&decl.match_clause),
@@ -2044,6 +2286,32 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 } else {
                     push_step(&mut items, &mut open_loop, completed);
                 }
+            }
+            "bind" => {
+                if pending.is_some() {
+                    return Err(format!(
+                        "line {}: the previous step is missing its `--- expect`",
+                        section.header_line + 1
+                    ));
+                }
+                refuse_nonempty_body(&section.body, "`--- bind`")?;
+                if open_loop.is_some() {
+                    return Err(
+                        "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case"
+                            .into(),
+                    );
+                }
+                let name = parse_bind_header(rest)?;
+                if bound_names.contains(&name) {
+                    return Err(format!(
+                        "`--- bind commit ${name}` is declared twice; one binding per name"
+                    ));
+                }
+                let Some(Item::Step(step)) = items.last_mut() else {
+                    return Err("`--- bind commit` has no write step to follow".into());
+                };
+                bind_commit(step, &name)?;
+                bound_names.insert(name);
             }
             "restart" => {
                 if !rest.is_empty() {
@@ -2593,6 +2861,7 @@ async fn run_query_step(
     mode: Option<&'static str>,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
+    bindings: &Bindings,
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "query", binding);
     let fail = |message: String| StepFail {
@@ -2600,6 +2869,7 @@ async fn run_query_step(
         message,
         bless_lines: None,
     };
+    let target = read_target(step, bindings).map_err(&fail)?;
     let inspected = match session.effective(&step.source) {
         Ok(_) => true,
         Err(error) if step.plan.is_some() => {
@@ -2622,9 +2892,8 @@ async fn run_query_step(
             };
         }
     };
-    let target = ReadTarget::branch(&step.branch);
     let (outcome, counts, inspection) = if inspected {
-        let door = session.query_inspected(target, &step.source, &step.name, &params);
+        let door = session.query_inspected(target.clone(), &step.source, &step.name, &params);
         let (outcome, counts) = under_traversal(mode, operation(host, step.ordinal, door)).await;
         let outcome = outcome.map_err(&fail)?;
         match outcome {
@@ -2639,7 +2908,7 @@ async fn run_query_step(
             Err(error) => (Err(error), counts, None),
         }
     } else {
-        let query = session.query(target, &step.source, &step.name, &params);
+        let query = session.query(target.clone(), &step.source, &step.name, &params);
         let (outcome, counts) = under_traversal(mode, operation(host, step.ordinal, query)).await;
         let outcome = outcome.map_err(&fail)?;
         (outcome, counts, None)
@@ -2709,7 +2978,7 @@ async fn run_query_step(
             }
             check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
             if step.same_as_v1 && !host.active() {
-                check_same_as_v1(host, session, step, &params, &result, *ordered)
+                check_same_as_v1(host, session, step, target, &params, &result, *ordered)
                     .await
                     .map_err(&fail)?;
             }
@@ -2728,13 +2997,14 @@ async fn check_same_as_v1(
     host: &impl ExecutionHost,
     session: &Session,
     step: &QueryStep,
+    target: ReadTarget,
     params: &omnigraph_compiler::ParamMap,
     v2: &QueryResult,
     ordered: bool,
 ) -> Result<(), String> {
     inspect_decl_with_policy(&step.decl, &mut false, true)?;
     let v1 = host
-        .reference_query(session, step, params)
+        .reference_query(session, step, target, params)
         .await
         .map_err(|e| format!("expect same as v1: v2 returned rows, v1 failed: {e}"))?;
     let rows = |result: &QueryResult, engine: &str| match result.to_rust_json() {
@@ -3053,7 +3323,8 @@ async fn run_control_step(
     session: &Session,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
-) -> Result<(), StepFail> {
+    bindings: &Bindings,
+) -> Result<Option<String>, StepFail> {
     let name = step.name;
     let label = step_label(step.ordinal, name, binding);
     let fail = |message: String| StepFail {
@@ -3077,7 +3348,9 @@ async fn run_control_step(
             .await
             .map_err(&fail)?;
             host.observe(|| format!("actual control: {outcome:?}"));
-            check_write_expect(host, name, expect, outcome).map_err(fail)
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| None)
+                .map_err(fail)
         }
         ControlWrite::Delete {
             name: branch,
@@ -3087,27 +3360,72 @@ async fn run_control_step(
                 .await
                 .map_err(&fail)?;
             host.observe(|| format!("actual control: {outcome:?}"));
-            check_write_expect(host, name, expect, outcome).map_err(fail)
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| None)
+                .map_err(fail)
+        }
+        ControlWrite::Publish {
+            graph_commit_id,
+            expect,
+        } => {
+            let id = resolve_operand(graph_commit_id, bindings).map_err(&fail)?;
+            let outcome = operation(host, step.ordinal, db.publish_commit_as(&id, None))
+                .await
+                .map_err(&fail)?;
+            host.observe(|| format!("actual control: {outcome:?}"));
+            let published = outcome
+                .as_ref()
+                .ok()
+                .map(|commit| commit.graph_commit_id.clone());
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| published)
+                .map_err(fail)
+        }
+        ControlWrite::Drop {
+            graph_commit_id,
+            expect,
+        } => {
+            let id = resolve_operand(graph_commit_id, bindings).map_err(&fail)?;
+            let outcome = operation(host, step.ordinal, db.drop_commit_as(&id, None))
+                .await
+                .map_err(&fail)?;
+            host.observe(|| format!("actual control: {outcome:?}"));
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| None)
+                .map_err(fail)
         }
         ControlWrite::Merge {
             source,
             into,
+            as_commit,
             expect,
         } => {
             let target = into.as_deref().unwrap_or(MAIN_BRANCH);
-            let outcome = operation(host, step.ordinal, db.branch_merge_as(source, target, None))
-                .await
-                .map_err(&fail)?
-                .map(|result| result.outcome)
-                .inspect_err(|error| host.observe_fault(error));
+            let outcome = operation(
+                host,
+                step.ordinal,
+                db.branch_merge_as_with_options(source, target, None, *as_commit),
+            )
+            .await
+            .map_err(&fail)?
+            .inspect_err(|error| host.observe_fault(error));
+            let commit = outcome.as_ref().ok().and_then(|result| {
+                result
+                    .commit
+                    .as_ref()
+                    .map(|commit| commit.graph_commit_id.clone())
+            });
+            let outcome = outcome.map(|result| result.outcome);
             host.observe(|| format!("actual merge: {outcome:?}"));
             match expect {
                 MergeExpect::Write(expect) => {
                     host.observe(|| format!("actual control: {outcome:?}"));
-                    check_write_expect(host, name, expect, outcome).map_err(fail)
+                    check_write_expect(host, name, expect, outcome)
+                        .map(|()| commit)
+                        .map_err(fail)
                 }
                 MergeExpect::Outcome(want) => match outcome {
-                    Ok(got) if got == *want => Ok(()),
+                    Ok(got) if got == *want => Ok(commit),
                     Ok(got) => Err(fail(format!(
                         "merge outcome mismatch: expected `{}`, got `{}`",
                         merge_outcome_word(*want),
@@ -3126,7 +3444,7 @@ async fn run_mutate_step(
     mode: Option<&'static str>,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
-) -> Result<(), StepFail> {
+) -> Result<Option<String>, StepFail> {
     let label = step_label(step.ordinal, "mutate", binding);
     let fail = |message: String| StepFail {
         label: label.clone(),
@@ -3139,7 +3457,7 @@ async fn run_mutate_step(
             return match &step.expect {
                 MutateExpect::Error { needle } if e.contains(needle) => {
                     host.record("parameter_error", || serde_json::json!({"message": e}));
-                    Ok(())
+                    Ok(None)
                 }
                 MutateExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
@@ -3153,7 +3471,7 @@ async fn run_mutate_step(
         operation(
             host,
             step.ordinal,
-            session.mutate(&step.branch, &step.source, &step.name, &params),
+            session.mutate_with_receipt(&step.branch, &step.source, &step.name, &params),
         ),
     )
     .await;
@@ -3161,29 +3479,36 @@ async fn run_mutate_step(
         .map_err(&fail)?
         .inspect_err(|error| host.observe_fault(error));
     host.record("mutation_result", || match &outcome {
-        Ok(result) => {
-            serde_json::json!({"nodes": result.affected_nodes, "edges": result.affected_edges})
+        Ok(receipt) => {
+            serde_json::json!({"nodes": receipt.result.affected_nodes, "edges": receipt.result.affected_edges})
         }
         Err(error) => serde_json::json!({"error": error.to_string()}),
     });
     host.observe(|| match &outcome {
-        Ok(result) => format!(
+        Ok(receipt) => format!(
             "actual affected: nodes={} edges={}",
-            result.affected_nodes, result.affected_edges
+            receipt.result.affected_nodes, receipt.result.affected_edges
         ),
         Err(error) => format!("actual mutation error: {error}"),
     });
     if let Some(violation) = check_pin(mode, &counts, false) {
         return Err(fail(violation));
     }
+    let commit_id = |receipt: &MutationReceipt| {
+        receipt
+            .commit
+            .as_ref()
+            .map(|commit| commit.graph_commit_id.clone())
+    };
     match &step.expect {
         MutateExpect::Ok => outcome
-            .map(|_| ())
+            .map(|receipt| commit_id(&receipt))
             .map_err(|e| fail(format!("mutation failed: {e}"))),
         MutateExpect::Affected { nodes, edges } => {
-            let result = outcome.map_err(|e| fail(format!("mutation failed: {e}")))?;
+            let receipt = outcome.map_err(|e| fail(format!("mutation failed: {e}")))?;
+            let result = &receipt.result;
             if result.affected_nodes == *nodes && result.affected_edges == *edges {
-                Ok(())
+                Ok(commit_id(&receipt))
             } else {
                 Err(fail(format!(
                     "affected counts mismatch: expected nodes={nodes} edges={edges}, got nodes={} edges={}",
@@ -3192,7 +3517,9 @@ async fn run_mutate_step(
             }
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded").map_err(fail)
+            check_error_expect(host, needle, outcome, "the mutation succeeded")
+                .map(|()| None)
+                .map_err(fail)
         }
     }
 }
@@ -3318,6 +3645,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
     host.admit_case(case)?;
     let mut first_fail: Option<StepFail> = None;
     let mut generation = 0usize;
+    let mut bindings = Bindings::new();
     host.observe(|| {
         if case.fixture.is_some() {
             "lifetime: initialized generation 0".into()
@@ -3358,13 +3686,32 @@ async fn execute_steps_inner<H: ExecutionHost>(
                 );
                 let outcome = match step {
                     Step::Query(q) => {
-                        run_query_step(host, &session, pinned_mode(&session), q, binding).await
+                        run_query_step(host, &session, pinned_mode(&session), q, binding, &bindings)
+                            .await
                     }
                     Step::Mutate(m) => {
-                        run_mutate_step(host, &session, pinned_mode(&session), m, binding).await
+                        run_mutate_step(host, &session, pinned_mode(&session), m, binding)
+                            .await
+                            .and_then(|commit| {
+                                record_binding(
+                                    &mut bindings,
+                                    m.bind.as_deref(),
+                                    commit,
+                                    &step_label(ordinal, "mutate", binding),
+                                )
+                            })
                     }
                     Step::Load(step) => run_load_step(host, &session, step, binding).await,
-                    Step::Control(c) => run_control_step(host, &session, c, binding).await,
+                    Step::Control(c) => run_control_step(host, &session, c, binding, &bindings)
+                        .await
+                        .and_then(|commit| {
+                            record_binding(
+                                &mut bindings,
+                                c.bind.as_deref(),
+                                commit,
+                                &step_label(ordinal, c.name, binding),
+                            )
+                        }),
                     Step::List(l) => run_list_step(host, &session, l, binding).await,
                     Step::Settings(s) => run_settings_step(host, &mut session, s, binding),
                     Step::Show(s) => run_show_step(host, &session, s, binding),
@@ -3618,6 +3965,8 @@ pub enum StepKind {
     BranchDelete,
     BranchMerge,
     BranchList,
+    CommitPublish,
+    CommitDrop,
     Settings,
     Show,
     Restart,
@@ -3684,6 +4033,8 @@ impl Step {
                 ControlWrite::Create { .. } => StepKind::BranchCreate,
                 ControlWrite::Delete { .. } => StepKind::BranchDelete,
                 ControlWrite::Merge { .. } => StepKind::BranchMerge,
+                ControlWrite::Publish { .. } => StepKind::CommitPublish,
+                ControlWrite::Drop { .. } => StepKind::CommitDrop,
             },
             Self::List(_) => StepKind::BranchList,
             Self::Settings(_) => StepKind::Settings,

@@ -580,7 +580,9 @@ pub async fn retire_branch_recoverably(
         .await
         .map_err(|error| OmniError::storage(error).before_effect())?;
     if let Some((tag, _)) = tags.iter().find(|(name, tag)| {
-        tag.branch.as_deref() == Some(branch) && !crate::branch_names::is_merge_input_tag(name)
+        tag.branch.as_deref() == Some(branch)
+            && !crate::branch_names::is_merge_input_tag(name)
+            && !crate::branch_names::is_unpublished_tag(name)
     }) {
         return Err(OmniError::storage(lance::Error::RefConflict {
             message: format!(

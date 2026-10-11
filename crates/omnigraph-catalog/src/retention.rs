@@ -161,6 +161,11 @@ impl MergeInputGuard {
     pub async fn release(&self) -> Result<()> {
         release_merge_input_tags(&self.dataset, &self.acknowledged_names).await
     }
+
+    /// The tags this guard created, in creation order.
+    pub fn tag_names(&self) -> &[String] {
+        &self.acknowledged_names
+    }
 }
 
 /// Delete only nonce-owned, immutable engine tags. No existence HEAD is
@@ -203,11 +208,16 @@ impl ManifestTagInventory {
         let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
         for name in tags.keys() {
             merge_input_owner(name)?;
+            crate::branch_names::unpublished_tag_commit_id(name)?;
         }
         Ok(Self {
             dataset: dataset.clone(),
             tags: tags.into_iter().collect(),
         })
+    }
+
+    pub(crate) fn dataset(&self) -> &Dataset {
+        &self.dataset
     }
 
     pub async fn snapshot(&self, tag: &TagContents, root_uri: &str) -> Result<PinnedGraphManifest> {

@@ -18,7 +18,7 @@ use omnigraph_compiler::{
 };
 
 use crate::db::graph_coordinator::{
-    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange,
+    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange, commit_not_found,
 };
 use crate::error::{OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
@@ -64,6 +64,7 @@ pub use system_column_upgrade::{
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
 };
 pub(crate) use table_ops::OpenedForMutation;
+pub(crate) use table_ops::Publication;
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -83,6 +84,13 @@ pub enum MergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
+}
+
+/// What a graph commit id addresses for a control write: a proposal that is
+/// not published, or the published commit a repeat answers.
+enum AddressedCommit {
+    Proposal(Box<super::manifest::UnpublishedCommit>),
+    Published(GraphCommit),
 }
 
 /// A merge's disposition and the graph commit published by that invocation.
@@ -3148,6 +3156,17 @@ impl Omnigraph {
             .await
     }
 
+    /// The branch a control write on `commit_id` addresses: a proposal's
+    /// recorded target while its tag stands, whatever its lifetime, else the
+    /// branch of the published commit; an unknown id is not found.
+    pub async fn commit_target_branch(&self, commit_id: &str) -> Result<String> {
+        let branch = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => candidate.property.graph_branch,
+            AddressedCommit::Published(published) => published.graph_branch,
+        };
+        Ok(branch.unwrap_or_else(|| "main".to_string()))
+    }
+
     /// List the branch's reachable graph lineage, **most recent first** (by
     /// [`GraphCommit::lineage_key`] — the same total order head selection and
     /// any future keyset pagination cursor derive from).
@@ -3171,6 +3190,188 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// The unpublished commits whose target is `branch` (`None` = main) and
+    /// whose publication is still possible, newest first. One tag listing
+    /// and one read per retained proposal.
+    pub async fn list_unpublished_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let proposals = crate::db::manifest::ManifestCoordinator::list_unpublished(
+            self.uri(),
+            &self.control_session(),
+            branch.as_deref(),
+        )
+        .await?;
+        Ok(proposals
+            .iter()
+            .map(crate::db::manifest::UnpublishedCommit::graph_commit)
+            .collect())
+    }
+
+    /// The unpublished commit `commit_id` names, judged against its target.
+    async fn unpublished_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<crate::db::manifest::UnpublishedCommit>> {
+        crate::db::manifest::ManifestCoordinator::unpublished_commit(
+            self.uri(),
+            &self.control_session(),
+            commit_id,
+        )
+        .await
+    }
+
+    /// What `commit_id` addresses: the proposal its tag names while that is
+    /// not published, else the published commit; an unknown id is not found.
+    async fn addressed_commit(&self, commit_id: &str) -> Result<AddressedCommit> {
+        use crate::db::manifest::{UnpublishedExpiry, UnpublishedLifetime};
+        match self.unpublished_commit(commit_id).await? {
+            Some(candidate)
+                if candidate.lifetime
+                    != UnpublishedLifetime::Expired(UnpublishedExpiry::Published) =>
+            {
+                Ok(AddressedCommit::Proposal(Box::new(candidate)))
+            }
+            _ => self
+                .coordinator
+                .read()
+                .await
+                .resolve_commit(&SnapshotId::new(commit_id))
+                .await
+                .map(AddressedCommit::Published),
+        }
+    }
+
+    /// `enforce` for an id-addressed control write on `target_branch`: a
+    /// denial answers the not-found error an unknown id answers, so the id
+    /// discloses neither existence nor publication state.
+    fn enforce_commit_control(
+        &self,
+        action: omnigraph_policy::PolicyAction,
+        target_branch: Option<&str>,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let scope = omnigraph_policy::ResourceScope::TargetBranch(
+            target_branch.unwrap_or("main").to_string(),
+        );
+        match self.enforce(action, &scope, actor) {
+            Err(OmniError::Policy(_)) if actor.is_some() => {
+                Err(commit_not_found(&SnapshotId::new(commit_id)))
+            }
+            decision => decision,
+        }
+    }
+
+    /// Publish the unpublished commit `commit_id` onto its recorded target
+    /// branch, under `commit_publish` on that branch. The publication is the
+    /// ordinary publish of the proposal's recorded changes under the
+    /// captured authority, so it is refused once the target moved. A commit
+    /// already published is answered as it stands: a repeat never publishes
+    /// twice.
+    pub async fn publish_commit_as(
+        &self,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<GraphCommit> {
+        self.ensure_schema_state_valid().await?;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Published(published) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitPublish,
+                    published.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Ok(published);
+            }
+        };
+        let target = candidate.property.graph_branch.clone();
+        let target_name = target.clone().unwrap_or_else(|| "main".to_string());
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitPublish,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_publishable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Published(published) => return Ok(published),
+        };
+        candidate.require_publishable()?;
+        self.ensure_schema_state_valid().await?;
+        let mut active = self.coordinator.write().await;
+        let published = if target.as_deref() == active.current_branch() {
+            *active = self.open_coordinator_for_branch(target.as_deref()).await?;
+            active.publish_unpublished(&candidate).await?
+        } else {
+            drop(active);
+            let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
+            let published = coordinator.publish_unpublished(&candidate).await?;
+            *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
+            published
+        };
+        if candidate
+            .record
+            .tables
+            .iter()
+            .any(|table| table.registration.table_key.starts_with("edge:"))
+        {
+            self.invalidate_graph_index().await;
+        }
+        Ok(published.commit)
+    }
+
+    /// Drop the unpublished commit `commit_id`, under `commit_drop` on its
+    /// recorded target branch and that branch's write gate, which it shares
+    /// with the publication: its tag is removed and its held merge inputs
+    /// released. A published commit is refused.
+    pub async fn drop_commit_as(&self, commit_id: &str, actor: Option<&str>) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        let published_conflict =
+            || OmniError::manifest_conflict(format!("commit '{commit_id}' is published"));
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Published(published) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitDrop,
+                    published.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Err(published_conflict());
+            }
+        };
+        let target = candidate.property.graph_branch.clone();
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitDrop,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_droppable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Published(_) => return Err(published_conflict()),
+        };
+        candidate.require_droppable()?;
+        crate::db::manifest::ManifestCoordinator::drop_unpublished(
+            self.uri(),
+            &self.control_session(),
+            &candidate,
+        )
+        .await
     }
 
     /// Legacy no-transaction opener retained only by the raw-write unit fixtures.
@@ -3223,6 +3424,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         txn: &crate::db::WriteTxn,
         lineage_intent: crate::db::manifest::LineageIntent,
+        publication: Publication,
     ) -> Result<crate::db::GraphCommit> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
@@ -3232,6 +3434,7 @@ impl Omnigraph {
             actor_id,
             txn,
             lineage_intent,
+            publication,
         )
         .await
     }

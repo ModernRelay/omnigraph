@@ -1288,6 +1288,117 @@ async fn policy_authorizes_omitted_commit_list_branch_as_main() {
     assert_eq!(omitted_body, explicit_body);
 }
 
+const WRITERS_WITHOUT_COMMIT_CONTROL_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-bruno]
+protected_branches: [main]
+rules:
+  - id: writers-data
+    allow:
+      actors: { group: writers }
+      actions: [read, change]
+      branch_scope: any
+"#;
+
+/// `commit_publish` and `commit_drop` are decided on the commit's recorded
+/// target, so a denial must look exactly like an unknown id on every surface
+/// that takes the id: the two routes and the two statements.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unknown() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "writer-token")],
+        WRITERS_WITHOUT_COMMIT_CONTROL_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        statement_request(
+            "/mutate",
+            "writer-token",
+            "query propose() as commit { insert Person { name: \"Pia\", age: 33 } }",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commit"]["published"], false, "{body}");
+    let proposal = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/commits?unpublished=true"), "writer-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commits"][0]["graph_commit_id"], proposal);
+
+    let unknown_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let control = |method: Method, path: String| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&path))
+            .method(method)
+            .header("authorization", "Bearer writer-token")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (unknown_status, unknown_body) = json_response(
+        &app,
+        control(Method::POST, format!("/commits/{unknown_id}/publish")),
+    )
+    .await;
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown_body}");
+    let unknown: ErrorOutput = serde_json::from_value(unknown_body).unwrap();
+    for (what, request) in [
+        (
+            "POST /commits/{id}/publish",
+            control(Method::POST, format!("/commits/{proposal}/publish")),
+        ),
+        (
+            "DELETE /commits/{id}",
+            control(Method::DELETE, format!("/commits/{proposal}")),
+        ),
+        (
+            "commit publish statement",
+            statement_request(
+                "/mutate",
+                "writer-token",
+                &format!("commit publish \"{proposal}\""),
+            ),
+        ),
+        (
+            "commit drop statement",
+            statement_request(
+                "/mutate",
+                "writer-token",
+                &format!("commit drop \"{proposal}\""),
+            ),
+        ),
+    ] {
+        let (status, body) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{what}: {body}");
+        let denied: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(denied.code, unknown.code, "{what}");
+        assert_eq!(
+            denied.error.replace(&proposal, unknown_id),
+            unknown.error,
+            "{what}: a denial names the id exactly as an unknown id is named"
+        );
+    }
+    let (status, body) = json_response(
+        &app,
+        get_request(&g("/commits?unpublished=true"), "writer-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["commits"][0]["graph_commit_id"], proposal,
+        "a denied control write leaves the proposal in place"
+    );
+}
+
 /// A direct commit diff resolves the commit across ALL branches before it
 /// authorizes the commit's branch, so a 403-vs-404 split would be a graph-wide
 /// commit-existence oracle: an actor without read on a branch could confirm a
@@ -1473,6 +1584,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (deny_status, deny_body) = json_response(
@@ -1850,6 +1962,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -1922,6 +2035,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: true,
+        as_commit: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(

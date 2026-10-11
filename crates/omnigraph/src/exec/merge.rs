@@ -4922,6 +4922,23 @@ impl Session {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeResult> {
+        self.branch_merge_as_with_options(source, target, actor_id, false)
+            .await
+    }
+
+    /// [`Self::branch_merge_as`] whose result is an unpublished commit when
+    /// `as_commit` is set (`branch merge … as commit`, RFC "Unpublished
+    /// graph commits"): the same gate and the same merge, published as a
+    /// proposal that leaves the target head unchanged and holds its merge
+    /// inputs until it is published or dropped. An up-to-date merge still
+    /// has no commit.
+    pub async fn branch_merge_as_with_options(
+        &self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+        as_commit: bool,
+    ) -> Result<MergeResult> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `BranchTransition { source, target }` — matches the HTTP-layer
         // convention at `server_branch_merge` (branch=Some(source),
@@ -4947,6 +4964,7 @@ impl Session {
             self.settings().merge_lineage(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
             WriteBudget::from_settings(self.settings()),
+            as_commit,
         ))
         .await;
         if let Err(error) = fail(&BRANCH_MERGE_PRE_RETURN) {
@@ -4995,6 +5013,7 @@ impl Omnigraph {
         lineage: MergeLineage,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        as_commit: bool,
     ) -> Result<MergeResult> {
         let outer_prepare_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::OuterPrepare,
@@ -5098,6 +5117,21 @@ impl Omnigraph {
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
         let target_was_active = self.active_branch().await == target_branch;
+        let publication = if as_commit {
+            let source_manifest = source_txn.manifest_probe.dataset();
+            crate::db::omnigraph::Publication::Propose(Some(
+                crate::db::manifest::UnpublishedMergeInputs {
+                    source_branch: source_branch.clone().unwrap_or_else(|| "main".to_string()),
+                    source_native: source_manifest.manifest().branch.clone(),
+                    source_manifest_version: source_manifest.version().version,
+                    source_head_commit_id: source_head_commit_id.clone(),
+                    merge_base_commit_id: base_commit.graph_commit_id.clone(),
+                    input_tags: input_guard.tag_names().to_vec(),
+                },
+            ))
+        } else {
+            crate::db::omnigraph::Publication::Publish
+        };
         outer_prepare_timing.finish();
         // Keep the deliberately large merge planner/publisher state out of the
         // operation shell's generated future. The inner operation composes
@@ -5120,11 +5154,14 @@ impl Omnigraph {
             lineage,
             history_release_bytes,
             write_budget,
+            publication,
         ))
         .await;
-        if !merge_result
-            .as_ref()
-            .is_err_and(|error| error.is_manifest_publish_in_doubt())
+        let proposal_holds_inputs = as_commit && merge_result.is_ok();
+        if !proposal_holds_inputs
+            && !merge_result
+                .as_ref()
+                .is_err_and(|error| error.is_manifest_publish_in_doubt())
             && let Err(release_error) = input_guard.release().await
         {
             tracing::warn!(%release_error, "merge input release failed; cleanup will retry");
@@ -5167,6 +5204,7 @@ impl Omnigraph {
         lineage: MergeLineage,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        publication: crate::db::omnigraph::Publication,
     ) -> Result<MergeResult> {
         let source_snapshot = &source_txn.base;
         let target_snapshot = &target_txn.base;
@@ -5820,6 +5858,7 @@ impl Omnigraph {
                 actor_id,
                 target_txn,
                 merge_lineage,
+                publication,
             ))
             .await?;
             manifest_publish_timing.finish();

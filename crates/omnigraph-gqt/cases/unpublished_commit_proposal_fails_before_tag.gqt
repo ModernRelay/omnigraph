@@ -1,0 +1,98 @@
+# issue: none
+# notes: A write `as commit` that fails after its candidate `__manifest` version is written and before its
+# notes: proposal tag leaves the branch unchanged and no unpublished commit; the next `as commit` write proposes and publishes as usual.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- seam
+at: propose.post_candidate_pre_tag
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect error: injected failpoint triggered: propose.post_candidate_pre_tag
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query propose_carol() as commit {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $carol
+
+--- query snapshot: $carol
+query names_at_proposal() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main_after_proposal() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+commit publish "${carol}"
+
+--- expect ok
+
+--- restart
+
+--- query
+query names_after_publish() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String

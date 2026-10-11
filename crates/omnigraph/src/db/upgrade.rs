@@ -39,7 +39,7 @@ use crate::db::manifest::migrations::{
     MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, SourceBranch, SourceLock, UPGRADE_PENDING_KEY,
     UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY, UPGRADE_SOURCE_FORMATS, UpgradeIntent,
     UpgradeSchemaContract, UpgradeSource, branch_completed, fence_operation, guard_stamp,
-    intent_from, read_stamp, receipt, recovery_guidance,
+    intent_from, read_stamp, receipt, recovery_guidance, stamp_operation,
 };
 use crate::db::manifest::retention::retired_manifest_branches;
 use crate::db::manifest::state::{SchemaContractRow, TablePin, TableState, read_converted_state};
@@ -71,6 +71,12 @@ fn handler(source: UpgradeSource) -> String {
 /// [`handler`] of a run that may have stopped before any route was chosen.
 fn handler_or_unrouted(routed: Option<UpgradeSource>) -> String {
     routed.map_or_else(|| UNROUTED_HANDLER.to_string(), handler)
+}
+
+/// The name of the stamp-only route a served lower stamp takes, as a report
+/// carries it.
+fn stamp_handler() -> String {
+    format!("stamp-v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION}-to-v{INTERNAL_MANIFEST_SCHEMA_VERSION}")
 }
 
 /// The rows one head of `__manifest` may hold.
@@ -509,17 +515,18 @@ async fn run(
             "unsupported_target",
             format!(
                 "this binary converts storage formats v{oldest}, v{older} and v{newest} to \
-                 v{INTERNAL_MANIFEST_SCHEMA_VERSION} and serves \
-                 v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION} and \
-                 v{INTERNAL_MANIFEST_SCHEMA_VERSION}; `--to-format` accepts \
-                 {INTERNAL_MANIFEST_SCHEMA_VERSION} only"
+                 v{INTERNAL_MANIFEST_SCHEMA_VERSION}, stamps \
+                 v{MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION} to v{INTERNAL_MANIFEST_SCHEMA_VERSION} \
+                 and serves both; `--to-format` accepts {INTERNAL_MANIFEST_SCHEMA_VERSION} only"
             ),
         );
         return Ok(());
     }
     let Some(source) = routed else {
         match (guard_stamp(&main), report.observed_format) {
-            (Ok(_), _) => report.outcome = UpgradeOutcome::AlreadyCurrent,
+            (Ok(_), _) => {
+                return stamp_live_refs(root, &main, options, actor, policy, report).await;
+            }
             (Err(error), Some(stamp)) if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION => {
                 report.finding("newer_than_binary", error.to_string());
             }
@@ -1767,6 +1774,59 @@ async fn fence_main(
             Ok(false)
         }
     }
+}
+
+/// The stamp-only route (RFC "Unpublished graph commits"): one metadata
+/// commit per live ref still stamped below the binary's, main first; the
+/// stamps are the resume state, so a rerun answers `AlreadyCurrent` when done.
+async fn stamp_live_refs(
+    root: &str,
+    main: &Dataset,
+    options: UpgradeOptions,
+    actor: Option<&str>,
+    policy: Option<&dyn omnigraph_policy::PolicyChecker>,
+    report: &mut UpgradeReport,
+) -> Result<()> {
+    let mut refs = inventory(main).await?;
+    refs.rotate_right(1);
+    let mut behind = Vec::new();
+    for branch in &refs {
+        let dataset = open(root, branch.native.as_deref()).await?;
+        if read_stamp(&dataset).is_some_and(|stamp| stamp < INTERNAL_MANIFEST_SCHEMA_VERSION) {
+            behind.push((branch, dataset));
+        }
+    }
+    if behind.is_empty() {
+        report.outcome = UpgradeOutcome::AlreadyCurrent;
+        return Ok(());
+    }
+    authorize(&refs, actor, policy)?;
+    report.route.push(stamp_handler());
+    report.work.live_refs = refs.len() as u64;
+    if options.check {
+        report.outcome = UpgradeOutcome::CheckPassed;
+        return Ok(());
+    }
+    for (branch, dataset) in behind {
+        publish_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await?;
+        report.last_durable_completed_boundary =
+            Some(format!("stamped:{}", named(branch.native.as_deref())));
+    }
+    report.completed_handlers.push(stamp_handler());
+    report.outcome = UpgradeOutcome::Completed;
+    Ok(())
+}
+
+/// One metadata-only commit that stamps a ref `target` and changes nothing
+/// else, never retried: the version number is the CAS.
+async fn publish_stamp(dataset: Dataset, target: u32) -> Result<Dataset> {
+    let transaction = Transaction::new(dataset.version().version, stamp_operation(target), None);
+    CommitBuilder::new(Arc::new(dataset))
+        .with_max_retries(0)
+        .with_skip_auto_cleanup(true)
+        .execute(transaction)
+        .await
+        .map_err(OmniError::storage)
 }
 
 async fn publish_fence(dataset: Dataset, intent: String, target: u32) -> Result<Dataset> {

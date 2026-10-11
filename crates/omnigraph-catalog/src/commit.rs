@@ -35,6 +35,7 @@
 //! Lance's auto-cleanup hook is skipped: `__manifest` versions are the snapshot
 //! and time-travel authority.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -58,6 +59,21 @@ use crate::state::{self, LineageRegistry, ManifestRows};
 /// is read by a merge, never by an open.
 pub(crate) const REGISTRY_HOT_ROWS: usize = 64;
 
+/// Where a publish of the whole row set lands.
+pub(crate) enum Placement {
+    /// `dataset`'s version + 1 on its linear history: the version number is
+    /// the CAS, so Lance retries nothing.
+    Linear,
+    /// A detached version Lance names after the rows are encoded: no CAS, the
+    /// only retry is the one around the random version id; the properties ride
+    /// the transaction (an unpublished graph commit's record).
+    Detached { properties: HashMap<String, String> },
+}
+
+/// How many random detached ids Lance may try before it gives up; zero
+/// retries never commit a detached version at all.
+const DETACHED_VERSION_RETRIES: u32 = 20;
+
 /// Write `rows` as the hot row set of `dataset`'s version + 1, and `cold` as
 /// a cold fragment of that version. The schema metadata carries over from
 /// `dataset`, a served stamp, and the new version is stamped with the format
@@ -67,6 +83,27 @@ pub(crate) async fn overwrite(
     dataset: Dataset,
     rows: &ManifestRows,
     cold: Option<&LineageRegistry>,
+) -> Result<(Dataset, RecordBatch)> {
+    overwrite_placed(dataset, rows, cold, Placement::Linear).await
+}
+
+/// Write `rows` as the hot row set of a detached version of `dataset`'s
+/// branch, with `properties` on its transaction; the branch's cold registry
+/// fragments are named again, unchanged. The row clocks are the caller's;
+/// the version Lance allocates is read from the returned dataset.
+pub(crate) async fn overwrite_detached(
+    dataset: Dataset,
+    rows: &ManifestRows,
+    properties: HashMap<String, String>,
+) -> Result<(Dataset, RecordBatch)> {
+    overwrite_placed(dataset, rows, None, Placement::Detached { properties }).await
+}
+
+async fn overwrite_placed(
+    dataset: Dataset,
+    rows: &ManifestRows,
+    cold: Option<&LineageRegistry>,
+    placement: Placement,
 ) -> Result<(Dataset, RecordBatch)> {
     guard_row_layout(&dataset)?;
     let mut metadata = dataset.schema().metadata.clone();
@@ -111,9 +148,17 @@ pub(crate) async fn overwrite(
         config_upsert_values: None,
         initial_bases: None,
     };
-    let transaction = TransactionBuilder::new(dataset.version().version, operation).build();
-    let committed = CommitBuilder::new(dataset)
-        .with_max_retries(0)
+    let mut transaction = TransactionBuilder::new(dataset.version().version, operation).build();
+    let builder = match placement {
+        Placement::Linear => CommitBuilder::new(dataset).with_max_retries(0),
+        Placement::Detached { properties } => {
+            transaction.transaction_properties = Some(Arc::new(properties));
+            CommitBuilder::new(dataset)
+                .with_detached(true)
+                .with_max_retries(DETACHED_VERSION_RETRIES)
+        }
+    };
+    let committed = builder
         .with_skip_auto_cleanup(true)
         .execute(transaction)
         .await

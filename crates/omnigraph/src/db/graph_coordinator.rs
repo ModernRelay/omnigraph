@@ -14,9 +14,9 @@ use super::commit_graph::{
 };
 use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
-    GenesisManifestAttempt, HistoryRecord, HistoryReleaseBytes, LineageIntent, ManifestChange,
-    ManifestCoordinator, ManifestIncarnation, ManifestInitError, PublishPrecondition,
-    SchemaContractRow,
+    GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
+    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
+    PublishPrecondition, SchemaContractRow, UnpublishedCommit, UnpublishedMergeInputs,
 };
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
@@ -612,8 +612,28 @@ impl GraphCoordinator {
         };
         match record {
             Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
-            None => Err(commit_not_found(snapshot_id)),
+            None => match self.unpublished_commit(id).await? {
+                Some(candidate) => {
+                    candidate.require_readable()?;
+                    Ok(CommitState {
+                        commit: candidate.graph_commit(),
+                        snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                    })
+                }
+                None => Err(commit_not_found(snapshot_id)),
+            },
         }
+    }
+
+    /// The unpublished commit `id` names, read after every published
+    /// resolution missed: one tag read on a miss of a published id.
+    async fn unpublished_commit(&self, id: &str) -> Result<Option<UnpublishedCommit>> {
+        ManifestCoordinator::unpublished_commit(
+            self.root_uri(),
+            &self.manifest.control_session(),
+            id,
+        )
+        .await
     }
 
     /// The record of a commit a read of `__history` did not find: held by the
@@ -647,8 +667,14 @@ impl GraphCoordinator {
         {
             return Ok(graph_commit_from_manifest_row(commit));
         }
-        match self.record_in_live_branches(id).await? {
-            Some(record) => Ok(graph_commit_from_manifest_row(record.commit)),
+        if let Some(record) = self.record_in_live_branches(id).await? {
+            return Ok(graph_commit_from_manifest_row(record.commit));
+        }
+        match self.unpublished_commit(id).await? {
+            Some(candidate) => {
+                candidate.require_readable()?;
+                Ok(candidate.graph_commit())
+            }
             None => Err(commit_not_found(snapshot_id)),
         }
     }
@@ -846,6 +872,52 @@ impl GraphCoordinator {
         })
     }
 
+    /// Write `changes` as an unpublished commit under the exact `authority`
+    /// (RFC "Unpublished graph commits"): the head and this coordinator's
+    /// view stay as captured. The commit reports the detached version it
+    /// lives at and `published: false`.
+    pub(crate) async fn propose_changes(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: &LineageIntent,
+        authority: &GraphHeadExpectation,
+        merge: Option<UnpublishedMergeInputs>,
+    ) -> Result<GraphCommit> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .propose_changes(changes, expected_table_versions, intent, authority, merge)
+            .await?;
+        let mut commit = graph_commit_from_manifest_row(outcome.head);
+        commit.graph_manifest_version = outcome.detached_version;
+        commit.published = false;
+        Ok(commit)
+    }
+
+    /// Publish `candidate` on this coordinator's branch, its recorded target.
+    /// The view must be a fresh open at the live head: the publication
+    /// derives its changes from the view's rows.
+    pub(crate) async fn publish_unpublished(
+        &mut self,
+        candidate: &UnpublishedCommit,
+    ) -> Result<PublishedSnapshot> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self.manifest.publish_unpublished(candidate).await?;
+        fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        let record = outcome.commit.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "the publication of an unpublished commit returned no graph commit record",
+            )
+        })?;
+        let commit = graph_commit_from_manifest_row(record);
+        Ok(PublishedSnapshot {
+            graph_manifest_version: outcome.version,
+            _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
+            commit,
+        })
+    }
+
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
     /// fresh intent nonce (stable across CAS retries) and a timestamp. The returned
     /// publication carries the actual addressed graph commit ID.
@@ -903,7 +975,7 @@ async fn settled_commit_state(
     })
 }
 
-fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
+pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
     OmniError::manifest_not_found(format!("commit '{}' not found", snapshot_id))
 }
 
@@ -1188,6 +1260,7 @@ mod tests {
             merged_parent_commit_id: merged_parent_commit_id.map(str::to_string),
             actor_id: None,
             created_at: 0,
+            published: true,
         }
     }
 

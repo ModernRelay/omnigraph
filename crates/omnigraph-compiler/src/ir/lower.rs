@@ -244,6 +244,7 @@ pub fn lower_mutation_query(
         name: query.name.clone(),
         params: lower_params(query, &param_types),
         ops,
+        as_commit: query.as_commit,
     })
 }
 

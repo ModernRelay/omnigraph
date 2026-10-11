@@ -112,6 +112,19 @@ section; a `process` setting in a case body refuses the case at parse time. GQ o
 and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
 
+A write's commit id can be bound for the rest of the case (RFC "Unpublished
+graph commits"): `--- bind commit $name`, an empty section directly after the
+`--- expect` of a mutation declaration, a `branch merge` or a `commit publish`
+expected to succeed, binds the receipt's commit id to `$name`
+(`$[a-z][a-z0-9_]*`); a write that published no commit fails the step. A
+`--- query snapshot: $name` header reads at that commit instead of a branch,
+and a commit statement whose whole quoted operand is the name,
+`commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
+bound id; this is the one place `${` may appear in a statement body, and the
+engine receives an ordinary literal. A name is bound once, before every use,
+outside a loop, and survives `--- restart`; the served path binds from the
+`ChangeOutput.commit` the route answered and sends `snapshot` on the read.
+
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;

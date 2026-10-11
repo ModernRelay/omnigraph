@@ -23,6 +23,14 @@ pub struct GraphCommit {
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
+    /// `false` for an unpublished commit: a proposal readable by its id and
+    /// invisible to every branch read until it is published.
+    #[serde(default = "published_by_default")]
+    pub published: bool,
+}
+
+fn published_by_default() -> bool {
+    true
 }
 
 impl GraphCommit {
@@ -704,6 +712,7 @@ pub fn graph_commit_from_manifest_row(row: crate::GraphLineageRow) -> GraphCommi
         merged_parent_commit_id: row.merged_parent_commit_id,
         actor_id: row.actor_id,
         created_at: row.created_at,
+        published: true,
     }
 }
 
@@ -1558,6 +1567,7 @@ mod tests {
             merged_parent_commit_id: merged_parent.map(str::to_string),
             actor_id: None,
             created_at: 0,
+            published: true,
         }
     }
 

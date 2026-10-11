@@ -107,6 +107,42 @@ omnigraph commit show <commit-id> --uri graph.omni
 `main`; selecting a branch includes the history inherited at its fork plus its
 own commits.
 
+### Unpublished commits
+
+A mutation or a merge written `as commit` records its result as an unpublished
+commit: the branch head is unchanged, the result is readable at the commit's
+id (`--snapshot <id>`), and the commit lists with `published: false`.
+
+```gq
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+branch merge feature into main as commit
+
+commit publish "<commit-id>"
+commit drop "<commit-id>"
+```
+
+`commit publish` installs the commit on the branch it recorded as its target;
+once an ordinary write moved that head past the commit's parent, the publish
+fails its precondition and the commit can only be dropped. A published commit
+is answered as it stands by a repeat publish and is never dropped.
+
+```bash
+omnigraph branch merge feature --into main --as-commit --uri graph.omni
+omnigraph commit list graph.omni --branch main --unpublished
+omnigraph commit publish <commit-id> --uri graph.omni
+omnigraph commit drop <commit-id> --uri graph.omni
+```
+
+Served, the same control writes are `POST /commits/{commit_id}/publish`
+(the published commit), `DELETE /commits/{commit_id}` (204), and
+`GET /commits?unpublished=true&branch=<name>`; `POST /branches/merge` takes
+`as_commit`, which excludes `delete_branch`. Publishing and dropping run under
+the `commit_publish` and `commit_drop` policy actions on the recorded target
+branch ([Policy](../operations/policy.md)).
+
 ## Historical reads
 
 Every read targets either a live branch or an immutable graph commit. Take a

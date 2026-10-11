@@ -61,7 +61,16 @@ pub mod publisher;
 pub mod read_executor;
 pub mod retention;
 pub mod state;
+pub mod unpublished;
 pub use branch_names::is_merge_input_tag;
+pub use migrations::{
+    UNPUBLISHED_COMMITS_STAMP, require_unpublished_commits, supports_unpublished_commits,
+};
+pub use unpublished::{
+    UNPUBLISHED_TAG_PREFIX, UnpublishedCommit, UnpublishedCommitProperty, UnpublishedExpiry,
+    UnpublishedLifetime, UnpublishedMergeInputs, is_unpublished_tag, unpublished_tag_commit_id,
+    unpublished_tag_name,
+};
 
 pub use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
@@ -85,7 +94,7 @@ use metadata::{
 pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
+pub use publisher::{CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
 use state::read_schema_contract_row;

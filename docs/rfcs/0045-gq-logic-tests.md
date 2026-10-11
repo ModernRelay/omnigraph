@@ -698,6 +698,18 @@ body every `${...}` must name the enclosing loop's variable (no enclosing
 loop, or any other name, is refused); no escape syntax exists for a
 literal `${`.
 
+Commit bindings (RFC "Unpublished graph commits") are the one exception
+to the statement-body fence. `--- bind commit $name`, an empty section
+directly after the `--- expect` of a mutation declaration, a `branch merge`
+or a `commit publish` expected to succeed, binds that write's commit id for
+the rest of the case, across `--- restart`; a write with no commit fails
+the step, a name is bound once and used only after its binding, and a
+binding inside a loop is refused. `--- query snapshot: $name` reads at the
+bound commit. A commit control statement whose whole quoted operand is the
+name, `commit publish "${name}"` or `commit drop "${name}"`, is dispatched
+with the bound id substituted, so the engine and the server parse an
+ordinary literal; any other `${` in a statement body stays refused.
+
 Null cells: a seed row sets a nullable property to null by writing JSON
 `null` for it. A result row omits a null cell's key (the Arrow JSON writer,
 RFC 0051), and expected rows are written the same way; the column's type

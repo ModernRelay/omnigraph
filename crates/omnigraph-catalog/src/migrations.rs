@@ -125,12 +125,20 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   `last_slot`. A v14 binary refuses the rows' type, so the stamp refuses
 ///   it before any open. A v14 graph is served as it is: each branch is
 ///   stamped 15 by its first publish under this binary, in the CAS that
-///   writes the first rows, and nothing is converted offline.
+///   writes the first rows, and nothing is converted offline. The same stamp
+///   fences the one other thing a v14 binary cannot interpret: the reserved
+///   `unpublished_<commit id>` tags that name a detached `__manifest` version
+///   holding an unpublished graph commit (RFC "Unpublished graph commits"),
+///   whose head row carries the proposal's captured clock `M + 1` rather than
+///   its physical version; a v14 binary would retain such a tag forever and
+///   refuse to delete its branch. `as commit` is refused on a v14 ref and
+///   never advances a stamp; `omnigraph upgrade` stamps a v14 graph's live
+///   refs 15 without waiting for a publish.
 ///
 /// v1–v13 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
 /// A v8, v9 or v13 standalone root reaches v15 through the offline
-/// `omnigraph upgrade`.
+/// `omnigraph upgrade`, which also stamps a v14 graph's live refs v15.
 pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 15;
 
 /// Normal open serves formats 14 and 15: a v15 row set is a v14 row set plus
@@ -139,6 +147,29 @@ pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 15;
 /// `omnigraph upgrade`; a graph at any other lower stamp, and a
 /// cluster-managed graph, is rebuilt by export and load.
 pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 14;
+
+/// The first stamp whose `__manifest` may carry an unpublished graph commit.
+pub const UNPUBLISHED_COMMITS_STAMP: u32 = 15;
+
+/// Whether a ref stamped `stamp` may hold, read or publish an unpublished
+/// graph commit. A served stamp below it names the explicit upgrade.
+pub fn supports_unpublished_commits(stamp: u32) -> bool {
+    stamp >= UNPUBLISHED_COMMITS_STAMP
+}
+
+/// Refuse an unpublished-commit operation on a ref stamped below
+/// [`UNPUBLISHED_COMMITS_STAMP`].
+pub fn require_unpublished_commits(stamp: u32) -> Result<()> {
+    if supports_unpublished_commits(stamp) {
+        return Ok(());
+    }
+    Err(OmniError::manifest(format!(
+        "__manifest is stamped at internal schema v{stamp}; unpublished graph commits need \
+         v{UNPUBLISHED_COMMITS_STAMP}. Stop every process on the graph, retain a verified \
+         backup and run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`; \
+         the upgrade changes the stamp of each live branch and nothing else."
+    )))
+}
 
 /// The stamp a fresh graph of the given system column vintage is born with:
 /// CURRENT for both `id`/`src`/`dst` and `__id`/`__src`/`__dst` since v10.
@@ -684,6 +715,23 @@ pub fn branch_completed(
         ));
     }
     Ok(true)
+}
+
+/// The stamp alone: one metadata-only transaction that stamps a ref `target`,
+/// keeping every other key and every row (the v14 to v15 route).
+#[doc(hidden)]
+pub fn stamp_operation(target: u32) -> Operation {
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+        schema_metadata_updates: Some(UpdateMap {
+            update_entries: vec![
+                (INTERNAL_SCHEMA_VERSION_KEY.to_string(), target.to_string()).into(),
+            ],
+            replace: false,
+        }),
+    }
 }
 
 /// The fence: one metadata-only transaction that stamps main `target` and
