@@ -14,6 +14,7 @@ use support::*;
 /// unit tests own exact epoch/drain/activation races; this verifies the complete
 /// captured-input -> durable apply -> new schema/query/graph serving journey.
 #[test]
+#[ignore = "nightly: the live-apply journey on the real 500 ms poll interval, about 30 s"]
 fn cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart() {
     live_apply_changes_schema_queries_and_adds_graph_without_restart(None);
 }

@@ -921,34 +921,30 @@ fn walk_clauses(
     Ok(())
 }
 
-/// Why `expect ordered` is refused for this declaration, if it is: the order
-/// is total only where a sort appends `<var>.id` tie-breaks (RFC 0045), so no
-/// `order`, an `rrf()`-led one, or an aggregate `return` each refuse it.
+/// Why `expect ordered` is refused, if it is: the order is total only where
+/// a sort appends `<var>.id` tie-breaks (RFC 0045) or, for a search-led
+/// aggregate with a key after the search function, every group key (RFC 0047).
 fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     if decl.order_clause.is_empty() {
         return Some("`expect ordered` is refused for a query without an `order` clause".into());
-    }
-    if matches!(
-        decl.order_clause.first().map(|o| &o.expr),
-        Some(Expr::Rrf { .. })
-    ) {
-        return Some(
-            "`expect ordered` is refused for an `order` clause led by `rrf()`; fusion sorts by \
-             ranked identity and downstream metadata; the harness does not promise a total order for every fusion shape"
-                .into(),
-        );
     }
     if decl
         .return_clause
         .iter()
         .any(|p| matches!(p.expr, Expr::Aggregate { .. }))
     {
-        return Some(
-            "`expect ordered` is refused for a query with an aggregate in its `return` list; \
-             group rows carry no `<var>.id` tie-break, and a search-led aggregate query is \
-             not ordered at all"
-                .into(),
+        let search_led = matches!(
+            decl.order_clause.first().map(|o| &o.expr),
+            Some(Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. })
         );
+        if !search_led || decl.order_clause.len() < 2 {
+            return Some(
+                "`expect ordered` is refused for a query with an aggregate in its `return` list \
+                 unless a search function leads its `order` and a key follows it; only then does \
+                 the sort append every group key, and group rows carry no `<var>.id` tie-break"
+                    .into(),
+            );
+        }
     }
     None
 }

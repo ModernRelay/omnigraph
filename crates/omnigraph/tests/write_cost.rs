@@ -25,8 +25,8 @@
 mod helpers;
 
 use helpers::cost::{
-    IoCounts, assert_flat, cost_harness, last_manifest_reads, local_graph, measure, measure_insert,
-    measure_insert_as, measure_with_staged,
+    DEEP_HISTORY_DEPTH, IoCounts, assert_flat, cost_harness, last_manifest_reads, local_graph,
+    measure, measure_insert, measure_insert_as, measure_with_staged,
 };
 use helpers::{
     MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
@@ -56,7 +56,7 @@ async fn internal_table_scans_are_flat_in_history() {
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
-        for d in [10u64, 100] {
+        for d in [10u64, DEEP_HISTORY_DEPTH] {
             if d > current {
                 commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
@@ -81,6 +81,17 @@ async fn internal_table_scans_are_flat_in_history() {
     .await;
 }
 
+/// A fresh graph at `depth` commits, compacted (the periodically-compacted
+/// production shape the gates pin), built for both depths at once before the
+/// sequential measures: `measure` resets the ambient tracker on install.
+async fn compacted_graph_at_depth(depth: u64) -> (u64, tempfile::TempDir, helpers::Session) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = local_graph(&dir).await;
+    commit_many(&db, depth as usize).await;
+    db.optimize().await.unwrap();
+    (depth, dir, db)
+}
+
 /// EnsureIndices is a graph-visible writer too: after data/internal compaction,
 /// its manifest work must be bounded by the affected table set rather than by
 /// commit-history depth. The physical index scan itself is intentionally not a
@@ -89,12 +100,11 @@ async fn internal_table_scans_are_flat_in_history() {
 async fn ensure_indices_manifest_reads_are_flat_in_history() {
     cost_harness(async {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-        for depth in [10u64, 100] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = local_graph(&dir).await;
-            commit_many(&db, depth as usize).await;
-            db.optimize().await.unwrap();
-
+        let graphs = tokio::join!(
+            Box::pin(compacted_graph_at_depth(10)),
+            Box::pin(compacted_graph_at_depth(DEEP_HISTORY_DEPTH))
+        );
+        for (depth, _dir, db) in [graphs.0, graphs.1] {
             let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
             db.apply_schema(&indexed_schema).await.unwrap();
             let (result, io) = measure(db.ensure_indices()).await;
@@ -293,11 +303,11 @@ async fn optimize_writes_no_control_object() {
 async fn optimize_manifest_reads_are_flat_in_history() {
     cost_harness(async {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-        for depth in [10u64, 100] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = local_graph(&dir).await;
-            commit_many(&db, depth as usize).await;
-            db.optimize().await.unwrap();
+        let graphs = tokio::join!(
+            Box::pin(compacted_graph_at_depth(10)),
+            Box::pin(compacted_graph_at_depth(DEEP_HISTORY_DEPTH))
+        );
+        for (depth, _dir, db) in [graphs.0, graphs.1] {
             commit_many(&db, 3).await;
 
             let commits_before = db.list_commits(None).await.unwrap().len();
@@ -343,7 +353,7 @@ async fn internal_table_scans_are_flat_without_compaction() {
 
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
         let mut current = 0u64;
-        for d in [10u64, 100] {
+        for d in [10u64, DEEP_HISTORY_DEPTH] {
             if d > current {
                 commit_many_as(&db, (d - current) as usize, ACTOR).await;
                 current = d;
@@ -393,7 +403,7 @@ async fn data_table_reads_split_into_flat_opener_and_scan_flat_with_session() {
 
     let mut curve: Vec<(u64, IoCounts)> = Vec::new();
     let mut current = 0u64;
-    for d in [10u64, 100] {
+    for d in [10u64, DEEP_HISTORY_DEPTH] {
         if d > current {
             commit_many(&db, (d - current) as usize).await;
             current = d;
@@ -508,23 +518,15 @@ async fn write_op_count_ceiling_at_shallow_depth() {
 /// stage paying its own history-proportional scan — and the equivalence test in
 /// `writes.rs` would still pass, because the results would remain correct while the
 /// write got quadratically slower on a deep graph.
-///
-/// Measured on local FS: depth~10 `__manifest`=11 / data=21, depth~100
-/// `__manifest`=10 / data=19 — flat within fixture noise, so the slack below is
-/// headroom, not a hidden allowance for growth. A history-proportional regression
-/// is ~10x at depth 100 and trips this immediately.
 #[tokio::test]
 async fn multi_table_staging_is_flat_in_history() {
     cost_harness(async {
         let mut curve: Vec<(u64, IoCounts)> = Vec::new();
-        for depth in [10u64, 100] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = local_graph(&dir).await;
-            commit_many(&db, depth as usize).await;
-            // Compact first for the same reason as the internal-table lock above:
-            // the gate pins the periodically-compacted production shape.
-            db.optimize().await.unwrap();
-
+        let graphs = tokio::join!(
+            Box::pin(compacted_graph_at_depth(10)),
+            Box::pin(compacted_graph_at_depth(DEEP_HISTORY_DEPTH))
+        );
+        for (depth, _dir, db) in [graphs.0, graphs.1] {
             // One mutation, two tables (Person node + Knows edge) — the shape that
             // actually exercises concurrent staging. The edge points at a node
             // `commit_many` already created, so referential integrity passes.
@@ -714,13 +716,17 @@ async fn manifest_reads_capture_warm_probe() {
         result.unwrap();
         io.manifest_reads
     }
-    let fresh = Box::pin(warm_write()).await;
-    cost_harness(async move {
-        let full = warm_write().await;
-        assert!(full > fresh,
-            "warm-coordinator probe reads must enter the full meter: full={full}, fresh={fresh}, reads={:#?}",
-            last_manifest_reads());
-    }).await;
+    let (fresh, (full, reads)) = tokio::join!(
+        Box::pin(warm_write()),
+        cost_harness(async move {
+            let full = warm_write().await;
+            (full, last_manifest_reads())
+        })
+    );
+    assert!(
+        full > fresh,
+        "warm-coordinator probe reads must enter the full meter: full={full}, fresh={fresh}, reads={reads:#?}"
+    );
 }
 
 // ── (F) Batched committed `@unique` probes — flat in DELTA rows ──
