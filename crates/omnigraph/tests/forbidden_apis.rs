@@ -251,6 +251,7 @@ write_surfaces! {
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence"],
     "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
+    "exec/blob_write.rs" => MUTATION_V9 => ["put_blob_at_as", "clear_blob_at_as"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_as_with_receipt", "load_file_as", "load_file_as_with_receipt", "load_graph_batch_as", "load_graph_batch_as_with_receipt"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
@@ -966,6 +967,7 @@ durable_calls! {
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.

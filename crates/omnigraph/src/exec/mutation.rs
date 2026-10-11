@@ -349,7 +349,7 @@ fn build_blob_array_from_value(value: &str, write_budget: WriteBudget) -> Result
 }
 
 /// Build a null blob array with `num_rows` elements.
-fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
+pub(super) fn build_null_blob_array(num_rows: usize) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(num_rows);
     for _ in 0..num_rows {
         builder.push_null().map_err(OmniError::lance_internal)?;
@@ -546,6 +546,13 @@ fn apply_assignments(
 
 use super::staging::{MutationStaging, PendingMode};
 
+/// Every table effect of a Mutation committed detached, with the gates and the
+/// lineage intent its one publication needs.
+pub(super) struct CommittedStagedMutation {
+    pub(super) committed: super::staging::CommittedMutation,
+    lineage_intent: crate::db::manifest::LineageIntent,
+}
+
 /// Open a sub-table dataset for read or staged write within the current
 /// mutation query, capturing pre-write metadata in `staging` on first touch.
 /// The captured table version is the physical staging baseline. The publisher's
@@ -568,7 +575,7 @@ use super::staging::{MutationStaging, PendingMode};
 /// touch records another predicate (`record_delete`), and `stage_all` combines
 /// them into one staged delete — there is no post-inline-commit reopen to
 /// special-case anymore.
-async fn open_table_for_mutation(
+pub(super) async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
     branch: Option<&str>,
@@ -1055,55 +1062,97 @@ impl Omnigraph {
                 })
             }
             Ok(total) => {
-                self.validate_staged_mutation(&staging, &txn).await?;
-                let staged = staging
-                    .stage_all_with_concurrency(self, requested.as_deref(), stage_write_concurrency)
-                    .await?;
-                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
-                let lineage_intent = self
-                    .new_lineage_intent_for_branch(
-                        requested.as_deref(),
+                let committed = self
+                    .commit_staged_mutation(
+                        staging,
+                        &txn,
                         actor_id,
+                        stage_write_concurrency,
                         history_release_bytes,
                     )
                     .await?;
-                // `_held_gates` holds the shared schema permit, branch
-                // effect gate, and sorted table gates acquired by `commit_all`.
-                // They remain held through manifest publication, covering the
-                // complete same-process effect lifetime. They are a local
-                // serialization aid; the exact publisher precondition remains
-                // the correctness authority.
-                let super::staging::CommittedMutation {
-                    updates,
-                    expected_versions,
-                    gates: _held_gates,
-                } = staged.commit_all(self, requested.as_deref(), &txn).await?;
-                // Failpoint for the detached-effects → publisher boundary:
-                // every table effect is committed detached but nothing is
-                // graph-visible. A failure here leaves the graph unchanged and
-                // the detached versions as reclaimable garbage. See
-                // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
-                fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-                let publish_result = self
-                    .commit_updates_on_branch_with_expected(
-                        requested.as_deref(),
-                        &updates,
-                        &expected_versions,
-                        actor_id,
-                        &txn,
-                        lineage_intent,
-                    )
-                    .await;
-                // RFC 0067: every effect is a detached commit of its pinned base,
-                // so a publish failure leaves the graph unchanged; the error
-                // is returned as is (a moved head is `ReadSetChanged`).
-                let commit = publish_result?;
+                let commit = self
+                    .publish_committed_mutation(committed, &txn, actor_id)
+                    .await?;
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),
                 })
             }
         }
+    }
+
+    /// The first half of the Mutation protocol's tail, shared by `.gq`
+    /// mutations and Blob cell writes: validate the staged change set, stage
+    /// every touched table, and commit each effect detached. Nothing is
+    /// graph-visible yet; the held gates and the lineage intent travel to
+    /// [`Self::publish_committed_mutation`].
+    pub(super) async fn commit_staged_mutation(
+        &self,
+        staging: MutationStaging,
+        txn: &crate::db::WriteTxn,
+        actor_id: Option<&str>,
+        stage_write_concurrency: usize,
+        history_release_bytes: HistoryReleaseBytes,
+    ) -> Result<CommittedStagedMutation> {
+        let requested = txn.branch.as_deref();
+        self.validate_staged_mutation(&staging, txn).await?;
+        let staged = staging
+            .stage_all_with_concurrency(self, requested, stage_write_concurrency)
+            .await?;
+        fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+        let lineage_intent = self
+            .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
+            .await?;
+        let committed = staged.commit_all(self, requested, txn).await?;
+        Ok(CommittedStagedMutation {
+            committed,
+            lineage_intent,
+        })
+    }
+
+    /// The second half of the Mutation protocol's tail: publish every detached
+    /// effect in one manifest CAS. This is the protocol's one publisher call.
+    pub(super) async fn publish_committed_mutation(
+        &self,
+        committed: CommittedStagedMutation,
+        txn: &crate::db::WriteTxn,
+        actor_id: Option<&str>,
+    ) -> Result<crate::db::GraphCommit> {
+        let CommittedStagedMutation {
+            committed:
+                super::staging::CommittedMutation {
+                    updates,
+                    expected_versions,
+                    detached: _,
+                    gates: _held_gates,
+                },
+            lineage_intent,
+        } = committed;
+        // `_held_gates` holds the shared schema permit, branch effect gate,
+        // and sorted table gates acquired by `commit_all`. They remain held
+        // through manifest publication, covering the complete same-process
+        // effect lifetime. They are a local serialization aid; the exact
+        // publisher precondition remains the correctness authority.
+        //
+        // Failpoint for the detached-effects → publisher boundary: every
+        // table effect is committed detached but nothing is graph-visible. A
+        // failure here leaves the graph unchanged and the detached versions as
+        // reclaimable garbage. See
+        // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
+        fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+        // RFC 0067: every effect is a detached commit of its pinned base, so a
+        // publish failure leaves the graph unchanged; the error is returned as
+        // is (a moved head is `ReadSetChanged`).
+        self.commit_updates_on_branch_with_expected(
+            txn.branch.as_deref(),
+            &updates,
+            &expected_versions,
+            actor_id,
+            txn,
+            lineage_intent,
+        )
+        .await
     }
 
     /// Lower + validate a named mutation query into its IR.
@@ -1801,7 +1850,7 @@ async fn scan_deleted_ids(
 /// order; both should share a schema if pending was produced through
 /// `apply_assignments` with full-schema scan input. If schemas drift,
 /// surface the internal contract failure at the mutation boundary.
-fn concat_match_batches_to_schema(
+pub(super) fn concat_match_batches_to_schema(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<RecordBatch> {

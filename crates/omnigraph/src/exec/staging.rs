@@ -877,6 +877,10 @@ pub(crate) struct CommittedMutation {
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
     pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
+    /// Each table's detached commit, keyed by table: the exact version its
+    /// pin will name, before publication. A Blob write reads its validator
+    /// evidence from here, never from a branch head.
+    pub(crate) detached: Vec<(String, crate::storage_layer::SnapshotHandle)>,
     /// The write envelope: shared schema permit, coarse branch gate, and
     /// sorted `(table, branch)` guards. The caller MUST hold the complete
     /// set across manifest publish (see `commit_all`) so no same-process
@@ -985,6 +989,7 @@ impl StagedMutation {
             return Ok(CommittedMutation {
                 updates: Vec::new(),
                 expected_versions,
+                detached: Vec::new(),
                 gates,
             });
         }
@@ -1005,6 +1010,7 @@ impl StagedMutation {
 
         let witness = txn.authority.staging_witness()?;
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
+        let mut detached_tables = Vec::with_capacity(staged.len());
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -1030,6 +1036,7 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            detached_tables.push((table_key.clone(), detached));
             updates.push(DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key,
@@ -1044,6 +1051,7 @@ impl StagedMutation {
         Ok(CommittedMutation {
             updates,
             expected_versions,
+            detached: detached_tables,
             gates,
         })
     }

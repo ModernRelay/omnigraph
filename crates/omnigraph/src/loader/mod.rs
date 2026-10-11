@@ -976,6 +976,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
+        detached: _,
         gates: _held_gates,
     } = staged.commit_all(db, branch, &txn).await?;
     // Same detached-effects → publisher boundary as mutations: every table
