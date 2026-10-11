@@ -1,28 +1,30 @@
 //! The checks every accepted plan passes (RFC 0047, "Checks have explicit
-//! boundaries"): binding identity, search identity and its declared
-//! approximation, retained eligibility predicates, correlated blocks, the
-//! projection and the origin of every projected score, the required order
-//! and the row cut, and the policy data the plan declares for its search.
-//! They establish that the plan keeps what the query requires; they do not
-//! prove row-selection equivalence, which only the exact subset's checked
-//! derivation does.
+//! boundaries"): binding and traversal identity, the eligibility predicates
+//! (every required conjunct placed, every placed conjunct required),
+//! correlated blocks, search identity and its declared approximation, the
+//! projection and the origin of every projected score, late hydration, the
+//! required order and the row cut, and the policy data the plan declares for
+//! its search. They establish that the plan keeps what the query requires
+//! and adds nothing it does not; they do not prove row-selection
+//! equivalence, which only the exact subset's checked derivation does.
 //!
-//! The order of a fused (`rrf`) search and of a search-ordered aggregate is
-//! not checked here: the plan does not yet implement the total order those
-//! shapes require (RFC 0047, "One total order"), and the step that does
-//! extends these checks.
+//! Requirements and plan are compared as typed IR (see `requirements.rs`).
+//! The planner adds one predicate the query does not state: the canonical
+//! `@id` of a written single String key equality (`scan_access::narrow_key`),
+//! which is admitted only when the validator derives the same id from the
+//! written value.
+
+use std::collections::HashSet;
 
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::ast::{Expr, Literal};
+use omnigraph_compiler::query::ast::{CompOp, Expr, Literal, RRF_COLUMN};
 use omnigraph_compiler::query::typecheck::BoundVariable;
+use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
-use super::requirements::{
-    Matcher, Position, Requirements, Retrieval, Search, result_column, score_column,
-};
+use super::requirements::{Requirements, Retrieval, Search, constant_true};
 use super::{AcceptInput, ValidationError};
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
-use crate::lower::ContainsJoinFields;
 use crate::optimizer::{RRF_NEAREST_ARM_K, derived_order};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
@@ -73,34 +75,45 @@ fn constrained_pipelines(
     }
 }
 
-/// Every conjunct a pipeline's nodes test, wherever placement put it.
-fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<IRExpr> {
+/// Every conjunct a pipeline's nodes test, wherever placement put it, with
+/// the node that tests it.
+fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
     let mut out = Vec::new();
     for id in nodes {
         match plan.node(*id) {
             Some(PhysicalNode::Scan { spec, .. }) => {
                 if let Some(filter) = &spec.filter {
-                    out.extend(filter.gq_filters());
+                    out.extend(
+                        filter
+                            .gq_filters()
+                            .into_iter()
+                            .flat_map(IRExpr::into_conjuncts)
+                            .map(|conjunct| (*id, conjunct)),
+                    );
                 }
             }
             Some(
                 PhysicalNode::Filter { filters, .. } | PhysicalNode::CrossJoin { filters, .. },
             ) => {
-                out.extend(filters.iter().cloned());
+                out.extend(
+                    filters
+                        .iter()
+                        .cloned()
+                        .flat_map(IRExpr::into_conjuncts)
+                        .map(|conjunct| (*id, conjunct)),
+                );
             }
             Some(PhysicalNode::ContainsJoin {
-                haystack,
-                needle,
-                residual,
-                ..
+                conjunct, residual, ..
             }) => {
-                let fields = ContainsJoinFields {
-                    haystack: (&haystack.0, &haystack.1),
-                    needle: (&needle.0, &needle.1),
-                    residual,
-                };
-                out.push(fields.conjunct());
-                out.extend(residual.iter().cloned());
+                out.push((*id, conjunct.clone()));
+                out.extend(
+                    residual
+                        .iter()
+                        .cloned()
+                        .flat_map(IRExpr::into_conjuncts)
+                        .map(|conjunct| (*id, conjunct)),
+                );
             }
             _ => {}
         }
@@ -122,6 +135,16 @@ fn ranked_scans(plan: &PhysicalPlan) -> Vec<(NodeId, &str, &RankedAccess)> {
         .collect()
 }
 
+/// The type `scan_access::narrow_key` gives the identity column and its
+/// value: a non-null String.
+fn narrowed_type() -> ExprType {
+    ExprType::Value {
+        scalar: ScalarType::String,
+        list: false,
+        nullable: false,
+    }
+}
+
 impl Requirements {
     pub(crate) fn check(
         &self,
@@ -129,26 +152,27 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let matcher = Matcher::new(input, self);
         let pipelines = constrained_pipelines(plan, budget)?;
         for nodes in &pipelines {
             self.check_bindings(plan, nodes)?;
-            self.check_eligibility(plan, nodes, &matcher, budget)?;
-            self.check_blocks(plan, nodes, &matcher, budget)?;
+            self.check_eligibility(plan, nodes, input, budget)?;
+            self.check_blocks(plan, nodes)?;
         }
         let top = pipeline(plan, plan.root(), budget)?;
-        self.check_search(plan, &matcher, budget)?;
+        self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
-        self.check_returns(plan, &top, &matcher, budget)?;
-        self.check_order_and_cut(plan, &top, &matcher, budget)?;
+        self.check_returns(plan, &top)?;
+        self.check_hydration(plan, &top)?;
+        self.check_order_and_cut(plan, &top, input, budget)?;
         check_policies(plan, budget)?;
         Ok(())
     }
 
     /// Every written binding is read with its type: a node binding by a scan
     /// (or a pushed-down count) of its node type, an edge binding by the
-    /// traversal that names it over its edge types; every traversal clause
-    /// is one traversal.
+    /// traversal that names it over its edge types; every traversal the query
+    /// writes runs once with its endpoints, edge selection, endpoint types,
+    /// hop bounds and edge binding, and no other traversal runs.
     fn check_bindings(&self, plan: &PhysicalPlan, nodes: &[NodeId]) -> Result<(), ValidationError> {
         for (name, bound) in &self.bindings {
             let found = nodes.iter().any(|id| match (plan.node(*id), bound) {
@@ -190,78 +214,192 @@ impl Requirements {
                 ));
             }
         }
-        let expands = nodes
-            .iter()
-            .filter(|id| matches!(plan.node(**id), Some(PhysicalNode::Expand { .. })))
-            .count();
-        if expands != self.traversals {
+        let mut required: Vec<&super::requirements::Traversal> = self.traversals.iter().collect();
+        for id in nodes {
+            let Some(PhysicalNode::Expand {
+                src,
+                dst,
+                edges,
+                src_type,
+                dst_type,
+                min_hops,
+                max_hops,
+                edge_binding,
+                ..
+            }) = plan.node(*id)
+            else {
+                continue;
+            };
+            let position = required.iter().position(|traversal| {
+                traversal.src == *src
+                    && traversal.dst == *dst
+                    && traversal.edges == *edges
+                    && traversal.src_type == *src_type
+                    && traversal.dst_type == *dst_type
+                    && traversal.min_hops == *min_hops
+                    && traversal.max_hops == *max_hops
+                    && traversal.edge_binding == *edge_binding
+            });
+            match position {
+                Some(position) => {
+                    required.remove(position);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "traversal identity",
+                        format!(
+                            "the plan traverses `${src}` to `${dst}` over {edges:?} ({min_hops}..{max_hops:?} hops); the query writes no such traversal"
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(missing) = required.first() {
             return Err(ValidationError::violated(
-                "binding identity",
+                "traversal identity",
                 format!(
-                    "the query writes {} traversals; the plan runs {expands}",
-                    self.traversals
+                    "the query traverses `${}` to `${}`; the plan runs no such traversal",
+                    missing.src, missing.dst
                 ),
             ));
         }
         Ok(())
     }
 
-    /// Every written eligibility conjunct is tested somewhere in each
-    /// pipeline the query's rows come from; a constant `true` constrains
-    /// nothing and needs no place.
+    /// The conjuncts a pipeline tests are exactly the ones the query
+    /// requires: every required conjunct is tested somewhere in it, and every
+    /// conjunct it tests is required, a constant `true` (which constrains
+    /// nothing) or the canonical identity of a written key equality on the
+    /// same scan.
     fn check_eligibility(
         &self,
         plan: &PhysicalPlan,
         nodes: &[NodeId],
-        matcher: &Matcher<'_>,
+        input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
         let placed = conjuncts(plan, nodes);
-        let mut written_conjuncts = Vec::new();
-        for clause in &self.eligibility {
-            matcher.conjuncts(clause, &mut written_conjuncts);
+        budget.visit(u64::try_from(placed.len() + self.eligibility.len()).unwrap_or(u64::MAX))?;
+        let placed_set: HashSet<&IRExpr> = placed.iter().map(|(_, conjunct)| conjunct).collect();
+        if let Some(missing) = self
+            .eligibility
+            .iter()
+            .find(|required| !placed_set.contains(required))
+        {
+            return Err(ValidationError::violated(
+                "predicate retention",
+                format!("the plan tests no conjunct for `{missing}`"),
+            ));
         }
-        // Placement keeps written order within each node, so the search
-        // resumes after the last match: in-order placement costs one match
-        // per conjunct, and any other order still finds its conjunct.
-        let mut cursor = 0;
-        for written in written_conjuncts {
-            if matcher.constant(written) && matcher.value(written) == Some(Literal::Bool(true)) {
+        let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for (id, conjunct) in &placed {
+            if constant_true(conjunct)
+                || required.contains(conjunct)
+                || self.narrowed_key(plan, *id, conjunct, &required, input)
+            {
                 continue;
             }
-            let mut found = false;
-            for offset in 0..placed.len() {
-                let index = (cursor + offset) % placed.len();
-                if matcher.matches(written, &placed[index], Position::Filter, budget)? {
-                    found = true;
-                    cursor = index + 1;
-                    break;
-                }
-            }
-            if !found {
-                return Err(ValidationError::violated(
-                    "predicate retention",
-                    format!("the plan tests no conjunct for `{written}`"),
-                ));
-            }
+            return Err(ValidationError::violated(
+                "predicate origin",
+                format!("the plan tests `{conjunct}`, which the query does not require"),
+            ));
         }
         Ok(())
     }
 
-    /// One correlated block per written block in each pipeline the query's
-    /// rows come from, each with the aggregate and comparison the query
-    /// wrote.
-    fn check_blocks(
+    /// Whether `conjunct`, placed on the scan `id`, is the identity equality
+    /// `scan_access::narrow_key` adds for a written equality on the scanned
+    /// type's single String key: the binding's id column equal, as a
+    /// non-null String, to the id the loader derives from the written value.
+    fn narrowed_key(
         &self,
         plan: &PhysicalPlan,
-        top: &[NodeId],
-        matcher: &Matcher<'_>,
-        budget: &mut Budget,
-    ) -> Result<(), ValidationError> {
-        let mut planned: Vec<_> = top
+        id: NodeId,
+        conjunct: &IRExpr,
+        required: &HashSet<&IRExpr>,
+        input: &AcceptInput<'_>,
+    ) -> bool {
+        let Some(PhysicalNode::Scan { spec, .. }) = plan.node(id) else {
+            return false;
+        };
+        let (Some(binding), Some(type_name)) =
+            (spec.binding.as_deref(), spec.table.node_type_name())
+        else {
+            return false;
+        };
+        let Some((
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty,
+            },
+            CompOp::Eq,
+            IRExpr::Literal(Literal::String(narrowed), literal_ty),
+        )) = conjunct.comparison_parts()
+        else {
+            return false;
+        };
+        if variable != binding
+            || property != input.catalog.system_columns.id
+            || *ty != narrowed_type()
+            || *literal_ty != narrowed_type()
+        {
+            return false;
+        }
+        let Some([key]) = input
+            .catalog
+            .node_types
+            .get(type_name)
+            .and_then(|node| node.key.as_deref())
+        else {
+            return false;
+        };
+        let Some(filter) = &spec.filter else {
+            return false;
+        };
+        filter
+            .gq_filters()
+            .into_iter()
+            .flat_map(IRExpr::into_conjuncts)
+            .filter(|written| required.contains(written))
+            .any(|written| {
+                let Some((left, CompOp::Eq, right)) = written.comparison_parts() else {
+                    return false;
+                };
+                [(left, right), (right, left)]
+                    .into_iter()
+                    .any(|(side, value)| {
+                        let keyed = matches!(side, IRExpr::PropAccess { variable, property, .. }
+                        if variable == binding && property == key);
+                        let literal = match value {
+                            IRExpr::Literal(literal, _) => Some(literal),
+                            IRExpr::Param(name, _) => input.params.get(name),
+                            _ => None,
+                        };
+                        keyed
+                            && literal.is_some_and(|literal| {
+                                input
+                                    .keys
+                                    .canonical_key_id(&spec.table.type_key, literal, value.ty())
+                                    .as_deref()
+                                    == Some(narrowed.as_str())
+                            })
+                    })
+            })
+    }
+
+    /// The correlated blocks of each pipeline the query's rows come from are
+    /// exactly the written ones, each over its outer binding with the
+    /// predicate the query states.
+    fn check_blocks(&self, plan: &PhysicalPlan, nodes: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<(&String, &omnigraph_compiler::ir::SubqueryPredicate)> = nodes
             .iter()
             .filter_map(|id| match plan.node(*id) {
-                Some(PhysicalNode::AntiJoin { predicate, .. }) => Some(predicate),
+                Some(PhysicalNode::AntiJoin {
+                    outer_var,
+                    predicate,
+                    ..
+                }) => Some((outer_var, predicate)),
                 _ => None,
             })
             .collect();
@@ -276,16 +414,9 @@ impl Requirements {
             ));
         }
         for block in &self.blocks {
-            let mut found = None;
-            for (index, predicate) in planned.iter().enumerate() {
-                if predicate.func == block.func
-                    && predicate.op == block.op
-                    && matcher.matches(&block.right, &predicate.right, Position::Plain, budget)?
-                {
-                    found = Some(index);
-                    break;
-                }
-            }
+            let found = planned.iter().position(|(outer_var, predicate)| {
+                **outer_var == block.outer_var && **predicate == block.predicate
+            });
             match found {
                 Some(index) => {
                     planned.remove(index);
@@ -294,8 +425,8 @@ impl Requirements {
                     return Err(ValidationError::violated(
                         "predicate retention",
                         format!(
-                            "no correlated block of the plan compares `{} {} {}`",
-                            block.func, block.op, block.right
+                            "no correlated block of the plan over `${}` decides as the query's block does",
+                            block.outer_var
                         ),
                     ));
                 }
@@ -307,12 +438,7 @@ impl Requirements {
     /// The plan ranks exactly the retrievals the leading `order` key names,
     /// each on its binding and property, with its argument and the
     /// approximation its contract declares, in the scope it orders.
-    fn check_search(
-        &self,
-        plan: &PhysicalPlan,
-        matcher: &Matcher<'_>,
-        budget: &mut Budget,
-    ) -> Result<(), ValidationError> {
+    fn check_search(&self, plan: &PhysicalPlan) -> Result<(), ValidationError> {
         let ranked = ranked_scans(plan);
         let fuse = plan.live().find_map(|(_, node)| match node {
             PhysicalNode::RankFuse { arms, k, .. } => Some((arms, k)),
@@ -337,7 +463,7 @@ impl Requirements {
             ));
         }
         for (scope, retrieval) in &expected {
-            let Some((_, binding, access)) =
+            let Some((id, binding, access)) =
                 ranked.iter().find(|(_, _, access)| access.scope == *scope)
             else {
                 return Err(ValidationError::violated(
@@ -348,7 +474,7 @@ impl Requirements {
             let same = *binding == retrieval.binding
                 && access.kind == retrieval.kind
                 && access.property == retrieval.property
-                && matcher.argument(&retrieval.query, &access.query, budget)?;
+                && access.query == retrieval.query;
             if !same {
                 return Err(ValidationError::violated(
                     "search identity",
@@ -375,14 +501,10 @@ impl Requirements {
                     ),
                 ));
             }
-            let type_key = ranked
-                .iter()
-                .find(|(_, _, other)| std::ptr::eq(*other, *access))
-                .and_then(|(id, _, _)| match plan.node(*id) {
-                    Some(PhysicalNode::Scan { spec, .. }) => Some(spec.table.type_key.as_str()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let type_key = match plan.node(*id) {
+                Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.as_str(),
+                _ => "",
+            };
             self.check_access(plan, type_key, access)?;
         }
         match (&self.search, fuse) {
@@ -398,12 +520,7 @@ impl Requirements {
                         ));
                     }
                 }
-                let same_k = match (k, planned_k) {
-                    (None, None) => true,
-                    (Some(written), Some(planned)) => matcher.argument(written, planned, budget)?,
-                    _ => false,
-                };
-                if !same_k {
+                if planned_k != k {
                     return Err(ValidationError::violated(
                         "search identity",
                         "the fusion's `k` is not the one the query writes",
@@ -428,9 +545,9 @@ impl Requirements {
     }
 
     /// Every count cut the plan declares (`PhysicalNode::row_cut`) is one the
-    /// query requires, where it requires it: the root `Limit` and the final
-    /// sort's `fetch` carry the query's `limit`, a fusion keeps that `limit`,
-    /// and a ranked scan's candidate cap is the one its declared policy sets
+    /// query requires, where it requires it: the root `Limit` (under a root
+    /// hydration) and the final sort's `fetch` carry the query's `limit`, and
+    /// a ranked scan's candidate cap is the one its declared policy sets
     /// (checked with its access). Any other cut is refused, a capped sort
     /// below the final one and a cut in a correlated block's tree included.
     fn check_row_cuts(
@@ -442,7 +559,7 @@ impl Requirements {
         let limit = self
             .limit
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        let root = plan.root();
+        let root = below_hydration(plan, plan.root());
         let mut id = match plan.node(root) {
             Some(PhysicalNode::Limit { input, .. }) => *input,
             _ => root,
@@ -458,7 +575,6 @@ impl Requirements {
             let required = match node {
                 PhysicalNode::Limit { .. } => id == root && limit == Some(cut),
                 PhysicalNode::Sort { .. } => Some(id) == final_sort && limit == Some(cut),
-                PhysicalNode::RankFuse { .. } => limit == Some(cut),
                 PhysicalNode::Scan {
                     ranked: Some(_), ..
                 } => true,
@@ -563,13 +679,7 @@ impl Requirements {
 
     /// The plan's projection is the query's `return`, item for item, and
     /// every projected score is the score of the retrieval it names.
-    fn check_returns(
-        &self,
-        plan: &PhysicalPlan,
-        top: &[NodeId],
-        matcher: &Matcher<'_>,
-        budget: &mut Budget,
-    ) -> Result<(), ValidationError> {
+    fn check_returns(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
         let projections = projections_of(plan, top);
         let [returns] = projections.as_slice() else {
             return Err(ValidationError::violated(
@@ -590,50 +700,38 @@ impl Requirements {
                 ),
             ));
         }
-        for (written, projected) in self.returns.iter().zip(returns.iter()) {
-            let alias = written
-                .alias
-                .clone()
-                .or_else(|| meta_field_result_key(&written.expr));
-            if projected.alias != alias
-                || !matcher.matches(&written.expr, &projected.expr, Position::Return, budget)?
-            {
+        for (required, projected) in self.returns.iter().zip(returns.iter()) {
+            if required != projected {
                 return Err(ValidationError::violated(
                     "projection",
                     format!(
                         "the plan returns `{}`; the query returns `{}`",
-                        projected.expr, written.expr
+                        projected.expr, required.expr
                     ),
                 ));
             }
         }
-        for (_, call) in super::requirements::projected_rank_calls(&self.returns) {
-            let Some(projected) = projected_retrieval(call) else {
-                continue;
-            };
-            let mut origin = false;
-            for retrieval in self.retrievals() {
-                if retrieval.kind == projected.kind
-                    && retrieval.binding == projected.binding
-                    && retrieval.property == projected.property
-                    && retrieval.query == projected.query
-                {
-                    origin = true;
-                    break;
-                }
-            }
-            let planned = ranked_scans(plan).into_iter().any(|(_, binding, access)| {
-                binding == projected.binding
-                    && access.kind == projected.kind
-                    && access.property == projected.property
+        for (_, call) in &self.projected_ranks {
+            let origin = self.written_search.as_ref().is_some_and(|lead| {
+                lead == call
+                    || matches!(lead, Expr::Rrf { primary, secondary, .. }
+                        if **primary == *call || **secondary == *call)
             });
+            let planned = match call {
+                Expr::Rrf { .. } => plan
+                    .live()
+                    .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. })),
+                call => projected_retrieval(call).is_some_and(|(kind, binding, property)| {
+                    ranked_scans(plan).into_iter().any(|(_, scanned, access)| {
+                        scanned == binding && access.kind == kind && access.property == property
+                    })
+                }),
+            };
             if !origin || !planned {
                 return Err(ValidationError::violated(
                     "score origin",
                     format!(
-                        "the projected `{call}` reads `${}.{}`, which no retrieval of the query with these arguments produces",
-                        projected.binding,
-                        score_column(projected.kind)
+                        "the projected `{call}` reads a score no retrieval of the query with these arguments produces"
                     ),
                 ));
             }
@@ -641,18 +739,145 @@ impl Requirements {
         Ok(())
     }
 
+    /// A root hydration (`HydrateColumns`) reads only written return items:
+    /// each deferred column is the bare property the query returns at its
+    /// position, under that item's column, read from the pinned table of the
+    /// binding's own scan; only cuts and sorts sit between it and the
+    /// projection.
+    fn check_hydration(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        for id in top {
+            let Some(PhysicalNode::HydrateColumns { input, bindings }) = plan.node(*id) else {
+                continue;
+            };
+            if *id != plan.root() {
+                return Err(ValidationError::violated(
+                    "hydration",
+                    "a hydration below the plan's root reads columns after rows are decided",
+                ));
+            }
+            let mut below = *input;
+            while let Some(PhysicalNode::Limit { input, .. } | PhysicalNode::Sort { input, .. }) =
+                plan.node(below)
+            {
+                below = *input;
+            }
+            if !matches!(plan.node(below), Some(PhysicalNode::Projection { .. })) {
+                return Err(ValidationError::violated(
+                    "hydration",
+                    "a hydration does not sit over the query's projection",
+                ));
+            }
+            for hydrated in bindings {
+                let scanned = top.iter().any(|scan| {
+                    matches!(plan.node(*scan), Some(PhysicalNode::Scan { spec, .. })
+                        if spec.binding.as_deref() == Some(hydrated.binding.as_str())
+                            && spec.table == hydrated.table)
+                });
+                let declared = matches!(self.bindings.get(&hydrated.binding),
+                    Some(BoundVariable::Node { type_name })
+                        if hydrated.table.node_type_name() == Some(type_name.as_str()));
+                if !scanned || !declared {
+                    return Err(ValidationError::violated(
+                        "hydration",
+                        format!(
+                            "the hydration of `${}` reads {}, which is not the table its scan reads",
+                            hydrated.binding, hydrated.table.type_key
+                        ),
+                    ));
+                }
+                for column in &hydrated.columns {
+                    let returned = self.returns.get(column.position).is_some_and(|item| {
+                        item.column == column.output
+                            && matches!(&item.expr, IRExpr::PropAccess { variable, property, .. }
+                                if *variable == hydrated.binding && *property == column.property)
+                    });
+                    if !returned {
+                        return Err(ValidationError::violated(
+                            "hydration",
+                            format!(
+                                "the hydration places `${}.{}` at return position {} as `{}`, which the query does not return there",
+                                hydrated.binding, column.property, column.position, column.output
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The final sort's comparator as RFC 0047 defines it: a ranking's score
+    /// (a fused ranking's `_rrf` descending) then the written keys; over a
+    /// search-led aggregate the written keys then every group key not written,
+    /// ascending; no sort where the query orders nothing.
+    fn required_keys(&self) -> Option<Vec<IROrdering>> {
+        if self.aggregate {
+            if self.order.is_empty() {
+                return None;
+            }
+            let mut keys = self.order.clone();
+            if self.search.is_some() {
+                for projection in &self.returns {
+                    if matches!(projection.expr, IRExpr::Aggregate { .. }) {
+                        continue;
+                    }
+                    let written = keys.iter().any(|key| match &key.expr {
+                        IRExpr::AliasRef(alias, _) => *alias == projection.column,
+                        expr => *expr == projection.expr,
+                    });
+                    if !written {
+                        keys.push(IROrdering {
+                            expr: IRExpr::AliasRef(
+                                projection.column.clone(),
+                                projection.ty.clone(),
+                            ),
+                            descending: false,
+                        });
+                    }
+                }
+            }
+            return Some(keys);
+        }
+        let lead = match &self.search {
+            None if self.order.is_empty() => return None,
+            None => Vec::new(),
+            Some(Search::Rank(retrieval)) => {
+                let (column, descending) = retrieval.kind.score();
+                vec![(retrieval.binding.as_str(), column, descending)]
+            }
+            Some(Search::Fuse { arms, .. }) => vec![(arms[0].binding.as_str(), RRF_COLUMN, true)],
+        };
+        Some(
+            lead.into_iter()
+                .map(|(binding, column, descending)| IROrdering {
+                    expr: IRExpr::PropAccess {
+                        variable: binding.to_string(),
+                        property: column.to_string(),
+                        ty: ExprType::Value {
+                            scalar: ScalarType::F64,
+                            list: false,
+                            nullable: false,
+                        },
+                    },
+                    descending,
+                })
+                .chain(self.order.iter().cloned())
+                .collect(),
+        )
+    }
+
     /// The plan's rows leave in the order the query requires and are cut
-    /// where it requires: the final sort's comparator is the search's score,
-    /// the remaining written keys and the binding identities, the `limit`
-    /// cuts its output, and nothing between them reorders or drops rows.
+    /// where it requires: the final sort's comparator is
+    /// [`Self::required_keys`] then the binding identities, the `limit` cuts
+    /// its output, and nothing between them reorders or drops rows.
     fn check_order_and_cut(
         &self,
         plan: &PhysicalPlan,
         top: &[NodeId],
-        matcher: &Matcher<'_>,
+        input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let mut id = plan.root();
+        let mut id = below_hydration(plan, plan.root());
         if let Some(limit) = self.limit {
             let rows = usize::try_from(limit).unwrap_or(usize::MAX);
             match plan.node(id) {
@@ -665,36 +890,7 @@ impl Requirements {
                 }
             }
         }
-        let fused = matches!(self.search, Some(Search::Fuse { .. }));
-        if fused {
-            let planned = top.iter().find_map(|id| match plan.node(*id) {
-                Some(PhysicalNode::RankFuse { limit, .. }) => Some(*limit),
-                _ => None,
-            });
-            let limit = self.limit.and_then(|limit| usize::try_from(limit).ok());
-            if planned != Some(limit) {
-                return Err(ValidationError::violated(
-                    "row cut",
-                    format!("the fusion keeps {planned:?} rows; the query's `limit` is {limit:?}"),
-                ));
-            }
-            return Ok(());
-        }
-        let score = match &self.search {
-            Some(Search::Rank(retrieval)) => Some(retrieval),
-            _ => None,
-        };
-        if score.is_some() && self.aggregate {
-            return Ok(());
-        }
-        // A key is constant by what it names: an alias by the `return` item it
-        // aliases, on the written side and on the planned side alike.
-        let written: Vec<&omnigraph_compiler::query::ast::Ordering> = self
-            .order
-            .iter()
-            .filter(|key| !matcher.constant(self.resolved_key(&key.expr)))
-            .collect();
-        if score.is_none() && self.order.is_empty() {
+        let Some(required) = self.required_keys() else {
             let sorted = top
                 .iter()
                 .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Sort { .. })));
@@ -705,7 +901,7 @@ impl Requirements {
                 ));
             }
             return Ok(());
-        }
+        };
         loop {
             match plan.node(id) {
                 Some(PhysicalNode::Sort { .. }) => break,
@@ -743,111 +939,37 @@ impl Requirements {
                 ),
             ));
         }
-        let mut keys = order_by.iter();
-        if let Some(retrieval) = score {
-            let (column, descending) = retrieval.kind.score();
-            let leads = keys.next().is_some_and(|key| {
-                key.descending == descending
-                    && matches!(&key.expr, IRExpr::PropAccess { variable, property }
-                        if *variable == retrieval.binding && property == column)
-            });
-            if !leads {
-                return Err(ValidationError::violated(
-                    "order",
-                    format!(
-                        "the final sort does not lead with the {:?} score of `${}`",
-                        retrieval.kind, retrieval.binding
-                    ),
-                ));
-            }
-        }
-        let returns = projection_of(plan, top)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let planned_constant = |expr: &IRExpr| match expr {
-            IRExpr::AliasRef(column) => returns
+        let lead = required.len() - self.order.len().min(required.len());
+        let same = order_by.len() == required.len()
+            && order_by
                 .iter()
-                .find(|projection| result_column(projection).as_deref() == Some(column))
-                .is_some_and(|projection| constant_ir(&projection.expr)),
-            other => constant_ir(other),
-        };
-        let rest: Vec<&IROrdering> = keys.filter(|key| !planned_constant(&key.expr)).collect();
-        if rest.len() != written.len() {
+                .zip(&required)
+                .enumerate()
+                .all(|(index, (planned, key))| {
+                    if !self.aggregate && index < lead {
+                        // A score key reads the ranked scan's (or the fusion's)
+                        // score column of the binding, in the score's direction.
+                        planned.descending == key.descending
+                            && matches!((&planned.expr, &key.expr), (
+                            IRExpr::PropAccess { variable, property, .. },
+                            IRExpr::PropAccess { variable: v, property: p, .. },
+                        ) if variable == v && property == p)
+                    } else {
+                        planned == key
+                    }
+                });
+        if !same {
             return Err(ValidationError::violated(
                 "order",
                 format!(
-                    "the final sort has {} written keys; the query writes {} that are not constant",
-                    rest.len(),
-                    written.len()
+                    "the final sort orders by {}; the query requires {}",
+                    keys_text(order_by),
+                    keys_text(&required)
                 ),
             ));
         }
-        for (key, planned) in written.iter().zip(&rest) {
-            if key.descending != planned.descending
-                || !self.same_key(&key.expr, planned, returns, matcher, budget)?
-            {
-                return Err(ValidationError::violated(
-                    "order",
-                    format!(
-                        "the final sort orders by `{}`; the query writes `{}`",
-                        planned.expr, key.expr
-                    ),
-                ));
-            }
-        }
-        self.check_tiebreak(order_by, tiebreak, returns, matcher)?;
+        self.check_tiebreak(order_by, tiebreak, input)?;
         Ok(())
-    }
-
-    /// Whether a planned sort key is the written key: as written, or the
-    /// `return` item the planner bound it to by its result column, which the
-    /// written key must lower to (two differently written expressions may
-    /// lower to one, and the planner binds the first such item). In a
-    /// grouped query a written meta-field key binds by name to the unaliased
-    /// return item whose column it names, as the compiler lowers it.
-    fn same_key(
-        &self,
-        written: &Expr,
-        planned: &IROrdering,
-        returns: &[IRProjection],
-        matcher: &Matcher<'_>,
-        budget: &mut Budget,
-    ) -> Result<bool, ValidationError> {
-        if let IRExpr::AliasRef(column) = &planned.expr
-            && !matches!(written, Expr::AliasRef(alias) if alias == column)
-        {
-            let Some(index) = returns
-                .iter()
-                .position(|projection| result_column(projection).as_deref() == Some(column))
-            else {
-                return Ok(false);
-            };
-            let Some(item) = self.returns.get(index) else {
-                return Ok(false);
-            };
-            let by_name = self.aggregate
-                && matches!(written, Expr::PropAccess { .. })
-                && item.alias.is_none()
-                && meta_field_result_key(written).as_deref() == Some(column)
-                && meta_field_result_key(&item.expr).as_deref() == Some(column);
-            return Ok(by_name
-                || item.expr == *written
-                || matcher.matches(written, &returns[index].expr, Position::Return, budget)?);
-        }
-        matcher.matches(written, &planned.expr, Position::Plain, budget)
-    }
-
-    /// A written order key with an alias resolved to the `return` item it
-    /// names.
-    fn resolved_key<'e>(&'e self, key: &'e Expr) -> &'e Expr {
-        match key {
-            Expr::AliasRef(alias) => self
-                .returns
-                .iter()
-                .find(|projection| projection.alias.as_deref() == Some(alias))
-                .map_or(key, |projection| &projection.expr),
-            other => other,
-        }
     }
 
     /// The sort's metadata keys complete its comparator as RFC 0047 defines:
@@ -857,13 +979,12 @@ impl Requirements {
     /// comparator already holds, every key when the query returns only order
     /// keys (rows that tie are indistinguishable), and identities of
     /// bindings the query does not name (anonymous traversal endpoints)
-    /// after every named one.
+    /// after every named one. A sort of group rows appends none.
     fn check_tiebreak(
         &self,
         order_by: &[IROrdering],
         tiebreak: &[ColumnRef],
-        returns: &[IRProjection],
-        matcher: &Matcher<'_>,
+        input: &AcceptInput<'_>,
     ) -> Result<(), ValidationError> {
         if self.aggregate {
             if !tiebreak.is_empty() {
@@ -874,58 +995,40 @@ impl Requirements {
             }
             return Ok(());
         }
-        let covered = self.returns.iter().all(|projection| {
-            self.order
-                .iter()
-                .any(|key| *self.resolved_key(&key.expr) == projection.expr)
-                || match &self.search {
-                    Some(Search::Rank(retrieval)) => projected_retrieval(&projection.expr)
-                        .is_some_and(|projected| {
-                            projected.kind == retrieval.kind
-                                && projected.binding == retrieval.binding
-                                && projected.property == retrieval.property
-                                && projected.query == retrieval.query
-                        }),
-                    _ => false,
-                }
+        let ranked_score = |index: usize| {
+            matches!(self.search, Some(Search::Rank(_)))
+                && self.projected_ranks.iter().any(|(position, call)| {
+                    *position == index && self.written_search.as_ref() == Some(call)
+                })
+        };
+        let covered = self.returns.iter().enumerate().all(|(index, projection)| {
+            ranked_score(index)
+                || order_by.iter().any(|key| match &key.expr {
+                    IRExpr::AliasRef(alias, _) => *alias == projection.column,
+                    expr => *expr == projection.expr,
+                })
         });
-        // The same claim over the lowered expressions: an expression a key
-        // lowers to, compared with what each returned item lowers to, since
-        // two differently written expressions may lower to one.
-        fn lowered_key<'k>(key: &'k IROrdering, returns: &'k [IRProjection]) -> &'k IRExpr {
-            match &key.expr {
-                IRExpr::AliasRef(alias) => returns
-                    .iter()
-                    .find(|projection| result_column(projection).as_deref() == Some(alias))
-                    .map_or(&key.expr, |projection| &projection.expr),
-                expr => expr,
-            }
-        }
-        let covered_lowered = !returns.is_empty()
-            && returns.iter().all(|projection| {
-                order_by
-                    .iter()
-                    .any(|key| *lowered_key(key, returns) == projection.expr)
-            });
-        if covered || covered_lowered {
+        if covered {
             return Ok(());
         }
+        let columns = input.catalog.system_columns;
         let keyed = |column: &ColumnRef| {
             let physical = match column.property.as_deref() {
-                Some(IDENTITY_MEMBER) => matcher.physical(SYSTEM_ID),
-                Some(EDGE_TYPE_MEMBER) => matcher.physical(EDGE_TYPE_MEMBER),
+                Some(IDENTITY_MEMBER) => columns.id,
+                Some(EDGE_TYPE_MEMBER) => omnigraph_compiler::traversal::EDGE_TYPE_COLUMN,
                 _ => return false,
             };
             order_by.iter().any(|key| {
                 let expr = match &key.expr {
-                    IRExpr::AliasRef(alias) => returns
+                    IRExpr::AliasRef(alias, _) => self
+                        .returns
                         .iter()
-                        .find(|projection| projection.alias.as_deref() == Some(alias))
+                        .find(|projection| projection.column == *alias)
                         .map_or(&key.expr, |projection| &projection.expr),
                     expr => expr,
                 };
-                matches!(expr, IRExpr::PropAccess { variable, property }
-                    if *variable == column.binding && *property == physical)
+                matches!(expr, IRExpr::PropAccess { variable, property, .. }
+                    if *variable == column.binding && property == physical)
             })
         };
         let mut expected = Vec::new();
@@ -956,8 +1059,6 @@ impl Requirements {
         Ok(())
     }
 }
-
-const SYSTEM_ID: &str = "@id";
 
 /// The adaptive search policies the plan declares (RFC 0047, "Execution and
 /// replay use the same acceptance path"): every `nearest` scan's probe
@@ -1126,6 +1227,14 @@ fn check_prefilter(
     Ok(())
 }
 
+/// The node under a root hydration, else the root.
+fn below_hydration(plan: &PhysicalPlan, root: NodeId) -> NodeId {
+    match plan.node(root) {
+        Some(PhysicalNode::HydrateColumns { input, .. }) => *input,
+        _ => root,
+    }
+}
+
 /// Every node of `top` that projects the query's `return`.
 fn projections_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Vec<&'p Vec<IRProjection>> {
     top.iter()
@@ -1140,41 +1249,27 @@ fn projections_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Vec<&'p Vec<IRP
         .collect()
 }
 
-/// The one projection of `top`, when there is one.
-fn projection_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Option<&'p Vec<IRProjection>> {
-    match projections_of(plan, top).as_slice() {
-        [returns] => Some(*returns),
-        _ => None,
-    }
-}
-
-/// Whether a planned key reads no row: ordering by it orders nothing.
-fn constant_ir(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Literal(_) | IRExpr::Param(_) => true,
-        IRExpr::Binary { left, right, .. } => constant_ir(left) && constant_ir(right),
-        IRExpr::Not(inner) | IRExpr::IsNull { expr: inner, .. } => constant_ir(inner),
-        _ => false,
-    }
+fn keys_text(keys: &[IROrdering]) -> String {
+    keys.iter()
+        .map(|key| format!("{}{}", key.expr, if key.descending { " desc" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn exactness(approximate: bool) -> &'static str {
     if approximate { "approximate" } else { "exact" }
 }
 
-/// The retrieval a projected rank call names.
-fn projected_retrieval(expr: &Expr) -> Option<Retrieval> {
-    super::requirements::retrieval_of(expr)
-}
-
-/// The alias the compiler gives an unaliased meta-field projection: the
-/// logical `var.@prop`.
-fn meta_field_result_key(expr: &Expr) -> Option<String> {
+/// The (kind, binding, property) a projected `nearest` or `bm25` call reads.
+fn projected_retrieval(expr: &Expr) -> Option<(RankKind, &str, &str)> {
     match expr {
-        Expr::PropAccess { variable, property } if property.starts_with('@') => {
-            Some(format!("{variable}.{property}"))
-        }
-        Expr::Aggregate { arg, .. } => meta_field_result_key(arg),
+        Expr::Nearest {
+            variable, property, ..
+        } => Some((RankKind::Nearest, variable, property)),
+        Expr::Bm25 { field, .. } => match field.as_ref() {
+            Expr::PropAccess { variable, property } => Some((RankKind::Bm25, variable, property)),
+            _ => None,
+        },
         _ => None,
     }
 }

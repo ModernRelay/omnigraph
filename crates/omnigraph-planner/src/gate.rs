@@ -461,12 +461,11 @@ pub async fn accept_query_explained(
 }
 
 /// One traced planning run of a read query: the rewritten logical plan, the
-/// optimized physical plan with its assumptions, the passes that fired, and
-/// the derivation the optimizer recorded for an exact-fragment chain.
+/// optimized physical plan with its assumptions and the passes that fired,
+/// and the derivation the optimizer recorded for an exact-fragment chain.
 pub(crate) struct Traced {
     pub logical: LogicalPlan,
     pub optimized: Optimized,
-    pub fired: Vec<&'static str>,
     pub derivation: Option<Derivation>,
 }
 
@@ -490,7 +489,6 @@ pub(crate) fn plan_traced(
     Ok(Traced {
         logical,
         optimized,
-        fired,
         derivation: tracer.finish(),
     })
 }
@@ -505,7 +503,6 @@ async fn plan_and_accept(
     let Traced {
         logical,
         mut optimized,
-        fired: _,
         derivation,
     } = plan_traced(input.ir, source, bounds)?;
     // Scan access is part of the plan acceptance checks: a probe or a key

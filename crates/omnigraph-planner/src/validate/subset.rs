@@ -1,12 +1,13 @@
 //! The exact fragment and its checked derivation (RFC 0047, "Checked
 //! rewrites for exact search"). Membership is a syntax-and-type check over
-//! the checked declaration: one binding of one node type, eligibility over
-//! Boolean, integer and String properties, literals and parameters, an
-//! optional leading `bm25()` over a String property, direct property sort
-//! keys, a limit, and a projection of properties and the selected score.
+//! the declaration's typed lowering: one binding of one node type,
+//! eligibility over Boolean, integer and String properties, literals and
+//! parameters (a literal or parameter cast to the property's integer type
+//! included), an optional leading `bm25()` over a String property, direct
+//! property sort keys, a limit, and a projection of properties and the
+//! selected score.
 //!
-//! For a member, the validator first checks that the IR is the lowering of
-//! the declaration, then builds the canonical chain from it
+//! For a member, the validator builds the canonical chain from the typed IR
 //! (`Limit(n, Sort(K, Project(V, [Search(a)] Filter(p, Scan(C)))))`, leaf
 //! first), applies the optimizer's recorded rule applications one by one,
 //! each checked against its precondition and reconstructed by the validator,
@@ -20,16 +21,19 @@ use std::collections::BTreeSet;
 
 use omnigraph_compiler::catalog::NodeType;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{BinaryOp, Clause, CompOp, Expr, Literal};
-use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 
 use super::budget::Budget;
-use super::requirements::{Matcher, Position, Requirements};
+use super::requirements::Requirements;
 use super::{AcceptInput, ValidationError};
 use crate::logical::{ColumnRef, IDENTITY_MEMBER, LogicalNode, LogicalPlan};
 use crate::mirror::{ExprMirror, OrderingMirror, ProjectionMirror};
-use crate::physical::{Eligibility, PhysicalNode, PhysicalPlan, RankKind, RankScope, ScanInput};
+use crate::optimizer::ROW_ADDR;
+use crate::physical::{
+    Eligibility, HydratedColumn, PhysicalNode, PhysicalPlan, RankKind, RankScope, ScanInput,
+};
 use crate::source::FullTextCoverage;
 
 /// A member of the exact fragment: its one binding and node type.
@@ -41,25 +45,39 @@ pub(crate) struct Member {
 
 /// The scalar types the fragment's comparisons and keys admit.
 fn admitted(property: &PropType) -> bool {
-    !property.list
-        && matches!(
-            property.scalar,
-            ScalarType::Bool
-                | ScalarType::I32
-                | ScalarType::I64
-                | ScalarType::U32
-                | ScalarType::U64
-                | ScalarType::String
-        )
+    !property.list && admitted_scalar(property.scalar)
 }
 
-/// An operand's type as the fragment compares it: an integer literal
-/// compares with any integer property, every other operand only with its
-/// own scalar type.
+fn admitted_scalar(scalar: ScalarType) -> bool {
+    matches!(
+        scalar,
+        ScalarType::Bool
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::String
+    )
+}
+
+/// The scalar of a non-list value type the fragment admits.
+fn admitted_type(ty: &ExprType) -> Option<ScalarType> {
+    match ty {
+        ExprType::Value {
+            scalar,
+            list: false,
+            ..
+        } if admitted_scalar(*scalar) => Some(*scalar),
+        _ => None,
+    }
+}
+
+/// An operand's type as the fragment compares it. The lowering makes both
+/// sides of a comparison one type (an explicit cast of a constant where
+/// they differ), so every operand compares only with its own scalar type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operand {
     Scalar(ScalarType),
-    IntegerLiteral,
     Null,
 }
 
@@ -67,10 +85,7 @@ impl Operand {
     fn integer(self) -> bool {
         matches!(
             self,
-            Self::IntegerLiteral
-                | Self::Scalar(
-                    ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
-                )
+            Self::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64)
         )
     }
 
@@ -81,7 +96,6 @@ impl Operand {
     fn same_type(self, other: Self) -> bool {
         match (self, other) {
             (Self::Null, _) | (_, Self::Null) => true,
-            (Self::IntegerLiteral, other) | (other, Self::IntegerLiteral) => other.integer(),
             (left, right) => left == right,
         }
     }
@@ -90,7 +104,6 @@ impl Operand {
 struct Fragment<'a> {
     binding: &'a str,
     node_type: &'a NodeType,
-    params: &'a [omnigraph_compiler::query::ast::Param],
 }
 
 impl Fragment<'_> {
@@ -102,38 +115,44 @@ impl Fragment<'_> {
         admitted(declared).then_some(declared.scalar)
     }
 
-    fn operand(&self, expr: &Expr) -> Option<Operand> {
+    fn operand(&self, expr: &IRExpr) -> Option<Operand> {
         match expr {
-            Expr::PropAccess { variable, property } => {
-                self.property(variable, property).map(Operand::Scalar)
-            }
-            Expr::Literal(Literal::Bool(_)) => Some(Operand::Scalar(ScalarType::Bool)),
-            Expr::Literal(Literal::String(_)) => Some(Operand::Scalar(ScalarType::String)),
-            Expr::Literal(Literal::Integer(_)) => Some(Operand::IntegerLiteral),
-            Expr::Literal(Literal::Null) => Some(Operand::Null),
-            Expr::Variable(name) => {
-                let param = self.params.iter().find(|param| param.name == *name)?;
-                let declared = PropType::from_param_type_name(&param.type_name, param.nullable)?;
-                admitted(&declared).then_some(Operand::Scalar(declared.scalar))
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => self.property(variable, property).map(Operand::Scalar),
+            IRExpr::Literal(Literal::Null, _) => Some(Operand::Null),
+            IRExpr::Literal(Literal::Bool(_) | Literal::String(_) | Literal::Integer(_), ty)
+            | IRExpr::Param(_, ty) => admitted_type(ty).map(Operand::Scalar),
+            // A constant cast to an admitted type: the scan translates the
+            // cast as the in-memory filter evaluates it.
+            IRExpr::Cast { expr, ty }
+                if matches!(
+                    expr.as_ref(),
+                    IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
+                ) =>
+            {
+                admitted_type(ty).map(Operand::Scalar)
             }
             _ => None,
         }
     }
 
     /// Whether `expr` is an admitted eligibility predicate.
-    fn predicate(&self, expr: &Expr) -> bool {
+    fn predicate(&self, expr: &IRExpr) -> bool {
         match expr {
-            Expr::Binary {
+            IRExpr::Binary {
                 left,
                 op: BinaryOp::And | BinaryOp::Or,
                 right,
+                ..
             } => self.predicate(left) && self.predicate(right),
-            Expr::Not(inner) => self.predicate(inner),
-            Expr::IsNull { expr, .. } => self.operand(expr).is_some(),
-            Expr::Binary {
+            IRExpr::Not(inner, _) => self.predicate(inner),
+            IRExpr::IsNull { expr, .. } => self.operand(expr).is_some(),
+            IRExpr::Binary {
                 left,
                 op: BinaryOp::Compare(op),
                 right,
+                ..
             } => {
                 let (Some(left), Some(right)) = (self.operand(left), self.operand(right)) else {
                     return false;
@@ -154,11 +173,14 @@ impl Fragment<'_> {
 
     /// Whether `expr` is the leading `bm25()` the fragment admits: over a
     /// String property of the binding, with a String literal or parameter.
-    fn bm25(&self, expr: &Expr) -> bool {
-        let Expr::Bm25 { field, query } = expr else {
+    fn bm25(&self, expr: &IRExpr) -> bool {
+        let IRExpr::Bm25 { field, query, .. } = expr else {
             return false;
         };
-        let Expr::PropAccess { variable, property } = field.as_ref() else {
+        let IRExpr::PropAccess {
+            variable, property, ..
+        } = field.as_ref()
+        else {
             return false;
         };
         self.property(variable, property) == Some(ScalarType::String)
@@ -166,72 +188,72 @@ impl Fragment<'_> {
     }
 }
 
-/// The member the checked declaration of `input` is, or `None` for a query
+/// The member the typed lowering of `input` is, or `None` for a query
 /// outside the fragment.
 pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
-    let decl = input.checked.decl();
-    let mut binding = None;
-    for clause in &decl.match_clause {
-        match clause {
-            Clause::Binding(found) if binding.is_none() => binding = Some(found),
-            Clause::Filter(_) => {}
+    let ir = input.ir;
+    let mut pipeline = ir.pipeline.iter();
+    let Some(IROp::NodeScan {
+        variable,
+        type_name,
+        filters,
+    }) = pipeline.next()
+    else {
+        return None;
+    };
+    let node_type = input.catalog.node_types.get(type_name)?;
+    let fragment = Fragment {
+        binding: variable,
+        node_type,
+    };
+    if !filters.iter().all(|filter| fragment.predicate(filter)) {
+        return None;
+    }
+    for op in pipeline {
+        match op {
+            IROp::Filter(filter) if fragment.predicate(filter) => {}
             _ => return None,
         }
     }
-    let binding = binding?;
-    let node_type = input.catalog.node_types.get(&binding.type_name)?;
-    let fragment = Fragment {
-        binding: &binding.variable,
-        node_type,
-        params: &decl.params,
-    };
-    for matched in &binding.prop_matches {
-        let declared = node_type.properties.get(&matched.prop_name)?;
-        let comparison = Expr::comparison(
-            Expr::PropAccess {
-                variable: binding.variable.clone(),
-                property: matched.prop_name.clone(),
-            },
-            CompOp::Eq,
-            matched.value.clone(),
-        );
-        if !admitted(declared) || !fragment.predicate(&comparison) {
-            return None;
-        }
-    }
-    for clause in &decl.match_clause {
-        if let Clause::Filter(filter) = clause
-            && !fragment.predicate(filter)
-        {
-            return None;
-        }
-    }
-    let mut order = decl.order_clause.iter();
-    let leading = decl.order_clause.first().map(|key| &key.expr);
+    let mut order = ir.order_by.iter();
+    let leading = ir.order_by.first().map(|key| &key.expr);
     let ranked = leading.is_some_and(|lead| fragment.bm25(lead));
     if ranked {
         order.next();
     }
     for key in order {
-        let Expr::PropAccess { variable, property } = &key.expr else {
+        let IRExpr::PropAccess {
+            variable, property, ..
+        } = &key.expr
+        else {
             return None;
         };
         fragment.property(variable, property)?;
     }
-    for projection in &decl.return_clause {
+    // The lowering makes a projected `bm25()` its score column; the
+    // declaration says which call it was.
+    let decl = input.checked.decl();
+    let written_lead = decl.order_clause.first().map(|key| &key.expr);
+    for (index, projection) in ir.return_exprs.iter().enumerate() {
         let direct = match &projection.expr {
-            Expr::PropAccess { variable, property } => {
-                fragment.property(variable, property).is_some()
+            IRExpr::PropAccess {
+                variable, property, ..
+            } if fragment.property(variable, property).is_some() => true,
+            _ => {
+                ranked
+                    && decl
+                        .return_clause
+                        .get(index)
+                        .is_some_and(|written| Some(&written.expr) == written_lead)
             }
-            call => ranked && Some(call) == leading,
         };
         if !direct {
             return None;
         }
     }
     Some(Member {
-        binding: binding.variable.clone(),
-        type_name: binding.type_name.clone(),
+        binding: variable.clone(),
+        type_name: type_name.clone(),
     })
 }
 
@@ -280,6 +302,13 @@ pub enum ChainNode {
         rows: usize,
         lowered: bool,
     },
+    /// Return columns read by row address above the limit; physical from
+    /// its creation.
+    Hydrate {
+        binding: String,
+        type_key: String,
+        columns: Vec<HydratedColumn>,
+    },
 }
 
 /// A chain node's place, leaf first; a chain holds at most one of each.
@@ -291,6 +320,7 @@ pub(crate) enum Role {
     Projection,
     Sort,
     Limit,
+    Hydrate,
 }
 
 impl ChainNode {
@@ -302,6 +332,7 @@ impl ChainNode {
             Self::Projection { .. } => Role::Projection,
             Self::Sort { .. } => Role::Sort,
             Self::Limit { .. } => Role::Limit,
+            Self::Hydrate { .. } => Role::Hydrate,
         }
     }
 
@@ -312,6 +343,7 @@ impl ChainNode {
             | Self::Projection { lowered, .. }
             | Self::Sort { lowered, .. }
             | Self::Limit { lowered, .. } => *lowered,
+            Self::Hydrate { .. } => true,
             Self::Search { .. } => false,
         }
     }
@@ -323,7 +355,7 @@ impl ChainNode {
             | Self::Projection { lowered, .. }
             | Self::Sort { lowered, .. }
             | Self::Limit { lowered, .. } => *lowered = true,
-            Self::Search { .. } => {}
+            Self::Search { .. } | Self::Hydrate { .. } => {}
         }
     }
 }
@@ -348,6 +380,13 @@ pub enum Rule {
     /// placing eligibility before scoring only under recorded full
     /// full-text coverage; `at` `[search, scan]`.
     RankBm25Scan { eligibility: Eligibility },
+    /// The physical `Limit(n > 0, …Projection(V, …Scan(C)))` reads each of
+    /// `columns`, a bare property of the binding that `V` returns at its
+    /// position and no other node reads, by row address above the limit:
+    /// the scan reads `_rowaddr` in their place, and a hydration over the
+    /// limit places them; `at` `[scan]`, successors the scan and the
+    /// hydration.
+    HydrateReturnColumns { columns: Vec<HydratedColumn> },
 }
 
 /// One recorded rule application.
@@ -504,6 +543,27 @@ impl Tracer {
         derivation.steps.push(Step { at, rule });
     }
 
+    /// Record `rule` applied to the current nodes of `at`, whose successors
+    /// are the current nodes of `successors` (a role it creates included).
+    pub(crate) fn record_with(&mut self, at: &[Role], successors: &[Role], rule: Rule) {
+        let Some(derivation) = self.derivation.as_mut() else {
+            return;
+        };
+        let mut indices = Vec::with_capacity(at.len());
+        for role in at {
+            let Some(index) = self.current.get(role).copied() else {
+                self.derivation = None;
+                return;
+            };
+            indices.push(index);
+        }
+        for role in successors {
+            self.current.insert(*role, self.next);
+            self.next += 1;
+        }
+        derivation.steps.push(Step { at: indices, rule });
+    }
+
     pub(crate) fn finish(self) -> Option<Derivation> {
         self.derivation
     }
@@ -564,15 +624,15 @@ pub(crate) fn check(
     member: &Member,
     budget: &mut Budget,
 ) -> Result<(), ValidationError> {
+    let _ = requirements;
     let ir = input.ir;
-    let matcher = Matcher::new(input, requirements);
-    lowered_ir(ir, input, member, &matcher, budget)?;
     let mut arena = canonical(ir, plan, member, input)?;
     for step in &derivation.steps {
         budget.step()?;
         apply(&mut arena, step, plan, member, input, budget)?;
     }
     let reached: Vec<&ChainNode> = [
+        Role::Hydrate,
         Role::Limit,
         Role::Sort,
         Role::Projection,
@@ -607,110 +667,6 @@ pub(crate) fn check(
     Ok(())
 }
 
-/// Stage one: the IR is the lowering of the member's declaration, the
-/// pattern the compiler defines for one binding.
-fn lowered_ir(
-    ir: &QueryIR,
-    input: &AcceptInput<'_>,
-    member: &Member,
-    matcher: &Matcher<'_>,
-    budget: &mut Budget,
-) -> Result<(), ValidationError> {
-    let decl = input.checked.decl();
-    let mut pipeline = ir.pipeline.iter();
-    let Some(IROp::NodeScan {
-        variable,
-        type_name,
-        filters,
-    }) = pipeline.next()
-    else {
-        return Err(invalid(
-            "the IR does not start with the binding's scan".into(),
-        ));
-    };
-    if *variable != member.binding || *type_name != member.type_name {
-        return Err(invalid(format!(
-            "the IR scans `${variable}: {type_name}`; the query binds `${}: {}`",
-            member.binding, member.type_name
-        )));
-    }
-    let binding = decl.match_clause.iter().find_map(|clause| match clause {
-        Clause::Binding(binding) => Some(binding),
-        _ => None,
-    });
-    let matches = binding.map_or(&[][..], |binding| binding.prop_matches.as_slice());
-    if filters.len() != matches.len() {
-        return Err(invalid(
-            "the IR scan's inline filters are not the binding's matches".into(),
-        ));
-    }
-    for (matched, filter) in matches.iter().zip(filters) {
-        let written = Expr::comparison(
-            Expr::PropAccess {
-                variable: member.binding.clone(),
-                property: matched.prop_name.clone(),
-            },
-            CompOp::Eq,
-            matched.value.clone(),
-        );
-        if !matcher.matches(&written, filter, Position::Filter, budget)? {
-            return Err(invalid(format!("the IR tests `{filter}` for `{written}`")));
-        }
-    }
-    let clauses: Vec<&Expr> = decl
-        .match_clause
-        .iter()
-        .filter_map(|clause| match clause {
-            Clause::Filter(filter) => Some(filter),
-            _ => None,
-        })
-        .collect();
-    let rest: Vec<&IROp> = pipeline.collect();
-    if rest.len() != clauses.len() {
-        return Err(invalid(
-            "the IR's filters are not the query's clauses".into(),
-        ));
-    }
-    for (clause, op) in clauses.iter().zip(rest) {
-        let IROp::Filter(filter) = op else {
-            return Err(invalid("the IR holds an op the fragment does not".into()));
-        };
-        if !matcher.matches(clause, filter, Position::Filter, budget)? {
-            return Err(invalid(format!("the IR tests `{filter}` for `{clause}`")));
-        }
-    }
-    if ir.return_exprs.len() != decl.return_clause.len() {
-        return Err(invalid("the IR's return is not the query's".into()));
-    }
-    for (written, lowered) in decl.return_clause.iter().zip(&ir.return_exprs) {
-        if written.alias != lowered.alias
-            || !matcher.matches(&written.expr, &lowered.expr, Position::Return, budget)?
-        {
-            return Err(invalid(format!(
-                "the IR returns `{}`; the query returns `{}`",
-                lowered.expr, written.expr
-            )));
-        }
-    }
-    if ir.order_by.len() != decl.order_clause.len() {
-        return Err(invalid("the IR's order is not the query's".into()));
-    }
-    for (written, lowered) in decl.order_clause.iter().zip(&ir.order_by) {
-        if written.descending != lowered.descending
-            || !matcher.matches(&written.expr, &lowered.expr, Position::Plain, budget)?
-        {
-            return Err(invalid(format!(
-                "the IR orders by `{}`; the query by `{}`",
-                lowered.expr, written.expr
-            )));
-        }
-    }
-    if ir.limit != decl.limit {
-        return Err(invalid("the IR's limit is not the query's".into()));
-    }
-    Ok(())
-}
-
 /// The canonical chain of a member, from its checked IR: the scan of the
 /// pinned table, every conjunct in written order (a repeated one once), the
 /// leading `bm25()`, the projection, the sort of the remaining keys with the
@@ -739,7 +695,7 @@ fn canonical(
     }
     let mut keys: &[IROrdering] = &ir.order_by;
     let search = match keys.first().map(|key| &key.expr) {
-        Some(IRExpr::Bm25 { field, query }) => match field.as_ref() {
+        Some(IRExpr::Bm25 { field, query, .. }) => match field.as_ref() {
             IRExpr::PropAccess { property, .. } => {
                 keys = &keys[1..];
                 Some(ChainNode::Search {
@@ -775,7 +731,7 @@ fn canonical(
     if sorted {
         let written: Vec<&IROrdering> = keys
             .iter()
-            .filter(|key| !matches!(key.expr, IRExpr::Literal(_)))
+            .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();
         nodes.push(ChainNode::Sort {
             keys: written
@@ -814,7 +770,7 @@ fn canonical_tiebreak(ir: &QueryIR, member: &Member, input: &AcceptInput<'_>) ->
         .all(|projection| keys.contains(&projection.expr.to_string()));
     let id = input.catalog.system_columns.id;
     let keyed = ir.order_by.iter().any(|key| {
-        matches!(&key.expr, IRExpr::PropAccess { variable, property }
+        matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
             if *variable == member.binding && property == id)
     });
     if covered || keyed {
@@ -992,15 +948,11 @@ fn apply(
                             _ => None,
                         });
                     if ranked.is_some() {
-                        let (column, descending) = RankKind::Bm25.score();
                         keys.insert(
                             0,
                             OrderingMirror::from(&IROrdering {
-                                expr: IRExpr::PropAccess {
-                                    variable: member.binding.clone(),
-                                    property: column.to_string(),
-                                },
-                                descending,
+                                expr: crate::optimizer::rank_score(&member.binding, RankKind::Bm25),
+                                descending: RankKind::Bm25.score().1,
                             }),
                         );
                     }
@@ -1051,6 +1003,113 @@ fn apply(
             });
             vec![(Role::Search, None), (Role::Scan, Some(node))]
         }
+        (Rule::HydrateReturnColumns { columns }, [scan]) => {
+            let mut node = arena.node(*scan, Role::Scan)?.clone();
+            let ChainNode::Scan {
+                type_key,
+                filter,
+                projection: Some(read),
+                ranked: None,
+                lowered: true,
+                ..
+            } = &mut node
+            else {
+                return Err(invalid(
+                    "only a physical, unranked scan with a projection defers columns".into(),
+                ));
+            };
+            let current = |role: Role| {
+                arena
+                    .current
+                    .get(&role)
+                    .and_then(|index| arena.nodes[*index].as_ref())
+            };
+            if current(Role::Hydrate).is_some()
+                || !matches!(current(Role::Limit), Some(ChainNode::Limit { rows, lowered: true }) if *rows > 0)
+            {
+                return Err(invalid(
+                    "return columns are hydrated once, above a nonzero physical limit".into(),
+                ));
+            }
+            let Some(ChainNode::Projection {
+                exprs,
+                lowered: true,
+            }) = current(Role::Projection)
+            else {
+                return Err(invalid(
+                    "return columns are hydrated over a physical projection".into(),
+                ));
+            };
+            let returns: Vec<IRProjection> =
+                exprs.iter().cloned().map(IRProjection::from).collect();
+            let node_type = input
+                .catalog
+                .node_types
+                .get(&member.type_name)
+                .ok_or_else(|| invalid("the member's type left the catalog".into()))?;
+            budget.visit(u64::try_from(columns.len() + returns.len()).unwrap_or(u64::MAX))?;
+            // Every read below the hydration that must still come from the
+            // scan: filters, sort keys, and every return item not deferred.
+            let mut reads = Vec::new();
+            for conjunct in filter.iter() {
+                crate::optimizer::reads_of_expr(&IRExpr::from(conjunct.clone()), &mut reads);
+            }
+            if let Some(ChainNode::Filter { conjuncts, .. }) = current(Role::Filter) {
+                for conjunct in conjuncts {
+                    crate::optimizer::reads_of_expr(&IRExpr::from(conjunct.clone()), &mut reads);
+                }
+            }
+            if let Some(ChainNode::Sort { keys, .. }) = current(Role::Sort) {
+                for key in keys {
+                    crate::optimizer::reads_of_expr(
+                        &IROrdering::from(key.clone()).expr,
+                        &mut reads,
+                    );
+                }
+            }
+            for (position, item) in returns.iter().enumerate() {
+                if !columns.iter().any(|column| column.position == position) {
+                    crate::optimizer::reads_of_expr(&item.expr, &mut reads);
+                }
+            }
+            for column in columns {
+                let returned = returns.get(column.position).is_some_and(|item| {
+                    item.column == column.output
+                        && matches!(&item.expr, IRExpr::PropAccess { variable, property, .. }
+                            if *variable == member.binding && *property == column.property)
+                });
+                let read_below = reads.iter().any(|read| {
+                    read.binding == member.binding
+                        && read.property.as_deref() == Some(column.property.as_str())
+                });
+                if !returned
+                    || read_below
+                    || !read.contains(&column.property)
+                    || node_type
+                        .key
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|key| *key == column.property)
+                    || column.property == input.catalog.system_columns.id
+                {
+                    return Err(invalid(format!(
+                        "`${}.{}` at return position {} cannot be read by row address",
+                        member.binding, column.property, column.position
+                    )));
+                }
+            }
+            read.retain(|name| !columns.iter().any(|column| column.property == *name));
+            if !read.iter().any(|name| name == ROW_ADDR) {
+                read.push(ROW_ADDR.to_string());
+            }
+            let hydrate = ChainNode::Hydrate {
+                binding: member.binding.clone(),
+                type_key: type_key.clone(),
+                columns: columns.clone(),
+            };
+            vec![(Role::Scan, Some(node)), (Role::Hydrate, Some(hydrate))]
+        }
         (rule, at) => {
             return Err(invalid(format!("rule {rule:?} names {} nodes", at.len())));
         }
@@ -1077,21 +1136,32 @@ fn apply(
 
 /// Whether the scan evaluates `conjunct` with the same typed semantics as
 /// the in-memory filter: the fragment's predicate forms over the member's
-/// properties, literals and bound parameters, with no cast.
+/// properties, literals and bound parameters, a constant cast included (the
+/// scan translates a cast as the filter evaluates it).
 fn translatable(conjunct: &IRExpr, member: &Member, input: &AcceptInput<'_>) -> bool {
     let Some(node_type) = input.catalog.node_types.get(&member.type_name) else {
         return false;
     };
     fn operand(expr: &IRExpr, member: &Member, node_type: &NodeType) -> bool {
         match expr {
-            IRExpr::PropAccess { variable, property } => {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
                 *variable == member.binding
                     && node_type.properties.get(property).is_some_and(admitted)
             }
             IRExpr::Literal(
                 Literal::Bool(_) | Literal::String(_) | Literal::Integer(_) | Literal::Null,
+                _,
             )
-            | IRExpr::Param(_) => true,
+            | IRExpr::Param(_, _) => true,
+            IRExpr::Cast { expr, ty } => {
+                admitted_type(ty).is_some()
+                    && matches!(
+                        expr.as_ref(),
+                        IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
+                    )
+            }
             _ => false,
         }
     }
@@ -1100,8 +1170,9 @@ fn translatable(conjunct: &IRExpr, member: &Member, input: &AcceptInput<'_>) -> 
             left,
             op: BinaryOp::And | BinaryOp::Or,
             right,
+            ..
         } => translatable(left, member, input) && translatable(right, member, input),
-        IRExpr::Not(inner) => translatable(inner, member, input),
+        IRExpr::Not(inner, _) => translatable(inner, member, input),
         IRExpr::IsNull { expr, .. } => operand(expr, member, node_type),
         IRExpr::Binary {
             left,
@@ -1110,6 +1181,7 @@ fn translatable(conjunct: &IRExpr, member: &Member, input: &AcceptInput<'_>) -> 
                     CompOp::Eq | CompOp::Ne | CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
                 ),
             right,
+            ..
         } => operand(left, member, node_type) && operand(right, member, node_type),
         other => operand(other, member, node_type),
     }
@@ -1122,11 +1194,26 @@ fn chain_of(
 ) -> Result<Vec<ChainNode>, ValidationError> {
     let mut chain = Vec::new();
     let mut id = plan.root();
+    let mut hydrated_table = None;
     loop {
         let node = plan
             .node(id)
             .ok_or_else(|| invalid(format!("node {id} is a tombstone")))?;
         let (converted, next) = match node {
+            PhysicalNode::HydrateColumns { input, bindings } if chain.is_empty() => {
+                let [hydrated] = bindings.as_slice() else {
+                    return Err(invalid("a chain hydrates one binding".into()));
+                };
+                hydrated_table = Some(&hydrated.table);
+                (
+                    ChainNode::Hydrate {
+                        binding: hydrated.binding.clone(),
+                        type_key: hydrated.table.type_key.clone(),
+                        columns: hydrated.columns.clone(),
+                    },
+                    Some(*input),
+                )
+            }
             PhysicalNode::Limit { input, rows } => (
                 ChainNode::Limit {
                     rows: *rows,
@@ -1151,6 +1238,7 @@ fn chain_of(
             PhysicalNode::Projection {
                 input,
                 return_exprs,
+                ..
             } => (
                 ChainNode::Projection {
                     exprs: return_exprs.iter().map(ProjectionMirror::from).collect(),
@@ -1181,6 +1269,7 @@ fn chain_of(
                     None => false,
                 };
                 if !same_table
+                    || hydrated_table.is_some_and(|table| *table != spec.table)
                     || spec.fragments.is_some()
                     || spec.runtime_filter.is_some()
                     || spec.columns != input.catalog.system_columns

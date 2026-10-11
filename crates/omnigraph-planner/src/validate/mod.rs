@@ -23,7 +23,7 @@ pub use replay::{
     REPLAY_VERSION, RULES_VERSION, ReplayEnvelope, ReplayQuery, ReplayRefusal, SEMANTICS_VERSION,
     accept_replay, catalog_digest, decode_replay,
 };
-pub use requirements::{ConstantEvaluator, Requirements};
+pub use requirements::{KeyIds, Requirements};
 pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
 
 use omnigraph_compiler::CheckedQuery;
@@ -106,15 +106,16 @@ impl std::fmt::Display for ValidationError {
 
 /// Everything acceptance reads beside the plan source: the checked
 /// declaration the requirements come from, the catalog it was checked
-/// against, the IR the planner plans (constants of filter positions already
-/// folded to their bound values), the bound parameter values (`now()`
-/// among them), the evaluator of a folded constant, and the limits.
+/// against, the typed IR the planner plans (constants of filter positions
+/// already folded to their bound values), the bound parameter values
+/// (`now()` among them), the derivation of a key's canonical id, and the
+/// limits.
 pub struct AcceptInput<'a> {
     pub checked: &'a CheckedQuery,
     pub catalog: &'a Catalog,
     pub ir: &'a QueryIR,
     pub params: &'a ParamMap,
-    pub constants: &'a dyn ConstantEvaluator,
+    pub keys: &'a dyn KeyIds,
     pub limits: ValidationLimits,
 }
 
@@ -224,15 +225,33 @@ pub(crate) fn accept(
     })
 }
 
-/// The checks of one acceptance, shared by fresh planning and replay: the
-/// invariants for every plan, and for a member of the exact fragment its
-/// derivation, which a member must carry.
+/// The checks of one acceptance, shared by fresh planning and replay, in
+/// three phases: the plan is well formed (its aggregate specs, output
+/// schemas and fusion row keys agree with its own nodes), it keeps exactly
+/// what the query requires (the invariants), and a member of the exact
+/// fragment carries its checked derivation.
 pub(crate) fn check(
     plan: &PhysicalPlan,
     input: &AcceptInput<'_>,
     derivation: Option<Derivation>,
     budget: &mut Budget,
 ) -> Result<(ValidationScope, Option<Derivation>), ValidationError> {
+    budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
+    let formed = |check: &'static str, result: Result<(), crate::error::PlanError>| {
+        result.map_err(|error| ValidationError::violated(check, error.to_string()))
+    };
+    formed(
+        "aggregate spec",
+        crate::aggregate::validate_aggregate_specs(plan),
+    )?;
+    formed(
+        "output schema",
+        crate::output::validate_output_schemas(plan),
+    )?;
+    formed(
+        "fusion row keys",
+        crate::optimizer::validate_rank_fuse_row_tiebreaks(plan),
+    )?;
     let requirements = Requirements::derive(input, budget)?;
     requirements.check(plan, input, budget)?;
     let Some(member) = subset::membership(input) else {

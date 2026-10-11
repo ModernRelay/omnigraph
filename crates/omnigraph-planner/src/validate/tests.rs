@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use omnigraph_compiler::CheckedQuery;
 use omnigraph_compiler::catalog::{Catalog, build_catalog};
-use omnigraph_compiler::ir::{IRExpr, ParamMap, QueryIR, fold};
+use omnigraph_compiler::ir::{IRExpr, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::schema::parser::parse_schema;
 
@@ -33,26 +33,19 @@ node Doc {
 edge Cites: Doc -> Doc
 "#;
 
-/// The bound-literal evaluator: literals and bound parameters through the
-/// compiler's fold rules.
-struct Bound<'p>(&'p ParamMap);
+/// The canonical id of a `Doc` by its String key, as a stand-in for the
+/// loader's derivation: `id:<value>`.
+struct Keys;
 
-impl ConstantEvaluator for Bound<'_> {
-    fn evaluate(&self, expr: &IRExpr) -> Option<Literal> {
-        match expr {
-            IRExpr::Literal(literal) => Some(literal.clone()),
-            IRExpr::Param(name) => self.0.get(name).cloned(),
-            IRExpr::Binary { left, op, right } => {
-                fold::evaluate(*op, &self.evaluate(left)?, &self.evaluate(right)?)
-            }
-            IRExpr::Not(inner) => match self.evaluate(inner)? {
-                Literal::Bool(value) => Some(Literal::Bool(!value)),
-                Literal::Null => Some(Literal::Null),
-                _ => None,
-            },
-            IRExpr::IsNull { expr, negated } => Some(Literal::Bool(
-                matches!(self.evaluate(expr)?, Literal::Null) != *negated,
-            )),
+impl KeyIds for Keys {
+    fn canonical_key_id(
+        &self,
+        type_key: &str,
+        value: &Literal,
+        _ty: &omnigraph_compiler::types::ExprType,
+    ) -> Option<String> {
+        match (type_key, value) {
+            ("node:Doc", Literal::String(key)) => Some(format!("id:{key}")),
             _ => None,
         }
     }
@@ -93,6 +86,7 @@ impl Fixture {
                         .iter()
                         .map(|field| field.name().clone())
                         .collect(),
+                    object_fields: node_type.node_object_fields().cloned().collect(),
                     row_count: None,
                 },
             );
@@ -130,13 +124,12 @@ impl Fixture {
         plan: PhysicalPlan,
         derivation: Option<Derivation>,
     ) -> Result<AcceptedPlan, ValidationError> {
-        let constants = Bound(&self.params);
         let input = AcceptInput {
             checked: &self.checked,
             catalog: &self.catalog,
             ir: &self.ir,
             params: &self.params,
-            constants: &constants,
+            keys: &Keys,
             limits: ValidationLimits::DEFAULT,
         };
         accept(plan, &input, derivation)
@@ -213,6 +206,7 @@ fn rules(derivation: &Derivation) -> Vec<&'static str> {
             Rule::PruneScanColumns { .. } => "prune",
             Rule::Lower => "lower",
             Rule::RankBm25Scan { .. } => "rank",
+            Rule::HydrateReturnColumns { .. } => "hydrate",
         })
         .collect()
 }
@@ -351,7 +345,8 @@ fn another_query_argument_fails_search_identity() {
             ..
         }) = plan.node_mut(id)
         {
-            ranked.query = IRExpr::Literal(Literal::String("other".into()));
+            ranked.query =
+                IRExpr::Literal(Literal::String("other".into()), ranked.query.ty().clone());
         }
     }
     let (check, detail) = fixture.refused(plan);
@@ -559,6 +554,7 @@ fn a_score_read_from_another_column_fails_the_projection() {
             return_exprs[1].expr = IRExpr::PropAccess {
                 variable: "d".to_string(),
                 property: "_distance".to_string(),
+                ty: return_exprs[1].expr.ty().clone(),
             };
         }
     }
@@ -569,13 +565,12 @@ fn a_score_read_from_another_column_fails_the_projection() {
 #[test]
 fn an_exhausted_budget_is_a_resource_outcome() {
     let fixture = ranked();
-    let constants = Bound(&fixture.params);
     let input = AcceptInput {
         checked: &fixture.checked,
         catalog: &fixture.catalog,
         ir: &fixture.ir,
         params: &fixture.params,
-        constants: &constants,
+        keys: &Keys,
         limits: ValidationLimits {
             work: 3,
             ..ValidationLimits::DEFAULT
@@ -774,17 +769,24 @@ fn both_acceptance_entries_agree_even_when_a_limit_runs_out() {
         },
     ] {
         let fixture = ranked();
-        let constants = Bound(&fixture.params);
         let input = AcceptInput {
             checked: &fixture.checked,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
-            constants: &constants,
+            keys: &Keys,
             limits,
         };
-        let plain = crate::gate::accept_query(&input, &fixture.source, &BOUNDS);
-        let explained = crate::gate::accept_query_explained(&input, &fixture.source, &BOUNDS);
+        let plain = futures::executor::block_on(crate::gate::accept_query(
+            &input,
+            &fixture.source,
+            &BOUNDS,
+        ));
+        let explained = futures::executor::block_on(crate::gate::accept_query_explained(
+            &input,
+            &fixture.source,
+            &BOUNDS,
+        ));
         match (plain, explained) {
             (Ok(plain), Ok((explained, explain))) => {
                 assert_eq!(plain.plan(), explained.plan());
@@ -821,13 +823,12 @@ fn derivation_cost_grows_with_the_query() {
         let traced = fixture.traced();
         let derivation = traced.derivation.clone().unwrap();
         let bytes = serde_json::to_vec(&derivation).unwrap().len();
-        let constants = Bound(&fixture.params);
         let input = AcceptInput {
             checked: &fixture.checked,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
-            constants: &constants,
+            keys: &Keys,
             limits: ValidationLimits::DEFAULT,
         };
         let mut budget = Budget::new(ValidationLimits::DEFAULT);

@@ -730,12 +730,16 @@ impl PhysicalNode {
         match self {
             Self::Limit { rows, .. } | Self::Page { rows, .. } => Some(*rows),
             Self::Sort { fetch, .. } => *fetch,
-            Self::RankFuse { limit, .. } => *limit,
             Self::Scan { ranked, .. } => ranked.as_ref().and_then(|ranked| ranked.fetch),
-            Self::MetadataCount { .. }
+            // A fusion emits every arm row; its `limit` sizes only the
+            // nearest arm's window, which that arm's scan declares as its
+            // fetch.
+            Self::RankFuse { .. }
+            | Self::MetadataCount { .. }
             | Self::SortMergeJoin { .. }
             | Self::HashJoin { .. }
             | Self::HydrateByAddress { .. }
+            | Self::HydrateColumns { .. }
             | Self::RowCompare { .. }
             | Self::ClassifyThreeWay { .. }
             | Self::CrossJoin { .. }

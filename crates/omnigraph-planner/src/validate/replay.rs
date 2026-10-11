@@ -26,10 +26,10 @@ pub const REPLAY_VERSION: u32 = 1;
 
 /// The catalogue of checks and rewrite rules acceptance applies. A rule id
 /// keeps its meaning within one version.
-pub const RULES_VERSION: u32 = 1;
+pub const RULES_VERSION: u32 = 2;
 
 /// The compiler and operator semantics a plan was built under.
-pub const SEMANTICS_VERSION: u32 = 1;
+pub const SEMANTICS_VERSION: u32 = 2;
 
 /// The query a saved plan came from: its source and declaration name. Its
 /// parameter values are the plan's own bound values.

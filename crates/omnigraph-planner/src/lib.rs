@@ -70,10 +70,10 @@ pub use operation::{Operation, PageBudgetSpec, ScopeSpec, Side, TableRef};
 pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
 pub use physical::{
-    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop, HydratedBinding,
-    HydratedColumn, NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan,
-    Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind, RankScope,
-    RankedAccess, ScanInput, StatisticSource,
+    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
+    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode,
+    PhysicalPlan, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
+    RankScope, RankedAccess, ScanInput, StatisticSource,
 };
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
@@ -83,9 +83,9 @@ pub use source::{
     MemorySource, NodeTypeSpec, PlanSource, SideId,
 };
 pub use validate::{
-    AcceptInput, AcceptedBoundPlan, AcceptedPlan, ConstantEvaluator, Evidence, ReplayEnvelope,
-    ReplayQuery, ReplayRefusal, ValidationError, ValidationLimits, ValidationScope,
-    ValidationSummary, accept_replay, catalog_digest, decode_replay,
+    AcceptInput, AcceptedBoundPlan, AcceptedPlan, Evidence, KeyIds, ReplayEnvelope, ReplayQuery,
+    ReplayRefusal, ValidationError, ValidationLimits, ValidationScope, ValidationSummary,
+    accept_replay, catalog_digest, decode_replay,
 };
 
 #[cfg(test)]

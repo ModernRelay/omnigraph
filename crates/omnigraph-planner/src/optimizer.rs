@@ -603,7 +603,7 @@ fn search_arm_reads(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
     }
 }
 
-fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
+pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
     IRExpr::PropAccess {
         variable: binding.to_string(),
         property: kind.score().0.to_string(),
@@ -634,7 +634,7 @@ fn fused_score(binding: &str) -> IRExpr {
 /// A key the type checker bound to a `return` item (T42, RFC
 /// 2026-09-24-shared-expression-model, "Order key binding") as the `AliasRef`
 /// of that item's column; a property or alias key as written.
-fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection]) -> IRExpr {
+pub(crate) fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection]) -> IRExpr {
     if matches!(key, IRExpr::PropAccess { .. } | IRExpr::AliasRef(_, _)) {
         return key.clone();
     }
@@ -1168,7 +1168,7 @@ pub(crate) fn physical_plan_with(
     } = lowering;
     physical.set_root(root);
     let late_query =
-        query && materialize_returns_late(&mut physical, plan, source, &mut decisions)?;
+        query && materialize_returns_late(&mut physical, plan, source, &mut decisions, tracer)?;
     if late_materialization || late_query {
         fired.push(PASS_LATE_MATERIALIZATION);
     }
@@ -1989,6 +1989,7 @@ fn materialize_returns_late(
     logical: &LogicalPlan,
     source: &dyn PlanSource,
     decisions: &mut Vec<StatisticSource>,
+    tracer: &mut Tracer,
 ) -> Result<bool, PlanError> {
     let root = physical.root();
     let Some(&PhysicalNode::Limit { input, rows: limit }) = physical.node(root) else {
@@ -2185,6 +2186,15 @@ fn materialize_returns_late(
         if let Some(PhysicalNode::Scan { spec, .. }) = physical.node_mut(scan) {
             spec.projection = Some(read);
         }
+    }
+    if let [hydrated] = bindings.as_slice() {
+        tracer.record_with(
+            &[Role::Scan],
+            &[Role::Scan, Role::Hydrate],
+            Rule::HydrateReturnColumns {
+                columns: hydrated.columns.clone(),
+            },
+        );
     }
     let hydrate = physical.add(PhysicalNode::HydrateColumns {
         input: root,
