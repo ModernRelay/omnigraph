@@ -90,7 +90,10 @@ async fn warm_stamp_read_costs_one_version_probe() {
         commit_many(&db, 5).await;
 
         let (stamp, io) = measure(db.internal_schema_version_of(ReadTarget::branch("main"))).await;
-        assert_eq!(stamp.unwrap(), 14);
+        assert_eq!(
+            stamp.unwrap(),
+            omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION
+        );
         assert_eq!(io.version_probes, 1, "{io:?}");
         assert_eq!(io.manifest_reads, 0, "{io:?}");
         assert_eq!(io.internal_open_count, 0, "{io:?}");
@@ -102,7 +105,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
         })
         .await;
         let (version, stamp) = pair.unwrap();
-        assert_eq!(stamp, 14);
+        assert_eq!(stamp, omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION);
         assert_eq!(
             version,
             db.snapshot_of(ReadTarget::branch("main"))
@@ -2427,4 +2430,124 @@ async fn merge_and_load_close_a_block_under_the_session_budget() {
         }),
     )
     .await;
+}
+
+async fn registry_manifest_files(root: &str) -> (Vec<String>, String, usize) {
+    let manifest = omnigraph_catalog::layout::open_manifest_dataset(root, None)
+        .await
+        .unwrap();
+    let hot = manifest
+        .fragments()
+        .iter()
+        .max_by_key(|fragment| fragment.id)
+        .unwrap();
+    assert_eq!(hot.files.len(), 1);
+    let mut cold = Vec::new();
+    let mut cold_rows = 0;
+    for fragment in manifest
+        .fragments()
+        .iter()
+        .filter(|fragment| fragment.id != hot.id)
+    {
+        cold_rows += fragment
+            .physical_rows
+            .expect("a written fragment has its row count");
+        cold.extend(fragment.files.iter().map(|file| file.path.clone()));
+    }
+    cold.sort();
+    (cold, hot.files[0].path.clone(), cold_rows)
+}
+
+fn registry_manifest_data_files(root: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_dir(root.join("__manifest").join("data"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            assert!(metadata.is_file());
+            (entry.file_name().into_string().unwrap(), metadata.len())
+        })
+        .collect()
+}
+
+/// Repeated merges import no copy of a registry already held by the target.
+#[tokio::test]
+async fn repeated_merges_reuse_shared_cold_registry_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = with_setting(&init_and_load(&dir).await, "history_release_bytes", "2048");
+    let mut shared = None;
+    for age in 1..=1024 {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+        let files = registry_manifest_files(uri).await;
+        if files.2 > 64 {
+            shared = Some(files.0);
+            break;
+        }
+    }
+    let shared = shared.expect("bounded preparation must cross the 64-row cold-push boundary");
+    assert!(!shared.is_empty());
+    db.branch_create("feature").await.unwrap();
+
+    let mut observations = Vec::new();
+    for round in 1..=2 {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 2000 + round)]),
+        )
+        .await
+        .unwrap();
+        mutate_branch(
+            &db,
+            "feature",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 3000 + round)]),
+        )
+        .await
+        .unwrap();
+        let before = registry_manifest_data_files(dir.path());
+        let merged = db.branch_merge("feature", "main").await.unwrap();
+        assert_eq!(merged.outcome, omnigraph::db::MergeOutcome::Merged);
+        let (cold, hot, _) = registry_manifest_files(uri).await;
+        let after = registry_manifest_data_files(dir.path());
+        let written: Vec<_> = after
+            .iter()
+            .filter(|(path, _)| !before.contains_key(*path))
+            .map(|(path, bytes)| (path.clone(), *bytes))
+            .collect();
+        observations.push((cold, hot, written));
+    }
+
+    for (round, (cold, hot, written)) in observations.iter().enumerate() {
+        assert_eq!(
+            cold,
+            &shared,
+            "merge {} must retain the shared cold files",
+            round + 1
+        );
+        assert_eq!(
+            written.len(),
+            1,
+            "merge {} must stage only the hot file: {written:?}",
+            round + 1
+        );
+        assert_eq!(
+            written[0].0, *hot,
+            "all newly staged manifest data belongs to the hot fragment"
+        );
+        assert!(
+            written[0].1 <= 64 * 1024,
+            "the fixed-schema hot write must stay bounded: {written:?}"
+        );
+    }
 }

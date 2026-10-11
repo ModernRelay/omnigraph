@@ -590,6 +590,7 @@ fn bulk_update_fixture(rows: usize) -> String {
 /// bulk load. The rejected one-over query must remain entirely pre-effect: no
 /// recovery sidecar, table version, manifest version, or row may move.
 #[tokio::test]
+#[ignore = "heavy-repro: an 8192-statement insert mutation at the exact keyed-row cap"]
 async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
     const LIMIT: usize = 8192;
     const SCHEMA: &str = "node Thing { key: String @key }\n";

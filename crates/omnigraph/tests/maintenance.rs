@@ -131,13 +131,6 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 
     let stats = db.optimize().await.unwrap();
 
-    // Schema declares 2 nodes + 2 edges = 4 data tables, plus the one internal
-    // system table optimize compacts (`__manifest`, RFC-013 step 2) = 5. Graph
-    // lineage lives in `__manifest` (Phase B retired the commit-graph datasets),
-    // so there is no separate lineage table to compact. Compaction runs on each
-    // but finds nothing to merge: the genesis graph commit rides the SINGLE init
-    // `__manifest` write (RFC-013 Phase 7), so a fresh graph has one fragment per
-    // table — nothing to compact anywhere.
     assert_eq!(stats.len(), 5);
     for s in &stats {
         assert_eq!(s.fragments_removed, 0, "{} should not remove", s.type_key);
@@ -206,15 +199,13 @@ async fn optimize_after_load_then_again_is_idempotent() {
     );
 }
 
-/// After 20 commits optimize finds `__manifest` (its only internal table) already
-/// one fragment, writes no recovery sidecar, and leaves the graph coherent for
-/// subsequent reads + strict writes.
+/// Optimize preserves main's cold registry files and keeps subsequent publishes readable.
 #[tokio::test]
-async fn optimize_leaves_the_one_fragment_manifest_alone() {
+async fn optimize_preserves_manifest_registry_fragments() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let db = helpers::with_setting(&init_and_load(&dir).await, "history_release_bytes", "2048");
 
-    for i in 0..20 {
+    for i in 0..270 {
         mutate_main(
             &db,
             MUTATION_QUERIES,
@@ -225,7 +216,29 @@ async fn optimize_leaves_the_one_fragment_manifest_alone() {
         .unwrap();
     }
 
+    let manifest_uri = format!("{}/__manifest", dir.path().to_str().unwrap());
+    let before = Dataset::open(&manifest_uri).await.unwrap();
+    let cold_files: Vec<_> = before
+        .fragments()
+        .iter()
+        .take(before.fragments().len() - 1)
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect();
+    assert!(
+        !cold_files.is_empty(),
+        "the fixture must release more registry rows than the hot bound"
+    );
     let stats = db.optimize().await.unwrap();
+    let after = Dataset::open(&manifest_uri).await.unwrap();
+    let after_files: BTreeSet<_> = after
+        .fragments()
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect();
+    assert!(
+        cold_files.iter().all(|file| after_files.contains(file)),
+        "optimize rewrote cold registry files"
+    );
 
     let manifest_stats = stats
         .iter()
@@ -233,11 +246,9 @@ async fn optimize_leaves_the_one_fragment_manifest_alone() {
         .expect("optimize stats missing internal table __manifest");
     assert!(
         !manifest_stats.committed && manifest_stats.fragments_removed == 0,
-        "every publish already rewrote __manifest as one fragment, so optimize must be a no-op on it: {manifest_stats:?}"
+        "the manifest publisher owns hot and cold fragments, so optimize must leave them intact: {manifest_stats:?}"
     );
 
-    // `__manifest` is the only internal table optimize touches (Phase B retired
-    // the commit-graph datasets), so no `_graph_commits*` stat is emitted.
     assert!(
         !stats
             .iter()
@@ -245,7 +256,6 @@ async fn optimize_leaves_the_one_fragment_manifest_alone() {
         "no commit-graph datasets exist after Phase B — optimize must not report them"
     );
 
-    // Internal compaction leaks no recovery sidecar.
     let recovery_dir = dir.path().join("__recovery");
     if recovery_dir.exists() {
         let leftover: Vec<_> = std::fs::read_dir(&recovery_dir)
@@ -259,7 +269,6 @@ async fn optimize_leaves_the_one_fragment_manifest_alone() {
         );
     }
 
-    // Coherent after internal compaction: reads + a strict write still work.
     assert!(count_rows(&db, "node:Person").await > 0);
     mutate_main(
         &db,
@@ -269,13 +278,15 @@ async fn optimize_leaves_the_one_fragment_manifest_alone() {
     )
     .await
     .unwrap();
+    let reopened = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        count_rows(&reopened, "node:Person").await,
+        count_rows(&db, "node:Person").await
+    );
 }
 
-/// `optimize` must stay NON-DESTRUCTIVE on a pre-`auto_cleanup`-fix upgraded graph:
-/// `compact_files` would otherwise fire the dataset's stored `lance.auto_cleanup.*`
-/// hook (version GC) during the compaction commit. Internal-table compaction clears
-/// that stale config first, so no versions are deleted. Without the clear, the
-/// aggressive policy below GCs old versions and the count drops.
+/// Optimize removes obsolete automatic-cleanup configuration without pruning
+/// retained versions of main's manifest.
 #[tokio::test]
 async fn optimize_clears_stale_auto_cleanup_and_preserves_versions() {
     let dir = tempfile::tempdir().unwrap();

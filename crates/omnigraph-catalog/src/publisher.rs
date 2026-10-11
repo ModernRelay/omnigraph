@@ -203,6 +203,8 @@ pub struct PublishOutcome {
     /// The buffer of `dataset`'s version.
     pub buffer: CommitBuffer,
     pub schema_contract: Option<crate::SchemaContractRow>,
+    /// The block registry rows `dataset`'s version keeps in its hot fragment.
+    pub registry: crate::state::LineageRegistry,
 }
 
 #[async_trait]
@@ -777,6 +779,23 @@ impl GraphNamespacePublisher {
         Ok((released.into_iter().chain(merged).collect(), closed))
     }
 
+    /// The registry rows of the runs `records` release. A run whose commits
+    /// are not the chain their ids claim gets no row: the merge-base walk
+    /// reads its block instead, and the publish goes on.
+    fn released_registry(records: &[HeldRecord<'_>]) -> crate::state::LineageRegistry {
+        match crate::state::LineageRegistry::of_released(records.iter().map(|held| held.commit)) {
+            Ok(registry) => registry,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "released commits are not the chain their ids claim; the merge-base walk \
+                     reads their blocks"
+                );
+                crate::state::LineageRegistry::default()
+            }
+        }
+    }
+
     /// The records [`Self::records_to_append`] chooses, for a test of what choosing them builds.
     #[cfg(test)]
     pub(crate) fn chosen_records_to_append<'a>(
@@ -922,9 +941,14 @@ impl GraphNamespacePublisher {
         Ok(())
     }
 
-    async fn merge_rows(&self, dataset: Dataset, rows: &ManifestRows) -> Result<Dataset> {
+    async fn merge_rows(
+        &self,
+        dataset: Dataset,
+        rows: &ManifestRows,
+        cold: Option<&crate::state::LineageRegistry>,
+    ) -> Result<Dataset> {
         fail(&PUBLISH_PRE_MERGE)?;
-        let (new_dataset, batch) = commit::overwrite(dataset, rows).await?;
+        let (new_dataset, batch) = commit::overwrite(dataset, rows, cold).await?;
         // The commit is durable and the graph is published; a failure here
         // models the acknowledgement being lost after that (RFC 0067). It is
         // an opaque error with no conflict details, so the publish loop's
@@ -1053,6 +1077,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         head,
                         buffer,
                         schema_contract,
+                        registry,
                         ..
                     },
             } = loaded;
@@ -1109,6 +1134,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     head,
                     buffer,
                     schema_contract: next_contract,
+                    registry,
                 };
                 let known_state =
                     rows.state(dataset.version().version, native_branch.as_deref())?;
@@ -1120,6 +1146,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     tables: rows.tables,
                     buffer: rows.buffer,
                     schema_contract: rows.schema_contract,
+                    registry: rows.registry,
                 });
             };
             if lineage.is_none() && !cfg!(any(test, feature = "test-util")) {
@@ -1160,6 +1187,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 native_branch.as_deref(),
             )?;
             known_state.schema_contract = next_contract.as_ref().map(|row| row.head.clone());
+            let mut registry = registry;
             let appended = match lineage {
                 Some(intent) => {
                     let read = HeldRows {
@@ -1169,6 +1197,10 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                     };
                     let (records, closed) =
                         Self::records_to_append(&read, native_branch.as_deref(), intent)?;
+                    registry.merge(&Self::released_registry(&records));
+                    if let Some(merged) = &intent.merged_parent {
+                        registry.merge(&merged.registry);
+                    }
                     match records.is_empty() {
                         true => None,
                         false => Some(
@@ -1184,7 +1216,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 }
                 None => None,
             };
-            let next = ManifestRows {
+            let mut next = ManifestRows {
                 schema_contract_head: next_contract.as_ref().map(|row| row.head.clone()),
                 buffer: buffer.after_publish(
                     lineage.map(|_| &head),
@@ -1199,9 +1231,11 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 tables: next_tables,
                 head: next_head,
                 schema_contract: next_contract,
+                registry,
             };
+            let cold = next.registry.cold_push();
 
-            match self.merge_rows(dataset.clone(), &next).await {
+            match self.merge_rows(dataset.clone(), &next, cold.as_ref()).await {
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
@@ -1220,6 +1254,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                         tables: next.tables,
                         buffer: next.buffer,
                         schema_contract: next.schema_contract,
+                        registry: next.registry,
                     });
                 }
                 Err(err) => {
@@ -1259,6 +1294,7 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                                             tables: next.tables,
                                             buffer: next.buffer,
                                             schema_contract: next.schema_contract,
+                                            registry: next.registry,
                                         });
                                     }
                                     if rows.head.graph_commit_id == next.head.graph_commit_id {
