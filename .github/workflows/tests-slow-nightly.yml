@@ -83,7 +83,10 @@ jobs:
             managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it \
             managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity \
             grouped_transfer_aggregation_streams_at_scale_issue_723 \
-            expand_projection_avoids_offset_overflow_scale_issue_703
+            expand_projection_avoids_offset_overflow_scale_issue_703 \
+            mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
+            hydration_chunks_stay_bounded_when_row_widths_step_up \
+            hydration_chunks_stay_bounded_when_wide_rows_interleave
           do
             filter="${filter:+$filter + }test(=$test_name)"
             owners+=(--passed "$test_name")

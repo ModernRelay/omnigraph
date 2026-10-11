@@ -1216,6 +1216,7 @@ fn doc_row(key: &str, payload_bytes: usize, fill: char) -> String {
 }
 
 #[tokio::test]
+#[ignore = "heavy-repro: 24 rows of 4 MiB after 4000 narrow rows through one fast-forward merge"]
 async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
     // Enough narrow rows that the plan ramps to cover the whole wide run in
     // one chunk when unguarded (~104 MiB retained without the hard charge).
@@ -1237,6 +1238,7 @@ async fn hydration_chunks_stay_bounded_when_row_widths_step_up() {
 }
 
 #[tokio::test]
+#[ignore = "heavy-repro: 30 rows of 4 MiB among 5970 narrow rows through one fast-forward merge"]
 async fn hydration_chunks_stay_bounded_when_wide_rows_interleave() {
     const ROWS: usize = 6_000;
 
