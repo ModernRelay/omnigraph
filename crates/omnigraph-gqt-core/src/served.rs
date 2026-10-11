@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use crate::{
     Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep, MAIN_BRANCH,
-    MergeExpect, MutateExpect, MutateStep, QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail,
-    WriteExpect, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
-    operation, step_kind, step_label, substitute,
+    MergeExpect, MutateExpect, MutateStep, ParamsInput, QueryExpect, QueryStep, Seed, ShowStep,
+    Step, StepFail, WriteExpect, check_error_expect, check_rows_json, expectation_evidence,
+    merge_outcome_word, operation, step_kind, step_label, substitute,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -196,6 +196,9 @@ async fn execute_served_inner<H: ExecutionHost>(
 /// instead of the process.
 const RESPONSE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Bytes of an undecodable response body a diagnostic repeats.
+const ECHO_LIMIT_BYTES: usize = 4 * 1024;
+
 /// The requests one served run sends: every one under `/graphs/{id}`, with
 /// the contract header and, when given, the bearer token.
 struct ServerClient {
@@ -272,17 +275,37 @@ impl ServerClient {
             return serde_json::from_slice(&body).map(Ok).map_err(|e| {
                 format!(
                     "server answered {status} with a body this runner cannot decode: {e}: {}",
-                    String::from_utf8_lossy(&body)
+                    self.echo(&body)
                 )
             });
         }
         let error: ErrorText = serde_json::from_slice(&body).map_err(|e| {
             format!(
                 "server answered {status} without an error body: {e}: {}",
-                String::from_utf8_lossy(&body)
+                self.echo(&body)
             )
         })?;
         Ok(Err(error.error))
+    }
+
+    /// An undecodable body as diagnostic text: the bearer token's raw and
+    /// JSON-escaped spellings redacted first, then the text cut to its bound.
+    fn echo(&self, body: &[u8]) -> String {
+        let mut text = String::from_utf8_lossy(body).into_owned();
+        if let Some(token) = self.token.as_deref().filter(|t| !t.is_empty()) {
+            let json = serde_json::to_string(token).expect("string encoding is infallible");
+            for spelling in [&json[1..json.len() - 1], token] {
+                text = text.replace(spelling, "<redacted>");
+            }
+        }
+        if text.len() <= ECHO_LIMIT_BYTES {
+            return text;
+        }
+        let mut end = ECHO_LIMIT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… ({} bytes, truncated)", &text[..end], body.len())
     }
 
     async fn post<Req: Serialize, Res: DeserializeOwned>(
@@ -296,6 +319,14 @@ impl ServerClient {
                 .json(body),
         )
         .await
+    }
+
+    /// Resolve after row materialization so the operation timer includes decoding.
+    async fn read(&self, request: &QueryRequest) -> Result<Result<Vec<Value>, String>, String> {
+        match self.post::<_, ReadOutput>("/query", request).await? {
+            Ok(output) => rows_of(&output).map(Ok),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     async fn get<Res: DeserializeOwned>(&self, route: &str) -> Result<Result<Res, String>, String> {
@@ -375,17 +406,20 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     }
 }
 
-/// The `--- params` body as it goes on the wire: the JSON the case spells,
-/// bindings substituted; the server holds it against the declaration, so a
-/// parameter error is the server's answer, never a local verdict.
+/// The `--- params` as they go on the wire: the JSON the case spells,
+/// bindings substituted, or a recipe's generated values; the server holds them
+/// against the declaration, so a parameter error is the server's answer, never
+/// a local verdict. A generated value travels in the request body, under the
+/// server's request limits.
 fn wire_params(
-    params_raw: Option<&String>,
+    params: Option<&ParamsInput>,
     binding: Option<(&str, &str)>,
 ) -> Result<Option<Value>, String> {
-    params_raw
-        .map(|raw| {
-            serde_json::from_str::<Value>(&substitute(raw, binding))
-                .map_err(|e| format!("params are not valid JSON: {e}"))
+    params
+        .map(|params| match params {
+            ParamsInput::Literal(raw) => serde_json::from_str::<Value>(&substitute(raw, binding))
+                .map_err(|e| format!("params are not valid JSON: {e}")),
+            ParamsInput::Generated(generated) => generated.generate(),
         })
         .transpose()
 }
@@ -405,7 +439,7 @@ fn check_read_expect(
     host: &impl ExecutionHost,
     label: &str,
     expect: &QueryExpect,
-    outcome: Result<ReadOutput, String>,
+    outcome: Result<Vec<Value>, String>,
     failed: &str,
     succeeded: &str,
     binding: Option<(&str, &str)>,
@@ -418,8 +452,7 @@ fn check_read_expect(
             span,
             shape,
         } => {
-            let output = outcome.map_err(|e| fail(format!("{failed}: {e}")))?;
-            let actual = rows_of(&output).map_err(&fail)?;
+            let actual = outcome.map_err(|e| fail(format!("{failed}: {e}")))?;
             host.observe(|| {
                 format!(
                     "shape: {} line(s) not judged under a server target",
@@ -465,14 +498,10 @@ async fn query(
         snapshot: None,
         settings: None,
     };
-    let outcome = operation(
-        host,
-        step.ordinal,
-        client.post::<_, ReadOutput>("/query", &request),
-    )
-    .await
-    .map_err(&fail)?
-    .map_err(&fail)?;
+    let outcome = operation(host, step.ordinal, client.read(&request))
+        .await
+        .map_err(&fail)?
+        .map_err(&fail)?;
     check_read_expect(
         host,
         &label,
@@ -774,7 +803,7 @@ async fn show(
 async fn statement(
     client: &ServerClient,
     text: &str,
-) -> Result<Result<ReadOutput, String>, String> {
+) -> Result<Result<Vec<Value>, String>, String> {
     let request = QueryRequest {
         query: text.to_string(),
         name: None,
@@ -783,5 +812,5 @@ async fn statement(
         snapshot: None,
         settings: None,
     };
-    client.post("/query", &request).await
+    client.read(&request).await
 }

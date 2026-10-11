@@ -47,7 +47,7 @@ field, `set` query parameter or `set` line naming one is refused.
 A setting reaches the engine through one of three doors:
 
 - CLI: `--set name=value`, repeatable, on `omnigraph query`, `mutate`,
-  `branch merge`, `commit changes` and `changes poll`; see the
+  `branch merge`, `commit changes` and `changes poll`, and direct `--store` loads; see the
   [CLI guide](../cli/index.md#session-settings).
 - HTTP body: the `settings` object on `POST /query`, `POST /mutate`,
   `POST /mutate/if-graph-commit` and `POST /branches/merge`, one key per
@@ -75,6 +75,7 @@ refuses startup; no default is substituted.
 | `ann_nprobes` | integer, at least `0` | `20` | request | `OMNIGRAPH_ANN_NPROBES` | the partition cap per index delta of a `nearest` scan; `0` is no cap |
 | `stage_write_concurrency` | integer `1..=64` | `8` | process | `OMNIGRAPH_LOAD_CONCURRENCY` | the width of the staged-write fan-out for `load` and `mutate` |
 | `traversal_work_limit` | integer `1..=9223372036854775807` | `1000000` | request | `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` | shared traversal row-work cap for statements containing alternatives or wildcard |
+| `write_max_bytes` | integer `1..=33554432` | `33554432` (32 MiB) | request | `OMNIGRAPH_WRITE_MAX_BYTES` | independent row-data and Blob-payload allowances for bounded writes; lowers the existing mutate, load and materializing branch-merge limits |
 | `history_release_bytes` | integer `1024..=262144` | `262144` | request | `OMNIGRAPH_HISTORY_RELEASE_BYTES` | the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of the session whose buffer and head reach it closes a history block, and the publish after it writes the block under `__history` (schema apply, branch create and delete, repair and upgrade publish under the production budget); a load reaches it only through the CLI or an embedded `Session`, since the HTTP load routes take no settings; query results never change, only the number of requests and files; production keeps the default, a caller may only lower it |
 
 For these statements the cap covers all traversals, including named and nested
@@ -99,6 +100,23 @@ Internal traversal pins used by the GQT harness can force indexed execution. A
 forced CSR pin is refused for statements with selections; there is no public
 `set traversal` setting.
 
+`write_max_bytes` applies to each existing write account: row data and Blob
+descriptors, logical Blob payloads, parser estimates and retained removed IDs.
+The accounts keep their existing per-table, per-operation or per-chunk scope.
+Row data and Blob payloads have separate allowances: a payload exactly at the
+limit can accompany a row whose metadata fits its own allowance. The value is
+captured once for an operation, including its retries and merge publication.
+A one-row keyed write costs about 1 to 3 KiB of row data from Arrow buffer
+rounding, so allowances below a few KiB refuse every write.
+
+The maximum is inclusive. A lower environment value is a process default,
+so a request may still select any valid value up to `33554432`. Embedded
+sessions and direct `--store` CLI loads can override it. HTTP load routes
+inherit the process default and accept no request setting; remote CLI loads
+refuse `--set`. HTTP bodies, Blob reads, compaction and external URI metadata
+retain their independent limits. Lower values can produce smaller merge
+chunks or reject a write that the default admits.
+
 `history_release_bytes` is measured against the branch's buffered commit and
 table-change rows as stored, plus the head whole; the row layout is in
 [storage versioning](../../dev/versioning.md#current-storage-contract). The
@@ -122,7 +140,7 @@ settings line's refusal as `ERROR line <n>, column <c>: <message>`.
 set merge_lineage = fast;
 error: unknown value `fast` for setting `merge_lineage`; expected one of off, on, verify
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
-error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, history_release_bytes
+error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, history_release_bytes
 set ann_nprobes = "many";
 error: setting `ann_nprobes` takes an integer of at least 0, got a string
 set stage_write_concurrency = 0;

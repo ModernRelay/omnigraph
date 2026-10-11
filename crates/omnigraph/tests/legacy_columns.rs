@@ -32,16 +32,31 @@ const LEGACY_DATA: &str = r#"{"type":"Person","data":{"id":"Alice","name":"Alice
 {"edge":"WorksAt","from":"Alice","to":"company-1","data":{"id":"works-alice","title":"engineer"}}
 {"edge":"WorksAt","id":"works-bob","from":"Bob","to":"company-1","data":{}}"#;
 
-#[tokio::test]
-async fn legacy_vintage_graph_works_end_to_end() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-
-    let db = helpers::session(
+/// A graph born with the legacy `id`/`src`/`dst` spellings.
+async fn init_legacy(uri: &str) -> Session {
+    helpers::session(
         Omnigraph::init_with_legacy_system_columns_for_tests(uri, LEGACY_SCHEMA)
             .await
             .unwrap(),
-    );
+    )
+}
+
+/// [`init_legacy`] with [`LEGACY_DATA`] loaded.
+async fn init_and_load_legacy(uri: &str) -> Session {
+    let db = init_legacy(uri).await;
+    db.load_jsonl(LEGACY_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+/// The persisted vintage, the Lance keys, the catalog spellings and the
+/// change images of a legacy-vintage graph; refused loads leave it unmoved.
+#[tokio::test]
+async fn legacy_vintage_graph_keeps_its_identity_and_change_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_legacy(uri).await;
 
     let ir: serde_json::Value = serde_json::from_str(
         &omnigraph_catalog::ManifestCoordinator::open(uri)
@@ -213,6 +228,15 @@ async fn legacy_vintage_graph_works_end_to_end() {
     assert_eq!(edge["from"], "Alice");
     assert_eq!(edge["to"], "company-1");
     assert!(edge["data"].get("id").is_none());
+}
+
+/// A legacy-vintage export re-imports byte-identically into a legacy-vintage
+/// graph and into a current-vintage one.
+#[tokio::test]
+async fn legacy_vintage_export_round_trips_into_both_vintages() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load_legacy(dir.path().to_str().unwrap()).await;
+    let exported = db.export_jsonl("main", &[]).await.unwrap();
     for legacy in [true, false] {
         let imported_dir = tempfile::tempdir().unwrap();
         let imported_uri = imported_dir.path().to_str().unwrap();
@@ -247,6 +271,17 @@ async fn legacy_vintage_graph_works_end_to_end() {
         );
         assert_eq!(imported.export_jsonl("main", &[]).await.unwrap(), exported);
     }
+}
+
+/// Reads, traversal, mutation, diff, evolution and a reopen all resolve the
+/// legacy spellings through the catalog.
+#[tokio::test]
+async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load_legacy(uri).await;
+    let loaded_version = version_main(&db).await.unwrap();
+    let loaded_commit = snapshot_id(&db, "main").await.unwrap();
 
     let people = read_table(&db, "node:Person").await;
     let mut ids = collect_column_strings(&people, "id");
@@ -538,80 +573,89 @@ edge WorksAt: Person -> Company {
 }
 
 #[tokio::test]
-async fn legacy_endpoint_constraints_keep_the_accepted_shape_hash() {
-    for constraint in ["@unique(src, dst)", "@key(src, dst)"] {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let source = format!(
-            "node Person {{ name: String @key }}\nedge Knows: Person -> Person {{\n since: I32?\n {constraint}\n @unique(dst, since)\n}}"
-        );
-        let db = helpers::session(
-            Omnigraph::init_with_legacy_system_columns_for_tests(uri, &source)
-                .await
-                .unwrap(),
-        );
-        let old_ir: omnigraph_compiler::SchemaIR = serde_json::from_str(
-            &omnigraph_catalog::ManifestCoordinator::open(uri)
-                .await
-                .unwrap()
-                .read_schema_contract()
-                .await
-                .unwrap()
-                .ir,
-        )
-        .unwrap();
-        let old_shape = omnigraph_compiler::compile_schema_shape(
-            &omnigraph_compiler::schema::parser::parse_persisted_schema_contract(&source).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            omnigraph_compiler::schema_shape_hash(&old_shape).unwrap(),
-            omnigraph_compiler::schema_shape_hash_from_ir(&old_ir).unwrap()
-        );
-        drop(db);
-        let db = helpers::session(Omnigraph::open(uri).await.unwrap());
-        db.load_jsonl(
-            r#"{"type":"Person","data":{"name":"alice"}}
+async fn legacy_unique_endpoint_constraint_keeps_the_accepted_shape_hash() {
+    legacy_endpoint_constraint_keeps_the_accepted_shape_hash("@unique(src, dst)").await;
+}
+
+#[tokio::test]
+async fn legacy_key_endpoint_constraint_keeps_the_accepted_shape_hash() {
+    legacy_endpoint_constraint_keeps_the_accepted_shape_hash("@key(src, dst)").await;
+}
+
+/// One persisted endpoint `constraint` over the legacy spellings: its shape
+/// hash matches the IR, the respelled evolution applies, a reopen reads it.
+async fn legacy_endpoint_constraint_keeps_the_accepted_shape_hash(constraint: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let source = format!(
+        "node Person {{ name: String @key }}\nedge Knows: Person -> Person {{\n since: I32?\n {constraint}\n @unique(dst, since)\n}}"
+    );
+    let db = helpers::session(
+        Omnigraph::init_with_legacy_system_columns_for_tests(uri, &source)
+            .await
+            .unwrap(),
+    );
+    let old_ir: omnigraph_compiler::SchemaIR = serde_json::from_str(
+        &omnigraph_catalog::ManifestCoordinator::open(uri)
+            .await
+            .unwrap()
+            .read_schema_contract()
+            .await
+            .unwrap()
+            .ir,
+    )
+    .unwrap();
+    let old_shape = omnigraph_compiler::compile_schema_shape(
+        &omnigraph_compiler::schema::parser::parse_persisted_schema_contract(&source).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        omnigraph_compiler::schema_shape_hash(&old_shape).unwrap(),
+        omnigraph_compiler::schema_shape_hash_from_ir(&old_ir).unwrap()
+    );
+    drop(db);
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"alice"}}
 {"type":"Person","data":{"name":"bob"}}
 {"edge":"Knows","from":"alice","to":"bob","data":{"since":2020}}"#,
-            LoadMode::Overwrite,
-        )
-        .await
-        .unwrap();
-        let desired = source
-            .replace("src", "@src")
-            .replace("dst", "@dst")
-            .replace("since: I32?", "since: I32?\n label: String?");
-        assert!(db.plan_schema(&desired).await.unwrap().supported);
-        db.apply_schema(&desired).await.unwrap();
-        if constraint.starts_with("@unique") {
-            let before = version_main(&db).await.unwrap();
-            let head = snapshot_id(&db, "main").await.unwrap();
-            let error = db.load_jsonl(r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#, LoadMode::Append).await.unwrap_err();
-            assert!(
-                error.to_string().to_lowercase().contains("unique"),
-                "{error}"
-            );
-            assert_eq!(version_main(&db).await.unwrap(), before);
-            assert_eq!(snapshot_id(&db, "main").await.unwrap(), head);
-            assert_eq!(count_rows(&db, "edge:Knows").await, 1);
-        }
-        for file in [
-            "_schema.pg.staging",
-            "_schema.ir.json.staging",
-            "__schema_state.json.staging",
-        ] {
-            assert!(!dir.path().join(file).exists());
-        }
-        drop(db);
-        let db = helpers::session(Omnigraph::open(uri).await.unwrap());
-        let result = query_main(&db,
-            "query endpoints() { match { $p: Person\n        $p $e:knows $f } return { min($e.@src), max($e.@dst) } }",
-            "endpoints", &ParamMap::new()).await.unwrap();
-        assert_eq!(
-            collect_column_strings(result.batches(), "e.@src"),
-            ["alice"]
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let desired = source
+        .replace("src", "@src")
+        .replace("dst", "@dst")
+        .replace("since: I32?", "since: I32?\n label: String?");
+    assert!(db.plan_schema(&desired).await.unwrap().supported);
+    db.apply_schema(&desired).await.unwrap();
+    if constraint.starts_with("@unique") {
+        let before = version_main(&db).await.unwrap();
+        let head = snapshot_id(&db, "main").await.unwrap();
+        let error = db.load_jsonl(r#"{"edge":"Knows","id":"duplicate","from":"alice","to":"bob","data":{"since":2021}}"#, LoadMode::Append).await.unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("unique"),
+            "{error}"
         );
-        assert_eq!(collect_column_strings(result.batches(), "e.@dst"), ["bob"]);
+        assert_eq!(version_main(&db).await.unwrap(), before);
+        assert_eq!(snapshot_id(&db, "main").await.unwrap(), head);
+        assert_eq!(count_rows(&db, "edge:Knows").await, 1);
     }
+    for file in [
+        "_schema.pg.staging",
+        "_schema.ir.json.staging",
+        "__schema_state.json.staging",
+    ] {
+        assert!(!dir.path().join(file).exists());
+    }
+    drop(db);
+    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
+    let result = query_main(&db,
+        "query endpoints() { match { $p: Person\n        $p $e:knows $f } return { min($e.@src), max($e.@dst) } }",
+        "endpoints", &ParamMap::new()).await.unwrap();
+    assert_eq!(
+        collect_column_strings(result.batches(), "e.@src"),
+        ["alice"]
+    );
+    assert_eq!(collect_column_strings(result.batches(), "e.@dst"), ["bob"]);
 }

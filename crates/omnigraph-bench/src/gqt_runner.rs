@@ -3,7 +3,11 @@
 use crate::case::Backend;
 use crate::counting::LogicalCallCounter;
 use crate::dataset_cache::DatasetManifestV1;
-use crate::gqt_case::{BoundGqt, DatasetBuildPlan, PlannedGqt};
+use crate::gqt_case::{
+    BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
+};
+use crate::gqt_evidence::{PreparationProofV2, RepetitionInputV2};
+use crate::gqt_served::{ServedInput, ServerDeploymentReceiptV1};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
 use crate::reset::{MetadataDigest, PhysicalDigest, TraversalLimits, verify_metadata_shape};
 use crate::runner::{
@@ -85,15 +89,22 @@ pub struct GqtMergeEvidence {
 #[serde(deny_unknown_fields)]
 pub struct GqtRepObservation {
     pub repetition: u32,
-    pub input_physical_digest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_physical_digest_sha256: Option<String>,
     pub elapsed_us: u64,
     pub peak_rss_bytes: Option<u64>,
     pub outcome: String,
-    pub logical_store_calls: LogicalStoreCallObservation,
-    pub control_store_calls: ControlCallObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_store_calls: Option<LogicalStoreCallObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_store_calls: Option<ControlCallObservation>,
     pub steps: Vec<GqtStepObservation>,
     pub verification: GqtVerification,
     pub merge: Option<GqtMergeEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_receipt_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_peak_rss_bytes: Option<u64>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -102,6 +113,7 @@ pub struct RunOptions {
     pub dataset_cache: Option<PathBuf>,
     pub no_build: bool,
     pub fixture_bindings: Vec<String>,
+    pub served: Option<ServedInput>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunExecution {
@@ -112,11 +124,17 @@ pub struct RunExecution {
     pub point_name: String,
     pub requested_repetitions: u32,
     pub bound: BoundGqt,
+    /// The repetition worker build: client evidence for a served target.
     pub build: BuildEvidence,
     pub machine: crate::machine::MachineIdentityV1,
-    pub environment: crate::environment::LocalEnvironmentEvidence,
-    pub fixture: DatasetManifestV1,
-    pub dataset_cache_hit: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::environment::LocalEnvironmentEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<DatasetManifestV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset_cache_hit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_receipt: Option<ServerDeploymentReceiptV1>,
     pub samples: Vec<GqtRepObservation>,
     pub wall_clock: WallClockSummary,
     pub durable_record: bool,
@@ -148,11 +166,20 @@ fn generation(uri: &str, guarded: bool) -> RunnerResult<Generation> {
         gate,
     })
 }
-struct HostState {
+struct LocalInstrumentation {
+    root: PathBuf,
+    uri: String,
+    metadata: MetadataDigest,
     generation: Generation,
+    baseline: Option<ControlSnapshot>,
+    manifest: LogicalCallCounter,
+    table: LogicalCallCounter,
+    merge_probes: MergeWriteProbes,
+}
+struct HostState {
+    local: Option<LocalInstrumentation>,
     current: usize,
     started: Option<(usize, Instant)>,
-    baseline: Option<ControlSnapshot>,
     elapsed: Option<u64>,
     logical: Option<LogicalStoreCallObservation>,
     control: Option<ControlCallObservation>,
@@ -167,18 +194,34 @@ struct HostState {
     settled: bool,
     merge: Option<GqtMergeEvidence>,
 }
+impl HostState {
+    fn new(local: Option<LocalInstrumentation>) -> Self {
+        Self {
+            local,
+            current: 0,
+            started: None,
+            elapsed: None,
+            logical: None,
+            control: None,
+            steps: Vec::new(),
+            occurrences: BTreeMap::new(),
+            prefix_reads: 0,
+            assertions: 0,
+            following: 0,
+            selected_assertion: false,
+            error: None,
+            ready: false,
+            settled: false,
+            merge: None,
+        }
+    }
+}
 struct BenchHost<'a, S> {
     signals: Mutex<&'a mut S>,
     state: Mutex<HostState>,
     selected: usize,
     kinds: BTreeMap<usize, StepKind>,
-    root: &'a Path,
-    uri: &'a str,
-    metadata: &'a MetadataDigest,
     expected_reads: u32,
-    manifest: LogicalCallCounter,
-    table: LogicalCallCounter,
-    merge_probes: MergeWriteProbes,
     attribution: crate::case::Attribution,
 }
 fn failure(message: impl std::fmt::Display) -> RunnerError {
@@ -187,16 +230,21 @@ fn failure(message: impl std::fmt::Display) -> RunnerError {
 impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
     fn start(&self, ordinal: usize) -> RunnerResult<()> {
         let mut state = self.state.lock().unwrap();
-        let kind = self
+        let kind = *self
             .kinds
             .get(&ordinal)
             .ok_or_else(|| failure("unknown operation ordinal"))?;
         if state.started.is_some() {
             return Err(failure("overlapping operation callbacks"));
         }
-        if *kind == StepKind::Restart {
-            if state.elapsed.is_none() {
-                state
+        let preparing = state.elapsed.is_none();
+        if kind == StepKind::Restart {
+            let local = state
+                .local
+                .as_mut()
+                .ok_or_else(|| failure("served restart is unsupported"))?;
+            if preparing {
+                local
                     .generation
                     .gate
                     .as_ref()
@@ -204,33 +252,37 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
                     .validate_preparation()
                     .map_err(failure)?;
             }
-            state.generation = generation(self.uri, state.elapsed.is_none())?;
+            local.generation = generation(&local.uri, preparing)?;
         }
         if ordinal == self.selected {
-            if state.elapsed.is_some() {
+            if !preparing {
                 return Err(failure("selected operation executed more than once"));
             }
             if state.prefix_reads != self.expected_reads {
                 return Err(failure(
-                    "prefix read did not execute an engine operation; cache treatment is unproved",
+                    "prefix read did not execute an operation; cache treatment is unproved",
                 ));
             }
-            verify_metadata_shape(self.root, self.metadata, TraversalLimits::default())
-                .map_err(|e| failure(e.to_string()))?;
+            if let Some(local) = &state.local {
+                verify_metadata_shape(&local.root, &local.metadata, TraversalLimits::default())
+                    .map_err(failure)?;
+            }
             self.signals.lock().unwrap().ready()?;
             state.ready = true;
-            if self.manifest.take().has_mutations() || self.table.take().has_mutations() {
-                return Err(failure("Lance mutation occurred before selected operation"));
-            }
-            state.baseline = Some(ControlSnapshot::read(&state.generation.counts));
-            if *kind != StepKind::Restart {
-                state
-                    .generation
-                    .gate
-                    .as_ref()
-                    .ok_or_else(|| failure("missing preparation gate"))?
-                    .begin_measurement()
-                    .map_err(failure)?;
+            if let Some(local) = &mut state.local {
+                if local.manifest.take().has_mutations() || local.table.take().has_mutations() {
+                    return Err(failure("Lance mutation occurred before selected operation"));
+                }
+                local.baseline = Some(ControlSnapshot::read(&local.generation.counts));
+                if kind != StepKind::Restart {
+                    local
+                        .generation
+                        .gate
+                        .as_ref()
+                        .ok_or_else(|| failure("missing preparation gate"))?
+                        .begin_measurement()
+                        .map_err(failure)?;
+                }
             }
         } else if ordinal < self.selected && matches!(kind, StepKind::Query | StepKind::BranchList)
         {
@@ -264,32 +316,42 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
         });
         if ordinal == self.selected {
             state.elapsed = Some(elapsed);
-            state.logical = Some(LogicalStoreCallObservation {
-                manifest: self.manifest.take(),
-                table: self.table.take(),
-                physical_attempts_observed: false,
-            });
-            state.control = Some(
-                state
+            if let Some(local) = &mut state.local {
+                let logical = LogicalStoreCallObservation {
+                    manifest: local.manifest.take(),
+                    table: local.table.take(),
+                    physical_attempts_observed: false,
+                };
+                let control = local
                     .baseline
                     .take()
                     .ok_or_else(|| failure("missing counter baseline"))?
-                    .delta(ControlSnapshot::read(&state.generation.counts))?,
-            );
-            if self.kinds[&ordinal] == StepKind::BranchMerge
-                && self.attribution == crate::case::Attribution::PerPhase
-            {
-                state.merge = Some(GqtMergeEvidence {
-                    phases: crate::runner::phase_observations(
-                        self.merge_probes.merge_timing_snapshot(),
-                    ),
-                    route: crate::runner::MergeRouteObservation::from_probes(&self.merge_probes),
-                });
+                    .delta(ControlSnapshot::read(&local.generation.counts))?;
+                let merge = if self.kinds[&ordinal] == StepKind::BranchMerge
+                    && self.attribution == crate::case::Attribution::PerPhase
+                {
+                    Some(GqtMergeEvidence {
+                        phases: crate::runner::phase_observations(
+                            local.merge_probes.merge_timing_snapshot(),
+                        ),
+                        route: crate::runner::MergeRouteObservation::from_probes(
+                            &local.merge_probes,
+                        ),
+                    })
+                } else {
+                    None
+                };
+                state.logical = Some(logical);
+                state.control = Some(control);
+                state.merge = merge;
             }
             self.signals.lock().unwrap().settled(elapsed)?;
             state.settled = true;
             if self.kinds[&ordinal] == StepKind::Restart {
                 state
+                    .local
+                    .as_ref()
+                    .ok_or_else(|| failure("served restart is unsupported"))?
                     .generation
                     .gate
                     .as_ref()
@@ -349,8 +411,20 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
         uri: &'a str,
         _: Option<Arc<dyn StorageAdapter>>,
     ) -> BoxFuture<'a, Result<Omnigraph, OmniError>> {
-        let storage = self.state.lock().unwrap().generation.storage.clone();
-        async move { Omnigraph::open_with_storage(uri, storage).await }.boxed()
+        let storage = self
+            .state
+            .lock()
+            .unwrap()
+            .local
+            .as_ref()
+            .map(|l| l.generation.storage.clone());
+        async move {
+            let storage = storage.ok_or_else(|| {
+                OmniError::Io(std::io::Error::other("served restart is unsupported"))
+            })?;
+            Omnigraph::open_with_storage(uri, storage).await
+        }
+        .boxed()
     }
 }
 pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
@@ -393,33 +467,18 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
                 .into_iter()
                 .map(|s| (s.ordinal, s.kind))
                 .collect(),
-            root,
-            uri,
-            metadata,
             expected_reads: bound.plan.cache_condition.iterations,
-            manifest,
-            table,
-            merge_probes: merge_probes.clone(),
             attribution: bound.plan.definition.protocol.attribution,
-            state: Mutex::new(HostState {
+            state: Mutex::new(HostState::new(Some(LocalInstrumentation {
+                root: root.into(),
+                uri: uri.into(),
+                metadata: metadata.clone(),
                 generation,
-                current: 0,
-                started: None,
                 baseline: None,
-                elapsed: None,
-                logical: None,
-                control: None,
-                steps: Vec::new(),
-                occurrences: BTreeMap::new(),
-                prefix_reads: 0,
-                assertions: 0,
-                following: 0,
-                selected_assertion: false,
-                error: None,
-                ready: false,
-                settled: false,
-                merge: None,
-            }),
+                manifest,
+                table,
+                merge_probes: merge_probes.clone(),
+            }))),
         };
         let executed = execute_steps(
             &case,
@@ -445,82 +504,125 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
         .await
         .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()));
 
-        let mut state = host.state.lock().unwrap();
-        let error = state.error.take().or_else(|| {
-            result
-                .as_ref()
-                .err()
-                .map(|message| RunnerError::new(stage_code(&state), message))
-        });
-        drop(result);
-        if let Some(mut error) = error {
-            if state.settled {
-                if let (Some(elapsed), Some(logical), Some(control)) =
-                    (state.elapsed, state.logical.take(), state.control.take())
-                {
-                    error.context.gqt_settled_sample = Some(Box::new(GqtRepObservation {
-                        repetition,
-                        input_physical_digest_sha256: input.digest_sha256.clone(),
-                        elapsed_us: elapsed,
-                        peak_rss_bytes: None,
-                        outcome: "verification-failed".into(),
-                        logical_store_calls: logical,
-                        control_store_calls: control,
-                        steps: std::mem::take(&mut state.steps),
-                        verification: GqtVerification {
-                            selected_assertion_passed: state.selected_assertion,
-                            assertions_passed: state.assertions,
-                            following_assertions: state.following,
-                        },
-                        merge: state.merge.take(),
-                    }));
-                }
-            }
-            return Err(error);
-        }
-        let sample = GqtRepObservation {
+        finish_execution(
+            &host,
+            result.map(|_| ()),
+            bound,
             repetition,
-            input_physical_digest_sha256: input.digest_sha256.clone(),
-            elapsed_us: state
-                .elapsed
-                .ok_or_else(|| failure("selected operation never reached the engine"))?,
-            peak_rss_bytes: None,
-            outcome: "expectations-passed".into(),
-            logical_store_calls: state
-                .logical
-                .take()
-                .ok_or_else(|| failure("missing logical counters"))?,
-            control_store_calls: state
-                .control
-                .take()
-                .ok_or_else(|| failure("missing control counters"))?,
-            steps: std::mem::take(&mut state.steps),
-            merge: state.merge.take(),
-            verification: GqtVerification {
-                selected_assertion_passed: state.selected_assertion,
-                assertions_passed: state.assertions,
-                following_assertions: state.following,
+            &PreparationProofV2::Embedded {
+                physical_digest: input.clone(),
+                metadata_digest: metadata.clone(),
             },
-        };
-        if let Err(error) =
-            validate_sample(&sample, bound, repetition, input, sample.elapsed_us, false)
-        {
-            let mut sample = sample;
-            sample.outcome = "verification-failed".into();
-            return Err(
-                RunnerError::new("gqt_verification_failed", error.to_string())
-                    .with_gqt_settled_sample(sample),
-            );
-        }
-        Ok(sample)
+        )
     })
     .await
+}
+
+pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
+    repetition: u32,
+    bound: &BoundGqt,
+    input: &ServedInput,
+    signals: &mut S,
+) -> RunnerResult<GqtRepObservation> {
+    bound.revalidate().map_err(failure)?;
+    input.validate(bound).map_err(failure)?;
+    if bound.identity.environment.target != Target::Server {
+        return Err(failure("served input requires a server point"));
+    }
+    let case = bound.plan.queries.parse().map_err(failure)?;
+    let host = BenchHost {
+        signals: Mutex::new(signals),
+        selected: bound.plan.definition.workload.measured_step.ordinal,
+        kinds: case
+            .steps()
+            .into_iter()
+            .map(|s| (s.ordinal, s.kind))
+            .collect(),
+        expected_reads: bound.plan.cache_condition.iterations,
+        attribution: bound.plan.definition.protocol.attribution,
+        state: Mutex::new(HostState::new(None)),
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(case.runner.timeout_ms),
+        omnigraph_gqt_core::execute_steps_served(&case, &input.target, &host),
+    )
+    .await
+    .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()))
+    .map_err(|message| crate::gqt_served::redact_error(message, input.target.token.as_deref()));
+    let proof = PreparationProofV2::Served {
+        server_receipt_sha256: input.receipt.digest().map_err(failure)?,
+    };
+    finish_execution(&host, result, bound, repetition, &proof)
+}
+
+fn finish_execution<S: MeasurementSignals + Send>(
+    host: &BenchHost<'_, S>,
+    result: Result<(), String>,
+    bound: &BoundGqt,
+    repetition: u32,
+    proof: &PreparationProofV2,
+) -> RunnerResult<GqtRepObservation> {
+    let mut state = host.state.lock().unwrap();
+    let error = state.error.take().or_else(|| {
+        result
+            .err()
+            .map(|message| RunnerError::new(stage_code(&state), message))
+    });
+    let Some(elapsed_us) = state.elapsed else {
+        return Err(error.unwrap_or_else(|| failure("selected operation never executed")));
+    };
+    let (physical, receipt) = match proof {
+        PreparationProofV2::Embedded {
+            physical_digest, ..
+        } => (Some(physical_digest.digest_sha256.clone()), None),
+        PreparationProofV2::Served {
+            server_receipt_sha256,
+        } => (None, Some(server_receipt_sha256.clone())),
+    };
+    let mut sample = GqtRepObservation {
+        repetition,
+        input_physical_digest_sha256: physical,
+        elapsed_us,
+        peak_rss_bytes: None,
+        outcome: if error.is_some() {
+            "verification-failed"
+        } else {
+            "expectations-passed"
+        }
+        .into(),
+        logical_store_calls: state.logical.take(),
+        control_store_calls: state.control.take(),
+        steps: std::mem::take(&mut state.steps),
+        merge: state.merge.take(),
+        verification: GqtVerification {
+            selected_assertion_passed: state.selected_assertion,
+            assertions_passed: state.assertions,
+            following_assertions: state.following,
+        },
+        server_receipt_sha256: receipt,
+        client_peak_rss_bytes: None,
+    };
+    if let Some(error) = error {
+        return Err(if state.settled {
+            error.with_gqt_settled_sample(sample)
+        } else {
+            error
+        });
+    }
+    if let Err(error) = validate_sample(&sample, bound, repetition, proof, elapsed_us, false) {
+        sample.outcome = "verification-failed".into();
+        return Err(
+            RunnerError::new("gqt_verification_failed", error.to_string())
+                .with_gqt_settled_sample(sample),
+        );
+    }
+    Ok(sample)
 }
 pub(crate) fn validate_sample(
     sample: &GqtRepObservation,
     bound: &BoundGqt,
     repetition: u32,
-    input: &PhysicalDigest,
+    input: &PreparationProofV2,
     elapsed: u64,
     parent: bool,
 ) -> RunnerResult<()> {
@@ -530,7 +632,7 @@ pub(crate) fn validate_failed_sample(
     sample: &GqtRepObservation,
     bound: &BoundGqt,
     repetition: u32,
-    input: &PhysicalDigest,
+    input: &PreparationProofV2,
     elapsed: u64,
 ) -> RunnerResult<()> {
     validate_evidence(sample, bound, repetition, input, elapsed, false, true)
@@ -539,11 +641,18 @@ fn validate_evidence(
     sample: &GqtRepObservation,
     bound: &BoundGqt,
     repetition: u32,
-    input: &PhysicalDigest,
+    input: &PreparationProofV2,
     elapsed: u64,
     parent: bool,
     failed: bool,
 ) -> RunnerResult<()> {
+    if !matches!(
+        (input, bound.identity.environment.target),
+        (PreparationProofV2::Embedded { .. }, Target::Engine)
+            | (PreparationProofV2::Served { .. }, Target::Server)
+    ) {
+        return Err(failure("sample proof target mismatch"));
+    }
     let selected = bound.plan.definition.workload.measured_step.ordinal;
     let receipts: Vec<_> = sample
         .steps
@@ -551,7 +660,6 @@ fn validate_evidence(
         .filter(|s| s.ordinal == selected)
         .collect();
     if sample.repetition != repetition
-        || sample.input_physical_digest_sha256 != input.digest_sha256
         || sample.elapsed_us != elapsed
         || sample.outcome
             != if failed {
@@ -566,8 +674,7 @@ fn validate_evidence(
             && (!sample.verification.selected_assertion_passed
                 || sample.verification.following_assertions == 0
                 || sample.verification.assertions_passed < 2))
-        || sample.logical_store_calls.physical_attempts_observed
-        || sample.peak_rss_bytes.is_some() != parent
+        || !sample_evidence_matches(sample, input, parent)
     {
         return Err(failure(
             "GQT sample evidence disagrees with the admitted operation",
@@ -579,13 +686,17 @@ fn validate_evidence(
         .into_iter()
         .map(|s| (s.ordinal, s.kind))
         .collect();
-    crate::record::validate_call_totals(
-        repetition as usize,
-        sample.logical_store_calls.manifest,
-        sample.logical_store_calls.table,
-        &sample.control_store_calls,
-    )
-    .map_err(failure)?;
+    if let (Some(logical), Some(control)) =
+        (&sample.logical_store_calls, &sample.control_store_calls)
+    {
+        crate::record::validate_call_totals(
+            repetition as usize,
+            logical.manifest,
+            logical.table,
+            control,
+        )
+        .map_err(failure)?;
+    }
     validate_merge_evidence(
         sample.merge.as_ref(),
         kinds[&selected],
@@ -614,10 +725,58 @@ fn validate_evidence(
     Ok(())
 }
 
+pub(crate) fn sample_evidence_matches(
+    sample: &GqtRepObservation,
+    input: &PreparationProofV2,
+    parent: bool,
+) -> bool {
+    let rss_matches = |rss: Option<u64>| {
+        if parent {
+            rss.is_some_and(|n| n > 0)
+        } else {
+            rss.is_none()
+        }
+    };
+    match input {
+        PreparationProofV2::Embedded {
+            physical_digest, ..
+        } => {
+            sample.input_physical_digest_sha256.as_ref() == Some(&physical_digest.digest_sha256)
+                && sample
+                    .logical_store_calls
+                    .as_ref()
+                    .is_some_and(|c| !c.physical_attempts_observed)
+                && sample.control_store_calls.is_some()
+                && sample.server_receipt_sha256.is_none()
+                && sample.client_peak_rss_bytes.is_none()
+                && rss_matches(sample.peak_rss_bytes)
+        }
+        PreparationProofV2::Served {
+            server_receipt_sha256,
+        } => {
+            sample.server_receipt_sha256.as_ref() == Some(server_receipt_sha256)
+                && sample.input_physical_digest_sha256.is_none()
+                && sample.logical_store_calls.is_none()
+                && sample.control_store_calls.is_none()
+                && sample.peak_rss_bytes.is_none()
+                && sample.merge.is_none()
+                && rss_matches(sample.client_peak_rss_bytes)
+                && sample.steps.iter().all(|s| {
+                    SERVED_READ_KINDS
+                        .into_iter()
+                        .any(|kind| GqtOperationKind::from(kind) == s.kind)
+                })
+        }
+    }
+}
+
 pub async fn execute_suite(
     suite: &crate::suite::ResolvedSuite,
     options: &RunOptions,
 ) -> RunnerResult<SuiteExecution> {
+    for run in &suite.runs {
+        validate_run_options(run.case.gqt().map_err(failure)?, options)?;
+    }
     let mut runs = Vec::new();
     let mut identities = std::collections::BTreeSet::new();
     for run in &suite.runs {
@@ -715,16 +874,16 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
     };
     let sample = GqtRepObservation {
         repetition: u32::MAX,
-        input_physical_digest_sha256: "0".repeat(64),
+        input_physical_digest_sha256: Some("0".repeat(64)),
         elapsed_us: u64::MAX,
         peak_rss_bytes: Some(u64::MAX),
         outcome: "expectations-passed".into(),
-        logical_store_calls: LogicalStoreCallObservation {
+        logical_store_calls: Some(LogicalStoreCallObservation {
             manifest: counts,
             table: counts,
             physical_attempts_observed: false,
-        },
-        control_store_calls: ControlCallObservation {
+        }),
+        control_store_calls: Some(ControlCallObservation {
             read_text: u64::MAX,
             read_text_if_exists: u64::MAX,
             read_text_versioned: u64::MAX,
@@ -733,7 +892,9 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
             mutation_calls: u64::MAX,
             write_text: u64::MAX,
             delete: u64::MAX,
-        },
+        }),
+        server_receipt_sha256: Some("0".repeat(64)),
+        client_peak_rss_bytes: Some(u64::MAX),
         steps,
         verification: GqtVerification {
             selected_assertion_passed: false,
@@ -782,6 +943,7 @@ pub async fn execute_run(
     crate::runner::refuse_unmodeled_runtime_overrides()?;
     let plan = run.case.gqt().map_err(failure)?.clone();
     plan.revalidate().map_err(failure)?;
+    validate_run_options(&plan, options)?;
     if run.repetitions == 0 || run.repetitions > crate::suite::MAX_REPETITIONS_PER_CASE {
         return Err(failure("invalid repetition count"));
     }
@@ -805,6 +967,9 @@ fn execute_owned(
     plan: PlannedGqt,
     options: RunOptions,
 ) -> RunnerResult<RunExecution> {
+    if let Some(input) = &options.served {
+        return execute_served_owned(run, plan, &options, input);
+    }
     let cache = options
         .dataset_cache
         .clone()
@@ -835,7 +1000,7 @@ fn execute_owned(
     crate::gqt_supervisor::preflight_plan(&plan, &cache.canonicalize().map_err(failure)?)?;
     let binding = binding(&plan.dataset, &options.fixture_bindings)?;
     let lease = crate::dataset_cache::acquire(
-        &plan.dataset_build_plan(),
+        &plan.dataset_build_plan().map_err(failure)?,
         &cache,
         &worker.executable,
         options.no_build,
@@ -859,14 +1024,16 @@ fn execute_owned(
                 worker_executable: worker.executable.clone(),
                 expected_worker_executable_sha256: worker.executable_sha256.clone(),
                 expected_machine: machine.clone(),
-                fixture_manifest_sha256: crate::model::typed_sha256(&lease.manifest)
-                    .map_err(|e| failure(e.to_string()))?,
                 repetition,
                 case: bound.clone(),
-                repetition_root: lease.active.clone(),
                 worker_scratch_root: scratch.clone(),
-                physical_digest: lease.physical().clone(),
-                metadata_digest: metadata,
+                execution: RepetitionInputV2::Embedded {
+                    fixture_manifest_sha256: crate::model::typed_sha256(&lease.manifest)
+                        .map_err(failure)?,
+                    repetition_root: lease.active.clone(),
+                    physical_digest: lease.physical().clone(),
+                    metadata_digest: metadata.clone(),
+                },
                 deadline: plan
                     .definition
                     .protocol
@@ -881,7 +1048,10 @@ fn execute_owned(
                         &observed.sample,
                         &bound,
                         repetition,
-                        lease.physical(),
+                        &PreparationProofV2::Embedded {
+                            physical_digest: lease.physical().clone(),
+                            metadata_digest: metadata.clone(),
+                        },
                         observed.sample.elapsed_us,
                         true,
                     )?;
@@ -917,18 +1087,7 @@ fn execute_owned(
             .err()
             .unwrap_or_else(|| failure("empty acquisition")));
     }
-    let mut times: Vec<_> = samples.iter().map(|s| s.elapsed_us).collect();
-    times.sort_unstable();
-    let count = times.len();
-    let p95_supported = count >= 20;
-    let wall_clock = WallClockSummary {
-        observed_repetitions: count as u32,
-        min_us: times[0],
-        p50_us: times[(count - 1) / 2],
-        max_us: times[count - 1],
-        p95_us: p95_supported.then(|| times[(count * 95).div_ceil(100) - 1]),
-        p95_supported,
-    };
+    let wall_clock = summarize_wall_clock(&samples);
     let execution = RunExecution {
         runner_output_version: 1,
         case_id: plan.definition.id.clone(),
@@ -939,9 +1098,10 @@ fn execute_owned(
         bound,
         build: crate::runner::build_evidence(build.as_ref())?,
         machine: machine.ok_or_else(|| failure("no worker identity"))?,
-        environment,
-        fixture: lease.manifest.clone(),
-        dataset_cache_hit: lease.cache_hit,
+        environment: Some(environment),
+        fixture: Some(lease.manifest.clone()),
+        dataset_cache_hit: Some(lease.cache_hit),
+        server_receipt: None,
         samples,
         wall_clock,
         durable_record: false,
@@ -952,6 +1112,169 @@ fn execute_owned(
             error.context.gqt_partial_run = Some(Box::new(execution));
             Err(error)
         }
+    }
+}
+
+pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerResult<()> {
+    plan.revalidate().map_err(failure)?;
+    match (plan.definition.environment.target, &options.served) {
+        (Target::Engine, None) => Ok(()),
+        (Target::Server, Some(input)) => {
+            if options.no_build || !options.fixture_bindings.is_empty() {
+                return Err(failure(
+                    "served graphs are pre-provisioned; local dataset acquisition options do not apply",
+                ));
+            }
+            let bound = input.receipt.bind(plan).map_err(failure)?;
+            input.validate(&bound).map_err(failure)
+        }
+        _ => Err(failure(
+            "server scenarios require exactly one matching server target and deployment receipt; embedded scenarios refuse them",
+        )),
+    }
+}
+
+fn execute_served_owned(
+    run: crate::suite::ResolvedRun,
+    plan: PlannedGqt,
+    options: &RunOptions,
+    input: &ServedInput,
+) -> RunnerResult<RunExecution> {
+    let bound = input.receipt.bind(&plan).map_err(failure)?;
+    input.validate(&bound).map_err(failure)?;
+    let scratch = options
+        .scratch_root
+        .as_ref()
+        .or(options.dataset_cache.as_ref())
+        .ok_or_else(|| failure("served acquisition requires a client scratch directory"))?;
+    std::fs::create_dir_all(scratch).map_err(failure)?;
+    let scratch = scratch.canonicalize().map_err(failure)?;
+    let workspace = tempfile::Builder::new()
+        .prefix("gqt-served-")
+        .tempdir_in(scratch)
+        .map_err(failure)?;
+    let worker = crate::runner::stage_bound_worker(
+        crate::runner::resolve_bound_worker(
+            options
+                .worker_executable
+                .as_deref()
+                .ok_or_else(|| failure("worker executable required"))?,
+        )?,
+        workspace.path(),
+    )?;
+    let execution_input = RepetitionInputV2::Served {
+        input: Box::new(input.clone()),
+    };
+    let proof = execution_input.proof().map_err(failure)?;
+    let mut samples = Vec::new();
+    let mut machine = None;
+    let mut build = None;
+    let mut contained = true;
+    let acquisition = (|| -> RunnerResult<()> {
+        for repetition in 1..=run.repetitions {
+            let worker_scratch_root = workspace
+                .path()
+                .join(format!("worker-scratch-{repetition:08}"));
+            std::fs::create_dir(&worker_scratch_root).map_err(failure)?;
+            let observed = crate::gqt_supervisor::supervise_repetition(
+                crate::gqt_supervisor::SupervisionInput {
+                    worker_executable: worker.executable.clone(),
+                    expected_worker_executable_sha256: worker.executable_sha256.clone(),
+                    expected_machine: machine.clone(),
+                    repetition,
+                    case: bound.clone(),
+                    execution: execution_input.clone(),
+                    worker_scratch_root: worker_scratch_root.clone(),
+                    deadline: plan
+                        .definition
+                        .protocol
+                        .deadline_seconds
+                        .map(Duration::from_secs),
+                    #[cfg(test)]
+                    auxiliary_deadline_override: None,
+                },
+            );
+            match observed {
+                Ok(observed) => {
+                    validate_sample(
+                        &observed.sample,
+                        &bound,
+                        repetition,
+                        &proof,
+                        observed.sample.elapsed_us,
+                        true,
+                    )?;
+                    machine = Some(observed.machine);
+                    build = Some(observed.worker_build);
+                    samples.push(observed.sample);
+                    std::fs::remove_dir_all(worker_scratch_root).map_err(failure)?;
+                }
+                Err(mut error) => {
+                    contained = crate::dataset_cache::contained(&error);
+                    if !contained {
+                        if let Err(marker) = crate::dataset_cache::quarantine_directory(
+                            workspace.path(),
+                            &error.message,
+                        ) {
+                            error.message.push_str(&format!(
+                                "; quarantine marker failed: {}",
+                                marker.message
+                            ));
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    })();
+    if !contained {
+        let _ = workspace.keep();
+    }
+    if samples.is_empty() {
+        return Err(acquisition
+            .err()
+            .unwrap_or_else(|| failure("empty acquisition")));
+    }
+    let wall_clock = summarize_wall_clock(&samples);
+    let execution = RunExecution {
+        runner_output_version: 1,
+        case_id: plan.definition.id.clone(),
+        case_path: run.case_path,
+        point_id: bound.point_id.clone(),
+        point_name: bound.point_name.clone(),
+        requested_repetitions: run.repetitions,
+        bound,
+        build: crate::runner::build_evidence(build.as_ref())?,
+        machine: machine.ok_or_else(|| failure("no client identity"))?,
+        environment: None,
+        fixture: None,
+        dataset_cache_hit: None,
+        server_receipt: Some(input.receipt.clone()),
+        samples,
+        wall_clock,
+        durable_record: false,
+    };
+    match acquisition {
+        Ok(()) => Ok(execution),
+        Err(mut error) => {
+            error.context.gqt_partial_run = Some(Box::new(execution));
+            Err(error)
+        }
+    }
+}
+
+fn summarize_wall_clock(samples: &[GqtRepObservation]) -> WallClockSummary {
+    let mut times: Vec<_> = samples.iter().map(|s| s.elapsed_us).collect();
+    times.sort_unstable();
+    let count = times.len();
+    WallClockSummary {
+        observed_repetitions: count as u32,
+        min_us: times[0],
+        p50_us: times[(count - 1) / 2],
+        max_us: times[count - 1],
+        p95_us: (count >= 20).then(|| times[(count * 95).div_ceil(100) - 1]),
+        p95_supported: count >= 20,
     }
 }
 fn binding<'a>(
@@ -1068,7 +1391,6 @@ pub(crate) fn validate_receipt_treatment(
     selected: usize,
     condition: &crate::case::CacheCondition,
 ) -> Result<(), String> {
-    use crate::case::EnginePreparation;
     let selected_at = steps
         .iter()
         .position(|s| s.ordinal == selected)
@@ -1098,13 +1420,7 @@ pub(crate) fn validate_receipt_treatment(
     {
         return Err("suffix receipt precedes or repeats selected ordinal".into());
     }
-    let engine = if reopened {
-        EnginePreparation::ReopenedAfterProgram
-    } else if reads > 0 {
-        EnginePreparation::WarmedByProgram
-    } else {
-        EnginePreparation::PreparationOnly
-    };
+    let engine = engine_preparation(reopened, reads, condition.process);
     if reads != condition.iterations || engine != condition.engine {
         return Err("operation receipts disagree with derived cache preparation".into());
     }

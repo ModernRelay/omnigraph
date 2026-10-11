@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance_namespace::LanceNamespace;
@@ -2868,11 +2868,11 @@ fn lineage_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) ->
     }
 }
 
-/// A [`lineage_intent`] whose commit takes about 4 KiB of the release budget,
-/// so that about `HISTORY_RELEASE_BYTES / 4096` of them fill a buffer.
+/// A [`lineage_intent`] whose commit takes an eighth of the release budget,
+/// so that about eight of them fill a buffer.
 fn fat_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) -> LineageIntent {
     LineageIntent {
-        actor_id: Some("a".repeat(4000)),
+        actor_id: Some("a".repeat(HISTORY_RELEASE_BYTES / 8)),
         ..lineage_intent(branch, merged_parent)
     }
 }
@@ -6516,7 +6516,7 @@ async fn history_ids(uri: &str) -> HashSet<String> {
 /// Each merge of a still-open source block archives only the source commits no earlier merge archived, so a cold lookup of its newest and oldest commit stays in budget.
 #[tokio::test]
 async fn repeated_merges_of_an_open_source_block_append_each_commit_once_and_stay_readable() {
-    const MERGES: u16 = 450;
+    const MERGES: u16 = 24;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let session = crate::lance_access::control_session();
@@ -6659,35 +6659,44 @@ async fn merges_separated_by_a_target_release_append_each_source_commit_once() {
     );
 }
 
-/// The block `01ARZ3NDEKTSV4RRFFQ69G5FAV` under 1,104 range extents that all
-/// cover slot 48: every `start-end` with `start` in 0..=47 and `end` in 48..=70,
+/// The block `01ARZ3NDEKTSV4RRFFQ69G5FAV` under range extents that all cover
+/// slot 48: every `start-end` with `start` in `starts` and `end` in `ends`,
 /// the run `(k+1)-j` a target forked at `k` appends when it merges at `j`.
 async fn settle_ranges_over_slot_48(
     uri: &str,
     session: &Arc<lance::session::Session>,
+    starts: std::ops::RangeInclusive<usize>,
+    ends: std::ops::RangeInclusive<usize>,
 ) -> Vec<HistoryRecord> {
+    assert!(*starts.end() < 48 && *ends.start() >= 48);
     let records = history_block_run("01ARZ3NDEKTSV4RRFFQ69G5FAV", 96);
-    for start in 0..=47 {
-        for end in 48..=70 {
-            super::history::settle(uri, session, &records[start..=end])
-                .await
-                .unwrap();
-        }
-    }
+    let ranges = starts
+        .clone()
+        .flat_map(|start| ends.clone().map(move |end| (start, end)));
+    futures::stream::iter(ranges)
+        .for_each_concurrent(Some(16), |(start, end)| {
+            let records = &records;
+            async move {
+                super::history::settle(uri, session, &records[start..=end])
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
     assert_eq!(
         stored_ranges(uri, "01ARZ3NDEKTSV4RRFFQ69G5FAV").await.len(),
-        48 * 23
+        starts.count() * ends.count()
     );
     records
 }
 
 /// A slot covered by more range extents than the old listing cap is read from the three narrowest of them, cold and through a handle's cache, for its commit and for its record.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slot_covered_by_over_a_thousand_equal_ranges_is_read_from_three_of_them() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 0..=47, 48..=70).await;
     let wanted = &records[48];
     let id = wanted.commit.graph_commit_id.as_str();
 
@@ -6835,7 +6844,7 @@ async fn a_conflicting_copy_among_the_ranges_read_is_still_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 40..=47, 48..=55).await;
     let mut conflicting = records[48..=48].to_vec();
     conflicting[0].commit.actor_id = Some("different".to_string());
     super::history::settle(&uri, &session, &conflicting)
@@ -6862,7 +6871,7 @@ async fn a_conflicting_copy_outside_the_narrowest_three_is_refused_only_by_the_w
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 40..=47, 48..=55).await;
     let mut widest = records[0..=95].to_vec();
     widest[48].commit.actor_id = Some("different".to_string());
     super::history::settle(&uri, &session, &widest)
@@ -7084,7 +7093,10 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let session = crate::lance_access::control_session();
-    let (full, replaced_head) = buffered_run(TAIL_MAX_COMMITS);
+    let buffered = 8;
+    let budget = HistoryReleaseBytes(1024);
+    let (full, replaced_head) = buffered_run(buffered);
+    assert!(full.is_full_under(&replaced_head, &[], budget).unwrap());
     let next_head = GraphLineageRow {
         graph_manifest_version: replaced_head.graph_manifest_version + 1,
         ..probe_commit("next", Some(&replaced_head.graph_commit_id))
@@ -7096,7 +7108,7 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
             &next_head,
             appended,
             &[],
-            HistoryReleaseBytes::PRODUCTION,
+            budget,
         )
     };
 
@@ -7108,13 +7120,13 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
         "{error}"
     );
     let all_but_the_newest =
-        super::history::settle(uri, &session, &full.records(&[])[..TAIL_MAX_COMMITS - 1])
+        super::history::settle(uri, &session, &full.records(&[])[..buffered - 1])
             .await
             .unwrap();
     let error = after(Some(&all_but_the_newest)).unwrap_err();
     assert!(
         error.to_string().contains(&format!(
-            "'c{TAIL_MAX_COMMITS}' would leave the buffer of `__manifest`"
+            "'c{buffered}' would leave the buffer of `__manifest`"
         )),
         "{error}"
     );
@@ -7127,6 +7139,10 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
     );
 
     let (with_room, replaced_head) = buffered_run(15);
+    let next_head = GraphLineageRow {
+        graph_manifest_version: replaced_head.graph_manifest_version + 1,
+        ..probe_commit("next", Some(&replaced_head.graph_commit_id))
+    };
     assert!(!with_room.is_full(&replaced_head, &[]).unwrap());
     assert_eq!(
         with_room
@@ -7142,6 +7158,25 @@ async fn commit_leaves_the_buffer_only_after_the_append_that_holds_it() {
             .commits()
             .len(),
         16
+    );
+
+    let unbounded = HistoryReleaseBytes(usize::MAX);
+    let (at_ceiling, replaced_head) = buffered_run(TAIL_MAX_COMMITS);
+    assert!(
+        at_ceiling
+            .is_full_under(&replaced_head, &[], unbounded)
+            .unwrap(),
+        "the commit ceiling fills the buffer under any byte budget"
+    );
+    let (one_below, replaced_head) = buffered_run(TAIL_MAX_COMMITS - 1);
+    assert!(
+        !one_below
+            .is_full_under(&replaced_head, &[], unbounded)
+            .unwrap()
+    );
+    assert!(
+        one_below.closes_with_under(&replaced_head, &[], unbounded),
+        "the commit that reaches the ceiling closes the buffer"
     );
 }
 

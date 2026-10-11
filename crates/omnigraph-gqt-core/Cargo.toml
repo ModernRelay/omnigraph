@@ -12,6 +12,7 @@ doctest = false
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 libm = "=0.2.16"
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.13.0" }
