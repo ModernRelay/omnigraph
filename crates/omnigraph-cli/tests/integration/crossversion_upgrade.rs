@@ -37,17 +37,17 @@
 //! Explicit invocation requires `OMNIGRAPH_V012_BIN` and
 //! `OMNIGRAPH_V012_SERVER_BIN` from the official release; it never skips.
 
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::{BlobCell, BlobContent, EntityKind};
-use support::{
+use crate::support::{
     HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, output_failure, output_success,
     unlock_cluster_fixture,
 };
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::{BlobCell, BlobContent, EntityKind};
 use tempfile::tempdir;
 
 /// Explicit release qualification requires both published executables.
@@ -78,13 +78,13 @@ fn v012_binaries() -> (PathBuf, PathBuf) {
 #[test]
 #[ignore = "release-binaries: official 0.12 CLI/server; manual release qualification"]
 fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
-    use serde_json::{Value, json};
-    use std::fs;
-    use std::time::Duration;
-    use support::{
+    use crate::support::{
         cli_at, parse_stdout_json, spawn_server_with_cluster_binary_env,
         write_cluster_config_fixture,
     };
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::time::Duration;
 
     let (old, old_server) = v012_binaries();
     let current = assert_cmd::cargo::cargo_bin("omnigraph");
@@ -1396,9 +1396,9 @@ fn human_report_lines(
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
+    use crate::support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
     use serde_json::json;
     use std::fs;
-    use support::{parse_stdout_json, resolved_snapshot_id, spawn_server_with_cluster};
 
     let Some(old) = std::env::var_os("OMNIGRAPH_V09_BIN").map(PathBuf::from) else {
         eprintln!("skipping v0.9 upgrade e2e: OMNIGRAPH_V09_BIN is unset");

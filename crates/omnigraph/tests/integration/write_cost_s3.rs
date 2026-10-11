@@ -22,17 +22,16 @@
 //! [M]). (See `write_cost.rs` for the local test that proves the split itself —
 //! opener flat, scan growing.)
 //!
-//! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `tests/s3_storage.rs`
+//! Skips gracefully without `OMNIGRAPH_S3_TEST_BUCKET` (the `s3_storage.rs`
 //! pattern). A cost (IO-count) gate, not a correctness test — run on demand
 //! against RustFS/S3, NOT in the every-merge `rustfs_integration` CI job
 //! (pulled out pending a dedicated cost/perf harness; see the backend-split
 //! note in docs/dev/testing.md § Cost-budget tests).
-#![recursion_limit = "512"]
 
-mod helpers;
+use crate::helpers;
 
-use helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
-use helpers::{commit_many, s3_test_graph_uri};
+use crate::helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
+use crate::helpers::{commit_many, s3_test_graph_uri};
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
