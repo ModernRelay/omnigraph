@@ -20,7 +20,13 @@ node Person {
 }
 
 --- seed
-{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query add_alice() {
+    insert Person { name: "alice", age: 30 }
+}
+
+--- expect affected: nodes=1 edges=0
 
 --- mutate
 query propose_bob() as commit {
