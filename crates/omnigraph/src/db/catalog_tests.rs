@@ -177,7 +177,7 @@ edge Knows: Person -> Person {}
         .expect("the right branch owns e");
     let (written, identity) = reader
         .storage()
-        .commit_staged_detached(base, staged, &witness)
+        .commit_staged_detached(base, staged, &witness, &[])
         .await
         .unwrap();
     assert_eq!(identity.read_version, right_people.version().version);
