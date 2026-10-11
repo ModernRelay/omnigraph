@@ -1,0 +1,62 @@
+# issue: none
+# notes: Final recreation after bounded prior cycles; exact live rows/registry after reopen.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+branch create "recycled" from main
+--- expect ok
+
+--- query branch: recycled
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"recycled"}
+--- expect shape
+name: String
+
+--- restart
+
+--- query branch: recycled
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"recycled"}
+--- expect shape
+name: String

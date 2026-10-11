@@ -7,26 +7,35 @@
 //! module varies with a repetition number.
 
 use std::error::Error;
-use std::fmt::{Display, Formatter, Write as _};
+#[cfg(test)]
+use std::fmt::Write as _;
+use std::fmt::{Display, Formatter};
+#[cfg(test)]
 use std::sync::Arc;
 
 use arrow_array::{Array, Int32Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryStreamExt;
+#[cfg(test)]
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
+#[cfg(test)]
 use omnigraph::loader::LoadMode;
+#[cfg(test)]
 use omnigraph::settings::SessionSettings;
+use omnigraph_compiler::SystemColumns;
+#[cfg(test)]
 use omnigraph_compiler::ir::ParamMap;
+#[cfg(test)]
 use omnigraph_compiler::query::ast::Literal;
+#[cfg(test)]
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
-    SystemColumns, compile_schema_shape, schema_shape_from_ir, schema_shape_json,
-};
+#[cfg(test)]
+use omnigraph_compiler::{compile_schema_shape, schema_shape_from_ir, schema_shape_json};
 use sha2::{Digest, Sha256};
 
-use crate::ValidatedCase;
-use crate::case::{
+use crate::legacy::case::ValidatedCase;
+use crate::legacy::case::{
     Aging, Arrival, Backend, ColumnShape, CompactionRecency, Contention, DataProvenance,
     DeletionHistory, Execution, FixtureBuilderKind, FixturePreparation, MAX_PREPARATION_COMMITS,
     MAX_PREPARATION_ROWS_PER_COMMIT, NetworkPosition, ReadWriteMix, ResetMode,
@@ -42,6 +51,7 @@ const BUILDER_VERSION: u32 = SYNTHETIC_BRANCH_MERGE_BUILDER_VERSION;
 const SUPPORTED_SEED: u64 = 0;
 const UPDATE_VALUE: i32 = i32::MAX;
 const NEW_COHORT: &str = "new";
+#[cfg(test)]
 const LOGICAL_FIXTURE_DIGEST_DOMAIN: &[u8] = b"omnigraph-bench-logical-fixture-v1\0";
 
 /// The engine's keyed-write limits. Chunks stay at or below half of either
@@ -841,6 +851,7 @@ impl<'a> BaseCohort<'a> {
 enum BranchState {
     Main,
     Source,
+    #[cfg(test)]
     Target,
     Merged,
 }
@@ -851,7 +862,12 @@ impl BranchState {
     }
 
     fn has_target_effects(self) -> bool {
-        matches!(self, Self::Target | Self::Merged)
+        match self {
+            Self::Merged => true,
+            #[cfg(test)]
+            Self::Target => true,
+            _ => false,
+        }
     }
 }
 
@@ -874,155 +890,13 @@ pub struct FixtureBuildSummary {
 /// The returned future drops its engine handle before returning. Callers may
 /// then digest and freeze the directory without opening the frozen original
 /// again.
-pub async fn initialize_local_fixture(
-    root_uri: &str,
-    plan: &BranchMergePlan,
-) -> BranchMergeResult<FixtureBuildSummary> {
-    let preflight = plan.preflight()?;
-    if root_uri.contains("://") && !root_uri.starts_with("file://") {
-        return Err(unsupported(
-            "invocation.root_uri",
-            format!("local fixture initialization cannot use {root_uri:?}"),
-        ));
-    }
-    let schema = schema_source(plan.tables);
-    let db = Session::from_defaults(
-        Arc::new(Omnigraph::init(root_uri, &schema).await.map_err(|error| {
-            fixture_error(format!("initialize fixture at {root_uri}: {error}"))
-        })?),
-        SessionSettings::default(),
-    );
-    let base_load_commits = load_base(&db, plan).await?;
-    if u64::try_from(base_load_commits).ok() != Some(preflight.base_load_commits) {
-        return Err(fixture_error(format!(
-            "builder-v3 base-load recipe drifted: preflight declared {} publications, execution produced {base_load_commits}",
-            preflight.base_load_commits
-        )));
-    }
-    let optimized_user_tables = match plan.compaction_recency {
-        CompactionRecency::Optimized => {
-            let outcomes = db
-                .optimize()
-                .await
-                .map_err(|error| fixture_error(format!("optimize fixture main branch: {error}")))?;
-            let intended_keys = (0..plan.node_tables())
-                .map(node_table_key)
-                .chain((0..plan.edge_tables()).map(edge_table_key));
-            for key in intended_keys {
-                let outcome = outcomes
-                    .iter()
-                    .find(|outcome| outcome.type_key == key)
-                    .ok_or_else(|| {
-                        fixture_error(format!(
-                            "optimized fixture returned no outcome for intended user table {key}"
-                        ))
-                    })?;
-                if outcome.skipped.is_some()
-                    || !outcome.committed
-                    || outcome.fragments_removed == 0
-                    || outcome.fragments_added == 0
-                {
-                    return Err(fixture_error(format!(
-                        "optimized fixture did not productively compact {key}: committed={}, fragments_removed={}, fragments_added={}, skipped={:?}",
-                        outcome.committed,
-                        outcome.fragments_removed,
-                        outcome.fragments_added,
-                        outcome.skipped
-                    )));
-                }
-            }
-            plan.tables
-        }
-        CompactionRecency::NotOptimized => 0,
-    };
+#[cfg(test)]
+#[path = "legacy/branch_merge_oracle.rs"]
+mod oracle;
+#[cfg(test)]
+pub use oracle::initialize_local_fixture;
 
-    prepare_reversible_updates(&db, plan).await?;
-
-    db.branch_create_from(ReadTarget::branch(MAIN_BRANCH), SOURCE_BRANCH)
-        .await
-        .map_err(|error| fixture_error(format!("create {SOURCE_BRANCH}: {error}")))?;
-    db.branch_create_from(ReadTarget::branch(MAIN_BRANCH), TARGET_BRANCH)
-        .await
-        .map_err(|error| fixture_error(format!("create {TARGET_BRANCH}: {error}")))?;
-
-    let queries = mutation_queries(plan.diverged_tables);
-    diverge(&db, SOURCE_BRANCH, Side::Source, plan, &queries).await?;
-    diverge(&db, TARGET_BRANCH, Side::Target, plan, &queries).await?;
-
-    let schema_shape = verified_schema_shape_json(&db, plan)?;
-    let mut logical_digest = Sha256::new();
-    logical_digest.update(LOGICAL_FIXTURE_DIGEST_DOMAIN);
-    hash_logical_field(
-        &mut logical_digest,
-        b"schema-shape",
-        schema_shape.as_bytes(),
-    );
-    // Builder v2 declares no secondary indexes. The per-branch verification
-    // below proves that every node and edge manifest has an empty physical
-    // index inventory before this declared empty inventory is certified in the
-    // logical digest. Compaction layout and encoding remain derived state.
-    hash_logical_field(&mut logical_digest, b"logical-index-inventory", b"[]");
-    verify_branch(
-        &db,
-        MAIN_BRANCH,
-        plan,
-        BranchState::Main,
-        Some(&mut logical_digest),
-    )
-    .await?;
-    verify_branch(
-        &db,
-        SOURCE_BRANCH,
-        plan,
-        BranchState::Source,
-        Some(&mut logical_digest),
-    )
-    .await?;
-    verify_branch(
-        &db,
-        TARGET_BRANCH,
-        plan,
-        BranchState::Target,
-        Some(&mut logical_digest),
-    )
-    .await?;
-    let source_history_depth = u64::try_from(
-        db.list_commits(Some(SOURCE_BRANCH))
-            .await
-            .map_err(|error| fixture_error(format!("list {SOURCE_BRANCH} commits: {error}")))?
-            .len(),
-    )
-    .map_err(|_| fixture_error("source history depth does not fit u64"))?;
-    let target_history_depth = u64::try_from(
-        db.list_commits(Some(TARGET_BRANCH))
-            .await
-            .map_err(|error| fixture_error(format!("list {TARGET_BRANCH} commits: {error}")))?
-            .len(),
-    )
-    .map_err(|_| fixture_error("target history depth does not fit u64"))?;
-    if source_history_depth != plan.requested_history_depth
-        || target_history_depth != plan.requested_history_depth
-    {
-        return Err(unsupported(
-            "fixture.state.history_depth",
-            format!(
-                "requested exactly {} reachable commits per branch, but deterministic construction produced {source_history_depth} on {SOURCE_BRANCH} and {target_history_depth} on {TARGET_BRANCH}; builder v3 does not silently pad or squash history; declare the observed depth or revise the versioned deterministic builder contract",
-                plan.requested_history_depth
-            ),
-        ));
-    }
-    let logical_content_sha256 = format!("{:x}", logical_digest.finalize());
-
-    drop(db);
-    Ok(FixtureBuildSummary {
-        base_load_commits,
-        optimized_user_tables,
-        source_history_depth,
-        target_history_depth,
-        logical_content_sha256,
-    })
-}
-
+#[cfg(test)]
 fn verified_schema_shape_json(db: &Omnigraph, plan: &BranchMergePlan) -> BranchMergeResult<String> {
     let catalog = db.catalog();
     let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
@@ -1371,6 +1245,7 @@ pub struct VerificationSummary {
     pub rows: u64,
 }
 
+#[cfg(test)]
 fn schema_source(tables: usize) -> String {
     debug_assert!(tables >= 2 && tables.is_multiple_of(2));
     let node_tables = tables / 2;
@@ -1397,6 +1272,7 @@ fn schema_source(tables: usize) -> String {
     source
 }
 
+#[cfg(test)]
 fn mutation_queries(diverged_tables: usize) -> String {
     let mut source = String::new();
     for table in 0..diverged_tables {
@@ -1438,6 +1314,7 @@ fn insert_edge_id(side: Side, table: usize, row: usize) -> String {
     format!("{}_e{table:03}_n{row:07}", side.tag())
 }
 
+#[cfg(test)]
 fn jsonl_node_row(ty: &str, name: &str, cohort: &str, val: i32, payload: &str) -> String {
     serde_json::json!({
         "type": ty,
@@ -1451,6 +1328,7 @@ fn jsonl_node_row(ty: &str, name: &str, cohort: &str, val: i32, payload: &str) -
     .to_string()
 }
 
+#[cfg(test)]
 fn jsonl_edge_row(
     ty: &str,
     id: &str,
@@ -1483,6 +1361,7 @@ fn edge_endpoints(plan: &BranchMergePlan, table: usize, row: usize) -> (String, 
     )
 }
 
+#[cfg(test)]
 async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<usize> {
     let payload = "x".repeat(plan.payload_bytes);
     let chunk_rows = load_chunk_rows(plan.payload_bytes)?;
@@ -1559,6 +1438,7 @@ async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<us
 
 /// A stable seed and pair ordinal choose one edge table and a wrapping batch
 /// of distinct existing rows. Both writes in a pair address the same rows.
+#[cfg(test)]
 fn preparation_batch(plan: &BranchMergePlan, seed: u64, pair: u64) -> (usize, usize) {
     let mut digest = Sha256::new();
     digest.update(b"omnigraph-bench-reversible-updates-v1\0");
@@ -1570,6 +1450,7 @@ fn preparation_batch(plan: &BranchMergePlan, seed: u64, pair: u64) -> (usize, us
     (table as usize, start as usize)
 }
 
+#[cfg(test)]
 async fn prepare_reversible_updates(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<()> {
     let Some(recipe) = plan.preparation else {
         return Ok(());
@@ -1637,6 +1518,7 @@ impl Side {
     }
 }
 
+#[cfg(test)]
 async fn diverge(
     db: &Session,
     branch: &str,
@@ -2379,6 +2261,227 @@ mod tests {
         }
     }
 
+    fn generated_fixture_source(plan: &BranchMergePlan) -> String {
+        let source = if plan.diverged_tables == 4 {
+            include_str!("../../../benchmarks/fixtures/branch_merge_d50.gqt")
+                .split("--- query branch: main\nquery node_0_main()")
+                .next()
+                .unwrap()
+                .replace("rows: 100000", &format!("rows: {}", plan.rows_per_table))
+                .replace(
+                    "\"population\": 100000",
+                    &format!("\"population\": {}", plan.rows_per_table),
+                )
+                .replace(
+                    "commits: 25",
+                    &format!("commits: {}", plan.rows_per_table.div_ceil(4096)),
+                )
+        } else {
+            include_str!("../../omnigraph-gqt/cases/generated_branch_merge_dataset.gqt").to_string()
+        };
+        let Some(preparation) = plan.preparation else {
+            return source;
+        };
+        let mut updates = String::new();
+        for pair in 0..preparation.additional_commits() / 2 {
+            let (table, start) = preparation_batch(plan, preparation.seed(), pair);
+            let ranges = plan.ranges(table).unwrap();
+            for restore in [false, true] {
+                let recipe = serde_json::json!({"tables": [{
+                    "kind": "edge", "name": edge_type_name(table),
+                    "rows": preparation.rows_per_commit(), "commits": 1,
+                    "start": start, "wrap": plan.rows_per_table,
+                    "id": {"kind": "key", "prefix": format!("e{table:03}_r"), "width": 7},
+                    "from": {"kind": "endpoint", "prefix": format!("n{table:03}_r"), "width": 7, "population": plan.rows_per_table, "distribution": {"kind": "ordinal"}},
+                    "to": {"kind": "endpoint", "prefix": format!("n{:03}_r", (table + 1) % plan.node_tables()), "width": 7, "population": plan.rows_per_table, "distribution": {"kind": "ordinal"}},
+                    "columns": {
+                        "cohort": {"kind": "ranges", "ranges": [
+                            {"end": ranges.source_updates_end, "value": plan.source_update_cohort},
+                            {"end": ranges.source_deletes_end, "value": plan.source_delete_cohort},
+                            {"end": ranges.target_updates_end, "value": plan.target_update_cohort},
+                            {"end": ranges.target_deletes_end, "value": plan.target_delete_cohort}], "fallback": "keep"},
+                        "val": {"kind": "ordinal", "start": if restore { 0 } else { -1 }, "step": if restore { 1 } else { -1 }},
+                        "payload": {"kind": "repeat", "text": "x", "count": plan.payload_bytes}
+                    }
+                }]});
+                writeln!(
+                    updates,
+                    "\n--- load generate: v1 seed: 0 mode: merge\n{}\n--- expect ok",
+                    serde_json::to_string_pretty(&recipe).unwrap()
+                )
+                .unwrap();
+            }
+        }
+        source.replacen(
+            "\n--- mutate\nbranch create \"bench-source\"",
+            &format!("{updates}\n--- mutate\nbranch create \"bench-source\""),
+            1,
+        )
+    }
+
+    #[test]
+    fn checked_in_generated_d50_retains_exact_publication_recipe() {
+        let source = include_str!("../../../benchmarks/fixtures/branch_merge_d50.gqt");
+        let case = omnigraph_gqt_core::parse_case("branch_merge_d50", source).unwrap();
+        let omnigraph_gqt_core::Seed::Generated(seed) = &case.fixture.as_ref().unwrap().seed else {
+            panic!("generated seed required");
+        };
+        assert_eq!(seed.call_count(), 200);
+        let steps = case.steps();
+        assert_eq!(steps.len(), 50);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.kind == omnigraph_gqt_core::StepKind::Load)
+                .count(),
+            16
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.kind == omnigraph_gqt_core::StepKind::Mutate)
+                .count(),
+            8
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.kind == omnigraph_gqt_core::StepKind::BranchCreate)
+                .count(),
+            2
+        );
+        let plan = plan(100_000, 4, 50);
+        assert_eq!(
+            plan.table_deltas
+                .iter()
+                .map(|delta| delta.source.updates)
+                .collect::<Vec<_>>(),
+            [5, 4, 4, 4]
+        );
+        let seed_body = source
+            .split_once("--- seed generate: v1 seed: 0\n")
+            .unwrap()
+            .1
+            .split("\n--- ")
+            .next()
+            .unwrap();
+        let recipe: serde_json::Value = serde_yaml::from_str(seed_body).unwrap();
+        for (table, row) in recipe["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(4)
+            .enumerate()
+        {
+            let ranges = plan.ranges(table).unwrap();
+            let ends = row["columns"]["cohort"]["ranges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|range| usize::try_from(range["end"].as_u64().unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ends,
+                [
+                    ranges.source_updates_end,
+                    ranges.source_deletes_end,
+                    ranges.target_updates_end,
+                    ranges.target_deletes_end
+                ]
+            );
+            assert_eq!(row["rows"], 100_000);
+            assert_eq!(row["commits"], 25);
+            assert_eq!(row["batch_rows"], 4096);
+            for ordinal in 0..=ranges.target_deletes_end {
+                let expected = plan.base_cohort(table, ordinal).label();
+                let actual = row["columns"]["cohort"]["ranges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|range| u64::try_from(ordinal).unwrap() < range["end"].as_u64().unwrap())
+                    .map_or(
+                        &row["columns"]["cohort"]["fallback"],
+                        |range| &range["value"],
+                    );
+                assert_eq!(actual.as_str().unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_dataset_matches_the_legacy_fixture_and_reversible_history() {
+        for (tables, delta, commits) in [(1, 3, 0), (1, 3, 2), (1, 3, 8), (1, 3, 64), (4, 50, 0)] {
+            let mut plan = plan(32, tables, delta);
+            plan.compaction_recency = CompactionRecency::NotOptimized;
+            plan.requested_history_depth = 1 + u64::try_from(tables * 5).unwrap() + commits;
+            if commits != 0 {
+                plan.preparation = Some(preparation(commits, 7, 42));
+            }
+            let old_root = tempfile::tempdir().unwrap();
+            let old = initialize_local_fixture(old_root.path().to_str().unwrap(), &plan)
+                .await
+                .unwrap();
+            let case = omnigraph_gqt_core::parse_case(
+                "generated_branch_merge_dataset",
+                &generated_fixture_source(&plan),
+            )
+            .unwrap();
+            let fixture = case.fixture.as_ref().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let uri = directory.path().to_str().unwrap();
+            let session = Session::from_defaults(
+                Arc::new(Omnigraph::init(uri, &fixture.schema).await.unwrap()),
+                SessionSettings::default(),
+            );
+            omnigraph_gqt_core::seed_case(&session, &fixture.seed, case.needs_indices)
+                .await
+                .unwrap();
+            let db = omnigraph_gqt_core::execute_steps(
+                &case,
+                std::path::Path::new("unused.gqt"),
+                false,
+                session,
+                uri,
+                None,
+                &omnigraph_gqt_core::PlainHost,
+            )
+            .await
+            .unwrap();
+            let mut digest = Sha256::new();
+            digest.update(LOGICAL_FIXTURE_DIGEST_DOMAIN);
+            hash_logical_field(
+                &mut digest,
+                b"schema-shape",
+                verified_schema_shape_json(&db, &plan).unwrap().as_bytes(),
+            );
+            hash_logical_field(&mut digest, b"logical-index-inventory", b"[]");
+            for (branch, state) in [
+                (MAIN_BRANCH, BranchState::Main),
+                (SOURCE_BRANCH, BranchState::Source),
+                (TARGET_BRANCH, BranchState::Target),
+            ] {
+                verify_branch(&db, branch, &plan, state, Some(&mut digest))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                format!("{:x}", digest.finalize()),
+                old.logical_content_sha256
+            );
+            assert_eq!(
+                db.list_commits(Some(SOURCE_BRANCH)).await.unwrap().len() as u64,
+                old.source_history_depth
+            );
+            assert_eq!(
+                db.list_commits(Some(TARGET_BRANCH)).await.unwrap().len() as u64,
+                old.target_history_depth
+            );
+            let protected = capture_protected_branch_heads(&db).await.unwrap();
+            db.branch_merge(SOURCE_BRANCH, TARGET_BRANCH).await.unwrap();
+            verify_merged_graph(&db, &plan, &protected).await.unwrap();
+        }
+    }
+
     #[test]
     fn delta_split_is_total_and_always_update_bearing() {
         for delta in [1, 2, 3, 50, 5_000] {
@@ -2505,7 +2608,7 @@ mod tests {
             additional_commits: commits,
             rows_per_commit: rows,
             seed,
-            maintenance: crate::case::PreparationMaintenance::None,
+            maintenance: crate::legacy::case::PreparationMaintenance::None,
         }
     }
 

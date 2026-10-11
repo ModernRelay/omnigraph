@@ -35,6 +35,7 @@ mod store;
 mod types;
 pub use admission::{
     ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
+    canonical_graph_uri,
 };
 pub use authorization::{
     AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,
@@ -42,13 +43,10 @@ pub use authorization::{
 };
 use config::{
     QueriesDecl, graph_address, load_desired, observe_declared_graphs, parse_cluster_config,
-    preview_schema_migration, schema_address, state_resource_digests, validate_cluster_header,
+    schema_address, state_resource_digests, validate_cluster_header,
 };
 pub use deployment::*;
-use diff::{
-    ResourceKind, append_embedding_profile_changes, append_policy_binding_changes,
-    compute_blast_radius, diff_resources, resource_kind,
-};
+use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
@@ -56,8 +54,9 @@ pub use serve::{
     AdmittedServingSnapshot, RootBoundServingSnapshot, ServingBlockedGraph, ServingGraph,
     ServingPolicy, ServingQuery, ServingSnapshot, acquire_serving_admission,
     admit_serving_snapshot, cluster_graph_ids, cluster_root_for_graph_uri,
-    read_root_bound_serving_snapshot, read_root_bound_serving_snapshot_from_storage,
-    read_serving_snapshot, read_serving_snapshot_from_storage, resolve_graph_storage_uri,
+    read_deployment_serving_snapshot, read_root_bound_serving_snapshot,
+    read_root_bound_serving_snapshot_from_storage, read_serving_snapshot,
+    read_serving_snapshot_from_storage, resolve_graph_storage_uri,
 };
 use store::ClusterStore;
 pub use types::*;
@@ -133,22 +132,16 @@ pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
     }
 }
 
+/// Observe a deployment without taking writer admission or reserving effects.
 pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
-    plan_config_dir_with_options(config_dir, PlanOptions::default()).await
+    plan_config_dir_as(config_dir, None).await
 }
 
-/// `plan`, optionally without the cluster lock (RFC 0048). An observed plan
-/// reads the ledger once, reports any lock it finds instead of refusing, and
-/// labels its output `authority: observed`; it is never authority for an
-/// effect.
-pub async fn plan_config_dir_with_options(
-    config_dir: impl AsRef<Path>,
-    options: PlanOptions,
-) -> PlanOutput {
-    // Keep the shared implementation off the forwarding caller's stack.
+/// Plan with the storage owner's selected actor. Apply always revalidates.
+pub async fn plan_config_dir_as(config_dir: impl AsRef<Path>, actor: Option<String>) -> PlanOutput {
     Box::pin(plan_config_dir_impl(
         config_dir.as_ref(),
-        options,
+        actor,
         None,
         &mut None,
     ))
@@ -156,16 +149,14 @@ pub async fn plan_config_dir_with_options(
 }
 
 /// Plan using the current applied policy for an already authenticated actor.
-/// Existing storage-holder entry points retain their explicit trust boundary.
 pub async fn plan_config_dir_authorized(
     config_dir: impl AsRef<Path>,
-    options: PlanOptions,
     identity: &IdentityAuthorization,
 ) -> AuthorizedPlanOutput {
     let mut authorization = None;
     let plan = Box::pin(plan_config_dir_impl(
         config_dir.as_ref(),
-        options,
+        None,
         Some(identity),
         &mut authorization,
     ))
@@ -178,16 +169,13 @@ pub async fn plan_config_dir_authorized(
 
 async fn plan_config_dir_impl(
     config_dir: &Path,
-    options: PlanOptions,
+    actor: Option<String>,
     identity: Option<&IdentityAuthorization>,
     authorization: &mut Option<PlanAuthorization>,
 ) -> PlanOutput {
-    let mut authority = if options.observe {
-        LedgerAuthority::Observed
-    } else {
-        LedgerAuthority::Locked
-    };
-    let outcome = load_desired(config_dir);
+    let authority = LedgerAuthority::Observed;
+    let captured = config::capture_desired(config_dir);
+    let outcome = captured.outcome;
     let mut diagnostics = outcome.diagnostics;
     let storage_root = outcome
         .desired
@@ -210,6 +198,7 @@ async fn plan_config_dir_impl(
             desired_revision: DesiredRevision {
                 config_digest: None,
             },
+            input_digest: None,
             resource_digests: BTreeMap::new(),
             dependencies: Vec::new(),
             state_observations: observations,
@@ -227,6 +216,7 @@ async fn plan_config_dir_impl(
             desired_revision: DesiredRevision {
                 config_digest: Some(desired.config_digest),
             },
+            input_digest: None,
             resource_digests: desired.resource_digests,
             dependencies: desired.dependencies,
             state_observations: observations,
@@ -236,42 +226,20 @@ async fn plan_config_dir_impl(
         };
     }
 
-    if !options.observe && !desired.state_lock {
-        authority = LedgerAuthority::Unlocked;
-    }
-    let _lock_guard = if options.observe {
-        backend
-            .observe_lock(&mut observations, &mut diagnostics)
-            .await;
-        None
-    } else if desired.state_lock {
-        match backend.acquire_lock("plan", &mut observations).await {
-            Ok(guard) => Some(guard),
-            Err(diagnostic) => {
-                diagnostics.push(diagnostic);
-                None
-            }
-        }
-    } else {
-        diagnostics.push(Diagnostic::warning(
-            "state_lock_disabled",
-            "state.lock",
-            "state.lock is false; plan read state without acquiring the cluster state lock",
-        ));
-        None
-    };
+    backend
+        .observe_lock(&mut observations, &mut diagnostics)
+        .await;
 
-    // Plan is read-only: pending sidecars are reported, never acted on
-    // (RFC-004 open question 3 keeps read-only commands warn-only).
+    // Plan reports pending recovery without executing it.
     warn_pending_recovery_sidecars(&backend, &mut diagnostics).await;
 
-    let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
+    let mut prior_cas = None;
     if !has_errors(&diagnostics) {
         match backend.read_state(&mut observations).await {
             Ok(snapshot) => {
+                prior_cas = snapshot.state_cas;
                 if let Some(state) = snapshot.state {
-                    prior_resources = state_resource_digests(&state);
                     prior_state = Some(state);
                 }
             }
@@ -279,15 +247,24 @@ async fn plan_config_dir_impl(
         }
     }
 
+    let bundle = capture_desired_deployment(&desired, captured.sources, None);
+    let input_digest = bundle
+        .as_ref()
+        .ok()
+        .and_then(|bundle| bundle.input_digest().ok());
     let mut changes = if has_errors(&diagnostics) {
         Vec::new()
+    } else if let Ok(bundle) = &bundle {
+        crate::diff::diff_state_resources(
+            &prior_state
+                .as_ref()
+                .map(|state| state.applied_revision.resources.clone())
+                .unwrap_or_default(),
+            &bundle.resources,
+        )
     } else {
-        diff_resources(&prior_resources, &desired.resource_digests)
+        Vec::new()
     };
-    if !has_errors(&diagnostics) {
-        append_policy_binding_changes(&mut changes, prior_state.as_ref(), &desired);
-        append_embedding_profile_changes(&mut changes, prior_state.as_ref(), &desired);
-    }
     // The same v2 scope rules govern previews and execution. A refused scope
     // is wholly pre-effect; no approval artifact can authorize a removed path.
     let scope_error = prior_state.as_ref().and_then(|state| {
@@ -298,42 +275,27 @@ async fn plan_config_dir_impl(
                 "convert the stopped cluster ledger to v2 before planning deployments",
             ));
         }
-        match capture_deployment(config_dir, &BTreeMap::new()) {
-            Ok(bundle) => preview_deployment_scope(state, &bundle).err(),
-            Err(error) => Some(error),
+        match &bundle {
+            Ok(bundle) => preview_deployment_scope(state, bundle).err(),
+            Err(error) => Some(error.clone()),
         }
     });
-    for change in &mut changes {
-        if let Some(error) = &scope_error {
-            change.disposition = Some(ApplyDisposition::Blocked);
-            change.reason = Some(error.code.clone());
-        } else {
-            change.disposition = Some(
-                if matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
-                    && change.operation == PlanOperation::Update
-                {
-                    ApplyDisposition::Derived
-                } else {
-                    ApplyDisposition::Applied
-                },
-            );
-            change.reason = None;
-        }
+    if let Err(error) = annotate_plan_changes(&backend, &mut changes, scope_error.as_ref()) {
+        diagnostics.push(error);
     }
     if let Some(error) = scope_error {
         diagnostics.push(error);
     }
 
+    let snapshot = store::StateSnapshot {
+        state: prior_state,
+        state_cas: prior_cas,
+    };
+
     if !has_errors(&diagnostics) {
-        if let Some(identity) = identity {
+        if let (Some(identity), Ok(captured)) = (identity, &bundle) {
             match authorization::authorize_candidate(
-                &backend,
-                &desired,
-                prior_state.as_ref(),
-                &observations,
-                &changes,
-                identity,
-                false,
+                &backend, &desired, captured, &snapshot, &changes, identity, false,
             )
             .await
             {
@@ -346,36 +308,38 @@ async fn plan_config_dir_impl(
         }
     }
 
-    // Embed real migration steps for schema updates so plan is a data-aware
-    // preview; failures degrade to the digest diff with a warning.
-    for change in &mut changes {
-        if change.operation != PlanOperation::Update {
-            continue;
-        }
-        let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) else {
-            continue;
+    if !has_errors(&diagnostics) {
+        let caller = match identity {
+            Some(identity) => DeploymentCaller::AuthenticatedIdentity(identity.clone()),
+            None => DeploymentCaller::storage_owner(actor),
         };
-        let graph_uri = backend.graph_root(&graph_id);
-        let source_path = desired
-            .resources
-            .iter()
-            .find(|resource| resource.address == change.resource)
-            .and_then(|resource| resource.path.clone());
-        let preview = match source_path {
-            Some(path) => preview_schema_migration(&graph_uri, &path).await,
-            None => Err("no schema source recorded".to_string()),
+        let preflight = match bundle {
+            Ok(bundle) => preflight_deployment_at(&bundle, &caller, snapshot).await,
+            Err(error) => Err(error),
         };
-        match preview {
-            Ok(migration) => change.migration = Some(migration),
-            Err(err) => diagnostics.push(Diagnostic::warning(
-                "schema_preview_unavailable",
-                change.resource.clone(),
-                format!("could not preview the schema migration: {err}"),
-            )),
+        match preflight {
+            Ok(migrations) => {
+                for change in &mut changes {
+                    if let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) {
+                        change.migration = migrations.get(&graph_id).cloned();
+                    }
+                }
+            }
+            Err(error) => {
+                for change in &mut changes {
+                    change.disposition = Some(ApplyDisposition::Blocked);
+                    change.reason = Some(error.code.clone());
+                }
+                diagnostics.push(error);
+            }
         }
     }
+
     let blast_radius = compute_blast_radius(&changes, &desired.dependencies);
     let ok = !has_errors(&diagnostics);
+    if !ok {
+        *authorization = None;
+    }
 
     PlanOutput {
         ok,
@@ -384,6 +348,7 @@ async fn plan_config_dir_impl(
         desired_revision: DesiredRevision {
             config_digest: Some(desired.config_digest),
         },
+        input_digest,
         resource_digests: desired.resource_digests,
         dependencies: desired.dependencies,
         state_observations: observations,

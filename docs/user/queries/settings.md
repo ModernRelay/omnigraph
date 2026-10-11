@@ -52,9 +52,7 @@ A setting reaches the engine through one of three doors:
 - HTTP body: the `settings` object on `POST /query`, `POST /mutate`,
   `POST /mutate/if-graph-commit` and `POST /branches/merge`, one key per
   `request` setting (`{"settings": {"merge_lineage": "verify"}}`); an unknown key
-  is refused. The deprecated `/read` and `/change` run under the process
-  defaults: neither takes a `settings` field, and each refuses a `set` or
-  `reset` prefix in the source it carries with that same refusal.
+  is refused.
 - HTTP query string: `set=<name>=<value>`, repeatable, on `GET /changes` and
   `GET /commits/{id}/changes`.
 

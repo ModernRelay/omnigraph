@@ -2002,6 +2002,45 @@ async fn injected_embedding_config_is_used_instead_of_env() {
     .unwrap();
 
     assert_eq!(result_slugs(&result)[0], "alpha-doc");
+
+    // Warmed clients stay immutable: replacing a provider must not reuse the
+    // old view's initialized embedding client or alter its same-space check.
+    let replacement = session(
+        db.with_runtime_bindings(
+            None,
+            Some(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
+                provider: omnigraph::embedding::Provider::Mock,
+                model: "test-model-b".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            })),
+            omnigraph::ExternalBlobPolicy::Deny,
+        )
+        .unwrap(),
+    );
+    assert!(db.shares_runtime_owner(&replacement));
+    let error = query_main(
+        &replacement,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("test-model-a") && error.contains("test-model-b"),
+        "{error}"
+    );
+    let original = query_main(
+        &db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&original)[0], "alpha-doc");
 }
 
 // ─── BM25 search ────────────────────────────────────────────────────────────

@@ -1164,6 +1164,261 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
     assert_eq!(doc.fragments_removed, 2);
 }
 
+/// Deterministic bytes no encoder can shorten, so a window of them found on
+/// disk is the stored value.
+fn incompressible(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+/// Every file under `root` whose bytes contain `needle`.
+fn files_containing(root: &std::path::Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if std::fs::read(&path)
+                .unwrap()
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The field ids each data file of a table's pinned version lists.
+async fn pinned_file_field_ids(db: &Omnigraph, table_key: &str) -> Vec<(String, Vec<i32>)> {
+    helpers::open_pinned_dataset_for_test(db, "main", table_key)
+        .await
+        .get_fragments()
+        .iter()
+        .flat_map(|fragment| fragment.metadata().files.clone())
+        .map(|file| (file.path.clone(), file.fields.to_vec()))
+        .collect()
+}
+
+/// A drop is logical at apply and erased by maintenance: `optimize` rewrites
+/// every fragment still holding a dropped property's values, here one
+/// fragment without deletions that Lance's planner leaves alone, in one graph
+/// commit with batches sized by the remaining Blob property, and `cleanup`
+/// then deletes the old files once nothing retains them, so no file of the
+/// graph holds the dropped bytes. A branch made after the drop and before the
+/// optimize retains them, even once merged into main, until it is deleted. A
+/// table with no dropped column and nothing to compact is neither sized nor
+/// committed. Bytes on disk need filesystem assertions.
+#[tokio::test]
+async fn optimize_then_cleanup_erases_dropped_property_values() {
+    const MIB: usize = 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let initial = "node Doc {\n    slug: String @key\n    note: String?\n    content: Blob?\n    secret: Blob?\n}\n\
+                   node Tag {\n    slug: String @key\n    icon: Blob?\n}\n";
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), initial)
+            .await
+            .unwrap(),
+    );
+    // Inline, packed and dedicated placements of the dropped Blob, and a
+    // 1 MiB kept value that sizes the rewrite's batches.
+    let secrets = [
+        ("inline", Some(incompressible(1, 512))),
+        ("packed", Some(incompressible(2, 96 * 1024))),
+        ("dedicated", Some(incompressible(3, 5 * MIB))),
+        ("null", None),
+    ];
+    let content = |slug: &str| match slug {
+        "dedicated" => Some(incompressible(4, MIB)),
+        "null" => None,
+        _ => Some(slug.as_bytes().to_vec()),
+    };
+    let mut lines = secrets
+        .iter()
+        .map(|(slug, secret)| {
+            serde_json::json!({
+                "type": "Doc",
+                "data": {
+                    "slug": slug,
+                    "note": format!("note of {slug}"),
+                    "content": content(slug).as_deref().map(base64_blob),
+                    "secret": secret.as_deref().map(base64_blob),
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>();
+    lines.push(
+        serde_json::json!({"type": "Tag", "data": {"slug": "t", "icon": base64_blob(b"icon")}})
+            .to_string(),
+    );
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    // Settle index work, then prove Lance's planner leaves both tables alone.
+    db.optimize().await.unwrap();
+    for stat in db.optimize().await.unwrap() {
+        assert!(!stat.committed, "test precondition: {stat:?}");
+    }
+    assert_eq!(
+        helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+            .await
+            .get_fragments()
+            .len(),
+        1,
+        "test precondition: one Doc fragment"
+    );
+    let dropped_ids = {
+        let doc = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+        BTreeSet::from([
+            doc.schema().field("note").unwrap().id,
+            doc.schema().field("secret").unwrap().id,
+        ])
+    };
+    let needles = secrets
+        .iter()
+        .filter_map(|(_, secret)| secret.as_ref().map(|bytes| bytes[64..96].to_vec()))
+        .collect::<Vec<_>>();
+    for needle in &needles {
+        assert!(
+            !files_containing(dir.path(), needle).is_empty(),
+            "test precondition: the dropped value is stored"
+        );
+    }
+
+    let desired = initial
+        .replace("    note: String?\n", "")
+        .replace("    secret: Blob?\n", "");
+    assert!(db.apply_schema(&desired).await.unwrap().applied);
+    let files_after_drop = pinned_file_field_ids(&db, "node:Doc").await;
+    assert!(
+        files_after_drop
+            .iter()
+            .any(|(_, fields)| dropped_ids.iter().all(|id| fields.contains(id))),
+        "test precondition: the drop keeps the data file naming both dropped ids"
+    );
+    // Its head and fork point pin the table version holding the dropped values.
+    db.branch_create("retained").await.unwrap();
+    let tag_pin = helpers::pinned_version(&db, "main", "node:Tag").await;
+    let commits_before = db.list_commits(None).await.unwrap().len();
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let stats = omnigraph::instrumentation::with_merge_write_probes(probes.clone(), db.optimize())
+        .await
+        .unwrap();
+    let stat = |key: &str| stats.iter().find(|stat| stat.type_key == key).unwrap();
+    let doc = stat("node:Doc");
+    assert!(
+        doc.committed,
+        "the fragment holding dropped values is rewritten"
+    );
+    assert_eq!((doc.fragments_removed, doc.fragments_added), (1, 1));
+    assert!(!stat("node:Tag").committed, "Tag has nothing to rewrite");
+    assert_eq!(
+        helpers::pinned_version(&db, "main", "node:Tag").await,
+        tag_pin
+    );
+    assert_eq!(
+        (
+            probes.compaction_blob_batch_calls(),
+            probes.compaction_blob_batch_rows()
+        ),
+        (1, 32),
+        "one task, sized by the kept 1 MiB value, not the dropped 5 MiB one; Tag is not scanned"
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap().len(),
+        commits_before + 1,
+        "optimize publishes one graph commit"
+    );
+    let live = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc")
+        .await
+        .schema()
+        .field_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for (path, fields) in pinned_file_field_ids(&db, "node:Doc").await {
+        assert!(
+            fields.iter().all(|id| live.contains(id)),
+            "{path} still names a dropped field id: {fields:?}"
+        );
+        assert!(files_after_drop.iter().all(|(old, _)| *old != path));
+    }
+    let mut expected = secrets
+        .iter()
+        .map(|(slug, _)| (slug.to_string(), vec![content(slug)]))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert!(
+        doc_blob_values(&db, &["content"]).await == expected,
+        "the remaining properties survive the rewrite"
+    );
+    for stat in db.optimize().await.unwrap() {
+        assert!(
+            !stat.committed,
+            "a second optimize has nothing left: {stat:?}"
+        );
+    }
+
+    // Older commits still pin the old files until cleanup stops retaining them.
+    for needle in &needles {
+        assert!(!files_containing(dir.path(), needle).is_empty());
+    }
+    // Merging the branch does not release its pins, and neither does another
+    // optimize of main: cleanup keeps every live branch's head and fork point.
+    db.load(
+        "retained",
+        r#"{"type":"Tag","data":{"slug":"u","icon":"base64:dQ=="}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.branch_merge("retained", "main").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    db.optimize().await.unwrap();
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    for needle in &needles {
+        assert!(
+            !files_containing(dir.path(), needle).is_empty(),
+            "the live branch retains the dropped bytes"
+        );
+    }
+    db.branch_delete("retained").await.unwrap();
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    for needle in &needles {
+        let found = files_containing(dir.path(), needle);
+        assert!(found.is_empty(), "dropped bytes remain in {found:?}");
+    }
+    let doc_dir = std::path::PathBuf::from(node_table_uri(&db, "Doc").await).join("data");
+    for (old, _) in &files_after_drop {
+        assert!(!doc_dir.join(old).exists(), "old data file remains: {old}");
+        // A local store leaves the emptied sidecar directory behind.
+        assert!(
+            std::fs::read_dir(doc_dir.join(old.trim_end_matches(".lance")))
+                .map_or(true, |mut sidecars| sidecars.next().is_none()),
+            "old Blob sidecars remain: {old}"
+        );
+    }
+    assert!(
+        doc_blob_values(&db, &["content"]).await == expected,
+        "the remaining properties survive cleanup"
+    );
+}
+
 /// `optimize` publishes its compaction to `__manifest` as a detached pin with
 /// fewer fragments, leaves the linear HEAD where it was, and a schema apply
 /// on the compacted table then succeeds.

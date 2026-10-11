@@ -439,11 +439,19 @@ pub(super) async fn prepare_selected_edges(
         .map_err(|error| memory.error(error))?;
     let mut prepared = Vec::with_capacity(step.members().len());
     for member in step.members() {
+        let table = format!("edge:{}", member.edge_type);
+        let dataset = env.snapshot.open_lance_dataset(&table).await?;
+        super::typed_value::check_stored_schema(
+            &dataset,
+            &env.catalog.edge_types[&member.edge_type].arrow_schema,
+            &table,
+            [
+                env.catalog.system_columns.src,
+                env.catalog.system_columns.dst,
+            ],
+        )?;
         prepared.push(PreparedEdge {
-            dataset: env
-                .snapshot
-                .open_lance_dataset(&format!("edge:{}", member.edge_type))
-                .await?,
+            dataset,
             probes: endpoint_probes(member.direction, env.catalog.system_columns),
         });
     }
@@ -548,11 +556,23 @@ pub(crate) enum ModeOrigin {
     Uncosted,
 }
 
-/// The start the plan recorded on `step`, with the two runtime corrections:
-/// a probed index coverage (or a CSR warmed by an earlier operator) re-runs
-/// the cost model before an indexed start, and the indexed start carries the
-/// per-hop policy that switches mid-flight (issue #533). `frontier_rows` is
-/// the breaker's retained frontier; the streaming single hop has none yet.
+impl ModeOrigin {
+    async fn runtime_coverage(
+        &self,
+        probe: impl Future<Output = Result<crate::table_store::IndexCoverage>>,
+    ) -> Option<Result<crate::table_store::IndexCoverage>> {
+        if matches!(self, Self::Costed(inputs)
+            if inputs.coverage_provenance == omnigraph_planner::CoverageProvenance::PinnedIndexFacts)
+        {
+            None
+        } else {
+            Some(probe.await)
+        }
+    }
+}
+
+/// Correct the recorded mode for the observed frontier and warm CSR, probing
+/// coverage only for legacy plans. The indexed start retains its per-hop policy.
 pub(super) async fn decide_expand_start(
     frontier_rows: Option<usize>,
     graph_index: &GraphIndexHandle,
@@ -602,18 +622,32 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-    let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
-    for orientation in endpoint_probes(direction, catalog.system_columns)
-        .iter()
-        .skip(1)
-    {
-        let extra =
-            crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key).await;
-        coverage = match (coverage, extra) {
-            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        };
-    }
+    super::typed_value::check_stored_schema(
+        &edge_ds,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        [catalog.system_columns.src, catalog.system_columns.dst],
+    )?;
+    let coverage = named
+        .origin
+        .runtime_coverage(async {
+            let mut coverage =
+                crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
+            for orientation in endpoint_probes(direction, catalog.system_columns)
+                .iter()
+                .skip(1)
+            {
+                let extra =
+                    crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key)
+                        .await;
+                coverage = match (coverage, extra) {
+                    (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                };
+            }
+            coverage
+        })
+        .await;
 
     let corrected = match &named.origin {
         ModeOrigin::Costed(inputs) => {
@@ -621,7 +655,9 @@ pub(super) async fn decide_expand_start(
             if let Some(observed) = frontier_rows {
                 inputs.frontier_rows = inputs.frontier_rows.min(observed as u64);
             }
-            inputs.coverage = coverage_for_decision(&coverage);
+            if let Some(coverage) = &coverage {
+                inputs.coverage = coverage_for_decision(coverage);
+            }
             inputs.csr_cached = inputs.csr_cached || graph_index.is_built();
             Some(inputs)
         }
@@ -657,7 +693,9 @@ pub(super) async fn decide_expand_start(
     );
     crate::instrumentation::record_expand_path(true);
     memory.metric("expand_indexed", 1);
-    warn_on_degraded_coverage(&coverage, key_col, edge_type);
+    if let Some(coverage) = &coverage {
+        warn_on_degraded_coverage(coverage, key_col, edge_type);
+    }
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
         None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
@@ -794,6 +832,14 @@ where
                 .await?
         }
     };
+    super::typed_value::check_stored_schema(
+        &dataset,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &format!("edge:{edge_type}"),
+        [catalog.system_columns.src, catalog.system_columns.dst]
+            .into_iter()
+            .chain(attach_columns.iter().copied()),
+    )?;
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
@@ -1035,7 +1081,7 @@ pub(super) fn resolve_csr<'g>(
 
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
-/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
+/// Only legacy Named can switch to CSR.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
@@ -1083,7 +1129,7 @@ where
         ExpandExecution::Budgeted(_) => None,
     };
     let budgeted = step.budgeted();
-    let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
+    let max = step.max_hops;
 
     let mut active = match start_indexed {
         Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1467,8 +1513,9 @@ pub(super) fn bulk_anti_join_mask(
 /// state across the swap instead of restarting.
 ///
 /// Id spaces differ per source: Indexed owns a per-traversal interner (both
-/// endpoint types in ONE dense space — see the cross-type single-hop guard in
-/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// endpoint types in ONE dense space, which is sound because
+/// `validate_expand_structure` refuses a cross-type expand a second hop), Csr
+/// borrows the graph index's per-type dictionaries.
 /// A swap therefore translates all live state through the id strings once.
 pub(super) enum ActiveExpandSource<'g> {
     Indexed(Box<IndexedExpandSource>),
@@ -1677,5 +1724,52 @@ mod traversal_scan_admission_tests {
                 .to_string()
                 .contains("physical row count sum overflow")
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use omnigraph_planner::{CoverageProvenance, IndexCoverage};
+
+    /// GQT cannot detect a cached metadata probe; an unpolled future proves its absence.
+    #[tokio::test]
+    async fn pinned_facts_never_poll_the_runtime_probe() {
+        for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+            let mut inputs = ExpandCostInputs {
+                frontier_rows: 1,
+                edge_count: 10,
+                src_node_count: 10,
+                effective_max_hops: 2,
+                max_hops_cap: 10,
+                max_frontier_cap: 100,
+                coverage,
+                coverage_provenance: CoverageProvenance::PinnedIndexFacts,
+                csr_cached: false,
+                probe_factor: 1.0,
+            };
+            assert!(
+                ModeOrigin::Costed(inputs.clone())
+                    .runtime_coverage(async {
+                        panic!("pinned index facts must not trigger a runtime metadata probe")
+                    })
+                    .await
+                    .is_none()
+            );
+            inputs.coverage_provenance = CoverageProvenance::LegacyAssumed;
+            for origin in [
+                ModeOrigin::Costed(inputs),
+                ModeOrigin::Pinned,
+                ModeOrigin::Uncosted,
+            ] {
+                let probe = origin
+                    .runtime_coverage(async { Ok(crate::table_store::IndexCoverage::Indexed) })
+                    .await;
+                assert!(matches!(
+                    probe,
+                    Some(Ok(crate::table_store::IndexCoverage::Indexed))
+                ));
+            }
+        }
     }
 }

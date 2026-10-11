@@ -195,9 +195,12 @@ pub struct PlanChange {
     pub metadata_change: Option<PlanMetadataChange>,
     /// For schema updates: the engine's migration plan against the live
     /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
-    /// unavailable (warning `schema_preview_unavailable`).
+    /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+    /// Removing a declared graph deletes its managed root and retained history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -216,10 +219,14 @@ pub struct BlastRadius {
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanOutput {
     pub ok: bool,
-    /// Whether this plan held the cluster lock or only observed the ledger.
+    /// Plans are observations and never reserve writer authority.
     pub authority: LedgerAuthority,
     pub config_dir: String,
     pub desired_revision: DesiredRevision,
+    /// Immutable captured input identity, when capture succeeded. This is an
+    /// observation, not a reservation or permission to execute it later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_digest: Option<String>,
     pub resource_digests: BTreeMap<String, String>,
     pub dependencies: Vec<Dependency>,
     pub state_observations: StateObservations,
@@ -259,13 +266,6 @@ pub enum LedgerAuthority {
     /// The command took no lock and wrote nothing. Its findings are a
     /// point-in-time observation; `state_cas` names the ledger it read.
     Observed,
-}
-
-/// Options for [`crate::plan_config_dir_with_options`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PlanOptions {
-    /// Plan without the cluster lock and label the output `observed`.
-    pub observe: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -526,11 +526,9 @@ fn secret_ref_name(value: &str) -> Result<&str, String> {
         .strip_prefix("${")
         .and_then(|s| s.strip_suffix('}'))
         .filter(|name| !name.trim().is_empty())
+        // Never echo the value: an inline one is the secret itself.
         .ok_or_else(|| {
-            format!(
-                "embedding api_key must be a ${{NAME}} env reference, got '{}'",
-                value.trim()
-            )
+            "embedding api_key must be a ${NAME} env reference, not an inline secret".to_string()
         })
 }
 
@@ -697,6 +695,10 @@ mod embedding_provider_config_tests {
         };
         let err = profile.resolve().unwrap_err();
         assert!(err.contains("${NAME}"), "got: {err}");
+        assert!(
+            !err.contains("sk-inline"),
+            "the refusal echoed the key: {err}"
+        );
     }
 
     #[test]

@@ -29,7 +29,6 @@ pub(crate) fn applies(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Command::Load { .. }
-            | Command::Ingest { .. }
             | Command::Mutate { .. }
             | Command::Branch {
                 command: BranchCommand::Create { .. }

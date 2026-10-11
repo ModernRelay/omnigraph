@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-reference-engine"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "Engine v1, frozen: the reference executor GQT compares engine v2 against. Never published."
 license = "MIT"
@@ -8,9 +8,9 @@ repository = "https://github.com/ModernRelay/omnigraph"
 publish = false
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.12.0" }
-omnigraph-core = { path = "../omnigraph-core", version = "0.12.0" }
-omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.12.0", features = ["test-util"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.13.0" }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.13.0", features = ["test-util"] }
 lance = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-index = { workspace = true }

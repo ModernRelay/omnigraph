@@ -32,7 +32,7 @@ means the data request was not sent. HTTP discovery refusals retain their status
 | 416 | Blob byte range is outside the value | Use the returned length to choose a valid range |
 | 424 | An allowed external Blob source could not be read | Restore source availability or correct its URI/credentials |
 | 429 | Server or per-actor admission limit reached | Use the whole-command outcome below before retrying; preserve `Retry-After` |
-| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
+| 500 | Server or stored-data integrity failure | Check server logs; do not assume partial success. A Blob delivery, change-route or streamed-response failure logs its error class (`error_variant`, and `storage_kind` for a storage failure), never its storage path; see below |
 | 503 | Admission is closed, or a published schema change requires completion | Inspect the structured error; generic 503 is not permission to repeat a write |
 
 A `GET` or `HEAD /blob` 500 logs `error_kind="blob_pre_header_internal"` with a
@@ -43,6 +43,16 @@ refusal before headers, logged with `error_variant="unclassified"`. A managed
 Blob body that fails after the headers logs the byte range under one of
 `blob_payload_read` (with the error class), `blob_payload_short_read` (with
 the returned and expected byte counts) or `blob_payload_permit_closed`.
+
+A change route (`GET /changes`, `POST /changes/baseline`,
+`GET /commits/{commit_id}/changes`) answers an internal failure with a fixed
+500 and logs `error_kind="change_route_internal"` with `error_variant`,
+`storage_kind` and `manifest_kind`. A change route that requires recovery logs
+the `operation_id` the 503 reports. An export or change-baseline response that
+fails after its 200 headers ends with an incomplete body and logs
+`error_kind="served_stream_failed"` with `stream` (`export` or
+`change_baseline`) and the same error class. None of these logs carries the
+error's message, which can hold object URIs or credentials.
 
 A graph-head `412` includes `precondition_failure` with `expected` and, when
 available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
@@ -118,29 +128,30 @@ between graph roots.
 ## Cluster failures
 
 - Run `cluster validate` before `plan` or `apply`.
-- Graph deletion is outside the supported deployment class; no approval command
-  authorizes it.
+- Apply refuses existing unmanaged roots and missing managed graphs that remain
+  declared. Restore authoritative data to keep a missing graph, or remove its
+  declaration to delete it; see [deployment boundaries](../clusters/index.md#deployment-boundaries).
 - A retained lock requires prior-owner and accepted-I/O quiescence, exclusion
   of other admissions/unlocks, and its exact ID; follow
   [ownership transfer](../deployment.md#writer-topology).
 - Directory boot reads `cluster.yaml` to resolve storage, but served graph,
-  query, and policy resources come from applied state. Submit schema/query
-  changes and graph additions with `cluster apply --server` for live activation.
+  query, and policy resources come from applied state. Submit configuration
+  changes with `cluster apply --server` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
   serve. Use `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
   inside, or contains, the cluster storage root that holds every graph and the
   applied state. For a new declaration, move the base to a sibling prefix before
-  applying. Existing external-Blob bindings cannot be replaced through the
-  current deployment class. An invalid applied binding keeps its graph blocked;
+  applying. Correct existing external-Blob bindings in the desired configuration
+  and apply them. An invalid applied binding keeps its graph blocked;
   if every graph is blocked, startup fails with `cluster_no_healthy_graphs`. See
   [External Blob references](../clusters/config.md#external-blob-references).
 - `external_blob_storage_root_uncomparable`: the cluster storage root is
   spelled with a path component an external Blob base cannot express (an empty
   component, or a percent sign in a local path), so a base of the same storage
   kind cannot be proven to lie outside it. Moving the base does not help:
-  correct a new declaration before applying. Existing graph roots and Blob
-  bindings remain fixed. Validation refuses the base, and an invalid applied
+  correct the declaration or remove the allow-list before applying. Graph roots
+  remain fixed. Validation refuses the base, and an invalid applied
   binding keeps the graph blocked, as for an overlap.
 
 See [Operating a cluster](../clusters/index.md).
@@ -171,8 +182,7 @@ condition is per table.
 - Queries, mutations, loads, merges, index builds, schema apply, optimize
   and cleanup are unaffected: none of them resolves the linear HEAD.
 - `repair` prints the last linear version, the HEAD and the count of foreign
-  versions, takes no action and exits 0. `--confirm` and `--force --confirm`
-  never adopt the foreign commit.
+  versions, takes no action and exits 0. The removed confirmation flags are rejected; repair never adopts the foreign commit.
 - `cleanup` never deletes a foreign version or its files; the table's result
   row lists them under `foreign_versions`.
 

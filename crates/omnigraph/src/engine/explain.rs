@@ -22,7 +22,7 @@ pub(crate) async fn explain_document(
     settings: &SessionSettings,
 ) -> Result<serde_json::Value> {
     let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
-    Ok(explain_query(&source)?.explain.to_value())
+    Ok(explain_query(&source).await?.explain.to_value())
 }
 
 /// The `tree` value of the lowered DataFusion plan's rows: one per operator
@@ -220,7 +220,7 @@ pub(crate) async fn explain_rows(
     settings: &SessionSettings,
 ) -> Result<QueryResult> {
     let source = QuerySource::gather(query, catalog, snapshot, params, settings).await?;
-    let planned = explain_query(&source)?;
+    let planned = explain_query(&source).await?;
     let assumptions = planned.accepted.plan().assumptions().clone();
     let lowered = lowered_tree(planned.accepted, &source).await?;
     let omnigraph_planner::explain::Explain {

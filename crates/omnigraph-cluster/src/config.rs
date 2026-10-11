@@ -682,23 +682,6 @@ pub(crate) async fn observe_declared_graphs(
     graph_error_count
 }
 
-/// RFC-004 §D7: the data-aware preview — the engine's migration plan for a
-/// desired schema against the live graph, computed read-only (no lock).
-pub(crate) async fn preview_schema_migration(
-    graph_uri: &str,
-    schema_path: &str,
-) -> Result<SchemaMigrationPlan, String> {
-    let source = fs::read_to_string(schema_path).map_err(|err| err.to_string())?;
-    let db = Omnigraph::open_read_only(graph_uri)
-        .await
-        .map_err(|err| err.to_string())?;
-    let preview = db
-        .preview_schema_apply(&source)
-        .await
-        .map_err(|err| err.to_string())?;
-    Ok(preview.plan)
-}
-
 pub(crate) struct LiveGraphObservation {
     graph_manifest_version: u64,
     schema_digest: String,

@@ -119,6 +119,27 @@ CI runs both.
 
 ## Pull Requests
 
+- **Title the PR `type(scope)!: description`** ([Conventional
+  Commits](https://www.conventionalcommits.org/en/v1.0.0/)). Every merge is a
+  squash whose subject is the title, so the title is the line `git log` keeps.
+  The `PR Title` check refuses anything else and re-runs when you edit the
+  title:
+  - `type` is one of `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `ci`,
+    `build`, `revert`, `rfc`, `release`; there is no `chore`, say what kind
+    of change it is.
+  - `(scope)` is optional: lowercase names, commas between several
+    (`refactor(blob,schema)!: …`).
+  - `!` marks a breaking change; the change also carries a
+    `changelog.d/<slug>.breaking.md` note.
+  - the description starts lowercase (a backtick or a digit is fine), has no
+    trailing period, and the whole title stays within 100 characters.
+  - an RFC PR is `rfc: <the RFC's subject>`, not `docs(rfc):`; RFC numbers
+    stay out of titles (RFCs are named by date and slug). A revert is
+    `revert: <what is undone>`; retitle GitHub's `Revert "…"` default.
+  - examples: `feat(server): return exact merge publication receipts`,
+    `fix(merge): decide fast_forward by the target's state`,
+    `test(gq): cover inherited indexes after fast-forward`,
+    `docs: fix a broken link in the upgrade guide`.
 - **Link the backing `accepted` issue or accepted RFC** (`Closes #123`, or
   reference the RFC) — or mark the PR as trivial per the fast-lane.
 - Keep changes focused; one logical change per PR.

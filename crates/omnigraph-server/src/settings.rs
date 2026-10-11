@@ -85,6 +85,34 @@ pub(crate) fn settings_from_snapshot(
     cli_require_all_graphs: bool,
     snapshot: omnigraph_cluster::ServingSnapshot,
 ) -> Result<ServerConfig> {
+    settings_from_snapshot_inner(
+        cluster_dir,
+        cli_bind,
+        cli_allow_unauthenticated,
+        cli_require_all_graphs,
+        snapshot,
+        false,
+    )
+}
+
+/// Project a settled deployment's achieved inventory, including unavailable
+/// graphs. Startup's all-graphs-ready environment setting does not veto an
+/// already-settled management-policy handoff.
+pub(crate) fn deployment_settings_from_snapshot(
+    cluster_dir: &Path,
+    snapshot: omnigraph_cluster::ServingSnapshot,
+) -> Result<ServerConfig> {
+    settings_from_snapshot_inner(cluster_dir, None, false, false, snapshot, true)
+}
+
+fn settings_from_snapshot_inner(
+    cluster_dir: &Path,
+    cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
+    cli_require_all_graphs: bool,
+    snapshot: omnigraph_cluster::ServingSnapshot,
+    deployment: bool,
+) -> Result<ServerConfig> {
     for diagnostic in &snapshot.diagnostics {
         warn!(
             code = %diagnostic.code,
@@ -94,7 +122,7 @@ pub(crate) fn settings_from_snapshot(
         );
     }
     let env_require_all_graphs = env_flag("OMNIGRAPH_REQUIRE_ALL_GRAPHS");
-    let require_all_graphs = cli_require_all_graphs || env_require_all_graphs;
+    let require_all_graphs = !deployment && (cli_require_all_graphs || env_require_all_graphs);
     // Boot provenance is independent of the complete runtime graph inventory.
     let witness = BootWitness {
         booted_serving_digest: snapshot.config_digest.clone(),
@@ -236,7 +264,8 @@ pub(crate) fn settings_from_snapshot(
         });
     }
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    if graphs.iter().all(|graph| graph.startup_failure.is_some())
+    if !deployment
+        && graphs.iter().all(|graph| graph.startup_failure.is_some())
         && !snapshot.applied_graphs.is_empty()
     {
         let skipped = skipped_graphs.join(", ");
@@ -1070,15 +1099,9 @@ graphs:
         )
         .unwrap();
         let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
-        let apply = omnigraph_cluster::apply_deployment(
-            dir.path(),
-            None,
-            &caller,
-            &Default::default(),
-            |_, _, _| {},
-        )
-        .await
-        .unwrap();
+        let apply = omnigraph_cluster::apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap();
         assert!(
             matches!(apply, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
             "{apply:?}"

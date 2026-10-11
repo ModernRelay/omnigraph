@@ -100,7 +100,7 @@ async fn load_does_not_create_run_branch() {
     assert_eq!(qr.num_rows(), 1);
 }
 
-/// `omnigraph change` writes directly to the target. After the call,
+/// `omnigraph mutate` writes directly to the target. After the call,
 /// `branch_list()` shows only `main`; no run record exists.
 #[tokio::test]
 async fn mutation_does_not_create_run_branch() {

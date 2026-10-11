@@ -1513,13 +1513,14 @@ fn validate_inventory(records: ArchiveRecordIter) -> Result<ValidatedInventory, 
                 ),
             ));
         }
-        if receipt.invocation_id != record.invocation.invocation_id {
+        if receipt.invocation_id != record.invocation().invocation_id {
             return Err(ProjectionError::new(
                 "projection_invocation_mismatch",
                 None,
                 format!(
                     "receipt invocation {} differs from record invocation {}",
-                    receipt.invocation_id, record.invocation.invocation_id
+                    receipt.invocation_id,
+                    record.invocation().invocation_id
                 ),
             ));
         }
@@ -1527,39 +1528,41 @@ fn validate_inventory(records: ArchiveRecordIter) -> Result<ValidatedInventory, 
         validate_relative_archive_path(&receipt.object_relative_path, "archive object")?;
         validate_relative_archive_path(&receipt.pointer_relative_path, "archive pointer")?;
 
-        require_invocation_id(&record.invocation.invocation_id, "record invocation id")?;
+        require_invocation_id(&record.invocation().invocation_id, "record invocation id")?;
         if previous_invocation
             .as_ref()
-            .is_some_and(|previous| previous >= &record.invocation.invocation_id)
+            .is_some_and(|previous| previous >= &record.invocation().invocation_id)
         {
             return Err(ProjectionError::new(
                 "projection_inventory_order_invalid",
                 None,
                 format!(
                     "archive invocation {} is not strictly after {:?}",
-                    record.invocation.invocation_id, previous_invocation
+                    record.invocation().invocation_id,
+                    previous_invocation
                 ),
             ));
         }
-        previous_invocation = Some(record.invocation.invocation_id.clone());
+        previous_invocation = Some(record.invocation().invocation_id.clone());
 
         if let Some(previous) = digests.insert(
             receipt.record_sha256.clone(),
-            record.invocation.invocation_id.clone(),
+            record.invocation().invocation_id.clone(),
         ) {
             return Err(ProjectionError::new(
                 "projection_record_digest_collision",
                 None,
                 format!(
                     "record digest {} appears for invocations {previous} and {}",
-                    receipt.record_sha256, record.invocation.invocation_id
+                    receipt.record_sha256,
+                    record.invocation().invocation_id
                 ),
             ));
         }
         retained.add(
             std::mem::size_of::<(String, String)>()
                 .saturating_add(receipt.record_sha256.len())
-                .saturating_add(record.invocation.invocation_id.len()),
+                .saturating_add(record.invocation().invocation_id.len()),
             "record digest index",
         )?;
 
@@ -1584,9 +1587,9 @@ fn validate_inventory(records: ArchiveRecordIter) -> Result<ValidatedInventory, 
         }
 
         let entry = InventoryEntry {
-            invocation_id: record.invocation.invocation_id.clone(),
+            invocation_id: record.invocation().invocation_id.clone(),
             record_sha256: receipt.record_sha256.clone(),
-            point_id: record.run.point_id.clone(),
+            point_id: record.point_id().to_owned(),
         };
         let entry_bytes = retained_inventory_entry_bytes(&entry);
         if entry_bytes > MAX_INVENTORY_ENTRY_BYTES {
@@ -1633,7 +1636,48 @@ fn validate_inventory(records: ArchiveRecordIter) -> Result<ValidatedInventory, 
     })
 }
 
-fn point_row(record: &RunRecordV1) -> Result<PointRow, ProjectionError> {
+trait ProjectionRecord {
+    fn point_row(&self) -> Result<PointRow, ProjectionError>;
+    fn run_row(
+        &self,
+        receipt: &crate::archive::ArchiveReceiptV1,
+    ) -> Result<RunRow, ProjectionError>;
+}
+impl ProjectionRecord for RunRecordV1 {
+    fn point_row(&self) -> Result<PointRow, ProjectionError> {
+        legacy_point_row(self)
+    }
+    fn run_row(&self, r: &crate::archive::ArchiveReceiptV1) -> Result<RunRow, ProjectionError> {
+        legacy_run_row(self, r)
+    }
+}
+impl ProjectionRecord for crate::gqt_record::AnyRunRecordV1 {
+    fn point_row(&self) -> Result<PointRow, ProjectionError> {
+        match self {
+            Self::Legacy(r) => legacy_point_row(r),
+            Self::Gqt(r) => gqt_point_row(r),
+        }
+    }
+    fn run_row(
+        &self,
+        receipt: &crate::archive::ArchiveReceiptV1,
+    ) -> Result<RunRow, ProjectionError> {
+        match self {
+            Self::Legacy(r) => legacy_run_row(r, receipt),
+            Self::Gqt(r) => gqt_run_row(r, receipt),
+        }
+    }
+}
+fn point_row<R: ProjectionRecord>(record: &R) -> Result<PointRow, ProjectionError> {
+    record.point_row()
+}
+fn run_row<R: ProjectionRecord>(
+    record: &R,
+    receipt: &crate::archive::ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    record.run_row(receipt)
+}
+fn legacy_point_row(record: &RunRecordV1) -> Result<PointRow, ProjectionError> {
     require_sha256(&record.run.point_id, "point id")?;
     let run_spec_json = canonical_json(&record.run.run_spec, "run spec")?;
     Ok(PointRow {
@@ -1645,7 +1689,7 @@ fn point_row(record: &RunRecordV1) -> Result<PointRow, ProjectionError> {
     })
 }
 
-fn run_row(
+fn legacy_run_row(
     record: &RunRecordV1,
     receipt: &crate::archive::ArchiveReceiptV1,
 ) -> Result<RunRow, ProjectionError> {
@@ -1653,7 +1697,7 @@ fn run_row(
     let wall = &record.measurements.wall_clock;
     let calls = logical_call_summaries(record)?;
     Ok(RunRow {
-        invocation_id: record.invocation.invocation_id.clone(),
+        invocation_id: record.invocation().invocation_id.clone(),
         record_sha256: receipt.record_sha256.clone(),
         archive_object: receipt.object_relative_path.clone(),
         archive_pointer: receipt.pointer_relative_path.clone(),
@@ -1754,6 +1798,127 @@ fn run_row(
     })
 }
 
+fn gqt_point_row(record: &crate::gqt_record::GqtRunRecordV1) -> Result<PointRow, ProjectionError> {
+    require_sha256(&record.run.point_id, "point id")?;
+    let run_spec_json = canonical_json(&record.run.run_spec, "run spec")?;
+    Ok(PointRow {
+        point_id: record.run.point_id.clone(),
+        point_name: record.run.point_name.clone(),
+        point_identity_version: record.run.point_identity_version,
+        scenario: json_string(&record.run.run_spec.scenario, "scenario")?,
+        run_spec_json,
+    })
+}
+
+fn gqt_run_row(
+    record: &crate::gqt_record::GqtRunRecordV1,
+    receipt: &crate::archive::ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    let machine = &record.machine;
+    let wall = &record.measurements.wall_clock;
+    let calls = gqt_logical_call_summaries(record)?;
+    Ok(RunRow {
+        invocation_id: record.invocation().invocation_id.clone(),
+        record_sha256: receipt.record_sha256.clone(),
+        archive_object: receipt.object_relative_path.clone(),
+        archive_pointer: receipt.pointer_relative_path.clone(),
+        session_id: record.invocation.session_id.clone(),
+        invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
+        case_id: record.run.case_id.clone(),
+        case_digest: record.run.case_digest.clone(),
+        package_version: record.sut.package_version.clone(),
+        source_commit: record.sut.source_commit.clone(),
+        source_tree_dirty: record.sut.source_tree_dirty,
+        build_profile: record.sut.build.profile.clone(),
+        build_opt_level: record.sut.build.cargo_opt_level.clone(),
+        debug_assertions: record.sut.build.debug_assertions,
+        target_triple: record.sut.build.target_triple.clone(),
+        rustc_version: record.sut.build.rustc_version.clone(),
+        build_declared_release_lto: record.sut.build.declared_release_lto.clone(),
+        build_declared_release_codegen_units: record.sut.build.declared_release_codegen_units,
+        build_declared_release_strip: record.sut.build.declared_release_strip,
+        build_cargo_encoded_rustflags_present: record.sut.build.cargo_encoded_rustflags_present,
+        build_release_profile_environment_overrides_supported: record
+            .sut
+            .build
+            .release_profile_environment_overrides_supported,
+        build_effective_codegen_options_proved: record.sut.build.effective_codegen_options_proved,
+        worker_executable_sha256: record.sut.build.worker_executable_sha256.clone(),
+        sut_fingerprint: typed_json_sha256(&record.sut, "system under test")?,
+        sut_json: canonical_json(&record.sut, "system under test")?,
+        machine_fingerprint: typed_json_sha256(machine, "machine identity")?,
+        machine_format_version: machine.format_version,
+        machine_os_name: machine.os_name.clone(),
+        machine_os_version: machine.os_version.clone(),
+        machine_kernel_version: machine.kernel_version.clone(),
+        machine_architecture: machine.architecture.clone(),
+        machine_cpu_model: machine.cpu_model.clone(),
+        machine_logical_cores: machine.logical_cores,
+        machine_physical_cores: machine.physical_cores,
+        machine_total_memory_bytes: machine.total_memory_bytes,
+        machine_resource_control_json: canonical_json(
+            &machine.resource_control,
+            "machine resource control",
+        )?,
+        machine_scheduling_json: canonical_json(&machine.scheduling, "machine scheduling")?,
+        machine_resource_limits_json: canonical_json(
+            &machine.resource_limits,
+            "machine resource limits",
+        )?,
+        machine_label: machine.machine_label.clone(),
+        backend_fingerprint: typed_json_sha256(&record.backend, "backend evidence")?,
+        backend_json: canonical_json(&record.backend, "backend evidence")?,
+        fixture_manifest_sha256: typed_json_sha256(&record.fixture, "dataset manifest")?,
+        fixture_logical_sha256: record
+            .fixture
+            .handoff
+            .summary
+            .logical_content_sha256
+            .clone(),
+        fixture_physical_sha256: record.fixture.handoff.physical.digest_sha256.clone(),
+        acquisition_status: json_string(&record.acquisition.status, "acquisition status")?,
+        claim_eligible: record.claim_eligible(),
+        terminal_failed_repetition: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.failed_repetition),
+        terminal_stage: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.stage.as_str().to_string()),
+        terminal_code: record
+            .acquisition
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.code.clone()),
+        requested_repetitions: record.acquisition.requested_repetitions,
+        observed_repetitions: record.acquisition.observed_repetitions,
+        min_us: wall.min_us,
+        p50_us: wall.p50_us,
+        max_us: wall.max_us,
+        p95_us: wall.p95_us,
+        p95_supported: wall.p95_supported,
+        wall_evidence: json_string(&wall.evidence, "wall evidence")?,
+        floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
+        lance_data_plane_logical_calls_min: calls.lance_data_plane.min,
+        lance_data_plane_logical_calls_p50: calls.lance_data_plane.p50,
+        lance_data_plane_logical_calls_max: calls.lance_data_plane.max,
+        control_plane_logical_calls_min: calls.control_plane.min,
+        control_plane_logical_calls_p50: calls.control_plane.p50,
+        control_plane_logical_calls_max: calls.control_plane.max,
+        logical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.logical.counts,
+            "logical counts presence",
+        )?,
+        physical_counts_presence_json: canonical_json(
+            &record.measurements.layer_presence.physical.counts,
+            "physical counts presence",
+        )?,
+    })
+}
+
 async fn load_points<'a>(
     db: &Session,
     points: impl Iterator<Item = &'a PointRow>,
@@ -1786,9 +1951,9 @@ async fn load_runs(db: &Session, records: ArchiveRecordIter) -> Result<(), Proje
         })?;
         let edge_line = serialize_graph_row(&EdgeEnvelope {
             edge: "Measures",
-            id: format!("measures:{}", record.invocation.invocation_id),
-            from: &record.invocation.invocation_id,
-            to: &record.run.point_id,
+            id: format!("measures:{}", record.invocation().invocation_id),
+            from: &record.invocation().invocation_id,
+            to: record.point_id(),
             data: MeasuresProperties {},
         })?;
         if let Some(body) = batch.push_group(&[run_line, edge_line])? {
@@ -2978,6 +3143,40 @@ fn logical_call_summaries(record: &RunRecordV1) -> Result<LogicalCallSummaries, 
     })
 }
 
+fn gqt_logical_call_summaries(
+    record: &crate::gqt_record::GqtRunRecordV1,
+) -> Result<LogicalCallSummaries, ProjectionError> {
+    let mut lance_data_plane = Vec::with_capacity(record.measurements.raw_samples.len());
+    let mut control_plane = Vec::with_capacity(record.measurements.raw_samples.len());
+    for sample in &record.measurements.raw_samples {
+        let manifest = sum_call_counts(sample.logical_store_calls.manifest)?;
+        let table = sum_call_counts(sample.logical_store_calls.table)?;
+        lance_data_plane.push(manifest.checked_add(table).ok_or_else(|| {
+            ProjectionError::new(
+                "projection_logical_call_overflow",
+                None,
+                "per-repetition Lance data-plane logical call total does not fit u64",
+            )
+        })?);
+        let control = &sample.control_store_calls;
+        control_plane.push(sum_u64_values(
+            [
+                control.read_text,
+                control.read_text_if_exists,
+                control.read_text_versioned,
+                control.exists,
+                control.list_dir,
+                control.mutation_calls,
+            ],
+            "per-repetition control-plane logical call total",
+        )?);
+    }
+    Ok(LogicalCallSummaries {
+        lance_data_plane: summarize_nearest_rank(lance_data_plane, "Lance data-plane")?,
+        control_plane: summarize_nearest_rank(control_plane, "control-plane")?,
+    })
+}
+
 fn sum_call_counts(counts: LogicalCallCounts) -> Result<u64, ProjectionError> {
     sum_u64_values(
         [
@@ -3978,7 +4177,7 @@ mod tests {
         let record = crate::record::tests::valid_record_fixture();
         let receipt = crate::archive::ArchiveReceiptV1 {
             archive_format_version: ARCHIVE_FORMAT_VERSION,
-            invocation_id: record.invocation.invocation_id.clone(),
+            invocation_id: record.invocation().invocation_id.clone(),
             record_sha256: "a".repeat(64),
             object_relative_path: "objects/sha256/aa/record.json".to_string(),
             pointer_relative_path: "invocations/01/pointer.json".to_string(),
@@ -4055,7 +4254,7 @@ mod tests {
 
         let receipt = crate::archive::ArchiveReceiptV1 {
             archive_format_version: ARCHIVE_FORMAT_VERSION,
-            invocation_id: record.invocation.invocation_id.clone(),
+            invocation_id: record.invocation().invocation_id.clone(),
             record_sha256: "a".repeat(64),
             object_relative_path: "objects/sha256/aa/record.json".to_string(),
             pointer_relative_path: "invocations/01/pointer.json".to_string(),
@@ -4487,7 +4686,7 @@ mod tests {
         assert_eq!(runs.rows.len(), 1);
         assert_eq!(
             runs.rows[0]["invocation_id"],
-            record.invocation.invocation_id
+            record.invocation().invocation_id
         );
         assert_eq!(runs.rows[0]["record_sha256"], receipt.record_sha256);
         assert_eq!(

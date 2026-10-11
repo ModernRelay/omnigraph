@@ -1,4 +1,5 @@
 # issue: none
+# traversal: auto
 # notes: The planner records the traversal mode on the physical Expand from
 # notes: the row-count estimate (3 sources over 2 edges: the indexed path
 # notes: costs 2, a CSR build 3) and the explain document names the pass.

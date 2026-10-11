@@ -20,6 +20,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                delete_root: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
                 resource: address.clone(),
@@ -31,6 +32,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                delete_root: None,
             }),
             Some(_) => {}
         }
@@ -47,6 +49,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                delete_root: None,
             });
         }
     }
@@ -54,82 +57,53 @@ pub(crate) fn diff_resources(
     changes
 }
 
-/// Binding-only policy changes: the file digest is unchanged (so
-/// `diff_resources` saw nothing) but the applied `applies_to` differs from
-/// the desired bindings — including the pre-5A case where the state entry
-/// has no bindings recorded yet. These are first-class plan changes: without
-/// this pass a binding edit would silently rot or silently converge.
-pub(crate) fn append_policy_binding_changes(
-    changes: &mut Vec<PlanChange>,
-    prior_state: Option<&ClusterState>,
-    desired: &DesiredCluster,
-) {
-    let Some(state) = prior_state else {
-        return; // no state: everything is already a Create carrying bindings
-    };
-    for (address, desired_bindings) in &desired.policy_bindings {
-        if changes.iter().any(|change| &change.resource == address) {
-            continue; // content change already covers it
-        }
-        let Some(entry) = state.applied_revision.resources.get(address) else {
-            continue; // not applied yet: the Create covers it
-        };
-        if entry.applies_to.as_ref() == Some(desired_bindings) {
-            continue;
-        }
-        changes.push(PlanChange {
-            resource: address.clone(),
-            operation: PlanOperation::Update,
-            before_digest: Some(entry.digest.clone()),
-            after_digest: Some(entry.digest.clone()),
-            disposition: None,
-            reason: None,
-            binding_change: true,
-            metadata_change: Some(PlanMetadataChange::PolicyBindings),
-            migration: None,
-        });
-    }
-    changes.sort_by(|a, b| a.resource.cmp(&b.resource));
-}
-
-/// Metadata-only embedding provider changes: the provider digest is unchanged
-/// but the applied state predates storing the profile body needed by
-/// config-free serving. This mirrors policy binding backfill instead of
-/// hiding a serving-time failure behind a no-op plan.
-pub(crate) fn append_embedding_profile_changes(
-    changes: &mut Vec<PlanChange>,
-    prior_state: Option<&ClusterState>,
-    desired: &DesiredCluster,
-) {
-    let Some(state) = prior_state else {
-        return; // no state: provider Creates carry profiles already
-    };
-    for (address, desired_profile) in &desired.embedding_providers {
-        if changes
+/// The same normalized resource projection drives captured and file plans.
+pub(crate) fn diff_state_resources(
+    prior: &BTreeMap<String, StateResource>,
+    desired: &BTreeMap<String, StateResource>,
+) -> Vec<PlanChange> {
+    let digests = |resources: &BTreeMap<String, StateResource>| {
+        resources
             .iter()
-            .any(|change| change.resource.as_str() == address.as_str())
-        {
-            continue; // content change already covers it
-        }
-        let Some(entry) = state.applied_revision.resources.get(address) else {
-            continue; // not applied yet: the Create covers it
+            .map(|(address, resource)| (address.clone(), resource.digest.clone()))
+            .collect()
+    };
+    let mut changes = diff_resources(&digests(prior), &digests(desired));
+    for (address, after) in desired {
+        let Some(before) = prior.get(address) else {
+            continue;
         };
-        if entry.embedding_profile.as_ref() == Some(desired_profile) {
+        if changes.iter().any(|change| &change.resource == address) {
             continue;
         }
-        changes.push(PlanChange {
-            resource: address.clone(),
-            operation: PlanOperation::Update,
-            before_digest: Some(entry.digest.clone()),
-            after_digest: Some(entry.digest.clone()),
-            disposition: None,
-            reason: None,
-            binding_change: false,
-            metadata_change: Some(PlanMetadataChange::EmbeddingProfile),
-            migration: None,
-        });
+        let metadata_change = match resource_kind(address) {
+            ResourceKind::Policy(_) if before.applies_to != after.applies_to => {
+                Some(PlanMetadataChange::PolicyBindings)
+            }
+            ResourceKind::EmbeddingProvider(_)
+                if before.embedding_profile != after.embedding_profile =>
+            {
+                Some(PlanMetadataChange::EmbeddingProfile)
+            }
+            _ => None,
+        };
+        if let Some(metadata_change) = metadata_change {
+            changes.push(PlanChange {
+                resource: address.clone(),
+                operation: PlanOperation::Update,
+                before_digest: Some(before.digest.clone()),
+                after_digest: Some(after.digest.clone()),
+                disposition: None,
+                reason: None,
+                binding_change: metadata_change == PlanMetadataChange::PolicyBindings,
+                metadata_change: Some(metadata_change),
+                migration: None,
+                delete_root: None,
+            });
+        }
     }
     changes.sort_by(|a, b| a.resource.cmp(&b.resource));
+    changes
 }
 
 pub(crate) fn compute_blast_radius(

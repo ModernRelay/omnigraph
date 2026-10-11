@@ -154,7 +154,10 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                 || matches!(
                     cmd,
                     Command::Cluster {
-                        command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
+                        command: ClusterCommand::Plan { .. }
+                            | ClusterCommand::Apply { .. }
+                            | ClusterCommand::Status { .. },
+                        managed: false,
                     }
                 )
         }
@@ -184,8 +187,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
         // record no actor. `control` refines per command:
-        // `cluster apply`/`upgrade-ledger` attribute an actor — the other read-only
-        // control verbs (status/plan/validate, policy, queries) never read it.
+        // Apply/upgrade attribute an actor; plan checks the intended actor
+        // against execution preflight. Other read-only control verbs do not.
         ScopeFlag::As => match capability {
             // `--as` names an actor for a direct/`--store` WRITE; a served write
             // resolves the actor from its token. The read commands (`query`,
@@ -201,11 +204,19 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Control => matches!(
                 cmd,
                 Command::Cluster {
-                    command: ClusterCommand::Apply { .. } | ClusterCommand::UpgradeLedger { .. },
-                    ..
+                    command: ClusterCommand::Plan { .. }
+                        | ClusterCommand::Apply { .. }
+                        | ClusterCommand::UpgradeLedger { .. },
+                    managed: false,
                 }
             ),
-            Direct => matches!(cmd, Command::RebuildFullTextIndexes { .. }),
+            Direct => matches!(
+                cmd,
+                Command::RebuildFullTextIndexes { .. }
+                    | Command::Schema {
+                        command: SchemaCommand::Apply { .. }
+                    }
+            ),
             Served | Local => false,
         },
         // A profile is consumed wherever scope resolution runs: the data/
@@ -246,14 +257,13 @@ pub(crate) fn command_capability(cmd: &Command) -> Capability {
 
 /// The plane a subcommand belongs to. Exhaustive — a new `Command` variant
 /// will not compile until classified. Descends into the nested enums where
-/// the plane differs per subcommand (`schema plan` is storage while `schema
-/// show`/`apply` are data; `queries`/`policy` read cluster applied state).
+/// the plane differs per subcommand (`schema plan`/`apply` are storage while
+/// `schema show` is data; `queries`/`policy` read cluster applied state).
 pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query { .. }
         | Command::Mutate { .. }
         | Command::Load { .. }
-        | Command::Ingest { .. }
         | Command::Branch { .. }
         | Command::Snapshot { .. }
         | Command::Export { .. }
@@ -262,10 +272,13 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
-            command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. },
+            command: SchemaCommand::Show { .. },
         } => Plane::Data,
         Command::Schema {
-            command: SchemaCommand::Plan { .. } | SchemaCommand::UpgradeSystemColumns { .. },
+            command:
+                SchemaCommand::Plan { .. }
+                | SchemaCommand::Apply { .. }
+                | SchemaCommand::UpgradeSystemColumns { .. },
         } => Plane::Storage,
         // `queries` and `policy` tooling now source their inputs from a
         // cluster's applied state (`--cluster`), so they live on the control
@@ -302,7 +315,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
-        Command::Ingest { .. } => "ingest",
         Command::Branch { .. } => "branch",
         Command::Schema { command } => match command {
             SchemaCommand::Plan { .. } => "schema plan",
@@ -365,7 +377,7 @@ pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
             | Command::Policy { .. }
             | Command::Queries { .. }
             | Command::Cluster { command: ClusterCommand::Apply { .. } | ClusterCommand::Status { .. }
-                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. } }
+                | ClusterCommand::ForceUnlock { .. } | ClusterCommand::UpgradeLedger { .. }, managed: false }
     )
 }
 
@@ -434,6 +446,11 @@ fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
             Command::Init { .. } => " Pass a storage URI.",
+            Command::Schema {
+                command: SchemaCommand::Apply { .. },
+            } => {
+                " Pass a standalone storage URI, or deploy the schema with `cluster apply --server <SERVER> --config <CONFIG>`."
+            }
             Command::Optimize { .. }
             | Command::RebuildFullTextIndexes { .. }
             | Command::Repair { .. }
@@ -507,6 +524,10 @@ mod tests {
                 [true, false, true, true, false, true],
             ),
             (
+                parse(&["omnigraph", "schema", "apply", "--schema", "s.pg", "g.omni"]),
+                [false, false, false, true, true, true],
+            ),
+            (
                 parse(&["omnigraph", "optimize", "g.omni"]),
                 [false, true, true, true, false, true],
             ),
@@ -521,8 +542,8 @@ mod tests {
                 parse(&["omnigraph", "init", "--schema", "s.pg", "g.omni"]),
                 [false, false, false, false, false, false],
             ),
-            // Read-only control verbs never read the actor; `cluster
-            // apply`/`upgrade-ledger` do. The cluster family accepts
+            // Plan checks the intended actor; other read-only control verbs
+            // do not. Apply/upgrade attribute it. The cluster family accepts
             // root addressing for durable deployment/recovery, without graph
             // selection or profile scope.
             (
@@ -532,6 +553,10 @@ mod tests {
             (
                 parse(&["omnigraph", "cluster", "status", "--config", "."]),
                 [true, true, false, false, false, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "plan", "--config", "."]),
+                [true, false, false, false, true, false],
             ),
             (
                 parse(&["omnigraph", "cluster", "apply", "--config", "."]),
@@ -551,6 +576,25 @@ mod tests {
                     "--writers-stopped",
                 ]),
                 [false, true, false, false, true, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "status", "--managed"]),
+                [false, false, false, false, false, false],
+            ),
+            (
+                parse(&["omnigraph", "cluster", "plan", "--managed"]),
+                [false, false, false, false, false, false],
+            ),
+            (
+                parse(&[
+                    "omnigraph",
+                    "cluster",
+                    "apply",
+                    "--managed",
+                    "--plan",
+                    "plan",
+                ]),
+                [false, false, false, false, false, false],
             ),
             (
                 parse(&["omnigraph", "version"]),
@@ -582,7 +626,6 @@ mod tests {
                 &["--writers-stopped", "--deployment-id", "unused"],
                 "--writers-stopped cannot be used with --server",
             ),
-            (&["--no-wait"], "does not accept managed run arguments"),
             (&["--graph", "knowledge"], "--graph selects a graph"),
         ];
         for (extra, expected) in cases {

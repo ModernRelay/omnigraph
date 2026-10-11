@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-seams"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "One seam type for test-time behavior substitution: a named slot a test fills and the engine consults."
 license = "MIT"

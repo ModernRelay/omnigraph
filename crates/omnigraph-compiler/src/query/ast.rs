@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::settings::{SettingId, SettingValue};
+use crate::types::{ExprType, ScalarType};
 
 pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
@@ -685,6 +686,46 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+}
+
+impl AggFunc {
+    /// The result scalar for an accepted argument; position determines nullability.
+    pub fn result_type(self, arg: &ExprType) -> Option<ScalarType> {
+        if matches!(arg, ExprType::Value { scalar: ScalarType::Vector(dim), .. }
+            if *dim == 0 || i32::try_from(*dim).is_err())
+        {
+            return None;
+        }
+        match (self, arg) {
+            (Self::Count, _) => Some(ScalarType::I64),
+            (
+                Self::Sum | Self::Avg,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_numeric().then_some(ScalarType::F64),
+            (
+                Self::Min | Self::Max,
+                ExprType::Value {
+                    scalar,
+                    list: false,
+                    nullable: _,
+                },
+            ) => scalar.is_orderable().then_some(*scalar),
+            (
+                Self::Sum | Self::Avg | Self::Min | Self::Max,
+                ExprType::Value {
+                    scalar: _,
+                    list: true,
+                    nullable: _,
+                }
+                | ExprType::Node { type_name: _ }
+                | ExprType::ExactInteger { .. },
+            ) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for AggFunc {

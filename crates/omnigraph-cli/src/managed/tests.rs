@@ -1,5 +1,5 @@
 use super::*;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 #[test]
 fn origins_are_canonical_and_credentials_cannot_change_destination() {
@@ -68,7 +68,17 @@ fn legacy_login_and_managed_login_are_exclusive() {
         assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
     }
     for value in ["0", "3601"] {
-        assert!(Cli::try_parse_from(["omnigraph", "cluster", "plan", "--timeout", value]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "omnigraph",
+                "cluster",
+                "plan",
+                "--managed",
+                "--timeout",
+                value
+            ])
+            .is_err()
+        );
     }
 }
 
@@ -96,42 +106,179 @@ fn contexts_are_exact_and_cannot_hide_unknown_authority() {
     assert!(read_context(dir.path()).is_err());
 }
 
+fn parse_cluster(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+    let matches = Cli::command().try_get_matches_from(args)?;
+    let cli = Cli::from_arg_matches(&matches)?;
+    let mut command_matches = &matches;
+    while let Some((_, sub_matches)) = command_matches.subcommand() {
+        command_matches = sub_matches;
+    }
+    crate::validate_cluster_arguments(&cli, command_matches)?;
+    Ok(cli)
+}
+
 #[tokio::test]
-async fn explicit_direct_is_the_only_context_override() {
+async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
     std::fs::write(dir.path().join(".omnigraph/context"), "malformed").unwrap();
     let config = dir.path().to_str().unwrap();
-    let managed = Cli::try_parse_from([
-        "omnigraph",
-        "cluster",
-        "status",
-        "--config",
-        config,
-        "--json",
-    ])
-    .unwrap();
-    assert_eq!(dispatch(&managed).await.unwrap().exit, 2);
-    let direct = Cli::try_parse_from([
-        "omnigraph",
-        "cluster",
-        "status",
-        "--config",
-        config,
-        "--direct",
-    ])
-    .unwrap();
-    assert!(dispatch(&direct).await.is_none());
-    let forbidden = Cli::try_parse_from([
-        "omnigraph",
-        "cluster",
-        "apply",
-        "--config",
-        config,
-        "--direct",
-        "--plan",
-        "plan-id",
-    ])
-    .unwrap();
-    assert_eq!(dispatch(&forbidden).await.unwrap().exit, 2);
+    for args in [
+        vec![
+            "omnigraph",
+            "cluster",
+            "status",
+            "--managed",
+            "--config",
+            config,
+        ],
+        vec![
+            "omnigraph",
+            "cluster",
+            "--managed",
+            "status",
+            "--config",
+            config,
+        ],
+    ] {
+        let managed = parse_cluster(&args).unwrap();
+        let output = dispatch(&managed).await.unwrap();
+        assert_eq!(output.exit, 2);
+        assert_eq!(output.body["type"], "context_invalid");
+    }
+    for verb in ["validate", "plan", "apply", "status", "observe"] {
+        let local = parse_cluster(&["omnigraph", "cluster", verb, "--config", config]).unwrap();
+        assert!(dispatch(&local).await.is_none(), "{verb}");
+    }
+    // Conflicting selectors refuse before the deliberately malformed context is read.
+    for extra in [
+        vec!["--direct"],
+        vec!["--as", "actor"],
+        vec!["--server", "https://data.example"],
+        vec!["--graph", "knowledge"],
+        vec!["--profile", "prod"],
+        vec!["--store", "file:///unused-store"],
+        vec!["--cluster", "file:///unused-cluster"],
+    ] {
+        let args = [
+            "omnigraph",
+            "cluster",
+            "status",
+            "--managed",
+            "--config",
+            config,
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .collect::<Vec<_>>();
+        let cli = parse_cluster(&args).unwrap();
+        let output = dispatch(&cli).await.unwrap();
+        assert_eq!(output.exit, 2, "{extra:?}");
+        assert_eq!(output.body["type"], "managed_scope_conflict", "{extra:?}");
+    }
+    for (extra, kind) in [
+        (vec!["--graph", "knowledge"], "token_profile_conflict"),
+        (
+            vec!["--graph", "knowledge", "--clear"],
+            "token_clear_conflict",
+        ),
+    ] {
+        let args = [
+            "omnigraph",
+            "cluster",
+            "token",
+            "--managed",
+            "--config",
+            config,
+        ]
+        .into_iter()
+        .chain(extra)
+        .collect::<Vec<_>>();
+        let cli = parse_cluster(&args).unwrap();
+        let output = dispatch(&cli).await.unwrap();
+        assert_eq!(output.exit, 2);
+        assert_eq!(output.body["type"], kind);
+    }
+    for args in [
+        vec![
+            "cluster",
+            "create",
+            "demo",
+            "--api",
+            "https://control.example",
+        ],
+        vec!["cluster", "apply", "--plan", "saved-plan"],
+        vec!["cluster", "plan", "--rev", "revision"],
+        vec!["cluster", "status", "run-id"],
+        vec!["cluster", "status", "--operation", "operation-id"],
+        vec![
+            "cluster",
+            "push",
+            "--expected-revision",
+            "rev",
+            "--message",
+            "update",
+        ],
+        vec!["cluster", "delete", "--incarnation", "inc-one"],
+        vec![
+            "cluster",
+            "undo-delete",
+            "--incarnation",
+            "inc-one",
+            "--deletion-id",
+            "delete-one",
+        ],
+        vec!["cluster", "token"],
+        vec!["cluster", "operation", "op-id"],
+        vec!["cluster", "history"],
+        vec!["cluster", "cancel", "run-id"],
+        vec!["cluster", "apply", "--managed"],
+        vec![
+            "cluster",
+            "apply",
+            "--managed",
+            "--plan",
+            "saved-plan",
+            "--deployment-id",
+            "id",
+        ],
+        vec!["cluster", "status", "--managed", "--deployment-id", "id"],
+        vec!["cluster", "status", "--managed", "--operation", "id"],
+        vec!["cluster", "validate", "--managed"],
+        vec!["cluster", "observe", "--managed"],
+        vec!["cluster", "force-unlock", "lock-id", "--managed"],
+        vec![
+            "cluster",
+            "upgrade-ledger",
+            "--writers-stopped",
+            "--managed",
+        ],
+        vec!["managed", "plan"],
+        vec!["managed", "operation", "op-id"],
+    ] {
+        let args = std::iter::once("omnigraph").chain(args).collect::<Vec<_>>();
+        assert!(parse_cluster(&args).is_err(), "accepted {args:?}");
+    }
+    for args in [
+        vec!["omnigraph", "cluster", "operation", "op-id", "--managed"],
+        vec![
+            "omnigraph",
+            "cluster",
+            "plan",
+            "--managed",
+            "--rev",
+            "revision",
+        ],
+        vec![
+            "omnigraph",
+            "cluster",
+            "apply",
+            "--managed",
+            "--plan",
+            "saved-plan",
+        ],
+        vec!["omnigraph", "cluster", "status", "--managed", "run-id"],
+    ] {
+        assert!(parse_cluster(&args).is_ok(), "refused {args:?}");
+    }
 }

@@ -1,0 +1,827 @@
+# Fixtures describe starting states; workloads describe operations and checks.
+# Named runs and settings live here. Large history groups are explicitly opt-in.
+# No default environment or reset: a scenario without its own takes the host's
+# local default (APFS/clonefile on macOS, qualified XFS/plain-copy elsewhere).
+version: 2
+defaults:
+  repetitions: 1
+  deadline_seconds: 60
+  protocol:
+    attribution: per-phase
+    schedule: manual
+    timer: monotonic
+scenarios:
+- id: branch-merge-d50-process-cold-xfs
+  fixture: fixtures/branch_merge_d50.gqt
+  workload: workloads/branch_merge_d50_cold.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "bench-source" into "bench-target"
+  repetitions: 5
+  environment:
+    backend:
+      kind: local-fs
+      filesystem: xfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: plain-copy
+- id: branch-merge-d50-warm
+  fixture: fixtures/branch_merge_d50.gqt
+  workload: workloads/branch_merge_d50_warm.gqt
+  measured_step:
+    ordinal: 25
+    text: |
+      --- mutate
+      branch merge "bench-source" into "bench-target"
+  repetitions: 5
+- id: branch-merge-d50-history64-xfs
+  fixture: fixtures/branch_merge_d50_history64.gqt
+  workload: workloads/branch_merge_d50_cold.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "bench-source" into "bench-target"
+  repetitions: 5
+  environment:
+    backend:
+      kind: local-fs
+      filesystem: xfs
+      storage_class: nvme-ssd
+  protocol:
+    reset: plain-copy
+- id: equal-current-narrow-one-batch
+  fixture: fixtures/equal_current_narrow_one_batch.gqt
+  workload: workloads/equal_current_different_history.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: equal-current-wide-four-batches
+  fixture: fixtures/equal_current_wide_four_batches.gqt
+  workload: workloads/equal_current_different_history.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: equal-current-wide-one-batch
+  fixture: fixtures/equal_current_wide_one_batch.gqt
+  workload: workloads/equal_current_different_history.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: finbench-disjoint-merge
+  fixture:
+    kind: registered
+    reference: fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml
+    preparation: fixtures/finbench/finbench_disjoint.gqt
+  workload: workloads/finbench_disjoint_merge.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "bench-source" into "bench-target"
+  repetitions: 5
+  deadline_seconds: 600
+- id: hot-table-idle-base
+  fixture: fixtures/hot_table_idle_base.gqt
+  workload: workloads/hot_table_idle_base.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query hot_write() { update Hot set { value: 1 } where key = "hot" }
+- id: hot-table-idle-branches-4-aged
+  fixture: fixtures/hot_table_idle_branches_4_aged.gqt
+  workload: workloads/hot_table_idle_branches_4_aged.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query hot_write() { update Hot set { value: 1 } where key = "hot" }
+- id: hot-table-idle-branches-4
+  fixture: fixtures/hot_table_idle_branches_4.gqt
+  workload: workloads/hot_table_idle_branches_4.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query hot_write() { update Hot set { value: 1 } where key = "hot" }
+- id: hot-table-idle-tables-4
+  fixture: fixtures/hot_table_idle_tables_4.gqt
+  workload: workloads/hot_table_idle_tables_4.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query hot_write() { update Hot set { value: 1 } where key = "hot" }
+- id: identity-lifecycle
+  fixture: fixtures/identity_lifecycle.gqt
+  workload: workloads/identity_lifecycle.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate branch: feature
+      query new_lifetime_write() { update Item set { value: 1 } where key = "alice" }
+- id: nearest-ranks-updated-embedding
+  fixture: fixtures/nearest_ranks_updated_embedding.gqt
+  workload: workloads/nearest_ranks_updated_embedding.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query nearest_after_update($q: Vector(4)) {
+          match { $d: Doc }
+          return { $d.slug }
+          order { nearest($d.embedding, $q) }
+          limit 6
+      }
+- id: nearest-skips-deleted-rows-and-fills-limit
+  fixture: fixtures/nearest_skips_deleted_rows_and_fills_limit.gqt
+  workload: workloads/nearest_skips_deleted_rows_and_fills_limit.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query nearest_after_delete($q: Vector(4)) {
+          match { $d: Doc }
+          return { $d.slug }
+          order { nearest($d.embedding, $q) }
+          limit 3
+      }
+- id: parallel-tables-1
+  fixture: fixtures/parallel_tables.gqt
+  workload: workloads/parallel_tables_1.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query update_tables() {
+          update T0 set { value: 1 } where key = "row"
+      }
+- id: parallel-tables-2
+  fixture: fixtures/parallel_tables.gqt
+  workload: workloads/parallel_tables_2.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query update_tables() {
+          update T0 set { value: 1 } where key = "row"
+          update T1 set { value: 1 } where key = "row"
+      }
+- id: parallel-tables-4
+  fixture: fixtures/parallel_tables.gqt
+  workload: workloads/parallel_tables_4.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query update_tables() {
+          update T0 set { value: 1 } where key = "row"
+          update T1 set { value: 1 } where key = "row"
+          update T2 set { value: 1 } where key = "row"
+          update T3 set { value: 1 } where key = "row"
+      }
+- id: repeated-deletion-recreation-branches
+  fixture: fixtures/repeated_deletion_recreation_branches.gqt
+  workload: workloads/repeated_deletion_recreation_branches.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch create "recycled" from main
+- id: repeated-deletion-recreation-rows
+  fixture: fixtures/repeated_deletion_recreation_rows.gqt
+  workload: workloads/repeated_deletion_recreation_rows.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query recreate_row() { insert Item { key: "temporary", value: 99 } }
+- id: threshold-crossings-after
+  fixture: fixtures/threshold_crossings_after.gqt
+  workload: workloads/threshold_crossings_after.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- mutate branch: b
+      query next_publish() { insert Person { name: "carol", age: 1 } }
+- id: threshold-crossings-at
+  fixture: fixtures/threshold_crossings_at.gqt
+  workload: workloads/threshold_crossings_at.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- mutate branch: b
+      query next_publish() { insert Person { name: "carol", age: 1 } }
+- id: threshold-crossings-before
+  fixture: fixtures/threshold_crossings_before.gqt
+  workload: workloads/threshold_crossings_before.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- mutate branch: b
+      query next_publish() { insert Person { name: "carol", age: 1 } }
+- id: threshold-crossings-production-control
+  fixture: fixtures/threshold_crossings_production_control.gqt
+  workload: workloads/threshold_crossings_production_control.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- mutate branch: b
+      query next_publish() { insert Person { name: "carol", age: 1 } }
+- id: tiny-branch
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_branch.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch create "child" from main
+- id: tiny-load
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_load.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- load generate: v1 seed: 0 mode: append
+      tables:
+        - kind: node
+          name: Item
+          rows: 1
+          commits: 1
+          batch_rows: 1
+          columns:
+            key: {kind: key, prefix: c, width: 1}
+            val: {kind: literal, value: 3}
+- id: tiny-mutate
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_mutate.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query add() { insert Item { key: "c", val: 3 } }
+- id: tiny-post-reopen
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_post_reopen.gqt
+  measured_step:
+    ordinal: 3
+    text: |
+      --- query branch: main
+      query items() {
+          match { $i: Item }
+          return { $i.key as key, $i.val as val }
+      }
+- id: tiny-read
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query items() {
+          match { $i: Item }
+          return { $i.key as key, $i.val as val }
+      }
+- id: tiny-restart
+  fixture: fixtures/tiny_graph.gqt
+  workload: workloads/tiny_restart.gqt
+  measured_step:
+    ordinal: 1
+    text: "--- restart\n"
+- id: very-long-history-1000-read
+  fixture: fixtures/very_long_history_1000.gqt
+  workload: workloads/very_long_history_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: very-long-history-1000-reopen
+  fixture: fixtures/very_long_history_1000.gqt
+  workload: workloads/very_long_history_reopen.gqt
+  measured_step:
+    ordinal: 1
+    text: "--- restart\n"
+- id: very-long-history-1000-write
+  fixture: fixtures/very_long_history_1000.gqt
+  workload: workloads/very_long_history_write.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+- id: very-long-history-10000-read
+  fixture: fixtures/very_long_history_10000.gqt
+  workload: workloads/very_long_history_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: very-long-history-10000-reopen
+  fixture: fixtures/very_long_history_10000.gqt
+  workload: workloads/very_long_history_reopen.gqt
+  measured_step:
+    ordinal: 1
+    text: "--- restart\n"
+- id: very-long-history-10000-write
+  fixture: fixtures/very_long_history_10000.gqt
+  workload: workloads/very_long_history_write.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+- id: very-long-history-100000-read
+  fixture: fixtures/very_long_history_100000.gqt
+  workload: workloads/very_long_history_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: very-long-history-100000-reopen
+  fixture: fixtures/very_long_history_100000.gqt
+  workload: workloads/very_long_history_reopen.gqt
+  measured_step:
+    ordinal: 1
+    text: "--- restart\n"
+- id: very-long-history-100000-write
+  fixture: fixtures/very_long_history_100000.gqt
+  workload: workloads/very_long_history_write.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+- id: very-long-history-32-read
+  fixture: fixtures/very_long_history_32.gqt
+  workload: workloads/very_long_history_read.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query branch: main
+      query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+- id: very-long-history-32-reopen
+  fixture: fixtures/very_long_history_32.gqt
+  workload: workloads/very_long_history_reopen.gqt
+  measured_step:
+    ordinal: 1
+    text: "--- restart\n"
+- id: very-long-history-32-write
+  fixture: fixtures/very_long_history_32.gqt
+  workload: workloads/very_long_history_write.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+- id: e2e-merge-all-changed
+  fixture: fixtures/e2e_merge_all_changed.gqt
+  workload: workloads/e2e_merge_all_changed.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "source" into "main"
+- id: e2e-merge-all-new
+  fixture: fixtures/e2e_merge_all_new.gqt
+  workload: workloads/e2e_merge_all_new.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "source" into "main"
+- id: e2e-merge-diverged-updates
+  fixture: fixtures/e2e_merge_diverged_updates.gqt
+  workload: workloads/e2e_merge_diverged_updates.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "source" into "main"
+- id: e2e-mixed-load
+  fixture: fixtures/e2e_mixed_load.gqt
+  workload: workloads/e2e_mixed_load.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- load generate: v1 seed: 0 mode: merge branch: main
+      tables:
+        - kind: node
+          name: Chunk
+          rows: 32
+          commits: 1
+          batch_rows: 32
+          start: 48
+          columns:
+            slug: {kind: key, prefix: base, width: 3}
+            embedding: {kind: literal, value: [300.0,0.0,0.0,0.0]}
+- id: e2e-branch-create
+  fixture: fixtures/e2e_branch_registry.gqt
+  workload: workloads/e2e_branch_create.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch create "child" from "main"
+- id: e2e-branch-create-from
+  fixture: fixtures/e2e_branch_registry.gqt
+  workload: workloads/e2e_branch_create_from.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch create "child" from "source"
+- id: e2e-branch-list
+  fixture: fixtures/e2e_branch_registry.gqt
+  workload: workloads/e2e_branch_list.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      branch list
+- id: e2e-branch-delete
+  fixture: fixtures/e2e_branch_delete.gqt
+  workload: workloads/e2e_branch_delete.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch delete "victim"
+- id: e2e-branch-adopt-untouched
+  fixture: fixtures/e2e_branch_adopt_untouched.gqt
+  workload: workloads/e2e_branch_adopt_untouched.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "source" into "target"
+- id: e2e-branch-adopt-written
+  fixture: fixtures/e2e_branch_adopt_written.gqt
+  workload: workloads/e2e_branch_adopt_written.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate
+      branch merge "source" into "target"
+- id: e2e-branch-first-write
+  fixture: fixtures/e2e_branch_first_write.gqt
+  workload: workloads/e2e_branch_first_write.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- mutate branch: target
+      query insert_chunk($v: Vector(4)) { insert Chunk { slug: "target-only", embedding: $v } }
+- id: e2e-nearest-prefilter
+  fixture: fixtures/e2e_nearest_prefilter.gqt
+  workload: workloads/e2e_nearest_prefilter.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query filtered_nearest($q: Vector(4)) {
+          match { $d: Doc { status: "hit" } }
+          return { $d.slug }
+          order { nearest($d.embedding, $q) }
+          limit 3
+      }
+- id: e2e-nearest-nprobes-one
+  fixture: fixtures/e2e_nearest_nprobes_one.gqt
+  workload: workloads/e2e_nearest_nprobes_one.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      set ann_nprobes = 1;
+      query nearest_matching_rows($q: Vector(4)) {
+          match { $d: Doc $d.n > 3 }
+          return { $d.slug }
+          order { nearest($d.embedding, $q) }
+          limit 3
+      }
+- id: e2e-rrf-traversal
+  fixture: fixtures/e2e_rrf_traversal.gqt
+  workload: workloads/e2e_rrf_traversal.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query recall_two_terms($q1: String, $q2: String) {
+          match {
+              $c: Chunk
+              $a: Artifact
+              $c chunkOfArtifact $a
+              search($c.text, $q1)
+          }
+          return { $c.slug }
+          order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+          limit 1
+      }
+- id: e2e-query-scan
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_scan.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query scan() { match { $p: Person } return { $p.name } }
+- id: e2e-query-wide-scan
+  fixture: fixtures/e2e_query_wide.gqt
+  workload: workloads/e2e_query_wide_scan.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query wide_scan() { match { $p: Person } return { $p } }
+- id: e2e-query-filter
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_filter.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+- id: e2e-query-lookup
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_lookup.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+- id: e2e-query-count
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_count.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query count_all() { match { $p: Person } return { count($p) as n } }
+- id: e2e-query-grouped
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_grouped.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query grouped() {
+          match { $p: Person }
+          return { $p.team, sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+      }
+- id: e2e-query-top-people
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_top_people.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query top_people() {
+          match { $p: Person }
+          return { $p.name, $p.age }
+          order { $p.age desc, $p.name asc }
+          limit 20
+      }
+- id: e2e-query-friends
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_friends.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+- id: e2e-query-filtered-friends
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_filtered_friends.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query filtered_friends() {
+          match { $p: Person $p.age >= 90 $p knows $q }
+          return { $p.name, $q.name }
+      }
+- id: e2e-query-no-friends
+  fixture: fixtures/e2e_query_shapes.gqt
+  workload: workloads/e2e_query_no_friends.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+- id: e2e-query-count-bare
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_count_bare.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query count_bare() { match { $p: Person } return { count($p) as n } }
+- id: e2e-query-destination-projection
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_destination_projection.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+- id: e2e-query-grouped-fanout
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_grouped_fanout.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query grouped_fanout() {
+          match { $p: Person $p knows $q }
+          return { $p.team, count($q) as n }
+      }
+- id: e2e-query-destination-search
+  fixture: fixtures/e2e_query_issues.gqt
+  workload: workloads/e2e_query_destination_search.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query destination_search() {
+          match { $p: Person $p knows $q search($q.body, "needle") }
+          return { $q.name }
+      }
+- id: e2e-traversal-hop1
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop1.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop1() {
+          match {
+              $a: Person
+              $b: Person
+              $a knows $b
+          }
+          return { $a.name, $b.name }
+      }
+- id: e2e-traversal-hop2
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop2.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop2() {
+          match {
+              $a: Person
+              $b: Person
+              $c: Person
+              $a knows $b
+              $b knows $c
+          }
+          return { $a.name, $c.name }
+      }
+- id: e2e-traversal-hop3
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_hop3.gqt
+  measured_step:
+    ordinal: 2
+    text: |
+      --- query
+      query hop3() {
+          match {
+              $a: Person
+              $b: Person
+              $c: Person
+              $d: Person
+              $a knows $b
+              $b knows $c
+              $c knows $d
+          }
+          return { $a.name, $d.name }
+      }
+- id: e2e-traversal-selective-csr
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_selective_csr.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query sel($name: String) {
+          match {
+              $a: Person { name: $name }
+              $a knows{1,2} $b
+          }
+          return { $b.name }
+      }
+- id: e2e-traversal-selective-indexed
+  fixture: fixtures/e2e_traversal.gqt
+  workload: workloads/e2e_traversal_selective_indexed.gqt
+  measured_step:
+    ordinal: 1
+    text: |
+      --- query
+      query sel($name: String) {
+          match {
+              $a: Person { name: $name }
+              $a knows{1,2} $b
+          }
+          return { $b.name }
+      }
+groups:
+  end-to-end:
+  - e2e-merge-all-changed
+  - e2e-merge-all-new
+  - e2e-merge-diverged-updates
+  - e2e-mixed-load
+  - e2e-branch-create
+  - e2e-branch-create-from
+  - e2e-branch-list
+  - e2e-branch-delete
+  - e2e-branch-adopt-untouched
+  - e2e-branch-adopt-written
+  - e2e-branch-first-write
+  - e2e-nearest-prefilter
+  - e2e-nearest-nprobes-one
+  - e2e-rrf-traversal
+  aws-xfs-process-cold:
+  - branch-merge-d50-process-cold-xfs
+  aws-xfs-history64:
+  - branch-merge-d50-history64-xfs
+  finbench:
+  - finbench-disjoint-merge
+  history-1000:
+  - very-long-history-1000-read
+  - very-long-history-1000-write
+  - very-long-history-1000-reopen
+  history-10000:
+  - very-long-history-10000-read
+  - very-long-history-10000-write
+  - very-long-history-10000-reopen
+  history-100000:
+  - very-long-history-100000-read
+  - very-long-history-100000-write
+  - very-long-history-100000-reopen
+  local-fast:
+  - tiny-read
+  - tiny-restart
+  - tiny-post-reopen
+  - tiny-mutate
+  - tiny-branch
+  - tiny-load
+  local-regression:
+  - very-long-history-32-read
+  - very-long-history-32-write
+  - very-long-history-32-reopen
+  - hot-table-idle-base
+  - hot-table-idle-tables-4
+  - hot-table-idle-branches-4
+  - hot-table-idle-branches-4-aged
+  - parallel-tables-1
+  - parallel-tables-2
+  - parallel-tables-4
+  - identity-lifecycle
+  - repeated-deletion-recreation-rows
+  - repeated-deletion-recreation-branches
+  - threshold-crossings-before
+  - threshold-crossings-at
+  - threshold-crossings-after
+  - threshold-crossings-production-control
+  - equal-current-narrow-one-batch
+  - equal-current-wide-one-batch
+  - equal-current-wide-four-batches
+  local-smoke:
+  - branch-merge-d50-warm
+  search:
+  - nearest-ranks-updated-embedding
+  - nearest-skips-deleted-rows-and-fills-limit
+  query-shapes:
+  - e2e-query-scan
+  - e2e-query-wide-scan
+  - e2e-query-filter
+  - e2e-query-lookup
+  - e2e-query-count
+  - e2e-query-grouped
+  - e2e-query-top-people
+  - e2e-query-friends
+  - e2e-query-filtered-friends
+  - e2e-query-no-friends
+  - e2e-query-count-bare
+  - e2e-query-destination-projection
+  - e2e-query-grouped-fanout
+  - e2e-query-destination-search
+  traversal:
+  - e2e-traversal-hop1
+  - e2e-traversal-hop2
+  - e2e-traversal-hop3
+  - e2e-traversal-selective-csr
+  - e2e-traversal-selective-indexed
+run:
+- local-fast

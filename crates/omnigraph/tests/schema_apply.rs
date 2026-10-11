@@ -1,6 +1,7 @@
 mod helpers;
 
 use base64::Engine;
+use std::collections::HashMap;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
 
@@ -92,6 +93,17 @@ async fn plan_schema_reports_supported_additive_change() {
 
     let preview = db.preview_schema_apply(&desired).await.unwrap();
     assert_eq!(preview.catalog.node_types.len(), 2);
+
+    let contract = db.schema_contract_digest();
+    // The served observational planner uses the accepted in-memory contract;
+    // it must neither reopen this root nor wait on a schema gate.
+    let parked = dir.path().with_extension("parked");
+    std::fs::rename(dir.path(), &parked).unwrap();
+    let observed = db.plan_schema_at_contract(&desired, &contract).unwrap();
+    std::fs::rename(&parked, dir.path()).unwrap();
+    assert_eq!(observed, plan);
+    db.apply_schema(&desired).await.unwrap();
+    assert!(db.plan_schema_at_contract(&desired, &contract).is_err());
 }
 
 #[tokio::test]
@@ -806,10 +818,16 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     let predecessor = db.list_commits(None).await.unwrap()[0].clone();
     let files_before = schema_storage_bytes(dir.path());
     let desired = TEST_SCHEMA.replace("age: I32?", "age: I32?\n    nickname: String?");
-    let prepared = db
-        .prepare_schema_apply_as(&desired, Some("deployer"))
+    let (prepared, migration) = db
+        .prepare_schema_apply_with_plan_as(&desired, Some("deployer"))
         .await
         .unwrap();
+    assert!(migration.supported);
+    assert!(migration.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty { type_name, property_name, .. }
+            if type_name == "Person" && property_name == "nickname"
+    )));
     assert!(!prepared.is_noop());
     assert_eq!(prepared.actor(), Some("deployer"));
     assert_eq!(
@@ -844,6 +862,7 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
         .unwrap();
     let commit = result.commit.as_ref().unwrap();
     assert!(result.applied);
+    assert_eq!(result.steps, migration.steps);
     assert_eq!(
         intent_nonce(&commit.graph_commit_id).unwrap(),
         commit_id,
@@ -1436,8 +1455,8 @@ node Document {
     db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
 
     // Admission policy is not durable graph data. Reopen with the default
-    // deny policy so the rewrite proves that a historical descriptor is
-    // carried without re-authorizing or probing its caller-owned target.
+    // deny policy so the drop proves that a stored descriptor stays in place
+    // without re-authorizing or probing its caller-owned target.
     let db = Omnigraph::open(uri).await.unwrap();
 
     let documents_before = count_rows(&db, "node:Document").await;
@@ -1448,10 +1467,9 @@ node Document {
         .graph_manifest_version();
 
     // Drop `note` from Document. v1 + chassis commit #3 emit
-    // `DropProperty`; the rewrite path projects to the
-    // target schema (no `note`), commits via stage_overwrite. Row
-    // counts are unchanged — only the column is dropped from the
-    // current schema view.
+    // `DropProperty`; a metadata-only Project removes the column from the
+    // table's schema and keeps every data file. Row counts are unchanged —
+    // only the column is dropped from the current schema view.
     let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty (not UnsupportedChange).
@@ -1469,10 +1487,10 @@ node Document {
         "expected DropProperty {{ type=Document, property=note }} in plan; got {plan:?}",
     );
 
-    // An unrelated schema rewrite carries the descriptor, not the external
-    // payload. The caller-owned target may be unavailable without blocking
-    // schema evolution.
+    // The drop reads no row, so the caller-owned target of a stored external
+    // descriptor may be unavailable without blocking schema evolution.
     std::fs::remove_file(&external_path).unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
         probes.clone(),
@@ -1482,10 +1500,12 @@ node Document {
     .unwrap();
     assert!(result.supported);
     assert!(result.applied);
-    // Three managed values (valid empty, inline, packed) in one batched read.
-    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
-    assert_eq!(probes.blob_payload_read_calls(), 3);
+    // Metadata-only: no managed or external payload is read, and every data
+    // file the table had before is still the table's data.
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
     assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
     assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
@@ -1546,7 +1566,7 @@ node Document {
             assert_eq!(reference.length, None);
         }
         BlobContent::Managed { .. } => {
-            panic!("schema rewrite must preserve the external Blob descriptor")
+            panic!("schema apply must preserve the external Blob descriptor")
         }
     }
 
@@ -1640,11 +1660,423 @@ node Document {
     );
 }
 
+/// Adding, renaming and dropping properties is metadata-only, on a Blob table
+/// (rename + drop + adds: a Project then a Merge) and a plain table (rename +
+/// drop: one Project): no row or payload is read, every data file stays the
+/// table's data, field ids, stable property markers and index coverage
+/// survive, the historical snapshot keeps its shape, one graph commit
+/// publishes it, and keyed writes, queries and optimize work afterwards.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_column_changes_keep_data_files_ids_and_index_coverage() {
+    use lance::index::DatasetIndexExt;
+
+    const MARKER: &str = "omnigraph.stable_property_id";
+
+    async fn fields(db: &Omnigraph, table_key: &str) -> Vec<(String, i32, Option<String>)> {
+        helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .schema()
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name.clone(),
+                    field.id,
+                    field.metadata.get(MARKER).cloned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn coverage(db: &Omnigraph, table_key: &str) -> Vec<(Vec<i32>, Vec<u32>)> {
+        let mut coverage = helpers::open_pinned_dataset_for_test(db, "main", table_key)
+            .await
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| !lance_index::is_system_index(index))
+            .map(|index| {
+                (
+                    index.fields.clone(),
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .map(|bitmap| bitmap.iter().collect())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        coverage
+    }
+
+    fn field<'a>(
+        fields: &'a [(String, i32, Option<String>)],
+        name: &str,
+    ) -> &'a (String, i32, Option<String>) {
+        fields
+            .iter()
+            .find(|(field, _, _)| field == name)
+            .unwrap_or_else(|| panic!("no field '{name}' in {fields:?}"))
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    rank: I32? @index
+    note: String?
+    content: Blob?
+}
+
+node Tag {
+    name: String @key
+    weight: I32? @index
+    color: String?
+}
+"#;
+    let db = helpers::session(Omnigraph::init(uri, initial).await.unwrap());
+    let packed = base64::engine::general_purpose::STANDARD.encode(vec![b'p'; 96 * 1024]);
+    let dedicated = base64::engine::general_purpose::STANDARD.encode(vec![b'd'; 5 * 1024 * 1024]);
+    let rows = [
+        serde_json::json!({"type": "Document", "data": {"title": "inline", "rank": 1, "note": "n1", "content": "base64:SW5saW5l"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "packed", "rank": 2, "note": "n2", "content": format!("base64:{packed}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "dedicated", "rank": 3, "note": "n3", "content": format!("base64:{dedicated}")}}),
+        serde_json::json!({"type": "Document", "data": {"title": "empty", "rank": 4, "note": "n4", "content": "base64:"}}),
+        serde_json::json!({"type": "Document", "data": {"title": "null", "rank": 5, "note": "n5", "content": null}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "red", "weight": 7, "color": "crimson"}}),
+        serde_json::json!({"type": "Tag", "data": {"name": "blue", "weight": 9, "color": "navy"}}),
+    ]
+    .iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_snapshot = db.resolve_snapshot("main").await.unwrap();
+    let mut before_state = HashMap::new();
+    for table in ["node:Document", "node:Tag"] {
+        let coverage_before = coverage(&db, table).await;
+        assert!(
+            coverage_before.len() >= 2,
+            "{table} needs its id and property indexes: {coverage_before:?}"
+        );
+        before_state.insert(
+            table,
+            (
+                data_file_paths(&db, table).await,
+                fields(&db, table).await,
+                coverage_before,
+            ),
+        );
+    }
+
+    let desired = r#"
+node Document {
+    title: String @key
+    score: I32? @rename_from("rank") @index
+    content: Blob?
+    summary: String?
+    thumb: Blob?
+}
+
+node Tag {
+    name: String @key
+    strength: I32? @rename_from("weight") @index
+}
+"#;
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.apply_schema(desired),
+    )
+    .await
+    .unwrap();
+    assert!(result.applied);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 0);
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        after.graph_manifest_version(),
+        before.graph_manifest_version() + 1,
+        "one graph commit publishes every table's evolution and the contract"
+    );
+    for table in ["node:Document", "node:Tag"] {
+        let entry = after.dataset(table).unwrap();
+        assert_eq!(
+            entry.published_dataset_version,
+            before.dataset(table).unwrap().published_dataset_version + 1
+        );
+        assert_eq!(
+            entry.entity_count,
+            before.dataset(table).unwrap().entity_count
+        );
+    }
+
+    for (table, renamed, from, dropped) in [
+        ("node:Document", "score", "rank", "note"),
+        ("node:Tag", "strength", "weight", "color"),
+    ] {
+        let (files_before, fields_before, coverage_before) = &before_state[table];
+        assert_eq!(
+            &data_file_paths(&db, table).await,
+            files_before,
+            "{table}: no data file is written or dropped"
+        );
+        let fields_after = fields(&db, table).await;
+        let (_, from_id, from_marker) = field(fields_before, from);
+        let (_, renamed_id, renamed_marker) = field(&fields_after, renamed);
+        assert_eq!(renamed_id, from_id, "{table}: a rename keeps the field id");
+        assert_eq!(
+            renamed_marker, from_marker,
+            "{table}: and the property identity"
+        );
+        assert!(from_marker.is_some());
+        assert!(fields_after.iter().all(|(name, _, _)| name != dropped));
+        for (name, id, marker) in fields_before {
+            if name != from && name != dropped {
+                assert_eq!(
+                    field(&fields_after, name),
+                    &(name.clone(), *id, marker.clone()),
+                    "{table}: an untouched column keeps its id and identity"
+                );
+            }
+        }
+        assert_eq!(
+            &coverage(&db, table).await,
+            coverage_before,
+            "{table}: every index keeps its field and fragment coverage"
+        );
+    }
+    for table in ["node:Document", "node:Tag"] {
+        helpers::assert_stable_property_markers(&db, table).await;
+        assert_exact_id_primary_key(&db, table).await;
+    }
+    let document_fields = fields(&db, "node:Document").await;
+    let max_before = before_state["node:Document"]
+        .1
+        .iter()
+        .map(|(_, id, _)| *id)
+        .max()
+        .unwrap();
+    for added in ["summary", "thumb"] {
+        let (_, id, marker) = field(&document_fields, added);
+        assert!(*id > max_before, "{added} takes a fresh field id");
+        assert!(marker.is_some(), "{added} carries its property identity");
+    }
+    assert_eq!(
+        document_fields
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["__id", "content", "score", "summary", "thumb", "title"],
+        "the physical column order follows the catalog, which orders properties by name"
+    );
+
+    // Payloads read back unchanged; the added Blob reads as null.
+    for (title, expected) in [
+        ("inline", b"Inline".to_vec()),
+        ("packed", vec![b'p'; 96 * 1024]),
+        ("dedicated", vec![b'd'; 5 * 1024 * 1024]),
+        ("empty", Vec::new()),
+    ] {
+        let bytes = read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert!(bytes == expected, "{title}: payload changed");
+    }
+    for (title, property) in [("null", "content"), ("inline", "thumb")] {
+        let error = db
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", title, property),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::NotFound),
+            "{title}.{property} reads as null, got {error:?}"
+        );
+    }
+
+    // The pre-apply snapshot keeps its own shape and values.
+    let historical = db
+        .snapshot_at_graph_manifest_version(before.graph_manifest_version())
+        .await
+        .unwrap()
+        .open_dataset("node:Document")
+        .await
+        .unwrap();
+    let historical_names = historical
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert!(historical_names.contains(&"note".to_string()));
+    assert!(historical_names.contains(&"rank".to_string()));
+    assert!(!historical_names.contains(&"score".to_string()));
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::snapshot(before_snapshot),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+
+    // Keyed writes, filtered queries and optimize work on the evolved tables.
+    db.load_jsonl(
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "new", "score": 6, "summary": "fresh", "thumb": "base64:VGh1bWI="},
+        })
+        .to_string(),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let writes = r#"
+query set_summary($title: String, $summary: String) {
+    update Document set { summary: $summary } where title = $title
+}
+
+query set_strength($name: String, $strength: I32) {
+    update Tag set { strength: $strength } where name = $name
+}
+"#;
+    mutate_main(
+        &db,
+        writes,
+        "set_summary",
+        &params(&[("$title", "dedicated"), ("$summary", "big")]),
+    )
+    .await
+    .unwrap();
+    mutate_main(
+        &db,
+        writes,
+        "set_strength",
+        &mixed_params(&[("$name", "red")], &[("$strength", 8)]),
+    )
+    .await
+    .unwrap();
+    let reads = r#"
+query scored($min: I32) {
+    match {
+        $d: Document
+        $d.score >= $min
+    }
+    return { $d.title }
+}
+
+query summarized() {
+    match {
+        $d: Document
+        $d.summary != ""
+    }
+    return { $d.title }
+}
+
+query strong($min: I32) {
+    match {
+        $t: Tag
+        $t.strength >= $min
+    }
+    return { $t.name }
+}
+"#;
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let summarized = query_main(&db, reads, "summarized", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&summarized), ["dedicated", "new"]);
+    let strong = query_main(&db, reads, "strong", &int_params(&[("$min", 8)]))
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&strong), ["blue", "red"]);
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "new", "thumb"),
+        )
+        .await,
+        b"Thumb"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "dedicated", "content"),
+        )
+        .await,
+        vec![b'd'; 5 * 1024 * 1024],
+        "an update carries the untouched Blob of an evolved row"
+    );
+
+    db.optimize().await.unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(
+            &db,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "packed", "content"),
+        )
+        .await,
+        vec![b'p'; 96 * 1024]
+    );
+    let scored = query_main(&db, reads, "scored", &int_params(&[("$min", 3)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&scored),
+        ["dedicated", "empty", "new", "null"]
+    );
+    let exported = db
+        .export_jsonl("main", &["Document".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(exported.lines().count(), 6);
+    assert!(exported.contains("\"score\":3"), "{exported}");
+    assert!(!exported.contains("\"rank\"") && !exported.contains("\"note\""));
+}
+
+/// A ranged external Blob descriptor survives a schema change on its table:
+/// the column changes are metadata-only, so the stored descriptor is never
+/// rebuilt and cannot be widened to its whole object.
 #[tokio::test]
 #[cfg(feature = "failpoints")]
 #[serial_test::parallel]
-async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
-    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+async fn schema_apply_preserves_ranged_external_blob_across_column_changes() {
+    async fn assert_ranged(db: &Omnigraph, target: ReadTarget, property: &str) {
+        let read = db
+            .read_blob_at(target, node_blob_cell("Document", "ranged", property))
+            .await
+            .unwrap();
+        match read.content {
+            BlobContent::External(reference) => {
+                assert_eq!(reference.uri, "s3://bucket/object");
+                assert_eq!((reference.offset, reference.length), (4, Some(8)));
+            }
+            BlobContent::Managed { .. } => panic!("the ranged descriptor must stay external"),
+        }
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1654,62 +2086,62 @@ node Document {
     content: Blob?
 }
 "#;
-    let desired = r#"
+    let added = r#"
 node Document {
     title: String @key
     content: Blob?
     note: String?
 }
 "#;
+    let renamed = r#"
+node Document {
+    title: String @key
+    body: Blob? @rename_from("content")
+}
+"#;
     let db = Omnigraph::init(uri, initial).await.unwrap();
-    let table_uri = helpers::seed_ranged_external_blob_row(&db, uri).await;
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+    let before = db.resolve_snapshot("main").await.unwrap();
+    let files_before = data_file_paths(&db, "node:Document").await;
 
-    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let manifest_before = before.graph_manifest_version();
-    let table_before = before
-        .dataset("node:Document")
-        .unwrap()
-        .published_dataset_version;
-    let physical_head_before = lance::Dataset::open(&table_uri)
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let apply = |desired: &'static str| {
+        omnigraph::instrumentation::with_merge_write_probes(
+            probes.clone(),
+            db.apply_schema(desired),
+        )
+    };
+    assert!(apply(added).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "content").await;
+    // The snapshot before the add reads the same cell under the same name.
+    assert_ranged(&db, ReadTarget::snapshot(before), "content").await;
+
+    assert!(apply(renamed).await.unwrap().applied);
+    assert_ranged(&db, ReadTarget::branch("main"), "body").await;
+
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(probes.external_blob_payload_read_calls(), 0);
+    assert_eq!(data_file_paths(&db, "node:Document").await, files_before);
+}
+
+/// The data files of a table's pinned version, per fragment id.
+async fn data_file_paths(db: &Omnigraph, table_key: &str) -> Vec<(u64, Vec<String>)> {
+    helpers::open_pinned_dataset_for_test(db, "main", table_key)
         .await
-        .unwrap()
-        .version()
-        .version;
-    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    assert!(sidecar_operation_ids(dir.path()).is_empty());
-
-    let error = db.apply_schema(desired).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("cannot preserve ranged external Blob descriptor"),
-        "unexpected schema-apply refusal: {error}"
-    );
-    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(after.graph_manifest_version(), manifest_before);
-    assert_eq!(
-        after
-            .dataset("node:Document")
-            .unwrap()
-            .published_dataset_version,
-        table_before
-    );
-    assert_eq!(
-        lance::Dataset::open(&table_uri)
-            .await
-            .unwrap()
-            .version()
-            .version,
-        physical_head_before
-    );
-    assert_eq!(
-        branch_head_commit_id(dir.path(), "main").await.unwrap(),
-        lineage_before
-    );
-    assert!(
-        sidecar_operation_ids(dir.path()).is_empty(),
-        "ranged descriptor refusal must occur before recovery arm"
-    );
+        .get_fragments()
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.id() as u64,
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -2453,7 +2885,10 @@ node Anchor { name: String @key }
 // lived) stays pinned by the older `__manifest` versions, so
 // `snapshot_at_graph_manifest_version(pre_drop)` still reads it. It becomes
 // unreachable once `omnigraph cleanup --keep 1` stops retaining those versions
-// and the collector reclaims its files.
+// and the collector reclaims its manifest. The dropped values stay in the
+// current data files until optimize rewrites them;
+// `maintenance.rs::optimize_then_cleanup_erases_dropped_property_values` owns
+// that erasure.
 
 #[tokio::test]
 #[cfg_attr(feature = "failpoints", serial_test::parallel)]
@@ -2469,7 +2904,7 @@ async fn apply_schema_property_drop_is_reclaimed_by_cleanup_not_apply() {
         .unwrap()
         .graph_manifest_version();
 
-    // Drop the `age` column. Apply rewrites the table without it.
+    // Drop the `age` column, a metadata-only change of the table.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.applied);

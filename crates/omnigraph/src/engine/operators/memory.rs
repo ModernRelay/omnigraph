@@ -457,6 +457,11 @@ impl WorkMemory {
         })
     }
 
+    /// The query pool's size, which the plan's assumed memory limit set.
+    pub(in crate::engine) fn pool_bytes(&self) -> u64 {
+        self.resources.limit
+    }
+
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
     pub(in crate::engine) fn batch_bytes(&self) -> usize {
         (self.resources.limit / 32).clamp(1, 1024 * 1024) as usize
@@ -687,13 +692,26 @@ impl WorkMemory {
         self.take_admitted(batch, indices, name, 1)
     }
 
-    fn take_admitted(
+    /// The bytes `take_once` admits for the rows of `batch` at `indices`
+    /// before Arrow allocates them: one copy per index, a row repeated by
+    /// the indices once per repetition, and Arrow's scratch. A caller sizes
+    /// a window by it before it takes.
+    pub(in crate::engine) fn take_bytes(
         &self,
         batch: &RecordBatch,
         indices: &UInt32Array,
-        name: &str,
-        factor: usize,
-    ) -> DfResult<RecordBatch> {
+    ) -> DfResult<usize> {
+        let (picked, scratch) = self.take_estimate(batch, indices)?;
+        Ok(picked.saturating_add(scratch))
+    }
+
+    /// The picked bytes of a take and its scratch bytes. A null index copies
+    /// no row: it costs what a null row of the column costs.
+    fn take_estimate(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+    ) -> DfResult<(usize, usize)> {
         let mut bytes = 0usize;
         let mut scratch_bytes = 0usize;
         for column in batch.columns() {
@@ -703,18 +721,38 @@ impl WorkMemory {
             let picked = match flat_take_size(&data, indices) {
                 Some(flat) => flat,
                 None => {
+                    let mut null_row = None;
                     let mut picked = 0usize;
-                    for row in indices.values() {
+                    for row in indices.iter() {
                         self.check()?;
-                        picked = picked
-                            .saturating_add(slice_memory_size(&data, *row as usize, 1)?)
-                            .saturating_add(16);
+                        let row_bytes = match row {
+                            Some(row) => slice_memory_size(&data, row as usize, 1)?,
+                            None => match null_row {
+                                Some(bytes) => bytes,
+                                None => {
+                                    let null = ArrayData::new_null(data.data_type(), 1);
+                                    *null_row.insert(slice_memory_size(&null, 0, 1)?)
+                                }
+                            },
+                        };
+                        picked = picked.saturating_add(row_bytes).saturating_add(16);
                     }
                     picked
                 }
             };
             bytes = bytes.saturating_add(picked).saturating_add(128);
         }
+        Ok((bytes, scratch_bytes))
+    }
+
+    fn take_admitted(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+        factor: usize,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.take_estimate(batch, indices)?;
         let admitted = self.resources.reservation(
             name,
             bytes.saturating_mul(factor).saturating_add(scratch_bytes),
@@ -733,7 +771,9 @@ impl WorkMemory {
 
 /// An upper bound on the picked bytes of a flat or fixed-size-list column
 /// without a slice per row: 16 per row, 2 more when nullable, the row's own
-/// bytes and offset. `None` for the variable nested and dictionary kinds.
+/// bytes and offset. A null index copies no bytes of a variable-width value
+/// (Arrow's byte take skips it); fixed-width values are allocated for every
+/// index. `None` for the variable nested and dictionary kinds.
 fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
     let rows = indices.len();
     let per_row = if data.nulls().is_some() { 18 } else { 16 };
@@ -744,18 +784,22 @@ fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
             .saturating_mul(field.data_type().primitive_width()?),
         DataType::Utf8 | DataType::Binary => {
             let offsets = data.buffers()[0].typed_data::<i32>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(4)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(4)
             })
         }
         DataType::LargeUtf8 | DataType::LargeBinary => {
             let offsets = data.buffers()[0].typed_data::<i64>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(8)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(8)
             })
         }
         DataType::Boolean => rows,
@@ -1149,6 +1193,56 @@ mod tests {
             drop(memory);
             assert_eq!(pool.reserved(), 0);
         }
+    }
+
+    /// A take admits one copy per index and a null row per null index, in the
+    /// flat path (a text column) and the per-row path (a struct over it): 64
+    /// null slots whose raw value names a 512 KiB row admit a few KiB, and
+    /// four repetitions of that row admit four copies per column, which a
+    /// 4 MiB pool holding the batch refuses before Arrow builds them. A case
+    /// cannot write null indices.
+    #[test]
+    fn a_take_admits_a_copy_per_index_and_a_null_row_per_null_index() {
+        use arrow_array::{StringArray, StructArray};
+        use datafusion::arrow::buffer::NullBuffer;
+        let wide = "x".repeat(512 * 1024);
+        let text: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some(wide.as_str()), Some("y")]));
+        let field = Arc::new(Field::new("text", DataType::Utf8, true));
+        let nested: Arc<dyn Array> = Arc::new(StructArray::from(vec![(
+            Arc::clone(&field),
+            Arc::clone(&text),
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            field.as_ref().clone(),
+            Field::new("nested", nested.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![text, nested]).unwrap();
+        let (pool, memory) = test_memory(4 * 1_048_576);
+        memory.hold(&batch).unwrap();
+        let nulls = UInt32Array::new(vec![0u32; 64].into(), Some(NullBuffer::new_null(64)));
+        let admitted = memory.take_bytes(&batch, &nulls).unwrap();
+        assert!(
+            admitted < 16 * 1024,
+            "null indices admitted {admitted} bytes"
+        );
+        let taken = memory.take_once(&batch, &nulls, "test take").unwrap();
+        assert_eq!(taken.num_rows(), 64);
+        assert!(
+            taken
+                .columns()
+                .iter()
+                .all(|column| column.null_count() == 64)
+        );
+        let repeated = UInt32Array::from(vec![0u32; 4]);
+        assert!(memory.take_bytes(&batch, &repeated).unwrap() >= 8 * 512 * 1024);
+        assert!(
+            memory.take_once(&batch, &repeated, "test take").is_err(),
+            "four copies of the row in two columns exceed the pool"
+        );
+        drop(taken);
+        drop(memory);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// Pins the runtime to one blocking thread; a case cannot size the runtime.

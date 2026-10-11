@@ -1,7 +1,8 @@
-//! Engine v1 is frozen: every file under this crate's `src/` is pinned by
-//! the SHA-256 of its bytes below, and a file missing from the list fails
-//! too. v1 is the reference GQT's `--- expect same as v1` compares engine v2
-//! against, so a defect seen on v1 is fixed on v2 (`crates/omnigraph/src/engine/`).
+//! Engine v1 is frozen: every file under this crate's `src/` and the compiler's
+//! `ir/untyped.rs` are pinned by the SHA-256 of their bytes below. A source file
+//! missing from the list fails too. v1 is the reference GQT's
+//! `--- expect same as v1` compares engine v2 against, so a defect seen on v1
+//! is fixed on v2 (`crates/omnigraph/src/engine/`).
 //! Editing a frozen file, or adding one, means updating this list in the
 //! same PR, under a reviewer's eyes.
 //!
@@ -15,16 +16,17 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// The original move plus shared-IR adapters in `gate.rs`, `query.rs` and
-/// `projection.rs`. New selectors and synthetic edge type reads are refused;
-/// named-edge execution remains the reference behavior.
-const BASELINE: &str = "PR #795 move plus typed-edge IR adapters";
+/// The reference executor over its frozen read IR. New selectors and synthetic
+/// edge type reads are refused; named-edge execution is the reference behavior.
+const BASELINE: &str = "frozen read IR with typed-edge adapters";
+
+const FROZEN_IR_SHA256: &str = "0e1a73646d4fd910f10f9d0944a3e20cf74cefb570e49469621c2b163ed5891a";
 
 /// (path under `src/`, SHA-256 of the file's bytes).
 const FROZEN: &[(&str, &str)] = &[
     (
         "gate.rs",
-        "10e39429913cf07374149dbca6f8320df12f75da5f31ff361a0cde68c033aeab",
+        "b0e75a0ce4e60596b496305e01c52889cdad14335ab95c807025d399570466d6",
     ),
     (
         "graph_index.rs",
@@ -36,7 +38,7 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "lib.rs",
-        "853e5cdccffcd45926a7fd46f61ada5a496e10abad6a1e8fba784f783b232f8e",
+        "eb6a7c1b76a8ae51b6336779b81a715c369e9872f5ce08d5cb8ccca000b18851",
     ),
     (
         "loader.rs",
@@ -44,11 +46,11 @@ const FROZEN: &[(&str, &str)] = &[
     ),
     (
         "projection.rs",
-        "1188855041cf2514c42e4a66eb2b7dbc5a9df48cd5d6bfd498fc274ecb91e9bd",
+        "be11d4ce201b212c0e8e2963a5ad5f0e3b8cd874e033eefef24874f02d6a4631",
     ),
     (
         "query.rs",
-        "8caba67ea769e8602ff291ce5b5293c8985bfc547ffddf09014d57816033ac0c",
+        "97ffde90e498a9b1568567cd1cc3dc2d284e9111360ce85abacb1a0b2341c1a1",
     ),
     (
         "table_store.rs",
@@ -98,4 +100,13 @@ fn every_source_file_matches_the_reviewed_frozen_bytes() {
              (`crates/omnigraph/src/engine/`)."
         );
     }
+    let ir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../omnigraph-compiler/src/ir/untyped.rs");
+    let bytes = std::fs::read(&ir)
+        .unwrap_or_else(|error| panic!("frozen IR `{}` is unreadable: {error}", ir.display()));
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&bytes)),
+        FROZEN_IR_SHA256,
+        "`ir/untyped.rs` is frozen at `{BASELINE}`; an edit needs its hash in \
+         tests/frozen.rs updated in the same PR and a reviewer's eyes"
+    );
 }

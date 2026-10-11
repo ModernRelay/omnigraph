@@ -91,7 +91,8 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. |
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
-| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
+| `omnigraph-gqt-core` | GQT format, ordinary session execution and expectation checks, shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
+| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 
 ## Principal flows
 
@@ -174,3 +175,21 @@ for read-only qualification and tests, not writer ownership.
 
 Upstream behavior must be checked against the full matching Lance pages in
 [lance.md](lance.md) before changing a substrate-facing contract.
+
+## Index facts in read planning
+
+The engine gathers effective index metadata from each query table at its pinned
+version, including correlated inner reads. `PlanSource` exposes one fact per
+index name and keyed column. Coverage unions same-name segments and intersects
+current fragments; missing bitmaps remain unknown. The planner prices Expand
+as fully indexed only when every required endpoint has complete usable BTREE
+coverage across its candidates. See the [index-facts decision](../rfcs/2026-10-08-index-facts-as-planner-input.md).
+
+Saved Expand inputs carry coverage provenance. Fresh plans use pinned facts;
+accepted older plans with no provenance default to the legacy runtime probe.
+Execution still adjusts for frontier size and warm CSR state. Explain statistics
+are diagnostics and do not select the replay path. Root scans finalize their access through the same Lance read builder used by
+execution. Static scans record a Boolean index query and residual or disable
+indexing. Dynamic and dependent reads keep their explicit runtime paths.
+Single String key equality can gain a canonical identity predicate before
+finalization; historical IDs prevent broader key narrowing.

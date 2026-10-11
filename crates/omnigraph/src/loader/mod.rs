@@ -1090,6 +1090,12 @@ fn validate_graph_batch_json_structure(raw_json: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Decode JSON while refusing duplicate object members at every depth.
+/// This performs no graph work; callers retain their own byte and schema bounds.
+pub fn parse_unique_json(source: &str) -> std::result::Result<JsonValue, serde_json::Error> {
+    serde_json::from_str::<UniqueJsonValue>(source).map(|value| value.0)
+}
+
 /// JSON value decoded with duplicate-member rejection at every object depth.
 /// `serde_json::Value` normally keeps the last duplicate, which is unsuitable
 /// at a write authority boundary because two producers can disagree about the

@@ -1,4 +1,4 @@
-//! Data-plane routes: read/query/change/ingest/branches/snapshot/export.
+//! Data-plane routes: read/query/mutate/load/branches/snapshot/export.
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
@@ -21,7 +21,7 @@ use omnigraph::{
 };
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorCode, ErrorOutput, ExportRequest,
-    GraphBatchLoadOutput, IngestRequest, QueryRequest, ReadRequest,
+    GraphBatchLoadOutput, IngestRequest, QueryRequest,
 };
 use omnigraph_server::{AppState, ProcessDefaults, build_app};
 use serde_json::{Value, json};
@@ -1255,7 +1255,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("authorization", "Bearer token-one")
             .header("content-type", "application/json")
@@ -1327,7 +1327,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -1356,7 +1356,7 @@ async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing(
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
@@ -1398,7 +1398,7 @@ async fn ingest_without_from_loads_into_existing_branch() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
@@ -1429,7 +1429,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -1463,7 +1463,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/ingest"))
+            .uri(g("/load"))
             .method(Method::POST)
             .header("authorization", "Bearer team-token")
             .header("content-type", "application/json")
@@ -1494,7 +1494,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
         .oneshot(
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/ingest"))
+                .uri(g("/load"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&oversize).unwrap()))
@@ -2270,8 +2270,6 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
     let (_temp, app) = app_for_loaded_graph().await;
     let target_refusal = "a branch statement names its branches itself; drop the request target";
     let name_refusal = "a branch statement takes no name and no parameters";
-    let deprecated_refusal =
-        "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
     let cases = [
         (
             "/query",
@@ -2352,51 +2350,6 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
             "/mutate",
             json!({"query": EXPLAIN_ADULTS}),
             "statement 'explain' is a read; use POST /query",
-        ),
-        (
-            "/change",
-            json!({"query": EXPLAIN_ADULTS}),
-            "the explain statement is not served on deprecated routes; use POST /query",
-        ),
-        (
-            "/read",
-            json!({"query_source": EXPLAIN_ADULTS}),
-            "the explain statement is not served on deprecated routes; use POST /query",
-        ),
-        (
-            "/read",
-            json!({"query_source": "branch list"}),
-            deprecated_refusal,
-        ),
-        (
-            "/read",
-            json!({"query_source": "branch create b0"}),
-            deprecated_refusal,
-        ),
-        (
-            "/read",
-            json!({"query_source": "branch delete b0"}),
-            deprecated_refusal,
-        ),
-        (
-            "/change",
-            json!({"query": "branch create b0"}),
-            deprecated_refusal,
-        ),
-        (
-            "/change",
-            json!({"query": "branch delete b0"}),
-            deprecated_refusal,
-        ),
-        (
-            "/change",
-            json!({"query": "branch list"}),
-            deprecated_refusal,
-        ),
-        (
-            "/change",
-            json!({"query": "branch merge b0", "branch": "main"}),
-            deprecated_refusal,
         ),
     ];
     for (path, request, expected) in cases {
@@ -2508,7 +2461,6 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             .unwrap()
     };
     let read = json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}});
-    let legacy_read = json!({"query_source": FIND_PERSON_GQ, "params": {"name": "Alice"}});
     let write = json!({
         "query": MUTATION_QUERIES,
         "name": "insert_person",
@@ -2517,19 +2469,14 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
     });
     let denied = [
         ("/query", "nobody-token", read.clone(), false),
-        ("/read", "nobody-token", legacy_read, false),
         ("/mutate", "team-token", write.clone(), false),
-        ("/change", "team-token", write.clone(), false),
         ("/mutate/if-graph-commit", "team-token", write, true),
     ];
     for (path, token, body, expected_head) in denied {
         let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {out}");
 
-        let mut unparseable = json!({"query": "not gq at all", "branch": "main"});
-        if path == "/read" {
-            unparseable = json!({"query_source": "not gq at all", "branch": "main"});
-        }
+        let unparseable = json!({"query": "not gq at all", "branch": "main"});
         let (status, out) =
             json_response(&app, send(path, token, unparseable, expected_head)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
@@ -2543,11 +2490,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
 
         // The measured shape, a declaration without its parameter list, is
         // refused at the name's end with the one fix at every door.
-        let field = if path == "/read" {
-            "query_source"
-        } else {
-            "query"
-        };
+        let field = "query";
         let missing = json!({field: "query name { match { $p: Person } return { $p.name } }", "branch": "main"});
         let (status, out) = json_response(&app, send(path, token, missing, expected_head)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
@@ -2633,9 +2576,6 @@ const UNKNOWN_SETTING_NEEDLE: &str = "unknown setting `turbo`";
 const SET_PARAMETER_SHAPE: &str = "query parameter 'set' takes <name>=<value>, got 'merge_lineage'";
 const NO_STATEMENT_NEEDLE: &str = "carries no statement";
 const SHOW_AT_WRITE_DOOR: &str = "statement 'show merge_lineage' is a read; use POST /query";
-const STATEMENT_AT_DEPRECATED_ROUTE: &str =
-    "branch statements are not served on deprecated routes; use POST /mutate or POST /query";
-const SETTINGS_AT_DEPRECATED_ROUTE: &str = "the deprecated /read and /change routes take no settings, neither a settings field nor a set or reset prefix; use POST /query or POST /mutate";
 const SHOW_COLUMNS: [&str; 5] = ["name", "value", "default", "source", "scope"];
 
 /// Every settings refusal is `ApiError::bad_request`: the message, the code,
@@ -3004,7 +2944,7 @@ async fn settings_field_is_accepted_at_the_conditional_mutation_route() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn settings_show_is_refused_at_the_write_door_and_the_deprecated_read_door() {
+async fn settings_show_is_refused_at_the_write_door() {
     let (_temp, app) = app_for_loaded_graph().await;
 
     let (status, body) = json_response(
@@ -3013,94 +2953,6 @@ async fn settings_show_is_refused_at_the_write_door_and_the_deprecated_read_door
     )
     .await;
     assert_settings_refusal(status, &body, SHOW_AT_WRITE_DOOR);
-
-    let (status, body) = json_response(
-        &app,
-        json_post("/read", &json!({"query_source": "show merge_lineage;"})),
-    )
-    .await;
-    assert_settings_refusal(status, &body, STATEMENT_AT_DEPRECATED_ROUTE);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn settings_field_is_refused_at_the_deprecated_change_route() {
-    let (_temp, app) = app_for_loaded_graph().await;
-    let mutation = "mutation add_person($name: String) {\n    insert Person { name: $name }\n}";
-
-    let (status, body) = json_response(
-        &app,
-        json_post(
-            "/change",
-            &json!({
-                "query_source": mutation,
-                "params": {"name": "Zed"},
-                "settings": {"merge_lineage": "off"}
-            }),
-        ),
-    )
-    .await;
-    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
-
-    assert_unknown_settings_field(
-        &app,
-        json_post(
-            "/change",
-            &json!({
-                "query_source": mutation,
-                "params": {"name": "Zed"},
-                "settings": {"stage_write_concurrency": 64}
-            }),
-        ),
-    )
-    .await;
-}
-
-/// Both carriers meet the same refusal at both deprecated routes, which
-/// serve their legacy bodies under the process defaults alone.
-#[tokio::test(flavor = "multi_thread")]
-async fn settings_field_and_prefix_are_refused_at_the_deprecated_routes() {
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let (status, body) = json_response(
-        &app,
-        json_post(
-            "/read",
-            &json!({
-                "query_source": FIND_PERSON_GQ,
-                "params": {"name": "Alice"},
-                "settings": {"merge_lineage": "off"}
-            }),
-        ),
-    )
-    .await;
-    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
-
-    let (status, body) = json_response(
-        &app,
-        json_post(
-            "/read",
-            &json!({
-                "query_source": format!("set merge_lineage = off;\n{FIND_PERSON_GQ}"),
-                "params": {"name": "Alice"}
-            }),
-        ),
-    )
-    .await;
-    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
-
-    let (status, body) = json_response(
-        &app,
-        json_post(
-            "/change",
-            &json!({
-                "query": format!("set merge_lineage = off;\n{MUTATION_QUERIES}"),
-                "name": "insert_person",
-                "params": {"name": "Dep", "age": 2}
-            }),
-        ),
-    )
-    .await;
-    assert_settings_refusal(status, &body, SETTINGS_AT_DEPRECATED_ROUTE);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3247,7 +3099,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -3257,9 +3109,9 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     assert_eq!(change_status, StatusCode::OK);
     assert_eq!(change_body["affected_nodes"], 1);
 
-    let read = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Mina" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -3269,7 +3121,7 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/read"))
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -3561,7 +3413,7 @@ async fn empty_source_is_refused_as_no_query_on_both_doors() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mutate_endpoint_runs_inline_mutation() {
     // Canonical mutation endpoint. Pairs with `/query` on the read side.
-    // Same wire shape as `/change`, no deprecation signal.
+    // Mutation receipts use the canonical route.
     let (_temp, app) = app_for_loaded_graph().await;
 
     let request = json!({
@@ -3622,53 +3474,9 @@ async fn mutate_endpoint_runs_inline_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn change_endpoint_emits_deprecation_headers() {
-    // `/change` is kept indefinitely for back-compat but flagged at runtime
-    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <mutate>;
-    // rel="successor-version"`). The OpenAPI side is covered by
-    // `openapi_change_is_deprecated` in tests/openapi.rs.
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let request = json!({
-        "query": MUTATION_QUERIES,
-        "name": "insert_person",
-        "params": { "name": "Legacyer", "age": 33 },
-        "branch": "main",
-    });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/change"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("deprecation")
-            .and_then(|v| v.to_str().ok()),
-        Some("true"),
-        "POST /change must advertise `Deprecation: true` (RFC 9745)"
-    );
-    assert_eq!(
-        response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("<mutate>; rel=\"successor-version\""),
-        "POST /change must point at /mutate via `Link` rel=successor-version (RFC 8288)"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn load_endpoint_loads_into_existing_branch() {
     // Canonical bulk-load endpoint (RFC-009 Phase 5). Same wire shape as
-    // /ingest, no deprecation signal.
+    // /load, no deprecation signal.
     let (_temp, app) = app_for_loaded_graph().await;
     let request = IngestRequest {
         branch: Some("main".to_string()),
@@ -3778,7 +3586,7 @@ node Plain { slug: String @key }
             vec![1.0, 0.0]
         );
         assert_eq!(provider_requests.load(Ordering::SeqCst), 1);
-        for path in ["/load", "/load/ndjson", "/ingest"] {
+        for path in ["/load", "/load/ndjson"] {
             let temp = init_graph_with_schema(SCHEMA).await;
             let graph = graph_path(temp.path());
             let db = Omnigraph::open(graph.to_str().unwrap())
@@ -4148,102 +3956,6 @@ async fn raw_graph_batch_policy_refusal_does_not_poll_body() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ingest_endpoint_emits_deprecation_headers() {
-    // `/ingest` is the deprecated alias of `/load` (RFC-009 Phase 5): flagged
-    // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <load>;
-    // rel="successor-version"`). The OpenAPI side is covered by
-    // `openapi_ingest_is_deprecated` in tests/openapi.rs.
-    let (_temp, app) = app_for_loaded_graph().await;
-    let request = IngestRequest {
-        branch: Some("main".to_string()),
-        from: None,
-        mode: Some(LoadMode::Merge),
-        data: r#"{"type":"Person","data":{"name":"Legacyer","age":33}}"#.to_string(),
-    };
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/ingest"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("deprecation")
-            .and_then(|v| v.to_str().ok()),
-        Some("true"),
-        "POST /ingest must advertise `Deprecation: true` (RFC 9745)"
-    );
-    assert_eq!(
-        response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("<load>; rel=\"successor-version\""),
-        "POST /ingest must point at /load via `Link` rel=successor-version (RFC 8288)"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn read_endpoint_emits_deprecation_headers() {
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let request = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
-        params: Some(json!({ "name": "Alice" })),
-        branch: Some("main".to_string()),
-        snapshot: None,
-        settings: None,
-    };
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/read"))
-                .method(Method::POST)
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&request).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("deprecation")
-            .and_then(|v| v.to_str().ok()),
-        Some("true"),
-        "POST /read must advertise `Deprecation: true` (RFC 9745)"
-    );
-    assert_eq!(
-        response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("<query>; rel=\"successor-version\""),
-        "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
-    );
-    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        body_bytes.as_ref(),
-        br#"{"query_name":"get_person","target":{"branch":"main","snapshot":null},"row_count":1,"columns":["p.name","p.age"],"rows":[{"p.name":"Alice","p.age":30}]}"#,
-        "POST /read's envelope is an indefinite compatibility contract (this fixture has no cell whose spelling RFC 0051 changes)"
-    );
-    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert!(
-        body.get("graph_commit_id").is_none(),
-        "POST /read has an indefinite byte-stable envelope and must not gain the canonical route's graph_commit_id: {body}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn query_endpoint_does_not_emit_deprecation_headers() {
     // Sanity check the inverse: the canonical `/query` endpoint must not
     // carry deprecation signaling, so SDK codegens don't propagate a
@@ -4322,54 +4034,6 @@ async fn query_rows_omit_null_cells() {
         text.contains(r#""rows":[{"a.name":""#) && !text.contains("k.since\":"),
         "a null cell's key is omitted from its row, and rows travel as the writer's bytes: {text}"
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn change_endpoint_accepts_legacy_field_names() {
-    // The canonical wire field names on /change are `query` and `name`, but
-    // serde aliases keep the legacy `query_source`/`query_name` payload
-    // shape working for clients that haven't migrated yet. Pin both shapes.
-    let (_temp, app) = app_for_loaded_graph().await;
-
-    let legacy_body = json!({
-        "query_source": MUTATION_QUERIES,
-        "query_name": "insert_person",
-        "params": { "name": "Legacy", "age": 21 },
-        "branch": "main",
-    });
-    let (status, body) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
-            .method(Method::POST)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&legacy_body).unwrap()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["affected_nodes"], 1);
-
-    let canonical_body = json!({
-        "query": MUTATION_QUERIES,
-        "name": "insert_person",
-        "params": { "name": "Canonical", "age": 22 },
-        "branch": "main",
-    });
-    let (status, body) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
-            .method(Method::POST)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&canonical_body).unwrap()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["affected_nodes"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4486,7 +4150,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -4497,9 +4161,9 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(change_body["branch"], "feature");
     assert_eq!(change_body["affected_nodes"], 1);
 
-    let read_main_before = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read_main_before = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Zoe" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -4509,7 +4173,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/read"))
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read_main_before).unwrap()))
@@ -4541,9 +4205,9 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(merge_body["target"], "main");
     assert_eq!(merge_body["outcome"], "fast_forward");
 
-    let read_main_after = ReadRequest {
-        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
-        query_name: Some("get_person".to_string()),
+    let read_main_after = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Zoe" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -4553,7 +4217,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/read"))
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read_main_after).unwrap()))
@@ -4645,7 +4309,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -5002,9 +4666,9 @@ query vector_search_string($q: String) {
         .unwrap();
     let app = build_app(state);
 
-    let read = ReadRequest {
-        query_source: EMBED_QUERY.to_string(),
-        query_name: Some("vector_search_string".to_string()),
+    let read = QueryRequest {
+        query: EMBED_QUERY.to_string(),
+        name: Some("vector_search_string".to_string()),
         params: Some(json!({ "q": "alpha" })),
         branch: Some("main".to_string()),
         snapshot: None,
@@ -5014,7 +4678,7 @@ query vector_search_string($q: String) {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/read"))
+            .uri(g("/query"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -5065,7 +4729,7 @@ async fn change_long_lived_handle_refreshes_before_preparing_write() {
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(
@@ -5094,7 +4758,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     // token changed discards its complete attempt and reprepares from the
     // winner's committed branch state.
     //
-    // This test spawns N concurrent /change inserts on a single
+    // This test spawns N concurrent /mutate inserts on a single
     // node type and asserts: every request returns 200 (no 409),
     // and the final row count equals the seed count + N (every
     // staged batch actually committed).
@@ -5123,7 +4787,7 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
             .unwrap();
             let req = Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/change"))
+                .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -5383,7 +5047,7 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
             .unwrap();
             let req = Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/change"))
+                .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -5474,7 +5138,7 @@ async fn change_disjoint_table_concurrency_succeeds_under_branch_occ_gate() {
     // publisher conflict.
     //
     // Setup: test.jsonl seeds 4 Persons + 2 Companies. Spawn N=4 concurrent
-    // /change inserts on `node:Person` and N=4 concurrent inserts on
+    // /mutate inserts on `node:Person` and N=4 concurrent inserts on
     // `node:Company`. All 8 must return 200, and the post-test row counts
     // must reflect every insert.
     const PERSON_QUERY: &str = r#"
@@ -5512,7 +5176,7 @@ query insert_c($name: String) {
             .unwrap();
             let req = Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/change"))
+                .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -5531,7 +5195,7 @@ query insert_c($name: String) {
             .unwrap();
             let req = Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/change"))
+                .uri(g("/mutate"))
                 .method(Method::POST)
                 .header("content-type", "application/json")
                 .body(Body::from(body))
@@ -5552,7 +5216,7 @@ query insert_c($name: String) {
         .collect();
     assert!(
         bad.is_empty(),
-        "expected every disjoint /change insert to return 200, got non-200 for: {:?}",
+        "expected every disjoint /mutate insert to return 200, got non-200 for: {:?}",
         bad,
     );
 
@@ -5594,11 +5258,11 @@ query insert_c($name: String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ingest_per_actor_admission_cap_returns_429() {
-    // Pin the admission gate on `/ingest`. With per-actor in-flight cap of 1
+    // Pin the admission gate on `/load`. With per-actor in-flight cap of 1
     // and 8 concurrent requests from the same actor, at least one request
     // must be rejected with HTTP 429 and `code: too_many_requests`.
     //
-    // Pre-fix bug class: the admission pattern at `server_change`
+    // Pre-fix bug class: the admission pattern at `server_mutate`
     // (`crates/omnigraph-server/src/lib.rs:932`) was the only handler
     // that called `WorkloadController::try_admit`. A heavy actor sending
     // bulk-ingest traffic would exhaust shared engine capacity (Lance I/O
@@ -5606,8 +5270,8 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     // Pinned at the HTTP boundary so future refactors that drop the
     // try_admit call from a mutating handler turn this red.
     //
-    // Post-fix invariant: `/ingest`, `/branches/create`, `/branches/delete`,
-    // `/branches/merge`, and `/schema/apply` all gate on
+    // Post-fix invariant: `/load`, `/branches/create`, `/branches/delete`,
+    // and `/branches/merge` all gate on
     // `state.workload.try_admit(&actor_arc, est_bytes)` after Cedar
     // authorization and before the engine call. Cap exhaustion surfaces as
     // 429 with `code: too_many_requests`.
@@ -5629,7 +5293,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
         1_000_000_000, // per-actor byte budget — large so it never bottlenecks
     );
     // MR-723: install a permit-all policy alongside the bearer token so
-    // /ingest (action=Change) passes Cedar evaluation. The test is
+    // /load (action=Change) passes Cedar evaluation. The test is
     // exercising the admission cap, not policy — the policy is just
     // enough to clear the State 3 path so the test reaches workload.
     let policy_path = temp.path().join("policy.yaml");
@@ -5671,7 +5335,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             .unwrap();
             let req = Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/ingest"))
+                .uri(g("/load"))
                 .method(Method::POST)
                 .header("authorization", "Bearer flooder-token")
                 .header("content-type", "application/json")
@@ -5699,7 +5363,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
         .collect();
     assert!(
         !too_many.is_empty(),
-        "expected at least one /ingest under cap=1 to return 429; got statuses: {:?}",
+        "expected at least one /load under cap=1 to return 429; got statuses: {:?}",
         statuses,
     );
 
@@ -6710,4 +6374,34 @@ async fn change_responses_carry_no_storage_vocabulary() {
     let terminal: Value =
         serde_json::from_str(text.lines().rfind(|line| !line.is_empty()).unwrap()).unwrap();
     assert_clean(&terminal, "baseline terminal record");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_routes_and_legacy_query_fields_refuse_without_graph_effects() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let before = main_head_commit_id(&app).await;
+    for path in ["/read", "/change", "/ingest"] {
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                path,
+                &json!({
+                    "query": "mutation add() { insert Person { name: \"Unexpected\", age: 1 } }",
+                    "data": "{\"type\":\"Person\",\"data\":{\"name\":\"Unexpected\",\"age\":1}}"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for path in ["/query", "/mutate"] {
+        for body in [
+            json!({"query_source": FIND_PERSON_GQ}),
+            json!({"query": FIND_PERSON_GQ, "query_name": "find_person"}),
+        ] {
+            let response = app.clone().oneshot(json_post(path, &body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}: {body}");
+        }
+    }
+    assert_eq!(main_head_commit_id(&app).await, before);
 }

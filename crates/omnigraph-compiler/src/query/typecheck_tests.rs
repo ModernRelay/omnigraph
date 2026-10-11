@@ -3,6 +3,79 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::schema::parser::parse_schema;
 
+/// Null positions are expressible through the public AST even though the GQ
+/// grammar has no null literal token.
+#[test]
+fn list_literal_type_unifies_all_non_null_elements() {
+    for items in [
+        vec![Literal::Integer(1), Literal::Float(2.5)],
+        vec![Literal::Float(2.5), Literal::Integer(1)],
+        vec![Literal::Null, Literal::Integer(1), Literal::Float(2.5)],
+        vec![Literal::Integer(1), Literal::Null, Literal::Float(2.5)],
+        vec![Literal::Integer(1), Literal::Float(2.5), Literal::Null],
+    ] {
+        assert_eq!(
+            literal_type(&Literal::List(items)).unwrap(),
+            PropType::list_of(ScalarType::F64, false)
+        );
+    }
+    for items in [
+        vec![],
+        vec![Literal::Null],
+        vec![Literal::Null, Literal::Null],
+    ] {
+        assert_eq!(
+            literal_type(&Literal::List(items)).unwrap(),
+            PropType::list_of(ScalarType::String, false)
+        );
+    }
+    for items in [
+        vec![Literal::Integer(1), Literal::String("x".into())],
+        vec![Literal::String("x".into()), Literal::Integer(1)],
+        vec![Literal::List(vec![])],
+        vec![Literal::Integer(1), Literal::List(vec![])],
+    ] {
+        assert!(literal_type(&Literal::List(items)).is_err());
+    }
+}
+
+#[test]
+fn public_ast_nulls_retain_the_checked_leaf_type_after_lowering() {
+    let catalog = setup();
+    let parsed = parse_query("query q() { match { $p: Person } return { 1 as value } }").unwrap();
+    for (expr, expected) in [
+        (
+            Expr::Literal(Literal::List(vec![
+                Literal::Null,
+                Literal::Integer(1),
+                Literal::Float(2.5),
+            ])),
+            PropType::list_of(ScalarType::F64, false),
+        ),
+        (
+            Expr::Literal(Literal::List(vec![Literal::Null])),
+            PropType::list_of(ScalarType::String, false),
+        ),
+        (
+            Expr::Binary {
+                left: Box::new(Expr::Literal(Literal::Null)),
+                op: BinaryOp::Compare(CompOp::Eq),
+                right: Box::new(Expr::Literal(Literal::Null)),
+            },
+            PropType::scalar(ScalarType::Bool, true),
+        ),
+    ] {
+        let mut query = parsed.single_decl().clone();
+        query.return_clause[0].expr = expr;
+        let checked = typecheck_query(&catalog, &query).unwrap();
+        let lowered = crate::lower_query(&catalog, &query, &checked).unwrap();
+        let projection = &lowered.return_exprs[0];
+        let expected = ExprType::from_prop(&expected);
+        assert_eq!(projection.ty, expected);
+        assert_eq!(projection.expr.leaf_type(), Some(&expected));
+    }
+}
+
 /// Node type name of a binding, panicking if it is an edge binding — the two
 /// namespaces can share a type name (see `setup_same_named_node_and_edge`).
 /// Indexing `ctx.bindings` covers the unbound case with its own panic.
@@ -1047,6 +1120,71 @@ return { $f.name }
     .unwrap();
     let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert!(err.to_string().contains("unbounded traversal is disabled"));
+}
+
+#[test]
+fn test_cross_type_multi_hop_bound_is_refused() {
+    let catalog = setup();
+    for (pattern, rendered, fix) in [
+        (
+            "$p: Person $p worksAt{1,2} $c",
+            "worksAt{1,2}",
+            "`$p worksAt $c`",
+        ),
+        (
+            "$p: Person $p worksAt{2,2} $c",
+            "worksAt{2,2}",
+            "no `WorksAt` path reaches hop 2, so this pattern matches nothing; to go further, start another traversal at the `Company` endpoint",
+        ),
+        (
+            "$c: Company $c worksAt{1,3} $p",
+            "worksAt{1,3}",
+            "`$c worksAt $p`",
+        ),
+        (
+            "$c: Company $c worksAt{3,4} $p",
+            "worksAt{3,4}",
+            "no `WorksAt` path reaches hop 3, so this pattern matches nothing; to go further, start another traversal at the `Person` endpoint",
+        ),
+        (
+            "$p: Person not { $p worksAt{1,2} $_ }",
+            "worksAt{1,2}",
+            "`$p worksAt $_`",
+        ),
+    ] {
+        let source = format!("query q() {{ match {{ {pattern} }} return {{ $p.name }} }}");
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
+        let diagnostic = err.diagnostic().expect("a typecheck diagnostic");
+        assert_eq!(diagnostic.code.as_str(), "T5", "{pattern}: {err}");
+        assert!(
+            diagnostic.message.contains(&format!(
+                "multi-hop traversal `{rendered}` requires the same node type at both endpoints, but `WorksAt: Person -> Company` connects different types"
+            )),
+            "{pattern}: {err}"
+        );
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .is_some_and(|text| text.contains(fix)),
+            "{pattern}: {diagnostic:?}"
+        );
+    }
+}
+
+#[test]
+fn test_cross_type_single_hop_bound_is_valid() {
+    let catalog = setup();
+    for traversal in ["$p worksAt $c", "$p worksAt{1,1} $c"] {
+        let source =
+            format!("query q() {{ match {{ $p: Person {traversal} }} return {{ $c.name }} }}");
+        let qf = parse_query(&source).unwrap();
+        let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
+        assert_eq!(ctx.traversals[0].src_type, "Person", "{traversal}");
+        assert_eq!(ctx.traversals[0].dst_type, "Company", "{traversal}");
+        assert_eq!(ctx.traversals[0].max_hops, Some(1), "{traversal}");
+    }
 }
 
 #[test]

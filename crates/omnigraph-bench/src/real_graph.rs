@@ -184,6 +184,16 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
         )));
     }
 
+    observe_branch(&db, "main", branches).await
+}
+
+/// Observe one live branch of a quiescent private dataset.
+pub(crate) async fn observe_branch(
+    db: &Omnigraph,
+    branch: &str,
+    branches: Vec<String>,
+) -> RealGraphResult<RealGraphObservationV1> {
+    let native = (branch != "main").then_some(branch);
     let catalog = db.catalog();
     let accepted_ir = catalog.bound_schema_ir().ok_or_else(|| {
         RealGraphError::new("copied graph catalog is not bound to accepted schema identity")
@@ -209,11 +219,11 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     })?;
 
     let snapshot = db
-        .snapshot_of(ReadTarget::branch("main"))
+        .snapshot_of(ReadTarget::branch(branch))
         .await
         .map_err(|error| RealGraphError::new(format!("capture copied graph main: {error}")))?;
     let graph_manifest_version = snapshot.graph_manifest_version();
-    let main_commit_id = snapshot.graph_head(None).map(str::to_owned);
+    let main_commit_id = snapshot.graph_head(native).map(str::to_owned);
     let expected_table_keys = accepted_ir
         .nodes
         .iter()
@@ -239,14 +249,14 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     let mut edge_tables = Vec::new();
     let mut indexes = Vec::new();
     let mut expected_logical_rows = BTreeMap::new();
-    let mut relocation_self_contained =
-        !db.manifest_has_external_base_paths(None)
-            .await
-            .map_err(|error| {
-                RealGraphError::new(format!(
-                    "inspect graph-manifest relocation metadata: {error}"
-                ))
-            })?;
+    let mut relocation_self_contained = !db
+        .manifest_has_external_base_paths(native)
+        .await
+        .map_err(|error| {
+            RealGraphError::new(format!(
+                "inspect graph-manifest relocation metadata: {error}"
+            ))
+        })?;
     for table_key in &expected_table_keys {
         let entry = snapshot
             .dataset(table_key)
@@ -335,30 +345,29 @@ pub async fn observe_real_graph(root: &Path) -> RealGraphResult<RealGraphObserva
     indexes.sort();
 
     let history_depth = u64::try_from(
-        db.list_commits(Some("main"))
+        db.list_commits(Some(branch))
             .await
             .map_err(|error| RealGraphError::new(format!("list main history: {error}")))?
             .len(),
     )
     .map_err(|_| RealGraphError::new("main history depth exceeds u64"))?;
     let mut sink = LogicalGraphSink::default();
-    db.export_jsonl_unordered_to_writer("main", &[], &mut sink)
+    db.export_jsonl_unordered_to_writer(branch, &[], &mut sink)
         .await
         .map_err(|error| RealGraphError::new(format!("stream copied graph content: {error}")))?;
     sink.verify_table_counts(&expected_logical_rows)?;
     let content = sink.finish(schema_sha256)?;
     let closing_snapshot = db
-        .snapshot_of(ReadTarget::branch("main"))
+        .snapshot_of(ReadTarget::branch(branch))
         .await
         .map_err(|error| RealGraphError::new(format!("recapture copied graph main: {error}")))?;
     if closing_snapshot.graph_manifest_version() != graph_manifest_version
-        || closing_snapshot.graph_head(None) != main_commit_id.as_deref()
+        || closing_snapshot.graph_head(native) != main_commit_id.as_deref()
     {
         return Err(RealGraphError::new(
             "copied graph main changed while logical evidence was being observed",
         ));
     }
-    drop(db);
 
     Ok(RealGraphObservationV1 {
         version: REAL_GRAPH_OBSERVATION_VERSION,
@@ -670,7 +679,7 @@ impl Write for LogicalGraphSink {
     }
 }
 
-fn canonical_json_bytes(value: &Value) -> RealGraphResult<Vec<u8>> {
+pub(crate) fn canonical_json_bytes(value: &Value) -> RealGraphResult<Vec<u8>> {
     let mut bytes = Vec::new();
     write_canonical_json(value, &mut bytes)?;
     Ok(bytes)

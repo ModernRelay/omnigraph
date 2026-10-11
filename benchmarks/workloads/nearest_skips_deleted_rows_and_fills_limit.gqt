@@ -1,0 +1,46 @@
+# issue: none
+# notes: Shared benchmark dataset/query contract.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query nearest_after_delete($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d003"}
+{"d.slug":"d004"}
+{"d.slug":"d005"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query nearest_after_delete($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+--- params
+{"q": [-0.3, 0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"d003"}
+{"d.slug":"d004"}
+{"d.slug":"d005"}
+
+--- expect shape
+d.slug: String

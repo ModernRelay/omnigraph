@@ -1,0 +1,72 @@
+# issue: 854
+# red_on: 2026-10-08, upstream/main at 2d5ec1e8 before this change: a String @key equality scanned the key column with the __id BTREE unused, and the plan grammar had no `access` claim to say so
+# traversal: auto
+# notes: A String key keeps its written equality and uses the identity index when available (plain, escaped, empty and reversed spellings).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"β'\"\\","age":22}}
+{"type":"Person","data":{"slug":"","age":33}}
+
+--- query
+set engine = v2;
+query plain($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "alpha"}
+--- expect unordered
+{"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+pass scan_access
+
+--- query
+set engine = v2;
+query escaped($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "β'\"\\"}
+--- expect unordered
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+pass scan_access
+
+--- query
+set engine = v2;
+query empty($s: String) {
+    match { $p: Person $s = $p.slug }
+    return { $p.age }
+}
+--- params
+{"s": ""}
+--- expect unordered
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+pass scan_access

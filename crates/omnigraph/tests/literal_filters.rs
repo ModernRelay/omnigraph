@@ -663,3 +663,147 @@ async fn camelcase_property_filter_executes() {
         "expected exactly the d1 row for repoName=acme"
     );
 }
+
+#[tokio::test]
+async fn unused_mutation_parameters_are_checked_before_a_noop() {
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    for (type_name, invalid, valid) in [
+        (
+            "I32",
+            Literal::Integer(i64::from(i32::MAX) + 1),
+            Literal::Integer(1),
+        ),
+        (
+            "[F32]",
+            Literal::List(vec![Literal::Float(f64::MAX)]),
+            Literal::List(vec![Literal::Float(0.5)]),
+        ),
+        ("F64", Literal::Float(f64::NAN), Literal::Float(1.25)),
+    ] {
+        let source = format!(
+            "query unused($value: {type_name}) {{ update Metric set {{ active: false }} where name = \"missing\" }}"
+        );
+        let error = db
+            .mutate(
+                "main",
+                &source,
+                "unused",
+                &ParamMap::from([("value".into(), invalid)]),
+            )
+            .await
+            .expect_err("an unused declared parameter is validated even when no row matches");
+        assert!(
+            error.to_string().contains("param 'value':"),
+            "{type_name}: {error}"
+        );
+        let receipt = db
+            .mutate_with_receipt(
+                "main",
+                &source,
+                "unused",
+                &ParamMap::from([("value".into(), valid)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.result.affected_nodes, 0, "{type_name}");
+        assert_eq!(receipt.result.affected_edges, 0, "{type_name}");
+        assert!(
+            receipt.commit.is_none(),
+            "{type_name}: a no-op does not publish"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_head_check() {
+    use omnigraph::error::OmniError;
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = metric_db(&dir).await;
+    let source = r#"query assigned($value: I32) {
+        update Metric set { count: $value } where name = "missing"
+    }"#;
+    let params = ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX) + 1))]);
+    let error = db
+        .mutate_as_with_expected_head(
+            "main",
+            source,
+            "assigned",
+            &params,
+            None,
+            Some("not-the-current-head"),
+        )
+        .await
+        .expect_err("caller expected-head refusal precedes parameter validation");
+    assert!(
+        matches!(error, OmniError::PreconditionFailed { .. }),
+        "{error}"
+    );
+    let error = db
+        .mutate("main", source, "assigned", &params)
+        .await
+        .expect_err("zero matched rows must not hide an invalid assignment parameter");
+    let text = error.to_string();
+    assert!(
+        text.contains("param 'value':") && text.contains("exceeds I32 range"),
+        "{text}"
+    );
+    let receipt = db
+        .mutate_with_receipt(
+            "main",
+            source,
+            "assigned",
+            &ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX)))]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 0);
+    assert_eq!(receipt.result.affected_edges, 0);
+    assert!(receipt.commit.is_none());
+}
+
+#[tokio::test]
+async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
+    use omnigraph_compiler::Literal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let predicate = r#"query optional_predicate($name: String?) {
+        update Metric set { active: false } where name = $name
+    }"#;
+    for params in [
+        ParamMap::new(),
+        ParamMap::from([("name".into(), Literal::Null)]),
+    ] {
+        let receipt = db
+            .mutate_with_receipt("main", predicate, "optional_predicate", &params)
+            .await
+            .unwrap();
+        assert_eq!(receipt.result.affected_nodes, 0);
+        assert_eq!(receipt.result.affected_edges, 0);
+        assert!(receipt.commit.is_none());
+    }
+
+    let assignment = r#"query optional_assignment($count: I32?) {
+        update Metric set { count: $count } where name = "m1"
+    }"#;
+    let receipt = db
+        .mutate_with_receipt("main", assignment, "optional_assignment", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 1);
+    assert_eq!(receipt.result.affected_edges, 0);
+    assert!(receipt.commit.is_some());
+    let cleared = r#"query cleared() {
+        match { $m: Metric $m.count is null }
+        return { $m.name }
+    }"#;
+    assert_eq!(
+        sorted_metric_names(&mut db, cleared, "cleared").await,
+        ["m1"]
+    );
+}

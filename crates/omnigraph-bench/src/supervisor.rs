@@ -14,8 +14,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::ValidatedCase;
 use crate::branch_merge::{BranchMergePlan, TARGET_BRANCH};
+use crate::legacy::case::ValidatedCase;
 use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::{
@@ -1367,12 +1367,12 @@ fn remaining(total: Duration, elapsed: Duration) -> Duration {
 #[cfg(all(test, unix))]
 mod tests {
     use crate::counting::LogicalCallCounts;
+    use crate::legacy::case::{ValidatedCase, parse_case};
     use crate::runner::{
         ControlCallObservation, LogicalStoreCallObservation, VerificationObservation,
         test_general_merge_route, test_general_merge_stored_phases,
     };
     use crate::worker_protocol::ChildFrameV1;
-    use crate::{ValidatedCase, parse_case};
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
@@ -1389,7 +1389,7 @@ mod tests {
 
     fn test_case() -> ValidatedCase {
         parse_case(include_str!(
-            "../../../benchmarks/cases/branch-merge-d50-warm.case-v1.yaml"
+            "../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"
         ))
         .into_result()
         .unwrap()

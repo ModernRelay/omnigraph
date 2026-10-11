@@ -443,8 +443,12 @@ needs one). Files are UTF-8 with `\n` endings (a `\r` anywhere is
 refused); a trailing newline is
 insignificant; blank lines in the JSONL sections (seed, expect) are
 ignored; a `#` line inside a JSONL section is refused (comments live in
-the header); `//` comments inside query and mutate sections are simply GQ
-text. Header lines are `#` lines before the first section, keys
+the header), while inside a YAML section (runner, seam, generated recipe)
+it is YAML text; a YAML section's body is read with every line
+newline-terminated, so a block scalar ending the body keeps the final line
+break the file shows, and its mapping keys must be strings (a plain `true`,
+`1` or `~` key is refused); `//` comments inside query and mutate sections
+are simply GQ text. Header lines are `#` lines before the first section, keys
 `# issue:`, `# red_on:`, `# notes:`, `# traversal:`. `# issue:` is always
 required; `# red_on:` is required when `# issue:` names a number and
 optional under `# issue: none`; a header line is accepted exactly when
@@ -456,20 +460,42 @@ list; no line ever continues a previous entry); a key given twice is
 refused, except `# notes:`, which repeats to carry a multi-line note;
 `# notes:` and `# traversal:` are optional. `# issue:` takes a number in canonical
 spelling (no sign, no leading zeros) or `none`; any other spelling is
-refused. `# traversal:` takes `indexed` or `csr` and pins every
-declaration step to that mode, for cases whose subject is one traversal
-path (Execution semantics owns the default); a statement step traverses
+refused. `# traversal:` takes `auto`, `indexed` or `csr` and prepares indexes.
+`indexed` and `csr` pin every declaration step to that mode; `auto` retains
+cost-based selection. A statement step traverses
 nothing and runs outside the pin. `# traversal:` in a file that names a
 server API (Execution routes, below) is refused: the pin is a task-local seam of the runner process.
 
-A file is: required `--- runner` (Explicit execution environments),
-then `--- schema`, then
-`--- seed`, then one or more steps, of
-which at least one is a query, mutate or cli step; a file missing any of these
-three leading sections, ordering them differently, or carrying no query,
-mutate or cli step (nothing would be asserted, a restart-only step list
-included) is refused. A `--- seam` may precede an operation as specified
+A file starts with required `--- runner` (Explicit execution environments),
+optionally followed by `--- schema` and then `--- seed`, then zero or more
+steps. Schema and seed must both be present or both absent; neither may occur
+after a step. Without them, execution requires an existing store supplied
+through `omnigraph-gqt --store <URI>`. With them, `--store` is refused.
+Dataset-only and restart-only files are admitted. The corpus supplies no
+store and refuses files without schema and seed. External stores require
+direct engine execution with a matching backend (`file://`, `s3://` or
+`az://`); DST owns its own initialized store and refuses `--store`.
+A `--- seam` may precede an operation as specified
 in Seams at an explicit step. A step is one of:
+
+- `--- load generate: v1 seed: <u64> mode: append|merge [branch: <name>]`
+  holds a bounded YAML table recipe, followed by `--- expect ok` or
+  `--- expect error: <substring>`. It accepts no params or other expectation
+  kinds. A seed may use `--- seed generate: v1 seed: <u64>` with the same
+  recipe, appending batches in order instead of loading inline JSONL with
+  overwrite semantics. Generators include literals, repeated strings,
+  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors
+  and ordinal/uniform/Zipf endpoints. Table `commits` fixes the number of
+  loader calls, with optional `batch_rows` fixing the chunk boundaries.
+  A generated load requires at least one nonempty batch; empty recipes are
+  admitted only as seeds, and any explicit batch size remains bounded.
+  Each call publishes independently; a failure preserves earlier commits.
+  The exact grammar, limits and pinned SHA-256 and Zipf algorithms are the
+  [generated fixture contract](../../crates/omnigraph-gqt/README.md#generated-fixtures-and-loads).
+  A load inside a loop repeats its fixed recipe without interpolation.
+  Mutation and any-write seams may precede it. One-call loads encode their
+  input before host operation callbacks; multi-call loads include generation
+  between calls and cannot represent one engine-only benchmark sample.
 
 - `--- query via <api>[, <api>]` (the APIs of Execution routes, below) holding exactly one GQ declaration with a read body, followed
   by an optional `--- params` section (JSON object) and a mandatory
@@ -981,9 +1007,9 @@ the glob; without it, every crossing.
 The seam must exist in the engine's catalog, or be a store place in the
 decoration's table `STORE_PLACES` (RFC 0066 §Design **Store places**), and
 be crossed by the kind of step it precedes: a seam of operation `mutation`
-before a mutate step, one of `branch_merge`, `branch_create` or
+before a mutate or load step, one of `branch_merge`, `branch_create` or
 `branch_delete` before the matching branch statement, one of `any_write`
-before either, a store place before either; a seam whose operation no step
+before any of those, a store place before any of those; a seam whose operation no step
 starts is refused as unreachable. No caller-supplied code or
 arbitrary action string is accepted. A new seam requires an implementation,
 a declared operation and set of effects in the catalog, and a proof case
@@ -1656,10 +1682,12 @@ live directly under `cases/`; v2-specific cases live in `cases/v2/`, with
 plan assertions in `cases/v2/planner/`. Directory placement is organizational:
 every case runs on engine v2, the `engine` setting's one value, and discovery
 never supplies a setting. The runner it
-calls (parser, execution, comparison, bless) is the crate's library,
-`crates/omnigraph-gqt/src/lib.rs`, and the format self-tests are unit
-tests beside it in `crates/omnigraph-gqt/src/tests.rs`; the crate is
-`publish = false` and never built for release. Direct-engine cases run on one shared
+calls delegates parsing, ordinary execution, comparison and bless to
+`omnigraph-gqt-core`. Format self-tests live in
+`crates/omnigraph-gqt-core/src/tests.rs`. The GQT runner retains discovery,
+process isolation, DST and reference execution; both crates are
+`publish = false`. The shared core is also linked into the release benchmark
+worker without the runner's test-only dependencies. Direct-engine cases run on one shared
 multi-thread tokio runtime whose worker stacks are 16 MiB (the engine's
 query futures overflow the 2 MiB default; the value equals the CI jobs'
 `RUST_MIN_STACK`, so the harness target does not depend on that

@@ -309,9 +309,7 @@ def markdown(result):
               f"Runtime environment: `{json.dumps(session['runtime_environment'], sort_keys=True)}`. Per-repetition thermal observations are retained in analysis.json; host isolation is not qualified.", "",
               "Reproduce the analyzer from the repository root:", "", "```sh",
               f"python3 scripts/analyze-http-perf.py {shlex.quote(result['session_directory'])}", "```", "",
-              "Reacquisition uses the session's config with a new, empty output directory and the attested binaries; preserve the exact shared environment and release receipts.", "", "```sh",
-              "OMNIGRAPH_HTTP_BENCH_CONFIG=/absolute/path/to/config.json cargo test -p omnigraph-cli --locked --test parity_matrix http_bench::controlled_http_comparison -- --exact --ignored --nocapture",
-              "```", "",
+              "Acquisition is deferred. Historical instrument sources and restoration requirements are preserved under `benchmarks/deferred/`.", "",
               "## Frozen fixture layout", "",
               "| State | Manifest version | Manifest fragments | Data fragments | Live data rows | Visible index entries |",
               "|---|---:|---:|---:|---:|---:|"]

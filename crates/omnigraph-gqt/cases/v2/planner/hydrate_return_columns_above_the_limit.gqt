@@ -1,0 +1,180 @@
+# issue: none
+# notes: Twelve docs; d07 and d10 have no body. d00 and d01 both cite d10, d02 cites
+# notes: d11, d03 cites d05. Pass 6 fetches a return column only the output reads by
+# notes: row address above the root limit when its binding's scan estimates more than
+# notes: four rows per kept row. Steps 1-3 hydrate (12 > 4 x 2; 12 > 4 x 1 for $b,
+# notes: whose scan step 3's key lookup on $a does not bound). Steps 4-6 do not: a
+# notes: sorted alias, 12 is not above 4 x 3, a key lookup reads one row. Step 2
+# notes: reaches $b through a hash join, step 3 by id lookup: both destination paths
+# notes: carry the row address. Every rows step is compared with engine v1.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    rank: I32
+    title: String
+    body: String?
+    embedding: Vector(2)
+}
+
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d00","rank":0,"title":"t-00","embedding":[0.0,0.0],"body":"body 00"}}
+{"type":"Doc","data":{"slug":"d01","rank":1,"title":"t-01","embedding":[1.0,0.0],"body":"body 01"}}
+{"type":"Doc","data":{"slug":"d02","rank":2,"title":"t-02","embedding":[2.0,0.0],"body":"body 02"}}
+{"type":"Doc","data":{"slug":"d03","rank":3,"title":"t-03","embedding":[3.0,0.0],"body":"body 03"}}
+{"type":"Doc","data":{"slug":"d04","rank":4,"title":"t-04","embedding":[4.0,0.0],"body":"body 04"}}
+{"type":"Doc","data":{"slug":"d05","rank":5,"title":"t-05","embedding":[5.0,0.0],"body":"body 05"}}
+{"type":"Doc","data":{"slug":"d06","rank":6,"title":"t-06","embedding":[6.0,0.0],"body":"body 06"}}
+{"type":"Doc","data":{"slug":"d07","rank":7,"title":"t-07","embedding":[7.0,0.0]}}
+{"type":"Doc","data":{"slug":"d08","rank":8,"title":"t-08","embedding":[8.0,0.0],"body":"body 08"}}
+{"type":"Doc","data":{"slug":"d09","rank":9,"title":"t-09","embedding":[9.0,0.0],"body":"body 09"}}
+{"type":"Doc","data":{"slug":"d10","rank":10,"title":"t-10","embedding":[10.0,0.0]}}
+{"type":"Doc","data":{"slug":"d11","rank":11,"title":"t-11","embedding":[11.0,0.0],"body":"body 11"}}
+{"edge":"Cites","from":"d00","to":"d10","data":{}}
+{"edge":"Cites","from":"d01","to":"d10","data":{}}
+{"edge":"Cites","from":"d02","to":"d11","data":{}}
+{"edge":"Cites","from":"d03","to":"d05","data":{}}
+
+--- query
+query top_two() {
+    match { $d: Doc }
+    return { $d.slug, $d.body, $d.title }
+    order { $d.rank desc }
+    limit 2
+}
+
+--- expect ordered
+{"d.body":"body 11","d.slug":"d11","d.title":"t-11"}
+{"d.slug":"d10","d.title":"t-10"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+d.title: String
+
+--- expect plan
+pass late_materialization
+hydrate $d: columns [body, title]
+scan Doc as $d: columns [__id, slug, rank, body, title]
+
+--- expect same as v1
+
+--- query
+query cited_twice() {
+    match {
+        $a: Doc
+        $a cites $b
+    }
+    return { $a.slug, $b.slug, $b.body, $b.embedding }
+    order { $a.slug }
+    limit 2
+}
+
+--- expect ordered
+{"a.slug":"d00","b.embedding":[10,0],"b.slug":"d10"}
+{"a.slug":"d01","b.embedding":[10,0],"b.slug":"d10"}
+
+--- expect shape
+a.slug: String
+b.slug: String
+b.body: String?
+b.embedding: Vector(2)
+
+--- expect plan
+pass late_materialization
+hydrate $b: columns [body, embedding]
+hash join $b
+
+--- expect same as v1
+
+--- query
+query first_citation() {
+    match {
+        $a: Doc { slug: "d02" }
+        $a cites $b
+    }
+    return { $b.body }
+    limit 1
+}
+
+--- expect unordered
+{"b.body":"body 11"}
+
+--- expect shape
+b.body: String?
+
+--- expect plan
+pass late_materialization
+hydrate $b: columns [body]
+scan Doc as $b: access id_lookup
+
+--- expect same as v1
+
+--- query
+query by_title() {
+    match { $d: Doc }
+    return { $d.slug, $d.title as t }
+    order { t desc }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"d11","t":"t-11"}
+{"d.slug":"d10","t":"t-10"}
+
+--- expect shape
+d.slug: String
+t: String
+
+--- expect plan
+not pass late_materialization
+
+--- expect same as v1
+
+--- query
+query lowest_three() {
+    match { $d: Doc }
+    return { $d.slug, $d.body }
+    order { $d.rank }
+    limit 3
+}
+
+--- expect ordered
+{"d.body":"body 00","d.slug":"d00"}
+{"d.body":"body 01","d.slug":"d01"}
+{"d.body":"body 02","d.slug":"d02"}
+
+--- expect shape
+d.slug: String
+d.body: String?
+
+--- expect plan
+not pass late_materialization
+
+--- expect same as v1
+
+--- query
+query one_body() {
+    match { $d: Doc { slug: "d03" } }
+    return { $d.body }
+    limit 1
+}
+
+--- expect unordered
+{"d.body":"body 03"}
+
+--- expect shape
+d.body: String?
+
+--- expect plan
+not pass late_materialization
+
+--- expect same as v1

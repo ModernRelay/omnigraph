@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-10-02
+updated: 2026-10-07
 discussion: https://github.com/ModernRelay/omnigraph/pull/824
 supersedes: []
 superseded_by: []
@@ -223,14 +223,15 @@ shutdown exit early. Treating a join as a complete storage drain would enable
 unsafe runtime replacement. This decision retains the future, accounts for its
 server lifetime and refuses unsupported conclusions.
 
-The coordinated v0.12 contract gains bounded admission and explicit CLI failure
-outcomes. There are no older-client adapters or alternate error aliases. Embedded Rust
+Bounded admission and explicit CLI failure outcomes belong to the current
+[HTTP contract](2026-09-30-v012-http-admission.md). There are no older-client adapters or alternate error aliases. Embedded Rust
 callers matching `OmniError` account for its new `Completion` wrapper; use
 `into_completion_evidence` to recover the original typed cause and evidence.
 The wrapper preserves display, diagnostics and storage/memory classification.
 Malformed branch-create names now return HTTP 400 rather than an internal 500.
-Existing data and cluster state require no migration. Server restart remains necessary for
-schema/stored-query deployment until the separate online-deployment gates pass.
+This ownership mechanism adds no data or cluster-state migration. Current online
+deployment and ledger-conversion rules remain with the
+[server runtime decision](2026-09-29-server-runtime-and-online-deployment.md).
 
 ## Decision log
 
@@ -263,3 +264,5 @@ schema/stored-query deployment until the separate online-deployment gates pass.
   capacity, registered-route body limits, request tracing and early nonzero
   containment after remaining logical owners finish. Native-I/O settlement
   and runtime reuse remain unqualified.
+
+- 2026-10-07: Replaced the Compatibility paragraph's v0.12 qualifier with the current HTTP admission decision, and the obsolete restart-required sentence with the current online-deployment and ledger-conversion authority.

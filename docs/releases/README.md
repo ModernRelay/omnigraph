@@ -4,6 +4,7 @@ Release documents describe user-visible changes and actions needed before
 upgrading. The [upgrade guide](../user/operations/upgrade.md) owns the current
 upgrade procedure.
 
+- [v0.13.0](v0.13.0.md): released 2026-10-07
 - [v0.12.0](v0.12.0.md): released 2026-10-05
 - [v0.11.0](v0.11.0.md)
 - [v0.10.0](v0.10.0.md)

@@ -63,9 +63,8 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
         if path == "/.well-known/oauth-protected-resource" {
             continue;
         }
-        let protected = path == "/graphs"
-            || path.starts_with("/graphs/")
-            || path.starts_with("/cluster/deployments");
+        let protected =
+            path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
         for operation in crate::handlers::path_item_operations_mut(item) {
             if protected {
                 let mut parameter = Parameter::new(HTTP_API_CONTRACT_HEADER);
@@ -95,7 +94,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                     );
                 }
             }
-            if path.starts_with("/graphs/{graph_id}/") || path.starts_with("/cluster/deployments") {
+            if path.starts_with("/graphs/{graph_id}/") || path.starts_with("/cluster/") {
                 for (status, description) in [
                     (
                         "429",

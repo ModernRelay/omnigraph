@@ -297,8 +297,9 @@ impl Session {
         let ir: &QueryIR = &query.ir;
         #[cfg(feature = "test-util")]
         if let Some(executor) = self.read_executor() {
+            let erased = ir.erase();
             let request = omnigraph_catalog::read_executor::ReadRequest {
-                ir,
+                ir: &erased,
                 params,
                 snapshot: snapshot.raw(),
                 catalog,

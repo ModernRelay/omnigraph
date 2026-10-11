@@ -643,7 +643,7 @@ fn aggregate_return(
 
     for (i, proj) in projections.iter().enumerate() {
         match &proj.expr {
-            IRExpr::Aggregate { func, arg } => {
+            IRExpr::Aggregate { func, arg, .. } => {
                 let (name, col) = evaluate_projection(wide, arg, params, ctx)?;
                 let alias = proj.alias.as_deref().unwrap_or(&name);
                 agg_projs.push(AggProj {

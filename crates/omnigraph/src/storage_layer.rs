@@ -127,9 +127,11 @@ impl DeletedIdBudget {
 }
 
 /// Scheduler I/O buffer of every batched managed Blob read; Lance's default is
-/// 32 MiB times the store's I/O parallelism. It caps read-ahead, not what a
-/// caller holds: 64 contiguous 1 MiB validation windows may arrive as one buffer.
-pub(crate) const BLOB_REBUILD_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
+/// 32 MiB times the store's I/O parallelism. Lance plans the reads in
+/// request-order batches no larger than this, a larger value alone, and reads a
+/// batch when the stream reaches it, so a reader that takes values one at a
+/// time holds one batch of read-ahead.
+pub(crate) const BLOB_READ_IO_BUFFER_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Resource budget for a pending-aware keyed scan that will feed one mutation
 /// table transaction.
@@ -778,6 +780,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         renames: &[(String, String)],
     ) -> Result<StagedHandle>;
 
+    /// Stage the next metadata-only commit of a planned schema evolution, or
+    /// `None` when no step remains; see `TableStore::stage_schema_evolution`.
+    /// Committed through `commit_staged_detached`.
+    async fn stage_schema_evolution(
+        &self,
+        snapshot: &SnapshotHandle,
+        evolution: &mut crate::table_store::SchemaEvolution,
+    ) -> Result<Option<StagedHandle>>;
+
     /// Stage a delete (two-phase, no HEAD advance) of the rows `filter`, a typed
     /// DataFusion expression, selects; `None` when 0 rows match and the table is
     /// not touched (no transaction, no version). See `TableStore::stage_delete`.
@@ -1306,6 +1317,18 @@ impl TableStorage for TableStore {
         TableStore::stage_rename_columns(self, snapshot.dataset(), renames)
             .await
             .map(StagedHandle::new)
+    }
+
+    async fn stage_schema_evolution(
+        &self,
+        snapshot: &SnapshotHandle,
+        evolution: &mut crate::table_store::SchemaEvolution,
+    ) -> Result<Option<StagedHandle>> {
+        Ok(
+            TableStore::stage_schema_evolution(self, snapshot.dataset(), evolution)
+                .await?
+                .map(StagedHandle::new),
+        )
     }
 
     async fn stage_delete(

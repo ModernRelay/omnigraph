@@ -887,7 +887,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Int32 range"));
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds I32 range"),
+            "{message}"
+        );
     }
     assert_eq!(count_rows(&mutation, "node:SignedBoundary").await, 1);
 
@@ -910,7 +914,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("UInt32 range"));
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds U32 range"),
+            "{message}"
+        );
     }
     assert_eq!(count_rows(&mutation, "node:UnsignedBoundary").await, 1);
 
@@ -926,7 +934,11 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
         .mutate("main", NARROWING_MUTATIONS, "put_float", &float_overflow)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("Float32 range"));
+    let message = error.to_string();
+    assert!(
+        message.contains("param 'value':") && message.contains("exceeds F32 range"),
+        "{message}"
+    );
     assert_eq!(count_rows(&mutation, "node:FloatBoundary").await, 1);
 }
 
@@ -1240,6 +1252,133 @@ node Document {
     )
     .await;
     assert_eq!(&later[..], &[0, 1, 2, 3, 255]);
+}
+
+/// Export reads the managed Blob cells of a batch through one batched read per
+/// Blob column, not one read per row, and hands each row its own payload. The
+/// rows load in reverse id order, so an id-ordered chunk requests descending
+/// stable row ids. `thumb` holds a managed cell on `d000` only: one read for
+/// the batch that holds it, none for the others. The four-way fixture above has
+/// too few managed rows per batch to tell the two read shapes apart. The
+/// change-feed baseline shares the walk.
+#[tokio::test]
+async fn export_reads_each_batch_of_managed_blobs_in_one_read_per_column() {
+    use base64::Engine as _;
+    use omnigraph::changes::ChangeFeedScope;
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+
+    const ROWS: u64 = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Document {\n    title: String @key\n    content: Blob?\n    thumb: Blob?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    let encoded = |bytes: &[u8]| {
+        format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    let content = |row: u64| encoded(format!("payload-{row:03}").as_bytes());
+    let thumb = |row: u64| {
+        if row == 0 {
+            serde_json::json!(encoded(b"T"))
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let input = (0..ROWS)
+        .rev()
+        .map(|row| {
+            serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": format!("d{row:03}"),
+                    "content": content(row),
+                    "thumb": thumb(row),
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let ordered = with_merge_write_probes(probes.clone(), db.export_jsonl("main", &[]))
+        .await
+        .unwrap();
+    let rows = ordered
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len() as u64, ROWS);
+    for (row, line) in (0..ROWS).zip(&rows) {
+        assert_eq!(line["id"], format!("d{row:03}"));
+        assert_eq!(line["data"]["content"], content(row), "row {row}");
+        assert_eq!(line["data"]["thumb"], thumb(row), "row {row}");
+    }
+    let chunks = probes.ordered_cursor_hydration_calls();
+    assert!(
+        chunks > 0 && chunks < ROWS,
+        "the walk must hydrate several rows per chunk, got {chunks} chunks"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        chunks + 1,
+        "one `content` read per hydrated chunk and one `thumb` read for the chunk holding d000"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        ROWS + 1,
+        "one payload per managed cell"
+    );
+
+    let probes = MergeWriteProbes::default();
+    let mut unordered = Vec::new();
+    with_merge_write_probes(
+        probes.clone(),
+        db.export_jsonl_unordered_to_writer("main", &[], &mut unordered),
+    )
+    .await
+    .unwrap();
+    let mut unordered = String::from_utf8(unordered)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut expected = ordered.lines().map(str::to_string).collect::<Vec<_>>();
+    unordered.sort();
+    expected.sort();
+    assert_eq!(
+        unordered, expected,
+        "the unordered walk renders the same rows"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        2,
+        "the table's one fragment scans as one batch: one read per Blob column"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), ROWS + 1);
+
+    let probes = MergeWriteProbes::default();
+    let mut baseline = Vec::new();
+    with_merge_write_probes(
+        probes.clone(),
+        db.capture_change_baseline("main", &ChangeFeedScope::default(), &mut baseline),
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8(baseline).unwrap(), ordered);
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        probes.ordered_cursor_hydration_calls() + 1
+    );
+    assert_eq!(probes.blob_payload_read_calls(), ROWS + 1);
 }
 
 /// Export orders each table by id. Sorting complete rows failed with

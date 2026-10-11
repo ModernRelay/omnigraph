@@ -6,13 +6,13 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
     BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
-    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput,
-    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
+    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
-    DiagnosticSeverity, ForceUnlockOutput, PlanOptions, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, force_unlock_config_dir, observe_config_dir, plan_config_dir_with_options,
-    status_config_dir, validate_config_dir,
+    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
+    ValidateOutput, force_unlock_config_dir, observe_config_dir, status_config_dir,
+    validate_config_dir,
 };
 use omnigraph_compiler::query::ast::{
     BranchStmt, BranchWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
@@ -34,7 +34,6 @@ use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -149,7 +148,6 @@ async fn main() -> Result<()> {
         .display_location_section(false)
         .install()?;
     let (cli, machine) = {
-        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -158,7 +156,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches_from(raw_args);
+            .get_matches();
         let mut command_matches = &matches;
         while let Some((_, child)) = command_matches.subcommand() {
             command_matches = child;
@@ -183,7 +181,7 @@ async fn main() -> Result<()> {
             None
         };
         let cli = Cli::from_arg_matches(&matches)?;
-        if let Err(error) = validate_core_root_arguments(&cli, command_matches) {
+        if let Err(error) = validate_cluster_arguments(&cli, command_matches) {
             error.exit();
         }
         (cli, machine)
@@ -196,6 +194,13 @@ async fn main() -> Result<()> {
     };
     match result {
         Err(error) => {
+            if error
+                .downcast_ref::<cluster_remote::WaitTimeout>()
+                .is_some()
+            {
+                std::io::stdout().flush()?;
+                std::process::exit(5);
+            }
             if let Some(evidence) = evidence {
                 let failure = command_outcome::Failure::classify(error, evidence);
                 match machine {
@@ -251,25 +256,110 @@ async fn main() -> Result<()> {
 
 /// Cross-level argument relations must be checked after Clap propagates global
 /// values: subcommand validation cannot see `--cluster` given before `cluster`.
-fn validate_core_root_arguments(
+fn validate_cluster_arguments(
     cli: &Cli,
     command_matches: &clap::ArgMatches,
 ) -> std::result::Result<(), clap::Error> {
-    let Command::Cluster { command } = &cli.command else {
+    let Command::Cluster { managed, command } = &cli.command else {
         return Ok(());
     };
-    if cli.cluster.is_some()
+    let conflict =
+        |message| Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+    if *managed {
+        match command {
+            ClusterCommand::Validate { .. }
+            | ClusterCommand::Observe { .. }
+            | ClusterCommand::ForceUnlock { .. }
+            | ClusterCommand::UpgradeLedger { .. } => {
+                return Err(conflict("this command cannot be used with --managed"));
+            }
+            ClusterCommand::Apply {
+                deployment_id,
+                writers_stopped,
+                plan,
+                ..
+            } => {
+                if deployment_id.is_some() || *writers_stopped {
+                    return Err(conflict(
+                        "--deployment-id and --writers-stopped cannot be used with --managed",
+                    ));
+                }
+                if plan.is_none() {
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "cluster apply --managed requires --plan <PLAN_ID>",
+                    ));
+                }
+            }
+            ClusterCommand::Status {
+                deployment_id,
+                wait,
+                timeout,
+                ..
+            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+                return Err(conflict(
+                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                ));
+            }
+            _ => {}
+        }
+        // The managed dispatcher rejects competing target selectors before
+        // reading context, preserving its structured scope diagnostics.
+        return Ok(());
+    }
+    match command {
+        ClusterCommand::Create { .. }
+        | ClusterCommand::Push { .. }
+        | ClusterCommand::Delete { .. }
+        | ClusterCommand::UndoDelete { .. }
+        | ClusterCommand::Token { .. }
+        | ClusterCommand::Operation { .. }
+        | ClusterCommand::History { .. }
+        | ClusterCommand::Cancel { .. } => {
+            return Err(conflict("this command requires --managed"));
+        }
+        ClusterCommand::Plan { revision, run, .. }
+            if revision.is_some()
+                || run.no_wait
+                || run.timeout.is_some()
+                || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict(
+                "plan options --rev, --no-wait, --timeout and --idempotency-key require --managed",
+            ));
+        }
+        ClusterCommand::Apply { plan, run, .. }
+            if plan.is_some() || run.idempotency_key.is_some() =>
+        {
+            return Err(conflict("--plan and --idempotency-key require --managed"));
+        }
+        ClusterCommand::Status {
+            run_id: Some(_), ..
+        } => {
+            return Err(conflict(
+                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+            ));
+        }
+        _ => {}
+    }
+    if cli.server.is_none()
         && matches!(
             command,
             ClusterCommand::Apply {
-                schema_correction: Some(_),
+                run: ClusterRunArgs { no_wait: true, .. },
                 ..
-            }
+            } | ClusterCommand::Apply {
+                run: ClusterRunArgs {
+                    timeout: Some(_),
+                    ..
+                },
+                ..
+            } | ClusterCommand::Status { wait: true, .. }
         )
     {
         return Err(Cli::command().error(
             clap::error::ErrorKind::ArgumentConflict,
-            "--schema-correction requires config-addressed apply; root reconciliation uses only the original captured input",
+            "deployment wait options require --server <SERVER>",
         ));
     }
     if cli.cluster.is_some()
@@ -302,7 +392,7 @@ fn validate_core_root_arguments(
     {
         return Err(Cli::command().error(
             clap::error::ErrorKind::MissingRequiredArgument,
-            "this Core deployment operation requires --cluster <ROOT>",
+            "this deployment operation requires --cluster <ROOT>",
         ));
     }
     Ok(())
@@ -608,44 +698,6 @@ async fn run(cli: Cli) -> Result<()> {
                 print_json(&payload)?;
             } else {
                 print_load_human(&payload);
-            }
-        }
-        Command::Ingest {
-            uri,
-            data,
-            branch,
-            from,
-            mode,
-            settings,
-            json,
-        } => {
-            let settings = client::parse_set_flags(&settings)?;
-            // stderr so `--json` consumers reading stdout are unaffected.
-            eprintln!(
-                "warning: `omnigraph ingest` is a deprecated loader command; \
-                 use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
-                 (ingest retains its permissive parser and defaults: --from main --mode merge; output uses current canonical vocabulary)"
-            );
-            let client = client::GraphClient::resolve_with_policy(
-                capability,
-                cli.server.as_deref(),
-                cli.graph.as_deref(),
-                uri,
-                cli.as_actor.as_deref(),
-                cli.profile.as_deref(),
-                cli.store.as_deref(),
-            )
-            .await?;
-            let branch = resolve_branch(branch, None, "main");
-            let from = resolve_branch(from, None, "main");
-            echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
-            let payload = client
-                .ingest(&branch, &from, &data.to_string_lossy(), mode, &settings)
-                .await?;
-            if json {
-                print_json(&payload)?;
-            } else {
-                print_ingest_human(&payload);
             }
         }
         Command::Branch { command } => match command {
@@ -1124,9 +1176,8 @@ async fn run(cli: Cli) -> Result<()> {
                 // RFC-011 Decision 10: a graph managed by a cluster evolves via
                 // `cluster apply` (deployment ledger), not a direct
                 // `schema apply` against its storage root — that would bypass the
-                // ledger. Mirrors `init`'s refusal. Only the embedded path can
-                // address a storage root; a served apply (`--server`) is the
-                // server's concern.
+                // ledger. Mirrors `init`'s refusal. This command addresses
+                // standalone storage only.
                 if !client.is_remote() {
                     if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(client.uri())
                         .await
@@ -1149,9 +1200,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let schema_source = fs::read_to_string(&schema)?;
                 // The embedded (direct-store) arm carries no stored-query
                 // registry — the registry is cluster-owned (RFC-011), so a
-                // direct apply has nothing to validate against. The served arm
-                // runs the server's own catalog check. So the validator is a
-                // no-op here on both arms.
+                // standalone apply has nothing to validate against.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
                     .apply_schema(&schema_source, |_catalog| Ok(()))
@@ -1249,7 +1298,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Export {
             uri,
             branch,
-            jsonl,
             type_names,
         } => {
             let client = client::GraphClient::resolve(
@@ -1262,9 +1310,6 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             let branch = resolve_branch(branch, None, "main");
-            if jsonl {
-                eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
-            }
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
@@ -1751,12 +1796,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Repair {
-            uri,
-            confirm,
-            force,
-            json,
-        } => {
+        Command::Repair { uri, json } => {
             let uri = resolve_maintenance_uri(
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -1769,30 +1809,15 @@ async fn run(cli: Cli) -> Result<()> {
             echo_write_target(cli.quiet, "repair", &uri, false);
             crate::admission::ensure_graph(&uri).await?;
             let db = Omnigraph::open(&uri).await?;
-            let stats = db
-                .repair(omnigraph::db::RepairOptions { confirm, force })
-                .await?;
+            let stats = db.repair(omnigraph::db::RepairOptions::default()).await?;
             let refused_count = stats
                 .datasets
                 .iter()
                 .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
                 .count();
-            let blocked_count = stats
-                .datasets
-                .iter()
-                .filter(|s| {
-                    matches!(s.action, omnigraph::db::RepairAction::Refused)
-                        && matches!(
-                            s.classification,
-                            omnigraph::db::RepairClassification::BlockedPromotion
-                        )
-                })
-                .count();
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
-                    "confirm": confirm,
-                    "force": force,
                     "graph_manifest_version": stats.graph_manifest_version,
                     "datasets": stats.datasets.iter().map(|s| serde_json::json!({
                         "type_key": s.type_key,
@@ -1806,13 +1831,7 @@ async fn run(cli: Cli) -> Result<()> {
                 });
                 print_json(&value)?;
             } else {
-                let mode = if confirm { "confirm" } else { "preview" };
-                println!(
-                    "repair {} — {} mode, {} datasets",
-                    uri,
-                    mode,
-                    stats.datasets.len()
-                );
+                println!("repair {} — {} datasets", uri, stats.datasets.len());
                 for s in &stats.datasets {
                     let drift = if s.published_dataset_version == s.lance_head_version {
                         format!("{}", s.published_dataset_version)
@@ -1839,34 +1858,11 @@ async fn run(cli: Cli) -> Result<()> {
                         err
                     );
                 }
-                if !confirm {
-                    println!("rerun with --confirm to publish verified maintenance drift");
-                }
             }
-            let drift_refused = refused_count - blocked_count;
-            if blocked_count > 0 && drift_refused == 0 {
+            if refused_count > 0 {
                 bail!(
-                    "repair reports {} blocked promotion(s), one per table and branch; nothing resolves a \
-                     blocked pin yet and --force --confirm refuses the same way; reads, mutations \
-                     and loads on those tables continue",
-                    blocked_count
-                );
-            }
-            if drift_refused > 0 {
-                let blocked_note = if blocked_count > 0 {
-                    format!(
-                        "; {} more blocked promotion(s), which --force does not resolve",
-                        blocked_count
-                    )
-                } else {
-                    String::new()
-                };
-                bail!(
-                    "repair refused {} suspicious or unverifiable dataset(s); review the preview \
-                     output and rerun with --force --confirm only if publishing that drift is \
-                     intentional{}",
-                    drift_refused,
-                    blocked_note
+                    "repair could not diagnose {} dataset(s); inspect the reported errors",
+                    refused_count
                 );
             }
         }
@@ -1971,13 +1967,12 @@ async fn run(cli: Cli) -> Result<()> {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;
             }
-            ClusterCommand::Plan {
-                config,
-                json,
-                observe,
-                ..
-            } => {
-                let output = plan_config_dir_with_options(config, PlanOptions { observe }).await;
+            ClusterCommand::Plan { config, json, .. } => {
+                let output = omnigraph_cluster::plan_config_dir_as(
+                    config,
+                    resolve_cluster_actor(cli.as_actor.as_deref())?,
+                )
+                .await;
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Observe { config, json } => {
@@ -1988,7 +1983,6 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
                 deployment_id,
-                schema_correction,
                 writers_stopped,
                 ..
             } => {
@@ -2006,12 +2000,8 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     finish_core_deployment(result, json)?;
                 } else {
-                    let corrections = read_schema_corrections(schema_correction.as_deref())?;
                     let result = omnigraph_cluster::apply_deployment(
-                        &config,
-                        deployment_id.as_deref(),
-                        &caller,
-                        &corrections,
+                        &config, deployment_id.as_deref(), &caller,
                         |id, root, lock| {
                             let root = omnigraph::storage::redacted_storage_uri(root);
                             eprintln!(
@@ -2045,23 +2035,9 @@ async fn run(cli: Cli) -> Result<()> {
                 config,
                 json,
                 deployment_id,
-                run_id,
-                operation,
-                api,
-                wait,
-                timeout,
+                ..
             } => {
                 if let Some(root) = cli.cluster.as_deref() {
-                    if run_id.is_some()
-                        || operation.is_some()
-                        || api.is_some()
-                        || wait
-                        || timeout.is_some()
-                    {
-                        bail!(
-                            "root-addressed Core status does not accept managed run/operation flags"
-                        );
-                    }
                     let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
                     let status = core_deployment_result(
                         omnigraph_cluster::deployment_status(
@@ -2094,14 +2070,15 @@ async fn run(cli: Cli) -> Result<()> {
                     finish_cluster_force_unlock(&output, json)?;
                 }
             }
-            ClusterCommand::History { .. }
-            | ClusterCommand::Cancel { .. }
-            | ClusterCommand::Token { .. }
-            | ClusterCommand::Create { .. }
+            ClusterCommand::Create { .. }
+            | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
-            | ClusterCommand::Push { .. } => {
-                unreachable!("managed dispatch refuses managed-only verbs without context")
+            | ClusterCommand::Token { .. }
+            | ClusterCommand::Operation { .. }
+            | ClusterCommand::History { .. }
+            | ClusterCommand::Cancel { .. } => {
+                unreachable!("managed cluster commands dispatch first")
             }
         },
         Command::Graphs { command } => match command {

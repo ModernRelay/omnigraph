@@ -37,7 +37,10 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Instant;
 
-use crate::record::{RunRecordV1, canonical_record_bytes, parse_canonical_record};
+use crate::gqt_record::{
+    AnyRunRecordV1, AuthorityRecord, canonical_bytes as canonical_record_bytes,
+    parse as parse_canonical_record,
+};
 
 /// Version of the archive pointer and receipt contract.
 pub const ARCHIVE_FORMAT_VERSION: u32 = 1;
@@ -140,7 +143,7 @@ pub struct ArchiveReceiptV1 {
 /// pointer. Unreachable content objects are deliberately not records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchivedRecord {
-    pub record: RunRecordV1,
+    pub record: AnyRunRecordV1,
     pub receipt: ArchiveReceiptV1,
 }
 
@@ -1592,9 +1595,9 @@ pub fn preflight_archive_publication(archive_root: &Path) -> Result<(), ArchiveE
 ///
 /// Re-publishing byte-identical content for the same invocation is
 /// idempotent. Reusing an invocation id for different bytes fails closed.
-pub fn publish_record(
+pub fn publish_record<R: AuthorityRecord>(
     archive_root: &Path,
-    record: &RunRecordV1,
+    record: &R,
 ) -> Result<ArchiveReceiptV1, ArchiveError> {
     let bytes = canonical_record_bytes(record).map_err(|error| {
         ArchiveError::new(
@@ -1619,7 +1622,7 @@ pub fn publish_record(
     }
     let record_sha256 = sha256_bytes(&bytes);
     require_sha256(&record_sha256, "record digest")?;
-    let invocation_id = &record.invocation.invocation_id;
+    let invocation_id = &record.invocation().invocation_id;
     let object_relative_path = object_relative_path(&record_sha256);
     let pointer_relative_path = pointer_relative_path(invocation_id)?;
 
@@ -2143,13 +2146,14 @@ fn load_invocation(
             ),
         ));
     }
-    if record.invocation.invocation_id != pointer.invocation_id {
+    if record.invocation().invocation_id != pointer.invocation_id {
         return Err(ArchiveError::new(
             "archive_invocation_mismatch",
             Some(&object_path),
             format!(
                 "pointer claims invocation {}, record contains {}",
-                pointer.invocation_id, record.invocation.invocation_id
+                pointer.invocation_id,
+                record.invocation().invocation_id
             ),
         ));
     }
@@ -3327,7 +3331,7 @@ mod tests {
 
         let loaded = load_archive(archive.path()).unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].record, record);
+        assert_eq!(loaded[0].record, AnyRunRecordV1::Legacy(record.clone()));
         assert_eq!(loaded[0].receipt.record_sha256, first.record_sha256);
         assert!(!loaded[0].receipt.newly_published);
 
@@ -3374,7 +3378,10 @@ mod tests {
         let record = crate::record::tests::valid_record_fixture();
         let receipt = publish_record(&archive, &record).unwrap();
 
-        assert_eq!(load_archive(&archive).unwrap()[0].record, record);
+        assert_eq!(
+            load_archive(&archive).unwrap()[0].record,
+            AnyRunRecordV1::Legacy(record.clone())
+        );
         assert!(archive.join(receipt.object_relative_path).is_file());
         assert!(archive.join(receipt.pointer_relative_path).is_file());
         assert_eq!(iter_archive(&replacement).unwrap().remaining(), 0);
@@ -3483,7 +3490,7 @@ mod tests {
         let bytes = canonical_record_bytes(&record).unwrap();
         let digest = sha256_bytes(&bytes);
         let object_relative = object_relative_path(&digest);
-        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_relative = pointer_relative_path(&record.invocation().invocation_id).unwrap();
 
         let original_inode = {
             let lock = acquire_archive_lock(
@@ -3599,7 +3606,10 @@ mod tests {
 
         assert!(receipt.newly_published);
         assert_eq!(remaining_pointer_directory_sync_failures(), 0);
-        assert_eq!(load_archive(archive.path()).unwrap()[0].record, record);
+        assert_eq!(
+            load_archive(archive.path()).unwrap()[0].record,
+            AnyRunRecordV1::Legacy(record.clone())
+        );
     }
 
     #[cfg(unix)]
@@ -3640,7 +3650,7 @@ mod tests {
         let archive = holder.path().join("archive");
         fs::create_dir(&archive).unwrap();
         let record = crate::record::tests::valid_record_fixture();
-        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_relative = pointer_relative_path(&record.invocation().invocation_id).unwrap();
         let pointer_path = archive.join(&pointer_relative);
         let pointer_parent = pointer_path.parent().unwrap().to_path_buf();
         let pointer_name = pointer_path.file_name().unwrap().to_owned();
@@ -3679,7 +3689,7 @@ mod tests {
         let archive = holder.path().join("archive");
         fs::create_dir(&archive).unwrap();
         let record = crate::record::tests::valid_record_fixture();
-        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_relative = pointer_relative_path(&record.invocation().invocation_id).unwrap();
         let pointer_path = archive.join(&pointer_relative);
         let shard_path = pointer_path.parent().unwrap().to_path_buf();
         let shard_name = shard_path.file_name().unwrap().to_owned();
@@ -3707,7 +3717,10 @@ mod tests {
             fs::metadata(&displaced_invocation_root).unwrap().ino(),
             "the pointer shard must remain reachable through a newly installed ancestor"
         );
-        assert_eq!(load_archive(&archive).unwrap()[0].record, record);
+        assert_eq!(
+            load_archive(&archive).unwrap()[0].record,
+            AnyRunRecordV1::Legacy(record.clone())
+        );
     }
 
     #[cfg(unix)]
@@ -3718,12 +3731,12 @@ mod tests {
         let archive = tempfile::tempdir().unwrap();
         let record = crate::record::tests::valid_record_fixture();
         let record_sha256 = sha256_bytes(&canonical_record_bytes(&record).unwrap());
-        let pointer_relative = pointer_relative_path(&record.invocation.invocation_id).unwrap();
+        let pointer_relative = pointer_relative_path(&record.invocation().invocation_id).unwrap();
         let pointer_path = archive.path().join(&pointer_relative);
         let displaced_pointer = archive.path().join("displaced-pointer");
         let expected_pointer = serde_json::to_vec(&InvocationPointerV1 {
             archive_format_version: ARCHIVE_FORMAT_VERSION,
-            invocation_id: record.invocation.invocation_id.clone(),
+            invocation_id: record.invocation().invocation_id.clone(),
             record_sha256: record_sha256.clone(),
             object_relative_path: object_relative_path(&record_sha256),
         })
@@ -3764,7 +3777,7 @@ mod tests {
         assert_eq!(error.code, "archive_pointer_publication_unknown");
         let possible = error.possibly_published.as_ref().unwrap();
         assert_eq!(possible.archive_format_version, ARCHIVE_FORMAT_VERSION);
-        assert_eq!(possible.invocation_id, record.invocation.invocation_id);
+        assert_eq!(possible.invocation_id, record.invocation().invocation_id);
         assert_eq!(possible.record_sha256, expected_digest);
         assert_eq!(
             possible.object_relative_path,
@@ -3772,7 +3785,7 @@ mod tests {
         );
         assert_eq!(
             possible.pointer_relative_path,
-            pointer_relative_path(&record.invocation.invocation_id).unwrap()
+            pointer_relative_path(&record.invocation().invocation_id).unwrap()
         );
         assert!(
             archive
@@ -3784,7 +3797,7 @@ mod tests {
         let serialized = serde_json::to_value(&error).unwrap();
         assert_eq!(
             serialized["possibly_published"]["invocation_id"],
-            record.invocation.invocation_id
+            record.invocation().invocation_id
         );
         assert_eq!(
             remaining_pointer_directory_sync_failures(),
@@ -3801,7 +3814,10 @@ mod tests {
             possible.as_ref()
         );
         assert_eq!(remaining_pointer_directory_sync_failures(), 0);
-        assert_eq!(load_archive(archive.path()).unwrap()[0].record, record);
+        assert_eq!(
+            load_archive(archive.path()).unwrap()[0].record,
+            AnyRunRecordV1::Legacy(record.clone())
+        );
 
         inject_pointer_directory_sync_failures(std::iter::repeat_n(
             nix::libc::EINTR,
@@ -3841,7 +3857,7 @@ mod tests {
         );
 
         let conflicting = ArchivePublicationUnknownV1::new(
-            record.invocation.invocation_id.clone(),
+            record.invocation().invocation_id.clone(),
             "b".repeat(64),
         )
         .unwrap();
@@ -3961,12 +3977,18 @@ mod tests {
         let anchored = load_invocation(&inventory.anchored_root, invocation_id)
             .unwrap()
             .0;
-        assert_eq!(anchored.record, original);
-        assert_ne!(anchored.record, forged_external_root);
+        assert_eq!(anchored.record, AnyRunRecordV1::Legacy(original.clone()));
+        assert_ne!(
+            anchored.record,
+            AnyRunRecordV1::Legacy(forged_external_root)
+        );
 
         fs::rename(&archive, &replacement).unwrap();
         fs::rename(&displaced, &archive).unwrap();
-        assert_eq!(inventory.next().unwrap().unwrap().record, original);
+        assert_eq!(
+            inventory.next().unwrap().unwrap().record,
+            AnyRunRecordV1::Legacy(original)
+        );
     }
 
     #[cfg(unix)]
@@ -4144,7 +4166,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .record
-                .invocation
+                .invocation()
                 .invocation_id,
             first.invocation.invocation_id
         );
@@ -4155,7 +4177,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .record
-                .invocation
+                .invocation()
                 .invocation_id,
             second.invocation.invocation_id
         );
@@ -4164,7 +4186,7 @@ mod tests {
         assert_eq!(
             second_pass
                 .by_ref()
-                .map(|result| result.unwrap().record.invocation.invocation_id)
+                .map(|result| result.unwrap().record.invocation().invocation_id.clone())
                 .collect::<Vec<_>>(),
             vec![
                 first.invocation.invocation_id,

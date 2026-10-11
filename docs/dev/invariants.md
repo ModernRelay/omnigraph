@@ -83,6 +83,18 @@ five more changes like this one?**
    mutations, polymorphism, policy predicates, and future planner capabilities
    belong in AST, IR, and typed plan structures. Do not smuggle semantics
    through strings, transport flags, global state, or side tables.
+   Expressions and parameter declarations retain the compiler's type.
+   Numeric comparison conversions are explicit Cast nodes; execution and scan
+   pushdown never select a domain from values. The internal exact integer
+   carrier cannot appear in a declared property, parameter or public result.
+   Mutation statements retain the compiler-selected node or edge target;
+   execution does not choose again when both namespaces contain the same name.
+   Binding validates every declared parameter, including unused declarations;
+   replay validates used values against the retained leaves. Projection fields
+   come from those declarations, including empty results. Opened Lance fields
+   must match the accepted storage schema in type and nullability. Derived
+   operator fields may widen nullable flags, but values may not violate a
+   declared non-null constraint.
 
 10. **Trust is established at the boundary and enforced at the engine.** HTTP
     resolves bearer tokens to actors; a client never supplies its trusted actor
@@ -142,11 +154,17 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 ## Current support boundaries
 
 - The server is cluster-only and ledger v2 is the sole operational protocol.
-  Server-owned apply activates schemas, stored queries and new graphs under the
-  existing writer admission; existing engines and runtime bindings stay owned.
+  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
+  under existing writer admission.
+  Runtime views share engine authority and retain immutable request bindings.
   Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
-  conversion is explicit and preserves data; no v1 executor remains. Graph
-  deletion and replacement of existing runtime bindings are outside this class.
+  conversion is explicit and preserves data; no v1 executor remains. Removing
+  a graph declaration authorizes deletion of its exact managed root and all
+  retained history, after affected admission closes and admitted work drains.
+  The existing ledger records deletion intent before effects and owns resumption
+  through verified root absence. Adoption and missing-root recreation remain
+  unsupported; unexpected roots and schema drift refuse rather than infer
+  identity from matching text.
   One outstanding durable authority owns completion/recovery. Generic drain
   does not prove native-I/O settlement or authorize lock release; excluded raw
   and older writers remain an operator obligation.

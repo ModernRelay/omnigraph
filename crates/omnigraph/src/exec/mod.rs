@@ -21,7 +21,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationOpIR, ParamMap};
 use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::query::ast::{Literal, NOW_PARAM_NAME};
-use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query_decl};
+use omnigraph_compiler::query::typecheck::{CheckedQuery, MutationTarget, typecheck_query_decl};
 use omnigraph_compiler::result::MutationResult;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;

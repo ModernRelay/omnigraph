@@ -115,7 +115,7 @@ def closing_keyword(repo: str | None) -> re.Pattern[str]:
 CODE_PATH = re.compile(r"^(?:(?:crates|tools)/(?!.*\.md$)|Cargo\.toml$|Cargo\.lock$)")
 WORKSPACE_MEMBERS = re.compile(r"^members\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
 # A corpus case's `# issue: N` header line, spelled exactly as the harness
-# accepts it (`crates/omnigraph-gqt/src/lib.rs`, `parse_header`).
+# accepts it (`crates/omnigraph-gqt-core/src/lib.rs`, `parse_header`).
 CASE_ISSUE_HEADER = re.compile(r"^# issue: ([1-9]\d*)$")
 CASE_ISSUE_STEM = re.compile(r"^issue[_-]?0*(\d+)[_-]?", re.IGNORECASE)
 # A Rust file under a crate's `tests/<dir>/`: a helper or fixture module,

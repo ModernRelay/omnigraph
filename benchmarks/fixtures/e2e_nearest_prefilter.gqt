@@ -1,0 +1,95 @@
+# issue: none
+# notes: 64 docs: 61 closer ineligible decoys and three eligible vectors at squared L2 distances 5, 8 and 13. The exact winners cannot come from post-filtering global top three.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key status: String embedding: Vector(4) @index }
+
+--- seed
+{"type":"Doc","data":{"slug":"miss000","status":"miss","embedding":[1.0,0.0,0.01,0.0]}}
+{"type":"Doc","data":{"slug":"miss001","status":"miss","embedding":[1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"miss002","status":"miss","embedding":[1.0,0.0,0.03,0.0]}}
+{"type":"Doc","data":{"slug":"miss003","status":"miss","embedding":[1.0,0.0,0.04,0.0]}}
+{"type":"Doc","data":{"slug":"miss004","status":"miss","embedding":[1.0,0.0,0.05,0.0]}}
+{"type":"Doc","data":{"slug":"miss005","status":"miss","embedding":[1.0,0.0,0.06,0.0]}}
+{"type":"Doc","data":{"slug":"miss006","status":"miss","embedding":[1.0,0.0,0.07,0.0]}}
+{"type":"Doc","data":{"slug":"miss007","status":"miss","embedding":[1.0,0.0,0.08,0.0]}}
+{"type":"Doc","data":{"slug":"miss008","status":"miss","embedding":[1.0,0.0,0.09,0.0]}}
+{"type":"Doc","data":{"slug":"miss009","status":"miss","embedding":[1.0,0.0,0.1,0.0]}}
+{"type":"Doc","data":{"slug":"miss010","status":"miss","embedding":[1.0,0.0,0.11,0.0]}}
+{"type":"Doc","data":{"slug":"miss011","status":"miss","embedding":[1.0,0.0,0.12,0.0]}}
+{"type":"Doc","data":{"slug":"miss012","status":"miss","embedding":[1.0,0.0,0.13,0.0]}}
+{"type":"Doc","data":{"slug":"miss013","status":"miss","embedding":[1.0,0.0,0.14,0.0]}}
+{"type":"Doc","data":{"slug":"miss014","status":"miss","embedding":[1.0,0.0,0.15,0.0]}}
+{"type":"Doc","data":{"slug":"miss015","status":"miss","embedding":[1.0,0.0,0.16,0.0]}}
+{"type":"Doc","data":{"slug":"miss016","status":"miss","embedding":[1.0,0.0,0.17,0.0]}}
+{"type":"Doc","data":{"slug":"miss017","status":"miss","embedding":[1.0,0.0,0.18,0.0]}}
+{"type":"Doc","data":{"slug":"miss018","status":"miss","embedding":[1.0,0.0,0.19,0.0]}}
+{"type":"Doc","data":{"slug":"miss019","status":"miss","embedding":[1.0,0.0,0.2,0.0]}}
+{"type":"Doc","data":{"slug":"miss020","status":"miss","embedding":[1.0,0.0,0.21,0.0]}}
+{"type":"Doc","data":{"slug":"miss021","status":"miss","embedding":[1.0,0.0,0.22,0.0]}}
+{"type":"Doc","data":{"slug":"miss022","status":"miss","embedding":[1.0,0.0,0.23,0.0]}}
+{"type":"Doc","data":{"slug":"miss023","status":"miss","embedding":[1.0,0.0,0.24,0.0]}}
+{"type":"Doc","data":{"slug":"miss024","status":"miss","embedding":[1.0,0.0,0.25,0.0]}}
+{"type":"Doc","data":{"slug":"miss025","status":"miss","embedding":[1.0,0.0,0.26,0.0]}}
+{"type":"Doc","data":{"slug":"miss026","status":"miss","embedding":[1.0,0.0,0.27,0.0]}}
+{"type":"Doc","data":{"slug":"miss027","status":"miss","embedding":[1.0,0.0,0.28,0.0]}}
+{"type":"Doc","data":{"slug":"miss028","status":"miss","embedding":[1.0,0.0,0.29,0.0]}}
+{"type":"Doc","data":{"slug":"miss029","status":"miss","embedding":[1.0,0.0,0.3,0.0]}}
+{"type":"Doc","data":{"slug":"miss030","status":"miss","embedding":[1.0,0.0,0.31,0.0]}}
+{"type":"Doc","data":{"slug":"miss031","status":"miss","embedding":[1.0,0.0,0.32,0.0]}}
+{"type":"Doc","data":{"slug":"miss032","status":"miss","embedding":[1.0,0.0,0.33,0.0]}}
+{"type":"Doc","data":{"slug":"miss033","status":"miss","embedding":[1.0,0.0,0.34,0.0]}}
+{"type":"Doc","data":{"slug":"miss034","status":"miss","embedding":[1.0,0.0,0.35,0.0]}}
+{"type":"Doc","data":{"slug":"miss035","status":"miss","embedding":[1.0,0.0,0.36,0.0]}}
+{"type":"Doc","data":{"slug":"miss036","status":"miss","embedding":[1.0,0.0,0.37,0.0]}}
+{"type":"Doc","data":{"slug":"miss037","status":"miss","embedding":[1.0,0.0,0.38,0.0]}}
+{"type":"Doc","data":{"slug":"miss038","status":"miss","embedding":[1.0,0.0,0.39,0.0]}}
+{"type":"Doc","data":{"slug":"miss039","status":"miss","embedding":[1.0,0.0,0.4,0.0]}}
+{"type":"Doc","data":{"slug":"miss040","status":"miss","embedding":[1.0,0.0,0.41,0.0]}}
+{"type":"Doc","data":{"slug":"miss041","status":"miss","embedding":[1.0,0.0,0.42,0.0]}}
+{"type":"Doc","data":{"slug":"miss042","status":"miss","embedding":[1.0,0.0,0.43,0.0]}}
+{"type":"Doc","data":{"slug":"miss043","status":"miss","embedding":[1.0,0.0,0.44,0.0]}}
+{"type":"Doc","data":{"slug":"miss044","status":"miss","embedding":[1.0,0.0,0.45,0.0]}}
+{"type":"Doc","data":{"slug":"miss045","status":"miss","embedding":[1.0,0.0,0.46,0.0]}}
+{"type":"Doc","data":{"slug":"miss046","status":"miss","embedding":[1.0,0.0,0.47,0.0]}}
+{"type":"Doc","data":{"slug":"miss047","status":"miss","embedding":[1.0,0.0,0.48,0.0]}}
+{"type":"Doc","data":{"slug":"miss048","status":"miss","embedding":[1.0,0.0,0.49,0.0]}}
+{"type":"Doc","data":{"slug":"miss049","status":"miss","embedding":[1.0,0.0,0.5,0.0]}}
+{"type":"Doc","data":{"slug":"miss050","status":"miss","embedding":[1.0,0.0,0.51,0.0]}}
+{"type":"Doc","data":{"slug":"miss051","status":"miss","embedding":[1.0,0.0,0.52,0.0]}}
+{"type":"Doc","data":{"slug":"miss052","status":"miss","embedding":[1.0,0.0,0.53,0.0]}}
+{"type":"Doc","data":{"slug":"miss053","status":"miss","embedding":[1.0,0.0,0.54,0.0]}}
+{"type":"Doc","data":{"slug":"miss054","status":"miss","embedding":[1.0,0.0,0.55,0.0]}}
+{"type":"Doc","data":{"slug":"miss055","status":"miss","embedding":[1.0,0.0,0.56,0.0]}}
+{"type":"Doc","data":{"slug":"miss056","status":"miss","embedding":[1.0,0.0,0.57,0.0]}}
+{"type":"Doc","data":{"slug":"miss057","status":"miss","embedding":[1.0,0.0,0.58,0.0]}}
+{"type":"Doc","data":{"slug":"miss058","status":"miss","embedding":[1.0,0.0,0.59,0.0]}}
+{"type":"Doc","data":{"slug":"miss059","status":"miss","embedding":[1.0,0.0,0.6,0.0]}}
+{"type":"Doc","data":{"slug":"miss060","status":"miss","embedding":[1.0,0.0,0.61,0.0]}}
+{"type":"Doc","data":{"slug":"hit001","status":"hit","embedding":[-1.0,1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit002","status":"hit","embedding":[-1.0,2.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit003","status":"hit","embedding":[-1.0,3.0,0.0,0.0]}}
+
+--- query
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+--- params
+{"q":[1.0,0.0,0.0,0.0]}
+
+--- expect ordered
+{"d.slug":"hit001"}
+{"d.slug":"hit002"}
+{"d.slug":"hit003"}
+--- expect shape
+d.slug: String
+

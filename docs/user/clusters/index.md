@@ -1,8 +1,9 @@
 # Operating a cluster
 
 An OmniGraph cluster is a declarative bundle of graphs, schemas, stored queries
-and authorization policies. Apply can create graphs and update schemas and
-queries. Submit to the running server to activate those changes without a restart.
+and authorization policies. Apply converges graph inventory, schemas, queries,
+policies and provider/Blob settings. Submit to the running server to activate
+changes without a restart.
 
 Use a cluster for a multi-graph server or shared operational configuration. For
 one local graph, the [quickstart](../quickstart.md) is simpler.
@@ -41,8 +42,12 @@ of the deployment ledger version. The [configuration reference](config.md)
 covers storage roots, embedding providers, external Blob policy and limits.
 
 For server-owned deployment, the applied policy must grant the operator
-`config_manage` at cluster scope, `read` on disclosed graphs, and `schema_apply`
-on graphs whose schema changes. New graphs need suitable declared policies too.
+`config_manage` at cluster scope. Schema changes and graph deletions additionally
+require `read` and `schema_apply` on the affected graphs. Direct deletion also
+enforces an installed graph policy and requires an authorized `--as` actor.
+Deployment status reveals management
+metadata under `config_manage`; it does not require data access on unrelated
+graphs. New graphs need suitable declared policies too.
 The server derives the actor from its bearer token; `--as` is for direct access.
 
 ## Bootstrap a cluster
@@ -88,26 +93,67 @@ canonical root. An explicit absolute `storage` must match that root; relative
 storage paths refuse. The CLI reads only local source files and needs no local
 mount or storage credentials for the server’s root.
 
+Preview the same local configuration through the server before applying:
+
+```bash
+omnigraph cluster plan --server production --config . --json
+omnigraph cluster apply --server production --config . --timeout 1800 --json
+```
+
+The served plan lists resource changes and schema migrations, including the exact
+managed root and history that a graph removal deletes. It writes nothing and keeps
+serving admission open. Its ledger CAS and input digest identify an observation;
+apply rechecks current authority and physical execution eligibility.
+
 The CLI prints the deployment ID before submission. The server keeps its PID,
-listener and writer ownership. It briefly closes admission on affected graphs,
+listener and writer ownership. It closes admission on affected graphs,
 finishes their admitted requests, publishes schema changes, and activates
-matching schemas and stored queries together. Unaffected graphs keep serving.
-Graph additions become available through the same deployment.
+matching schemas, queries and runtime permissions together. Unaffected graphs
+keep serving.
+Graph additions and removals use the same deployment; see
+[deletion semantics](#deployment-boundaries) before removing a declaration.
 
 The response separates the durable deployment result from `active`, which means
-that result is currently serving in this process. A successful response requires
-both convergence and activation. Each graph publishes atomically; deployment
+that result's affected bindings are installed in this process. An unrelated
+blocked graph does not invalidate that activation. Default apply waits for
+convergence and activation by polling the original ID. `--no-wait` instead returns
+after durable acceptance; drain and preparation may precede that acknowledgment.
+`--timeout SECONDS` bounds caller waiting, including acceptance (default 300,
+maximum 3600). Expiry exits 5 with the original ID and last observation; it does
+not cancel execution or prove failure. Resume observation with:
+
+```bash
+omnigraph cluster status --server production --deployment-id ID --wait --timeout 1800 --json
+```
+
+The exact response contains `deployment`, `active` and `in_progress`. General
+cluster status retains its aggregate `status` object. An authenticated submitter
+can read its own durable receipt even after its deployment removes its management
+permission; general status and later deployments still require current permission.
+Lost submission responses are followed only by original-ID reads, never automatic
+resubmission. While waiting, observation retries transient HTTP 429/503 responses
+and interrupted response bodies within the same budget; malformed receipts fail immediately.
+Expired receipts and unknown outcomes require investigation.
+
+Each graph publishes atomically; deployment
 across multiple graphs is not one transaction. Query-only changes create no graph
 commit and also work with multiple branches. Schema changes remain main-only
 and require a single live branch.
 
-Existing graph roots, format, policy, provider, trust and external-Blob bindings
-stay fixed. New graph bindings are validated with their creation input. A refusal before any
-deployment effect restores the unchanged serving views, including after a drain
-timeout; any old requests remain tracked for a subsequent transition. Removing
-graphs or changing existing runtime bindings is outside this deployment class.
-There is one operational ledger protocol; no legacy import, refresh, approval
-or sweep command runs alongside it.
+Policies, provider definitions and graph bindings, and external-Blob rules can
+change on existing graphs. Current permissions authorize the deployment; proposed
+permissions cannot authorize themselves. Provider changes do not re-embed stored
+vectors. Roots, format and credential/trust configuration stay fixed.
+A refusal before effects restores unchanged serving views, including after a
+drain timeout. That timeout bounds draining admitted requests; once drained,
+the server owns preparation, completion and activation through the existing
+shutdown boundary. There is one deployment protocol and no legacy execution fallback.
+
+Upgrade the CLI, server and cluster tools together. Finish outstanding deployments
+with the build that accepted them before upgrading: captured inputs are exact
+and are not translated into a different request. Use the stopped-ledger upgrade
+command to remove obsolete completed-result runtime fields; graph data and exact
+achieved receipts are preserved. The graph storage format is unchanged.
 
 ## Direct deployments and conversion
 
@@ -116,7 +162,8 @@ the serving owner to have stopped and handed off the lock. Start the server afte
 settlement to activate the applied revision. Direct apply never takes over a live
 server or writes around its lock.
 
-An existing v1 ledger requires explicit conversion before ordinary operation:
+Use explicit stopped-ledger conversion for a v1 ledger or a v2 ledger whose
+completed receipts still contain obsolete runtime activation fields:
 
 ```bash
 omnigraph --cluster file:///srv/company-brain \
@@ -127,7 +174,12 @@ Stop serving, writers and maintenance and establish prior graph/control I/O
 quiescence first. Conversion preserves rows, graph identities, branches, history
 and applied resources. It does not reset graphs, replay old work or convert graph
 storage formats. There is no automatic migration or v1 execution fallback.
-Unsupported formats and unresolved legacy work refuse conversion.
+For v2, conversion removes only those obsolete runtime fields, preserving the
+ledger identity, next deployment sequence and exact achieved receipts. Outstanding
+deployments and unsupported receipt shapes refuse; finish accepted work with
+its originating build before upgrading.
+Normal reads report `ledger_upgrade_required` with the stopped-upgrade command
+for a recognized prior receipt; malformed or unknown state remains an error.
 
 A completed read-only preflight refusal releases a newly acquired direct lock.
 Accepted work, cancellation and uncertain effects retain it for reconciliation.
@@ -144,8 +196,8 @@ OMNIGRAPH_BEARER_TOKEN='secret' omnigraph cluster status \
 ```
 
 Status is read-only. `active` is false for an older result after a newer revision
-activates, and a recorded witness from another server process does not prove
-current activation. Repeating apply with the same ID and identical captured input
+activates. Only the current runtime can prove activation; a durable completion
+receipt alone cannot. Repeating apply with the same ID and identical captured input
 returns its recorded outcome; it never executes again. Different input refuses.
 
 If the server stopped with an outstanding deployment, inspect the storage root:
@@ -165,11 +217,12 @@ omnigraph --cluster file:///srv/company-brain \
 ```
 
 Reconciliation uses captured input and exact publication evidence; it never
-replays an uncertain schema or graph-creation invocation. Work that never
-started is recorded as not attempted. A partial graph birth can be abandoned
-only when its exact unpublished, empty artifacts are proved to belong to that
+replays an uncertain schema or graph-creation invocation. Unstarted schema or
+graph-creation work can be recorded as not attempted. A partial graph birth can
+be abandoned only when its exact unpublished, empty artifacts belong to that
 attempt. A foreign or committed graph is never reset. Unknown outcomes stay
-outstanding and block new writes.
+outstanding and block new writes. A later creation may reuse an empty local
+directory tree left by that cleanup; files, symlinks and cloud markers still refuse.
 
 A settled partial result permits a corrective successor from achieved state;
 it does not roll back graphs that committed. Recovery retains a new admission
@@ -177,23 +230,42 @@ lock, so perform ownership transfer before starting another owner. Never
 allocate a new ID to retry an unknown outcome. Result eviction reports acceptance
 and outcome as unknown; it never authorizes replay. See [limits](config.md#limits).
 
-## Correct deliberate schema drift
+## Deployment boundaries
 
-Every deployment compares the achieved schema identity, even when source text
-changes. A recreated graph or out-of-band schema change refuses with
-`applied_schema_drift`. To accept a reviewed observed contract, save the exact
-graph-to-contract JSON map from that refusal and submit:
+`cluster apply` creates graphs, deletes removed graphs, and updates schemas,
+stored queries, policies, providers and Blob rules. Removing a graph declaration
+and applying is destructive: it deletes that graph's managed storage, including
+all branches, retained history and managed Blob bytes. Review the deletion in
+`cluster plan` and keep any required backup before applying. There is no separate
+delete flag or unregister mode. External Blob source objects are not deleted.
+On object stores, deletion removes the active namespace; provider version history
+and retention policies may keep older objects. This is not secure erasure.
 
-```bash
-omnigraph cluster apply --config ./company-brain --as act-alice \
-  --schema-correction correction.json --json
-```
+Live apply closes the affected graph to new requests and waits for its admitted
+work and response bodies before deletion. Other graphs continue serving. If
+deletion is interrupted, reconcile the original deployment ID; the recorded
+operation resumes removal of the exact root. Editing the desired configuration
+does not cancel accepted deletion, and absence during recovery does not create a
+replacement graph.
 
-The same option is available with `--server`. It must match the observed source
-hash, accepted IR hash, identity domain and version, and requires schema-apply
-permission. Unknown, stale or unnecessary entries refuse. Correction accepts the
-identified current graph; it does not restore missing data or history. An
-original-ID resubmission must retain the same correction input.
+Importing an existing root, recreating a missing managed graph, accepting schema
+drift and repairing catalog payloads are not apply modes. Restore missing or
+damaged authoritative data from a verified backup before deploying changes to
+that graph.
+
+Every present affected root is checked against its achieved schema identity,
+even when source text changes. Removing an already-absent graph still records a
+completed deletion; it never recreates the root. An out-of-band replacement or schema change refuses with
+`applied_schema_drift`; matching text cannot authorize a different graph identity.
+
+Plan always observes without taking the cluster writer lock. It reports the
+existing owner and runs the same effect-free preparation used by apply, with
+the intended actor. Its migration steps come from that preparation, not a second
+schema-file read. Apply prepares again under writer admission because a preview
+reserves nothing. Unavailable affected graphs, schema drift and migration
+restrictions are errors, except that deletion accepts an already-absent root. An unavailable unrelated graph does not block an
+independent change. Live apply also validates provider secrets and serving
+settings on the server.
 
 ## Operational boundaries
 

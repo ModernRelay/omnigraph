@@ -73,6 +73,9 @@ fn main() {
         }
         emit_git_rerun_paths(repository);
     }
+    if let Some(root) = repository {
+        emit_gqt_engine_digest(root);
+    }
     let source_git_commit = repository
         .and_then(probe_git_commit)
         .unwrap_or_else(|| UNKNOWN.to_string());
@@ -820,4 +823,68 @@ fn emit_reference_rerun_path(reference: &Path, git_dir: &Path) {
         }
         ancestor = path.parent();
     }
+}
+
+fn emit_gqt_engine_digest(root: &Path) {
+    use sha2::{Digest, Sha256};
+    fn collect(path: &Path, files: &mut Vec<PathBuf>) {
+        if path.file_name().is_some_and(|n| {
+            n == "tests" || n == "tests.rs" || n == "gqt_tests.rs" || n == "branch_merge_oracle.rs"
+        }) {
+            return;
+        }
+
+        if path.is_dir() {
+            println!("cargo:rerun-if-changed={}", path.display());
+            let mut children = std::fs::read_dir(path)
+                .expect("read engine digest directory")
+                .map(|e| e.expect("read engine digest entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                collect(&child, files)
+            }
+        } else if path.is_file() {
+            files.push(path.to_path_buf())
+        }
+    }
+    let mut files = Vec::new();
+    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+        let path = root.join(name);
+        if path.exists() {
+            files.push(path)
+        }
+    }
+    if root.join(".cargo").is_dir() {
+        collect(&root.join(".cargo"), &mut files)
+    }
+    for entry in std::fs::read_dir(root.join("crates")).expect("read workspace crates") {
+        let path = entry.expect("read crate entry").path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "omnigraph-gqt" | "omnigraph-dst" | "omnigraph-reference-engine"
+        ) {
+            continue;
+        }
+        for leaf in ["Cargo.toml", "build.rs", "src"] {
+            let input = path.join(leaf);
+            if input.exists() {
+                collect(&input, &mut files)
+            }
+        }
+    }
+    files.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"omnigraph-gqt-engine-inputs-v1\0");
+    for path in files {
+        let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+        let bytes = std::fs::read(&path).expect("read engine digest input");
+        digest.update((relative.len() as u64).to_le_bytes());
+        digest.update(relative.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+        println!("cargo:rerun-if-changed={}", path.display())
+    }
+    println!("cargo:rustc-env=GQT_ENGINE_DIGEST={:x}", digest.finalize());
 }

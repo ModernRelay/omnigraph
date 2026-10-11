@@ -84,7 +84,7 @@ CLI never follows an external URI: `get` refuses it and directs the caller to
 ## HTTP reads
 
 `GET` and `HEAD /graphs/{id}/blob` take `entity`, `type`, `id`, `property`, and
-either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.12` header every
+either `branch` or `snapshot`, plus the `Omnigraph-Http-Api: 0.13` header every
 protected graph route requires (`api_contract_mismatch` without it). Managed
 values support one standard `Range`,
 `ETag`, `If-Match`, and `If-None-Match`. Treat an ETag as an opaque validator of
@@ -105,4 +105,4 @@ Historical identity fails closed: if a rename, drop/re-add, or branch lifetime
 does not prove that a historical property is the same logical Blob property,
 OmniGraph returns an error rather than guessing.
 
-Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/v0.12.0/docs/user/blobs.md).
+Canonical user contract: [Blob values](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/blobs.md).

@@ -28,7 +28,7 @@ pub use omnigraph::{
     SystemColumnUpgradeReport, TableCollectionPlan, UnpublishedManifest,
 };
 pub(crate) use omnigraph::{
-    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph_core::metadata::now_micros;

@@ -37,15 +37,22 @@ impl DataTokens {
     }
 
     pub fn token(&self, grants: Value) -> String {
-        self.signed(Some(grants))
+        self.signed(Some(grants), None)
     }
 
     pub fn identity_token(&self) -> String {
-        self.signed(None)
+        self.signed(None, None)
     }
 
-    fn signed(&self, grants: Option<Value>) -> String {
+    pub fn identity_token_for(&self, subject: &str) -> String {
+        self.signed(None, Some(subject))
+    }
+
+    fn signed(&self, grants: Option<Value>, subject: Option<&str>) -> String {
         let mut claims = self.fixture["claims"].clone();
+        if let Some(subject) = subject {
+            claims["sub"] = json!(subject);
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

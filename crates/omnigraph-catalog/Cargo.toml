@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-catalog"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "The `__manifest` catalog of an omnigraph store: table registrations, graph branch registrations and lineage, and the publish."
 license = "MIT"
@@ -14,10 +14,10 @@ dst = ["omnigraph-core/dst", "omnigraph-storage/dst", "omnigraph-seams/install"]
 test-util = ["omnigraph-core/test-util"]
 
 [dependencies]
-omnigraph-core = { path = "../omnigraph-core", version = "0.12.0" }
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.12.0" }
-omnigraph-seams = { path = "../omnigraph-seams", version = "0.12.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.12.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.13.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.13.0" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.13.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 datafusion = { workspace = true }
@@ -42,7 +42,7 @@ url = { workspace = true }
 object_store = { workspace = true }
 
 [dev-dependencies]
-omnigraph-core = { path = "../omnigraph-core", version = "0.12.0", features = ["test-util"] }
+omnigraph-core = { path = "../omnigraph-core", version = "0.13.0", features = ["test-util"] }
 lance-io = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 tempfile = { workspace = true }

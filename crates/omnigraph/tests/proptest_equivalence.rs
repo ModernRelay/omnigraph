@@ -52,7 +52,7 @@ query related($name: String) {
 query employers($name: String) {
     match {
         $p: Person { name: $name }
-        $p worksAt{1,2} $c
+        $p worksAt $c
     }
     return { $c.name }
 }
@@ -190,8 +190,9 @@ async fn col0_set(db: &Session, name: &str, params: &ParamMap) -> HashSet<String
 // CSR, indexed, and auto paths return identical result multisets — over both a
 // same-type traversal (knows{1,3}, exercises cycles/self-loops), its undirected
 // form (<knows>{1,3} — Direction::Both must agree across arms, incl. dedup of
-// pairs present both ways), and a cross-type one (worksAt{1,2}, collision-prone). This is the search-over-the-class version
-// of the hand-built cross-type-collision fixture.
+// pairs present both ways), and a cross-type one (worksAt, collision-prone; a
+// bound above one hop is refused at type check). This is the search-over-the-class
+// version of the hand-built cross-type-collision fixture.
 #[test]
 fn prop_expand_indexed_eq_csr() {
     let rt = tokio::runtime::Runtime::new().unwrap();

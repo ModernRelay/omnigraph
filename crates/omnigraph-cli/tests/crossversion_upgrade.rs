@@ -31,6 +31,10 @@
 //! graph, fall back to a binary under `target/storage-upgrade-binaries/`; with
 //! `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unresolved predecessor of a
 //! journey fails instead of skipping.
+//! The ignored 0.12.0 cluster-ledger journey is manual release qualification:
+//! storage stays at 14, followed by live deployment without restart.
+//! Explicit invocation requires `OMNIGRAPH_V012_BIN` and
+//! `OMNIGRAPH_V012_SERVER_BIN` from the official release; it never skips.
 
 mod support;
 
@@ -44,6 +48,330 @@ use support::{
     unlock_cluster_fixture,
 };
 use tempfile::tempdir;
+
+/// Explicit release qualification requires both published executables.
+#[cfg(unix)]
+fn v012_binaries() -> (PathBuf, PathBuf) {
+    let binary = |variable| {
+        let path =
+            PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| {
+                panic!("manual cluster upgrade qualification requires {variable}")
+            }));
+        assert!(
+            path.is_file(),
+            "required {variable} is not a binary file: {}",
+            path.display()
+        );
+        path
+    };
+    (
+        binary("OMNIGRAPH_V012_BIN"),
+        binary("OMNIGRAPH_V012_SERVER_BIN"),
+    )
+}
+
+/// Process/transport and genuine predecessor bytes cannot be expressed in GQT.
+/// SIGTERM + successful process exit precedes exact-ID lock release; no graph
+/// storage conversion, receipt fabrication or source rewrite stands in for it.
+#[cfg(unix)]
+#[test]
+#[ignore = "release-binaries: official 0.12 CLI/server; manual release qualification"]
+fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::time::Duration;
+    use support::{
+        cli_at, parse_stdout_json, spawn_server_with_cluster_binary_env,
+        write_cluster_config_fixture,
+    };
+
+    let (old, old_server) = v012_binaries();
+    let current = assert_cmd::cargo::cargo_bin("omnigraph");
+    let current_server = std::env::var_os("CARGO_BIN_EXE_omnigraph-server")
+        .map(PathBuf::from)
+        .or_else(support::built_server_binary)
+        .expect("build the candidate server before the cluster upgrade journey");
+    let version = output_success(cli_at(&old).arg("version"));
+    let version = String::from_utf8(version.stdout).unwrap();
+    assert_eq!(version.lines().next(), Some("omnigraph 0.12.0"));
+    assert!(version.contains("internal-schema 14 (serves v14 to v14)"));
+    let candidate_version = output_success(cli_at(&current).arg("version"));
+    assert!(
+        String::from_utf8(candidate_version.stdout)
+            .unwrap()
+            .contains("internal-schema 14 (serves v14 to v14)")
+    );
+
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    let root_uri = format!("file://{}", root.display());
+    let graph = root.join("graphs/knowledge.omni");
+    let state_path = root.join("__cluster/state.json");
+    write_cluster_config_fixture(root);
+    let config_path = root.join("cluster.yaml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, format!("{}policies:\n  operator:\n    file: ./cluster.policy.yaml\n    applies_to: [cluster]\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n", config.split("policies:").next().unwrap())).unwrap();
+    fs::write(root.join("cluster.policy.yaml"), "version: 1\ngroups:\n  operators: [act-parity]\nrules:\n  - id: manage\n    allow:\n      actors: { group: operators }\n      actions: [config_manage]\n").unwrap();
+    let policy = "version: 1\ngroups:\n  operators: [act-parity]\n  readers: [act-unbound]\nrules:\n  - id: operator\n    allow:\n      actors: { group: operators }\n      actions: [read, change, schema_apply, invoke_query]\n  - id: reader\n    allow:\n      actors: { group: readers }\n      actions: [read]\n";
+    fs::write(root.join("graph.policy.yaml"), policy).unwrap();
+    let unlock = |binary: &Path| {
+        let path = root.join("__cluster/lock.json");
+        let lock: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        output_success(cli_at(binary).args([
+            "--cluster",
+            &root_uri,
+            "cluster",
+            "force-unlock",
+            lock["lock_id"].as_str().unwrap(),
+            "--json",
+        ]));
+        assert!(!root.join("__cluster/lock.json").exists());
+    };
+    let initial = parse_stdout_json(&output_success(
+        cli_at(&old)
+            .args(["cluster", "apply", "--config"])
+            .arg(root)
+            .arg("--json"),
+    ));
+    assert_eq!(initial["status"], "complete", "{initial}");
+    assert_eq!(initial["result"]["restart_required"], true);
+    let original_domain =
+        initial["result"]["graphs"]["knowledge"]["contract"]["schema_identity_domain"].clone();
+    assert!(original_domain.is_string());
+    unlock(&old);
+    output_success(
+        cli_at(&old)
+            .args([
+                "--as",
+                "act-parity",
+                "mutate",
+                "seed",
+                "-e",
+                "query seed() { insert Person { name: \"Alice\", age: 31 } }",
+                "--store",
+            ])
+            .arg(&graph)
+            .arg("--json"),
+    );
+    unlock(&old);
+
+    let server_env = [(
+        "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+        r#"{"act-parity":"parity-tok","act-reader":"reader-token"}"#,
+    )];
+    let predecessor = spawn_server_with_cluster_binary_env(root, &old_server, &server_env);
+    let query = "query people() { match { $p: Person } return { $p.name, $p.age, $p.bio } }";
+    let served = |binary: &Path, base: &str, args: &[&str]| {
+        parse_stdout_json(&output_success(
+            cli_at(binary)
+                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .args(args)
+                .args(["--server", base, "--graph", "knowledge", "--json"]),
+        ))
+    };
+    let apply = |binary: &Path, base: &str| {
+        parse_stdout_json(&output_success(
+            cli_at(binary)
+                .env("OMNIGRAPH_BEARER_TOKEN", "parity-tok")
+                .args(["cluster", "apply", "--server", base, "--config"])
+                .arg(root)
+                .arg("--json"),
+        ))
+    };
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let reader = |base: &str, contract: &str, query: &str| {
+        http.post(format!("{base}/graphs/knowledge/query"))
+            .header(omnigraph_api_types::HTTP_API_CONTRACT_HEADER, contract)
+            .bearer_auth("reader-token")
+            .json(&json!({"query":query}))
+            .send()
+            .unwrap()
+    };
+    let reported_contract = |base: &str| {
+        http.head(format!("{base}/healthz"))
+            .send()
+            .unwrap()
+            .headers()[omnigraph_api_types::HTTP_API_CONTRACT_HEADER]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(reported_contract(&predecessor.base_url), "0.12");
+    fs::write(
+        root.join("people.pg"),
+        "node Person { name: String @key age: I32? bio: String? }\n",
+    )
+    .unwrap();
+    let old_applied = apply(&old, &predecessor.base_url);
+    assert_eq!(old_applied["active"], true, "{old_applied}");
+    assert_eq!(
+        old_applied["deployment"]["result"]["restart_required"],
+        false
+    );
+    assert!(old_applied["deployment"]["result"]["activation"].is_object());
+    let old_snapshot = served(&old, &predecessor.base_url, &["snapshot"]);
+    assert_eq!(old_snapshot["internal_schema_version"], 14);
+    let old_history = served(&old, &predecessor.base_url, &["commit", "list"]);
+    assert_eq!(old_history["commits"].as_array().unwrap().len(), 3);
+    let seeded_commit = old_history["commits"][1]["graph_commit_id"]
+        .as_str()
+        .unwrap();
+    let historical_query = "query people() { match { $p: Person } return { $p.name, $p.age } }";
+    let historical_args = [
+        "query",
+        "people",
+        "-e",
+        historical_query,
+        "--snapshot",
+        seeded_commit,
+    ];
+    let historical_rows = served(&old, &predecessor.base_url, &historical_args)["rows"].clone();
+    assert_eq!(historical_rows, json!([{"p.name":"Alice","p.age":31}]));
+    let old_read = served(
+        &old,
+        &predecessor.base_url,
+        &["query", "people", "-e", query],
+    );
+    assert_eq!(old_read["columns"], json!(["p.name", "p.age", "p.bio"]));
+    let old_rows = old_read["rows"].clone();
+    // JSON object rows omit null cells; the columns still prove the new field.
+    assert_eq!(old_rows, json!([{"p.name":"Alice","p.age":31}]));
+    assert_eq!(reader(&predecessor.base_url, "0.12", query).status(), 403);
+    predecessor.stop_gracefully();
+    unlock(&old);
+
+    let old_bytes = fs::read(&state_path).unwrap();
+    let old_state: Value = serde_json::from_slice(&old_bytes).unwrap();
+    assert_eq!(old_state["version"], 2);
+    assert!(old_state.get("outstanding").is_none());
+    assert_eq!(old_state["deployment_results"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        old_state["applied_revision"]["schema_contracts"]["knowledge"]["schema_identity_domain"],
+        original_domain
+    );
+    // The candidate refuses before opening graph storage or starting a listener.
+    let refusal = output_failure(
+        cli_at(&current_server)
+            .args(["--cluster"])
+            .arg(root)
+            .args(["--bind", "127.0.0.1:0"])
+            .env(server_env[0].0, server_env[0].1)
+            .timeout(Duration::from_secs(10)),
+    );
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("ledger_upgrade_required"));
+    assert_eq!(fs::read(&state_path).unwrap(), old_bytes);
+    assert!(!root.join("__cluster/lock.json").exists());
+    let refused = output_failure(cli_at(&current).args([
+        "--cluster",
+        &root_uri,
+        "cluster",
+        "upgrade-ledger",
+        "--json",
+    ]));
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--writers-stopped"));
+    assert_eq!(fs::read(&state_path).unwrap(), old_bytes);
+    output_success(cli_at(&current).args([
+        "--as",
+        "act-parity",
+        "--cluster",
+        &root_uri,
+        "cluster",
+        "upgrade-ledger",
+        "--writers-stopped",
+        "--json",
+    ]));
+    let converted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let mut expected = old_state.clone();
+    for receipt in expected["deployment_results"].as_array_mut().unwrap() {
+        receipt.as_object_mut().unwrap().remove("restart_required");
+        receipt.as_object_mut().unwrap().remove("activation");
+    }
+    expected["state_revision"] = json!(old_state["state_revision"].as_u64().unwrap() + 1);
+    assert_eq!(
+        converted, expected,
+        "only obsolete runtime claims and ledger revision change"
+    );
+    assert!(!root.join("__cluster/lock.json").exists());
+
+    let candidate = spawn_server_with_cluster_binary_env(root, &current_server, &server_env);
+    let pid = candidate.id();
+    let contract = omnigraph_api_types::HTTP_API_CONTRACT;
+    assert_eq!(reported_contract(&candidate.base_url), contract);
+    assert_eq!(
+        served(&current, &candidate.base_url, &["snapshot"]),
+        old_snapshot
+    );
+    assert_eq!(
+        served(&current, &candidate.base_url, &["commit", "list"]),
+        old_history
+    );
+    assert_eq!(
+        served(&current, &candidate.base_url, &historical_args)["rows"],
+        historical_rows
+    );
+    assert_eq!(
+        served(
+            &current,
+            &candidate.base_url,
+            &["query", "people", "-e", query]
+        )["rows"],
+        old_rows
+    );
+    assert_eq!(reader(&candidate.base_url, contract, query).status(), 403);
+
+    // Upgrade resumes the existing identities, then schema and policy take
+    // effect in the same process. A second apply proves revocation too.
+    fs::write(
+        root.join("people.pg"),
+        "node Person { name: String @key age: I32? bio: String? email: String? }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("graph.policy.yaml"),
+        policy.replace("readers: [act-unbound]", "readers: [act-reader]"),
+    )
+    .unwrap();
+    let applied = apply(&current, &candidate.base_url);
+    assert_eq!(applied["active"], true, "{applied}");
+    assert_eq!(applied["deployment"]["result"]["converged"], true);
+    let current_query = "query people() { match { $p: Person } return { $p.name, $p.email } }";
+    let allowed = reader(&candidate.base_url, contract, current_query);
+    assert_eq!(allowed.status(), 200);
+    let allowed = allowed.json::<Value>().unwrap();
+    assert_eq!(allowed["columns"], json!(["p.name", "p.email"]));
+    assert_eq!(allowed["rows"], json!([{"p.name":"Alice"}]));
+    let new_state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        new_state["applied_revision"]["schema_contracts"]["knowledge"]["schema_identity_domain"],
+        original_domain
+    );
+    let history = served(&current, &candidate.base_url, &["commit", "list"]);
+    assert_eq!(
+        &history["commits"].as_array().unwrap()[1..],
+        old_history["commits"].as_array().unwrap()
+    );
+    fs::write(root.join("graph.policy.yaml"), policy).unwrap();
+    assert_eq!(apply(&current, &candidate.base_url)["active"], true);
+    assert_eq!(
+        reader(&candidate.base_url, contract, current_query).status(),
+        403
+    );
+    assert_eq!(
+        served(&current, &candidate.base_url, &["commit", "list"]),
+        history
+    );
+    assert_eq!(
+        served(&current, &candidate.base_url, &historical_args)["rows"],
+        historical_rows
+    );
+    assert_eq!(candidate.id(), pid);
+    candidate.stop_gracefully();
+    unlock(&current);
+}
 
 /// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
 /// unset — the legitimate skip. A var that is SET but points at a missing path
