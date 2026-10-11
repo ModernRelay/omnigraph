@@ -697,37 +697,56 @@ run, `Session::explain_query`, the `explain` statement and the inspected run
 share the path, so explain validates exactly what a run validates and reports
 the outcome as `validation.scope`.
 
-The requirements come from the declaration, its type context and the
-catalog, not from the IR: binding identity, search identity and its declared
-approximation, every eligibility conjunct (checked per `rrf` arm, since each
-arm copies the match), correlated blocks, the projection and the origin of
-every projected score, order and cut, and the policies the plan declares
-for its search. Every node declares its count cut (`PhysicalNode::row_cut`,
-a match over every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s
-`fetch`, a `RankFuse`'s limit, a ranked scan's candidate cap), and the
+Acceptance first checks that the plan is well formed: aggregate
+specifications against their typed signatures
+(`aggregate::validate_aggregate_specs`), every node's output schema against
+what its operator derives (`output::validate_output_schemas`), and a fusion's
+row keys (`optimizer::validate_rank_fuse_row_tiebreaks`). Execution keeps
+only the checks that need the snapshot or the bound values
+(`validate_traversal_admission`, `typed_value::validate_plan_values`).
+
+The requirements come from the compiler's typed lowering of the checked
+declaration (`AcceptInput.ir`), checked first against the declaration's
+counts of traversals, blocks, return items, order keys and limit. Every
+`QueryIR` expression carries its type and every conversion is an explicit
+`Cast`, so the plan's expressions compare with the lowering's by equality,
+types included; the declaration supplies only which return items and order
+key are the written score calls. The checks: binding identity and traversal
+identity (endpoints, edge selection, direction, endpoint types, hop bounds),
+search identity and its declared approximation, eligibility in both
+directions (every lowered conjunct is tested, checked per `rrf` arm since
+each arm copies the match, and every tested conjunct is a lowered one, a
+constant `true`, or the identity equality key narrowing derives through
+`AcceptInput.keys`), correlated blocks, the exact projection and the origin
+of every projected score, order and cut, late materialization
+(`HydrateColumns`), and the policies the plan declares for its search.
+Every node declares its count cut (`PhysicalNode::row_cut`, a match over
+every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s `fetch`, a ranked
+scan's candidate cap; a fusion and a hydration cut nothing), and the
 validator justifies each one by its position: the root `Limit` and the final
-`Sort` (below the root `Limit` and its projections) at the query's `limit`, a
-fusion at that `limit`, and a ranked scan's cap as its declared policy sets
-it. Any other cut, a capped sort below the final one or a cut in a
-correlated block's tree, is refused as `row cut`. A matcher relates each written expression to the IR through
-the compiler's lowering patterns (property leaves on physical columns, `in`
-as a swapped `contains`, a bare search call as `= true`, a folded constant as
-the value the engine's evaluator gives it). The order check recomputes the
-root's order from the operators (`optimizer::derived_order`, typed
-`OrderKey`s) and accepts the planner's tie-break omissions that are
-comparator equivalences: a key already in the comparator, every key when the
-query returns only order keys, and identities of bindings the query does not
-name (anonymous endpoints, cycle temps) after every named one.
+`Sort` (below the root `Limit`, its projections and a hydration) at the
+query's `limit`, and a ranked scan's cap as its declared policy sets it. Any
+other cut, a capped sort below the final one or a cut in a correlated
+block's tree, is refused as `row cut`. The order check recomputes the root's
+order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
+a fusion's sort leads with `<binding>._rrf` descending, a search-ordered
+aggregate's with its remaining keys and then every group key it did not
+write, and the planner's tie-break omissions that are comparator
+equivalences are accepted: a key already in the comparator, every key when
+the query returns only order keys or constants, and identities of bindings
+the query does not name (anonymous endpoints, cycle temps) after every named
+one.
 
 A query of one binding, Boolean/integer/String eligibility, an optional
 leading `bm25()` over a String property, direct property sort keys, a limit
 and a projection of properties and the selected score is a member of the
 exact fragment (`validate/subset.rs`). For a member the optimizer records the
 rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
-`RankBm25Scan`) over arena references; the validator checks that the IR is
-the declaration's lowering, rebuilds the canonical chain
-`Limit(Sort(Project([Search](Filter(Scan)))))`, re-applies every rule
-against its precondition and requires the result to equal the plan. The
+`RankBm25Scan`, `HydrateReturnColumns`, `NarrowKey`) over arena references;
+the validator rebuilds the canonical chain
+`Limit(Sort(Project([Search](Filter(Scan)))))` from the typed lowering,
+re-applies every rule against its precondition and requires the result to
+equal the plan. The
 checker's arena keeps only each role's current node, releasing a replaced one
 before storing its successor, so its memory is linear in the query. A member
 is accepted as `exact_subset`; every other plan as `invariants_only`.
@@ -742,8 +761,13 @@ derivation. It checks the byte limit and the envelope's versions before
 decoding the plan, refuses another schema and a dataset the plan did not pin
 as conflicts, re-establishes every full-text coverage fact the plan records
 from the pinned snapshot, recompiles the query, and accepts the plan again; a
-recorded fact the snapshot contradicts, or a plan that fails a check, is
-invalid evidence, a bad request.
+recorded fact the snapshot contradicts, or a plan that fails a check
+(well-formedness included), is invalid evidence, a bad request.
+
+Full-text coverage is derived from the index facts the planner reads for the
+pinned dataset (`FullTextCoverage::of_facts`): `absent` without an inverted
+index on the column, `full` only when every inverted segment there reports a
+known coverage of every fragment, `partial` otherwise.
 
 ## Search and rank
 

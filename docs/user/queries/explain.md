@@ -132,8 +132,10 @@ value); `settings`, each setting it read with its spelling (`traversal`,
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
 the `rrf_plan` mode and the prefilter gate's admission thresholds;
-`full_text`, the full-text coverage (`full`, `partial` or `absent`) of every
-property a `bm25` scan ranks, keyed `<table>.<property>`; and
+`full_text`, the full-text coverage of every property a `bm25` scan ranks,
+keyed `<table>.<property>` (`full` only when the index is known to cover every
+fragment, `partial` when coverage is incomplete or unknown, `absent` without a
+full-text index); and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
 retained through rewrites so historical replay can enforce the target rule. Query

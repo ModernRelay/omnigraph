@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-10-05
+updated: 2026-10-10
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -403,6 +403,18 @@ its aggregate, comparison and right-hand side. Its inner predicates are
 checked through the block's plan subtree, not derived from the declaration's
 inner clauses, whose variables the lowering may rename.
 
+As built, requirements come from the compiler's typed lowering of the
+checked declaration, which acceptance receives beside it. Since every
+`QueryIR` expression carries its compiler type and every conversion is an
+explicit `Cast`, the lowering keeps the meaning the paragraph above feared
+it would lose, so requirements compare by structural equality, types
+included: a conjunct, traversal, block, search argument, return item and
+order key in the plan must equal the lowering's. The lowering is itself
+checked against the declaration first; its traversal, block, return item,
+order key and limit counts must be the declaration's. The declaration
+supplies only what the lowering does not name: which return items and which
+order key are the written score calls.
+
 For a search-ordered aggregate, derive population requirements before grouping
 and order/cut requirements after grouping. With no remaining order key, group
 order stays unspecified as defined above. Full-text index readiness comes
@@ -425,12 +437,32 @@ fact](#full-text-index-presence-as-a-planning-fact), not from query syntax.
    (`optimizer::derived_order` over typed `OrderKey`s) rather than reading a
    declared property. Three planner omissions in the identity tie-break are
    comparator equivalences and accepted: an identity already in the
-   comparator, every identity when the query returns only order keys (rows
-   that tie are indistinguishable), and the identities of bindings the query
-   does not name (anonymous endpoints, cycle temps), after every named one.
+   comparator, every identity when the query returns only order keys or
+   constants (rows that tie are indistinguishable), and the identities of
+   bindings the query does not name (anonymous endpoints, cycle temps),
+   after every named one.
 3. Check required properties and recorded prerequisites before accepting the
    plan. Cost estimates select among accepted candidates and cannot discharge
    a missing requirement.
+
+As built, predicate checks are two-sided. Retention requires every conjunct
+of the lowering to be tested somewhere in the pipelines the rows come from;
+origin requires every tested conjunct to be one the lowering requires, a
+constant `true`, or the identity equality that key narrowing derives (see the
+rule catalogue below). A plan that adds a predicate the query never wrote is
+therefore refused as surely as one that drops a written predicate. Each
+traversal keeps its identity: written endpoints, edge selection, direction,
+endpoint types and hop bounds.
+
+Acceptance is the only gate. Before the requirement checks, it checks that
+the plan is well formed: aggregate specifications agree with their typed
+signatures, every node's output schema agrees with what its operator
+derives, and a fusion's row keys are complete and canonical. Execution keeps
+only the checks that need the pinned snapshot or the bound values (traversal
+admission, literal and parameter conversion, stored-schema agreement). A
+saved plan that fails any acceptance check is a bad request (400) at the
+replay door, before execution; a fresh plan that fails one is a planner
+defect.
 
 Property checks do not by themselves prove row-selection equivalence. A plan
 with a dropped filter can have the same schema, ordering and row count. The
@@ -519,6 +551,16 @@ projection-placement row, since the planner prunes the scan rather than
 placing a projection) and `rank_bm25_scan` (the BM25 lowering row, with the
 eligibility placement below). The canonical sort already carries
 `fetch=n`, so no top-k rule applies, and the planner removes no Sort.
+
+Rules version 2 adds two rules. `narrow_key` lets the scan of a binding with
+a written equality on its type's single String key also test the identity
+equality `@id = <id>`, where `<id>` is the canonical id the loader derives
+from that key value; acceptance derives the id again through the catalog and
+admits no other conjunct by this rule. `hydrate_return_columns` is late
+materialization under a positive limit: the scan defers returned columns no
+other node reads and carries `_rowaddr` in their place, and a
+`HydrateColumns` root over the limit reads them from the same table by row
+address.
 
 `T` is a finite, versioned table from the admitted predicate's typed operators
 to typed scan-filter operators. Literal/parameter and property leaves retain
@@ -667,8 +709,9 @@ schema identities and snapshot facts remain fixed through execution.
 
 As built, the replay envelope carries the query source and name, the scope,
 the digest of the accepted schema, the bound plan (whose values are the
-captured parameters) and a member's derivation, under `replay_version`,
-`rules_version` and `semantics_version` 1. A version mismatch, a different
+captured parameters) and a member's derivation, under `replay_version` 1,
+`rules_version` 2 and `semantics_version` 2 (the typed lowering and the
+step 5 total order). A version mismatch, a different
 schema digest and a dataset the plan did not pin are conflicts (409) that ask
 for the query again; malformed evidence or a plan failing a check is a bad
 request (400); exhaustion is `ResourceLimitExceeded` (413). The recorded
@@ -741,6 +784,13 @@ goes through the recording wrapper, so the fact is part of the plan's
 `Assumptions` and a replay against another snapshot is refused, as for every
 other planner input. Index coverage of newer rows is not consulted: an
 uncovered tail is not a refusal.
+
+As built, the fact is derived from the planner's index facts for the pinned
+dataset, the same facts key narrowing and index selection read: `absent`
+when the property has no inverted index, `full` only when every inverted
+segment on the column reports known coverage of every fragment, and
+`partial` otherwise. Unknown coverage is never `full`. Replay derives it
+again from the pinned dataset.
 
 The `T27` rule is the catalog predicate index reconciliation already uses (a
 non-enum, single-column String `@index`), moved into the compiler so the type
@@ -972,7 +1022,7 @@ and regressions. Step 7 can ship independently.
 | 2a | Shared query/explain validation and acceptance; exact-subset rules, adaptive-policy checks, bounded/versioned replay evidence, GQT scope assertions. The order checks of a fusion and of a search-ordered aggregate land with step 5, which implements their order | supports steps 3-6 |
 | 3 | `T27` and `FullTextIndexRequired` | #747 |
 | 4 | The ranked binding roots its component; the `rrf()` arms type error | #789 |
-| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired | #787, #788 |
+| 5 | One total order: fused score column, `Sort` over fusion and search-ordered aggregates, `T37` retired, `T54` (PR #938, merged); its order checks land with step 2a | #787, #788 |
 | 6 | Read descriptors with producer ids and fusion-arm references | None |
 | 7 | Served read floor | #752 |
 | 8 | Engine v2 reverses a ranked component when selectivity and its mode-specific validation rule admit it | None (performance) |
@@ -1048,3 +1098,19 @@ None.
   and acceptance justifies each declared cut by its position (root `Limit`
   and final sort `fetch` at the query's `limit`, the fusion's limit, a
   ranked scan's policy cap) and refuses every other.
+- 2026-10-10: step 2a brought onto the typed lowering, index facts, key
+  narrowing, late materialization and step 5. Requirements now come from
+  the compiler's typed lowering and compare by equality, types included;
+  the declaration supplies only the written score calls. Predicate checks
+  became two-sided (an added conjunct is refused, not only a dropped one),
+  and traversals keep their hop bounds, direction and endpoint types.
+  Acceptance is the single gate: the plan well-formedness checks the typed
+  lowering added to execution run first in acceptance, and a saved plan
+  failing them is a bad request at the replay door. Two rules joined the
+  catalogue (`narrow_key`, `hydrate_return_columns`; rules version 2), and
+  order checks for a fusion and a search-ordered aggregate replaced their
+  step 2a exemptions (semantics version 2); a fusion no longer cuts rows,
+  so acceptance justifies no fusion cut. Full-text coverage is derived
+  from the index facts, with unknown coverage never full. A constant return
+  item joined the tie-break equivalences, and an `order` clause whose keys
+  all fold to constants still requires the sort by the identity tie-break.
