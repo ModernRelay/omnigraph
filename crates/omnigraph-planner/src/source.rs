@@ -281,6 +281,34 @@ pub enum FullTextCoverage {
     Absent,
 }
 
+impl FullTextCoverage {
+    /// The coverage the index facts of one table establish for `column`:
+    /// `Absent` with no index on it, `Full` only when it has a full-text
+    /// index and every full-text index on it has known coverage of every
+    /// current fragment, `Partial` otherwise. An index of unknown kind or
+    /// unknown coverage on the column never counts as full.
+    pub fn of_facts(facts: &[IndexFact], column: &str) -> Self {
+        let on_column: Vec<&IndexFact> =
+            facts.iter().filter(|fact| fact.column == column).collect();
+        let full_text = on_column
+            .iter()
+            .any(|fact| fact.kind == IndexKind::Inverted);
+        let unknown = on_column.iter().any(|fact| fact.kind == IndexKind::Unknown);
+        if !full_text {
+            return if unknown { Self::Partial } else { Self::Absent };
+        }
+        let full = !unknown
+            && on_column
+                .iter()
+                .filter(|fact| fact.kind == IndexKind::Inverted)
+                .all(|fact| {
+                    fact.coverage
+                        .is_some_and(|coverage| coverage.covered == coverage.total)
+                });
+        if full { Self::Full } else { Self::Partial }
+    }
+}
+
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySource {

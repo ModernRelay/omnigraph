@@ -1136,3 +1136,61 @@ fn a_reference_to_an_unreached_or_superseded_node_is_refused() {
         }
     }
 }
+
+/// A return item the lowering folds to a constant (`@type` of a binding
+/// with one edge type) cannot tell two rows apart, so ordering by the other
+/// returns completes the comparator without identities.
+#[test]
+fn a_constant_return_needs_no_tiebreak() {
+    let fixture = Fixture::new(
+        r#"query q() {
+    match { $p: Doc $d: Doc $p $e:cites $d }
+    return { $p.slug as source, $d.slug as target, $e.@type as edge_type }
+    order { $p.slug, $d.slug, $e.@type }
+}"#,
+        &[],
+    );
+    assert!(
+        fixture
+            .ir
+            .return_exprs
+            .iter()
+            .any(|projection| matches!(projection.expr, IRExpr::Literal(_, _))),
+        "the lowering folds the single edge type"
+    );
+    fixture
+        .accept(fixture.plan())
+        .expect("a constant return is covered by the other keys");
+}
+
+/// An `order` clause whose every key folds to a constant still orders its
+/// rows, by the identity tie-break alone (or groups, by nothing more), so the
+/// plan's sort is required rather than refused.
+#[test]
+fn a_constant_order_still_sorts() {
+    for query in [
+        r#"query q() {
+    match { $p: Doc $d: Doc $p $e:cites $d }
+    return { $d.slug as target }
+    order { $e.@type }
+}"#,
+        r#"query q() {
+    match { $p: Doc $d: Doc $p $e:cites $d }
+    return { $p.slug as source, count($d) as n }
+    order { $e.@type }
+}"#,
+    ] {
+        let fixture = Fixture::new(query, &[]);
+        assert!(
+            fixture
+                .ir
+                .order_by
+                .iter()
+                .all(|key| matches!(key.expr, IRExpr::Literal(_, _))),
+            "the lowering folds the single edge type: {query}"
+        );
+        fixture
+            .accept(fixture.plan())
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+    }
+}

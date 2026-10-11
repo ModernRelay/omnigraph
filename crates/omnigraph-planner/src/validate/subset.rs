@@ -1099,8 +1099,7 @@ fn apply(
                         .key
                         .as_deref()
                         .unwrap_or_default()
-                        .iter()
-                        .any(|key| *key == column.property)
+                        .contains(&column.property)
                     || column.property == input.catalog.system_columns.id
                 {
                     return Err(invalid(format!(

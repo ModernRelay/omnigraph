@@ -195,7 +195,9 @@ pub(crate) enum PlanLine {
     },
     /// Acceptance checked the plan to `scope` (`exact_subset` or
     /// `invariants_only`), as the document's `validation` reports it.
-    ValidationScope { scope: String },
+    ValidationScope {
+        scope: String,
+    },
 }
 
 #[derive(Debug, Default)]

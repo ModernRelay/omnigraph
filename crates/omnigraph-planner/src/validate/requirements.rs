@@ -27,7 +27,7 @@ use crate::physical::RankKind;
 /// path derives it from the key's value. The engine implements it with the
 /// loader's derivation, so a key narrowing the planner adds (an `@id`
 /// equality beside the written key equality) is re-derived, not trusted.
-pub trait KeyIds {
+pub trait KeyIds: Sync {
     /// The id of the node of `type_key` whose key is `value` (typed `ty`), or
     /// `None` when the type is not keyed by one String property.
     fn canonical_key_id(&self, type_key: &str, value: &Literal, ty: &ExprType) -> Option<String>;
@@ -84,7 +84,7 @@ impl Retrieval {
 pub(crate) enum Search {
     Rank(Retrieval),
     Fuse {
-        arms: [Retrieval; 2],
+        arms: Box<[Retrieval; 2]>,
         k: Option<IRExpr>,
     },
 }
@@ -138,6 +138,9 @@ pub struct Requirements {
     /// literal key does not), each bound to a `return` item as the planner
     /// binds it.
     pub(crate) order: Vec<IROrdering>,
+    /// Whether the query writes an `order` clause at all: one whose every
+    /// key is a constant still orders its rows by the identity tie-break.
+    pub(crate) ordered: bool,
     pub(crate) limit: Option<u64>,
     pub(crate) aggregate: bool,
 }
@@ -267,7 +270,7 @@ impl Requirements {
                 ..
             }) => match (Retrieval::of(primary), Retrieval::of(secondary)) {
                 (Some(primary), Some(secondary)) => Some(Search::Fuse {
-                    arms: [primary, secondary],
+                    arms: Box::new([primary, secondary]),
                     k: k.as_deref().cloned(),
                 }),
                 _ => None,
@@ -308,6 +311,7 @@ impl Requirements {
                 .collect(),
             written_search,
             order,
+            ordered: !ir.order_by.is_empty(),
             limit: ir.limit,
             aggregate: ir
                 .return_exprs

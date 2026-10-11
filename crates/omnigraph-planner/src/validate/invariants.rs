@@ -121,6 +121,18 @@ fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
     out
 }
 
+/// The expression an order key names: for an alias, the return item it
+/// aliases.
+fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
+    match key {
+        IRExpr::AliasRef(alias, _) => returns
+            .iter()
+            .find(|projection| projection.column == *alias)
+            .map_or(key, |projection| &projection.expr),
+        expr => expr,
+    }
+}
+
 /// The ranked scans of the plan with their ids.
 fn ranked_scans(plan: &PhysicalPlan) -> Vec<(NodeId, &str, &RankedAccess)> {
     plan.live()
@@ -276,10 +288,17 @@ impl Requirements {
             .iter()
             .find(|required| !placed_set.contains(required))
         {
-            return Err(ValidationError::violated(
-                "predicate retention",
-                format!("the plan tests no conjunct for `{missing}`"),
-            ));
+            // The same text under other stored types is a retyped conjunct.
+            let text = missing.to_string();
+            let detail = if placed
+                .iter()
+                .any(|(_, conjunct)| conjunct.to_string() == text)
+            {
+                format!("the plan tests `{missing}` with stored types the query does not give it")
+            } else {
+                format!("the plan tests no conjunct for `{missing}`")
+            };
+            return Err(ValidationError::violated("predicate retention", detail));
         }
         let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
         for (id, conjunct) in &placed {
@@ -450,7 +469,7 @@ impl Requirements {
         }
         match (&self.search, fuse) {
             (Some(Search::Fuse { arms, k }), Some((planned, planned_k))) => {
-                for (arm, retrieval) in planned.iter().zip(arms) {
+                for (arm, retrieval) in planned.iter().zip(arms.iter()) {
                     if arm.binding != retrieval.binding || arm.kind != retrieval.kind {
                         return Err(ValidationError::violated(
                             "search identity",
@@ -753,7 +772,9 @@ impl Requirements {
     /// ascending; no sort where the query orders nothing.
     fn required_keys(&self) -> Option<Vec<IROrdering>> {
         if self.aggregate {
-            if self.order.is_empty() {
+            // Under a search, groups have no order unless a key remains
+            // after the score; otherwise any written clause sorts them.
+            if !self.ordered || (self.search.is_some() && self.order.is_empty()) {
                 return None;
             }
             let mut keys = self.order.clone();
@@ -780,7 +801,7 @@ impl Requirements {
             return Some(keys);
         }
         let lead = match &self.search {
-            None if self.order.is_empty() => return None,
+            None if !self.ordered => return None,
             None => Vec::new(),
             Some(Search::Rank(retrieval)) => {
                 let (column, descending) = retrieval.kind.score();
@@ -900,14 +921,15 @@ impl Requirements {
                     }
                 });
         if !same {
-            return Err(ValidationError::violated(
-                "order",
+            let (planned, wanted) = (keys_text(order_by), keys_text(&required));
+            let detail = if planned == wanted {
                 format!(
-                    "the final sort orders by {}; the query requires {}",
-                    keys_text(order_by),
-                    keys_text(&required)
-                ),
-            ));
+                    "the final sort orders by {planned} with stored types the query does not give its keys"
+                )
+            } else {
+                format!("the final sort orders by {planned}; the query requires {wanted}")
+            };
+            return Err(ValidationError::violated("order", detail));
         }
         self.check_tiebreak(order_by, tiebreak, input)?;
         Ok(())
@@ -918,7 +940,7 @@ impl Requirements {
     /// edge) in binding-name order, ascending, nulls first. Three planner
     /// omissions are comparator equivalences and accepted: a key the
     /// comparator already holds, every key when the query returns only order
-    /// keys (rows that tie are indistinguishable), and identities of
+    /// keys or constants (rows that tie are indistinguishable), and identities of
     /// bindings the query does not name (anonymous traversal endpoints)
     /// after every named one. A sort of group rows appends none.
     fn check_tiebreak(
@@ -942,12 +964,14 @@ impl Requirements {
                     *position == index && self.written_search.as_ref() == Some(call)
                 })
         };
+        // A key orders the expression it names, so it covers every return
+        // item lowering to that expression, under any alias.
         let covered = self.returns.iter().enumerate().all(|(index, projection)| {
             ranked_score(index)
-                || order_by.iter().any(|key| match &key.expr {
-                    IRExpr::AliasRef(alias, _) => *alias == projection.column,
-                    expr => *expr == projection.expr,
-                })
+                || matches!(projection.expr, IRExpr::Literal(_, _))
+                || order_by
+                    .iter()
+                    .any(|key| *named_expr(&self.returns, &key.expr) == projection.expr)
         });
         if covered {
             return Ok(());
@@ -960,15 +984,7 @@ impl Requirements {
                 _ => return false,
             };
             order_by.iter().any(|key| {
-                let expr = match &key.expr {
-                    IRExpr::AliasRef(alias, _) => self
-                        .returns
-                        .iter()
-                        .find(|projection| projection.column == *alias)
-                        .map_or(&key.expr, |projection| &projection.expr),
-                    expr => expr,
-                };
-                matches!(expr, IRExpr::PropAccess { variable, property, .. }
+                matches!(named_expr(&self.returns, &key.expr), IRExpr::PropAccess { variable, property, .. }
                     if *variable == column.binding && property == physical)
             })
         };
