@@ -110,12 +110,11 @@ before retrying with a precondition.
 
 Over HTTP:
 
-- `PUT` takes a `Content-Type: application/octet-stream` body of at most 32 MiB,
-  inclusive. Another media type is a `415`. A body over 32 MiB is a `413`,
-  refused before any of it is read when `Content-Length` declares it, and a body
-  that does not arrive before the server's body deadline is a `408`. The value
-  must also fit the server's `write_max_bytes`, which a request cannot change;
-  a larger one is a `413` once the body is read;
+- `PUT` takes a `Content-Type: application/octet-stream` body of at most the
+  server's `write_max_bytes` (32 MiB by default), inclusive; a request cannot
+  change it. Another media type is a `415`. A larger body is a `413`, refused
+  before any of it is read when `Content-Length` declares it, and a body that
+  does not arrive before the server's body deadline is a `408`;
 - both verbs take `branch` (default `main`) and refuse `snapshot` or any other
   unknown parameter with a `400`. A missing branch is a `404`;
 - `change` is authorized before the body is read;

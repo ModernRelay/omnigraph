@@ -1004,7 +1004,7 @@ pub(crate) async fn server_blob_head(
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
             )),
-        (status = 413, description = "The body exceeds 32 MiB, or the value alone or with the entity's carried Blob payloads exceeds the server's `write_max_bytes`", body = ErrorOutput),
+        (status = 413, description = "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
         (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -1058,9 +1058,9 @@ pub(crate) async fn server_blob_put(
                 .ok_or_else(|| ApiError::bad_request("invalid Content-Length"))?,
         ),
     };
-    if let Some(declared) = declared.filter(|declared| *declared > omnigraph::BLOB_WRITE_MAX_BYTES)
-    {
-        return Err(blob_put_too_large(declared));
+    let limit = state.blob_put_limit();
+    if let Some(declared) = declared.filter(|declared| *declared > limit) {
+        return Err(blob_put_too_large(limit, declared));
     }
 
     let deadline = request
@@ -1070,7 +1070,7 @@ pub(crate) async fn server_blob_put(
         .ok_or_else(|| ApiError::internal("missing request body deadline"))?;
     let bytes = tokio::time::timeout_at(
         deadline.0,
-        collect_blob_put_body(request.into_body(), declared),
+        collect_blob_put_body(request.into_body(), declared, limit),
     )
     .await
     .map_err(|_| ingress::body_timeout())??;
@@ -1222,10 +1222,10 @@ fn blob_write_cell(query: BlobWriteQuery) -> omnigraph::BlobCell {
 
 /// The refusal of a put body over the limit: the same resource, limit and
 /// message the engine reports for an oversized embedded put.
-fn blob_put_too_large(actual: u64) -> ApiError {
+fn blob_put_too_large(limit: u64, actual: u64) -> ApiError {
     ApiError::from_omni(OmniError::resource_limit(
         omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE,
-        omnigraph::BLOB_WRITE_MAX_BYTES,
+        limit,
         actual,
     ))
 }
@@ -1235,6 +1235,7 @@ fn blob_put_too_large(actual: u64) -> ApiError {
 async fn collect_blob_put_body(
     body: Body,
     declared: Option<u64>,
+    limit: u64,
 ) -> std::result::Result<Bytes, ApiError> {
     let capacity = declared.map_or(Ok(0), usize::try_from).map_err(|_| {
         ApiError::bad_request("Content-Length does not fit in this platform's memory")
@@ -1246,8 +1247,8 @@ async fn collect_blob_put_body(
             ApiError::bad_request(format!("failed to read Blob request body: {err}"))
         })?;
         let actual = data.len().saturating_add(chunk.len()) as u64;
-        if actual > omnigraph::BLOB_WRITE_MAX_BYTES {
-            return Err(blob_put_too_large(actual));
+        if actual > limit {
+            return Err(blob_put_too_large(limit, actual));
         }
         data.extend_from_slice(&chunk);
     }

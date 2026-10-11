@@ -1237,7 +1237,7 @@ Physical row addresses never become public stable identity.
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
-| Oversize upload | Route 32 MiB and engine `write_max_bytes` (32 MiB by default) inclusive limits in payload bytes, separate from the row-data budget (§4.3); refusal before effect |
+| Oversize upload | Route and engine `write_max_bytes` (32 MiB by default, at most 32 MiB) inclusive limits in payload bytes, separate from the row-data budget (§4.3); refusal before effect, and before reading past the limit on the route |
 | Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. Schema apply reads no Blob payload: its column changes are metadata-only (§8.4) |
 | Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
@@ -1430,13 +1430,13 @@ The implementation extends existing owners before creating new fixtures, per
   reference, proving that target payload is not read while the untouched sibling
   remains byte-identical. Every refusal proves table HEAD, manifest, lineage,
   and accepted state unchanged.
-- `writes.rs` also owns the payload/framing split (§4.3): an exact 32 MiB PUT is
-  accepted and one more byte is refused by the payload limit, not by a framing
-  ceiling; a 32 MiB value carried by an update, one inserted through an
-  embedded `.gq` parameter and one loaded by the compatibility loader are
-  accepted where the combined ceiling refused them, while the strict NDJSON
-  loader still refuses that value's encoded line at its line limit; and a
-  framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
+- The payload/row split (§4.3) is owned by the `write_max_bytes` owners: the
+  `write_max_bytes*.gqt` and `load_write_max_bytes_*.gqt` cases (an exact
+  payload beside its row, one more byte refused, a value carried by an update),
+  `consistency.rs` and `merge_fast_forward.rs`. `writes.rs` owns the put's
+  bound: an exact-limit put is accepted at the default and under a lowered
+  `write_max_bytes`, one more byte is refused as `Blob write payload bytes`, and
+  a carried sibling shares the payload allowance. It owns the sibling carry rule
   too: an external sibling becomes managed under an admitting policy (visible
   through `stat`), fails with `StoredExternalBlobDenied` naming the sibling under
   a denying one, and on a row with two external cells under a denying policy a
@@ -1936,9 +1936,13 @@ publisher architecture.
   most 32 MiB, captured once per operation, for every keyed writer and the
   compatibility loader's forecast, which classifies a `base64:` value as payload
   only for a declared Blob property. The Blob put checks its value against the
-  session's allowance, so a lowered `write_max_bytes` lowers the put's bound too;
-  the PUT route and the CLI keep their 32 MiB pre-read bounds, the setting's
-  maximum. The two §12.3 surface guards move to 3A. Superseded: §4.3's "The raw
+  session's allowance, so a lowered `write_max_bytes` lowers the put's bound too.
+  A PUT carries no settings, so the route refuses a body over the server's
+  process `write_max_bytes` before reading past it and reserves only that much
+  ingress; the CLI keeps its 32 MiB pre-read bound, the setting's maximum,
+  because a served caller cannot see the server's value. The payload/row split
+  is owned by the `write_max_bytes` owners, so §12.2's `writes.rs` split bullet
+  narrows to the put's bound. The two §12.3 surface guards move to 3A. Superseded: §4.3's "The raw
   managed payload limit is 32 MiB inclusive" and "the same operation-wide 32 MiB
   pre-effect payload budget"; §10's "Route and engine 32 MiB inclusive limits in
   payload bytes, separate from the batch framing budget"; and §13's 3-pre

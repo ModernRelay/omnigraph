@@ -140,7 +140,8 @@ pub(crate) async fn admit(
     let limit = if !receives_body {
         0
     } else if blob_put {
-        crate::BLOB_PUT_REQUEST_BODY_LIMIT_BYTES
+        usize::try_from(state.blob_put_limit())
+            .map_err(|_| ApiError::internal("Blob put limit exceeds usize"))?
     } else if matches!(route, "/cluster/deployments" | "/cluster/plan") {
         crate::deployment::REQUEST_BYTES
     } else if route == "/mcp" {
