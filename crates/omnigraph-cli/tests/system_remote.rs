@@ -773,6 +773,8 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
 /// The put carries 2 MiB of raw bytes, past the JSON request bound.
 #[test]
 fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
     use support::managed_http::{IntentApiFixture, MergeDeliveryFault};
 
     let temp = tempfile::tempdir().unwrap();
@@ -823,23 +825,65 @@ fn remote_blob_write_delivery_loss_never_replays_committed_effect() {
             }
             let before = commits();
             let proxy = IntentApiFixture::graph_blob_write_proxy(&server.base_url, fault);
-            let mut command = cli();
-            command
-                .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
-                .arg("blob")
-                .arg(if put { "put" } else { "clear" })
-                .args(["node", "Document", "readme", "content"]);
+            let mut args: Vec<std::ffi::OsString> = ["blob", if put { "put" } else { "clear" }]
+                .into_iter()
+                .chain(["node", "Document", "readme", "content"])
+                .map(Into::into)
+                .collect();
             if put {
-                command.arg("--file").arg(&payload);
+                args.extend(["--file".into(), payload.clone().into_os_string()]);
             }
-            command
-                .arg("--server")
-                .arg(&proxy.origin)
-                .arg("--graph")
-                .arg(PARITY_GRAPH_ID)
-                .arg("--json")
-                .timeout(std::time::Duration::from_secs(15));
-            let output = output_failure(&mut command);
+            args.extend(
+                [
+                    "--server",
+                    proxy.origin.as_str(),
+                    "--graph",
+                    PARITY_GRAPH_ID,
+                    "--json",
+                ]
+                .map(Into::into),
+            );
+            // A withheld reply is observed, not waited out: once the proxy
+            // holds the consumed upstream receipt, the caller is still waiting
+            // and is abandoned.
+            let output = if matches!(fault, MergeDeliveryFault::CallerWait) {
+                let mut caller = cli_process()
+                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .args(&args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while proxy.forwarded_responses().is_empty() {
+                    assert!(
+                        caller.try_wait().unwrap().is_none(),
+                        "{put}/{fault:?}: caller must still wait while the proxy owns the consumed reply"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "{put}/{fault:?}: upstream write must complete before the caller is abandoned"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    caller.try_wait().unwrap().is_none(),
+                    "{put}/{fault:?}: caller must still wait when the consumed reply is withheld"
+                );
+                caller.kill().unwrap();
+                caller.wait_with_output().unwrap()
+            } else {
+                output_failure(
+                    cli()
+                        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                        .args(&args)
+                        .timeout(Duration::from_secs(15)),
+                )
+            };
+            assert!(
+                !output.status.success(),
+                "{put}/{fault:?}: lost delivery must not report success"
+            );
             if !matches!(fault, MergeDeliveryFault::CallerWait) {
                 assert_eq!(output.status.code(), Some(1), "{put}/{fault:?}");
             }
