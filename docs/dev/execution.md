@@ -51,8 +51,27 @@ deterministic edge tie-break. A correlated block (`not { ... }`,
 anti-join over its typed inner pipeline, keeping each outer row by a
 `SubqueryPredicate` on the aggregate of its matches.
 
-Do not replace these shapes with eager cross-products. Keep intermediate rows
-factorized and flatten only where the result contract needs it.
+Do not replace these shapes with eager cross-products. Rows between operators
+are flat Arrow batches, not a factorized representation: an `Expand` copies
+an input row's columns into every output row that row produces. What bounds
+multi-hop fan-out is:
+
+- deferred bindings: the compiler's IR lowering gives at most one binding of
+  each connected pattern a `NodeScan`, normally the first declared
+  (`scan_root`), and `Expand` introduces the rest, so connected bindings never
+  become a cross join closed by a filter;
+- bounded streaming: every `Expand` emits chunks of at most
+  `EXPAND_OUTPUT_ROWS` (256) rows through a two-batch producer channel, and a
+  downstream `Limit` that stops reading cancels the producer (the `Expand` row
+  of [the operator table](#v2-plan-lowering-one-node-one-operator));
+- narrow rows: `projection_pushdown` reads only the columns the tree uses
+  before destination rows are repeated per edge, and `late_materialization`
+  moves return-only columns to a `HydrateColumns` node above a root `Limit` in
+  a plan without an `Aggregate` ([filters and pushdown](#filters-and-pushdown));
+- set semantics: an unbound traversal returns each endpoint pair once, and
+  `{min,max}` hops are shortest distances from a BFS that keeps one visited
+  set per source ([selected edge traversal](#selected-edge-traversal),
+  [the traversal guide](../user/queries/traversal.md)).
 
 ### Selected edge traversal
 
