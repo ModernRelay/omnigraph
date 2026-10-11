@@ -384,6 +384,14 @@ journeys listed in the step) and for the upgrade journeys' captured notices,
 in place of grepping a `--nocapture` log. The local command in
 [testing.md](testing.md) stays `cargo test`; the two run the same binaries.
 
+Every run, red or green, uploads that report as `test-workspace-junit` and
+the compile step's `--timings` page as `test-workspace-build-timings`, both
+kept 14 days: per-test durations and per-crate compile and link times on the
+hosted runner, which any change to this job's scheduling is sized from. The
+`ci` profile terminates a test that runs ten minutes (`slow-timeout`), so a
+hang fails as a named test instead of holding the job to its 60-minute limit,
+and a test still running after one minute is reported as `SLOW` in the log.
+
 The `main` run also seeds the dependency cache that pull requests restore.
 Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
 `dst.yml` saves only from `main` (`save-if`): a save from any other ref, a
