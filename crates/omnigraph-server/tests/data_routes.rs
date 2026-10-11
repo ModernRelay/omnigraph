@@ -993,8 +993,9 @@ async fn blob_put_raw_body_bounds_media_type_length_and_deadline() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_admission_open(&operations, &workload, "after").await;
 
-    // The server's process `write_max_bytes` bounds the value once the body is
-    // read; a `PUT` carries no settings that could change it.
+    // A put takes no settings, so the server's process `write_max_bytes` is its
+    // limit before the body arrives: a declared body past it is refused
+    // unread, and a streamed one at the byte past it.
     let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
         (variable == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "4093".to_string())
     })
@@ -1005,20 +1006,48 @@ async fn blob_put_raw_body_bounds_media_type_length_and_deadline() {
             .unwrap()
             .with_process_defaults(ProcessDefaults { settings, sources }),
     );
+    let refused_at = |body: &[u8]| {
+        let refused = serde_json::from_slice::<ErrorOutput>(body)
+            .unwrap()
+            .resource_limit
+            .unwrap();
+        (refused.resource, refused.limit, refused.actual)
+    };
+    let (polled, body) = watched_body();
+    let mut request = blob_write_request(Method::PUT, &uri, body, None);
+    request
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("4094"));
+    let (status, _, body) = blob_exchange(&lowered, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a declared body past the process limit is refused unread"
+    );
+    assert_eq!(
+        refused_at(&body),
+        ("Blob write payload bytes".to_string(), 4093, 4094)
+    );
+    let chunks = futures::stream::iter([
+        Ok::<Bytes, Infallible>(Bytes::from(vec![7_u8; 4093])),
+        Ok(Bytes::from_static(b"!")),
+    ]);
     let (status, _, body) = blob_exchange(
         &lowered,
-        blob_write_request(Method::PUT, &uri, vec![7_u8; 4094], None),
+        blob_write_request(Method::PUT, &uri, Body::from_stream(chunks), None),
     )
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    let refused = serde_json::from_slice::<ErrorOutput>(&body)
-        .unwrap()
-        .resource_limit
-        .unwrap();
     assert_eq!(
-        (refused.resource.as_str(), refused.limit, refused.actual),
-        ("Blob write payload bytes", 4093, 4094)
+        refused_at(&body),
+        ("Blob write payload bytes".to_string(), 4093, 4094)
     );
+    let (status, _, body) = blob_exchange(
+        &lowered,
+        blob_write_request(Method::PUT, &uri, vec![7_u8; 4093], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
 #[tokio::test(flavor = "multi_thread")]

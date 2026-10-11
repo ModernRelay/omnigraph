@@ -181,8 +181,6 @@ impl utoipa::Modify for SecurityAddon {
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-/// A Blob put's raw body: exactly the bytes one put may store, inclusive.
-const BLOB_PUT_REQUEST_BODY_LIMIT_BYTES: usize = omnigraph::BLOB_WRITE_MAX_BYTES as usize;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 /// The maximum internal-schema (storage-format) version this binary supports.
@@ -847,6 +845,17 @@ impl AppState {
     pub fn with_process_defaults(mut self, defaults: ProcessDefaults) -> Self {
         self.process_defaults = Arc::new(defaults);
         self
+    }
+
+    /// The bytes one Blob put may store, inclusive: the process
+    /// `write_max_bytes`, at most `BLOB_WRITE_MAX_BYTES`. A put takes no
+    /// request settings, so this is known before its body is read; ingress
+    /// reserves it and the route refuses a body past it.
+    pub(crate) fn blob_put_limit(&self) -> u64 {
+        self.process_defaults
+            .settings
+            .write_max_bytes()
+            .min(omnigraph::BLOB_WRITE_MAX_BYTES)
     }
 
     /// One session for one request: the process defaults, then the typed

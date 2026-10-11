@@ -1836,7 +1836,7 @@
             }
           },
           "413": {
-            "description": "The body exceeds 32 MiB, or the value alone or with the entity's carried Blob payloads exceeds the server's `write_max_bytes`; Request body exceeds its route limit before operation admission",
+            "description": "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
