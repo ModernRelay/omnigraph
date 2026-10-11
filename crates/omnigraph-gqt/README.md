@@ -301,7 +301,7 @@ subject that begins with
 `*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
 quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
 are fine inside the quotes. A store
-place is admitted before a mutate, load or branch step (a branch create writes
+place is admitted before a mutate, load, branch or commit step (a branch create writes
 nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
 `contention`, `skip`, or a store action, the first being `misdirect`, with
 `lose`, `error`, `corrupt` and `delay` spellable and refused at admission

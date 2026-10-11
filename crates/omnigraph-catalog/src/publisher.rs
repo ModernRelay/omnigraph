@@ -399,6 +399,16 @@ decide_seam! {
     pub static PROPOSE_POST_CANDIDATE_PRE_TAG = ("propose.post_candidate_pre_tag", AnyWrite, [Fail]);
 }
 
+decide_seam! {
+    /// After the proposal tag of a write `as commit` names its candidate
+    /// version and before the target authority is probed: the unpublished
+    /// commit is addressable, so a failure here is undone by releasing the
+    /// tag, or reported in doubt when that release fails too. It is never a
+    /// plain error, which would release a merge's input holds while the
+    /// proposal stays publishable.
+    pub static PROPOSE_POST_TAG_PRE_PROBE = ("propose.post_tag_pre_probe", AnyWrite, [Fail]);
+}
+
 impl GraphNamespacePublisher {
     #[cfg(any(test, feature = "test-util"))]
     pub fn new(root_uri: &str, branch: Option<&str>) -> Self {
@@ -1518,8 +1528,26 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 }
             }
         }
-        let latest =
-            super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref()).await?;
+        let probe = async {
+            fail(&PROPOSE_POST_TAG_PRE_PROBE)?;
+            super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref()).await
+        }
+        .await;
+        let latest = match probe {
+            Ok(latest) => latest,
+            Err(error) => {
+                return Err(
+                    match super::unpublished::release_unpublished_tag(&dataset, &name).await {
+                        Ok(()) => error,
+                        Err(release) => OmniError::manifest_publish_in_doubt(format!(
+                            "unpublished commit '{graph_commit_id}' may remain addressable: its \
+                             authority probe failed ({error}) and the tag release failed \
+                             ({release})"
+                        )),
+                    },
+                );
+            }
+        };
         if latest.version != captured_manifest_version
             || latest.branch_identifier != authority.branch_identifier
         {

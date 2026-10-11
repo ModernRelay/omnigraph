@@ -29,6 +29,7 @@ use crate::publisher::{
     CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition,
 };
 use crate::retention::{ManifestTagInventory, release_merge_input_tags};
+use crate::seams::{decide_seam, fail};
 use crate::state::{
     BranchRecords, GraphLineageRow, TablePin, TableRow, TableState, read_manifest_rows_projected,
 };
@@ -557,6 +558,14 @@ async fn judge_lifetime(
     }
 }
 
+decide_seam! {
+    /// After `commit drop` released the input holds of a merge proposal and
+    /// before it deletes the proposal tag: the proposal is still addressable
+    /// and its property still names the holds, so a retried drop releases
+    /// them again (an absent tag is a completed release) and then deletes.
+    pub static DROP_POST_INPUTS_PRE_TAG = ("drop.post_inputs_pre_tag", AnyWrite, [Fail]);
+}
+
 impl ManifestCoordinator {
     /// Write `changes` as an unpublished commit on this coordinator's branch
     /// under the exact `authority`. The live head, and this coordinator's
@@ -773,9 +782,13 @@ impl ManifestCoordinator {
         Ok(records)
     }
 
-    /// Remove the candidate's addressability and release its input holds.
+    /// Release the candidate's input holds, then remove its addressability.
     /// Publication authority is the caller's to check first: a published
-    /// commit is never dropped. The deletion is confirmed by a read.
+    /// commit is never dropped. The holds go first: they are nonce-owned and
+    /// idempotent, and a failure between the two steps leaves a readable
+    /// proposal whose retried drop releases them again, whereas holds left
+    /// after the tag is gone have no owner to name them until the target
+    /// head moves. The deletion is confirmed by a read.
     pub async fn drop_unpublished(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -783,6 +796,10 @@ impl ManifestCoordinator {
     ) -> Result<()> {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
+        if let Some(merge) = &candidate.property.merge {
+            release_merge_input_tags(&main, &merge.input_tags).await?;
+        }
+        fail(&DROP_POST_INPUTS_PRE_TAG)?;
         let name = candidate.tag_name();
         release_unpublished_tag(&main, &name).await?;
         match main.tags().get(&name).await {
@@ -790,12 +807,7 @@ impl ManifestCoordinator {
                 "the tag of unpublished commit '{}' is still listed after its deletion",
                 candidate.property.graph_commit_id
             ))),
-            Err(lance::Error::RefNotFound { .. }) => {
-                if let Some(merge) = &candidate.property.merge {
-                    release_merge_input_tags(&main, &merge.input_tags).await?;
-                }
-                Ok(())
-            }
+            Err(lance::Error::RefNotFound { .. }) => Ok(()),
             Err(error) if error.is_not_found() => Ok(()),
             Err(error) => Err(OmniError::manifest_publish_in_doubt(format!(
                 "the deletion of the tag of unpublished commit '{}' could not be confirmed: {error}",

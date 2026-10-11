@@ -9,8 +9,7 @@ Check the [release notes](../../releases/) for storage and index compatibility.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v15 in place,
-and stamps a v14 graph to v15 in place.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v15 in place, and stamps a v14 graph to v15 in place by the route `stamp-v14-to-v15`: one metadata-only commit per live branch still at v14, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. That upgrade is required before `as commit`, `commit publish` or `commit drop`, which are refused on a branch still at v14.
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
@@ -36,14 +35,6 @@ immutable objects under `__history/legacy/`, converts each live branch,
 validates what it wrote and only then removes the marker. A run that stops
 after the marker is resumed by running the same command again with the same
 executable. Never delete the marker or anything under `__history/`.
-
-A v14 graph takes the stamp-only route `stamp-v14-to-v15` instead. It writes
-one metadata-only commit per live branch still at v14, main first, and nothing
-else: no pending marker, nothing under `__history/legacy/`, no table row
-rewritten. Stop every reader and writer and take the backup as for any
-upgrade. A run that stops part-way is finished by running it again. The
-upgrade is required before `as commit`, `commit publish` or `commit drop`,
-which are refused on a branch still at v14.
 
 | `outcome` | Meaning | Exit |
 |---|---|---|

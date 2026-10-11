@@ -46,8 +46,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches; `merge --as-commit` leaves the merge unpublished | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes` | Inspect history (`list --unpublished` for a branch's unpublished commits) or one commit's entity changes | direct or served |
-| `commit publish/drop` | Publish an unpublished commit onto its recorded target branch, or drop it | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits) or one commit's entity changes; publish an unpublished commit onto its recorded target branch, or drop it | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
