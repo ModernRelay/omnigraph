@@ -1408,6 +1408,8 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                     "merged_parent_commit_id":null, "actor_id":"legacy-actor",
                     "created_at":123456,
                 });
+                let mut shown = commit.clone();
+                shown["published"] = serde_json::json!(true);
                 let reply = match operation {
                     "load" => serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,
@@ -1457,8 +1459,8 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                 let payload = parse_stdout_json(&output);
                 match operation {
                     "load" => assert_eq!(payload["total_entities"], 1),
-                    "commit-list" => assert_eq!(payload["commits"][0], commit),
-                    _ => assert_eq!(payload, commit),
+                    "commit-list" => assert_eq!(payload["commits"][0], shown),
+                    _ => assert_eq!(payload, shown),
                 }
                 let requests = data.workflow_requests();
                 assert_eq!(requests.len(), 1);

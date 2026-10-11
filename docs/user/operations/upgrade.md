@@ -1,15 +1,15 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage format v14 and never migrates a graph. A
-standalone graph at v8 or v9 (release 0.11.x) or at v13 is converted in place
-by the offline [storage upgrade](#storage-upgrade). A graph at any other
+Normal open accepts storage formats v14 and v15 (a v14 graph is stamped v15 at its first
+publish, or by the [storage upgrade](#storage-upgrade)) and never migrates a graph. A standalone
+graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offline upgrade. A graph at any other
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
 Check the [release notes](../../releases/) for storage and index compatibility.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v14 in place.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v15 in place, and stamps a v14 graph to v15 in place by the route `stamp-v14-to-v15`: one metadata-only commit per live branch still at v14, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. That upgrade is required before `as commit`, `commit publish` or `commit drop`, which are refused on a branch still at v14.
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
@@ -38,9 +38,9 @@ executable. Never delete the marker or anything under `__history/`.
 
 | `outcome` | Meaning | Exit |
 |---|---|---|
-| `check_passed` | v8, v9 or v13 graph, every check passed, nothing written | 0 |
-| `already_current` | v14 graph, nothing to do | 0 |
-| `completed` | converted, validated and served as v14 | 0 |
+| `check_passed` | v8, v9, v13 or v14 graph, every check passed, nothing written | 0 |
+| `already_current` | v15 graph, no live branch at v14, nothing to do | 0 |
+| `completed` | converted, validated and served as v15, or every live branch stamped v15 | 0 |
 | `check_failed` | a finding below; nothing was written | 1 |
 | `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
@@ -57,7 +57,7 @@ reports `retired_refs`, `orphan_writers`, `bookkeeping_versions`,
 
 | Finding | Names | What to do |
 |---|---|---|
-| `unsupported_target` | the target | `--to-format` accepts 14 only |
+| `unsupported_target` | the target | `--to-format` accepts 15 only |
 | `newer_than_binary` | the format | upgrade the binary |
 | `unsupported_source` | the format, layout, over-budget branch, or the unreadable, over-bound or table-mismatched root schema objects of a v8 or v9 graph | [rebuild](#rebuild) with the build that wrote the graph. For a retired branch, instead of rebuilding run `cleanup --keep <N> --confirm` with that build, then `upgrade --check` again; rebuild only when the retired branch stays. For root schema objects, restore the whole root from one backup, objects and tables together, then check again; the objects alone, from an older backup, no longer match the tables and are refused. An unreadable contract refuses the 0.11.x open too, so export with 0.11.x is no way out of it |
 | `source_recovery_required` | leftover recovery files, or a `.staging` root schema object of a v8 or v9 graph, each with or without a live `__schema_apply_lock__` branch | stop every writer, then open the graph read-write with 0.11.x: `omnigraph snapshot <graph>` is such an open (`upgrade --check` is not). The open removes the recovery files and finishes or rolls back a schema apply that changed the table set; a property-only `.staging` it refuses and names the manual choice between the live and the staging schema. The lock stays live after the open; the upgrade handles it (next row). Then check again |
@@ -91,15 +91,15 @@ merge base or tag needs it (without `--confirm` it is a dry run), then run
 After the upgrade, commit ids from before it resolve as before, and commit
 listing, the change feed, merges and `cleanup` read across the upgrade. A
 snapshot addressed by a catalog version below the upgrade serves the commit
-at that version, or the nearest commit below it. A v14 development build
-older than this upgrade reports pre-upgrade commit ids as not found and
-refuses full-history reads on an upgraded graph: upgrade every binary first.
+at that version, or the nearest commit below it. The upgrade lands the graph
+at v15, so a v14 development build older than this upgrade refuses the
+upgraded graph before any open: upgrade every binary first.
 
 A graph written by 0.11.x (v8 or v9) has limits of its own. Its checks read every catalog version since `init`, so a long history is slow to check.
 
 | Subject | After the upgrade |
 |---|---|
-| Root schema objects | `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph root are read as the graph's schema and must be present and consistent. The upgrade leaves them in place. v14 never reads them, and they go stale at the next schema apply. `_graph_commit_recoveries.lance/` also stays, as an unreferenced dataset |
+| Root schema objects | `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph root are read as the graph's schema and must be present and consistent. The upgrade leaves them in place. v14 and v15 never read them, and they go stale at the next schema apply. `_graph_commit_recoveries.lance/` also stays, as an unreferenced dataset |
 | Unfinished schema apply | A `.staging` copy of a root schema object, or a leftover recovery file, is refused as `source_recovery_required`, with or without a live `__schema_apply_lock__` branch: open the graph read-write with 0.11.x (`omnigraph snapshot <graph>`), which removes the recovery file and finishes or rolls back an apply that changed the table set. An apply that changed properties only leaves a `.staging` that 0.11.x refuses as well; its message names the manual choice between the live and the staging schema. 0.11.x releases the lock only inside the process that took it, so the lock stays live after that open. A live lock on an otherwise clean root is handled by the upgrade: the converted graph does not hold it as a live branch, and the next schema apply is not refused as already in progress |
 | Schema of old commits | 0.11.x kept only the latest schema, so every commit from before the upgrade is recorded under the one schema live at the upgrade. The tables and rows of an old commit are exact. A read at an old commit id is planned against the live schema, as in 0.11.x: a type added later is absent there, and a type dropped later cannot be queried |
 | Table versions above a commit | An interrupted 0.11.x write can leave them. The upgrade opens each table only at the version main's head pins and does not report them. Reads and writes ignore them, `repair` reports `foreign_drift` and `cleanup` lists them as foreign versions |
@@ -240,7 +240,7 @@ mapping is:
 | v7 | the exact unreleased development build that wrote it |
 | v8, v9 | latest 0.11.x (v8: legacy system column spellings). A standalone graph takes the [storage upgrade](#storage-upgrade) instead |
 | v10 to v13 | the main development build that wrote it; the refusal names its build dates. A standalone v13 graph takes the [storage upgrade](#storage-upgrade) instead |
-| v14 | current binary; entity export/import is not required within this storage generation |
+| v14, v15 | current binary; entity export/import is not required within this storage generation |
 
 If the graph's generation is newer than the binary, upgrade the binary instead.
 
@@ -249,8 +249,8 @@ If the graph's generation is newer than the binary, upgrade the binary instead.
 `omnigraph schema upgrade-system-columns <graph>` respells a served graph's
 legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`).
 It needs a graph that normal open accepts. The respelling
-keeps v14 and publishes the replacement contract with the renamed table
-references in one new graph commit. Columns are renamed by field id: no table
+changes no storage layout and publishes the replacement contract with the
+renamed table references in one new graph commit. Columns are renamed by field id: no table
 rows are rewritten, indexes survive, and data and existing history/commit IDs are preserved;
 `--check` runs the preflight and writes nothing; `--json` prints the report.
 The preflight refuses a graph with any non-main branch (merge what you need,

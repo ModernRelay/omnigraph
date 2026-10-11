@@ -1,0 +1,99 @@
+# issue: 773
+# red_on: 2026-10-10, main 26ef1609: step 11 row mismatch, main holds `w2` after `branch merge b1` (expected 5 rows, got 6); steps 1-10 green, both merges `merged`. Same on 80406fee (2026-09-25).
+# notes: b0 forks before w2 exists, b1 forks after. main merges b0, then b1,
+# notes: which deleted w2. The base of the b1 merge must be b1's fork point
+# notes: (w2 present); b0's older fork point (w2 absent) makes the delete vanish.
+# notes: Three main commits between b1's fork and the b0 merge are the minimum for the pre-fix
+# notes: distance-sum search to pick the older fork point; with two the sums tie and its version tie-break picks the right base.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate
+query insert_w2() {
+    insert Person { name: "w2" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate
+query insert_x1() {
+    insert Person { name: "x1" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_x2() {
+    insert Person { name: "x2" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_x3() {
+    insert Person { name: "x3" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b0
+query insert_y() {
+    insert Person { name: "y" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+
+--- expect outcome: merged
+
+--- mutate branch: b1
+query delete_w2() {
+    delete Person where name = "w2"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b1
+
+--- expect outcome: merged
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "x1"}
+{"p.name": "x2"}
+{"p.name": "x3"}
+{"p.name": "y"}
+
+--- expect shape
+p.name: String

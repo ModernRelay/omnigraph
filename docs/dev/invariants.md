@@ -51,7 +51,13 @@ five more changes like this one?**
    staged file nothing references, which a retry ignores. `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
-   abandonment. Published table effects and the accepted schema contract
+   abandonment. The one explicitly requested exception is an unpublished
+   commit (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)):
+   its detached `__manifest` version is reachable by its graph commit id
+   through the reserved tag `unpublished_<id>`, which acknowledges durable
+   snapshot addressability with `published: false` and never branch
+   visibility; the branch still changes only at the later ordinary
+   publication, and the tag expires with the captured target authority. Published table effects and the accepted schema contract
    are complete in one manifest publication; no contract-file installation
    remains. There is no side record to classify. The collector holds two properties
    on every run: safety, that every pin of every retained `__manifest`

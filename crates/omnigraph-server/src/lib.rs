@@ -141,6 +141,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_commit_publish,
+        handlers::server_commit_drop,
         handlers::server_commit_changes,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
@@ -2635,7 +2637,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
-        .route("/commits/{commit_id}", get(server_commit_show))
+        .route(
+            "/commits/{commit_id}",
+            get(server_commit_show).delete(server_commit_drop),
+        )
+        .route("/commits/{commit_id}/publish", post(server_commit_publish))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route("/changes", get(server_changes_feed))
         .route("/changes/baseline", post(server_changes_baseline))

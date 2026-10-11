@@ -329,6 +329,11 @@ pub struct BranchMergeRequest {
     /// and never fails the already-landed merge.
     #[serde(default)]
     pub delete_branch: bool,
+    /// Publish the merge as an unpublished commit (`branch merge … as commit`):
+    /// the target head is unchanged until `commit publish`. Refused together
+    /// with `delete_branch`, whose source the proposal still holds.
+    #[serde(default)]
+    pub as_commit: bool,
     /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
@@ -488,6 +493,10 @@ pub enum BranchOutcomeOutput {
         target: String,
         merge: BranchMergeOutcome,
     },
+    /// `commit publish`: the receipt's `commit` is the now-published commit.
+    Published,
+    /// `commit drop`: the unpublished commit `graph_commit_id` is gone.
+    Dropped { graph_commit_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -617,6 +626,15 @@ pub struct CommitOutput {
     /// Commit creation time as Unix epoch microseconds.
     #[schema(example = 1714000000000000i64)]
     pub created_at: i64,
+    /// `false` for an unpublished commit (a write `as commit`): readable by
+    /// its id, invisible to every branch read, until `commit publish`.
+    /// `graph_manifest_version` is then the detached version holding it.
+    #[serde(default = "published_by_default")]
+    pub published: bool,
+}
+
+fn published_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1484,6 +1502,11 @@ pub struct SnapshotQuery {
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
+    /// `true` lists the unpublished commits whose recorded target is `branch`
+    /// (writes `as commit` awaiting `commit publish`), newest first, instead
+    /// of the branch's history.
+    #[serde(default)]
+    pub unpublished: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1932,6 +1955,7 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
+        published: commit.published,
     }
 }
 

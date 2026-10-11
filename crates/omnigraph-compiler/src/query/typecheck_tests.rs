@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use super::visits::{self, Visit};
 use super::*;
 use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
@@ -67,8 +70,14 @@ fn public_ast_nulls_retain_the_checked_leaf_type_after_lowering() {
     ] {
         let mut query = parsed.single_decl().clone();
         query.return_clause[0].expr = expr;
+        let expected_occurrences = sorted(expected_visits(&query));
+        visits::start();
         let checked = typecheck_query(&catalog, &query).unwrap();
-        let lowered = crate::lower_query(&catalog, &query, &checked).unwrap();
+        assert_eq!(sorted(visits::finish()), expected_occurrences);
+        visits::start();
+        let lowered = crate::lower_query(&catalog, &checked).unwrap();
+        infer_query_result_schema(&catalog, &checked).unwrap();
+        assert_eq!(visits::finish(), Vec::new());
         let projection = &lowered.return_exprs[0];
         let expected = ExprType::from_prop(&expected);
         assert_eq!(projection.ty, expected);
@@ -78,7 +87,7 @@ fn public_ast_nulls_retain_the_checked_leaf_type_after_lowering() {
 
 /// Node type name of a binding, panicking if it is an edge binding — the two
 /// namespaces can share a type name (see `setup_same_named_node_and_edge`).
-/// Indexing `ctx.bindings` covers the unbound case with its own panic.
+/// Indexing `ctx.scope.bindings` covers the unbound case with its own panic.
 fn node_type_of(binding: &BoundVariable) -> &str {
     match binding {
         BoundVariable::Node { type_name } => type_name,
@@ -169,7 +178,11 @@ insert Shared { label: "node" }
     let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
-            ctx.targets,
+            ctx.ops
+                .iter()
+                .map(CheckedMutationOp::target)
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![MutationTarget::Node {
                 type_name: "Shared".to_string(),
             }]
@@ -235,7 +248,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -351,7 +364,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -367,7 +380,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -404,7 +417,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -717,7 +730,7 @@ limit 3
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
+    assert!(ctx.scope.bindings.contains_key("d"));
 }
 
 #[test]
@@ -735,7 +748,7 @@ limit 3
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
+    assert!(ctx.scope.bindings.contains_key("d"));
 }
 
 #[test]
@@ -754,7 +767,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -773,7 +786,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -811,7 +824,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -828,7 +841,7 @@ order { bm25($p.name, $q) desc }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -880,7 +893,7 @@ limit 5
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
+    assert!(ctx.scope.bindings.contains_key("d"));
 }
 
 #[test]
@@ -898,7 +911,7 @@ limit 5
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("d"));
+    assert!(ctx.scope.bindings.contains_key("d"));
 }
 
 #[test]
@@ -990,10 +1003,17 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(
-        ctx.traversals[0].edges.named().unwrap().direction,
+        ctx.scope
+            .traversals()
+            .next()
+            .unwrap()
+            .edges
+            .named()
+            .unwrap()
+            .direction,
         Direction::Both
     );
-    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
+    assert_eq!(node_type_of(&ctx.scope.bindings["f"]), "Person");
 }
 
 #[test]
@@ -1034,10 +1054,17 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
     assert_eq!(
-        ctx.traversals[0].edges.named().unwrap().direction,
+        ctx.scope
+            .traversals()
+            .next()
+            .unwrap()
+            .edges
+            .named()
+            .unwrap()
+            .direction,
         Direction::Out
     );
-    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
+    assert_eq!(node_type_of(&ctx.scope.bindings["f"]), "Person");
 }
 
 #[test]
@@ -1059,7 +1086,14 @@ return { $p.name }
     // $c is Company (to_type), $p is src — direction should be Out
     // because $p (Person=from_type) worksAt $c (Company=to_type) is forward
     assert_eq!(
-        ctx.traversals[0].edges.named().unwrap().direction,
+        ctx.scope
+            .traversals()
+            .next()
+            .unwrap()
+            .edges
+            .named()
+            .unwrap()
+            .direction,
         Direction::Out
     );
 }
@@ -1080,8 +1114,8 @@ return { $f.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert_eq!(ctx.traversals[0].min_hops, 1);
-    assert_eq!(ctx.traversals[0].max_hops, Some(3));
+    assert_eq!(ctx.scope.traversals().next().unwrap().min_hops, 1);
+    assert_eq!(ctx.scope.traversals().next().unwrap().max_hops, Some(3));
 }
 
 #[test]
@@ -1181,9 +1215,21 @@ fn test_cross_type_single_hop_bound_is_valid() {
             format!("query q() {{ match {{ $p: Person {traversal} }} return {{ $c.name }} }}");
         let qf = parse_query(&source).unwrap();
         let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-        assert_eq!(ctx.traversals[0].src_type, "Person", "{traversal}");
-        assert_eq!(ctx.traversals[0].dst_type, "Company", "{traversal}");
-        assert_eq!(ctx.traversals[0].max_hops, Some(1), "{traversal}");
+        assert_eq!(
+            ctx.scope.traversals().next().unwrap().src_type,
+            "Person",
+            "{traversal}"
+        );
+        assert_eq!(
+            ctx.scope.traversals().next().unwrap().dst_type,
+            "Company",
+            "{traversal}"
+        );
+        assert_eq!(
+            ctx.scope.traversals().next().unwrap().max_hops,
+            Some(1),
+            "{traversal}"
+        );
     }
 }
 
@@ -1203,7 +1249,7 @@ return { $p.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("p"));
+    assert!(ctx.scope.bindings.contains_key("p"));
 }
 
 #[test]
@@ -1244,8 +1290,8 @@ return { $fof.name }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(ctx.bindings.contains_key("mid"));
-    assert!(ctx.bindings.contains_key("fof"));
+    assert!(ctx.scope.bindings.contains_key("mid"));
+    assert!(ctx.scope.bindings.contains_key("fof"));
 }
 
 #[test]
@@ -1265,7 +1311,7 @@ insert Person {
     let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
-            ctx.targets[0],
+            *ctx.ops[0].target(),
             MutationTarget::Node {
                 type_name: "Person".to_string(),
             }
@@ -1306,7 +1352,7 @@ insert Doc {
     let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
-            ctx.targets[0],
+            *ctx.ops[0].target(),
             MutationTarget::Node {
                 type_name: "Doc".to_string(),
             }
@@ -1382,7 +1428,7 @@ insert Knows {
     let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
-            ctx.targets[0],
+            *ctx.ops[0].target(),
             MutationTarget::Edge {
                 type_name: "Knows".to_string(),
             }
@@ -1422,7 +1468,7 @@ delete Knows where from = $from
     let checked = typecheck_query_decl(&catalog, qf.single_decl()).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => assert_eq!(
-            ctx.targets[0],
+            *ctx.ops[0].target(),
             MutationTarget::Edge {
                 type_name: "Knows".to_string(),
             }
@@ -1462,7 +1508,11 @@ insert Knows { from: $name, to: $friend }
     match checked {
         CheckedQuery::Mutation(ctx) => {
             assert_eq!(
-                ctx.targets,
+                ctx.ops
+                    .iter()
+                    .map(CheckedMutationOp::target)
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 vec![
                     MutationTarget::Node {
                         type_name: "Person".to_string(),
@@ -1565,9 +1615,14 @@ return { $f.name, $w.since }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert_eq!(edge_type_of(&ctx.bindings["w"]), "Knows");
+    assert_eq!(edge_type_of(&ctx.scope.bindings["w"]), "Knows");
     assert_eq!(
-        ctx.traversals[0].edge_binding.as_deref(),
+        ctx.scope
+            .traversals()
+            .next()
+            .unwrap()
+            .edge_binding
+            .as_deref(),
         Some("w"),
         "resolved traversal carries the binding for lowering"
     );
@@ -1772,8 +1827,10 @@ return { $e.label }
     assert!(typecheck_query(&catalog, scalar_edge.single_decl()).is_ok());
 }
 
+/// An invalid Blob aggregation fails at typecheck, so no checked read exists
+/// to infer from; a valid aggregation infers through the checked read.
 #[test]
-fn test_blob_count_cannot_bypass_result_schema_inference() {
+fn test_blob_count_fails_at_typecheck_before_inference() {
     let catalog = setup_blob();
     let qf = parse_query(
         r#"
@@ -1784,22 +1841,28 @@ return { count($d.payload) }
 "#,
     )
     .unwrap();
-    let ctx = TypeContext {
-        bindings: HashMap::from([(
-            "d".to_string(),
-            BoundVariable::Node {
-                type_name: "Document".to_string(),
-            },
-        )]),
-        aliases: HashMap::new(),
-        traversals: Vec::new(),
-        subqueries: Vec::new(),
-    };
-    let error = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap_err();
+    let error = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
     assert_eq!(
         error.to_string(),
         "type error: T24: Blob property `$d.payload` is not available as a .gq read value; Blob values require a dedicated API"
     );
+
+    let qf = parse_query(
+        r#"
+query q() {
+match { $d: Document }
+return { count($d.name) }
+}
+"#,
+    )
+    .unwrap();
+    let checked = typecheck_query(&catalog, qf.single_decl()).unwrap();
+    let schema = infer_query_result_schema(&catalog, &checked).unwrap();
+    assert_eq!(schema.fields().len(), 1);
+    let field = &schema.fields()[0];
+    assert_eq!(field.name(), "count");
+    assert_eq!(field.data_type(), &arrow_schema::DataType::Int64);
+    assert!(field.is_nullable());
 }
 
 #[test]
@@ -1894,6 +1957,7 @@ return { $d.name }
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),
+        as_commit: false,
     };
     let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
     assert_eq!(
@@ -1981,7 +2045,10 @@ return { $f.name, count($w.since) }
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    assert!(matches!(&ctx.bindings["w"], BoundVariable::Edge { .. }));
+    assert!(matches!(
+        &ctx.scope.bindings["w"],
+        BoundVariable::Edge { .. }
+    ));
 }
 
 #[test]
@@ -2154,7 +2221,7 @@ fn test_boolean_expressions_are_nullable_when_an_operand_is() {
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, qf.single_decl()).unwrap();
-    let schema = infer_query_result_schema(&catalog, qf.single_decl(), &ctx).unwrap();
+    let schema = infer_query_result_schema(&catalog, &ctx).unwrap();
     let shapes: Vec<(&str, bool)> = schema
         .fields()
         .iter()
@@ -2417,7 +2484,7 @@ fn test_edge_selection_resolution_and_scope_issue_659() {
     let catalog = build_catalog(&schema).unwrap();
     let query = parse_query("query q() { match { $p: Person $c: Company $p $e:(worksAt | employs | worksAt) $c } return { $e.title, $e.@type } }").unwrap();
     let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
-    let resolved = &ctx.traversals[0];
+    let resolved = ctx.scope.traversals().next().unwrap();
     assert_eq!(
         (&resolved.src_type, &resolved.dst_type),
         (&"Person".to_string(), &"Company".to_string())
@@ -2435,17 +2502,21 @@ fn test_edge_selection_resolution_and_scope_issue_659() {
             },
         ])
     );
-    let BoundVariable::Edge { type_names } = &ctx.bindings["e"] else {
+    let BoundVariable::Edge { type_names } = &ctx.scope.bindings["e"] else {
         panic!("expected edge binding");
     };
     assert_eq!(type_names, &["Employs", "WorksAt"]);
+    let scope = TypeContext {
+        bindings: ctx.scope.bindings.clone(),
+        aliases: HashMap::new(),
+    };
     assert!(
-        read_property_type(&catalog, &ctx, "e", "title")
+        read_property_type(&catalog, &scope, "e", "title")
             .unwrap()
             .nullable
     );
     assert_eq!(
-        read_property_type(&catalog, &ctx, "e", "@type").unwrap(),
+        read_property_type(&catalog, &scope, "e", "@type").unwrap(),
         PropType::scalar(ScalarType::String, false)
     );
 
@@ -2464,11 +2535,14 @@ fn test_empty_wildcard_has_no_representative_edge_issue_659() {
     )
     .unwrap();
     let ctx = typecheck_query(&catalog, query.single_decl()).unwrap();
-    assert_eq!(ctx.traversals[0].edges, EdgeSelection::Wildcard(vec![]));
-    assert_eq!(ctx.traversals[0].src_type, "Company");
-    assert_eq!(ctx.traversals[0].dst_type, "Company");
+    assert_eq!(
+        ctx.scope.traversals().next().unwrap().edges,
+        EdgeSelection::Wildcard(vec![])
+    );
+    assert_eq!(ctx.scope.traversals().next().unwrap().src_type, "Company");
+    assert_eq!(ctx.scope.traversals().next().unwrap().dst_type, "Company");
     assert!(
-        matches!(&ctx.bindings["e"], BoundVariable::Edge { type_names } if type_names.is_empty())
+        matches!(&ctx.scope.bindings["e"], BoundVariable::Edge { type_names } if type_names.is_empty())
     );
 }
 
@@ -2480,12 +2554,21 @@ fn checked_scopes_retain_local_resolution_issue_659() {
     for selector in ["(worksAt | employs)", "(employs | worksAt)", "*"] {
         let query = parse_query(&format!("query q() {{ match {{ $c: Company exists {{ $c {selector} $p $p: Person }} }} return {{ $c.name }} }}")).unwrap();
         let checked = typecheck_query(&catalog, query.single_decl()).unwrap();
-        assert!(!checked.bindings.contains_key("p"));
-        assert!(checked.traversals.is_empty());
-        let child = &checked.subqueries[0];
+        assert!(!checked.scope.bindings.contains_key("p"));
+        assert!(checked.scope.traversals().next().is_none());
+        let child = &checked.scope.blocks().next().unwrap();
         assert!(!child.outer_bindings.contains_key("p"));
-        assert_eq!(child.inner.traversals[0].src_type, "Company");
-        selections.push(child.inner.traversals[0].edges.members().to_vec());
+        assert_eq!(child.inner.traversals().next().unwrap().src_type, "Company");
+        selections.push(
+            child
+                .inner
+                .traversals()
+                .next()
+                .unwrap()
+                .edges
+                .members()
+                .to_vec(),
+        );
     }
     assert!(selections.windows(2).all(|pair| pair[0] == pair[1]));
 }
@@ -2517,8 +2600,8 @@ fn future_outer_declarations_are_not_inner_correlations_issue_659() {
     let catalog = setup();
     let query = parse_query("query q() { match { $p: Person not { $p knows $x } $x: Company } return { $p.name, $x.name } }").unwrap();
     let checked = typecheck_query(&catalog, query.single_decl()).unwrap();
-    assert_eq!(node_type_of(&checked.bindings["x"]), "Company");
-    let block = &checked.subqueries[0];
+    assert_eq!(node_type_of(&checked.scope.bindings["x"]), "Company");
+    let block = &checked.scope.blocks().next().unwrap();
     assert!(!block.outer_bindings.contains_key("x"));
     assert_eq!(node_type_of(&block.inner.bindings["x"]), "Person");
 }
@@ -2547,4 +2630,392 @@ fn a_type_error_exposes_its_diagnostic_with_code_and_stage() {
             .iter()
             .any(|code| code.as_str() == "T1")
     );
+}
+
+/// The resolution work one checking invocation is allowed, enumerated by
+/// address from the immutable input: every `Expr` occurrence once, every
+/// literal payload once, including every list element.
+fn expected_visits(query: &QueryDecl) -> Vec<Visit> {
+    fn expr(e: &Expr, out: &mut Vec<Visit>) {
+        out.push(Visit::Expr(e as *const Expr as usize));
+        match e {
+            Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::AliasRef(_) => {}
+            Expr::Literal(lit) => literal(lit, out),
+            Expr::Nearest { query, .. } => expr(query, out),
+            Expr::Search { field, query }
+            | Expr::MatchText { field, query }
+            | Expr::Bm25 { field, query } => {
+                expr(field, out);
+                expr(query, out);
+            }
+            Expr::Fuzzy {
+                field,
+                query,
+                max_edits,
+            } => {
+                expr(field, out);
+                expr(query, out);
+                if let Some(max_edits) = max_edits {
+                    expr(max_edits, out);
+                }
+            }
+            Expr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                expr(primary, out);
+                expr(secondary, out);
+                if let Some(k) = k {
+                    expr(k, out);
+                }
+            }
+            Expr::Aggregate { arg, .. } => expr(arg, out),
+            Expr::Binary { left, right, .. }
+            | Expr::In {
+                needle: left,
+                list: right,
+            } => {
+                expr(left, out);
+                expr(right, out);
+            }
+            Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr(inner, out),
+        }
+    }
+    fn literal(lit: &Literal, out: &mut Vec<Visit>) {
+        out.push(Visit::Literal(lit as *const Literal as usize));
+        if let Literal::List(items) = lit {
+            for item in items {
+                literal(item, out);
+            }
+        }
+    }
+    fn walk_clauses(clauses: &[Clause], out: &mut Vec<Visit>) {
+        for clause in clauses {
+            match clause {
+                Clause::Binding(binding) => {
+                    for pm in &binding.prop_matches {
+                        expr(&pm.value, out);
+                    }
+                }
+                Clause::Traversal(_) => {}
+                Clause::Filter(filter) => expr(filter, out),
+                Clause::Subquery(subquery) => {
+                    walk_clauses(&subquery.clauses, out);
+                    if let Some(arg) = &subquery.arg {
+                        expr(arg, out);
+                    }
+                    expr(&subquery.right, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk_clauses(&query.match_clause, &mut out);
+    for projection in &query.return_clause {
+        expr(&projection.expr, &mut out);
+    }
+    for ordering in &query.order_clause {
+        expr(&ordering.expr, &mut out);
+    }
+    for mutation in &query.mutations {
+        match mutation {
+            Mutation::Insert(insert) => {
+                for assignment in &insert.assignments {
+                    expr(&assignment.value, &mut out);
+                }
+            }
+            Mutation::Update(update) => {
+                for assignment in &update.assignments {
+                    expr(&assignment.value, &mut out);
+                }
+                expr(&update.predicate, &mut out);
+            }
+            Mutation::Delete(delete) => expr(&delete.predicate, &mut out),
+        }
+    }
+    out
+}
+
+fn sorted(mut visits: Vec<Visit>) -> Vec<Visit> {
+    visits.sort();
+    visits
+}
+
+const ONCE_READ: &str = r#"
+query q($name: String, $min: I32) {
+match {
+    $p: Person { name: $name, active: true }
+    $p knows $f
+    $f.age > $min and not ($f.email is null)
+    $f.name in ["a", "b"]
+    $f.tags contains "x" or $f.age = $min
+    count { $f knows $m } > 0
+    max($m.age) { $f knows $m } > $min
+}
+return { $f.name, $f.age is null as missing, now() as at }
+order { $f.name desc, missing }
+limit 10
+}
+"#;
+
+const ONCE_MUTATIONS: [&str; 2] = [
+    r#"
+query m($name: String, $age: I32) {
+insert Person { name: $name, active: true, age: $age }
+update Person set { age: $age } where name = $name and age > 1
+}
+"#,
+    r#"
+query d($name: String) {
+delete Person where name contains "x" or not (active = true)
+}
+"#,
+];
+
+/// Every expression occurrence resolves once and every literal payload is
+/// typed once; lowering and schema inference resolve nothing.
+#[test]
+fn every_expression_occurrence_resolves_once() {
+    let catalog = setup_expressions();
+    let parsed = parse_query(ONCE_READ).unwrap();
+    let mut query = parsed.single_decl().clone();
+    query.return_clause.push(Projection {
+        expr: Expr::comparison(
+            Expr::Literal(Literal::Null),
+            CompOp::Eq,
+            Expr::PropAccess {
+                variable: "f".into(),
+                property: "age".into(),
+            },
+        ),
+        alias: Some("nulled".into()),
+    });
+    query.return_clause.push(Projection {
+        expr: Expr::Not(Box::new(Expr::Literal(Literal::Null))),
+        alias: Some("unknown".into()),
+    });
+    let query = &query;
+    let expected = sorted(expected_visits(query));
+    assert!(!expected.is_empty());
+
+    visits::start();
+    let checked = typecheck_query(&catalog, query).unwrap();
+    assert_eq!(sorted(visits::finish()), expected);
+
+    visits::start();
+    crate::lower_query(&catalog, &checked).unwrap();
+    infer_query_result_schema(&catalog, &checked).unwrap();
+    assert_eq!(visits::finish(), Vec::new());
+
+    for source in ONCE_MUTATIONS {
+        let parsed = parse_query(source).unwrap();
+        let query = parsed.single_decl();
+        let expected = sorted(expected_visits(query));
+        visits::start();
+        let CheckedQuery::Mutation(checked) = typecheck_query_decl(&catalog, query).unwrap() else {
+            panic!("{source} is a mutation");
+        };
+        assert_eq!(sorted(visits::finish()), expected, "{source}");
+        visits::start();
+        crate::lower_mutation_query(&catalog, &checked).unwrap();
+        assert_eq!(visits::finish(), Vec::new(), "{source}");
+    }
+}
+
+/// Positive control for the instrument: resolving one already enumerated
+/// child a second time is what the assertion above detects.
+#[test]
+fn a_second_resolution_of_one_child_fails_the_once_assertion() {
+    let catalog = setup_expressions();
+    let parsed = parse_query(ONCE_READ).unwrap();
+    let query = parsed.single_decl();
+    let expected = sorted(expected_visits(query));
+    let Some(Clause::Filter(Expr::Binary { left, .. })) = query.match_clause.get(2) else {
+        panic!("the third clause is the comparison filter");
+    };
+
+    visits::start();
+    let checked = typecheck_query(&catalog, query).unwrap();
+    let ctx = TypeContext {
+        bindings: checked.scope.bindings.clone(),
+        aliases: HashMap::new(),
+    };
+    let params = parse_declared_param_types(&query.params).unwrap();
+    resolve_expr(&catalog, left, &ctx, &params, Scope::Read).unwrap();
+    let actual = sorted(visits::finish());
+
+    assert_ne!(actual, expected);
+    let mut second = Vec::new();
+    expected_visits_of(left, &mut second);
+    let mut once_more = expected.clone();
+    once_more.extend(second);
+    assert_eq!(actual, sorted(once_more));
+}
+
+/// The visits of one expression subtree, for the control above.
+fn expected_visits_of(expr: &Expr, out: &mut Vec<Visit>) {
+    fn walk(e: &Expr, out: &mut Vec<Visit>) {
+        out.push(Visit::Expr(e as *const Expr as usize));
+        match e {
+            Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::AliasRef(_) => {}
+            Expr::Literal(lit) => {
+                out.push(Visit::Literal(lit as *const Literal as usize));
+                if let Literal::List(items) = lit {
+                    for item in items {
+                        out.push(Visit::Literal(item as *const Literal as usize));
+                    }
+                }
+            }
+            Expr::Nearest { query, .. } => walk(query, out),
+            Expr::Search { field, query }
+            | Expr::MatchText { field, query }
+            | Expr::Bm25 { field, query } => {
+                walk(field, out);
+                walk(query, out);
+            }
+            Expr::Fuzzy {
+                field,
+                query,
+                max_edits,
+            } => {
+                walk(field, out);
+                walk(query, out);
+                if let Some(max_edits) = max_edits {
+                    walk(max_edits, out);
+                }
+            }
+            Expr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                walk(primary, out);
+                walk(secondary, out);
+                if let Some(k) = k {
+                    walk(k, out);
+                }
+            }
+            Expr::Aggregate { arg, .. } => walk(arg, out),
+            Expr::Binary { left, right, .. }
+            | Expr::In {
+                needle: left,
+                list: right,
+            } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => walk(inner, out),
+        }
+    }
+    walk(expr, out);
+}
+
+/// Every source field survives into the checked tree: the optional `fuzzy`
+/// edit bound and `rrf` constant, both comparison operands, the `is not null`
+/// negation, the spelled search predicate, the row-count and column-aggregate blocks.
+#[test]
+fn checked_tree_retains_every_source_field() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Doc { text: String  score: I32?  embedding: Vector(2) }\nedge Cites: Doc -> Doc",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let parsed = parse_query(
+        r#"
+query q($q: String, $v: Vector(2)) {
+match {
+    $d: Doc
+    fuzzy($d.text, $q, 2)
+    $d.score is not null
+    count { $d cites $o } > 0
+    max($o.score) { $d cites $o } >= 1
+}
+return { $d.text }
+order { rrf(nearest($d.embedding, $v), bm25($d.text, $q), 60) }
+limit 5
+}
+"#,
+    )
+    .unwrap();
+    let checked = typecheck_query(&catalog, parsed.single_decl()).unwrap();
+    let [
+        CheckedClause::Binding(binding),
+        CheckedClause::Filter(fuzzy),
+        CheckedClause::Filter(not_null),
+        CheckedClause::Block(count),
+        CheckedClause::Block(max),
+    ] = checked.scope.clauses.as_slice()
+    else {
+        panic!("five checked clauses: {:?}", checked.scope.clauses);
+    };
+    assert_eq!(binding.variable, "d");
+    assert!(binding.matches.is_empty());
+    let TypedExpr::Binary {
+        left,
+        op: BinaryOp::Compare(CompOp::Eq),
+        right,
+        ..
+    } = fuzzy
+    else {
+        panic!("a bare search call is retained as `call = true`: {fuzzy:?}");
+    };
+    assert!(matches!(
+        left.as_ref(),
+        TypedExpr::Fuzzy {
+            max_edits: Some(max_edits),
+            ..
+        } if matches!(max_edits.as_ref(), TypedExpr::Literal { literal: Literal::Integer(2), .. })
+    ));
+    assert!(matches!(
+        right.as_ref(),
+        TypedExpr::Literal {
+            literal: Literal::Bool(true),
+            ..
+        }
+    ));
+    assert!(matches!(
+        not_null,
+        TypedExpr::IsNull {
+            negated: true,
+            inner,
+            ..
+        } if matches!(inner.as_ref(), TypedExpr::PropAccess { property, .. } if property == "score")
+    ));
+    assert!(matches!(count.aggregate, CheckedBlockAggregate::RowCount));
+    assert_eq!(count.op, CompOp::Gt);
+    assert!(matches!(
+        &max.aggregate,
+        CheckedBlockAggregate::Aggregate {
+            func: AggFunc::Max,
+            arg: TypedExpr::PropAccess { variable, property, .. },
+            ..
+        } if variable == "o" && property == "score"
+    ));
+    assert_eq!(max.op, CompOp::Ge);
+    assert!(matches!(
+        &max.right,
+        TypedExpr::Literal {
+            literal: Literal::Integer(1),
+            ..
+        }
+    ));
+    let [order] = checked.orders.as_slice() else {
+        panic!("one order key");
+    };
+    assert!(matches!(
+        &order.expr,
+        TypedExpr::Rrf {
+            primary,
+            secondary,
+            k: Some(k),
+            ..
+        } if matches!(primary.as_ref(), TypedExpr::Nearest { .. })
+            && matches!(secondary.as_ref(), TypedExpr::Bm25 { .. })
+            && matches!(k.as_ref(), TypedExpr::Literal { literal: Literal::Integer(60), .. })
+    ));
+    assert_eq!(checked.limit, Some(5));
+    assert_eq!(checked.params.len(), 2);
 }

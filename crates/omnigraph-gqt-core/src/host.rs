@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use omnigraph::Session;
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::{ParamMap, QueryResult};
@@ -87,6 +87,7 @@ pub trait ExecutionHost: Sync {
         &'a self,
         _session: &'a Session,
         _step: &'a QueryStep,
+        _target: ReadTarget,
         _params: &'a ParamMap,
     ) -> BoxFuture<'a, Result<QueryResult, String>> {
         futures::future::ready(Err(

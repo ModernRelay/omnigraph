@@ -15,7 +15,7 @@ use omnigraph_cluster::{
     validate_config_dir,
 };
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
+    BranchStmt, BranchWrite, CommitWrite, EmptyFile, FileBody, QueryFile, SettingStmt,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -770,6 +770,7 @@ async fn run(cli: Cli) -> Result<()> {
                 source,
                 into,
                 delete_branch,
+                as_commit,
                 settings,
                 json,
             } => {
@@ -787,7 +788,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let into = resolve_branch(into, None, "main");
                 echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
                 let payload = client
-                    .branch_merge(&source, &into, delete_branch, &settings)
+                    .branch_merge(&source, &into, delete_branch, as_commit, &settings)
                     .await?;
                 // Keep the successful merge receipt on stdout; optional
                 // deletion has its own structured result and human warning.
@@ -800,12 +801,21 @@ async fn run(cli: Cli) -> Result<()> {
                 if json {
                     print_json(&payload)?;
                 } else {
-                    println!(
-                        "merged {} into {}: {}",
-                        payload.source,
-                        payload.target,
-                        payload.outcome.as_str()
-                    );
+                    match payload.commit.as_ref().filter(|commit| !commit.published) {
+                        Some(commit) => println!(
+                            "merged {} into {} as commit {}: {}",
+                            payload.source,
+                            payload.target,
+                            commit.graph_commit_id,
+                            payload.outcome.as_str()
+                        ),
+                        None => println!(
+                            "merged {} into {}: {}",
+                            payload.source,
+                            payload.target,
+                            payload.outcome.as_str()
+                        ),
+                    }
                     if payload.branch_deleted == Some(true) {
                         println!("deleted branch {}", payload.source);
                     }
@@ -813,7 +823,12 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Commit { command } => match command {
-            CommitCommand::List { uri, branch, json } => {
+            CommitCommand::List {
+                uri,
+                branch,
+                unpublished,
+                json,
+            } => {
                 let client = match managed_data {
                     Some(client) => client,
                     None => {
@@ -828,11 +843,74 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?
                     }
                 };
-                let payload = client.list_commits(branch.as_deref()).await?;
+                let payload = if unpublished {
+                    client.list_unpublished_commits(branch.as_deref()).await?
+                } else {
+                    client.list_commits(branch.as_deref()).await?
+                };
                 if json {
                     print_json(&payload)?;
                 } else {
                     print_commit_list_human(&payload.commits);
+                }
+            }
+            CommitCommand::Publish {
+                uri,
+                commit_id,
+                json,
+            } => {
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                echo_write_target(
+                    cli.quiet,
+                    "commit publish",
+                    client.uri(),
+                    client.is_remote(),
+                );
+                let commit = client.commit_publish(&commit_id).await?;
+                if json {
+                    print_json(&commit)?;
+                } else {
+                    println!(
+                        "published commit {} on {}",
+                        commit.graph_commit_id,
+                        commit.graph_branch.as_deref().unwrap_or("main")
+                    );
+                }
+            }
+            CommitCommand::Drop {
+                uri,
+                commit_id,
+                json,
+            } => {
+                let client = client::GraphClient::resolve_with_policy(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                confirm_destructive("commit drop", client.uri(), cli.yes, json)?;
+                echo_write_target(cli.quiet, "commit drop", client.uri(), client.is_remote());
+                client.commit_drop(&commit_id).await?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "uri": client.uri(),
+                        "graph_commit_id": commit_id,
+                    }))?;
+                } else {
+                    println!("dropped commit {commit_id}");
                 }
             }
             CommitCommand::Show {
@@ -1432,6 +1510,10 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?
                     }
                     Ok(QueryFile {
+                        body: FileBody::Commit(write),
+                        ..
+                    }) => bail!("{}", commit_write_at_read_door(&write)),
+                    Ok(QueryFile {
                         body: FileBody::Show(id),
                         settings: prefix,
                         ..
@@ -1529,6 +1611,25 @@ async fn run(cli: Cli) -> Result<()> {
                             &client,
                             &query_source,
                             stmt,
+                            has_target,
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                            &settings,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile {
+                        body: FileBody::Commit(write),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_commit_statement_cli(
+                            &client,
+                            &query_source,
+                            write,
                             has_target,
                             name.is_some() || params_json.is_some(),
                             if_commit.is_some(),
@@ -2211,6 +2312,30 @@ async fn run_branch_statement_cli(
     }
     client
         .branch_write_statement(query_source, write, settings)
+        .await
+}
+
+/// The `mutate` door's commit-statement path: the envelope refusals a branch
+/// statement meets, drop consent, then the round trip; the proposal names its
+/// own target, so `--branch` is refused like any request target.
+#[allow(clippy::too_many_arguments)]
+async fn run_commit_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    write: CommitWrite,
+    has_target: bool,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ChangeOutput> {
+    refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
+    if let CommitWrite::Drop { .. } = &write {
+        confirm_destructive("commit drop", client.uri(), yes, json)?;
+    }
+    client
+        .commit_write_statement(query_source, write, settings)
         .await
 }
 
