@@ -275,10 +275,13 @@ existing, test-attributed, and given an added line carrying an
 alphanumeric character, not a comment or an attribute, inside its body;
 `N` must be followed by a non-digit or by the end of the line (Rust
 shape) (`issue_5630` never matches issue 563;
-`issue_563_underfill` does). The Rust shape matches only in top-level
+`issue_563_underfill` does). The Rust shape matches in top-level
 test targets, `crates/*/tests/<name>.rs` and `tools/*/tests/<name>.rs`,
-and in-source modules, `crates/*/src/**` and `tools/*/src/**`; helper and
-fixture modules under `tests/` never match (a helper named for an issue
+their `tests/integration/main.rs` roots and direct modules with a bare,
+top-level `mod <name>;` declaration in that root at the head commit, and
+in-source modules, `crates/*/src/**` and `tools/*/src/**`. Attributed
+declarations, path overrides and deeper integration modules are not resolved;
+other helper and fixture modules under `tests/` never match (a helper named for an issue
 is not a test). A plain function, however named, never satisfies the
 gate; an added definition is skipped when its name starts with `_`, when
 the line is a declaration ending in `;`, or when the same name is
@@ -697,6 +700,18 @@ header line), loop or no loop, is refused, and inside a params or expect
 body every `${...}` must name the enclosing loop's variable (no enclosing
 loop, or any other name, is refused); no escape syntax exists for a
 literal `${`.
+
+Commit bindings (RFC "Unpublished graph commits") are the one exception
+to the statement-body fence. `--- bind commit $name`, an empty section
+directly after the `--- expect` of a mutation declaration, a `branch merge`
+or a `commit publish` expected to succeed, binds that write's commit id for
+the rest of the case, across `--- restart`; a write with no commit fails
+the step, a name is bound once and used only after its binding, and a
+binding inside a loop is refused. `--- query snapshot: $name` reads at the
+bound commit. A commit control statement whose whole quoted operand is the
+name, `commit publish "${name}"` or `commit drop "${name}"`, is dispatched
+with the bound id substituted, so the engine and the server parse an
+ordinary literal; any other `${` in a statement body stays refused.
 
 Null cells: a seed row sets a nullable property to null by writing JSON
 `null` for it. A result row omits a null cell's key (the Arrow JSON writer,

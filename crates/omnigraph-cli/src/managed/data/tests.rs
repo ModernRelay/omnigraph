@@ -465,7 +465,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
 async fn identity_issuance_caches_no_permissions_and_discovers_without_control_calls() {
     let discovery = json!({"graphs":[{"graph_id":"hidden","display_name":"hidden"}]});
     let commit = json!({"graph_commit_id":"head-a","graph_branch":"main","graph_manifest_version":7,
-        "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
+        "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true});
     let data = IntentApiFixture::graph(vec![
         IntentReply::json(200, discovery.clone()),
         IntentReply::json(
@@ -885,7 +885,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         "graph_commit_id":"commit-a", "graph_branch":null,
         "graph_manifest_version":3, "parent_commit_id":"prior",
         "merged_parent_commit_id":"imported-head", "actor_id":"principal:alice",
-        "created_at":123456,
+        "created_at":123456, "published":true,
     });
     let server = IntentApiFixture::graph(vec![
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
@@ -1250,7 +1250,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
-    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345});
+    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true});
     let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.

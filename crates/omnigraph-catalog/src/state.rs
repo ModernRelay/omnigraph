@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, LargeStringArray, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance_table::format::Fragment;
 
 use crate::error::{OmniError, Result};
 use crate::history::{self, Appended, HistoryRecord};
@@ -11,19 +12,23 @@ use crate::record::expand_from_storage;
 /// The row schema's public path; it is defined in the private `record` module.
 pub use crate::record::manifest_schema;
 use crate::row::{
-    CommitColumns, CommitColumnsBuilder, RawTable, ReplacedClock, ReplacedColumns,
-    ReplacedColumnsBuilder, TableColumns, TableColumnsBuilder, metadata_measure,
+    CommitColumns, CommitColumnsBuilder, RawTable, RegistryColumns, RegistryColumnsBuilder,
+    ReplacedClock, ReplacedColumns, ReplacedColumnsBuilder, TableColumns, TableColumnsBuilder,
+    metadata_measure,
 };
 
-use super::layout::{replaced_table_object_id, table_object_id};
+use super::layout::{
+    history_block_object_id, history_merge_object_id, replaced_table_object_id, table_object_id,
+};
 use super::metadata::TableVersionMetadata;
 use super::migrations::{guard_row_layout, read_stamp};
 use super::{
-    HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT,
-    OBJECT_TYPE_REPLACED_TABLE, OBJECT_TYPE_SETTLED_COMMIT, OBJECT_TYPE_TABLE, TAIL_MAX_COMMITS,
-    TableIdentity, TableRegistration,
+    HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, OBJECT_TYPE_GRAPH_COMMIT, OBJECT_TYPE_HISTORY_BLOCK,
+    OBJECT_TYPE_HISTORY_MERGE, OBJECT_TYPE_REPLACED_TABLE, OBJECT_TYPE_SETTLED_COMMIT,
+    OBJECT_TYPE_TABLE, TAIL_MAX_COMMITS, TableIdentity, TableRegistration,
 };
 use omnigraph_core::graph_commit_id::parse_history_block_id;
+use ulid::Ulid;
 
 #[derive(Debug, Clone)]
 pub struct DatasetEntry {
@@ -540,6 +545,9 @@ pub struct BranchRecords {
     /// The merge base the merging branch resolved, when it is known: the target
     /// descends from it, so it and the commits before it are not appended again.
     pub merge_base: Option<String>,
+    /// The captured source's registry rows absent from the captured target,
+    /// imported by the target publication for later ancestry walks.
+    pub registry: LineageRegistry,
 }
 
 impl BranchRecords {
@@ -579,6 +587,7 @@ impl From<HistoryRecord> for BranchRecords {
             buffer: CommitBuffer::default(),
             head,
             merge_base: None,
+            registry: LineageRegistry::default(),
         }
     }
 }
@@ -609,8 +618,158 @@ impl history::RecordSource for HeldRecord<'_> {
     }
 }
 
+/// One released first-parent run of a history block, as a `history_block`
+/// row records it: slots `first_slot..=last_slot` of `block`, each slot's
+/// first parent the slot before it, `first_slot`'s first parent
+/// `parent_commit_id` (none for a genesis run), and the generation of
+/// `first_slot`; a later slot's generation is its distance from `first_slot`
+/// plus the jumps of the [`MergeEdge`]s between them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockRun {
+    pub block: Ulid,
+    pub first_slot: u16,
+    pub last_slot: u16,
+    pub first_generation: u64,
+    pub parent_commit_id: Option<String>,
+}
+
+/// One merge commit inside a released run, as a `history_merge` row records
+/// it: the one edge that leaves the run's chain, and the generation the merge
+/// gave its slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MergeEdge {
+    pub block: Ulid,
+    pub slot: u16,
+    pub generation: u64,
+    pub merged_parent_commit_id: String,
+}
+
+/// The block registry one `__manifest` version holds: the runs and the merge
+/// edges of released history its branch wrote or merged, sorted, one copy of
+/// each. Derived from `__history` and never its authority: a slot no run
+/// describes is read from its block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineageRegistry {
+    pub runs: Vec<BlockRun>,
+    pub merges: Vec<MergeEdge>,
+}
+
+impl LineageRegistry {
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty() && self.merges.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.runs.len() + self.merges.len()
+    }
+
+    /// Add `other`'s rows, keeping one copy of each.
+    pub fn merge(&mut self, other: &LineageRegistry) {
+        self.runs.extend(other.runs.iter().cloned());
+        self.merges.extend(other.merges.iter().cloned());
+        self.normalize();
+    }
+
+    /// Keep rows absent from the captured target, including distinct overlapping runs.
+    pub fn retain_missing(&mut self, known: &Self) {
+        let runs: HashSet<_> = known.runs.iter().collect();
+        let merges: HashSet<_> = known.merges.iter().collect();
+        self.runs.retain(|run| !runs.contains(run));
+        self.merges.retain(|edge| !merges.contains(edge));
+    }
+
+    /// Every row, taken out of the hot fragment for a cold fragment of its
+    /// own, once the hot fragment holds more than
+    /// [`crate::commit::REGISTRY_HOT_ROWS`] of them; `None` leaves the rows
+    /// where they are.
+    pub(crate) fn cold_push(&mut self) -> Option<LineageRegistry> {
+        (self.len() > crate::commit::REGISTRY_HOT_ROWS).then(|| std::mem::take(self))
+    }
+
+    /// The logical [`manifest_schema`] batch of these rows alone: what a cold
+    /// fragment holds.
+    pub(crate) fn to_batch(&self) -> Result<RecordBatch> {
+        let mut batch = RowBatch::default();
+        batch.push_registry(self);
+        batch.finish(None)
+    }
+
+    fn normalize(&mut self) {
+        self.runs.sort();
+        self.runs.dedup();
+        self.merges.sort();
+        self.merges.dedup();
+    }
+
+    /// The rows of `commits`, a first-parent run oldest first as a publish
+    /// releases it: one run per block the `hb1` ids name, split where the
+    /// block or the slot sequence changes, and one edge per merged parent.
+    /// Refuses a run whose slots are not the chain their ids claim: a slot's
+    /// first parent must be the slot before it and its generation one above
+    /// it, or more at a merge.
+    pub fn of_released<'a>(commits: impl IntoIterator<Item = &'a GraphLineageRow>) -> Result<Self> {
+        let mut registry = Self::default();
+        let mut previous: Option<(
+            &GraphLineageRow,
+            omnigraph_core::graph_commit_id::HistoryBlockId,
+        )> = None;
+        for commit in commits {
+            let Some(id) = parse_history_block_id(&commit.graph_commit_id)? else {
+                previous = None;
+                continue;
+            };
+            let continues = previous.as_ref().is_some_and(|(last, last_id)| {
+                last_id.block == id.block
+                    && last_id.slot + 1 == id.slot
+                    && commit.parent_commit_id.as_deref() == Some(last.graph_commit_id.as_str())
+            });
+            if continues {
+                let (last, _) = previous.expect("a continued run has a last commit");
+                let floor = last.generation.saturating_add(1);
+                let chain = if commit.merged_parent_commit_id.is_some() {
+                    commit.generation >= floor
+                } else {
+                    commit.generation == floor
+                };
+                if !chain {
+                    return Err(OmniError::manifest_internal(format!(
+                        "graph commit '{}' at generation {} follows '{}' at generation {} in a \
+                         released run; a run's generations rise by one, more at a merge",
+                        commit.graph_commit_id,
+                        commit.generation,
+                        last.graph_commit_id,
+                        last.generation
+                    )));
+                }
+                let run = registry.runs.last_mut().expect("a continued run is open");
+                run.last_slot = id.slot;
+            } else {
+                registry.runs.push(BlockRun {
+                    block: id.block,
+                    first_slot: id.slot,
+                    last_slot: id.slot,
+                    first_generation: commit.generation,
+                    parent_commit_id: commit.parent_commit_id.clone(),
+                });
+            }
+            if let Some(merged) = &commit.merged_parent_commit_id {
+                registry.merges.push(MergeEdge {
+                    block: id.block,
+                    slot: id.slot,
+                    generation: commit.generation,
+                    merged_parent_commit_id: merged.clone(),
+                });
+            }
+            previous = Some((commit, id));
+        }
+        registry.normalize();
+        Ok(registry)
+    }
+}
+
 /// Every row of one `__manifest` version: one row per table identity, the
-/// head commit's record, and the buffer.
+/// head commit's record, the buffer, and the block registry rows the version
+/// keeps in its hot fragment.
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestRows {
     pub(crate) tables: Vec<TableRow>,
@@ -618,6 +777,75 @@ pub(crate) struct ManifestRows {
     pub(crate) buffer: CommitBuffer,
     pub(crate) schema_contract_head: Option<SchemaContractHead>,
     pub(crate) schema_contract: Option<SchemaContractRow>,
+    pub(crate) registry: LineageRegistry,
+}
+
+/// The columns of a [`manifest_schema`] batch under construction, one entry
+/// per row in every builder.
+#[derive(Default)]
+struct RowBatch {
+    object_ids: Vec<String>,
+    object_types: Vec<&'static str>,
+    tables: TableColumnsBuilder,
+    commits: CommitColumnsBuilder,
+    replaced: ReplacedColumnsBuilder,
+    registry: RegistryColumnsBuilder,
+}
+
+impl RowBatch {
+    fn push_registry(&mut self, registry: &LineageRegistry) {
+        for run in &registry.runs {
+            self.object_ids.push(history_block_object_id(
+                run.block,
+                run.first_slot,
+                run.last_slot,
+            ));
+            self.object_types.push(OBJECT_TYPE_HISTORY_BLOCK);
+            self.tables.push_null();
+            self.commits.push_lineage_edges(
+                run.first_generation,
+                run.parent_commit_id.as_deref(),
+                None,
+            );
+            self.replaced.push_null();
+            self.registry.push_run(run);
+        }
+        for edge in &registry.merges {
+            self.object_ids
+                .push(history_merge_object_id(edge.block, edge.slot));
+            self.object_types.push(OBJECT_TYPE_HISTORY_MERGE);
+            self.tables.push_null();
+            self.commits.push_lineage_edges(
+                edge.generation,
+                None,
+                Some(&edge.merged_parent_commit_id),
+            );
+            self.replaced.push_null();
+            self.registry.push_merge(edge);
+        }
+    }
+
+    /// The batch, with `contract`'s texts on its last row, the contract row.
+    fn finish(self, contract: Option<&SchemaContractRow>) -> Result<RecordBatch> {
+        let row_count = self.object_types.len();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(self.object_ids)),
+            Arc::new(StringArray::from(self.object_types)),
+        ];
+        columns.extend(self.tables.finish());
+        columns.extend(self.commits.finish());
+        columns.extend(self.replaced.finish());
+        columns.extend(self.registry.finish());
+        let mut sources = vec![None; row_count];
+        let mut irs = vec![None; row_count];
+        if let Some(contract) = contract {
+            sources[row_count - 1] = Some(contract.source.as_str());
+            irs[row_count - 1] = Some(contract.ir.as_str());
+        }
+        columns.push(Arc::new(LargeStringArray::from(sources)));
+        columns.push(Arc::new(LargeStringArray::from(irs)));
+        RecordBatch::try_new(manifest_schema(), columns).map_err(OmniError::arrow_internal)
+    }
 }
 
 impl ManifestRows {
@@ -629,53 +857,56 @@ impl ManifestRows {
                 "cannot serialize a projected or inconsistent schema contract",
             ));
         }
-        let rows = self.tables.len() + 1 + self.buffer.commits.len() + self.buffer.replaced.len();
-        let mut object_ids = Vec::with_capacity(rows);
-        let mut object_types = Vec::with_capacity(rows);
-        let mut tables = TableColumnsBuilder::default();
-        let mut commits = CommitColumnsBuilder::default();
-        let mut replaced = ReplacedColumnsBuilder::default();
+        let mut batch = RowBatch::default();
         for table in &self.tables {
-            object_ids.push(table_object_id(table.registration.identity));
-            object_types.push(OBJECT_TYPE_TABLE);
-            tables.push(table)?;
-            commits.push_null();
-            replaced.push_null();
+            batch
+                .object_ids
+                .push(table_object_id(table.registration.identity));
+            batch.object_types.push(OBJECT_TYPE_TABLE);
+            batch.tables.push(table)?;
+            batch.commits.push_null();
+            batch.replaced.push_null();
+            batch.registry.push_null();
         }
-        object_ids.push(self.head.graph_commit_id.clone());
-        object_types.push(OBJECT_TYPE_GRAPH_COMMIT);
-        tables.push_null();
-        commits.push(&self.head);
-        replaced.push_null();
+        batch.object_ids.push(self.head.graph_commit_id.clone());
+        batch.object_types.push(OBJECT_TYPE_GRAPH_COMMIT);
+        batch.tables.push_null();
+        batch.commits.push(&self.head);
+        batch.replaced.push_null();
+        batch.registry.push_null();
         let buffered = &self.buffer.commits;
         for (index, commit) in buffered.iter().enumerate() {
             let child = buffered.get(index + 1).unwrap_or(&self.head);
-            object_ids.push(commit.graph_commit_id.clone());
-            object_types.push(OBJECT_TYPE_SETTLED_COMMIT);
-            tables.push_null();
-            commits.push_settled(
+            batch.object_ids.push(commit.graph_commit_id.clone());
+            batch.object_types.push(OBJECT_TYPE_SETTLED_COMMIT);
+            batch.tables.push_null();
+            batch.commits.push_settled(
                 commit,
                 index.checked_sub(1).map(|_| &buffered[index - 1]),
                 child,
             );
-            replaced.push_null();
+            batch.replaced.push_null();
+            batch.registry.push_null();
         }
+        batch.push_registry(&self.registry);
         let current: HashMap<TableIdentity, &TableRow> = self
             .tables
             .iter()
             .map(|table| (table.registration.identity, table))
             .collect();
         for row in &self.buffer.replaced {
-            object_ids.push(replaced_table_object_id(row.identity(), row.replaced_at));
-            object_types.push(OBJECT_TYPE_REPLACED_TABLE);
+            batch
+                .object_ids
+                .push(replaced_table_object_id(row.identity(), row.replaced_at));
+            batch.object_types.push(OBJECT_TYPE_REPLACED_TABLE);
             let current = current.get(&row.identity()).copied();
             let registered = match &row.before {
                 ReplacedRow::Table(table) => {
-                    tables.push_replaced(table, current)?;
+                    batch.tables.push_replaced(table, current)?;
                     false
                 }
                 ReplacedRow::Unregistered(registration) => {
-                    tables.push_replaced(
+                    batch.tables.push_replaced(
                         &TableRow {
                             registration: registration.clone(),
                             state: TableState::Registered,
@@ -685,37 +916,25 @@ impl ManifestRows {
                     true
                 }
             };
-            commits.push_null();
-            replaced.push(ReplacedClock {
+            batch.commits.push_null();
+            batch.replaced.push(ReplacedClock {
                 replaced_at: row.replaced_at,
                 registered,
             });
+            batch.registry.push_null();
         }
 
         if let Some(contract) = &self.schema_contract {
-            object_ids.push(crate::SCHEMA_CONTRACT_OBJECT_ID.to_string());
-            object_types.push(crate::OBJECT_TYPE_SCHEMA_CONTRACT);
-            tables.push_contract(&contract.head)?;
-            commits.push_null();
-            replaced.push_null();
+            batch
+                .object_ids
+                .push(crate::SCHEMA_CONTRACT_OBJECT_ID.to_string());
+            batch.object_types.push(crate::OBJECT_TYPE_SCHEMA_CONTRACT);
+            batch.tables.push_contract(&contract.head)?;
+            batch.commits.push_null();
+            batch.replaced.push_null();
+            batch.registry.push_null();
         }
-        let row_count = object_types.len();
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(object_ids)),
-            Arc::new(StringArray::from(object_types)),
-        ];
-        columns.extend(tables.finish());
-        columns.extend(commits.finish());
-        columns.extend(replaced.finish());
-        let mut sources = vec![None; row_count];
-        let mut irs = vec![None; row_count];
-        if let Some(contract) = &self.schema_contract {
-            sources[row_count - 1] = Some(contract.source.as_str());
-            irs[row_count - 1] = Some(contract.ir.as_str());
-        }
-        columns.push(Arc::new(LargeStringArray::from(sources)));
-        columns.push(Arc::new(LargeStringArray::from(irs)));
-        RecordBatch::try_new(manifest_schema(), columns).map_err(OmniError::arrow_internal)
+        batch.finish(self.schema_contract.as_ref())
     }
 
     /// The records of the buffered commits, oldest first, and of the head.
@@ -727,6 +946,7 @@ impl ManifestRows {
                 tables: self.tables.clone(),
             },
             merge_base: None,
+            registry: self.registry.clone(),
         }
     }
 
@@ -864,14 +1084,54 @@ async fn scan_manifest_rows(
     scan_rows_unguarded(dataset, with_content).await
 }
 
+/// The fragment of a `__manifest` version that holds its head row, buffer,
+/// `table` rows, schema contract and hot registry rows: the one with the
+/// highest id, which every publish lists last among the fragments it writes
+/// (`commit.rs`). A version of one fragment is all hot.
+pub(crate) fn hot_fragment(dataset: &Dataset) -> Result<Fragment> {
+    dataset
+        .fragments()
+        .iter()
+        .max_by_key(|fragment| fragment.id)
+        .cloned()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "`__manifest` version {} holds no fragment",
+                dataset.version().version
+            ))
+        })
+}
+
+/// The fragments of a `__manifest` version beside [`hot_fragment`]: each holds
+/// cold registry rows and nothing else, and a publish names it again without
+/// rewriting it.
+pub(crate) fn cold_fragments(dataset: &Dataset) -> Vec<Fragment> {
+    let hot = dataset.fragments().iter().map(|fragment| fragment.id).max();
+    dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| Some(fragment.id) != hot)
+        .cloned()
+        .collect()
+}
+
+/// A scan of `dataset` over its hot fragment alone when it has cold ones.
+fn hot_scanner(dataset: &Dataset) -> Result<lance::dataset::scanner::Scanner> {
+    let mut scanner = dataset.scan();
+    if dataset.fragments().len() > 1 {
+        scanner.with_fragments(vec![hot_fragment(dataset)?]);
+    }
+    Ok(scanner)
+}
+
 /// [`scan_manifest_rows`] without the stamp and pending-key guard, which the
-/// caller has answered for.
+/// caller has answered for. Reads the hot fragment only.
 async fn scan_rows_unguarded(
     dataset: &Dataset,
     with_content: bool,
 ) -> Result<(ManifestRows, Option<OmniError>)> {
     crate::instrumentation::record_manifest_scan();
-    let mut scanner = dataset.scan();
+    let mut scanner = hot_scanner(dataset)?;
     scanner
         .project(&crate::record::packed_projection(dataset, with_content))
         .map_err(OmniError::storage)?;
@@ -885,6 +1145,33 @@ async fn scan_rows_unguarded(
     }
     let error = rows.content_error.take();
     Ok((rows.finish()?, error))
+}
+
+/// The registry rows of `fragments`, cold fragments of `dataset`, which hold
+/// no other row. One scan, so one request per fragment; a merge keeps the
+/// result per handle.
+pub(crate) async fn read_cold_registry(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<LineageRegistry> {
+    if fragments.is_empty() {
+        return Ok(LineageRegistry::default());
+    }
+    crate::instrumentation::record_manifest_scan();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(fragments.to_vec());
+    scanner
+        .project(&crate::record::packed_projection(dataset, false))
+        .map_err(OmniError::storage)?;
+    let mut batches = scanner
+        .try_into_stream()
+        .await
+        .map_err(OmniError::storage)?;
+    let mut rows = RowsDecoder::default();
+    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+        rows.push(&batch, Some(dataset.version().version), false)?;
+    }
+    rows.into_registry()
 }
 
 /// Strict decoding of the acknowledged batch retained by the publisher cache.
@@ -906,6 +1193,7 @@ struct RowsDecoder {
     head: Option<GraphLineageRow>,
     buffered: Vec<(GraphLineageRow, bool)>,
     replaced: BTreeMap<(u64, TableIdentity), (ReplacedClock, RawTable)>,
+    registry: LineageRegistry,
     version: Option<u64>,
 }
 
@@ -936,6 +1224,7 @@ impl RowsDecoder {
         let table_columns = TableColumns::new(&lookup)?;
         let commit_columns = CommitColumns::new(&lookup)?;
         let replaced_columns = ReplacedColumns::new(&lookup)?;
+        let registry_columns = RegistryColumns::new(&lookup)?;
         if with_content && self.content_error.is_none() {
             if let Err(error) = fold_schema_contract_batch(&batch, &mut self.schema_contract) {
                 self.content_error = Some(error);
@@ -957,12 +1246,66 @@ impl RowsDecoder {
                     !table_columns.is_null(row) || !replaced_columns.is_null(row)
                 }
                 OBJECT_TYPE_REPLACED_TABLE => !commit_columns.is_null(row),
+                OBJECT_TYPE_HISTORY_BLOCK | OBJECT_TYPE_HISTORY_MERGE => {
+                    !table_columns.is_null(row)
+                        || !replaced_columns.is_null(row)
+                        || !commit_columns.holds_only_lineage_edges(row)
+                }
                 _ => false,
             };
-            if foreign {
+            let registry_row = matches!(
+                object_type,
+                OBJECT_TYPE_HISTORY_BLOCK | OBJECT_TYPE_HISTORY_MERGE
+            );
+            if foreign || (!registry_row && !registry_columns.is_null(row)) {
                 return Err(foreign_fields(object_type, row));
             }
             match object_type {
+                OBJECT_TYPE_HISTORY_BLOCK => {
+                    let (block, first_slot, last_slot) = registry_columns.decode(row)?;
+                    let (generation, parent_commit_id, merged) =
+                        commit_columns.lineage_edges(row)?;
+                    let expected = history_block_object_id(block, first_slot, last_slot);
+                    if object_ids.value(row) != expected
+                        || first_slot > last_slot
+                        || merged.is_some()
+                    {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest history_block row at index {row} has object_id '{}', \
+                             expected '{expected}' with no merged parent",
+                            object_ids.value(row)
+                        )));
+                    }
+                    self.registry.runs.push(BlockRun {
+                        block,
+                        first_slot,
+                        last_slot,
+                        first_generation: generation,
+                        parent_commit_id,
+                    });
+                }
+                OBJECT_TYPE_HISTORY_MERGE => {
+                    let (block, slot, last_slot) = registry_columns.decode(row)?;
+                    let (generation, parent_commit_id, merged) =
+                        commit_columns.lineage_edges(row)?;
+                    let expected = history_merge_object_id(block, slot);
+                    let (Some(merged_parent_commit_id), None) = (merged, parent_commit_id) else {
+                        return Err(foreign_fields(object_type, row));
+                    };
+                    if object_ids.value(row) != expected || slot != last_slot {
+                        return Err(OmniError::manifest_internal(format!(
+                            "manifest history_merge row at index {row} has object_id '{}', \
+                             expected '{expected}'",
+                            object_ids.value(row)
+                        )));
+                    }
+                    self.registry.merges.push(MergeEdge {
+                        block,
+                        slot,
+                        generation,
+                        merged_parent_commit_id,
+                    });
+                }
                 crate::OBJECT_TYPE_SCHEMA_CONTRACT => {
                     if !commit_columns.is_null(row) || !replaced_columns.is_null(row) {
                         return Err(foreign_fields(object_type, row));
@@ -1122,13 +1465,34 @@ impl RowsDecoder {
                 before,
             });
         }
+        let mut registry = self.registry;
+        registry.normalize();
         Ok(ManifestRows {
             schema_contract_head: self.schema_contract_head,
             schema_contract: self.schema_contract,
             tables: self.tables.into_values().collect(),
             head,
             buffer: CommitBuffer { commits, replaced },
+            registry,
         })
+    }
+
+    /// The rows of cold fragments: registry rows and nothing else.
+    fn into_registry(self) -> Result<LineageRegistry> {
+        if self.head.is_some()
+            || !self.tables.is_empty()
+            || !self.buffered.is_empty()
+            || !self.replaced.is_empty()
+            || self.schema_contract_head.is_some()
+            || self.schema_contract.is_some()
+        {
+            return Err(OmniError::manifest_internal(
+                "a cold fragment of `__manifest` holds rows beside the block registry",
+            ));
+        }
+        let mut registry = self.registry;
+        registry.normalize();
+        Ok(registry)
     }
 }
 
@@ -1305,7 +1669,7 @@ pub(crate) async fn read_schema_contract_row(
 ) -> Result<SchemaContractRow> {
     require_schema_content(dataset)?;
     crate::instrumentation::record_manifest_scan();
-    let mut scanner = dataset.scan();
+    let mut scanner = hot_scanner(dataset)?;
     scanner
         .project(&crate::record::packed_projection(dataset, true))
         .map_err(OmniError::storage)?;
@@ -1340,7 +1704,7 @@ pub(crate) fn schema_contract_from_batch(
 
 fn require_schema_content(dataset: &Dataset) -> Result<()> {
     let stamp = read_stamp(dataset);
-    if stamp != Some(crate::INTERNAL_MANIFEST_SCHEMA_VERSION)
+    if !stamp.is_some_and(crate::migrations::is_served_stamp)
         || crate::record::SCHEMA_CONTENT_COLUMNS
             .iter()
             .any(|name| dataset.schema().field(name).is_none())

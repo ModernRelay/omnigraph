@@ -79,7 +79,7 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline upgrade to stamp 14, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 15, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
 commit to its activation commit; the value is the `UpgradeIntent`, whose
 `source_format` names the route. Ordinary
@@ -256,7 +256,7 @@ The v8 storage fence keeps older binaries from exposing retired branches.
   visibility, a partial legacy write completed on retry, a resume after the
   directory running no census, and the `recovery_required` reports for a
   foreign intent, a changed source and a modified legacy object.
-- `crates/omnigraph/tests/recovery.rs` owns manifest-only contract admission,
+- `crates/omnigraph/tests/integration/recovery.rs` owns manifest-only contract admission,
   ignored orphan schema artifacts, read-only opens without writes, and legacy
   sidecars refusing read-write but not read-only open.
 - The initialization cells in `failpoints.rs` own exact-genesis recovery,

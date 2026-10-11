@@ -352,10 +352,11 @@ compare-and-swap on the graph branch incarnation and the logical graph head
 the writer captured when it staged: `db/omnigraph/table_ops.rs` captures both
 into the publication precondition, and `db/manifest/publisher.rs` checks both
 on every attempt before it touches table pins. It is not a swap on a physical
-`__manifest` version. `compact_internal_table` advances a branch's physical
-`__manifest` HEAD without moving either value (`db/omnigraph/optimize.rs`),
-so a writer staged at physical version 20 and head H can still publish after
-compaction produces physical 21 at the same head. Every detached commit
+`__manifest` version. Removing obsolete automatic-cleanup configuration
+advances main's physical `__manifest` HEAD without moving either value
+(`db/omnigraph/optimize.rs`), so a writer staged at physical version 20 and
+head H can still publish after that metadata update produces physical 21 at
+the same head. Every detached commit
 therefore records that authority in its transaction properties, under the keys
 `omnigraph.staged_against_branch_incarnation` and
 `omnigraph.staged_against_graph_head`, and the collector reads its owner from

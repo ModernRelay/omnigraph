@@ -144,10 +144,20 @@ mod tests {
     use super::*;
 
     fn lit(literal: Literal) -> IRExpr {
-        let ty = ExprType::from_prop(
-            &crate::query::typecheck::literal_type(&literal).expect("valid test literal"),
-        );
-        IRExpr::Literal(literal, ty)
+        let scalar_of = |literal: &Literal| match literal {
+            Literal::Null | Literal::String(_) => ScalarType::String,
+            Literal::Integer(_) => ScalarType::I64,
+            Literal::Float(_) => ScalarType::F64,
+            Literal::Bool(_) => ScalarType::Bool,
+            Literal::Date(_) => ScalarType::Date,
+            Literal::DateTime(_) => ScalarType::DateTime,
+            other => panic!("fold tests use scalar literals, got {other:?}"),
+        };
+        let prop = match &literal {
+            Literal::List(items) => PropType::list_of(scalar_of(&items[0]), false),
+            scalar => PropType::scalar(scalar_of(scalar), matches!(scalar, Literal::Null)),
+        };
+        IRExpr::Literal(literal, ExprType::from_prop(&prop))
     }
 
     fn compared(left: Literal, op: CompOp, right: Literal) -> IRExpr {
