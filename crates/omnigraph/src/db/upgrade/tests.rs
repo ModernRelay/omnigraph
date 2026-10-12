@@ -42,7 +42,7 @@ async fn manifest_version(uri: &str) -> u64 {
 
 const RERUN: (&str, &str) = (
     "this omnigraph executable",
-    "then rerun `omnigraph upgrade <graph> --to-format 15` without `--check`",
+    "then rerun `omnigraph upgrade <graph> --to-format 16` without `--check`",
 );
 const PRESERVE_AND_CHECK: (&str, &str) = (
     "the omnigraph executable that started the conversion",
@@ -58,11 +58,11 @@ const FENCING_EXECUTABLE: (&str, &str) = (
 
 /// The route names a report carries, spelled out: a change of `handler` is a
 /// change of what operators and their tooling read.
-const UNROUTED: &str = "history-lance-files-to-v15";
-const FROM_8: &str = "history-lance-files-v8-to-v15";
-const FROM_9: &str = "history-lance-files-v9-to-v15";
-const FROM_13: &str = "history-lance-files-v13-to-v15";
-const STAMP: &str = "stamp-v14-to-v15";
+const UNROUTED: &str = "history-lance-files-to-v16";
+const FROM_8: &str = "history-lance-files-v8-to-v16";
+const FROM_9: &str = "history-lance-files-v9-to-v16";
+const FROM_13: &str = "history-lance-files-v13-to-v16";
+const STAMP: &str = "stamp-v14-to-v16";
 
 fn route_name(stamp: u32) -> &'static str {
     match stamp {
@@ -494,7 +494,7 @@ async fn served(root: &str, native: Option<&str>) -> (Vec<String>, Vec<(String, 
     (keys, heads)
 }
 
-/// Every live ref of `source` is converted: served under stamp 15 with its
+/// Every live ref of `source` is converted: served under stamp 16 with its
 /// own head alone, and main is activated three versions above its source.
 async fn assert_converted(source: &Source) {
     let root = source.root.as_str();
@@ -619,8 +619,8 @@ async fn a_target_other_than_the_served_format_is_unsupported() {
         assert_eq!(codes(&report), ["unsupported_target"]);
         assert_eq!(
             report.findings[0].message,
-            "this binary converts storage formats v8, v9 and v13 to v15, stamps v14 to v15 and \
-             serves both; `--to-format` accepts 15 only"
+            "this binary converts storage formats v8, v9 and v13 to v16, stamps v14 to v16 and \
+             serves both; `--to-format` accepts 16 only"
         );
         assert_eq!(report.target_format, target);
         assert!(!report.target_defaulted);
@@ -693,7 +693,7 @@ async fn a_pending_conversion_with_a_valid_intent_is_reported_by_check_as_pendin
         let guidance = pending_report(&json, true, "pending_upgrade", handler).await;
         assert!(
             guidance.contains(&format!(
-                "the pending storage conversion of attempt {attempt} to format v15"
+                "the pending storage conversion of attempt {attempt} to format v16"
             )) && guidance.contains(
                 "rerun `omnigraph upgrade <graph>` without `--check` with this executable"
             ),
@@ -805,7 +805,7 @@ async fn converted_once(stamp: u32) {
     );
     for again in [check(&source.root).await, execute(&source.root).await] {
         assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
-        assert_eq!(again.observed_format, Some(15));
+        assert_eq!(again.observed_format, Some(16));
     }
     assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
 }
@@ -837,12 +837,23 @@ async fn version_of(uri: &str, native: Option<&str>) -> u64 {
 /// main first, under the stamp route; `--check` writes nothing, a rerun is
 /// current, and the graph opens.
 #[tokio::test]
-async fn a_v14_graph_is_stamped_v15_per_live_ref() {
+async fn a_v14_graph_is_stamped_current_per_live_ref() {
+    stamped_current_per_live_ref(14).await;
+}
+
+/// A v15 graph takes the same stamp route: the stamp fences a v15 binary off
+/// the reserved `unattached_` tags, nothing in its rows changes.
+#[tokio::test]
+async fn a_v15_graph_is_stamped_current_per_live_ref() {
+    stamped_current_per_live_ref(15).await;
+}
+
+async fn stamped_current_per_live_ref(stamp: u32) {
     let (dir, uri) = fresh_graph().await;
     let feature = forked_branch(&uri, "feature").await;
     for native in [None, Some(feature.as_str())] {
         let mut manifest = open(&uri, native).await.unwrap();
-        set_stamp_for_test(&mut manifest, 14).await.unwrap();
+        set_stamp_for_test(&mut manifest, stamp).await.unwrap();
     }
     let versions = (
         version_of(&uri, None).await,
@@ -851,7 +862,7 @@ async fn a_v14_graph_is_stamped_v15_per_live_ref() {
     let before = stored_files(dir.path());
     let checked = check(&uri).await;
     assert_eq!(checked.outcome, UpgradeOutcome::CheckPassed, "{checked:?}");
-    assert_eq!(checked.observed_format, Some(14));
+    assert_eq!(checked.observed_format, Some(stamp));
     assert_eq!(checked.route, [STAMP]);
     assert!(checked.completed_handlers.is_empty());
     assert_eq!(checked.work.live_refs, 2);
@@ -867,8 +878,8 @@ async fn a_v14_graph_is_stamped_v15_per_live_ref() {
         Some(format!("stamped:ref '{feature}'").as_str())
     );
     assert_eq!(report.work.live_refs, 2);
-    assert_eq!(stamp_of(&uri, None).await, Some(15));
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    assert_eq!(stamp_of(&uri, None).await, Some(16));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(version_of(&uri, None).await, versions.0 + 1);
     assert_eq!(version_of(&uri, Some(&feature)).await, versions.1 + 1);
 
@@ -894,11 +905,45 @@ async fn a_live_ref_left_at_v14_is_stamped_alone() {
 
     let report = execute(&uri).await;
     assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
-    assert_eq!(report.observed_format, Some(15));
+    assert_eq!(report.observed_format, Some(16));
     assert_eq!(report.completed_handlers, [STAMP]);
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(version_of(&uri, None).await, main_version);
     assert_eq!(version_of(&uri, Some(&feature)).await, feature_version + 1);
+    assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
+}
+
+/// A v15 graph is served as it is: reads and ordinary publishes need no
+/// upgrade, the first publish on a ref stamps that ref 16 and leaves the
+/// other at 15, and the stamp-only route finishes the rest.
+#[tokio::test]
+async fn a_v15_graph_is_served_and_stamped_by_its_first_publish() {
+    let (_dir, uri) = fresh_graph().await;
+    let feature = forked_branch(&uri, "feature").await;
+    for native in [None, Some(feature.as_str())] {
+        let mut manifest = open(&uri, native).await.unwrap();
+        set_stamp_for_test(&mut manifest, 15).await.unwrap();
+    }
+    let graph = Arc::new(Omnigraph::open(&uri).await.unwrap());
+    for branch in ["main", "feature"] {
+        graph
+            .snapshot_of(crate::db::ReadTarget::branch(branch))
+            .await
+            .unwrap();
+    }
+    insert(&graph, "main", "served").await;
+    assert_eq!(stamp_of(&uri, None).await, Some(16));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    drop(graph);
+
+    let report = execute(&uri).await;
+    assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+    assert_eq!(report.completed_handlers, [STAMP]);
+    assert_eq!(
+        report.last_durable_completed_boundary.as_deref(),
+        Some(format!("stamped:ref '{feature}'").as_str())
+    );
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
     assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
 }
 
@@ -2475,6 +2520,27 @@ fn commit_ids(commits: &[crate::db::GraphCommit]) -> Vec<&str> {
 
 /// The `Person` roots of the collector's plan for `options`, with every
 /// branch's retained versions; the plan must find nothing to report as an error.
+/// Every detached `Person` manifest on disk.
+async fn person_detached_versions(
+    graph: &Omnigraph,
+    root: &str,
+) -> std::collections::BTreeSet<u64> {
+    let snapshot = graph
+        .snapshot_of(crate::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let path = &snapshot.dataset(PERSON).unwrap().dataset_path;
+    lance::Dataset::open(&format!("{root}/{path}"))
+        .await
+        .unwrap()
+        .list_detached_manifests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|manifest| manifest.version)
+        .collect()
+}
+
 async fn person_roots(
     graph: &Omnigraph,
     options: crate::db::CleanupPolicyOptions,
@@ -2533,15 +2599,35 @@ async fn cleanup_after_upgrade_with_keep_four_and_older_than() {
         assert_eq!(branches, [main, feature.clone()]);
         assert_eq!(roots, pinned_roots);
     }
-    for options in [week, keep(4)] {
+    // The first write ("a") was Person's first rows, so its effect lies
+    // beneath the full-text declaration commit 2 pins: the one link no
+    // commit pins. The first cleanup reclaims it and nothing else; every
+    // pinned root and every served version stays.
+    let links: std::collections::BTreeSet<u64> = person_detached_versions(&graph, &source.root)
+        .await
+        .difference(&pinned_roots)
+        .copied()
+        .collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    for (round, options) in [week, keep(4)].into_iter().enumerate() {
         let stats = graph.cleanup(options).await.unwrap();
+        let reclaimed = |table_key: &str| {
+            if round == 0 && table_key == PERSON {
+                links.len() as u64
+            } else {
+                0
+            }
+        };
         assert!(
-            stats
-                .iter()
-                .all(|row| row.error.is_none() && row.manifests_removed == 0),
+            stats.iter().all(|row| row.error.is_none()
+                && row.manifests_removed == reclaimed(&row.type_key)),
             "{stats:?}"
         );
     }
+    assert_eq!(
+        person_detached_versions(&graph, &source.root).await,
+        pinned_roots
+    );
     assert_eq!(names(&graph, "main").await, ["a", "c"]);
     assert_eq!(names(&graph, "feature").await, ["a", "b"]);
     for (version, rows) in (1..).zip(counts) {
@@ -3414,7 +3500,7 @@ mod interrupted {
             assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
             if !activated {
                 assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
-                assert_eq!(resumed.observed_format, Some(15), "{context}");
+                assert_eq!(resumed.observed_format, Some(16), "{context}");
                 assert_eq!(resumed.route, [route_name(stamp)], "{context}");
                 assert_eq!(
                     resumed.work.census_reads > 0,

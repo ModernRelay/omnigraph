@@ -184,24 +184,24 @@ fn manifest_guard_reads_cargo_dependency_tables_only() {
     assert_eq!(refused_dependencies("dependencies = {}\n"), none);
 
     assert_eq!(
-        refused_dependencies("[dependencies]\nserde_yaml = { workspace = true }\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[dependencies]\nyaml_serde = { workspace = true }\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
-        refused_dependencies("[dependencies.serde_yaml]\nworkspace = true\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[dependencies.yaml_serde]\nworkspace = true\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
-        refused_dependencies("[\"depend\\u0065ncies\"]\nserde_yaml.workspace = true\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[\"depend\\u0065ncies\"]\nyaml_serde.workspace = true\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
         refused_dependencies("dependencies.libc.version = \"0.2\"\n"),
         vec!["dependencies.libc"]
     );
     assert_eq!(
-        refused_dependencies("target.'cfg(unix)'.dependencies.serde_yaml.workspace = true\n"),
-        vec!["target.cfg(unix).dependencies.serde_yaml"]
+        refused_dependencies("target.'cfg(unix)'.dependencies.yaml_serde.workspace = true\n"),
+        vec!["target.cfg(unix).dependencies.yaml_serde"]
     );
     assert_eq!(
         refused_dependencies("[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
@@ -981,8 +981,8 @@ fn seam_at_names(case: &str) -> Vec<String> {
             continue;
         }
         let body = lines[start + 1..end].join("\n");
-        if let Ok(serde_yaml::Value::Mapping(fields)) = serde_yaml::from_str(&body)
-            && let Some(at) = fields.get("at").and_then(serde_yaml::Value::as_str)
+        if let Ok(yaml_serde::Value::Mapping(fields)) = yaml_serde::from_str(&body)
+            && let Some(at) = fields.get("at").and_then(yaml_serde::Value::as_str)
         {
             names.push(at.to_string());
         }

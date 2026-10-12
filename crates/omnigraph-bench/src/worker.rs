@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn worker_refuses_identity_mismatch_before_opening_a_store() {
-        let case: crate::legacy::case::CaseV1 = serde_yaml::from_str(
+        let case: crate::legacy::case::CaseV1 = yaml_serde::from_str(
             r#"
 version: 1
 id: worker-identity-test

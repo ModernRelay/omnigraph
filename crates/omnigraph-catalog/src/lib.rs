@@ -61,10 +61,17 @@ pub mod publisher;
 pub mod read_executor;
 pub mod retention;
 pub mod state;
+pub mod unattached;
 pub mod unpublished;
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
-    UNPUBLISHED_COMMITS_STAMP, require_unpublished_commits, supports_unpublished_commits,
+    UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
+    require_unpublished_commits, supports_unattached_branches, supports_unpublished_commits,
+};
+pub use unattached::{
+    CandidateProperty, UNATTACHED_PROPERTY_VERSION, UNATTACHED_TAG_PREFIX, UnattachedCommit,
+    UnattachedCommitProperty, UnattachedExpiry, UnattachedInventoryReader, UnattachedLifetime,
+    is_unattached_tag, unattached_tag_name, unattached_tag_parts, unattached_tag_root_prefix,
 };
 pub use unpublished::{
     UNPUBLISHED_TAG_PREFIX, UnpublishedCommit, UnpublishedCommitProperty, UnpublishedExpiry,
@@ -94,7 +101,10 @@ use metadata::{
 pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub use publisher::{CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition};
+pub use publisher::{
+    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, UnattachedIntent,
+    UnattachedOutcome, UnattachedWriteBase,
+};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
 use state::read_schema_contract_row;
@@ -507,6 +517,40 @@ impl SnapshotDataset {
     /// Whether this dataset has a user full-text index on physical `column`.
     pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
         crate::dataset_index::has_fts_index_on(&self.dataset, column).await
+    }
+
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        crate::dataset_index::has_fts_postings_on(&self.dataset, column).await
+    }
+
+    /// The names of this version's built index entries: every entry of the
+    /// raw index-metadata section, read without the current reader's
+    /// supported-version filtering (see [`Self::has_raw_index_section`]),
+    /// except untrained full-text segments, which index no row. System
+    /// entries count as built. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        if !self.has_raw_index_section() {
+            return Ok(Vec::new());
+        }
+        let store = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            &store,
+            self.dataset.manifest_location(),
+            self.dataset.manifest(),
+        )
+        .await
+        .map_err(OmniError::storage)?;
+        Ok(indices
+            .into_iter()
+            .filter(|index| !crate::dataset_index::is_untrained_full_text(index))
+            .map(|index| index.name)
+            .collect())
     }
 
     /// Whether this dataset has a user vector index on physical `column`.

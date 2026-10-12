@@ -4,7 +4,7 @@
 # notes: keeps edge multiplicity, hidden filter/order dependencies survive,
 # notes: and a bare destination retains its non-Blob, non-Vector properties.
 # notes: physical memory coverage: omnigraph/tests/engine_v2_memory.rs;
-# notes: overflow geometry: omnigraph/tests/repro_issue_703.rs.
+# notes: overflow geometry: omnigraph/tests/integration/repro_issue_703.rs.
 
 --- runner
 timeout_ms: 10000

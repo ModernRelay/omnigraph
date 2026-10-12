@@ -10,21 +10,21 @@
 // re-materializes ~2.4 GiB of text (over the ceiling).
 //
 // Expensive (loads ~1.2 GiB, builds an inverted index over it): run explicitly
-//   cargo test -p omnigraph-engine --test repro_issue_563 -- --ignored --nocapture
+//   cargo test -p omnigraph-engine --test integration repro_issue_563:: -- --ignored --nocapture
 //
 // This is the SYMPTOM tier: proof at overflow scale, run at explicit
 // checkpoints. The always-on MECHANISM tier lives in tests/search.rs: the
 // capped-scan tests (bm25 under-fill + aggregate exemption, 20-row corpus)
 // and the rrf uncapped-arm pins (20- and 7-row corpora).
 
-mod helpers;
+use crate::helpers;
 
 use arrow_array::StringArray;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
 
-use helpers::*;
+use crate::helpers::*;
 
 const CHUNKS: usize = 6_000;
 const ARTIFACTS: usize = 750;

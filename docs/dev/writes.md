@@ -149,6 +149,7 @@ physical-effect proofs:
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table (Lance's plan plus every fragment still holding a dropped column), chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
 | Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
+| Mutation `as unattached branch [on <id>]` | The writer's own physical adapter over the base's table pins: a root stages against the recorded target's live head, a child against its base snapshot's detached pins (`WriteTxn.unattached_base`, `revalidate_unattached_base`) | One unattached snapshot ([RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): the complete result rows written as a detached version `D` of the recorded target's `__manifest` with the version 2 candidate property (`UnattachedCommitProperty`: id, root, parent, no row clock), addressed by the reserved tag `unattached_<root>_<C>` created put-if-absent at `D` and acknowledged only after the root authority is revalidated (`stage_unattached` + `confirm_unattached`); the branch head is unchanged, a child's `parent_commit_id` is its base, `commit publish` answers `unattached_cannot_publish` (409), `commit drop` cascades descendants-first, and every tag of a root expires with the captured target authority; never published |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
@@ -233,6 +234,29 @@ a detached version of the pin and publishes the pins once. A failure before
 publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
+
+Every writer commits a table effect through
+`TableStore::commit_staged_detached`, which takes the table's declared
+full-text columns. Lance applies a full-text analyzer only through a segment
+of the index, so a version holding rows and no segment for a declared column
+would match with a bare tokenizer (no lowercasing, no stemming). A table's
+first rows and an overwrite load (an overwrite drops every index) produce such
+a version, as does a schema evolution that adds a full-text column; when the
+committed version holds no segment for a declared column, the gateway chains
+an untrained, certified segment (an empty fragment bitmap, no postings) in a
+second detached commit under the same witness and returns that version to
+pin. The gateway decides this before the commit from the base version's index
+metadata and the effect's operation, as Lance's manifest build decides (an
+overwrite keeps no index, an index commit swaps the segments it removes for
+the ones it adds, and any other operation keeps a segment of every index whose
+column remains), resolving each column by field id in the schema the version
+will have, so a renamed column keeps its index; Lance's commit loads the same
+metadata, so the check adds no storage request. Schema apply declares a
+full-text `@index` it adds to a table it does not evolve the same way, beside
+the contract. The index writer builds postings where no segment covers a
+fragment, and the branch-merge insertion proof steps over a declaration link,
+which moves no row. The system-column upgrade keeps every index and declares
+none.
 
 Schema apply changes an existing table's columns by metadata-only Lance
 commits (`TableStore::stage_schema_evolution`). Renamed and dropped columns

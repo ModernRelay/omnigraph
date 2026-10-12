@@ -177,7 +177,7 @@ edge Knows: Person -> Person {}
         .expect("the right branch owns e");
     let (written, identity) = reader
         .storage()
-        .commit_staged_detached(base, staged, &witness)
+        .commit_staged_detached(base, staged, &witness, &[])
         .await
         .unwrap();
     assert_eq!(identity.read_version, right_people.version().version);
@@ -187,6 +187,135 @@ edge Knows: Person -> Person {}
     );
     assert_eq!(left_people.count_rows(None).await.unwrap(), 4);
     assert_eq!(right_people.count_rows(None).await.unwrap(), 5);
+}
+
+/// A detached table commit over a detached base no `__manifest` version pins
+/// (a child unattached snapshot's base) records that base as its read
+/// version, holds the cumulative rows and leaves the base and the live pin.
+#[tokio::test]
+async fn detached_commit_over_an_unpinned_detached_base_stacks_on_it() {
+    use lance_table::format::is_detached_version;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let graph = Arc::new(
+        crate::db::Omnigraph::init(root, "node Person { name: String @key }\n")
+            .await
+            .unwrap(),
+    );
+    let session = crate::Session::from_defaults(
+        Arc::clone(&graph),
+        omnigraph_compiler::settings::SessionSettings::default(),
+    );
+    session
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}"#,
+            crate::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let (live, _) = graph
+        .capture_read_view(crate::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let entry = live.snapshot.dataset("node:Person").unwrap().clone();
+    let full_path = format!("{root}/{}", entry.dataset_path);
+    let live_pin =
+        crate::db::omnigraph::promotion::open_pinned_for_write(&graph, &full_path, &entry)
+            .await
+            .unwrap();
+    let live_version = live_pin.version();
+    let transaction = live
+        .snapshot
+        .open_lance_dataset("node:Person")
+        .await
+        .unwrap()
+        .read_transaction()
+        .await
+        .unwrap()
+        .unwrap();
+    let witness = crate::table_store::StagingWitness::from_transaction(&transaction).unwrap();
+    let storage = graph.storage();
+    let delete = |name: &str| datafusion::prelude::ident("name").eq(datafusion::prelude::lit(name));
+
+    let staged = storage
+        .stage_delete(&live_pin, delete("a"))
+        .await
+        .unwrap()
+        .expect("the live pin holds a");
+    let (base, base_identity) = storage
+        .commit_staged_detached(live_pin, staged, &witness, &[])
+        .await
+        .unwrap();
+    assert_eq!(base_identity.read_version, live_version);
+    let base_version = base.version();
+    assert!(is_detached_version(base_version));
+    assert_eq!(storage.count_rows(&base, None).await.unwrap(), 2);
+
+    let staged = storage
+        .stage_delete(&base, delete("b"))
+        .await
+        .unwrap()
+        .expect("the detached base holds b");
+    let (child, child_identity) = storage
+        .commit_staged_detached(base.clone(), staged, &witness, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        child_identity.read_version, base_version,
+        "the child records the detached base as the version it read"
+    );
+    assert!(is_detached_version(child.version()));
+    assert_ne!(child.version(), base_version);
+    assert_eq!(storage.count_rows(&child, None).await.unwrap(), 1);
+    assert_eq!(
+        storage.count_rows(&base, None).await.unwrap(),
+        2,
+        "the base is immutable under its child"
+    );
+
+    let reopened = storage
+        .open_dataset_head(&full_path, None)
+        .await
+        .unwrap()
+        .into_dataset()
+        .checkout_version(child.version())
+        .await
+        .unwrap();
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 1);
+    assert_eq!(
+        reopened.version().version,
+        child.version(),
+        "the child reopens by its detached version"
+    );
+
+    let (after, _) = graph
+        .capture_read_view(crate::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let after_entry = after.snapshot.dataset("node:Person").unwrap();
+    assert_eq!(
+        after_entry.published_dataset_version, entry.published_dataset_version,
+        "the live pin is unchanged"
+    );
+    assert_eq!(
+        after_entry.version_metadata.staged_version(),
+        entry.version_metadata.staged_version()
+    );
+    assert_eq!(
+        after
+            .snapshot
+            .open_lance_dataset("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        3
+    );
 }
 
 fn test_schema_source() -> &'static str {
@@ -1008,5 +1137,102 @@ async fn projection_refresh_matches_clean_full_reopen() {
         lineage,
         first_parent_chain(&fresh).await,
         "a coordinator that publishes after foreign commits holds every commit of the branch"
+    );
+}
+
+/// A drop removes a descendant's candidate tag and confirms it before it
+/// touches the requested id: a failure between the two leaves the requested
+/// id addressable and a retried drop finishes it (RFC drop and cleanup).
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn unattached_drop_removes_descendants_before_the_requested_id() {
+    use lance::dataset::refs::{BranchIdentifier, Ref};
+
+    let _scenario = crate::seams::FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let coordinator = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let control_session = omnigraph_core::lance_access::control_session();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    let version = main.version().version;
+    let head = coordinator.head().clone();
+    let root_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let child_id = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    let snapshot = |id: &str, parent: &str| {
+        let property = UnattachedCommitProperty {
+            version: UNATTACHED_PROPERTY_VERSION,
+            graph_commit_id: id.to_string(),
+            root_commit_id: root_id.to_string(),
+            parent_commit_id: parent.to_string(),
+            captured_head_commit_id: head.graph_commit_id.clone(),
+            graph_branch: None,
+            native_branch: None,
+            branch_identifier: BranchIdentifier::main(),
+            inherited_head: false,
+            actor_id: None,
+            created_at: 0,
+        };
+        UnattachedCommit {
+            property,
+            record: HistoryRecord {
+                commit: head.clone(),
+                tables: Vec::new(),
+            },
+            detached_version: version,
+            lifetime: UnattachedLifetime::Live,
+        }
+    };
+    let root = snapshot(root_id, &head.graph_commit_id);
+    let child = snapshot(child_id, root_id);
+    for tag in [root.tag_name(), child.tag_name()] {
+        main.tags()
+            .create(&tag, Ref::Version(None, Some(version)))
+            .await
+            .unwrap();
+    }
+    let listed = |main: &Dataset| {
+        let main = main.clone();
+        async move {
+            let mut names: Vec<String> = main.tags().list().await.unwrap().into_keys().collect();
+            names.sort();
+            names
+        }
+    };
+    assert_eq!(listed(&main).await, [root.tag_name(), child.tag_name()]);
+
+    {
+        let _failpoint = catalog::UNATTACHED_DROP_POST_DESCENDANT_PRE_PARENT.fire_always();
+        let error = ManifestCoordinator::drop_unattached(
+            uri,
+            &control_session,
+            &root,
+            std::slice::from_ref(&child),
+        )
+        .await
+        .expect_err("the injected failure after the descendant's removal must surface");
+        assert!(
+            error
+                .to_string()
+                .contains("unattached.drop_post_descendant_pre_parent"),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        listed(&main).await,
+        [root.tag_name()],
+        "the descendant is gone and the requested id stays addressable"
+    );
+
+    ManifestCoordinator::drop_unattached(uri, &control_session, &root, &[])
+        .await
+        .unwrap();
+    assert!(listed(&main).await.is_empty());
+    assert!(
+        ManifestCoordinator::drop_unattached(uri, &control_session, &root, &[])
+            .await
+            .is_ok(),
+        "absence is the completed outcome"
     );
 }

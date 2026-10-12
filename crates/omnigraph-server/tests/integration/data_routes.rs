@@ -73,6 +73,59 @@ fn repeated_zero_blob_input(length: usize) -> String {
     format!("base64:{}{tail}", "AAAA".repeat(full_triples))
 }
 
+/// A Blob write: PUT with a raw octet-stream body, or DELETE without one.
+fn blob_write_request(
+    method: Method,
+    uri: &str,
+    body: impl Into<Body>,
+    if_match: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+        .uri(uri)
+        .method(method.clone());
+    if method == Method::PUT {
+        builder = builder.header("content-type", "application/octet-stream");
+    }
+    if let Some(tag) = if_match {
+        builder = builder.header("if-match", tag);
+    }
+    builder.body(body.into()).unwrap()
+}
+
+/// Status, `ETag` header and body of one response; the body is JSON for a
+/// write and raw bytes for a read. A response chunk owns its request's
+/// admission until it drops, so the body is copied out here and the request
+/// releases its capacity when this returns.
+async fn blob_exchange(
+    app: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, Option<String>, Vec<u8>) {
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get("etag")
+        .map(|value| value.to_str().unwrap().to_string());
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, etag, body.to_vec())
+}
+
+async fn main_commit_count(app: &axum::Router) -> usize {
+    let (status, commits) = json_response(
+        app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/commits"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{commits}");
+    commits["commits"].as_array().unwrap().len()
+}
+
 async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value) {
     let receipt = output
         .get("commit")
@@ -619,6 +672,381 @@ async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
             );
         }
     }
+}
+
+/// PUT and DELETE `/blob` replace or clear one cell of a node or an edge by
+/// exact id and return the exact receipt of their own commit. A failed
+/// `If-Match` is a 412 naming the cell's validator in `ETag` and
+/// `blob_precondition_failure`, never the graph-commit
+/// `precondition_failure`, and publishes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_put_and_delete_return_exact_receipts_and_blob_preconditions() {
+    let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
+    let precondition_failure = |body: &[u8]| {
+        let output: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(output["code"], "conflict", "{output}");
+        assert!(output.get("precondition_failure").is_none(), "{output}");
+        output["blob_precondition_failure"].clone()
+    };
+    for (entity, type_name, id, property, original) in [
+        ("node", "Document", "readme", "content", &b"Hello World"[..]),
+        (
+            "edge",
+            "Attachment",
+            "attachment-1",
+            "payload",
+            &b"Edge"[..],
+        ),
+    ] {
+        let uri = blob_uri(entity, type_name, id, property, "");
+        let get = || blob_write_request(Method::GET, &uri, Body::empty(), None);
+        let (status, original_etag, bytes) = blob_exchange(&app, get()).await;
+        assert_eq!((status, &bytes[..]), (StatusCode::OK, original));
+        let original_etag = original_etag.unwrap();
+        let commits = main_commit_count(&app).await;
+
+        let (status, etag, body) = blob_exchange(
+            &app,
+            blob_write_request(Method::PUT, &uri, "never", Some("\"stale\"")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{entity}");
+        assert_eq!(etag.as_deref(), Some(original_etag.as_str()));
+        assert_eq!(
+            precondition_failure(&body),
+            json!({"current_etag": original_etag})
+        );
+        assert_eq!(
+            main_commit_count(&app).await,
+            commits,
+            "a 412 publishes nothing"
+        );
+
+        let (status, etag, body) = blob_exchange(
+            &app,
+            blob_write_request(Method::PUT, &uri, "Replaced", Some(&original_etag)),
+        )
+        .await;
+        let receipt: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        let replaced_etag = etag.expect("a put returns the stored value's ETag");
+        assert_ne!(replaced_etag, original_etag);
+        assert_eq!(
+            receipt["selector"],
+            json!({"entity": entity, "type": type_name, "id": id, "property": property})
+        );
+        assert_eq!(receipt["branch"], "main");
+        assert_eq!(receipt["kind"], "managed");
+        assert_eq!(receipt["size"], 8);
+        assert_eq!(receipt["etag"], replaced_etag);
+        assert!(receipt["actor_id"].is_null());
+        assert_receipt_commit_matches_get(&app, &receipt).await;
+        let at_commit = blob_uri(
+            entity,
+            type_name,
+            id,
+            property,
+            &format!(
+                "&snapshot={}",
+                receipt["commit"]["graph_commit_id"].as_str().unwrap()
+            ),
+        );
+        for read in [
+            get(),
+            blob_write_request(Method::GET, &at_commit, Body::empty(), None),
+        ] {
+            let (status, etag, bytes) = blob_exchange(&app, read).await;
+            assert_eq!((status, &bytes[..]), (StatusCode::OK, &b"Replaced"[..]));
+            assert_eq!(
+                etag.as_deref(),
+                Some(replaced_etag.as_str()),
+                "the receipt's ETag is the one a read at its commit reports"
+            );
+        }
+
+        let (status, etag, body) = blob_exchange(
+            &app,
+            blob_write_request(Method::DELETE, &uri, Body::empty(), Some(&replaced_etag)),
+        )
+        .await;
+        let receipt: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(etag, None);
+        assert_eq!(receipt["kind"], "null");
+        assert!(receipt.get("size").is_none() && receipt.get("etag").is_none());
+        assert_receipt_commit_matches_get(&app, &receipt).await;
+        assert_eq!(blob_exchange(&app, get()).await.0, StatusCode::NOT_FOUND);
+        let commits = main_commit_count(&app).await;
+
+        let (status, _, body) = blob_exchange(
+            &app,
+            blob_write_request(Method::DELETE, &uri, Body::empty(), None),
+        )
+        .await;
+        let receipt: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert!(
+            receipt["commit"].is_null(),
+            "clearing a null cell publishes nothing: {receipt}"
+        );
+        for (method, body) in [(Method::DELETE, ""), (Method::PUT, "any")] {
+            let (status, etag, body) = blob_exchange(
+                &app,
+                blob_write_request(method.clone(), &uri, body, Some("*")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{method} *");
+            assert_eq!(etag, None, "a null cell has no validator");
+            assert_eq!(precondition_failure(&body), json!({}));
+        }
+        assert_eq!(main_commit_count(&app).await, commits);
+
+        let (status, _, body) = blob_exchange(
+            &app,
+            blob_write_request(Method::PUT, &uri, original.to_vec(), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&blob_exchange(&app, get()).await.2[..], original);
+    }
+
+    let commits = main_commit_count(&app).await;
+    for (uri, if_match, expected) in [
+        (
+            blob_uri("node", "Document", "missing", "content", ""),
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            blob_uri("node", "Document", "readme", "content", "&branch=absent"),
+            None,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            blob_uri("node", "Document", "readme", "title", ""),
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            blob_uri("node", "Document", "readme", "content", "&snapshot=any"),
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            blob_uri("node", "Document", "readme", "content", ""),
+            Some("unquoted"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        for method in [Method::PUT, Method::DELETE] {
+            let (status, _, body) = blob_exchange(
+                &app,
+                blob_write_request(method.clone(), &uri, "x", if_match),
+            )
+            .await;
+            assert_eq!(
+                status,
+                expected,
+                "{method} {uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+    assert_eq!(
+        main_commit_count(&app).await,
+        commits,
+        "refusals publish nothing"
+    );
+}
+
+/// Owners release after the response; wait for them before reading the
+/// capacity they held.
+async fn assert_admission_open(
+    operations: &omnigraph_server::operations::OperationRuntime,
+    workload: &omnigraph_server::workload::WorkloadController,
+    step: &str,
+) {
+    let settled =
+        tokio::time::timeout(Duration::from_secs(10), operations.wait_logical_owners()).await;
+    assert!(
+        settled.is_ok_and(|clean| clean),
+        "{step}: {:?} {:?}",
+        operations.snapshot(),
+        workload.snapshot()
+    );
+    assert_eq!(operations.snapshot().active_writes, 0, "{step}");
+    assert_eq!(
+        workload.snapshot(),
+        omnigraph_server::workload::WorkloadSnapshot::default(),
+        "{step}"
+    );
+}
+
+/// The raw PUT body: a wrong media type and a declared length over 32 MiB are
+/// refused before any body byte is polled, exactly 32 MiB is stored and one
+/// more byte is refused, and an expired body deadline is a 408. Every
+/// refusal leaves admission open.
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_put_raw_body_bounds_media_type_length_and_deadline() {
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let temp = init_graph_with_schema_and_data(BLOB_HTTP_SCHEMA, BLOB_HTTP_DATA).await;
+    let graph = graph_path(temp.path());
+    let workload = omnigraph_server::workload::WorkloadController::with_limits(
+        omnigraph_server::workload::WorkloadLimits {
+            body_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    );
+    let state = AppState::new_with_workload(
+        graph.to_string_lossy().to_string(),
+        Omnigraph::open(graph.to_str().unwrap()).await.unwrap(),
+        Vec::new(),
+        workload.clone(),
+    );
+    let operations = state.operation_runtime().clone();
+    let app = build_app(state);
+    let uri = blob_uri("node", "Document", "readme", "content", "");
+    let watched_body = || {
+        let polled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::once(async move {
+            observed.store(true, Ordering::SeqCst);
+            Ok::<Bytes, Infallible>(Bytes::from_static(b"x"))
+        }));
+        (polled, body)
+    };
+
+    let (polled, body) = watched_body();
+    let mut request = blob_write_request(Method::PUT, &uri, body, None);
+    request
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/json"));
+    let (status, _, _) = blob_exchange(&app, request).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(!polled.load(Ordering::SeqCst), "415 precedes the body");
+    assert_admission_open(&operations, &workload, "415").await;
+
+    let (polled, body) = watched_body();
+    let mut request = blob_write_request(Method::PUT, &uri, body, None);
+    request.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&(LIMIT + 1).to_string()).unwrap(),
+    );
+    let (status, _, body) = blob_exchange(&app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a declared 413 precedes the body"
+    );
+    let refused: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    let limit = refused.resource_limit.unwrap();
+    assert_eq!(
+        (limit.resource.as_str(), limit.limit, limit.actual),
+        ("Blob write payload bytes", LIMIT as u64, LIMIT as u64 + 1)
+    );
+    assert_admission_open(&operations, &workload, "declared 413").await;
+
+    let mut request = blob_write_request(Method::PUT, &uri, vec![7_u8; LIMIT], None);
+    request.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&LIMIT.to_string()).unwrap(),
+    );
+    let (status, _, body) = blob_exchange(&app, request).await;
+    let receipt: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["size"], LIMIT as u64, "exactly 32 MiB is stored");
+
+    // No declared length: the collector refuses the byte past the limit.
+    let chunks = futures::stream::iter([
+        Ok::<Bytes, Infallible>(Bytes::from(vec![7_u8; LIMIT])),
+        Ok(Bytes::from_static(b"!")),
+    ]);
+    let (status, _, body) = blob_exchange(
+        &app,
+        blob_write_request(Method::PUT, &uri, Body::from_stream(chunks), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let refused: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(refused.resource_limit.unwrap().actual, LIMIT as u64 + 1);
+    assert_admission_open(&operations, &workload, "collected 413").await;
+
+    let stalled = futures::StreamExt::chain(
+        futures::stream::once(async { Ok::<Bytes, Infallible>(Bytes::from_static(b"x")) }),
+        futures::stream::pending(),
+    );
+    let (status, _, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        blob_exchange(
+            &app,
+            blob_write_request(Method::PUT, &uri, Body::from_stream(stalled), None),
+        ),
+    )
+    .await
+    .expect("the body deadline bounds an incomplete upload");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_admission_open(&operations, &workload, "408").await;
+
+    let (status, _, body) =
+        blob_exchange(&app, blob_write_request(Method::PUT, &uri, "after", None)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_admission_open(&operations, &workload, "after").await;
+
+    // A put takes no settings, so the server's process `write_max_bytes` is its
+    // limit before the body arrives: a declared body past it is refused
+    // unread, and a streamed one at the byte past it.
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_WRITE_MAX_BYTES").then(|| "4093".to_string())
+    })
+    .unwrap();
+    let lowered = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap()
+            .with_process_defaults(ProcessDefaults { settings, sources }),
+    );
+    let refused_at = |body: &[u8]| {
+        let refused = serde_json::from_slice::<ErrorOutput>(body)
+            .unwrap()
+            .resource_limit
+            .unwrap();
+        (refused.resource, refused.limit, refused.actual)
+    };
+    let (polled, body) = watched_body();
+    let mut request = blob_write_request(Method::PUT, &uri, body, None);
+    request
+        .headers_mut()
+        .insert("content-length", HeaderValue::from_static("4094"));
+    let (status, _, body) = blob_exchange(&lowered, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a declared body past the process limit is refused unread"
+    );
+    assert_eq!(
+        refused_at(&body),
+        ("Blob write payload bytes".to_string(), 4093, 4094)
+    );
+    let chunks = futures::stream::iter([
+        Ok::<Bytes, Infallible>(Bytes::from(vec![7_u8; 4093])),
+        Ok(Bytes::from_static(b"!")),
+    ]);
+    let (status, _, body) = blob_exchange(
+        &lowered,
+        blob_write_request(Method::PUT, &uri, Body::from_stream(chunks), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        refused_at(&body),
+        ("Blob write payload bytes".to_string(), 4093, 4094)
+    );
+    let (status, _, body) = blob_exchange(
+        &lowered,
+        blob_write_request(Method::PUT, &uri, vec![7_u8; 4093], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1639,10 +2067,43 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         "{\"type\":\"Company\",\"data\":{\"name\":\"OwnedCo\"}}\n",
         "{\"edge\":\"WorksAt\",\"from\":\"Owned\",\"to\":\"OwnedCo\"}\n"
     );
-    for door in ["/mutate", "/load", "/load/ndjson", "/branches/merge"] {
-        let temp = init_loaded_graph().await;
+    const PHOTO: &str = "owned photo";
+    for door in [
+        "/mutate",
+        "/load",
+        "/load/ndjson",
+        "/branches/merge",
+        "PUT /blob",
+        "DELETE /blob",
+    ] {
+        // A Blob door writes Alice's photo on the standard rows; it adds no
+        // Person, so its Person counts stay one lower.
+        let blob_door = door.ends_with(" /blob");
+        let temp = if blob_door {
+            init_graph_with_schema_and_data(
+                &fs::read_to_string(fixture("test.pg"))
+                    .unwrap()
+                    .replace("    age: I32?", "    age: I32?\n    photo: Blob?"),
+                &fs::read_to_string(fixture("test.jsonl")).unwrap(),
+            )
+            .await
+        } else {
+            init_loaded_graph().await
+        };
         let graph = graph_path(temp.path());
         let db = Arc::new(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+        if door == "DELETE /blob" {
+            Session::from_defaults(Arc::clone(&db), SessionSettings::default())
+                .put_blob_at_as(
+                    "main",
+                    alice_photo(),
+                    Bytes::from_static(b"seeded"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         if door == "/branches/merge" {
             db.branch_create("feature").await.unwrap();
             Session::from_defaults(Arc::clone(&db), SessionSettings::default())
@@ -1685,6 +2146,10 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(BATCH))
                 .unwrap(),
+            "PUT /blob" => blob_write_request(Method::PUT, &alice_photo_uri(), PHOTO, None),
+            "DELETE /blob" => {
+                blob_write_request(Method::DELETE, &alice_photo_uri(), Body::empty(), None)
+            }
             _ => json_post(door, &json!({"source": "feature", "delete_branch": true})),
         };
         let holder_db = Arc::clone(&db);
@@ -1753,10 +2218,15 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         );
         assert_eq!(workload.snapshot().operation_count, 1);
         assert_eq!(workload.snapshot().ingress_count, 1);
-        assert!(
-            workload.snapshot().ingress_bytes > 0,
-            "disconnect cannot release the retained input budget"
-        );
+        match door {
+            // The raw put body's reservation shrank to the bytes received.
+            "PUT /blob" => assert_eq!(workload.snapshot().ingress_bytes, PHOTO.len() as u64),
+            "DELETE /blob" => assert_eq!(workload.snapshot().ingress_bytes, 0),
+            _ => assert!(
+                workload.snapshot().ingress_bytes > 0,
+                "disconnect cannot release the retained input budget"
+            ),
+        }
         let transition = state
             .prepare_same_view(
                 &view.key,
@@ -1805,14 +2275,28 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
             after[0].parent_commit_id,
             Some(before[0].graph_commit_id.clone())
         );
-        assert_eq!(harness.person_count("main").await, 5, "{door}");
-        let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person { name: \"Owned\" } $p worksAt $c } return { $p.name, $c.name } }"}))).await;
-        assert_eq!(status, StatusCode::OK, "{rows}");
-        assert_eq!(
-            rows["rows"],
-            json!([{ "p.name": "Owned", "c.name": "OwnedCo" }]),
-            "all participants must publish together"
-        );
+        let persons = if blob_door { 4 } else { 5 };
+        assert_eq!(harness.person_count("main").await, persons, "{door}");
+        if blob_door {
+            let (status, _, bytes) = blob_exchange(
+                &app,
+                blob_write_request(Method::GET, &alice_photo_uri(), Body::empty(), None),
+            )
+            .await;
+            if door == "PUT /blob" {
+                assert_eq!((status, &bytes[..]), (StatusCode::OK, PHOTO.as_bytes()));
+            } else {
+                assert_eq!(status, StatusCode::NOT_FOUND, "the clear published");
+            }
+        } else {
+            let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person { name: \"Owned\" } $p worksAt $c } return { $p.name, $c.name } }"}))).await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            assert_eq!(
+                rows["rows"],
+                json!([{ "p.name": "Owned", "c.name": "OwnedCo" }]),
+                "all participants must publish together"
+            );
+        }
         if door == "/branches/merge" {
             assert!(
                 !db.branch_list()
@@ -1828,8 +2312,21 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
             StatusCode::OK,
             "same process must resume: {sentinel}"
         );
-        assert_eq!(harness.person_count("main").await, 6);
+        assert_eq!(harness.person_count("main").await, persons + 1);
     }
+}
+
+fn alice_photo() -> omnigraph::BlobCell {
+    omnigraph::BlobCell {
+        entity: omnigraph::EntityKind::Node,
+        type_name: "Person".to_string(),
+        id: "Alice".to_string(),
+        property: "photo".to_string(),
+    }
+}
+
+fn alice_photo_uri() -> String {
+    blob_uri("node", "Person", "Alice", "photo", "")
 }
 
 struct ThreadEngineFault {
@@ -2621,6 +3118,281 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     }
     let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
     assert_eq!(listed["commits"], json!([]));
+}
+
+/// One mutation `as unattached branch` on main, a root when `base` is `None`
+/// and a child of that snapshot otherwise, answered with its unattached
+/// snapshot (RFC "Unattached graph branches").
+async fn sprout_person(app: &axum::Router, name: &str, base: Option<&str>) -> Value {
+    let on = base.map(|id| format!(" on \"{id}\"")).unwrap_or_default();
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({"query": format!(
+                "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+            )}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["affected_nodes"], 1, "{body}");
+    assert_eq!(body["commit"]["published"], false, "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    assert_eq!(body["commit"]["graph_branch"], Value::Null, "{body}");
+    assert_eq!(
+        body["commit"]["merged_parent_commit_id"],
+        Value::Null,
+        "{body}"
+    );
+    body["commit"].clone()
+}
+
+/// `row_count` of every `Person` at the snapshot.
+async fn person_count_at_snapshot(app: &axum::Router, snapshot: &str) -> u64 {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/query",
+            &json!({
+                "query": "query people() { match { $p: Person } return { $p.name } }",
+                "snapshot": snapshot,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["row_count"].as_u64().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head_before = main_head_commit_id(&app).await;
+    let commits_before = main_commit_count(&app).await;
+    let people_on_main = {
+        let (_, body) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": "query people() { match { $p: Person } return { $p.name } }"}),
+            ),
+        )
+        .await;
+        body["row_count"].as_u64().unwrap()
+    };
+
+    let root = sprout_person(&app, "Root", None).await;
+    let root_id = root["graph_commit_id"].as_str().unwrap().to_string();
+    assert_eq!(root["root_commit_id"], root_id, "a root is its own root");
+    assert_eq!(root["parent_commit_id"], head_before, "{root}");
+    let child = sprout_person(&app, "Child", Some(&root_id)).await;
+    let child_id = child["graph_commit_id"].as_str().unwrap().to_string();
+    assert_eq!(child["root_commit_id"], root_id, "{child}");
+    assert_eq!(child["parent_commit_id"], root_id, "{child}");
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+    assert_eq!(main_commit_count(&app).await, commits_before);
+    assert_eq!(
+        person_count_at_snapshot(&app, &root_id).await,
+        people_on_main + 1
+    );
+    assert_eq!(
+        person_count_at_snapshot(&app, &child_id).await,
+        people_on_main + 2,
+        "a child holds its ancestors' effects and its own"
+    );
+
+    let (status, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([child, root]), "newest first");
+    let (status, listed) = get_json(&app, g("/commits?unattached=true&branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([child, root]));
+    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["commits"],
+        json!([]),
+        "unattached is not unpublished"
+    );
+    let (status, body) = get_json(&app, g("/commits?unattached=true&unpublished=true")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, history) = get_json(&app, g("/commits")).await;
+    assert!(
+        history["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|commit| commit["graph_commit_id"] != root_id
+                && commit["graph_commit_id"] != child_id),
+        "an unattached snapshot is not history: {history}"
+    );
+    let (status, shown) = get_json(&app, g(&format!("/commits/{child_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown, child);
+
+    for id in [&root_id, &child_id] {
+        let (status, body) = json_response(
+            &app,
+            bodiless(Method::POST, &format!("/commits/{id}/publish")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let refusal: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(refusal.code, Some(ErrorCode::UnattachedCannotPublish));
+        assert_eq!(
+            refusal.error,
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/mutate",
+                &json!({"query": format!("commit publish \"{id}\"")}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "unattached_cannot_publish", "{body}");
+        assert_eq!(
+            body["error"],
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+    }
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{root_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for id in [&root_id, &child_id] {
+        for request in [
+            bodiless(Method::GET, &format!("/commits/{id}")),
+            bodiless(Method::POST, &format!("/commits/{id}/publish")),
+            bodiless(Method::DELETE, &format!("/commits/{id}")),
+        ] {
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        }
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/mutate",
+                &json!({"query": format!(
+                    "query sprout() as unattached branch on \"{id}\" {{ insert Person {{ name: \"Late\", age: 33 }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    assert_eq!(
+        listed["commits"],
+        json!([]),
+        "dropping the root drops the chain"
+    );
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+}
+
+/// A stored declaration keeps its `as unattached branch on $base` clause:
+/// each invocation receives the base through `params`, and the request
+/// `branch` cannot select another target.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            (
+                "sprout_root",
+                "query sprout_root($name: String) as unattached branch { insert Person { name: $name, age: 33 } }",
+                true,
+            ),
+            (
+                "sprout_child",
+                "query sprout_child($name: String, $base: String) as unattached branch on $base { insert Person { name: $name, age: 33 } }",
+                true,
+            ),
+        ],
+        &[("act-full", "t-full")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("sprout_root", "t-full", json!({"params": {"name": "Root"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    let root_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Child", "base": root_id}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    assert_eq!(body["commit"]["root_commit_id"], root_id, "{body}");
+    assert_eq!(body["commit"]["parent_commit_id"], root_id, "{body}");
+    let child_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Grandchild", "base": child_id}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commit"]["root_commit_id"], root_id, "{body}");
+    assert_eq!(body["commit"]["parent_commit_id"], child_id, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Astray", "base": root_id}, "branch": "feature"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Lost"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing base is 400: {body}"
+    );
+    let (status, body) =
+        json_response(&app, get_request(&g("/commits?unattached=true"), "t-full")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commits"].as_array().unwrap().len(), 3, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

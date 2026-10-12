@@ -13,7 +13,10 @@ use futures::StreamExt;
 use omnigraph::Session;
 use omnigraph::db::MergeResult;
 use omnigraph::settings::{SettingId, SettingValue};
-use omnigraph_compiler::query::ast::{BranchStmt, EmptyFile, FileBody, QueryDecl, QueryFile};
+use omnigraph_compiler::Literal;
+use omnigraph_compiler::query::ast::{
+    BranchStmt, EmptyFile, FileBody, MutationWriteMode, QueryDecl, QueryFile, UnattachedBase,
+};
 use tracing::Instrument;
 
 /// Inputs, actor admission and execution leave the request together. Dropping
@@ -976,6 +979,304 @@ pub(crate) async fn server_blob_head(
     blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
+#[utoipa::path(
+    put,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "putBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. Weak tags never match. The write evaluates it against the branch head it applies to."),
+    ),
+    request_body(
+        content = inline(BlobBinaryBody),
+        content_type = "application/octet-stream",
+        description = "The raw bytes to store: at most 33554432 bytes (32 MiB), inclusive."
+    ),
+    responses(
+        (status = 200, description = "The bytes are published in one graph commit", body = BlobWriteOutput,
+            headers(
+                ("ETag" = String, description = "Strong validator of the stored value; equals `etag` in the body"),
+            )),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 408, description = "The request body did not arrive before the body deadline", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
+        (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Replace one Blob value of an existing node or edge with the request body.
+///
+/// The cell's old value is never read; the entity's other cells are carried
+/// unchanged. Authorization of `change` on the branch runs before the body is
+/// read. Once admitted the write is owned by the server: a disconnect loses
+/// only the response, never cancels or replays the write.
+pub(crate) async fn server_blob_put(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+    request: Request,
+) -> std::result::Result<Response, ApiError> {
+    let ingress = request
+        .extensions()
+        .get::<IngressLease>()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing ingress reservation"))?;
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(request.headers())?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/octet-stream"))
+    {
+        return Err(ApiError::unsupported_media_type(
+            "a Blob put requires Content-Type: application/octet-stream",
+        ));
+    }
+    let declared = match request.headers().get(CONTENT_LENGTH) {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| ApiError::bad_request("invalid Content-Length"))?,
+        ),
+    };
+    let limit = state.blob_put_limit();
+    if let Some(declared) = declared.filter(|declared| *declared > limit) {
+        return Err(blob_put_too_large(limit, declared));
+    }
+
+    let deadline = request
+        .extensions()
+        .get::<ingress::BodyDeadline>()
+        .copied()
+        .ok_or_else(|| ApiError::internal("missing request body deadline"))?;
+    let bytes = tokio::time::timeout_at(
+        deadline.0,
+        collect_blob_put_body(request.into_body(), declared, limit),
+    )
+    .await
+    .map_err(|_| ingress::body_timeout())??;
+    ingress
+        .shrink(bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .put_blob_at_as(&branch, cell, bytes, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "clearBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. A null cell satisfies neither form."),
+    ),
+    responses(
+        (status = 200, description = "The cell is null. `commit` is the clear's publication, or `null` when the cell already was null and nothing was published", body = BlobWriteOutput),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob or non-nullable property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The entity's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Set one nullable Blob value of an existing node or edge to null.
+///
+/// Clearing a cell that is already null publishes nothing. Like a put, the
+/// clear is owned by the server once admitted.
+pub(crate) async fn server_blob_delete(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(&headers)?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, 0)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .clear_blob_at_as(&branch, cell, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+fn parse_blob_write_query(
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<BlobWriteQuery, ApiError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ApiError::bad_request(format!(
+            "invalid Blob write query parameters: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+fn blob_write_precondition(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<omnigraph::BlobPrecondition>, ApiError> {
+    api::parse_blob_if_match(
+        headers
+            .get_all(axum::http::header::IF_MATCH)
+            .iter()
+            .map(|value| value.as_bytes()),
+    )
+    .map_err(ApiError::bad_request)
+}
+
+/// A Blob write needs `change` on its branch, checked before any body byte
+/// is read.
+fn authorize_blob_write(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: &str,
+) -> std::result::Result<(), ApiError> {
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
+fn blob_write_cell(query: BlobWriteQuery) -> omnigraph::BlobCell {
+    omnigraph::BlobCell {
+        entity: match query.entity {
+            api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
+            api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+        },
+        type_name: query.r#type,
+        id: query.id,
+        property: query.property,
+    }
+}
+
+/// The refusal of a put body over the limit: the same resource, limit and
+/// message the engine reports for an oversized embedded put.
+fn blob_put_too_large(limit: u64, actual: u64) -> ApiError {
+    ApiError::from_omni(OmniError::resource_limit(
+        omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE,
+        limit,
+        actual,
+    ))
+}
+
+/// Collect a put body into one buffer, sized from a declared length that is
+/// already within the limit. The engine adopts the buffer without a copy.
+async fn collect_blob_put_body(
+    body: Body,
+    declared: Option<u64>,
+    limit: u64,
+) -> std::result::Result<Bytes, ApiError> {
+    let capacity = declared.map_or(Ok(0), usize::try_from).map_err(|_| {
+        ApiError::bad_request("Content-Length does not fit in this platform's memory")
+    })?;
+    let mut data = Vec::with_capacity(capacity);
+    let mut body = body.into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::bad_request(format!("failed to read Blob request body: {err}"))
+        })?;
+        let actual = data.len().saturating_add(chunk.len()) as u64;
+        if actual > limit {
+            return Err(blob_put_too_large(limit, actual));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if declared.is_some_and(|declared| declared != data.len() as u64) {
+        return Err(ApiError::bad_request(
+            "Blob request body length does not match its Content-Length",
+        ));
+    }
+    Ok(Bytes::from(data))
+}
+
+/// A write receipt with its `ETag` header when the cell holds a managed value.
+fn blob_write_response(output: BlobWriteOutput) -> std::result::Result<Response, ApiError> {
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = output.etag.as_deref() {
+        headers.insert(
+            axum::http::header::ETAG,
+            axum::http::HeaderValue::from_str(etag)
+                .map_err(|_| ApiError::internal("a managed Blob ETag is not a header value"))?,
+        );
+    }
+    Ok((StatusCode::OK, headers, Json(output)).into_response())
+}
+
 fn parse_blob_read_query(
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<BlobReadQuery, ApiError> {
@@ -1231,9 +1532,11 @@ fn reject_graph_commit_expected_head(
 /// Order: parse and classify first; a branch statement then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise
 /// runs the same handler body as its `/branches` route (its own Cedar action
-/// and admission check). A mutation body takes `branch` (defaulting to
-/// `main` only here, so a defaulted target is never mistaken for a spelled
-/// one), then the `Change` check, admission, selection, and the engine call.
+/// and admission check). A mutation body selects its declaration, then takes
+/// its target: the request `branch` (defaulting to `main` only here, so a
+/// defaulted target is never mistaken for a spelled one), or for a child
+/// unattached write the recorded target of its base; then the `Change` check
+/// on that target, admission, and the engine call.
 pub(crate) async fn run_mutate(
     state: AppState,
     handle: GraphRequest,
@@ -1285,20 +1588,43 @@ pub(crate) async fn run_mutate(
             return Err(explain_at_write_door());
         }
     };
-    let branch = branch.unwrap_or_else(|| "main".to_string());
+    let decl = select_named_query_decl(queries, name)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let selected_name = decl.name;
+    let params = query_params_from_json(&decl.params, params_json)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let branch = match &decl.write_mode {
+        MutationWriteMode::Unattached { base: Some(base) } => {
+            unattached_child_target(
+                &session,
+                handle.policy.as_deref(),
+                actor,
+                base,
+                &params,
+                branch,
+            )
+            .await?
+        }
+        MutationWriteMode::Publish
+        | MutationWriteMode::AsCommit
+        | MutationWriteMode::Unattached { base: None } => {
+            let branch = branch.unwrap_or_else(|| "main".to_string());
+            authorize_request(
+                actor,
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some(branch.clone()),
+                    target_branch: None,
+                },
+            )?;
+            branch
+        }
+    };
     let actor_arc = actor
         .map(|a| Arc::clone(&a.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.map(|a| a.actor_id.as_ref());
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Change,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
     // Per-actor admission: bound concurrent in-flight mutations and
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
@@ -1309,10 +1635,6 @@ pub(crate) async fn run_mutate(
         .workload
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
-    let (selected_name, query_params) =
-        select_named_query(queries, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let params = query_params_from_json(&query_params, params_json)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let query = query.to_owned();
     let expected_head = expected_head.map(str::to_owned);
@@ -1330,7 +1652,7 @@ pub(crate) async fn run_mutate(
             .await
             .map_err(ApiError::from_omni)?;
         Ok(ChangeOutput {
-            branch,
+            branch: receipt.branch,
             query_name: selected_name,
             affected_nodes: receipt.result.affected_nodes,
             affected_edges: receipt.result.affected_edges,
@@ -1340,6 +1662,57 @@ pub(crate) async fn run_mutate(
         })
     })
     .await
+}
+
+/// The recorded target a child unattached write addresses, after the `change`
+/// check on it: a denial is masked as the commit 404, and a present request
+/// `branch` must then spell the target (an omitted one is accepted).
+async fn unattached_child_target(
+    session: &Session,
+    policy: Option<&PolicyEngine>,
+    actor: Option<&AuthenticatedActor>,
+    base: &UnattachedBase,
+    params: &ParamMap,
+    branch: Option<String>,
+) -> std::result::Result<String, ApiError> {
+    let base_id = match base {
+        UnattachedBase::Literal(id) => id.clone(),
+        UnattachedBase::Param(name) => match params.get(name) {
+            Some(Literal::String(id)) => id.clone(),
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "parameter '${name}' names the base of an unattached branch and must be a String"
+                )));
+            }
+        },
+    };
+    let target = session
+        .commit_target_branch(&base_id)
+        .await
+        .map_err(|error| change_route_commit_lookup_error(error, &base_id))?;
+    match authorize(
+        actor,
+        policy,
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(target.clone()),
+            target_branch: None,
+        },
+    )? {
+        Authz::Allowed => {}
+        Authz::Denied(_) => {
+            return Err(ApiError::not_found(format!("commit '{base_id}' not found")));
+        }
+    }
+    if let Some(requested) = branch
+        && requested != target
+    {
+        return Err(ApiError::bad_request(format!(
+            "branch '{requested}' is not the recorded target '{target}' of unattached branch \
+             '{base_id}'; name that branch or omit the branch"
+        )));
+    }
+    Ok(target)
 }
 
 /// Shared backend for `/query` and the stored-read arm of `/queries/{name}`.
@@ -2699,12 +3072,20 @@ async fn delete_merged_source_branch(
 ///
 /// `unpublished=true` lists instead the unpublished commits whose recorded
 /// target is `branch` (writes `as commit` awaiting `commit publish`), newest
-/// first; each carries `published: false`.
+/// first; each carries `published: false`. `unattached=true` lists instead
+/// the live unattached snapshots whose recorded target is `branch` (writes
+/// `as unattached branch`), newest first, each with `kind: "unattached"`;
+/// the two filters together are refused (400).
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    if query.unattached && query.unpublished {
+        return Err(ApiError::bad_request(
+            "`unattached=true` and `unpublished=true` select different listings; pass one",
+        ));
+    }
     // An omitted `branch` means main's history, so the policy gate must
     // see `main` — not `has_branch == false`, which a branch-scoped read
     // grant can never match.
@@ -2719,7 +3100,9 @@ pub(crate) async fn server_commit_list(
         },
     )?;
     let db = &handle.engine;
-    let commits = if query.unpublished {
+    let commits = if query.unattached {
+        db.list_unattached_commits(Some(branch.as_str())).await
+    } else if query.unpublished {
         db.list_unpublished_commits(Some(branch.as_str())).await
     } else {
         db.list_commits(Some(branch.as_str())).await
@@ -2793,7 +3176,7 @@ pub(crate) async fn server_commit_show(
         (status = 200, description = "The commit as published on its recorded target branch; a published id is answered as it stands", body = api::CommitOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 404, description = "Commit not found, or its publication is not permitted", body = ErrorOutput),
-        (status = 409, description = "The target's state moved under the proposal's authority", body = ErrorOutput),
+        (status = 409, description = "The target's state moved under the proposal's authority (code `conflict`), or the commit is unattached and cannot publish (code `unattached_cannot_publish`, no durable effect)", body = ErrorOutput),
         (status = 412, description = "The target head moved past the commit's captured parent; the commit can only be dropped", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -2804,7 +3187,9 @@ pub(crate) async fn server_commit_show(
 ///
 /// The target is the branch the commit recorded when it was written `as
 /// commit`, so the request carries no body. Runs under `commit_publish` on
-/// that branch; a denial answers the 404 an unknown id answers. The GQ
+/// that branch; a denial answers the 404 an unknown id answers. An
+/// unattached snapshot (`as unattached branch`) never publishes: 409 with
+/// code `unattached_cannot_publish`, after the same authorization. The GQ
 /// statement `commit publish "<id>"` on `POST /mutate` runs the same body.
 pub(crate) async fn server_commit_publish(
     State(state): State<AppState>,
@@ -2837,10 +3222,10 @@ pub(crate) async fn server_commit_publish(
     tag = "commits",
     operation_id = "dropCommit",
     params(
-        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+        ("commit_id" = String, Path, description = "Unpublished commit or unattached snapshot identifier"),
     ),
     responses(
-        (status = 204, description = "Commit dropped: its id stops resolving and its held merge inputs are released"),
+        (status = 204, description = "Commit dropped: the requested id and every unattached descendant lost addressability, and a proposal's held merge inputs are released"),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 404, description = "Commit not found, or its drop is not permitted", body = ErrorOutput),
         (status = 409, description = "The commit is published", body = ErrorOutput),
@@ -2849,12 +3234,13 @@ pub(crate) async fn server_commit_publish(
     ),
     security(("bearer_token" = [])),
 )]
-/// Drop an unpublished commit.
+/// Drop an unpublished commit or an unattached snapshot.
 ///
 /// **Irreversible.** Runs under `commit_drop` on the commit's recorded target
 /// branch; a denial answers the 404 an unknown id answers. A published commit
-/// is never dropped (409). The GQ statement `commit drop "<id>"` on
-/// `POST /mutate` runs the same body.
+/// is never dropped (409). Dropping an unattached snapshot also drops every
+/// unattached descendant, the root's whole chain included. The GQ statement
+/// `commit drop "<id>"` on `POST /mutate` runs the same body.
 pub(crate) async fn server_commit_drop(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -2906,14 +3292,6 @@ pub(crate) fn select_named_query_decl(
         bail!("query file contains multiple queries; pass --name");
     };
     Ok(query)
-}
-
-pub(crate) fn select_named_query(
-    queries: Vec<QueryDecl>,
-    requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let query = select_named_query_decl(queries, requested_name)?;
-    Ok((query.name, query.params))
 }
 
 pub(crate) fn query_params_from_json(
@@ -3210,7 +3588,7 @@ mod blob_error_tests {
         let snapshot = omnigraph::db::SnapshotId::new(
             "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV",
         );
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             "version: 1\n\
              groups:\n  team: [act-alice]\n\
              rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",

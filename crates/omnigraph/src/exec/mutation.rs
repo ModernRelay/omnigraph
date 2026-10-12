@@ -553,6 +553,79 @@ pub(super) struct CommittedStagedMutation {
     lineage_intent: crate::db::manifest::LineageIntent,
 }
 
+/// Where a declaration's write lands, resolved from the parsed declaration
+/// before the policy gate and the write transaction (RFC "Unattached graph
+/// branches": a child's recorded target is known before authorization).
+enum WriteRoute {
+    Publish,
+    AsCommit,
+    /// A root snapshot over the request branch's head.
+    UnattachedRoot,
+    /// A child over the Live snapshot it names, on the recorded target that
+    /// snapshot's chain inherits.
+    UnattachedChild(Box<crate::db::manifest::UnattachedCommit>),
+}
+
+impl WriteRoute {
+    /// Whether lowering, which parses the declaration again, read the mode
+    /// the route was resolved from.
+    fn agrees_with(&self, mode: &omnigraph_compiler::query::ast::MutationWriteMode) -> bool {
+        use omnigraph_compiler::query::ast::MutationWriteMode;
+        matches!(
+            (self, mode),
+            (Self::Publish, MutationWriteMode::Publish)
+                | (Self::AsCommit, MutationWriteMode::AsCommit)
+                | (
+                    Self::UnattachedRoot,
+                    MutationWriteMode::Unattached { base: None }
+                )
+                | (
+                    Self::UnattachedChild(_),
+                    MutationWriteMode::Unattached { base: Some(_) }
+                )
+        )
+    }
+
+    fn publication(&self, txn: &crate::db::WriteTxn) -> Result<crate::db::omnigraph::Publication> {
+        use crate::db::manifest::UnattachedWriteBase;
+        use crate::db::omnigraph::Publication;
+        Ok(match self {
+            Self::Publish => Publication::Publish,
+            Self::AsCommit => Publication::Propose(None),
+            Self::UnattachedRoot => Publication::Unattached(UnattachedWriteBase::Head),
+            Self::UnattachedChild(_) => {
+                let base = txn.unattached_base.as_ref().ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "a child unattached write carries no base in its transaction",
+                    )
+                })?;
+                Publication::Unattached(base.write_base())
+            }
+        })
+    }
+}
+
+/// The base id an `on` operand names: the literal as written, or the
+/// `String` value of the named parameter.
+fn unattached_base_id(
+    base: &omnigraph_compiler::query::ast::UnattachedBase,
+    params: &ParamMap,
+) -> Result<String> {
+    use omnigraph_compiler::query::ast::UnattachedBase;
+    match base {
+        UnattachedBase::Literal(id) => Ok(id.clone()),
+        UnattachedBase::Param(name) => match params.get(name) {
+            Some(Literal::String(id)) => Ok(id.clone()),
+            Some(_) => Err(OmniError::manifest(format!(
+                "parameter '${name}' names the base of an unattached branch and must be a String"
+            ))),
+            None => Err(OmniError::manifest(format!(
+                "parameter '${name}' names the base of an unattached branch and is missing"
+            ))),
+        },
+    }
+}
+
 /// Open a sub-table dataset for read or staged write within the current
 /// mutation query, capturing pre-write metadata in `staging` on first touch.
 /// The captured table version is the physical staging baseline. The publisher's
@@ -850,19 +923,37 @@ impl Session {
         actor_id: Option<&str>,
         expected_head: Option<&str>,
     ) -> Result<crate::MutationReceipt> {
-        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
-        // `Branch(branch)` to match the HTTP-layer convention at
-        // `server_change` (branch=Some(branch), target_branch=None). When no
-        // PolicyChecker is installed this is a no-op; with policy installed
-        // and actor=None this fails hard (forget-the-actor footgun guard).
-        self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+        self.mutate_as_with_optional_branch_receipt(
+            Some(branch),
+            query_source,
+            query_name,
+            params,
             actor_id,
-        )?;
+            expected_head,
+        )
+        .await
+    }
+
+    /// Executes a mutation with an optional branch selection. An omitted branch
+    /// inherits an unattached child's recorded target and otherwise selects main.
+    /// A supplied branch, including main, must match a child's recorded target.
+    pub async fn mutate_as_with_optional_branch_receipt(
+        &self,
+        branch: Option<&str>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+        expected_head: Option<&str>,
+    ) -> Result<crate::MutationReceipt> {
+        let decl = omnigraph_compiler::find_named_query(query_source, query_name)
+            .map_err(query_lookup_error)?;
+        let (route, branch) = self
+            .resolve_write_route(&decl.write_mode, branch, params, actor_id)
+            .await?;
         let settings = self.effective(query_source)?;
         self.mutate_with_current_actor(
-            branch,
+            &branch,
             query_source,
             query_name,
             params,
@@ -871,8 +962,80 @@ impl Session {
             settings.stage_write_concurrency(),
             HistoryReleaseBytes(settings.history_release_bytes()),
             WriteBudget::from_settings(&settings),
+            &route,
         )
         .await
+    }
+
+    /// The route of a declaration's write and the branch it addresses, after
+    /// the engine-layer `change` gate on that branch; a child unattached
+    /// write addresses its base's recorded target, a denial masked as not found.
+    async fn resolve_write_route(
+        &self,
+        mode: &omnigraph_compiler::query::ast::MutationWriteMode,
+        branch: Option<&str>,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+    ) -> Result<(WriteRoute, String)> {
+        use omnigraph_compiler::query::ast::MutationWriteMode;
+        let base = match mode {
+            MutationWriteMode::Publish => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::Publish, branch.to_string()));
+            }
+            MutationWriteMode::AsCommit => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::AsCommit, branch.to_string()));
+            }
+            MutationWriteMode::Unattached { base: None } => {
+                let branch = branch.unwrap_or("main");
+                self.enforce_change(branch, actor_id)?;
+                return Ok((WriteRoute::UnattachedRoot, branch.to_string()));
+            }
+            MutationWriteMode::Unattached { base: Some(base) } => base,
+        };
+        let base_id = unattached_base_id(base, params)?;
+        let addressed = self.addressed_commit(&base_id).await?;
+        let target = addressed.target_branch().unwrap_or("main").to_string();
+        match self.enforce_change(&target, actor_id) {
+            Err(OmniError::Policy(_)) if actor_id.is_some() => {
+                return Err(crate::db::graph_coordinator::commit_not_found(
+                    &crate::db::SnapshotId::new(base_id),
+                ));
+            }
+            decision => decision?,
+        }
+        let candidate = match addressed {
+            crate::db::omnigraph::AddressedCommit::Unattached(candidate) => candidate,
+            crate::db::omnigraph::AddressedCommit::Proposal(_)
+            | crate::db::omnigraph::AddressedCommit::Published(_) => {
+                return Err(OmniError::manifest(format!(
+                    "commit '{base_id}' is not an unattached snapshot"
+                )));
+            }
+        };
+        candidate.require_extendable()?;
+        if let Some(branch) = branch {
+            let requested =
+                Omnigraph::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
+            if requested != target {
+                return Err(OmniError::manifest(format!(
+                    "branch '{requested}' is not the recorded target '{target}' of unattached \
+                     branch '{base_id}'; name that branch or omit the branch"
+                )));
+            }
+        }
+        Ok((WriteRoute::UnattachedChild(candidate), target))
+    }
+
+    fn enforce_change(&self, branch: &str, actor_id: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )
     }
 }
 
@@ -914,6 +1077,7 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
+        route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
@@ -935,6 +1099,7 @@ impl Omnigraph {
                     attempt == 0,
                     &mut retryable,
                     write_budget,
+                    route,
                 )
                 .await
             {
@@ -970,24 +1135,32 @@ impl Omnigraph {
         first_attempt: bool,
         retryable: &mut bool,
         write_budget: WriteBudget,
+        route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
+        let addressed = requested.as_deref().unwrap_or("main").to_string();
         // Capture one branch-wide write authority: native branch identity,
         // exact optional graph head, accepted schema identity/catalog, and the
         // base table snapshot. Execution, validation, staging, and publication
         // all use this immutable attempt. `commit_all` revalidates the complete
         // token under the root-shared schema → branch → sorted-table gates
         // before its first detached commit.
-        let mut txn = self
-            .open_write_txn(requested.as_deref())
-            .await
-            .map_err(|error| {
-                if first_attempt {
-                    error.before_effect()
-                } else {
-                    error.without_pre_effect_evidence()
-                }
-            })?;
+        let opened = match route {
+            WriteRoute::UnattachedChild(base) => {
+                self.open_write_txn_on_unattached(requested.as_deref(), base)
+                    .await
+            }
+            WriteRoute::Publish | WriteRoute::AsCommit | WriteRoute::UnattachedRoot => {
+                self.open_write_txn(requested.as_deref()).await
+            }
+        };
+        let mut txn = opened.map_err(|error| {
+            if first_attempt {
+                error.before_effect()
+            } else {
+                error.without_pre_effect_evidence()
+            }
+        })?;
         // Caller CAS gate against the pinned view this attempt executes with —
         // a separate head lookup would reopen the race. Re-checked per
         // reprepare; not `ReadSetChanged`, so the retry loop never replays it.
@@ -1017,6 +1190,11 @@ impl Omnigraph {
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
         let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        debug_assert!(
+            route.agrees_with(&ir.write_mode),
+            "the lowered write mode {:?} disagrees with the pre-parsed route",
+            ir.write_mode
+        );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
         // Only an insert-only mutation is safe to replay automatically after a
@@ -1059,6 +1237,7 @@ impl Omnigraph {
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: None,
+                    branch: addressed,
                 })
             }
             Ok(total) => {
@@ -1071,17 +1250,14 @@ impl Omnigraph {
                         history_release_bytes,
                     )
                     .await?;
-                let publication = if ir.as_commit {
-                    crate::db::omnigraph::Publication::Propose(None)
-                } else {
-                    crate::db::omnigraph::Publication::Publish
-                };
+                let publication = route.publication(&txn)?;
                 let commit = self
                     .publish_committed_mutation(committed, &txn, actor_id, publication)
                     .await?;
                 Ok(crate::MutationReceipt {
                     result: total,
                     commit: Some(commit),
+                    branch: addressed,
                 })
             }
         }
@@ -2015,7 +2191,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             name: "q".into(),
             params: Vec::new(),
             ops: vec![op],
-            as_commit: false,
+            write_mode: omnigraph_compiler::query::ast::MutationWriteMode::Publish,
         };
         for (ir, is_insert) in [
             (

@@ -217,7 +217,7 @@ pub fn lower_mutation_query(catalog: &Catalog, query: &CheckedMutationQuery) -> 
         name: query.name.clone(),
         params: lower_params(&query.params),
         ops,
-        as_commit: query.as_commit,
+        write_mode: query.write_mode.clone(),
     })
 }
 

@@ -26,7 +26,8 @@ use omnigraph::{BlobCell, BlobContent, BlobEtag, BlobPrecondition, BlobWriteOutc
 use serial_test::serial;
 
 use helpers::collector::{
-    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain, staged_since,
+    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain,
+    pins_in_history, staged_since,
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
@@ -8635,12 +8636,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         .unwrap();
     }
     let person_uri = node_table_uri(&db, "Person").await;
-    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
-    let detached_before = raw.list_detached_manifests().await.unwrap().len();
+    let detached_before = detached_versions(&person_uri).await;
     assert!(
-        detached_before >= 3,
+        detached_before.len() >= 3,
         "every write leaves its detached version"
     );
+    let pins = pins_in_history(&db, "main", "node:Person").await;
 
     for pass in 0..2 {
         let stats = db
@@ -8660,9 +8661,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         );
     }
 
-    let detached_after = raw.list_detached_manifests().await.unwrap().len();
+    // Every pinned version is a young proven copy and stays; only the first
+    // load's effect beneath its full-text declaration, a link no commit pins,
+    // is reclaimed.
     assert_eq!(
-        detached_after, detached_before,
+        detached_versions(&person_uri).await,
+        &detached_before & &pins,
         "young proven copies are kept, not reaped"
     );
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
@@ -9010,8 +9014,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 2,
-        "the retry sweeps what the first pass left of the two links and main's pruned base pin: {row:?}"
+        row.manifests_removed, 3,
+        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
+         base load's effect beneath its full-text declaration: {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {
@@ -9141,6 +9146,611 @@ async fn merge_as_commit_probe_failure_releases_the_proposal_tag() {
         db.list_unpublished_commits(None).await.unwrap().is_empty(),
         "no unpublished commit is listed after the undone proposal"
     );
+}
+
+const UNATTACHED_ROOT_QUERY: &str = r#"
+query insert_root($name: String, $age: I32) as unattached branch {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+const UNATTACHED_CHILD_QUERY: &str = r#"
+query insert_child($name: String, $age: I32, $base: String) as unattached branch on $base {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+/// The child declaration with its base spelled as a literal.
+fn unattached_child_on(base: &str) -> String {
+    format!(
+        r#"
+query insert_child($name: String, $age: I32) as unattached branch on "{base}" {{
+    insert Person {{ name: $name, age: $age }}
+}}
+"#
+    )
+}
+
+/// The parameters of one Person insert, with the base id of a child written
+/// by parameter.
+fn person_params(name: &str, age: i64, base: Option<&str>) -> omnigraph_compiler::ir::ParamMap {
+    let mut strings = vec![("$name", name)];
+    if let Some(base) = base {
+        strings.push(("$base", base));
+    }
+    mixed_params(&strings, &[("$age", age)])
+}
+
+async fn person_count_at(db: &Omnigraph, target: ReadTarget) -> usize {
+    db.snapshot_of(target)
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap()
+}
+
+fn manifest_kind(error: &OmniError) -> Option<ManifestErrorKind> {
+    match error {
+        OmniError::Manifest(error) => Some(error.kind),
+        _ => None,
+    }
+}
+
+/// The engine path of RFC "Unattached graph branches" end to end, in Rust
+/// until the GQT runner substitutes `on "${name}"` (plan step 8): root,
+/// children by literal and parameter, reads, refusals, publish refusal, drop.
+#[tokio::test]
+#[serial]
+async fn unattached_root_and_child_write_read_refuse_publish_and_drop() {
+    use omnigraph::db::GraphCommitKind;
+    use omnigraph::error::ManifestConflictDetails;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let main_commits = db.list_commits(Some("main")).await.unwrap();
+    let main_head = main_commits[0].graph_commit_id.clone();
+
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.branch, "main");
+    assert_eq!(root.result.affected_nodes, 1);
+    let root = root
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    assert_eq!(root.kind, GraphCommitKind::Unattached);
+    assert!(!root.published);
+    assert_eq!(
+        root.root_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_eq!(root.parent_commit_id.as_deref(), Some(main_head.as_str()));
+    assert_eq!(root.graph_branch, None);
+    assert!(is_detached_version(root.graph_manifest_version));
+
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.branch, "main");
+    let child = child
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    assert_eq!(child.kind, GraphCommitKind::Unattached);
+    assert_eq!(child.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        child.parent_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_ne!(child.graph_commit_id, root.graph_commit_id);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("grandchild", 3, Some(&child.graph_commit_id)),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("a child by parameter reports its snapshot");
+    assert_eq!(grandchild.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        grandchild.parent_commit_id.as_deref(),
+        Some(child.graph_commit_id.as_str())
+    );
+
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(
+        person_count_at(&db, at(&grandchild.graph_commit_id)).await,
+        main_before + 3
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+    assert_eq!(db.get_commit(&child.graph_commit_id).await.unwrap(), child);
+    assert!(db.list_unpublished_commits(None).await.unwrap().is_empty());
+    let listed: Vec<String> = db
+        .list_unattached_commits(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|commit| commit.graph_commit_id)
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            grandchild.graph_commit_id.clone(),
+            child.graph_commit_id.clone(),
+            root.graph_commit_id.clone()
+        ],
+        "live snapshots list newest first"
+    );
+    assert_eq!(
+        db.commit_target_branch(&child.graph_commit_id)
+            .await
+            .unwrap(),
+        "main"
+    );
+
+    let refused = db
+        .mutate_with_receipt(
+            "feature",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("elsewhere", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused.to_string().contains("is not the recorded target"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&main_head),
+            "insert_child",
+            &person_params("published-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused
+            .to_string()
+            .contains("is not an unattached snapshot"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "insert_child",
+            &person_params("unknown-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("no-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(refused.to_string().contains("is missing"), "{refused}");
+
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let refused = db.publish_commit_as(id, None).await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+        let OmniError::Manifest(manifest_error) = refused else {
+            panic!("a publish refusal is a typed manifest conflict");
+        };
+        assert_eq!(manifest_error.kind, ManifestErrorKind::Conflict);
+        assert_eq!(
+            manifest_error.details,
+            Some(ManifestConflictDetails::UnattachedCannotPublish {
+                graph_commit_id: id.clone()
+            })
+        );
+    }
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+
+    db.drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    for id in [
+        &root.graph_commit_id,
+        &child.graph_commit_id,
+        &grandchild.graph_commit_id,
+    ] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+        assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let repeated = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&repeated), Some(ManifestErrorKind::NotFound));
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+}
+
+/// A child write whose base is dropped between its resolution and its effect
+/// gates refuses under the gates, before any detached table commit: the
+/// table's detached manifests and main are as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn unattached_child_refuses_after_its_base_is_dropped_before_the_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let staged_before = detached_versions(&person_uri).await;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        let query = unattached_child_on(&root.graph_commit_id);
+        tokio::spawn(async move {
+            db.mutate_with_receipt(
+                "main",
+                &query,
+                "insert_child",
+                &person_params("child", 2, None),
+            )
+            .await
+        })
+    };
+    parked.wait_until_reached().await;
+    let dropper = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    dropper
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    parked.release();
+    let refused = writer.await.unwrap().unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    assert!(
+        refused.to_string().contains("dropped before the write"),
+        "{refused}"
+    );
+    assert_eq!(
+        detached_versions(&person_uri).await,
+        staged_before,
+        "the refused child committed no detached table version"
+    );
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+}
+
+/// A root and a child of it on main, written through the engine.
+async fn write_unattached_root_and_child(
+    db: &Session,
+) -> (omnigraph::db::GraphCommit, omnigraph::db::GraphCommit) {
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    (root, child)
+}
+
+/// The detached Person version the snapshot `id` pins.
+async fn person_pin_at(db: &Omnigraph, id: &str) -> u64 {
+    db.snapshot_of(ReadTarget::snapshot(SnapshotId::new(id.to_string())))
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .published_dataset_version()
+}
+
+/// Keep one `__manifest` version per branch and reap at any age: what the
+/// collector roots is the only thing that survives.
+fn keep_one_at_any_age() -> omnigraph::db::CleanupPolicyOptions {
+    omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    }
+}
+
+/// Every detached Person manifest aged to the epoch.
+fn age_detached_manifests(person_uri: &str) {
+    for entry in std::fs::read_dir(std::path::Path::new(person_uri).join("_versions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap().to_string_lossy().starts_with('d') {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+}
+
+async fn unattached_tags(uri: &str) -> std::collections::BTreeSet<String> {
+    helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None)
+        .await
+        .tags()
+        .list()
+        .await
+        .unwrap()
+        .into_keys()
+        .filter(|name| name.starts_with("unattached_"))
+        .collect()
+}
+
+/// A live chain's complete result pins are roots: a cleanup that reaps at
+/// any age keeps the root's and the child's detached Person versions, their
+/// tags and their reads (RFC "Unattached graph branches", collector).
+#[tokio::test]
+#[serial]
+async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    assert_ne!(root_pin, child_pin);
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        plan.roots.contains(&root_pin) && plan.roots.contains(&child_pin),
+        "a live snapshot's pins are roots: {:?}",
+        plan.roots
+    );
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    assert!(
+        report.retained_unattached_tags.iter().any(|record| {
+            record.graph_commit_id == child.graph_commit_id
+                && record.parent_commit_id == root.graph_commit_id
+                && record.root_commit_id == root.graph_commit_id
+        }),
+        "{:?}",
+        report.retained_unattached_tags
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        remaining.contains(&root_pin) && remaining.contains(&child_pin),
+        "the rooted pins survive the reap: {remaining:?}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(db.list_unattached_commits(None).await.unwrap().len(), 2);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&child.graph_commit_id),
+            "insert_child",
+            &person_params("grandchild", 3, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let grandchild_pin = person_pin_at(&db, &grandchild.graph_commit_id).await;
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    let main = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    main.tags().delete(&child_tag).await.unwrap();
+    insert_person(&db, "main", "after-missing-ancestor").await;
+    age_detached_manifests(&person_uri);
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.roots.contains(&grandchild_pin));
+    assert!(plan.roots.contains(&root_pin));
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(remaining.contains(&grandchild_pin));
+    assert!(remaining.contains(&root_pin));
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let refused = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+
+    let refused = db
+        .snapshot_of(at(&grandchild.graph_commit_id))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+}
+
+/// A head advance expires the chain: its pins are no longer roots, cleanup
+/// releases the child's tag before the root's with a readback each, and a
+/// failure between the two leaves the root addressable for the retry.
+#[tokio::test]
+#[serial]
+async fn cleanup_releases_expired_unattached_tags_descendants_first() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    let root_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, root.graph_commit_id
+    );
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone(), child_tag.clone()])
+    );
+    insert_person(&db, "main", "after").await;
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        !plan.roots.contains(&root_pin) && !plan.roots.contains(&child_pin),
+        "an expired snapshot roots nothing: {:?}",
+        plan.roots
+    );
+    assert!(report.retained_unattached_tags.is_empty());
+    let order: Vec<&str> = omnigraph::db::unattached_release_order(
+        &report.expired_unattached_tags,
+        &report.retained_unattached_tags,
+    )
+    .into_iter()
+    .map(|record| record.name.as_str())
+    .collect();
+    assert_eq!(order, [child_tag.as_str(), root_tag.as_str()]);
+
+    let interrupted = {
+        let _fp = catalog::CLEANUP_POST_UNATTACHED_RELEASE.fail_once_at(1);
+        db.cleanup(keep_one_at_any_age()).await.unwrap_err()
+    };
+    assert!(
+        interrupted
+            .to_string()
+            .contains("cleanup.post_unattached_release"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone()]),
+        "the child's tag went first; the root's stays for the retry"
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert!(unattached_tags(&uri).await.is_empty());
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        !remaining.contains(&root_pin) && !remaining.contains(&child_pin),
+        "the unrooted pins are reaped: {remaining:?}"
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before + 1
+    );
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
 }
 
 /// Cancellation preserves accepted inputs until the target's exact publication

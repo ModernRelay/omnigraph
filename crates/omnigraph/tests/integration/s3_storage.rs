@@ -1,4 +1,4 @@
-mod helpers;
+use crate::helpers;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use omnigraph::instrumentation::{
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
-use helpers::*;
+use crate::helpers::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_compatible_graph_lifecycle_works() {

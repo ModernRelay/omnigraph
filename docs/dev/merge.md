@@ -338,7 +338,7 @@ structured error; it cannot replace the successful merge receipt. See
 
 - `crates/omnigraph/src/exec/merge.rs` — classification and execution.
 - `crates/omnigraph/tests/integration/merge_truth_table.rs` — operation-pair semantics.
-- `crates/omnigraph/tests/merge_fast_forward.rs` — pointer/proven-insert routes
+- `crates/omnigraph/tests/integration/merge_fast_forward.rs` — pointer/proven-insert routes
   and bounded fallback.
 - `crates/omnigraph/tests/integration/branching.rs` — branch identity and Blob behavior.
 - `crates/omnigraph/tests/integration/merge_cost.rs` — delta scope and manifest-history
