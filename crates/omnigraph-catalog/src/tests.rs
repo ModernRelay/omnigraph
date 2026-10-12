@@ -14572,3 +14572,70 @@ async fn proposal_readers_never_open_an_unattached_tag() {
             .is_empty()
     );
 }
+
+/// The manifest-store reads one proposal listing and one proposal lookup
+/// cost, counted on the store itself so Lance's direct local reads are
+/// included, with `roots` unrelated unattached roots planted beside them.
+async fn proposal_reader_reads_with_unattached_roots(roots: usize) -> (u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let control_session = crate::lance_access::control_session();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    let version = main.version().version;
+    for index in 0..roots {
+        let root = format!("01ARZ3NDEKTSV4RRFFQ69G5F{index:02}");
+        main.tags()
+            .create(
+                &unattached_tag_name(&root, &root),
+                lance::dataset::refs::Ref::Version(None, Some(version)),
+            )
+            .await
+            .unwrap();
+    }
+    let probes = fresh_publish_probes();
+    let listed = crate::instrumentation::with_query_io_probes(
+        probes.clone(),
+        ManifestCoordinator::list_unpublished(uri, &control_session, None),
+    )
+    .await
+    .unwrap();
+    assert!(listed.is_empty());
+    let listing = drain_publish_io(&probes.manifest_stores).reads;
+    let probes = fresh_publish_probes();
+    let looked_up = crate::instrumentation::with_query_io_probes(
+        probes.clone(),
+        ManifestCoordinator::unpublished_commit(
+            uri,
+            &control_session,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(looked_up.is_none());
+    (listing, drain_publish_io(&probes.manifest_stores).reads)
+}
+
+/// Proposal listing and lookup open no unattached tag: their manifest-store
+/// read count is the same with zero and with four unrelated unattached roots
+/// (Lance's `tags().list()` opens every tag, so names are enumerated first).
+#[tokio::test]
+async fn proposal_reader_reads_are_independent_of_the_unattached_population() {
+    let (listing_without, lookup_without) = proposal_reader_reads_with_unattached_roots(0).await;
+    for roots in 1..=4 {
+        let (listing, lookup) = proposal_reader_reads_with_unattached_roots(roots).await;
+        assert_eq!(
+            listing, listing_without,
+            "proposal listing with {roots} unrelated unattached roots read \
+             {listing} manifest-store objects, {listing_without} with none"
+        );
+        assert_eq!(
+            lookup, lookup_without,
+            "proposal lookup with {roots} unrelated unattached roots read \
+             {lookup} manifest-store objects, {lookup_without} with none"
+        );
+    }
+}

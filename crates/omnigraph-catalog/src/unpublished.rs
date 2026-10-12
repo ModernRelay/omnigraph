@@ -28,7 +28,9 @@ use crate::migrations::{read_stamp, require_unpublished_commits};
 use crate::publisher::{
     CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition,
 };
-use crate::retention::{ManifestTagInventory, release_merge_input_tags};
+use crate::retention::{
+    ManifestTagInventory, list_native_tag_names, read_native_tag, release_merge_input_tags,
+};
 use crate::seams::{decide_seam, fail};
 use crate::state::{
     BranchRecords, GraphLineageRow, TablePin, TableRow, TableState, read_manifest_rows_projected,
@@ -683,10 +685,10 @@ impl ManifestCoordinator {
     }
 
     /// Every live proposal whose target is `branch` (`None` = main), newest
-    /// first by `(created_at, graph_commit_id)`. One tag listing, then one
-    /// read per proposal tag: the cost grows with the retained proposals and
-    /// not with the unattached population, whose `unattached_` tags the
-    /// name filter skips unopened.
+    /// first by `(created_at, graph_commit_id)`. One listing of tag names,
+    /// then one read per proposal tag: the cost grows with the retained
+    /// proposals and not with the unattached population, whose `unattached_`
+    /// tags the name filter leaves unopened.
     pub async fn list_unpublished(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -695,15 +697,17 @@ impl ManifestCoordinator {
         let branch = branch.filter(|branch| *branch != "main");
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-        let tags = main.tags().list().await.map_err(OmniError::storage)?;
-        let mut names: Vec<(String, TagContents)> = tags
+        let names: Vec<String> = list_native_tag_names(&main)
+            .await?
             .into_iter()
-            .filter(|(name, _)| is_unpublished_tag(name))
+            .filter(|name| is_unpublished_tag(name))
             .collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0));
         let mut proposals = Vec::new();
-        for (name, tag) in &names {
-            let proposal = Self::unpublished_from_tag(root_uri, &main, name, tag).await?;
+        for name in &names {
+            let Some(tag) = read_native_tag(&main, name).await? else {
+                continue;
+            };
+            let proposal = Self::unpublished_from_tag(root_uri, &main, name, &tag).await?;
             if proposal.property.graph_branch.as_deref() == branch && proposal.is_live() {
                 proposals.push(proposal);
             }

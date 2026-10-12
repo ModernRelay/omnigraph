@@ -33,7 +33,7 @@ use crate::migrations::{read_stamp, require_unattached_branches};
 use crate::publisher::{
     GraphHeadExpectation, UnattachedIntent, UnattachedOutcome, UnattachedWriteBase,
 };
-use crate::retention::ManifestTagInventory;
+use crate::retention::{ManifestTagInventory, list_native_tag_names, read_native_tag};
 use crate::seams::{decide_seam, fail};
 use crate::state::{GraphLineageRow, read_manifest_rows_projected};
 use crate::unpublished::{
@@ -361,6 +361,7 @@ pub async fn release_unattached_tag_confirmed(dataset: &Dataset, name: &str) -> 
 /// target checks for the duration of a listing or collection operation.
 pub struct UnattachedInventoryReader<'a> {
     inventory: &'a ManifestTagInventory,
+    tags: NativeTags<'a>,
     root_uri: &'a str,
     judged: JudgedLifetimes,
 }
@@ -369,13 +370,14 @@ impl<'a> UnattachedInventoryReader<'a> {
     pub fn new(inventory: &'a ManifestTagInventory, root_uri: &'a str) -> Self {
         Self {
             inventory,
+            tags: NativeTags::sealed(inventory),
             root_uri,
             judged: JudgedLifetimes::default(),
         }
     }
 
     pub async fn read(&mut self, name: &str) -> Result<UnattachedCommit> {
-        let tag = self.inventory.tags.get(name).ok_or_else(|| {
+        let tag = self.inventory.tags.get(name).cloned().ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "native tag '{name}' is not in the captured inventory"
             ))
@@ -383,12 +385,54 @@ impl<'a> UnattachedInventoryReader<'a> {
         ManifestCoordinator::unattached_from_tag_sharing(
             self.root_uri,
             self.inventory.dataset(),
-            &self.inventory.tags,
+            &mut self.tags,
             name,
-            tag,
+            &tag,
             &mut self.judged,
         )
         .await
+    }
+}
+
+/// Candidate tags by name: a sealed inventory answers from what it captured
+/// and reads nothing, an on-demand source reads each selected name once.
+struct NativeTags<'a> {
+    dataset: &'a Dataset,
+    sealed: bool,
+    read: BTreeMap<String, Option<TagContents>>,
+}
+
+impl<'a> NativeTags<'a> {
+    fn on_demand(dataset: &'a Dataset) -> Self {
+        Self {
+            dataset,
+            sealed: false,
+            read: BTreeMap::new(),
+        }
+    }
+
+    fn sealed(inventory: &'a ManifestTagInventory) -> Self {
+        Self {
+            dataset: inventory.dataset(),
+            sealed: true,
+            read: inventory
+                .tags
+                .iter()
+                .map(|(name, tag)| (name.clone(), Some(tag.clone())))
+                .collect(),
+        }
+    }
+
+    async fn get(&mut self, name: &str) -> Result<Option<&TagContents>> {
+        if !self.read.contains_key(name) {
+            let tag = if self.sealed {
+                None
+            } else {
+                read_native_tag(self.dataset, name).await?
+            };
+            self.read.insert(name.to_string(), tag);
+        }
+        Ok(self.read.get(name).and_then(Option::as_ref))
     }
 }
 
@@ -403,7 +447,7 @@ impl JudgedLifetimes {
         &mut self,
         root_uri: &str,
         main: &Dataset,
-        tags: &BTreeMap<String, TagContents>,
+        tags: &mut NativeTags<'_>,
         property: &UnattachedCommitProperty,
     ) -> Result<UnattachedLifetime> {
         let mut current = property.clone();
@@ -432,7 +476,7 @@ impl JudgedLifetimes {
             }
             let parent_tag =
                 unattached_tag_name(&current.root_commit_id, &current.parent_commit_id);
-            let Some(tag) = tags.get(&parent_tag) else {
+            let Some(tag) = tags.get(&parent_tag).await?.cloned() else {
                 break UnattachedLifetime::Undecidable(format!(
                     "required ancestor '{}' under root '{}' has no retained candidate tag",
                     current.parent_commit_id, current.root_commit_id
@@ -441,7 +485,7 @@ impl JudgedLifetimes {
             if let Some((parent, _)) = self.ancestors.get(&current.parent_commit_id) {
                 current = parent.clone();
             } else {
-                current = ManifestCoordinator::unattached_record_from_tag(main, &parent_tag, tag)
+                current = ManifestCoordinator::unattached_record_from_tag(main, &parent_tag, &tag)
                     .await?
                     .0;
             }
@@ -573,11 +617,12 @@ impl ManifestCoordinator {
     }
 
     /// The snapshot `graph_commit_id` names, or `None` when no tag names it.
-    /// One tag listing (the tag name carries the root, which a lookup by `C`
-    /// alone does not know), then validates the snapshot and its retained
-    /// ancestry, reading each detached version and transaction along the
-    /// parent path before judging the live target. An id that is not a canonical ULID names no snapshot and
-    /// costs no listing.
+    /// One listing of tag names (the tag name carries the root, which a
+    /// lookup by `C` alone does not know) and one read of the named tag,
+    /// then validates the snapshot and its retained ancestry, reading each
+    /// ancestor tag, detached version and transaction along the parent path
+    /// before judging the live target. No other tag is opened. An id that is
+    /// not a canonical ULID names no snapshot and costs no listing.
     pub async fn unattached_commit(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -588,42 +633,37 @@ impl ManifestCoordinator {
         }
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-        let tags: BTreeMap<_, _> = main
-            .tags()
-            .list()
-            .await
-            .map_err(OmniError::storage)?
-            .into_iter()
-            .collect();
         let mut named = Vec::new();
-        for (name, tag) in &tags {
-            if let Some((_, named_id)) = unattached_tag_parts(name)?
+        for name in list_native_tag_names(&main).await? {
+            if let Some((_, named_id)) = unattached_tag_parts(&name)?
                 && named_id == graph_commit_id
             {
-                named.push((name, tag));
+                named.push(name);
             }
         }
-        named.sort_by(|a, b| a.0.cmp(b.0));
         match named.as_slice() {
             [] => Ok(None),
-            [(name, tag)] => Self::unattached_from_tag_sharing(
-                root_uri,
-                &main,
-                &tags,
-                name,
-                tag,
-                &mut JudgedLifetimes::default(),
-            )
-            .await
-            .map(Some),
+            [name] => {
+                let mut tags = NativeTags::on_demand(&main);
+                let Some(tag) = tags.get(name).await?.cloned() else {
+                    return Ok(None);
+                };
+                Self::unattached_from_tag_sharing(
+                    root_uri,
+                    &main,
+                    &mut tags,
+                    name,
+                    &tag,
+                    &mut JudgedLifetimes::default(),
+                )
+                .await
+                .map(Some)
+            }
             many => Err(OmniError::manifest_internal(format!(
                 "unattached branch '{graph_commit_id}' is named by {} candidate tags under \
                  different roots ({})",
                 many.len(),
-                many.iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                many.join(", ")
             ))),
         }
     }
@@ -631,7 +671,7 @@ impl ManifestCoordinator {
     async fn unattached_from_tag_sharing(
         root_uri: &str,
         main: &Dataset,
-        tags: &BTreeMap<String, TagContents>,
+        tags: &mut NativeTags<'_>,
         name: &str,
         tag: &TagContents,
         judged: &mut JudgedLifetimes,
@@ -709,9 +749,10 @@ impl ManifestCoordinator {
     }
 
     /// Every live snapshot whose recorded target is `branch` (`None` =
-    /// main), newest first by `(created_at, graph_commit_id)`. One tag
-    /// listing, then one read per candidate tag and one target scan per
-    /// distinct chain: the cost grows with the retained snapshots.
+    /// main), newest first by `(created_at, graph_commit_id)`. One listing
+    /// of tag names, then one read per candidate tag and one target scan per
+    /// distinct chain: the cost grows with the retained snapshots, and no
+    /// other tag is opened.
     pub async fn list_unattached(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -720,24 +761,27 @@ impl ManifestCoordinator {
         let branch = branch.filter(|branch| *branch != "main");
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-        let tags: BTreeMap<_, _> = main
-            .tags()
-            .list()
-            .await
-            .map_err(OmniError::storage)?
+        let names: Vec<String> = list_native_tag_names(&main)
+            .await?
             .into_iter()
+            .filter(|name| is_unattached_tag(name))
             .collect();
-        let mut names: Vec<_> = tags
-            .iter()
-            .filter(|(name, _)| is_unattached_tag(name))
-            .collect();
-        names.sort_by(|a, b| a.0.cmp(b.0));
+        let mut tags = NativeTags::on_demand(&main);
         let mut judged = JudgedLifetimes::default();
         let mut snapshots = Vec::new();
-        for (name, tag) in &names {
-            let snapshot =
-                Self::unattached_from_tag_sharing(root_uri, &main, &tags, name, tag, &mut judged)
-                    .await?;
+        for name in &names {
+            let Some(tag) = tags.get(name).await?.cloned() else {
+                continue;
+            };
+            let snapshot = Self::unattached_from_tag_sharing(
+                root_uri,
+                &main,
+                &mut tags,
+                name,
+                &tag,
+                &mut judged,
+            )
+            .await?;
             if snapshot.property.graph_branch.as_deref() == branch && snapshot.is_live() {
                 snapshots.push(snapshot);
             }
@@ -751,10 +795,10 @@ impl ManifestCoordinator {
 
     /// Every snapshot under `root` that descends from `graph_commit_id`,
     /// deepest first (post-order), so a caller removes each one before its
-    /// base. Discovery lists the candidate tags by the root's name prefix
-    /// without opening any other tag; each one under the prefix is decoded
-    /// and judged once. A record reached twice is a cycle, an integrity
-    /// failure.
+    /// base. Discovery selects the candidate tags by the root's name prefix
+    /// from one listing of tag names and opens no other tag; each one under
+    /// the prefix is read, decoded and judged once. A record reached twice
+    /// is a cycle, an integrity failure.
     pub async fn unattached_descendants(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -764,24 +808,28 @@ impl ManifestCoordinator {
         let prefix = unattached_tag_root_prefix(root);
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-        let tags: BTreeMap<_, _> = main
-            .tags()
-            .list()
-            .await
-            .map_err(OmniError::storage)?
+        let names: Vec<String> = list_native_tag_names(&main)
+            .await?
             .into_iter()
+            .filter(|name| name.starts_with(&prefix))
             .collect();
-        let mut names: Vec<_> = tags
-            .iter()
-            .filter(|(name, _)| name.starts_with(&prefix))
-            .collect();
-        names.sort_by(|a, b| a.0.cmp(b.0));
+        let mut tags = NativeTags::on_demand(&main);
         let mut judged = JudgedLifetimes::default();
         let mut records = Vec::with_capacity(names.len());
-        for (name, tag) in &names {
+        for name in &names {
+            let Some(tag) = tags.get(name).await?.cloned() else {
+                continue;
+            };
             records.push(
-                Self::unattached_from_tag_sharing(root_uri, &main, &tags, name, tag, &mut judged)
-                    .await?,
+                Self::unattached_from_tag_sharing(
+                    root_uri,
+                    &main,
+                    &mut tags,
+                    name,
+                    &tag,
+                    &mut judged,
+                )
+                .await?,
             );
         }
         let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
