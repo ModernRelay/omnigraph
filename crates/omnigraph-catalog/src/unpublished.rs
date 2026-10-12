@@ -28,7 +28,9 @@ use crate::migrations::{read_stamp, require_unpublished_commits};
 use crate::publisher::{
     CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition,
 };
-use crate::retention::{ManifestTagInventory, release_merge_input_tags};
+use crate::retention::{
+    ManifestTagInventory, list_native_tag_names, read_native_tag, release_merge_input_tags,
+};
 use crate::seams::{decide_seam, fail};
 use crate::state::{
     BranchRecords, GraphLineageRow, TablePin, TableRow, TableState, read_manifest_rows_projected,
@@ -186,6 +188,12 @@ impl UnpublishedCommitProperty {
         else {
             return Ok(None);
         };
+        Self::decode_value(value).map(Some)
+    }
+
+    /// The version 1 layout of one property value; a version 2 value is
+    /// refused here and read through [`crate::unattached::CandidateProperty`].
+    pub(crate) fn decode_value(value: &str) -> Result<Self> {
         let property: Self = serde_json::from_str(value).map_err(|error| {
             OmniError::manifest_internal(format!(
                 "the unpublished commit property does not decode: {error}"
@@ -197,7 +205,7 @@ impl UnpublishedCommitProperty {
                 property.version, UNPUBLISHED_PROPERTY_VERSION
             )));
         }
-        Ok(Some(property))
+        Ok(property)
     }
 
     pub fn tag_name(&self) -> String {
@@ -321,6 +329,7 @@ impl UnpublishedCommit {
             crate::commit_graph::graph_commit_from_manifest_row(self.record.commit.clone());
         commit.graph_manifest_version = self.detached_version;
         commit.published = false;
+        commit.kind = crate::commit_graph::GraphCommitKind::Unpublished;
         commit
     }
 
@@ -487,6 +496,33 @@ pub(crate) fn candidate_changes(
     Ok(changes)
 }
 
+/// The live incarnation a candidate recorded as its target, `None` when that
+/// incarnation is retired or replaced: one branch listing. A record that
+/// names a branch without its native ref is corrupt.
+pub(crate) async fn resolve_recorded_target(
+    main: &Dataset,
+    graph_commit_id: &str,
+    graph_branch: Option<&str>,
+    native_branch: Option<&str>,
+) -> Result<Option<Dataset>> {
+    match (graph_branch, native_branch) {
+        (None, None) => Ok(Some(main.clone())),
+        (Some(logical), Some(native)) => {
+            match crate::branch_control::resolve_live_native_branch(main, logical).await? {
+                Some(live) if live == native => match main.checkout_branch(native).await {
+                    Ok(dataset) => Ok(Some(dataset)),
+                    Err(lance::Error::RefNotFound { .. }) => Ok(None),
+                    Err(error) => Err(OmniError::storage(error)),
+                },
+                _ => Ok(None),
+            }
+        }
+        _ => Err(OmniError::manifest_internal(format!(
+            "candidate '{graph_commit_id}' names a branch without its native ref"
+        ))),
+    }
+}
+
 /// The lifetime of a proposal captured under `property`, judged against the
 /// live target: one branch listing and one scan of the target's head.
 async fn judge_lifetime(
@@ -494,32 +530,17 @@ async fn judge_lifetime(
     main: &Dataset,
     property: &UnpublishedCommitProperty,
 ) -> Result<UnpublishedLifetime> {
-    let target = match (&property.graph_branch, &property.native_branch) {
-        (None, None) => main.clone(),
-        (Some(logical), Some(native)) => {
-            match crate::branch_control::resolve_live_native_branch(main, logical).await? {
-                Some(live) if &live == native => match main.checkout_branch(native).await {
-                    Ok(dataset) => dataset,
-                    Err(lance::Error::RefNotFound { .. }) => {
-                        return Ok(UnpublishedLifetime::Expired(
-                            UnpublishedExpiry::IncarnationRetired,
-                        ));
-                    }
-                    Err(error) => return Err(OmniError::storage(error)),
-                },
-                _ => {
-                    return Ok(UnpublishedLifetime::Expired(
-                        UnpublishedExpiry::IncarnationRetired,
-                    ));
-                }
-            }
-        }
-        _ => {
-            return Err(OmniError::manifest_internal(format!(
-                "unpublished commit '{}' names a branch without its native ref",
-                property.graph_commit_id
-            )));
-        }
+    let Some(target) = resolve_recorded_target(
+        main,
+        &property.graph_commit_id,
+        property.graph_branch.as_deref(),
+        property.native_branch.as_deref(),
+    )
+    .await?
+    else {
+        return Ok(UnpublishedLifetime::Expired(
+            UnpublishedExpiry::IncarnationRetired,
+        ));
     };
     let rows = read_manifest_rows_projected(&target).await?;
     let head = rows.head.graph_commit_id.clone();
@@ -585,7 +606,9 @@ impl ManifestCoordinator {
 
     /// The proposal `graph_commit_id` names, or `None` when no tag names it.
     /// One tag read, one checkout of the detached version, one scan and one
-    /// transaction read, then the lifetime rule against the live target.
+    /// transaction read, then the lifetime rule against the live target. An
+    /// `unattached_` tag is never opened here: its name carries two ids and
+    /// its record is version 2 (`crate::unattached`).
     pub async fn unpublished_commit(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -662,8 +685,10 @@ impl ManifestCoordinator {
     }
 
     /// Every live proposal whose target is `branch` (`None` = main), newest
-    /// first by `(created_at, graph_commit_id)`. One tag listing, then one
-    /// read per proposal tag: the cost grows with the retained proposals.
+    /// first by `(created_at, graph_commit_id)`. One listing of tag names,
+    /// then one read per proposal tag: the cost grows with the retained
+    /// proposals and not with the unattached population, whose `unattached_`
+    /// tags the name filter leaves unopened.
     pub async fn list_unpublished(
         root_uri: &str,
         control_session: &Arc<lance::session::Session>,
@@ -672,15 +697,17 @@ impl ManifestCoordinator {
         let branch = branch.filter(|branch| *branch != "main");
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-        let tags = main.tags().list().await.map_err(OmniError::storage)?;
-        let mut names: Vec<(String, TagContents)> = tags
+        let names: Vec<String> = list_native_tag_names(&main)
+            .await?
             .into_iter()
-            .filter(|(name, _)| is_unpublished_tag(name))
+            .filter(|name| is_unpublished_tag(name))
             .collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0));
         let mut proposals = Vec::new();
-        for (name, tag) in &names {
-            let proposal = Self::unpublished_from_tag(root_uri, &main, name, tag).await?;
+        for name in &names {
+            let Some(tag) = read_native_tag(&main, name).await? else {
+                continue;
+            };
+            let proposal = Self::unpublished_from_tag(root_uri, &main, name, &tag).await?;
             if proposal.property.graph_branch.as_deref() == branch && proposal.is_live() {
                 proposals.push(proposal);
             }

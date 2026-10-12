@@ -61,10 +61,17 @@ pub mod publisher;
 pub mod read_executor;
 pub mod retention;
 pub mod state;
+pub mod unattached;
 pub mod unpublished;
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
-    UNPUBLISHED_COMMITS_STAMP, require_unpublished_commits, supports_unpublished_commits,
+    UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
+    require_unpublished_commits, supports_unattached_branches, supports_unpublished_commits,
+};
+pub use unattached::{
+    CandidateProperty, UNATTACHED_PROPERTY_VERSION, UNATTACHED_TAG_PREFIX, UnattachedCommit,
+    UnattachedCommitProperty, UnattachedExpiry, UnattachedInventoryReader, UnattachedLifetime,
+    is_unattached_tag, unattached_tag_name, unattached_tag_parts, unattached_tag_root_prefix,
 };
 pub use unpublished::{
     UNPUBLISHED_TAG_PREFIX, UnpublishedCommit, UnpublishedCommitProperty, UnpublishedExpiry,
@@ -94,7 +101,10 @@ use metadata::{
 pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub use publisher::{CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition};
+pub use publisher::{
+    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, UnattachedIntent,
+    UnattachedOutcome, UnattachedWriteBase,
+};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
 use state::read_schema_contract_row;

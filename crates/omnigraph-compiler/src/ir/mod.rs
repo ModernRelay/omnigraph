@@ -10,7 +10,9 @@ pub use lower::is_fresh_variable;
 use std::collections::HashMap;
 
 use crate::error::{CompilerError, Result};
-use crate::query::ast::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Param, Precedence};
+use crate::query::ast::{
+    AggFunc, BinaryOp, CompOp, Literal, MutationWriteMode, NOW_PARAM_NAME, Param, Precedence,
+};
 use crate::query::typecheck::MutationTarget;
 use crate::traversal::EdgeSelection;
 use crate::types::{AggSignature, ExprType, PropType};
@@ -82,9 +84,9 @@ pub struct MutationIR {
     pub name: String,
     pub params: Vec<IRParam>,
     pub ops: Vec<MutationOpIR>,
-    /// The declaration's `as commit` clause: its result is published as an
-    /// unpublished commit, the branch head unchanged.
-    pub as_commit: bool,
+    /// The declaration's write clause: the branch head, an unpublished
+    /// commit, or an unattached snapshot with its optional base.
+    pub write_mode: MutationWriteMode,
 }
 
 #[derive(Debug, Clone)]

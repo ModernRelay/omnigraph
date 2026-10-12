@@ -137,7 +137,7 @@ query nearest_hops($q: Vector(4)) {
 }
 "#;
 
-/// Issue #563 mechanism fixture (symptom twin: `tests/repro_issue_563.rs`): every
+/// Issue #563 mechanism fixture (symptom twin: `tests/integration/repro_issue_563.rs`): every
 /// chunk matches, but only chunks 8..=11, mid score order, have an edge, so a
 /// BM25 scan capped near `limit` could not fill the join.
 const UNDERFILL_SCHEMA: &str = r#"

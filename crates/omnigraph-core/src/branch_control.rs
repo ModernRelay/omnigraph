@@ -583,6 +583,7 @@ pub async fn retire_branch_recoverably(
         tag.branch.as_deref() == Some(branch)
             && !crate::branch_names::is_merge_input_tag(name)
             && !crate::branch_names::is_unpublished_tag(name)
+            && !crate::branch_names::is_unattached_tag(name)
     }) {
         return Err(OmniError::storage(lance::Error::RefConflict {
             message: format!(

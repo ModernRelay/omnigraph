@@ -3,7 +3,9 @@
 //! and one engine-result -> DTO mapping per verb. Plain serde/utoipa
 //! types; no transport, no server internals.
 
-use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
+use omnigraph::db::{
+    GraphCommit, GraphCommitKind, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,
+};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{LoadMode, LoadReceipt, LoadResult};
 use omnigraph_compiler::SchemaMigrationStep;
@@ -501,9 +503,10 @@ pub enum BranchOutcomeOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
-    /// The branch that received the effect. For a branch statement: the
-    /// created branch, the deleted branch (gone by the time this is read),
-    /// or the merge target.
+    /// The branch that received the effect, or the recorded target of an
+    /// unattached write (a child inherits its base's target whatever the
+    /// request named). For a branch statement: the created branch, the
+    /// deleted branch (gone by the time this is read), or the merge target.
     pub branch: String,
     /// The declared mutation's name, or a branch statement's two keywords
     /// (`branch create`, `branch delete`, `branch merge`).
@@ -615,7 +618,7 @@ pub struct GraphBatchLoadOutput {
     pub commit: Option<CommitOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
     pub graph_branch: Option<String>,
@@ -626,15 +629,98 @@ pub struct CommitOutput {
     /// Commit creation time as Unix epoch microseconds.
     #[schema(example = 1714000000000000i64)]
     pub created_at: i64,
-    /// `false` for an unpublished commit (a write `as commit`): readable by
-    /// its id, invisible to every branch read, until `commit publish`.
+    /// `false` for an unpublished commit (a write `as commit`) or an
+    /// unattached snapshot (a write `as unattached branch`): readable by its
+    /// id, invisible to every branch read; only the former publishes.
     /// `graph_manifest_version` is then the detached version holding it.
+    /// Always `kind == published`.
     #[serde(default = "published_by_default")]
     pub published: bool,
+    /// Which kind of commit this is. Required on the wire; a legacy receipt
+    /// without it derives `published` or `unpublished` from `published`.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub kind: CommitKindOutput,
+    /// The root of an unattached snapshot's chain, the snapshot's own id on
+    /// a root; `null` for the other kinds.
+    #[serde(default)]
+    pub root_commit_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CommitOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Receipt {
+            graph_commit_id: String,
+            graph_branch: Option<String>,
+            graph_manifest_version: u64,
+            parent_commit_id: Option<String>,
+            merged_parent_commit_id: Option<String>,
+            actor_id: Option<String>,
+            created_at: i64,
+            #[serde(default = "published_by_default")]
+            published: bool,
+            #[serde(default, deserialize_with = "deserialize_commit_kind")]
+            kind: Option<CommitKindOutput>,
+            #[serde(default)]
+            root_commit_id: Option<String>,
+        }
+
+        let receipt = Receipt::deserialize(deserializer)?;
+        let kind = receipt.kind.unwrap_or(if receipt.published {
+            CommitKindOutput::Published
+        } else {
+            CommitKindOutput::Unpublished
+        });
+        Ok(Self {
+            graph_commit_id: receipt.graph_commit_id,
+            graph_branch: receipt.graph_branch,
+            graph_manifest_version: receipt.graph_manifest_version,
+            parent_commit_id: receipt.parent_commit_id,
+            merged_parent_commit_id: receipt.merged_parent_commit_id,
+            actor_id: receipt.actor_id,
+            created_at: receipt.created_at,
+            published: receipt.published,
+            kind,
+            root_commit_id: receipt.root_commit_id,
+        })
+    }
+}
+
+fn deserialize_commit_kind<'de, D>(deserializer: D) -> Result<Option<CommitKindOutput>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CommitKindOutput::deserialize(deserializer).map(Some)
 }
 
 fn published_by_default() -> bool {
     true
+}
+
+/// `published`: a commit of a branch's lineage. `unpublished`: a proposal
+/// (`as commit`) awaiting `commit publish`. `unattached`: an unattached
+/// snapshot (`as unattached branch`), which never publishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKindOutput {
+    #[default]
+    Published,
+    Unpublished,
+    Unattached,
+}
+
+impl From<GraphCommitKind> for CommitKindOutput {
+    fn from(kind: GraphCommitKind) -> Self {
+        match kind {
+            GraphCommitKind::Published => Self::Published,
+            GraphCommitKind::Unpublished => Self::Unpublished,
+            GraphCommitKind::Unattached => Self::Unattached,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1507,6 +1593,11 @@ pub struct CommitListQuery {
     /// of the branch's history.
     #[serde(default)]
     pub unpublished: bool,
+    /// `true` lists the live unattached snapshots whose recorded target is
+    /// `branch` (writes `as unattached branch`), newest first, instead of
+    /// the branch's history. Refused together with `unpublished`.
+    #[serde(default)]
+    pub unattached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1568,6 +1659,10 @@ pub enum ErrorCode {
     /// "no such resource."
     MethodNotAllowed,
     Conflict,
+    /// 409: the commit is an unattached snapshot, a kind that never
+    /// publishes. Distinct from `conflict`, the authority-moved refusal of a
+    /// publishable proposal.
+    UnattachedCannotPublish,
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
     TooManyRequests,
@@ -1956,6 +2051,8 @@ pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
         published: commit.published,
+        kind: commit.kind.into(),
+        root_commit_id: commit.root_commit_id.clone(),
     }
 }
 
@@ -2633,6 +2730,72 @@ mod tests {
                 .to_string()
                 .contains("missing field `commit`")
         );
+    }
+
+    #[test]
+    fn commit_receipts_infer_legacy_kind_and_preserve_explicit_kind() {
+        let receipt = || {
+            json!({
+                "graph_commit_id": "commit",
+                "graph_branch": "feature",
+                "graph_manifest_version": 9_223_372_036_854_775_809u64,
+                "parent_commit_id": "parent",
+                "merged_parent_commit_id": "merged_parent",
+                "actor_id": "actor",
+                "created_at": 1714000000000000i64
+            })
+        };
+        for (published, kind, expected) in [
+            (None, None, CommitKindOutput::Published),
+            (Some(true), None, CommitKindOutput::Published),
+            (Some(false), None, CommitKindOutput::Unpublished),
+            (
+                Some(false),
+                Some(CommitKindOutput::Published),
+                CommitKindOutput::Published,
+            ),
+            (
+                Some(true),
+                Some(CommitKindOutput::Unpublished),
+                CommitKindOutput::Unpublished,
+            ),
+            (
+                Some(false),
+                Some(CommitKindOutput::Unattached),
+                CommitKindOutput::Unattached,
+            ),
+        ] {
+            let mut wire = receipt();
+            if let Some(published) = published {
+                wire["published"] = json!(published);
+            }
+            if let Some(kind) = kind {
+                wire["kind"] = json!(kind);
+                if kind == CommitKindOutput::Unattached {
+                    wire["root_commit_id"] = json!("root");
+                }
+            }
+            let decoded: CommitOutput = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(decoded.kind, expected, "{wire}");
+            wire["published"] = json!(published.unwrap_or(true));
+            wire["kind"] = json!(expected);
+            wire.as_object_mut()
+                .unwrap()
+                .entry("root_commit_id")
+                .or_insert(json!(null));
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+
+        let mut wire = receipt();
+        wire["future_field"] = json!("ignored");
+        let decoded = CommitOutput::deserialize(wire).unwrap();
+        assert_eq!(decoded.kind, CommitKindOutput::Published);
+
+        for kind in [json!(null), json!("unknown")] {
+            let mut wire = receipt();
+            wire["kind"] = kind;
+            assert!(serde_json::from_value::<CommitOutput>(wire).is_err());
+        }
     }
 
     #[test]

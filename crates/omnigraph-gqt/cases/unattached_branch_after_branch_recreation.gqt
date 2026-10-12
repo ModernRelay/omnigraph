@@ -1,0 +1,88 @@
+# issue: none
+# notes: Deleting and recreating the recorded target retires the root's incarnation: its read answers not found
+# notes: naming the retired incarnation, the drop still succeeds, and the recreated branch holds only main's rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+branch delete feature
+
+--- expect ok
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- query snapshot: $r
+query names_at_retired_root() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found: it expired (its incarnation of branch 'feature' is retired)
+
+--- mutate
+query child_of_retired() as unattached branch on "${r}" {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect error: not found: it expired
+
+--- mutate
+commit drop "${r}"
+
+--- expect ok
+
+--- query branch: feature
+query names_on_feature() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

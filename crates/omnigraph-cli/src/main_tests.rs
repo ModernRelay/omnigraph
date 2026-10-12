@@ -64,6 +64,23 @@ fn branch_merge_as_commit_excludes_delete_branch() {
 }
 
 #[test]
+fn commit_list_unattached_excludes_unpublished() {
+    use clap::Parser;
+    let error = crate::cli::Cli::try_parse_from([
+        "omnigraph",
+        "commit",
+        "list",
+        "--unattached",
+        "--unpublished",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(
+        crate::cli::Cli::try_parse_from(["omnigraph", "commit", "list", "--unattached"]).is_ok()
+    );
+}
+
+#[test]
 fn apply_bearer_token_adds_header_when_configured() {
     let client = reqwest::Client::new();
     let request = apply_bearer_token(client.get("http://example.com"), Some("demo-token"))

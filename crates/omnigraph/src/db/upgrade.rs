@@ -1,5 +1,5 @@
-//! `omnigraph upgrade`: the offline conversion of a standalone root to storage
-//! format 15 from each [`UpgradeSource`], by two routes: from 13, whose schema
+//! `omnigraph upgrade`: the offline conversion of a standalone root to the
+//! current storage format from each [`UpgradeSource`], by two routes: from 13, whose schema
 //! contract is a row of `__manifest`, and from 8 or 9, whose contract is read
 //! from the graph root (`root_schema`) until the fence binds it. The upgrade
 //! reads every ref of `__manifest` at a pinned version, fences main with its
@@ -54,7 +54,7 @@ mod root_schema;
 /// What a report names when the run stopped before the stamp of the source
 /// told the route: the pending intent is unreadable, or main carries a stamp
 /// no route converts.
-const UNROUTED_HANDLER: &str = "history-lance-files-to-v15";
+const UNROUTED_HANDLER: &str = "history-lance-files-to-v16";
 /// The logical name of the ref a 0.11.x schema apply holds while it runs.
 const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 /// The release whose roots are stamped 8 or 9, as a refusal names it.
@@ -1862,7 +1862,7 @@ async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
         .map_err(OmniError::storage)
 }
 
-/// Overwrite the head of a live ref with its stamp-15 rows under its receipt
+/// Overwrite the head of a live ref with its current-stamp rows under its receipt
 /// (and, on main, the pending key) in one commit that is never retried.
 async fn publish_conversion(
     root: &str,

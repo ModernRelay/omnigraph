@@ -1091,7 +1091,7 @@ fn nested_and_relocated_catalogs_keep_content_identity_and_refuse_aliases() {
         path: "../fixtures/tiny_graph.gqt".into(),
     };
     definition.workload.queries = "../workloads/tiny_read.gqt".into();
-    let original = serde_yaml::to_string(&definition).unwrap();
+    let original = yaml_serde::to_string(&definition).unwrap();
     let nested = original
         .replace("../fixtures/", "../../fixtures/")
         .replace("../workloads/", "../../workloads/");

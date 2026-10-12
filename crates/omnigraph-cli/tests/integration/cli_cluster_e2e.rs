@@ -6,9 +6,9 @@ use std::fs;
 use omnigraph::db::Omnigraph;
 use tempfile::tempdir;
 
-mod support;
+use crate::support;
 
-use support::*;
+use crate::support::*;
 
 /// A real listener and the real CLI own the restart-free contract. Registry
 /// unit tests own exact epoch/drain/activation races; this verifies the complete
@@ -989,13 +989,13 @@ fn live_graph_removal_deletes_owned_storage(
     assert_live_tool_data(server);
     let config_path = config_dir.join("cluster.yaml");
     let source = fs::read_to_string(&config_path).unwrap();
-    let mut expanded: serde_yaml::Value = serde_yaml::from_str(&source).unwrap();
+    let mut expanded: yaml_serde::Value = yaml_serde::from_str(&source).unwrap();
     expanded["graphs"]["retired"] = expanded["graphs"]["tools"].clone();
     expanded["policies"]["graph_operators"]["applies_to"]
         .as_sequence_mut()
         .unwrap()
-        .push(serde_yaml::Value::from("retired"));
-    fs::write(&config_path, serde_yaml::to_string(&expanded).unwrap()).unwrap();
+        .push(yaml_serde::Value::from("retired"));
+    fs::write(&config_path, yaml_serde::to_string(&expanded).unwrap()).unwrap();
     live_apply(config_dir, server, "live-deployment-token");
     output_success(live_policy_cli("live-deployment-token").args([
         "mutate",
@@ -1123,7 +1123,7 @@ fn live_graph_removal_deletes_owned_storage(
 
     // A later declaration creates a new, empty graph lifetime. An observation
     // of the old deletion ID must never delete this replacement.
-    fs::write(&config_path, serde_yaml::to_string(&expanded).unwrap()).unwrap();
+    fs::write(&config_path, yaml_serde::to_string(&expanded).unwrap()).unwrap();
     let created = live_apply(config_dir, server, "live-deployment-token");
     assert_eq!(
         created["deployment"]["result"]["graphs"]["retired"]["outcome"],
@@ -1436,7 +1436,7 @@ struct LiveBindingsFixture {
 
 impl LiveBindingsFixture {
     fn new() -> Self {
-        use support::managed_http::{IntentApiFixture, IntentReply};
+        use crate::support::managed_http::{IntentApiFixture, IntentReply};
         let embedding = |vector| {
             IntentReply::json(
                 200,
@@ -1503,14 +1503,14 @@ impl LiveBindingsFixture {
 
     fn exercise(&self, config_dir: &std::path::Path, server: &TestServer) {
         let token = "live-deployment-token";
-        let first_profile = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        let first_profile = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v1\nmodel: space-a\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
             self.first.origin
         )).unwrap();
         fs::write(config_dir.join("bindings.pg"), "node SearchDoc { name: String @key text: String embedding: Vector(3) @embed(\"text\") }\nnode Asset { name: String @key content: Blob? }\n").unwrap();
         bindings_edit_config(config_dir, |config| {
-            config["graphs"]["bindings"] = serde_yaml::from_str("schema: ./bindings.pg\nembedding_provider: first\nexternal_blobs:\n  allow:\n    - base: s3://lifecycle-assets/first\n      scope: server_safe\n").unwrap();
-            config["providers"] = serde_yaml::from_str("embedding: {}\n").unwrap();
+            config["graphs"]["bindings"] = yaml_serde::from_str("schema: ./bindings.pg\nembedding_provider: first\nexternal_blobs:\n  allow:\n    - base: s3://lifecycle-assets/first\n      scope: server_safe\n").unwrap();
+            config["providers"] = yaml_serde::from_str("embedding: {}\n").unwrap();
             config["providers"]["embedding"]["first"] = first_profile;
             config["policies"]["graph_operators"]["applies_to"]
                 .as_sequence_mut()
@@ -1556,7 +1556,7 @@ impl LiveBindingsFixture {
         assert_eq!(live_snapshot(server, "bindings"), before);
 
         // A new endpoint and graph binding also remove the former definition.
-        let replacement = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        let replacement = yaml_serde::from_str::<yaml_serde::Value>(&format!(
             "kind: openai-compatible\nbase_url: {}/v2\nmodel: space-c\napi_key: ${{OMNIGRAPH_LIFECYCLE_EMBED_KEY}}\n",
             self.replacement.origin
         )).unwrap();
@@ -1564,7 +1564,7 @@ impl LiveBindingsFixture {
             config["providers"]["embedding"]
                 .as_mapping_mut()
                 .unwrap()
-                .remove(serde_yaml::Value::from("first"));
+                .remove(yaml_serde::Value::from("first"));
             config["providers"]["embedding"]["replacement"] = replacement;
             config["graphs"]["bindings"]["embedding_provider"] = "replacement".into();
         });
@@ -1644,7 +1644,7 @@ impl LiveBindingsFixture {
             config["graphs"]["bindings"]
                 .as_mapping_mut()
                 .unwrap()
-                .remove(serde_yaml::Value::from("external_blobs"));
+                .remove(yaml_serde::Value::from("external_blobs"));
         });
         live_apply(config_dir, server, token);
         bindings_external_load(server, "s3://lifecycle-assets/second/asset.bin", false);
@@ -1714,11 +1714,11 @@ impl LiveBindingsFixture {
     }
 }
 
-fn bindings_edit_config(config_dir: &std::path::Path, edit: impl FnOnce(&mut serde_yaml::Value)) {
+fn bindings_edit_config(config_dir: &std::path::Path, edit: impl FnOnce(&mut yaml_serde::Value)) {
     let path = config_dir.join("cluster.yaml");
-    let mut config: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let mut config: yaml_serde::Value = yaml_serde::from_slice(&fs::read(&path).unwrap()).unwrap();
     edit(&mut config);
-    fs::write(path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    fs::write(path, yaml_serde::to_string(&config).unwrap()).unwrap();
 }
 
 fn bindings_nearest(server: &TestServer, expected: &str) {

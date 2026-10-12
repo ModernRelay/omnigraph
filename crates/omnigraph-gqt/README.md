@@ -121,7 +121,12 @@ expected to succeed, binds the receipt's commit id to `$name`
 and a commit statement whose whole quoted operand is the name,
 `commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
 bound id; this is the one place `${` may appear in a statement body, and the
-engine receives an ordinary literal. A name is bound once, before every use,
+engine receives an ordinary literal. A mutation declaration
+`as unattached branch on "${name}"` (RFC "Unattached graph branches") is
+substituted the same way, and a `--- params` body may spell a bound name,
+`{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
+`branch:` sends no request branch on the served path, so a child write
+inherits its base's recorded target. A name is bound once, before every use,
 outside a loop, and survives `--- restart`; the served path binds from the
 `ChangeOutput.commit` the route answered and sends `snapshot` on the read.
 

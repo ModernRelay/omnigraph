@@ -17,7 +17,8 @@ use tokio::sync::Mutex;
 use super::commit_graph::GraphCommit;
 use super::publisher::{
     GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
-    PublishPrecondition, is_retryable_publish_conflict, map_lance_publish_error,
+    PublishPrecondition, UnattachedIntent, UnattachedWriteBase, is_retryable_publish_conflict,
+    map_lance_publish_error,
 };
 use super::state::{ManifestRows, TABLE_ROW_BYTES, read_manifest_rows, read_manifest_state};
 use super::*;
@@ -3160,6 +3161,14 @@ fn lineage_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) ->
     }
 }
 
+fn unattached_intent(branch: Option<&str>) -> UnattachedIntent {
+    UnattachedIntent {
+        branch: branch.map(str::to_string),
+        actor_id: Some("alice".to_string()),
+        created_at: lineage_now_micros(),
+    }
+}
+
 /// A [`lineage_intent`] whose commit takes an eighth of the release budget,
 /// so that about eight of them fill a buffer.
 fn fat_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) -> LineageIntent {
@@ -3532,13 +3541,8 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     );
 }
 
-/// Test C (S3 variant, bucket-gated): the same two-disjoint-writers +
-/// `LineageIntent` race as Test A, but on a real object store so the one-winner
-/// behaviour exercises the genuine conditional-put CAS on `__manifest` rather
-/// than the local content-token emulation. Skips with a log when
-/// `OMNIGRAPH_S3_TEST_BUCKET` is unset (the `tests/s3_storage.rs` gate); the
-/// rustfs CI job sets it. Asserts the same end-state: both commit, single linear
-/// chain.
+/// Exercises object-store conditional PUTs; the local variant uses content tokens.
+/// Shares the bucket gate with `tests/integration/s3_storage.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
@@ -4039,7 +4043,7 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
             let message = error.to_string();
             assert!(
                 message.contains(&format!("internal schema v{stamp}"))
-                    && message.contains("reads only v14 to v15")
+                    && message.contains("reads only v14 to v16")
                     && !message.contains("omnigraph upgrade"),
                 "{what} of a stamp {stamp} manifest: {message}"
             );
@@ -4442,6 +4446,493 @@ async fn recreated_branch_has_no_exact_head_and_inherits_the_head_of_its_source(
     );
     assert_eq!(on_recreated.native_branch, manifest.manifest().branch);
     assert_eq!(on_recreated.generation, 3);
+}
+
+fn expect_person(entry: &DatasetEntry, table_version: u64) -> ExpectedTableVersions {
+    HashMap::from([(
+        entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version,
+            native_ref: NativeRefPin::Unchecked,
+        },
+    )])
+}
+
+fn pinned_version(tables: &[TableRow], entry: &DatasetEntry) -> u64 {
+    let table = tables
+        .iter()
+        .find(|table| table.registration.identity == entry.identity)
+        .expect("the snapshot carries the Person row");
+    match &table.state {
+        TableState::Pinned(pin) => pin.table_version,
+        other => panic!("Person is pinned, got {other:?}"),
+    }
+}
+
+fn assert_bare_ulid(graph_commit_id: &str) {
+    assert!(
+        omnigraph_core::graph_commit_id::canonical_ulid(graph_commit_id).is_some(),
+        "an unattached id is a canonical ULID: {graph_commit_id}"
+    );
+    assert_eq!(
+        omnigraph_core::graph_commit_id::parse_history_block_id(graph_commit_id).unwrap(),
+        None,
+        "an unattached id is never a history block id: {graph_commit_id}"
+    );
+}
+
+/// A root on a fork that has not published captures the head it inherited:
+/// the record names it as parent and captured head with `inherited_head`,
+/// the branch's linear versions and absent exact head are untouched.
+#[tokio::test]
+async fn unattached_root_on_a_fresh_branch_records_the_inherited_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let on_main = lineage_intent(None, None);
+    mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&on_main))
+        .await
+        .unwrap();
+    mc.create_branch("feature").await.unwrap();
+    let fork = ManifestCoordinator::open_at_branch(uri, "feature")
+        .await
+        .unwrap();
+    assert_eq!(fork.exact_graph_head(), None);
+    let fork_manifest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let linear_version = fork_manifest.version().version;
+    let inherited = read_manifest_rows(&fork_manifest).await.unwrap().head;
+    let person = fork.snapshot().dataset("node:Person").unwrap().clone();
+    let update = append_person_and_make_update(uri, &person, "Alice").await;
+    let authority = GraphHeadExpectation::new(
+        Some("feature"),
+        fork_manifest.branch_identifier().await.unwrap(),
+        None,
+    );
+
+    let outcome = GraphNamespacePublisher::new(uri, Some("feature"))
+        .write_unattached_candidate(
+            &[ManifestChange::Update(update.clone())],
+            &expect_person(&person, 1),
+            &unattached_intent(Some("feature")),
+            &authority,
+            &UnattachedWriteBase::Head,
+        )
+        .await
+        .unwrap();
+    assert_bare_ulid(&outcome.graph_commit_id);
+    assert_eq!(outcome.root_commit_id, outcome.graph_commit_id);
+    assert_eq!(
+        outcome.head.parent_commit_id.as_deref(),
+        Some(inherited.graph_commit_id.as_str())
+    );
+    assert_eq!(outcome.head.generation, inherited.generation + 1);
+    assert_eq!(outcome.head.graph_branch.as_deref(), Some("feature"));
+    assert_eq!(outcome.head.native_branch, fork_manifest.manifest().branch);
+    assert_eq!(outcome.head.merged_parent_commit_id, None);
+    assert_eq!(
+        pinned_version(&outcome.tables, &person),
+        update.published_dataset_version
+    );
+
+    let after = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    assert_eq!(after.version().version, linear_version);
+    assert_eq!(
+        ManifestCoordinator::open_at_branch(uri, "feature")
+            .await
+            .unwrap()
+            .exact_graph_head(),
+        None
+    );
+    assert_eq!(history_row_count(uri).await, 0);
+
+    let snapshot = ManifestCoordinator::unattached_commit(
+        uri,
+        &mc.control_session(),
+        &outcome.graph_commit_id,
+    )
+    .await
+    .unwrap()
+    .expect("the candidate tag names the snapshot");
+    assert!(snapshot.is_root());
+    assert!(snapshot.is_live());
+    assert!(snapshot.property.inherited_head);
+    assert_eq!(
+        snapshot.property.captured_head_commit_id,
+        inherited.graph_commit_id
+    );
+    assert_eq!(
+        snapshot.property.parent_commit_id,
+        inherited.graph_commit_id
+    );
+    assert_eq!(snapshot.property.authority(), authority);
+    assert_eq!(snapshot.detached_version, outcome.detached_version);
+    assert_eq!(snapshot.record.commit, outcome.head);
+    assert_eq!(snapshot.record.tables, outcome.tables);
+}
+
+/// A child's expected table versions are judged against its base snapshot's
+/// rows, which the live rows never pinned; its record repeats the root's
+/// captured coordinates and names the base as parent.
+#[tokio::test]
+async fn unattached_child_checks_expected_versions_against_its_base() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mc = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let head = mc.exact_graph_head().unwrap();
+    let live_version = mc.version();
+    let authority = GraphHeadExpectation::new(
+        None,
+        lance::dataset::refs::BranchIdentifier::main(),
+        Some(head.clone()),
+    );
+    let person = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let publisher = GraphNamespacePublisher::new(uri, None);
+
+    let alice = append_person_and_make_update(uri, &person, "Alice").await;
+    let root = publisher
+        .write_unattached_candidate(
+            &[ManifestChange::Update(alice.clone())],
+            &expect_person(&person, 1),
+            &unattached_intent(None),
+            &authority,
+            &UnattachedWriteBase::Head,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned_version(&root.tables, &person),
+        alice.published_dataset_version
+    );
+    assert_eq!(pinned_version(&main_rows(uri).await.tables, &person), 1);
+
+    let bob = append_person_and_make_update(uri, &person, "Bob").await;
+    let base = UnattachedWriteBase::Snapshot {
+        root_commit_id: root.graph_commit_id.clone(),
+        base_commit_id: root.graph_commit_id.clone(),
+        detached_version: root.detached_version,
+        captured_head_commit_id: head.clone(),
+    };
+    let against_live = publisher
+        .write_unattached_candidate(
+            &[ManifestChange::Update(bob.clone())],
+            &expect_person(&person, 1),
+            &unattached_intent(None),
+            &authority,
+            &base,
+        )
+        .await
+        .unwrap_err();
+    let OmniError::Manifest(refused) = against_live else {
+        panic!("expected a typed manifest conflict, got {against_live:?}");
+    };
+    assert_eq!(
+        refused.details,
+        Some(ManifestConflictDetails::PublishedDatasetVersionMismatch {
+            type_key: "node:Person".to_string(),
+            expected_published_dataset_version: 1,
+            actual_published_dataset_version: alice.published_dataset_version,
+        }),
+        "the live pin (1) is not the base's pin"
+    );
+
+    let child = publisher
+        .write_unattached_candidate(
+            &[ManifestChange::Update(bob.clone())],
+            &expect_person(&person, alice.published_dataset_version),
+            &unattached_intent(None),
+            &authority,
+            &base,
+        )
+        .await
+        .unwrap();
+    assert_bare_ulid(&child.graph_commit_id);
+    assert_ne!(child.graph_commit_id, root.graph_commit_id);
+    assert_eq!(child.root_commit_id, root.graph_commit_id);
+    assert_eq!(
+        child.head.parent_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_eq!(child.head.generation, root.head.generation + 1);
+    assert_eq!(
+        pinned_version(&child.tables, &person),
+        bob.published_dataset_version
+    );
+
+    let session = mc.control_session();
+    let snapshot = ManifestCoordinator::unattached_commit(uri, &session, &child.graph_commit_id)
+        .await
+        .unwrap()
+        .expect("the candidate tag names the child");
+    assert!(!snapshot.is_root());
+    assert!(snapshot.is_live());
+    assert!(!snapshot.property.inherited_head);
+    assert_eq!(snapshot.property.root_commit_id, root.graph_commit_id);
+    assert_eq!(snapshot.property.parent_commit_id, root.graph_commit_id);
+    assert_eq!(snapshot.property.captured_head_commit_id, head);
+    assert_eq!(snapshot.detached_version, child.detached_version);
+    assert_eq!(
+        ManifestCoordinator::unattached_descendants(
+            uri,
+            &session,
+            &root.graph_commit_id,
+            &root.graph_commit_id
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|descendant| descendant.property.graph_commit_id.as_str())
+        .collect::<Vec<_>>(),
+        [child.graph_commit_id.as_str()]
+    );
+
+    let misnamed = publisher
+        .write_unattached_candidate(
+            &[ManifestChange::Update(bob)],
+            &expect_person(&person, alice.published_dataset_version),
+            &unattached_intent(None),
+            &authority,
+            &UnattachedWriteBase::Snapshot {
+                root_commit_id: root.graph_commit_id.clone(),
+                base_commit_id: head.clone(),
+                detached_version: root.detached_version,
+                captured_head_commit_id: head.clone(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        misnamed.contains("not the base unattached branch"),
+        "a detached version whose head is not the named base is refused: {misnamed}"
+    );
+
+    let main = open_manifest_dataset_native_with_session(uri, None, &session)
+        .await
+        .unwrap();
+    let child_tag = snapshot.tag_name();
+    let original_tag = main.tags().get(&child_tag).await.unwrap();
+    for (parent, captured, expected) in [
+        (
+            child.graph_commit_id.clone(),
+            head.clone(),
+            "cyclic ancestry",
+        ),
+        (
+            root.graph_commit_id.clone(),
+            "different-head".to_string(),
+            "disagrees with ancestor",
+        ),
+    ] {
+        let detached = main
+            .checkout_version(lance::dataset::refs::Ref::Version(
+                original_tag.branch.clone(),
+                Some(original_tag.version),
+            ))
+            .await
+            .unwrap();
+        let mut rows = read_manifest_rows(&detached).await.unwrap();
+        let mut property = snapshot.property.clone();
+        property.parent_commit_id = parent.clone();
+        property.captured_head_commit_id = captured;
+        rows.head.parent_commit_id = Some(parent);
+        let (corrupt, _) =
+            crate::commit::overwrite_detached(detached, &rows, property.encode().unwrap())
+                .await
+                .unwrap();
+        main.tags()
+            .update(
+                &child_tag,
+                lance::dataset::refs::Ref::Version(None, Some(corrupt.version().version)),
+            )
+            .await
+            .unwrap();
+        let refused = ManifestCoordinator::unattached_commit(uri, &session, &child.graph_commit_id)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains(expected), "{refused}");
+    }
+    main.tags()
+        .update(
+            &child_tag,
+            lance::dataset::refs::Ref::Version(original_tag.branch, Some(original_tag.version)),
+        )
+        .await
+        .unwrap();
+
+    let main = open_manifest_dataset_native_with_session(uri, None, &session)
+        .await
+        .unwrap();
+    crate::unattached::release_unattached_tag_confirmed(
+        &main,
+        &unattached_tag_name(&root.graph_commit_id, &root.graph_commit_id),
+    )
+    .await
+    .unwrap();
+    let orphan = ManifestCoordinator::unattached_commit(uri, &session, &child.graph_commit_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        orphan.lifetime,
+        UnattachedLifetime::Undecidable(_)
+    ));
+    for refused in [
+        orphan.require_readable(),
+        orphan.require_extendable(),
+        orphan.require_droppable(),
+    ] {
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("required ancestor")
+        );
+    }
+    assert!(
+        ManifestCoordinator::list_unattached(uri, &session, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ManifestCoordinator::drop_unattached(uri, &session, &orphan, &[])
+            .await
+            .is_err()
+    );
+    assert!(main.tags().get(&orphan.tag_name()).await.is_ok());
+
+    let live = ManifestCoordinator::open(uri).await.unwrap();
+    assert_eq!(live.version(), live_version);
+    assert_eq!(live.exact_graph_head(), Some(head));
+    assert_eq!(pinned_version(&main_rows(uri).await.tables, &person), 1);
+}
+
+/// A head-preserving linear version between the tag and the probe leaves
+/// the snapshot acknowledged; a head advance refuses it and releases its
+/// tag: the probe judges the head, not the linear version number.
+#[tokio::test]
+async fn unattached_probe_judges_the_head_not_the_linear_version() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut mc = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let head = mc.exact_graph_head().unwrap();
+    let authority = GraphHeadExpectation::new(
+        None,
+        lance::dataset::refs::BranchIdentifier::main(),
+        Some(head.clone()),
+    );
+    let person = mc.snapshot().dataset("node:Person").unwrap().clone();
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let session = mc.control_session();
+
+    let alice = append_person_and_make_update(uri, &person, "Alice").await;
+    let bob = append_person_and_make_update(uri, &person, "Bob").await;
+    let captured_version = mc.version();
+    let outcome = publisher
+        .write_unattached_candidate_interleaved(
+            &[ManifestChange::Update(alice.clone())],
+            &expect_person(&person, 1),
+            &unattached_intent(None),
+            &authority,
+            &UnattachedWriteBase::Head,
+            async {
+                GraphNamespacePublisher::new(uri, None)
+                    .publish(&[ManifestChange::Update(bob)], &HashMap::new(), None)
+                    .await
+                    .unwrap();
+            },
+        )
+        .await
+        .unwrap();
+    let live = main_rows(uri).await;
+    assert_eq!(live.head.graph_commit_id, head);
+    assert!(
+        open_manifest_dataset(uri, None)
+            .await
+            .unwrap()
+            .version()
+            .version
+            > captured_version,
+        "the head-preserving publish took a linear version after the capture"
+    );
+    let snapshot = ManifestCoordinator::unattached_commit(uri, &session, &outcome.graph_commit_id)
+        .await
+        .unwrap()
+        .expect("a head-preserving version does not expire the snapshot");
+    assert!(snapshot.is_live());
+    assert_eq!(
+        pinned_version(&snapshot.record.tables, &person),
+        alice.published_dataset_version
+    );
+
+    let carol = append_person_and_make_update(uri, &person, "Carol").await;
+    let advance = lineage_intent(None, None);
+    let refused = publisher
+        .write_unattached_candidate_interleaved(
+            &[ManifestChange::Update(carol)],
+            &HashMap::new(),
+            &unattached_intent(None),
+            &authority,
+            &UnattachedWriteBase::Head,
+            async {
+                mc.commit_changes_with_lineage(&[], &HashMap::new(), Some(&advance))
+                    .await
+                    .unwrap();
+            },
+        )
+        .await
+        .unwrap_err();
+    let OmniError::Manifest(refused) = refused else {
+        panic!("expected a typed manifest conflict, got {refused:?}");
+    };
+    let advanced = main_rows(uri).await.head.graph_commit_id;
+    assert_ne!(advanced, head);
+    assert_eq!(
+        refused.details,
+        Some(ManifestConflictDetails::ReadSetChanged {
+            member: "graph_head:main".to_string(),
+            expected: Some(head),
+            actual: Some(advanced),
+        })
+    );
+    let listed = ManifestCoordinator::list_unattached(uri, &session, None)
+        .await
+        .unwrap();
+    assert!(
+        listed.is_empty(),
+        "the refused attempt released its tag and the first snapshot expired: {:?}",
+        listed
+            .iter()
+            .map(|snapshot| snapshot.property.graph_commit_id.clone())
+            .collect::<Vec<_>>()
+    );
+    let tags = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .tags()
+        .list()
+        .await
+        .unwrap();
+    let candidate_tags: Vec<&String> = tags.keys().filter(|name| is_unattached_tag(name)).collect();
+    assert_eq!(
+        candidate_tags,
+        [&unattached_tag_name(
+            &outcome.graph_commit_id,
+            &outcome.graph_commit_id
+        )],
+        "only the acknowledged root keeps a tag"
+    );
 }
 
 #[tokio::test]
@@ -13488,7 +13979,7 @@ async fn stamps_13_is_refused_by_open_read_and_publish_naming_the_upgrade() {
         .to_string();
     for clause in [
         "internal schema v13",
-        "reads only v14 to v15",
+        "reads only v14 to v16",
         "For a standalone root, stop all readers, writers and maintenance",
         "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`",
         "A cluster-managed graph has no in-place route yet: with a main development build from \
@@ -14001,4 +14492,150 @@ fn registry_import_keeps_only_rows_missing_from_the_captured_target() {
     let mut against_empty = novel.clone();
     against_empty.retain_missing(&LineageRegistry::default());
     assert_eq!(against_empty, novel);
+}
+
+/// A planted `unattached_` tag is a second reserved kind: the proposal
+/// listing and lookup never open it, the inventory admits it and refuses a
+/// malformed reserved name, and a lookup by an unnamed id answers `None`.
+#[tokio::test]
+async fn proposal_readers_never_open_an_unattached_tag() {
+    use super::retention::ManifestTagInventory;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let control_session = crate::lance_access::control_session();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    let version = main.version().version;
+    let root = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let child = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+    let planted = unattached_tag_name(root, child);
+    main.tags()
+        .create(
+            &planted,
+            lance::dataset::refs::Ref::Version(None, Some(version)),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        ManifestCoordinator::list_unpublished(uri, &control_session, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        ManifestCoordinator::unpublished_commit(uri, &control_session, child)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let inventory = ManifestTagInventory::capture(&main).await.unwrap();
+    assert_eq!(inventory.tags[&planted].version, version);
+    assert!(
+        ManifestCoordinator::unattached_commit(uri, &control_session, root)
+            .await
+            .unwrap()
+            .is_none(),
+        "no tag names the root id as a snapshot"
+    );
+    let opened = ManifestCoordinator::unattached_commit(uri, &control_session, child)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        opened.contains("carries no candidate property"),
+        "the planted tag names a linear version: {opened}"
+    );
+
+    main.tags()
+        .create(
+            "unattached_not-two-ulids",
+            lance::dataset::refs::Ref::Version(None, Some(version)),
+        )
+        .await
+        .unwrap();
+    let refused = match ManifestTagInventory::capture(&main).await {
+        Ok(_) => panic!("a malformed reserved name must refuse the inventory"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("reserved unattached-branch prefix"),
+        "{refused}"
+    );
+    assert!(
+        ManifestCoordinator::list_unpublished(uri, &control_session, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The manifest-store reads one proposal listing and one proposal lookup
+/// cost, counted on the store itself so Lance's direct local reads are
+/// included, with `roots` unrelated unattached roots planted beside them.
+async fn proposal_reader_reads_with_unattached_roots(roots: usize) -> (u64, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let control_session = crate::lance_access::control_session();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    let version = main.version().version;
+    for index in 0..roots {
+        let root = format!("01ARZ3NDEKTSV4RRFFQ69G5F{index:02}");
+        main.tags()
+            .create(
+                &unattached_tag_name(&root, &root),
+                lance::dataset::refs::Ref::Version(None, Some(version)),
+            )
+            .await
+            .unwrap();
+    }
+    let probes = fresh_publish_probes();
+    let listed = crate::instrumentation::with_query_io_probes(
+        probes.clone(),
+        ManifestCoordinator::list_unpublished(uri, &control_session, None),
+    )
+    .await
+    .unwrap();
+    assert!(listed.is_empty());
+    let listing = drain_publish_io(&probes.manifest_stores).reads;
+    let probes = fresh_publish_probes();
+    let looked_up = crate::instrumentation::with_query_io_probes(
+        probes.clone(),
+        ManifestCoordinator::unpublished_commit(
+            uri,
+            &control_session,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(looked_up.is_none());
+    (listing, drain_publish_io(&probes.manifest_stores).reads)
+}
+
+/// Proposal listing and lookup open no unattached tag: their manifest-store
+/// read count is the same with zero and with four unrelated unattached roots
+/// (Lance's `tags().list()` opens every tag, so names are enumerated first).
+#[tokio::test]
+async fn proposal_reader_reads_are_independent_of_the_unattached_population() {
+    let (listing_without, lookup_without) = proposal_reader_reads_with_unattached_roots(0).await;
+    for roots in 1..=4 {
+        let (listing, lookup) = proposal_reader_reads_with_unattached_roots(roots).await;
+        assert_eq!(
+            listing, listing_without,
+            "proposal listing with {roots} unrelated unattached roots read \
+             {listing} manifest-store objects, {listing_without} with none"
+        );
+        assert_eq!(
+            lookup, lookup_without,
+            "proposal lookup with {roots} unrelated unattached roots read \
+             {lookup} manifest-store objects, {lookup_without} with none"
+        );
+    }
 }

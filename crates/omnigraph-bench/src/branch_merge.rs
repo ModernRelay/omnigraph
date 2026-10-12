@@ -2379,7 +2379,7 @@ mod tests {
             .split("\n--- ")
             .next()
             .unwrap();
-        let recipe: serde_json::Value = serde_yaml::from_str(seed_body).unwrap();
+        let recipe: serde_json::Value = yaml_serde::from_str(seed_body).unwrap();
         for (table, row) in recipe["tables"]
             .as_array()
             .unwrap()

@@ -13,8 +13,9 @@ use omnigraph_server::api::{IngestRequest, QueryRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::json;
 
-mod support;
-use support::*;
+use crate::support;
+
+use crate::support::*;
 
 async fn read_managed_blob_bytes(
     db: &Omnigraph,

@@ -3120,6 +3120,281 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     assert_eq!(listed["commits"], json!([]));
 }
 
+/// One mutation `as unattached branch` on main, a root when `base` is `None`
+/// and a child of that snapshot otherwise, answered with its unattached
+/// snapshot (RFC "Unattached graph branches").
+async fn sprout_person(app: &axum::Router, name: &str, base: Option<&str>) -> Value {
+    let on = base.map(|id| format!(" on \"{id}\"")).unwrap_or_default();
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({"query": format!(
+                "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+            )}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["affected_nodes"], 1, "{body}");
+    assert_eq!(body["commit"]["published"], false, "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    assert_eq!(body["commit"]["graph_branch"], Value::Null, "{body}");
+    assert_eq!(
+        body["commit"]["merged_parent_commit_id"],
+        Value::Null,
+        "{body}"
+    );
+    body["commit"].clone()
+}
+
+/// `row_count` of every `Person` at the snapshot.
+async fn person_count_at_snapshot(app: &axum::Router, snapshot: &str) -> u64 {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/query",
+            &json!({
+                "query": "query people() { match { $p: Person } return { $p.name } }",
+                "snapshot": snapshot,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["row_count"].as_u64().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head_before = main_head_commit_id(&app).await;
+    let commits_before = main_commit_count(&app).await;
+    let people_on_main = {
+        let (_, body) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": "query people() { match { $p: Person } return { $p.name } }"}),
+            ),
+        )
+        .await;
+        body["row_count"].as_u64().unwrap()
+    };
+
+    let root = sprout_person(&app, "Root", None).await;
+    let root_id = root["graph_commit_id"].as_str().unwrap().to_string();
+    assert_eq!(root["root_commit_id"], root_id, "a root is its own root");
+    assert_eq!(root["parent_commit_id"], head_before, "{root}");
+    let child = sprout_person(&app, "Child", Some(&root_id)).await;
+    let child_id = child["graph_commit_id"].as_str().unwrap().to_string();
+    assert_eq!(child["root_commit_id"], root_id, "{child}");
+    assert_eq!(child["parent_commit_id"], root_id, "{child}");
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+    assert_eq!(main_commit_count(&app).await, commits_before);
+    assert_eq!(
+        person_count_at_snapshot(&app, &root_id).await,
+        people_on_main + 1
+    );
+    assert_eq!(
+        person_count_at_snapshot(&app, &child_id).await,
+        people_on_main + 2,
+        "a child holds its ancestors' effects and its own"
+    );
+
+    let (status, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([child, root]), "newest first");
+    let (status, listed) = get_json(&app, g("/commits?unattached=true&branch=main")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["commits"], json!([child, root]));
+    let (status, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["commits"],
+        json!([]),
+        "unattached is not unpublished"
+    );
+    let (status, body) = get_json(&app, g("/commits?unattached=true&unpublished=true")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_, history) = get_json(&app, g("/commits")).await;
+    assert!(
+        history["commits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|commit| commit["graph_commit_id"] != root_id
+                && commit["graph_commit_id"] != child_id),
+        "an unattached snapshot is not history: {history}"
+    );
+    let (status, shown) = get_json(&app, g(&format!("/commits/{child_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "{shown}");
+    assert_eq!(shown, child);
+
+    for id in [&root_id, &child_id] {
+        let (status, body) = json_response(
+            &app,
+            bodiless(Method::POST, &format!("/commits/{id}/publish")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let refusal: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(refusal.code, Some(ErrorCode::UnattachedCannotPublish));
+        assert_eq!(
+            refusal.error,
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/mutate",
+                &json!({"query": format!("commit publish \"{id}\"")}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "unattached_cannot_publish", "{body}");
+        assert_eq!(
+            body["error"],
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+    }
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{root_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for id in [&root_id, &child_id] {
+        for request in [
+            bodiless(Method::GET, &format!("/commits/{id}")),
+            bodiless(Method::POST, &format!("/commits/{id}/publish")),
+            bodiless(Method::DELETE, &format!("/commits/{id}")),
+        ] {
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+        }
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/mutate",
+                &json!({"query": format!(
+                    "query sprout() as unattached branch on \"{id}\" {{ insert Person {{ name: \"Late\", age: 33 }} }}"
+                )}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}: {body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unattached=true")).await;
+    assert_eq!(
+        listed["commits"],
+        json!([]),
+        "dropping the root drops the chain"
+    );
+    assert_eq!(main_head_commit_id(&app).await, head_before);
+}
+
+/// A stored declaration keeps its `as unattached branch on $base` clause:
+/// each invocation receives the base through `params`, and the request
+/// `branch` cannot select another target.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            (
+                "sprout_root",
+                "query sprout_root($name: String) as unattached branch { insert Person { name: $name, age: 33 } }",
+                true,
+            ),
+            (
+                "sprout_child",
+                "query sprout_child($name: String, $base: String) as unattached branch on $base { insert Person { name: $name, age: 33 } }",
+                true,
+            ),
+        ],
+        &[("act-full", "t-full")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("sprout_root", "t-full", json!({"params": {"name": "Root"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    let root_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Child", "base": root_id}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main", "{body}");
+    assert_eq!(body["commit"]["kind"], "unattached", "{body}");
+    assert_eq!(body["commit"]["root_commit_id"], root_id, "{body}");
+    assert_eq!(body["commit"]["parent_commit_id"], root_id, "{body}");
+    let child_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Grandchild", "base": child_id}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commit"]["root_commit_id"], root_id, "{body}");
+    assert_eq!(body["commit"]["parent_commit_id"], child_id, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Astray", "base": root_id}, "branch": "feature"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "sprout_child",
+            "t-full",
+            json!({"params": {"name": "Lost"}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing base is 400: {body}"
+    );
+    let (status, body) =
+        json_response(&app, get_request(&g("/commits?unattached=true"), "t-full")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["commits"].as_array().unwrap().len(), 3, "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_publish_refuses_a_moved_head_and_merge_as_commit_excludes_delete_branch() {
     let (_temp, app) = app_for_loaded_graph().await;
