@@ -6,7 +6,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{ParamMap, QueryIR};
+use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::ir::untyped::QueryIR;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_core::error::Result;

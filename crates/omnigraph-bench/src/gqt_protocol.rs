@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::gqt_case::BoundGqt as CaseV1;
+pub use crate::gqt_evidence::{PreparationProofV2, RepetitionInputV2};
 use crate::gqt_runner::GqtRepObservation as RepObservation;
 use crate::machine::MachineIdentityV1;
-use crate::reset::{MetadataDigest, PhysicalDigest};
 use crate::runner::EffectiveEnvironmentValue;
 /// Attested build facts reported by an honest worker from its own process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ pub struct WorkerBuildV1 {
 }
 
 /// The only worker protocol understood by this build.
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum compact JSON payload bytes in one frame, excluding its newline.
 ///
@@ -76,28 +76,26 @@ const EXECUTABLE_DIGEST_BUFFER_BYTES: usize = 1024 * 1024;
 /// parent planning and repetition execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerRequestV1 {
+pub struct WorkerRequestV2 {
     pub repetition: u32,
     pub case: CaseV1,
     pub expected_point_id: String,
     pub expected_case_digest: String,
-    pub repetition_root: PathBuf,
+    pub execution: RepetitionInputV2,
     /// Harness-owned empty sibling directory on the verified scratch backend.
     /// Both generic process-temporary spill and OmniGraph merge staging must
     /// resolve through this exact protocol field.
     pub worker_scratch_root: PathBuf,
-    pub expected_physical_digest: PhysicalDigest,
-    pub expected_metadata_digest: MetadataDigest,
 }
 
 /// Frames sent by the supervising parent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ParentFrameV1 {
+pub enum ParentFrameV2 {
     /// Supplies the complete repetition input. This is always the first frame.
     Request {
         protocol_version: u32,
-        request: Box<WorkerRequestV1>,
+        request: Box<WorkerRequestV2>,
     },
     /// Releases a prepared worker into the selected operation.
     Begin {
@@ -106,7 +104,7 @@ pub enum ParentFrameV1 {
     },
 }
 
-impl ParentFrameV1 {
+impl ParentFrameV2 {
     pub fn protocol_version(&self) -> u32 {
         match self {
             Self::Request {
@@ -134,7 +132,7 @@ pub enum WorkerStageV1 {
 /// Frames sent by one repetition worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "frame", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ChildFrameV1 {
+pub enum ChildFrameV2 {
     /// Open, cache preparation, identity, and pre-measurement checks completed.
     Ready {
         protocol_version: u32,
@@ -145,8 +143,7 @@ pub enum ChildFrameV1 {
         /// Process-effective identity captured by this child immediately
         /// before it declared itself ready for measurement.
         machine: Box<MachineIdentityV1>,
-        physical_digest: PhysicalDigest,
-        metadata_digest: MetadataDigest,
+        proof: PreparationProofV2,
     },
     /// The operation returned; subsequent assertions cannot extend its clock.
     Settled {
@@ -252,7 +249,7 @@ pub(crate) fn open_and_digest_worker_executable(path: &Path) -> io::Result<(File
     Ok((file, observed, format!("{:x}", digest.finalize())))
 }
 
-impl ChildFrameV1 {
+impl ChildFrameV2 {
     pub fn protocol_version(&self) -> u32 {
         match self {
             Self::Ready {

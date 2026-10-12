@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ModernRelay/omnigraph/crates/omnigraph-gqt/trace_schema.json",
+  "title": "omnigraph-gqt diagnostic trace row",
+  "description": "One JSON object per line of a file written by `omnigraph-gqt --trace`. `kind` selects the row's columns. `step`, `step_line`, `loop_binding` and `generation` name the case operation the runner began last and appear on every row after the first `operation`; `start` never carries them, and neither does the `truncated` terminator, so it always fits the bytes reserved for it. The golden test in `src/trace.rs` serialises one row of every kind against this file.",
+  "type": "object",
+  "oneOf": [
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "start" },
+        "format": { "const": "omnigraph-gqt-diagnostic-trace" },
+        "version": { "const": 1 },
+        "invocation_id": { "type": "string" },
+        "case_path": { "type": "string" },
+        "case_digest": { "type": "string" },
+        "source_digest": { "type": "string" },
+        "executable_digest": { "type": "string" },
+        "environment": {},
+        "seed": { "type": "integer", "minimum": 0 },
+        "replay": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "idx",
+        "kind",
+        "format",
+        "version",
+        "invocation_id",
+        "case_path",
+        "case_digest",
+        "source_digest",
+        "executable_digest",
+        "environment",
+        "seed",
+        "replay"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "operation" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "step", "step_line", "loop_binding", "generation"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "observation" },
+        "text": { "type": "string" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "text"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "evidence" },
+        "record": { "type": "string" },
+        "value": {},
+        "session": { "type": ["string", "null"] },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "record", "value", "session"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "seam_crossing" },
+        "seam": { "type": "string" },
+        "decision": { "enum": ["pass", "fire", "store"] },
+        "effect": { "type": ["string", "null"] },
+        "session": { "type": ["string", "null"] },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "seam", "decision", "effect", "session"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "store_request" },
+        "verb": { "type": "string" },
+        "class": { "type": "string" },
+        "dataset": { "type": "string" },
+        "path": { "type": "string" },
+        "range": { "type": ["string", "null"] },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "session": { "type": "string" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "verb", "class", "dataset", "path", "range", "bytes", "session"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "span" },
+        "id": { "type": "integer", "minimum": 0 },
+        "parent": { "type": ["integer", "null"], "minimum": 0 },
+        "target": { "type": "string" },
+        "name": { "type": "string" },
+        "level": { "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] },
+        "file": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 0 },
+        "thread": { "type": ["string", "null"] },
+        "session": { "type": ["string", "null"] },
+        "fields": { "type": "object" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "idx",
+        "kind",
+        "id",
+        "parent",
+        "target",
+        "name",
+        "level",
+        "file",
+        "line",
+        "thread",
+        "session",
+        "fields"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "span_record" },
+        "id": { "type": "integer", "minimum": 0 },
+        "fields": { "type": "object" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "id", "fields"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "span_close" },
+        "id": { "type": "integer", "minimum": 0 },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "id"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "event" },
+        "parent": { "type": ["integer", "null"], "minimum": 0 },
+        "target": { "type": "string" },
+        "name": { "type": "string" },
+        "level": { "enum": ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] },
+        "file": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 0 },
+        "thread": { "type": ["string", "null"] },
+        "session": { "type": ["string", "null"] },
+        "fields": { "type": "object" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "idx",
+        "kind",
+        "parent",
+        "target",
+        "name",
+        "level",
+        "file",
+        "line",
+        "thread",
+        "session",
+        "fields"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "finish" },
+        "code": { "type": "string" },
+        "phase": { "type": "string" },
+        "step": { "type": "integer", "minimum": 0 },
+        "step_line": { "type": ["integer", "null"], "minimum": 0 },
+        "loop_binding": {},
+        "generation": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "code", "phase"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "idx": { "type": "integer", "minimum": 0 },
+        "kind": { "const": "truncated" },
+        "reason": { "type": "string" },
+        "max_bytes": { "type": "integer", "minimum": 0 },
+        "max_records": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["idx", "kind", "reason", "max_bytes", "max_records"],
+      "additionalProperties": false
+    }
+  ]
+}

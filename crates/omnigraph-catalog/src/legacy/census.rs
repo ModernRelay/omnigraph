@@ -1423,10 +1423,10 @@ pub async fn materialize(
     Ok(())
 }
 
-/// The stamp-14 rows a live ref is converted to: the `table` rows of `head`,
-/// its commit as the head row, an empty buffer, and the schema contract the
-/// commit names, read from its archive. `metadata` is the schema metadata of
-/// the converted version and carries stamp 14.
+/// The rows a live ref is converted to, under the stamp this binary writes:
+/// the `table` rows of `head`, its commit as the head row, an empty buffer,
+/// and the schema contract the commit names, read from its archive. `metadata`
+/// is the schema metadata of the converted version and carries that stamp.
 pub async fn conversion_batch(
     root_uri: &str,
     session: &Arc<lance::session::Session>,
@@ -1457,6 +1457,7 @@ pub async fn conversion_batch(
         buffer: CommitBuffer::default(),
         schema_contract_head: Some(contract.head.clone()),
         schema_contract: Some(contract),
+        registry: Default::default(),
     };
     let schema = crate::record::manifest_storage_schema(metadata);
     let batch = crate::record::compact_to_storage(&rows.to_batch()?, &schema)?;

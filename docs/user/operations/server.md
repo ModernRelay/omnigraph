@@ -37,6 +37,21 @@ start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
+### Logs
+
+The server logs to standard output at `info` unless `RUST_LOG` sets other
+levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
+their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
+whose verbose SDK logs contain query arguments and results, and Lance's
+`lance::dataset_events` and `lance::file_audit`, which at `info` name every
+table's full storage URI, every file Lance creates or deletes, and each delete
+predicate with its entity IDs. Other targets keep their configured levels.
+Embedders using their own subscriber must enforce the same filter.
+
+A failed Blob delivery, change-route request or streamed response is logged by
+its error class, never by its message; see
+[HTTP errors](troubleshooting.md#http-errors).
+
 ## HTTP contract
 
 Upgrade the v0.13 CLI, server and HTTP integrations together. Every protected
@@ -187,10 +202,8 @@ graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
 execution retains its input and slot until it finishes, with no later result
 lookup. See [admission and shutdown](../deployment.md).
 
-`omnigraph_server::init_tracing()` limits `rmcp` and `rmcp::*` logging to warnings
-and errors even with `RUST_LOG=trace`: verbose SDK logs contain query arguments
-and results. Other targets keep their configured levels. Embedders using their
-own subscriber must enforce the same SDK filter.
+Verbose MCP SDK logs contain query arguments and results, so the server keeps
+them out of its log; see [Logs](#logs).
 
 Requests require the resource authority or a loopback host; browsers must use
 the resource origin, while native clients can omit `Origin`. The deployment
@@ -215,16 +228,16 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
-| `/graphs/{id}/blob` | GET/HEAD one Blob cell |
+| `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
 | `/graphs/{id}/branches` | Branch management and merge |
-| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, and per-commit changes |
+| `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
 `/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
-`/mutate` serves `branch create`, `branch delete`, and `branch merge`.
-See [Branching](../branching/index.md).
+`/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
+and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`
 takes an optional `settings` field, and the two GET change routes a `set=`
 parameter; see [Session settings](../queries/index.md#session-settings).
@@ -311,10 +324,10 @@ modes.
 
 ## Deliver Blob values
 
-`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and
-`property`. They support managed ranges/ETag conditions and report external
-references without fetching them. See [Blob values](../blobs.md) for details
-and [Blob limits](../blobs.md#limits).
+`GET`/`HEAD /graphs/{id}/blob` select a cell by `entity`, `type`, `id` and `property`,
+support managed ranges/ETag conditions, and report external references without fetching
+them. `PUT` and `DELETE` replace or clear the cell; see [Blob values](../blobs.md),
+[Replacing one Blob value](../blobs.md#replacing-one-blob-value) and [Blob limits](../blobs.md#limits).
 
 ## Changes and baselines
 

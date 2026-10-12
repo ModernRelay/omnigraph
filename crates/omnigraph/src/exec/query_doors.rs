@@ -272,8 +272,9 @@ impl Session {
     ) -> Result<QueryResult> {
         #[cfg(feature = "test-util")]
         if let Some(executor) = self.read_executor() {
+            let erased = ir.erase();
             let request = omnigraph_catalog::read_executor::ReadRequest {
-                ir,
+                ir: &erased,
                 params,
                 snapshot: snapshot.raw(),
                 catalog,
@@ -329,8 +330,8 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        let type_ctx = typecheck_query(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, statement.decl(), &type_ctx)?);
+        let checked = typecheck_query(catalog, statement.decl())?;
+        let ir = Arc::new(lower_query(catalog, &checked)?);
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(ir)
         } else {

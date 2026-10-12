@@ -1,3 +1,4 @@
+use crate::storage_layer::WriteBudget;
 use arrow_array::{
     Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
     builder::StringBuilder,
@@ -23,7 +24,9 @@ use datafusion::prelude::Expr;
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
-use lance::dataset::optimize::{CompactionMetrics, CompactionOptions, plan_compaction};
+use lance::dataset::optimize::{
+    CompactionMetrics, CompactionOptions, CompactionPlan, TaskData, plan_compaction,
+};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{
     Operation, RewriteGroup, Transaction, TransactionBuilder, UpdateMode,
@@ -66,15 +69,16 @@ use crate::blob::{
     StorageRootConflict, nested_blob_field,
 };
 use crate::dataset_index::{
-    has_btree_index_on, has_fts_index_on, has_vector_index_on, is_full_text_index,
-    user_indices_for_column, validate_full_text_demand, validate_full_text_scan,
+    has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
+    is_full_text_index, is_untrained_full_text, user_indices_for_column, validate_full_text_demand,
+    validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_REBUILD_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
+    BLOB_READ_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
     KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 
@@ -133,6 +137,9 @@ pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
     (memory_limit / 3).min(40 * 1024 * 1024) as usize
 }
+
+/// The built read and its scanner-normalized filter.
+pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 
 /// Configuration surface for a scan after projection, filtering, and ordering
 /// have been selected by [`TableStore::scan_stream_with`].
@@ -218,6 +225,11 @@ impl PreparedScan {
 }
 
 impl ScanTuning<'_> {
+    pub(crate) fn use_scalar_index(&mut self, enabled: bool) -> &mut Self {
+        self.scanner.use_scalar_index(enabled);
+        self
+    }
+
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter_demand
             .merge(FtsFilterDemand::from_filter(&filter));
@@ -245,6 +257,11 @@ impl ScanTuning<'_> {
 
     pub(crate) fn batch_readahead(&mut self, batches: usize) -> &mut Self {
         self.scanner.batch_readahead(batches);
+        self
+    }
+
+    pub(crate) fn io_buffer_size(&mut self, bytes: u64) -> &mut Self {
+        self.scanner.io_buffer_size(bytes);
         self
     }
 
@@ -539,6 +556,24 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
     );
 }
 
+/// Whether `transaction`, read at `expected_read_version`, only declares
+/// full-text indexes ([`TableStore::stage_full_text_declarations`]): a
+/// `CreateIndex` that adds untrained full-text segments (empty fragment
+/// bitmaps) and removes nothing. It moves no row.
+pub(crate) fn is_full_text_declaration(
+    transaction: &Transaction,
+    expected_read_version: u64,
+) -> bool {
+    transaction.read_version == expected_read_version
+        && matches!(
+            &transaction.operation,
+            Operation::CreateIndex { new_indices, removed_indices }
+                if removed_indices.is_empty()
+                    && !new_indices.is_empty()
+                    && new_indices.iter().all(is_untrained_full_text)
+        )
+}
+
 /// Verify one persisted link of the insertion-absence proof chain and return
 /// its exact physical row contribution. This is intentionally stricter than a
 /// property lookup: the caller must also supply the expected parent version,
@@ -690,6 +725,48 @@ pub struct StagedCompaction {
     pub metrics: CompactionMetrics,
 }
 
+/// Whether `fragment` still physically stores a column the current schema no
+/// longer has: a field id that one of its data or overlay files lists and
+/// `live` (the schema's field ids) lacks. A metadata-only drop keeps the
+/// dropped id in every file that also holds a surviving column; a file
+/// holding no surviving column leaves the fragment with the drop. Lance's
+/// overlay tombstone is negative and names no column, and a Blob-v2 column is
+/// listed by its own id, never by its descriptor children's, so a table
+/// without a dropped column never matches. Manifest metadata only.
+fn fragment_holds_dropped_column(fragment: &Fragment, live: &HashSet<i32>) -> bool {
+    fragment
+        .files
+        .iter()
+        .chain(fragment.overlays.iter().map(|overlay| &overlay.data_file))
+        .any(|file| file.fields.iter().any(|id| *id >= 0 && !live.contains(id)))
+}
+
+/// The metadata-only commits of one table's schema evolution, planned once by
+/// [`TableStore::plan_schema_evolution`] from the dataset's manifest alone and
+/// consumed step by step by [`TableStore::stage_schema_evolution`].
+#[derive(Debug, Clone)]
+pub struct SchemaEvolution {
+    /// Renames and drops: the surviving columns in target order, committed as
+    /// `Operation::Project`. `None` when no column is renamed, dropped or
+    /// otherwise changed.
+    project: Option<LanceSchema>,
+    /// Additions: the complete target schema, committed as `Operation::Merge`
+    /// over the unchanged fragments. `None` when no column is added.
+    merge: Option<LanceSchema>,
+    /// The `(field id, name)` columns, in order, of the dataset the next step
+    /// must be staged against: the planned base, then each step's result.
+    expected: Vec<(i32, String)>,
+}
+
+/// A schema's columns as `(field id, name)` in pre-order: the identity a
+/// staged evolution step checks its dataset against.
+fn schema_columns(schema: &LanceSchema) -> Vec<(i32, String)> {
+    schema
+        .fields_pre_order()
+        .map(|field| (field.id, field.name.clone()))
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
@@ -728,6 +805,97 @@ impl StagedCommitMetadata {
     fn affected_rows(affected_rows: Option<RowAddrTreeMap>) -> Self {
         Self { affected_rows }
     }
+}
+
+/// One Lance detached commit of `transaction` on `ds`: no conflict pass, no
+/// HEAD movement, no auto-cleanup.
+async fn commit_detached(
+    ds: Arc<Dataset>,
+    transaction: Transaction,
+    affected_rows: Option<RowAddrTreeMap>,
+) -> Result<Dataset> {
+    let mut builder = CommitBuilder::new(ds)
+        .with_skip_auto_cleanup(true)
+        .with_detached(true);
+    if let Some(affected_rows) = affected_rows {
+        builder = builder.with_affected_rows(affected_rows);
+    }
+    builder
+        .execute(transaction)
+        .await
+        .map_err(OmniError::storage)
+}
+
+/// The columns of `columns` that hold no full-text segment once `effect`
+/// commits on `base` (or on `base` itself, with no effect). Decided from the
+/// base and the operation as Lance's manifest build decides, never by reading
+/// the new version's index section, so a write that keeps its segments pays
+/// no extra request (Lance's commit loads the base's indexes anyway): an
+/// `Overwrite` keeps no index, a `CreateIndex` replaces the ones it removes
+/// with the ones it adds, and every other operation keeps at least one segment
+/// of an index whose column stays in the schema, empty or not. A base without
+/// an index section holds none. Columns resolve by field id in the schema the
+/// version will have (an `Overwrite`, `Project` or `Merge` sets it), so a
+/// renamed column keeps its index; a column that version lacks, such as one a
+/// later step adds, is not reported.
+async fn full_text_columns_without_segment(
+    base: &Dataset,
+    effect: Option<&Operation>,
+    columns: &[String],
+) -> Result<Vec<String>> {
+    let schema = match effect {
+        Some(
+            Operation::Overwrite { schema, .. }
+            | Operation::Project { schema, .. }
+            | Operation::Merge { schema, .. },
+        ) => schema,
+        _ => base.schema(),
+    };
+    let present: Vec<(&String, i32)> = columns
+        .iter()
+        .filter_map(|column| schema.field(column).map(|field| (column, field.id)))
+        .collect();
+    if present.is_empty() || matches!(effect, Some(Operation::Overwrite { .. })) {
+        return Ok(present
+            .into_iter()
+            .map(|(column, _)| column.clone())
+            .collect());
+    }
+    let (removed, added) = match effect {
+        Some(Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        }) => (
+            removed_indices
+                .iter()
+                .map(|index| index.uuid)
+                .collect::<HashSet<_>>(),
+            new_indices.as_slice(),
+        ),
+        _ => (HashSet::new(), &[][..]),
+    };
+    let mut covered = HashSet::new();
+    if base.manifest.index_section.is_some() {
+        for index in base
+            .load_indices()
+            .await
+            .map_err(OmniError::storage)?
+            .iter()
+            .filter(|index| !removed.contains(&index.uuid))
+        {
+            if is_full_text_index(index) {
+                covered.extend(index.fields.iter().copied());
+            }
+        }
+    }
+    for index in added.iter().filter(|index| is_full_text_index(index)) {
+        covered.extend(index.fields.iter().copied());
+    }
+    Ok(present
+        .into_iter()
+        .filter(|(_, id)| !covered.contains(id))
+        .map(|(column, _)| column.clone())
+        .collect())
 }
 
 // Sealed storage surface: the `new_fragments`/`removed_fragment_ids`
@@ -954,7 +1122,7 @@ pub(crate) struct ExternalBlobPreflight {
 pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
 
 /// The managed payloads of one Blob column, in the order of the row ids given
-/// to [`TableStore::managed_blob_payloads`]. The rewrite takes one per managed
+/// to [`TableStore::managed_blob_payloads`]. The reader takes one per managed
 /// descriptor and then calls `finish`.
 pub(crate) struct ManagedBlobPayloads<'a> {
     column_name: &'a str,
@@ -972,18 +1140,18 @@ impl ManagedBlobPayloads<'_> {
         let data = next
             .ok_or_else(|| {
                 OmniError::blob_integrity(format!(
-                    "Blob rewrite for '{column_name}' lost alignment with managed source rows"
+                    "managed Blob read of '{column_name}' lost alignment with its managed rows"
                 ))
             })?
             .data
             .ok_or_else(|| {
                 OmniError::blob_integrity(format!(
-                    "Blob rewrite for '{column_name}' returned null for a managed descriptor"
+                    "managed Blob read of '{column_name}' returned null for a managed descriptor"
                 ))
             })?;
         if data.len() as u64 != length {
             return Err(OmniError::blob_integrity(format!(
-                "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
+                "managed Blob read of '{column_name}' observed managed length {}, descriptor recorded {length}",
                 data.len()
             )));
         }
@@ -1001,7 +1169,7 @@ impl ManagedBlobPayloads<'_> {
                 .is_some()
         {
             return Err(OmniError::blob_integrity(format!(
-                "Blob rewrite for '{}' produced extra managed source blobs",
+                "managed Blob read of '{}' produced extra managed blobs",
                 self.column_name
             )));
         }
@@ -1841,7 +2009,7 @@ impl TableStore {
             && total > limit
         {
             return Err(OmniError::resource_limit(
-                "materialized blob payload bytes",
+                MATERIALIZED_BLOB_PAYLOAD_BYTES,
                 limit,
                 total,
             ));
@@ -1941,11 +2109,11 @@ impl TableStore {
         batch: &RecordBatch,
         external: &ExternalBlobPreflight,
         max_blob_bytes: u64,
-    ) -> Result<u64> {
+    ) -> Result<WriteBatchBytes> {
         let payload = self.persisted_blob_payload_bytes(ds.schema(), batch, external)?;
         if payload > max_blob_bytes {
             return Err(OmniError::resource_limit(
-                "materialized blob payload bytes",
+                MATERIALIZED_BLOB_PAYLOAD_BYTES,
                 max_blob_bytes,
                 payload,
             ));
@@ -1953,8 +2121,9 @@ impl TableStore {
         let retained = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
             OmniError::manifest_internal("persisted Blob batch memory size exceeds u64")
         })?;
-        retained.checked_add(payload).ok_or_else(|| {
-            OmniError::manifest_internal("materialized Blob batch byte count overflow")
+        Ok(WriteBatchBytes {
+            rows: retained,
+            payload,
         })
     }
 
@@ -2018,8 +2187,10 @@ impl TableStore {
     }
 
     /// The one batched managed Blob read (`Dataset::read_blobs`): ordered,
-    /// streamed, with the explicit rewrite I/O buffer. `managed_row_ids` must
-    /// name managed rows only; Lance would resolve and read an external row.
+    /// streamed, with the explicit I/O buffer. Materializing rewrites,
+    /// export, the change-feed baseline, change images and entity reads all
+    /// read managed payloads here. `managed_row_ids` must name managed rows
+    /// only; Lance would resolve and read an external row.
     pub(crate) async fn managed_blob_payloads<'a>(
         ds: &Dataset,
         column_name: &'a str,
@@ -2035,7 +2206,7 @@ impl TableStore {
                     .map_err(OmniError::storage)?
                     .with_row_ids(managed_row_ids)
                     .preserve_order(true)
-                    .with_io_buffer_size_bytes(BLOB_REBUILD_IO_BUFFER_BYTES)
+                    .with_io_buffer_size_bytes(BLOB_READ_IO_BUFFER_BYTES)
                     .try_into_stream()
                     .await
                     .map_err(OmniError::storage)?,
@@ -2150,6 +2321,24 @@ impl TableStore {
         Box::pin(async move {
             let scanner = prepared?.validated(&dataset).await?;
             scanner.create_plan().await.map_err(OmniError::storage)
+        })
+    }
+
+    pub(crate) fn scan_plan_with_filter<F>(
+        ds: &Dataset,
+        projection: Option<&[&str]>,
+        configure: F,
+    ) -> BoxFuture<'static, Result<PlannedScan>>
+    where
+        F: FnOnce(&mut ScanTuning<'_>) -> Result<()>,
+    {
+        let prepared = PreparedScan::configure(ds, projection, None, None, false, configure);
+        let dataset = ds.clone();
+        Box::pin(async move {
+            let scanner = prepared?.validated(&dataset).await?;
+            let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
+            let filter = scanner.get_expr_filter().map_err(OmniError::storage)?;
+            Ok((plan, filter))
         })
     }
 
@@ -2781,14 +2970,16 @@ impl TableStore {
         batch: RecordBatch,
         semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(
                 "stage_keyed_write called with empty batch",
             ));
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size())
-            .map_err(|_| OmniError::manifest_internal("keyed write batch bytes exceed u64"))?;
+        let usage = write_batch_bytes(&batch)?;
+        let batch_bytes = usage.rows;
+        write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, usage.payload)?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("keyed write entities for {type_key}"),
@@ -2796,10 +2987,10 @@ impl TableStore {
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
+        if batch_bytes > write_budget.bytes() {
             return Err(OmniError::resource_limit(
                 format!("keyed write bytes for {type_key}"),
-                KEYED_WRITE_MAX_BYTES,
+                write_budget.bytes(),
                 batch_bytes,
             ));
         }
@@ -2820,6 +3011,7 @@ impl TableStore {
                     &expected_schema_preorder_ids,
                     "stage_keyed_write",
                     system_columns,
+                    write_budget,
                 )
                 .await;
         }
@@ -2831,7 +3023,7 @@ impl TableStore {
         // retains keyed fencing without an Append side door; Overwrite keeps
         // Lance's external-reference behavior because it accepts WriteParams.
         let batch = self
-            .prepare_keyed_write_batch(type_key, batch, system_columns)
+            .prepare_keyed_write_batch(type_key, batch, system_columns, write_budget)
             .await?;
 
         let merged_rows = batch.num_rows() as u64;
@@ -2891,6 +3083,7 @@ impl TableStore {
         ds: Dataset,
         chunk: ProvenInsertChunk,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
         let (
             table_key,
@@ -2930,6 +3123,7 @@ impl TableStore {
             &expected_schema_preorder_ids,
             "stage_proven_strict_insert",
             system_columns,
+            write_budget,
         )
         .await
     }
@@ -2951,15 +3145,16 @@ impl TableStore {
         expected_schema_preorder_ids: &[u32],
         context: &'static str,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(format!(
                 "{context} called with empty batch"
             )));
         }
-        let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal(format!("{context} batch bytes exceed u64"))
-        })?;
+        let usage = write_batch_bytes(&batch)?;
+        let batch_bytes = usage.rows;
+        write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, usage.payload)?;
         if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
             return Err(OmniError::resource_limit(
                 format!("keyed write entities for {table_key}"),
@@ -2967,16 +3162,16 @@ impl TableStore {
                 batch.num_rows() as u64,
             ));
         }
-        if batch_bytes > KEYED_WRITE_MAX_BYTES {
+        if batch_bytes > write_budget.bytes() {
             return Err(OmniError::resource_limit(
                 format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
+                write_budget.bytes(),
                 batch_bytes,
             ));
         }
 
         let batch = self
-            .prepare_keyed_write_batch(table_key, batch, system_columns)
+            .prepare_keyed_write_batch(table_key, batch, system_columns, write_budget)
             .await?;
         ensure_proven_insert_blobs_are_materialized(&batch, table_key)?;
 
@@ -3088,11 +3283,18 @@ impl TableStore {
         type_key: &str,
         batch: RecordBatch,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch> {
         let external_uris = collect_external_blob_uris(&batch)?;
         let preflight = self.preflight_external_blob_uris(&external_uris).await?;
-        self.prepare_keyed_write_batch_with_preflight(type_key, batch, &preflight, system_columns)
-            .await
+        self.prepare_keyed_write_batch_with_preflight(
+            type_key,
+            batch,
+            &preflight,
+            system_columns,
+            write_budget,
+        )
+        .await
     }
 
     /// Operation-wide sibling of [`Self::prepare_keyed_write_batch`]. The
@@ -3104,42 +3306,23 @@ impl TableStore {
         batch: RecordBatch,
         preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<RecordBatch> {
         self.validate_keyed_write_batch(table_key, &batch, system_columns)?;
         let external_uris = collect_external_blob_uris(&batch)?;
-        let payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
-        if payload_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "materialized external blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
-                payload_bytes,
-            ));
-        }
-        let retained_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("keyed write input batch bytes exceed u64")
-        })?;
-        let predicted_bytes = retained_bytes.checked_add(payload_bytes).ok_or_else(|| {
+        let external_bytes = preflight.materialized_payload_bytes(&external_uris)?;
+        write_budget.check("materialized external blob payload bytes", external_bytes)?;
+        let usage = write_batch_bytes(&batch)?;
+        let payload_bytes = usage.payload.checked_add(external_bytes).ok_or_else(|| {
             OmniError::manifest_internal("materialized keyed Blob byte count overflow")
         })?;
-        if predicted_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                predicted_bytes,
-            ));
-        }
+        write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
+        write_budget.check(format!("keyed write bytes for {table_key}"), usage.rows)?;
         let batch =
-            materialize_external_blob_inputs(batch, KEYED_WRITE_MAX_BYTES, preflight).await?;
-        let materialized_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("materialized keyed write batch bytes exceed u64")
-        })?;
-        if materialized_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed write bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                materialized_bytes,
-            ));
-        }
+            materialize_external_blob_inputs(batch, write_budget.bytes(), preflight).await?;
+        let usage = write_batch_bytes(&batch)?;
+        write_budget.check(format!("keyed write bytes for {table_key}"), usage.rows)?;
+        write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, usage.payload)?;
         Ok(batch)
     }
 
@@ -3323,6 +3506,7 @@ impl TableStore {
         interval: &ProvenInsertInterval,
         external_preflight: &ExternalBlobPreflight,
         system_columns: SystemColumns,
+        write_budget: WriteBudget,
     ) -> Result<SendableRecordBatchStream> {
         interval
             .validate(
@@ -3344,7 +3528,7 @@ impl TableStore {
                 Self::scan_stream_with(source, None, None, None, false, move |scanner| {
                     selected.select(scanner);
                     scanner.batch_size(KEYED_WRITE_MAX_ROWS);
-                    scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                    scanner.batch_size_bytes(write_budget.bytes());
                     Ok(())
                 })
                 .await?
@@ -3354,6 +3538,7 @@ impl TableStore {
                 output_schema,
                 raw,
                 type_key.to_string(),
+                write_budget,
             ));
         }
 
@@ -3376,7 +3561,7 @@ impl TableStore {
                 self.clone(),
                 external_preflight.clone(),
             ),
-            |(mut raw, mut current, mut offset, source, store, external_preflight)| async move {
+            move |(mut raw, mut current, mut offset, source, store, external_preflight)| async move {
                 loop {
                     if let Some(batch) = current.as_ref()
                         && offset < batch.num_rows()
@@ -3408,7 +3593,7 @@ impl TableStore {
                                 source.schema(),
                                 descriptors,
                                 &[row_id],
-                                Some(KEYED_WRITE_MAX_BYTES),
+                                Some(write_budget.bytes()),
                                 Some(&external_preflight),
                                 None,
                             )
@@ -3438,6 +3623,7 @@ impl TableStore {
             output_schema,
             materialized,
             type_key.to_string(),
+            write_budget,
         ))
     }
 
@@ -3698,25 +3884,104 @@ impl TableStore {
     /// RFC 0067: commit a staged effect as a Lance detached
     /// version of its base. No conflict pass runs, nothing at HEAD moves, and
     /// the result is invisible until a manifest pin references it.
+    ///
+    /// `declared_full_text` names the table's declared full-text columns.
+    /// Lance applies a full-text analyzer only through a segment of the
+    /// index: rows no segment covers are matched with that segment's
+    /// analyzer, and with no segment at all its flat path tokenizes bare (no
+    /// lowercasing, no stemming). A column the committed version holds no
+    /// full-text segment for (a table whose first rows land here, an
+    /// overwrite, which drops every index) gets an untrained one in a second
+    /// detached commit chained on the first under the same witness, and the
+    /// returned version is that one. So no version a writer pins leaves a
+    /// declared full-text index without its analyzer; postings still come
+    /// from explicit reconciliation.
     pub async fn commit_staged_detached(
         &self,
         ds: Arc<Dataset>,
         mut staged: StagedWrite,
         witness: &StagingWitness,
+        declared_full_text: &[String],
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         witness.stamp(&mut staged.transaction);
-        let mut builder = CommitBuilder::new(ds)
-            .with_skip_auto_cleanup(true)
-            .with_detached(true);
-        if let Some(affected_rows) = staged.commit_metadata.affected_rows {
-            builder = builder.with_affected_rows(affected_rows);
+        let undeclared = full_text_columns_without_segment(
+            &ds,
+            Some(&staged.transaction.operation),
+            declared_full_text,
+        )
+        .await?;
+        let mut dataset =
+            commit_detached(ds, staged.transaction, staged.commit_metadata.affected_rows).await?;
+        if let Some(mut declaration) = self
+            .stage_full_text_declarations(&dataset, &undeclared)
+            .await?
+        {
+            witness.stamp(&mut declaration);
+            dataset = commit_detached(Arc::new(dataset), declaration, None).await?;
         }
-        let dataset = builder
-            .execute(staged.transaction)
-            .await
-            .map_err(OmniError::storage)?;
         let identity = self.transaction_identity(&dataset)?;
         Ok((dataset, identity))
+    }
+
+    /// Commit, detached on `ds` under `witness`, the declaration of every
+    /// column of `columns` holding no full-text segment
+    /// ([`Self::stage_full_text_declarations`]): the effect of a schema apply
+    /// that declares a full-text index on a table it does not rewrite. `None`
+    /// when every column already has a segment.
+    pub async fn commit_full_text_declarations(
+        &self,
+        ds: Arc<Dataset>,
+        columns: &[String],
+        witness: &StagingWitness,
+    ) -> Result<Option<(Dataset, StagedTransactionIdentity)>> {
+        let undeclared = full_text_columns_without_segment(&ds, None, columns).await?;
+        let Some(mut declaration) = self.stage_full_text_declarations(&ds, &undeclared).await?
+        else {
+            return Ok(None);
+        };
+        witness.stamp(&mut declaration);
+        let dataset = commit_detached(ds, declaration, None).await?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok(Some((dataset, identity)))
+    }
+
+    /// The `CreateIndex` that gives every column of `columns` an untrained,
+    /// certified full-text segment on `ds`: an empty fragment bitmap, no
+    /// postings, the engine's analyzer. `None` when `columns` is empty.
+    pub(crate) async fn stage_full_text_declarations(
+        &self,
+        ds: &Dataset,
+        columns: &[String],
+    ) -> Result<Option<Transaction>> {
+        let mut new_indices = Vec::new();
+        for column in columns {
+            let params = InvertedIndexParams::default();
+            let mut builder_ds = ds.clone();
+            let mut segment = builder_ds
+                .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                .replace(true)
+                .train(false)
+                .execute_uncommitted()
+                .await
+                .map_err(|error| {
+                    OmniError::storage_context(
+                        format!("declare the full-text index on '{column}'"),
+                        error,
+                    )
+                })?;
+            fts_compat::write_certificate(ds, &mut segment).await?;
+            new_indices.push(segment);
+        }
+        Ok((!new_indices.is_empty()).then(|| {
+            TransactionBuilder::new(
+                ds.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices: Vec::new(),
+                },
+            )
+            .build()
+        }))
     }
 
     /// The identity of the transaction a version records (RFC 0067), read
@@ -3834,22 +4099,82 @@ impl TableStore {
         Ok((dataset, committed_identity))
     }
 
-    /// RFC 0067: plan and execute Lance compaction against a pinned base and
-    /// stage the result as one `Rewrite` transaction. The new fragments take
-    /// ids above the base's high-water mark, so the commit needs no
-    /// `ReserveFragments` (whose replay would not conflict with its twin). A
-    /// stable-row-id rewrite carries every index's coverage over to the new
-    /// fragments when Lance applies it. `None` when the plan has no task.
-    /// Every task of a Blob table is sized before any executes, so a sizing
-    /// refusal leaves no rewritten file behind.
+    /// Plan a graph table's compaction: Lance's plan for `options`, plus one
+    /// task of its own for every other fragment that still physically holds
+    /// a dropped column ([`fragment_holds_dropped_column`]).
+    ///
+    /// This is how a dropped property's values are erased. Schema apply drops
+    /// a property with a metadata-only `Operation::Project`, which keeps every
+    /// data file that also holds a surviving column, the dropped values
+    /// included, and Lance's planner selects fragments by size, deletions and
+    /// overlays, never by dropped columns. Planning those fragments here makes
+    /// every `optimize` rewrite them: the rewrite scans the current schema
+    /// only, so the new data files and Blob sidecars hold no dropped value,
+    /// and a later `cleanup` that no longer retains the versions before the
+    /// rewrite deletes the old files. A single-fragment task is the shape
+    /// Lance itself plans for a fragment that compacts alone (deletion
+    /// materialization), and its `Rewrite` group replaces the fragment in
+    /// place. A fragment a Lance task already rewrites, or one
+    /// `options.excluded_fragment_ids` names, gets no task of its own.
+    /// Lance applies its per-run source budgets (`max_source_fragments`,
+    /// `max_source_rows`, `max_source_bytes`) to its own tasks only, so
+    /// options that set one are refused rather than let the added tasks run
+    /// outside it. The selection reads only the manifest, so a table holding
+    /// no dropped column costs nothing beyond Lance's own planning.
+    pub(crate) async fn plan_table_compaction(
+        ds: &Dataset,
+        options: &CompactionOptions,
+    ) -> Result<CompactionPlan> {
+        if options.max_source_fragments.is_some()
+            || options.max_source_rows.is_some()
+            || options.max_source_bytes.is_some()
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "compaction of {} sets a per-run source budget, which Lance applies only to \
+                 its own tasks; the dropped-column tasks would run outside it",
+                ds.uri()
+            )));
+        }
+        let mut plan = plan_compaction(ds, options)
+            .await
+            .map_err(OmniError::storage)?;
+        let live = ds.schema().field_ids().into_iter().collect::<HashSet<_>>();
+        let mut skip = plan
+            .tasks
+            .iter()
+            .flat_map(|task| task.fragments.iter().map(|fragment| fragment.id))
+            .chain(
+                options
+                    .excluded_fragment_ids
+                    .iter()
+                    .map(|id| u64::from(*id)),
+            )
+            .collect::<HashSet<_>>();
+        for fragment in ds.manifest.fragments.iter() {
+            if fragment_holds_dropped_column(fragment, &live) && skip.insert(fragment.id) {
+                plan.tasks.push(TaskData {
+                    fragments: vec![fragment.clone()],
+                });
+            }
+        }
+        Ok(plan)
+    }
+
+    /// RFC 0067: plan ([`Self::plan_table_compaction`]) and execute Lance
+    /// compaction against a pinned base and stage the result as one `Rewrite`
+    /// transaction. The new fragments take ids above the base's high-water
+    /// mark, so the commit needs no `ReserveFragments` (whose replay would
+    /// not conflict with its twin). A stable-row-id rewrite carries every
+    /// index's coverage over to the new fragments when Lance applies it.
+    /// `None` when the plan has no task. Every task of a Blob table is sized
+    /// before any executes, so a sizing refusal leaves no rewritten file
+    /// behind.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
     ) -> Result<Option<StagedCompaction>> {
-        let plan = plan_compaction(ds, options)
-            .await
-            .map_err(OmniError::storage)?;
+        let plan = Self::plan_table_compaction(ds, options).await?;
         if plan.num_tasks() == 0 {
             return Ok(None);
         }
@@ -4067,6 +4392,216 @@ impl TableStore {
         )
         .build();
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
+    }
+
+    /// Plan the metadata-only commits that move a table from its dataset
+    /// schema to `target`, the desired physical schema in catalog order, with
+    /// `renames` naming each renamed column as `(from, to)`. Reads only the
+    /// manifest.
+    ///
+    /// A target column maps to the dataset column it is renamed from, or to
+    /// the column of its own name, and keeps that column's field id, type,
+    /// nullability and metadata (the unenforced primary key and the Blob-v2
+    /// extension included), so the data files and indexes that reference the
+    /// id keep serving it; only its name and its
+    /// `omnigraph.stable_property_id` marker follow the target. A marker that
+    /// names another property refuses. Every other target column is new: it
+    /// must be nullable, and it takes a field id above every id the table's
+    /// data files still reference (`Manifest::max_field_id`), so a fragment
+    /// that lacks it reads it as null. A dataset column no target column maps
+    /// to is dropped. A column whose type or nullability would change refuses:
+    /// that needs a rewrite, which schema apply never plans.
+    pub(crate) fn plan_schema_evolution(
+        ds: &Dataset,
+        target: &arrow_schema::Schema,
+        renames: &[(String, String)],
+    ) -> Result<SchemaEvolution> {
+        let current = ds.schema();
+        let mut source_of = HashMap::<&str, &str>::with_capacity(renames.len());
+        for (from, to) in renames {
+            if source_of.insert(to.as_str(), from.as_str()).is_some() {
+                return Err(OmniError::manifest_internal(format!(
+                    "schema evolution renames two columns to '{to}'"
+                )));
+            }
+        }
+        let mut fields = Vec::with_capacity(target.fields().len());
+        let mut consumed = HashSet::<&str>::new();
+        let mut renamed = false;
+        let mut added = false;
+        for target_field in target.fields() {
+            let name = target_field.name().as_str();
+            let source = match source_of.get(name) {
+                Some(from) if current.field(from).is_some() => Some(*from),
+                // The rename was applied by an earlier step of this evolution.
+                Some(_) if current.field(name).is_some() => Some(name),
+                Some(from) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "column '{name}' is renamed from '{from}', which the dataset does not have"
+                    )));
+                }
+                None => current.field(name).map(|_| name),
+            };
+            let Some(source) = source else {
+                if !target_field.is_nullable() {
+                    return Err(OmniError::manifest_internal(format!(
+                        "new column '{name}' is not nullable; adding it without a rewrite needs a nullable column"
+                    )));
+                }
+                fields.push(
+                    lance::datatypes::Field::try_from(target_field.as_ref())
+                        .map_err(OmniError::lance_internal)?,
+                );
+                added = true;
+                continue;
+            };
+            if !consumed.insert(source) {
+                return Err(OmniError::manifest_internal(format!(
+                    "two target columns map to dataset column '{source}'"
+                )));
+            }
+            let existing = current
+                .field(source)
+                .expect("the source column was found above");
+            let desired = lance::datatypes::Field::try_from(target_field.as_ref())
+                .map_err(OmniError::lance_internal)?;
+            if existing.data_type() != desired.data_type() || existing.nullable != desired.nullable
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "column '{source}' cannot become '{name}' without a rewrite: {:?} (nullable {}) -> {:?} (nullable {})",
+                    existing.data_type(),
+                    existing.nullable,
+                    desired.data_type(),
+                    desired.nullable,
+                )));
+            }
+            let mut field = existing.clone();
+            if source != name {
+                field.name = name.to_string();
+                renamed = true;
+            }
+            match target_field
+                .metadata()
+                .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+            {
+                Some(property_id) => {
+                    match field
+                        .metadata
+                        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                    {
+                        Some(existing_id) if existing_id != property_id => {
+                            return Err(OmniError::manifest_internal(format!(
+                                "column '{source}' carries property identity {existing_id}, not {property_id}"
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            field.metadata.insert(
+                                crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
+                                property_id.clone(),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    if field
+                        .metadata
+                        .contains_key(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                    {
+                        return Err(OmniError::manifest_internal(format!(
+                            "column '{source}' carries a property identity its target '{name}' lacks"
+                        )));
+                    }
+                }
+            }
+            fields.push(field);
+        }
+        let dropped = current
+            .fields
+            .iter()
+            .any(|field| !consumed.contains(field.name.as_str()));
+
+        let mut evolved = LanceSchema {
+            fields,
+            metadata: current.metadata.clone(),
+        };
+        // Only the new columns (id -1) take ids, above every id the table's
+        // data files still reference.
+        evolved.set_field_id(Some(ds.manifest.max_field_id()));
+        evolved.validate().map_err(OmniError::lance_internal)?;
+
+        let expected = schema_columns(current);
+        if !added {
+            let project = (&evolved != current).then_some(evolved);
+            return Ok(SchemaEvolution {
+                project,
+                merge: None,
+                expected,
+            });
+        }
+        let project = if renamed || dropped {
+            let surviving = evolved
+                .fields
+                .iter()
+                .filter(|field| current.field_by_id(field.id).is_some())
+                .cloned()
+                .collect();
+            Some(LanceSchema {
+                fields: surviving,
+                metadata: current.metadata.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(SchemaEvolution {
+            project,
+            merge: Some(evolved),
+            expected,
+        })
+    }
+
+    /// Stage the next metadata-only commit of a planned schema evolution (see
+    /// [`Self::plan_schema_evolution`]) against `ds`, or `None` when no step
+    /// remains. Renames and drops stage first, as `Operation::Project`
+    /// (Lance's own rename and drop); additions follow, as `Operation::Merge`
+    /// over `ds`'s unchanged fragments (Lance's own all-null add). Lance
+    /// refuses a Merge that renames a field, so a table with both kinds
+    /// commits the Project detached and stages the Merge against that
+    /// version: at most two commits. `ds` must have the columns the previous
+    /// step left (the planned base first), or the step refuses. Neither step
+    /// writes or rewrites a data file or reads a row; every surviving index
+    /// keeps its coverage, and an index on a dropped column leaves with it.
+    /// HEAD does NOT advance.
+    pub async fn stage_schema_evolution(
+        &self,
+        ds: &Dataset,
+        evolution: &mut SchemaEvolution,
+    ) -> Result<Option<StagedWrite>> {
+        if schema_columns(ds.schema()) != evolution.expected {
+            return Err(OmniError::manifest_internal(format!(
+                "schema evolution step staged against {} version {}, whose columns are not the ones the plan expects",
+                ds.uri(),
+                ds.manifest.version
+            )));
+        }
+        let operation = if let Some(schema) = evolution.project.take() {
+            evolution.expected = schema_columns(&schema);
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            }
+        } else if let Some(schema) = evolution.merge.take() {
+            evolution.expected = schema_columns(&schema);
+            Operation::Merge {
+                fragments: ds.manifest.fragments.as_ref().clone(),
+                schema,
+                preserves_nullability: true,
+            }
+        } else {
+            return Ok(None);
+        };
+        let transaction = TransactionBuilder::new(ds.manifest.version, operation).build();
+        Ok(Some(StagedWrite::new(transaction, Vec::new(), Vec::new())))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
@@ -4643,7 +5178,8 @@ impl TableStore {
             // columns now so an already-overwide match fails before
             // `take_rows` performs the second full-row read.
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
-            let payload_budget = account.remaining_bytes_after(non_blob_bytes)?;
+            account.remaining_bytes_after(non_blob_bytes)?;
+            let payload_budget = account.write_budget.bytes() - account.payload_bytes;
 
             if let Some(schema) = &carried_without_blobs {
                 let carried_rows = predicate_rows_as(schema, &batch)?;
@@ -4689,16 +5225,17 @@ impl TableStore {
                         )
                         .unwrap_or(error));
                 }
-                Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
-                    let actual = account
-                        .bytes_with(non_blob_bytes)?
-                        .checked_add(actual)
-                        .ok_or_else(|| {
-                            OmniError::manifest_internal("pending scan byte count overflow")
-                        })?;
+                Err(OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    actual,
+                    ..
+                }) if resource == MATERIALIZED_BLOB_PAYLOAD_BYTES => {
+                    let actual = account.payload_bytes.checked_add(actual).ok_or_else(|| {
+                        OmniError::manifest_internal("pending scan byte count overflow")
+                    })?;
                     return Err(OmniError::resource_limit(
-                        "retained keyed batch bytes per operation",
-                        KEYED_WRITE_MAX_BYTES,
+                        MATERIALIZED_BLOB_PAYLOAD_BYTES,
+                        account.write_budget.bytes(),
                         actual,
                     ));
                 }
@@ -4746,6 +5283,10 @@ impl TableStore {
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_fts_index_on(ds, column).await
+    }
+
+    pub async fn has_fts_postings(&self, ds: &Dataset, column: &str) -> Result<bool> {
+        has_fts_postings_on(ds, column).await
     }
 
     /// Metadata-only check (no data IO) of whether the FTS (inverted) index
@@ -4975,6 +5516,8 @@ struct PendingScanAccount {
     table_key: String,
     rows: u64,
     bytes: u64,
+    payload_bytes: u64,
+    write_budget: WriteBudget,
 }
 
 impl PendingScanAccount {
@@ -4983,8 +5526,13 @@ impl PendingScanAccount {
             table_key: budget.table_key,
             rows: 0,
             bytes: 0,
+            payload_bytes: budget.initial.payload_bytes,
+            write_budget: budget.write_budget,
         };
-        account.add_usage(budget.initial_rows, budget.initial_bytes)?;
+        account
+            .write_budget
+            .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, account.payload_bytes)?;
+        account.add_usage(budget.initial.rows, budget.initial.bytes)?;
         Ok(account)
     }
 
@@ -5002,9 +5550,16 @@ impl PendingScanAccount {
     fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let bytes = u64::try_from(batch.get_array_memory_size())
-            .map_err(|_| OmniError::manifest_internal("pending scan bytes exceed u64"))?;
-        self.add_usage(rows, bytes)
+        let usage = write_batch_bytes(batch)?;
+        let payload_bytes = self
+            .payload_bytes
+            .checked_add(usage.payload)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan Blob payload overflow"))?;
+        self.write_budget
+            .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
+        self.add_usage(rows, usage.rows)?;
+        self.payload_bytes = payload_bytes;
+        Ok(())
     }
 
     fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
@@ -5023,10 +5578,10 @@ impl PendingScanAccount {
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
-        if next_bytes > KEYED_WRITE_MAX_BYTES {
+        if next_bytes > self.write_budget.bytes() {
             return Err(OmniError::resource_limit(
                 "retained keyed batch bytes per operation",
-                KEYED_WRITE_MAX_BYTES,
+                self.write_budget.bytes(),
                 next_bytes,
             ));
         }
@@ -5060,14 +5615,14 @@ impl PendingScanAccount {
 
     fn remaining_bytes_after(&self, bytes: u64) -> Result<u64> {
         let actual = self.bytes_with(bytes)?;
-        if actual > KEYED_WRITE_MAX_BYTES {
+        if actual > self.write_budget.bytes() {
             return Err(OmniError::resource_limit(
                 "retained keyed batch bytes per operation",
-                KEYED_WRITE_MAX_BYTES,
+                self.write_budget.bytes(),
                 actual,
             ));
         }
-        Ok(KEYED_WRITE_MAX_BYTES - actual)
+        Ok(self.write_budget.bytes() - actual)
     }
 
     fn next_scan_rows(&self) -> usize {
@@ -5078,7 +5633,7 @@ impl PendingScanAccount {
     }
 
     fn next_scan_bytes(&self) -> u64 {
-        KEYED_WRITE_MAX_BYTES.saturating_sub(self.bytes).max(1)
+        self.write_budget.bytes().saturating_sub(self.bytes).max(1)
     }
 }
 
@@ -5250,6 +5805,56 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
         combined.extend(write.new_fragments.iter().cloned());
     }
     combined
+}
+
+pub(crate) const MATERIALIZED_BLOB_PAYLOAD_BYTES: &str = "materialized blob payload bytes";
+
+/// Row data includes Arrow bookkeeping and URI descriptors. Only the data
+/// buffer of a typed logical Blob is excluded: payload bytes are admitted in
+/// their own account, so a payload at the allowance can accompany a small row.
+#[derive(Debug, Default)]
+pub(crate) struct WriteBatchBytes {
+    pub(crate) rows: u64,
+    pub(crate) payload: u64,
+}
+
+pub(crate) fn write_batch_bytes(batch: &RecordBatch) -> Result<WriteBatchBytes> {
+    let mut bytes = WriteBatchBytes {
+        rows: u64::try_from(batch.get_array_memory_size())
+            .map_err(|_| OmniError::manifest_internal("write batch bytes exceed u64"))?,
+        payload: 0,
+    };
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field =
+            lance::datatypes::Field::try_from(field.as_ref()).map_err(OmniError::lance_internal)?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let Some(descriptions) = column.as_any().downcast_ref::<StructArray>() else {
+            return Err(OmniError::manifest_internal(
+                "Blob write column is not a struct",
+            ));
+        };
+        if descriptions.column_by_name("data").is_none() {
+            continue;
+        }
+        let input = logical_blob_input(descriptions, field.name())?;
+        let capacity = u64::try_from(input.data.values().capacity())
+            .map_err(|_| OmniError::manifest_internal("Blob buffer capacity exceeds u64"))?;
+        bytes.rows = bytes.rows.checked_sub(capacity).ok_or_else(|| {
+            OmniError::manifest_internal("Blob buffer exceeds its Arrow memory charge")
+        })?;
+        for row in 0..descriptions.len() {
+            if descriptions.is_valid(row) && input.data.is_valid(row) {
+                let length = u64::try_from(input.data.value_length(row))
+                    .map_err(|_| OmniError::manifest_internal("Blob value length exceeds u64"))?;
+                bytes.payload = bytes.payload.checked_add(length).ok_or_else(|| {
+                    OmniError::manifest_internal("Blob payload byte count overflow")
+                })?;
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 struct LogicalBlobInput<'a> {
@@ -5963,6 +6568,7 @@ fn bounded_proven_insert_stream(
     schema: SchemaRef,
     raw: SendableRecordBatchStream,
     table_key: String,
+    write_budget: WriteBudget,
 ) -> SendableRecordBatchStream {
     let output_schema = schema.clone();
     let bounded = futures::stream::try_unfold(
@@ -5974,10 +6580,11 @@ fn bounded_proven_insert_stream(
             Vec::<RecordBatch>::new(),
             0_usize,
             0_u64,
+            0_u64,
             schema,
             table_key,
         ),
-        |(
+        move |(
             mut raw,
             mut current,
             mut current_offset,
@@ -5985,28 +6592,29 @@ fn bounded_proven_insert_stream(
             mut accumulated,
             mut accumulated_rows,
             mut accumulated_bytes,
+            mut accumulated_payload_bytes,
             schema,
             table_key,
         )| async move {
             loop {
                 if let Some((batch, consumed_rows)) = pending.take() {
                     let batch_rows = batch.num_rows();
-                    let batch_bytes =
-                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                            OmniError::manifest_internal(
-                                "proven insert delta batch bytes exceed u64",
-                            )
-                            .into_datafusion_external()
-                        })?;
+                    let usage =
+                        write_batch_bytes(&batch).map_err(OmniError::into_datafusion_external)?;
+                    let batch_bytes = usage.rows;
                     let fits = accumulated_rows
                         .checked_add(batch_rows)
                         .is_some_and(|rows| rows <= KEYED_WRITE_MAX_ROWS)
                         && accumulated_bytes
                             .checked_add(batch_bytes)
-                            .is_some_and(|bytes| bytes <= KEYED_WRITE_MAX_BYTES);
+                            .is_some_and(|bytes| bytes <= write_budget.bytes())
+                        && accumulated_payload_bytes
+                            .checked_add(usage.payload)
+                            .is_some_and(|bytes| bytes <= write_budget.bytes());
                     if accumulated.is_empty() || fits {
                         accumulated_rows += batch_rows;
                         accumulated_bytes += batch_bytes;
+                        accumulated_payload_bytes += usage.payload;
                         accumulated.push(batch);
                         current_offset += consumed_rows;
                         if current
@@ -6017,12 +6625,14 @@ fn bounded_proven_insert_stream(
                             current_offset = 0;
                         }
                         if accumulated_rows == KEYED_WRITE_MAX_ROWS
-                            || accumulated_bytes == KEYED_WRITE_MAX_BYTES
+                            || accumulated_bytes == write_budget.bytes()
+                            || accumulated_payload_bytes == write_budget.bytes()
                         {
                             let output = finish_proven_insert_batch(
                                 &schema,
                                 std::mem::take(&mut accumulated),
                                 &table_key,
+                                write_budget,
                             )
                             .map_err(OmniError::into_datafusion_external)?;
                             return Ok(Some((
@@ -6033,6 +6643,7 @@ fn bounded_proven_insert_stream(
                                     current_offset,
                                     None,
                                     Vec::new(),
+                                    0,
                                     0,
                                     0,
                                     schema,
@@ -6048,6 +6659,7 @@ fn bounded_proven_insert_stream(
                         &schema,
                         std::mem::take(&mut accumulated),
                         &table_key,
+                        write_budget,
                     )
                     .map_err(OmniError::into_datafusion_external)?;
                     return Ok(Some((
@@ -6060,6 +6672,7 @@ fn bounded_proven_insert_stream(
                             Vec::new(),
                             0,
                             0,
+                            0,
                             schema,
                             table_key,
                         ),
@@ -6069,8 +6682,13 @@ fn bounded_proven_insert_stream(
                 if let Some(batch) = current.as_ref() {
                     if current_offset < batch.num_rows() {
                         pending = Some(
-                            next_proven_insert_batch(batch, current_offset, &table_key)
-                                .map_err(OmniError::into_datafusion_external)?,
+                            next_proven_insert_batch(
+                                batch,
+                                current_offset,
+                                &table_key,
+                                write_budget,
+                            )
+                            .map_err(OmniError::into_datafusion_external)?,
                         );
                         continue;
                     }
@@ -6091,6 +6709,7 @@ fn bounded_proven_insert_stream(
                             &schema,
                             std::mem::take(&mut accumulated),
                             &table_key,
+                            write_budget,
                         )
                         .map_err(OmniError::into_datafusion_external)?;
                         return Ok(Some((
@@ -6101,6 +6720,7 @@ fn bounded_proven_insert_stream(
                                 current_offset,
                                 pending,
                                 Vec::new(),
+                                0,
                                 0,
                                 0,
                                 schema,
@@ -6137,6 +6757,7 @@ fn next_proven_insert_batch(
     batch: &RecordBatch,
     offset: usize,
     table_key: &str,
+    write_budget: WriteBudget,
 ) -> Result<(RecordBatch, usize)> {
     if offset >= batch.num_rows() {
         return Err(OmniError::manifest_internal(format!(
@@ -6146,7 +6767,8 @@ fn next_proven_insert_batch(
     }
 
     let max_rows = (batch.num_rows() - offset).min(KEYED_WRITE_MAX_ROWS);
-    let (mut rows, mut logical_bytes) = largest_proven_insert_prefix(batch, offset, max_rows)?;
+    let (mut rows, mut logical_bytes) =
+        largest_proven_insert_prefix(batch, offset, max_rows, write_budget)?;
     loop {
         let is_whole_batch = offset == 0 && rows == batch.num_rows();
         let retained_bytes = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
@@ -6156,35 +6778,37 @@ fn next_proven_insert_batch(
         let retained_parent_slop = 64_u64 * 1024;
         let keeps_only_logical_slice =
             retained_bytes <= logical_bytes.saturating_add(retained_parent_slop);
+        let retained_usage = write_batch_bytes(batch)?;
         let candidate = if is_whole_batch
-            && retained_bytes <= KEYED_WRITE_MAX_BYTES
+            && retained_usage.rows <= write_budget.bytes()
+            && retained_usage.payload <= write_budget.bytes()
+            && retained_bytes <= write_budget.bytes().saturating_mul(2)
             && keeps_only_logical_slice
         {
             batch.clone()
         } else {
             copy_proven_insert_batch_range(batch, offset, rows)?
         };
-        let bytes = u64::try_from(candidate.get_array_memory_size()).map_err(|_| {
-            OmniError::manifest_internal("proven insert delta batch bytes exceed u64")
-        })?;
-        if bytes <= KEYED_WRITE_MAX_BYTES {
-            validate_proven_insert_source_batch(&candidate, table_key)?;
+        let usage = write_batch_bytes(&candidate)?;
+        let bytes = usage.rows.max(usage.payload);
+        if bytes <= write_budget.bytes() {
+            validate_proven_insert_source_batch(&candidate, table_key, write_budget)?;
             return Ok((candidate, rows));
         }
         if rows == 1 {
             return Err(OmniError::resource_limit(
                 format!("proven insert delta bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
+                write_budget.bytes(),
                 bytes,
             ));
         }
         drop(candidate);
-        rows = ((u128::try_from(rows).unwrap() * u128::from(KEYED_WRITE_MAX_BYTES))
+        rows = ((u128::try_from(rows).unwrap() * u128::from(write_budget.bytes()))
             / u128::from(bytes))
         .try_into()
         .unwrap_or(1_usize)
         .clamp(1, rows - 1);
-        logical_bytes = proven_insert_slice_memory_size(batch, offset, rows)?;
+        logical_bytes = batch_slice_memory_size(batch, offset, rows)?;
     }
 }
 
@@ -6196,31 +6820,56 @@ fn largest_proven_insert_prefix(
     batch: &RecordBatch,
     offset: usize,
     max_rows: usize,
+    write_budget: WriteBudget,
 ) -> Result<(usize, u64)> {
-    let one_row_bytes = proven_insert_slice_memory_size(batch, offset, 1)?;
-    if max_rows == 1 || one_row_bytes > KEYED_WRITE_MAX_BYTES {
-        return Ok((1, one_row_bytes));
+    let fits = |rows| -> Result<bool> {
+        let slice = batch.slice(offset, rows);
+        let usage = write_batch_bytes(&slice)?;
+        let mut row_bytes = batch_slice_memory_size(batch, offset, rows)?;
+        for (field, column) in slice.schema().fields().iter().zip(slice.columns()) {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(OmniError::lance_internal)?;
+            if lance_field.is_blob()
+                && let Some(descriptions) = column.as_any().downcast_ref::<StructArray>()
+                && descriptions.column_by_name("data").is_some()
+            {
+                let input = logical_blob_input(descriptions, field.name())?;
+                let offsets = input.data.value_offsets();
+                let payload_buffer = u64::try_from(offsets[offsets.len() - 1] - offsets[0])
+                    .map_err(|_| {
+                        OmniError::manifest_internal("logical Blob slice bytes exceed u64")
+                    })?;
+                row_bytes = row_bytes.checked_sub(payload_buffer).ok_or_else(|| {
+                    OmniError::manifest_internal("logical Blob slice exceeds row size")
+                })?;
+            }
+        }
+        Ok(row_bytes <= write_budget.bytes() && usage.payload <= write_budget.bytes())
+    };
+    if max_rows == 1 || !fits(1)? {
+        return Ok((1, batch_slice_memory_size(batch, offset, 1)?));
     }
-
-    let max_bytes = proven_insert_slice_memory_size(batch, offset, max_rows)?;
-    if max_bytes <= KEYED_WRITE_MAX_BYTES {
-        return Ok((max_rows, max_bytes));
+    if fits(max_rows)? {
+        return Ok((max_rows, batch_slice_memory_size(batch, offset, max_rows)?));
     }
-
     let mut low = 1_usize;
     let mut high = max_rows - 1;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        if proven_insert_slice_memory_size(batch, offset, middle)? <= KEYED_WRITE_MAX_BYTES {
+        if fits(middle)? {
             low = middle;
         } else {
             high = middle - 1;
         }
     }
-    Ok((low, proven_insert_slice_memory_size(batch, offset, low)?))
+    Ok((low, batch_slice_memory_size(batch, offset, low)?))
 }
 
-fn proven_insert_slice_memory_size(batch: &RecordBatch, offset: usize, rows: usize) -> Result<u64> {
+pub(crate) fn batch_slice_memory_size(
+    batch: &RecordBatch,
+    offset: usize,
+    rows: usize,
+) -> Result<u64> {
     batch.columns().iter().try_fold(0_u64, |total, column| {
         let bytes = column
             .slice(offset, rows)
@@ -6229,11 +6878,9 @@ fn proven_insert_slice_memory_size(batch: &RecordBatch, offset: usize, rows: usi
             .map_err(OmniError::arrow_internal)?;
         total
             .checked_add(u64::try_from(bytes).map_err(|_| {
-                OmniError::manifest_internal("proven insert logical slice bytes exceed u64")
+                OmniError::manifest_internal("logical batch slice bytes exceed u64")
             })?)
-            .ok_or_else(|| {
-                OmniError::manifest_internal("proven insert logical slice bytes overflow")
-            })
+            .ok_or_else(|| OmniError::manifest_internal("logical batch slice bytes overflow"))
     })
 }
 
@@ -6241,13 +6888,14 @@ fn finish_proven_insert_batch(
     schema: &SchemaRef,
     mut batches: Vec<RecordBatch>,
     table_key: &str,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let batch = if batches.len() == 1 {
         batches.pop().expect("length checked")
     } else {
         arrow_select::concat::concat_batches(schema, &batches).map_err(OmniError::arrow_internal)?
     };
-    validate_proven_insert_source_batch(&batch, table_key)?;
+    validate_proven_insert_source_batch(&batch, table_key, write_budget)?;
     Ok(batch)
 }
 
@@ -6267,7 +6915,11 @@ fn copy_proven_insert_batch_range(
     arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }
 
-fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> Result<()> {
+fn validate_proven_insert_source_batch(
+    batch: &RecordBatch,
+    table_key: &str,
+    write_budget: WriteBudget,
+) -> Result<()> {
     if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
         return Err(OmniError::resource_limit(
             format!("proven insert delta entities for {table_key}"),
@@ -6275,15 +6927,12 @@ fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> 
             batch.num_rows() as u64,
         ));
     }
-    let bytes = u64::try_from(batch.get_array_memory_size())
-        .map_err(|_| OmniError::manifest_internal("proven insert delta batch bytes exceed u64"))?;
-    if bytes > KEYED_WRITE_MAX_BYTES {
-        return Err(OmniError::resource_limit(
-            format!("proven insert delta bytes for {table_key}"),
-            KEYED_WRITE_MAX_BYTES,
-            bytes,
-        ));
-    }
+    let usage = write_batch_bytes(batch)?;
+    write_budget.check(
+        format!("proven insert delta bytes for {table_key}"),
+        usage.rows,
+    )?;
+    write_budget.check(MATERIALIZED_BLOB_PAYLOAD_BYTES, usage.payload)?;
     Ok(())
 }
 

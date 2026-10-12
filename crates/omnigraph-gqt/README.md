@@ -56,8 +56,41 @@ or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and
 automatic index building; ordinary steps may change the supplied store.
 `--store` refuses files with schema and seed, DST and server targets, seams,
-and concurrent blocks. Server targets, direct-engine memory storage and
-cloud fixture initialization fail admission explicitly.
+and concurrent blocks. Direct-engine memory storage and cloud fixture
+initialization fail admission explicitly.
+
+With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
+token-protected deployment), the declared `omnigraph-server` environments run
+against that server and nothing else is selected: each step travels to the
+route that already serves it (`--- query` and `branch list`/`show` to
+`POST /query`, `--- mutate` and the branch statements to `POST /mutate`,
+`--- load` and the seed to `POST /load`) and is judged from the answer the way
+the in-process path judges the engine. The server's graph must already carry
+the case's schema (`GET /schema` is compared; a cluster-backed graph refuses a
+remote schema apply), and the seed loads through `/load`, so the graph should
+be fresh. Without `--server`, an `omnigraph-server` environment is planned
+but not selected (the report says `partial`); the corpus therefore runs
+in-process as before, and the served conformance test in
+`crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs` runs every case
+that declares the target against an in-process server and requires a green
+in-process verdict and the same served verdict; `gqt_served_count.rs` totals
+the served and skipped cases and refuses an empty served set. A declared
+`omnigraph-server-dst` environment is refused at admission on every run: no
+runner implements it. The declared `storage` is recorded, not checked: no
+route reports the server's backend. Refused before any request, by name: `--- restart`,
+`--- concurrent`, seam directives, settings steps and settings prefixes on a
+control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`nearest`, `rrf`). The `--- expect shape` section is not judged under a
+server target: it holds the executor's Arrow schema against the compiler's,
+which no wire answer carries. `--server` is exclusive with `--store`, and a
+served run never blesses. `--server` selects exactly one `omnigraph-server`
+environment (`--storage` picks when several are declared), since every pass
+would share the one graph. Parameters travel as the case spells them, or as
+its recipe generates them, and the server judges them, so a parameter error is
+the server's text. A served report
+carries no bearer token and does not replay: the server's state is not frozen
+in it, as an external `--store`'s is not.
 
 External workers inherit only the selected backend's storage configuration:
 `AWS_*` for S3; `AZURE_*`, Azurite and managed-identity endpoint variables,
@@ -78,6 +111,24 @@ order, and that shape is derived, so a `show` step writes no `--- expect shape`
 section; a `process` setting in a case body refuses the case at parse time. GQ operations
 and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
+
+A write's commit id can be bound for the rest of the case (RFC "Unpublished
+graph commits"): `--- bind commit $name`, an empty section directly after the
+`--- expect` of a mutation declaration, a `branch merge` or a `commit publish`
+expected to succeed, binds the receipt's commit id to `$name`
+(`$[a-z][a-z0-9_]*`); a write that published no commit fails the step. A
+`--- query snapshot: $name` header reads at that commit instead of a branch,
+and a commit statement whose whole quoted operand is the name,
+`commit publish "${name}"` or `commit drop "${name}"`, is dispatched with the
+bound id; this is the one place `${` may appear in a statement body, and the
+engine receives an ordinary literal. A mutation declaration
+`as unattached branch on "${name}"` (RFC "Unattached graph branches") is
+substituted the same way, and a `--- params` body may spell a bound name,
+`{"base": "${name}"}`, beside the loop variable; a `--- mutate` header without
+`branch:` sends no request branch on the served path, so a child write
+inherits its base's recorded target. A name is bound once, before every use,
+outside a loop, and survives `--- restart`; the served path binds from the
+`ChangeOutput.commit` the route answered and sends `snapshot` on the read.
 
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
@@ -145,6 +196,7 @@ cannot supply endpoints. All these generators emit ordinary loader JSONL:
 | `ranges` | `ranges`, `fallback` | First `{end, value}` with `i < end`, otherwise fallback; ends strictly increase |
 | `vector` | `dimensions` | Deterministic components in `[0, 1)`, exactly representable as `f32` |
 | `endpoint` | `prefix`, `width`, `population`, `distribution` | A padded key selected from `0..population` |
+| `blob` | `byte`, `length` | The `base64:` input text of a managed Blob holding `length` copies of `byte` (0–255) |
 
 Endpoint distribution is `{kind: ordinal}`, `{kind: uniform}`, or
 `{kind: zipf, exponent: 1.25}`. Ordinal selects `i % population`. Uniform
@@ -180,6 +232,30 @@ the cumulative sums, and selects the first bound strictly above word bits
 11–63 divided by `2^53`, clamping the final rank. Endpoint lane is zero;
 all non-rejection attempts are zero. Values depend on the seed, table, column
 and ordinal, so changing chunk boundaries leaves row values unchanged.
+
+A query or mutate step's parameters may be generated too. In place of a JSON
+`--- params` body, `--- params generate: v1 seed: <u64>` holds a strict YAML
+recipe whose `params:` map names each parameter with one column generator,
+evaluated at ordinal zero:
+
+```yaml
+--- params generate: v1 seed: 0
+params:
+  title: {kind: literal, value: exact}
+  content: {kind: blob, byte: 7, length: 33554432}
+```
+
+The header takes `generate: v1` and a seed, never `mode:` or `branch:`. A
+recipe names 1–256 parameters, and its values have a conservative 64 MiB JSON
+bound, enough for one 32 MiB Blob (about 44.7 MB of `base64:` text); its Zipf
+endpoints share the eight million CDF entry bound a table recipe has. All three
+are checked when the case parses. The case keeps the recipe, and its step
+generates the values when it runs, so a report carries the recipe, never the
+generated bytes. A recipe takes no `${` substitution, inside a loop or not. Its
+random stream uses table name `params` and column names `param.<name>`. On an
+`omnigraph-server` target the runner sends the generated values in the request
+body, so the server's request limits apply: a 32 MiB Blob exceeds the 1 MiB
+mutation body.
 
 `LoadStep::call_count()` exposes the exact number of engine loader calls.
 For one call, generation and JSON encoding complete before the execution
@@ -230,7 +306,7 @@ subject that begins with
 `*`: the case reader refuses an unquoted leading `*` as a YAML alias; a
 quoted subject is read as one scalar, so globset's `{a,b}` and `[!x]` forms
 are fine inside the quotes. A store
-place is admitted before a mutate, load or branch step (a branch create writes
+place is admitted before a mutate, load, branch or commit step (a branch create writes
 nothing through the adapter, so a store place before it is `seam_unobserved`). `action` is `fail`,
 `contention`, `skip`, or a store action, the first being `misdirect`, with
 `lose`, `error`, `corrupt` and `delay` spellable and refused at admission
@@ -366,8 +442,11 @@ hash join $e
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
+hydrate $d: columns [body]
 pass projection_pushdown
 not pass aggregate_pushdown
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+block aggregate sum($c.amount): sum(I64?) exact_integer round_to_nearest -> F64?
 ```
 
 A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
@@ -381,9 +460,50 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
 the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
 none. Dropping a type key or swapping key order fails these assertions.
-`pass <name>` states that a named optimizer pass fired, `not pass <name>` that
-it did not. Projection/read lists are sets; identity keys and selection members
+`hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
+exactly those columns of `$d` by row address above the root limit (pass
+`late_materialization`); the `scan` lines keep reading the logical plan, whose
+projection still lists them. `pass <name>` states that a named optimizer pass
+fired, `not pass <name>` that it did not. Projection/read lists are sets; identity keys and selection members
 are ordered lists. A mismatch prints the whole explain document.
+`aggregate <column>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the named output's aggregate function, input type, accumulator,
+overflow rule and result type. Accumulators are `count`, `exact_integer`,
+`float64` and `extremum`; overflow rules are `round_to_nearest` and `error`.
+Types use shape syntax, node type names or `exact_integer`. A type's `?`
+declares nullability here; a shape line's `?` describes observed null cells.
+An unfiltered count-only query can use `MetadataCount`, which has no aggregate
+specification and does not satisfy an `aggregate` line.
+`block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`
+checks the same facts on an AntiJoin's aggregate leaf, named by its GQ text,
+even beneath a comparison cast. Bare row count has no aggregate spec.
+
+`result columns [total: F64?, person: Person]` checks the complete declared
+result in return order, including names, types and nullability. It follows
+Sort and Limit to the result node; a MetadataCount also declares columns.
+
+`type $p.age: I64?` requires at least one non-cast expression with that GQ
+text, and every matching expression must carry the stated type. Types are
+stored compiler declarations, including nullability. `cast $p.age: I64? ->
+F64?` requires an explicit conversion over that expression with exactly those
+source and target types; `no cast $p.age` refuses any conversion over it.
+The checks search every typed tree in the physical plan, including pushed
+filters, sort keys, ranked scans, join predicates, aggregate arguments and
+both block comparison operands.
+Cast text is transparent, so a `type` line selects the underlying expression.
+The internal `exact_integer` and `[exact_integer]` comparison types, optionally
+nullable, are accepted here but cannot be returned as public result columns.
+
+Every successful rows step compares the plan root's declared schema with the
+compiler's independent inference and with the executed result. The inference
+check compares declared nullability; the execution check rejects observed
+nulls in non-null columns and compares node objects by their complete Struct
+type. The runner also serializes and deserializes the executed bound plan,
+validates its typed expression trees and aggregate signatures/specs, compares
+its explain documents, and directly compares stored schemas, return types,
+named node-object declarations and complete block predicates/specs. These checks require no plan section
+and execute no additional query.
+
 Pass names must be registered optimizer passes. Excluded columns must
 exist in the selected type's catalog schema. Unknown names fail even in
 negative assertions. Assert destination projection on the dependent scan;
@@ -394,6 +514,11 @@ resolved member list and per-member directions. Selection kinds are `named`,
 canonical catalog names, with JSON quotes available for a member name. An
 endpoint-only `expand $a $b: mode indexed_scan` applies to every Expand between
 those bindings, including selections.
+The optional `# traversal: auto` header prepares indexes while leaving mode
+selection to the cost model. Without a traversal header or another index
+requirement, a fixture does not build indexes. `indexed` and `csr` prepare
+indexes and force their respective paths.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -402,7 +527,7 @@ plan or its mode differs. A `scan <Type>[ as $var]: access id_lookup` line
 selects the physical scans of that type (or the one bound to that binding)
 and claims each is a traversal's destination read once per slice of at most
 256 input rows; it fails when no such scan is in the physical plan, the scan
-is a table scan (no access path) or the build side of a hash join. A `hash
+has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
@@ -417,6 +542,12 @@ of the scan, the candidates it asks the index for and, on a `nearest` scan,
 the probe cap the plan carries (`0` spells no cap, as the `ann_nprobes`
 setting does). Nothing is compared as rendered text, so a planner that
 reaches the same facts by another route keeps the case green.
+
+A `scan <Type>[ as $var]: access sequential` line requires the recorded
+sequential choice. `access index_probe <physical-column>` requires a probe
+with that physical column in a leaf of `index_query`; it does not compare
+rendered search text, residuals or index names. `pass scan_access` records
+completed finalization; `pass key_to_id` records a safe key narrowing.
 
 ## Reference comparison
 
@@ -458,12 +589,71 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
 cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-EXAMPLE.json
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
+cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
 cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 ```
 
 `--store` may precede or follow the case paths. External-store reports retain
 the URI and step evidence, but cannot replay: the report does not freeze the
 store contents. `--- restart` reopens that same root.
+
+`--trace` saves diagnostic JSONL for each selected DST attempt, including
+both runs of every seed. It requires at least one selected DST environment;
+direct-engine attempts in a mixed case still run without recording. The flag
+may precede or follow paths and combines with `--measure` and selectors.
+The case format and assertions stay unchanged. Recording is off by default.
+
+Each attempt gets a unique file under `target/gqt-artifacts/trace/`, or
+`<dir>/trace/` with `--artifacts <dir>`. The runner prints each path before
+launching its worker and includes it in the invocation report. Files contain
+GQT operations, observations and assertion evidence, every decision seam
+crossing, plus available `omnigraph` tracing spans and events from all
+worker threads. This is a diagnostic stream, not a complete graph history or
+a lineage oracle.
+
+Every line is one flat JSON object: `idx`, `kind`, the columns of that kind,
+and from the first `operation` on the step the runner began last as `step`,
+`step_line`, `loop_binding` and `generation` (the `truncated` terminator
+excepted: it carries no step columns, so it always fits the bytes reserved
+for it). The schema is
+[`trace_schema.json`](trace_schema.json), one branch per kind; a library
+test serialises one row of every kind against it.
+
+| `kind` | columns | meaning |
+|---|---|---|
+| `start` | `format`, `version`, `invocation_id`, `case_path`, the three digests, `environment`, `seed`, `replay` | the header the supervisor writes before the worker starts; never carries step columns |
+| `operation` | the step columns | the runner began a case operation |
+| `observation` | `text` | one host observation, the lines the report keeps |
+| `evidence` | `record`, `value`, `session` | one assertion evidence record (`record` is `expectation`, `assertion`, `seam_delivered`, ...) with its value |
+| `seam_crossing` | `seam`, `decision` (`pass`, `fire`, `store`), `effect`, `session` | the engine crossed a decision seam and the installed decider answered |
+| `store_request` | `verb`, `class`, `dataset`, `path`, `range`, `bytes`, `session` | one object-store request as the `--measure` ledger notes it, both realms; only with `--measure`; `session` is the ledger's label (`setup`, `step`, `runner` or a block session), never null |
+| `span`, `span_record`, `span_close` | `id`, `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing span opened, recorded fields, closed |
+| `event` | `parent`, `target`, `name`, `level`, `file`, `line`, `thread`, `session`, `fields` | an `omnigraph` tracing event; `parent` is the enclosing span's `id`, as on `span` rows |
+| `finish` | `code`, `phase` | the worker completed with this result |
+| `truncated` | `reason`, `max_bytes`, `max_records` | recording stopped at the limit; never carries step columns |
+
+Seam crossings come from the runner, not the engine: a pass-through observer
+sits on every catalog seam the step did not arm, and the armed deciders are
+wrapped, so each crossing lands with the decision the decider returned. The
+crossing's position inside the action is not recorded; the seam name and the
+step are. Store requests are the measure ledger's: with `--trace --measure`
+every request of both realms lands as a `store_request` row at the moment
+the ledger notes it (a listing page refused later keeps its `list` verb in
+the trace and is `list_failed` in the ledger), with the ledger's label
+(`setup`, `step`, `runner` or a block session) as its `session`. `--trace`
+alone wraps no store, so a store place that is not armed leaves no row. A
+concurrent block is one step whose sessions interleave on one thread;
+`session` names the session a row belongs to: `null` outside a block on
+evidence, crossing, span and event rows, the ledger's label on store rows.
+
+Recording stops at 16 MiB or 100000 records with a `truncated` record. Trace
+fields may also be shortened to bound capture memory. A killed worker
+retains its written prefix; a missing `finish` means the recording is
+incomplete.
+Recording errors fail the invocation and preserve the original case error.
+Trace paths and bytes do not participate in deterministic replay comparison;
+`--replay <report.json>` replays the case without creating another trace.
+Recording adds host I/O and may consume more of the case's wall-time budget.
 
 `--measure` records, for every step of each DST environment, the object-store
 requests made while the step ran (the engine's, and under a `--- store` rule

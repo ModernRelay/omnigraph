@@ -12,7 +12,11 @@ fn nearest_in_a_later_ordering_position_reads_the_vector_column() {
             IRExpr::Nearest {
                 variable: "c".to_string(),
                 property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param("q".to_string())),
+                query: Box::new(IRExpr::Param(
+                    "q".to_string(),
+                    value_type(ScalarType::String, false),
+                )),
+                ty: value_type(ScalarType::F32, false),
             },
         ],
     );
@@ -29,13 +33,22 @@ fn nearest_in_a_later_ordering_position_reads_the_vector_column() {
 fn entity_reference_keeps_a_later_nearest_vector_column_demanded_by_name() {
     let op = ir(
         vec![scan("c")],
-        vec![IRExpr::Variable("c".to_string())],
+        vec![IRExpr::Variable(
+            "c".to_string(),
+            omnigraph_compiler::ExprType::Node {
+                type_name: "T".into(),
+            },
+        )],
         vec![
             prop("c", "rank"),
             IRExpr::Nearest {
                 variable: "c".to_string(),
                 property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param("q".to_string())),
+                query: Box::new(IRExpr::Param(
+                    "q".to_string(),
+                    value_type(ScalarType::String, false),
+                )),
+                ty: value_type(ScalarType::F32, false),
             },
         ],
     );
@@ -52,7 +65,18 @@ fn metadata_count_rewrite_converges() {
         vec![scan("c")],
         vec![IRExpr::Aggregate {
             func: AggFunc::Count,
-            arg: Box::new(IRExpr::Variable("c".to_string())),
+            arg: Box::new(IRExpr::Variable(
+                "c".to_string(),
+                omnigraph_compiler::ExprType::Node {
+                    type_name: "T".into(),
+                },
+            )),
+            signature: AggSignature {
+                arg: ExprType::Node {
+                    type_name: "T".into(),
+                },
+                result: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+            },
         }],
         vec![],
     );
@@ -83,12 +107,18 @@ fn search_expression_arms_attribute_field_and_nested_columns() {
                 field: Box::new(prop("c", "title")),
                 query: Box::new(prop("c", "probe")),
                 max_edits: Some(Box::new(prop("c", "edits"))),
+                ty: value_type(ScalarType::Bool, false),
             }),
             secondary: Box::new(IRExpr::Bm25 {
                 field: Box::new(prop("c", "body")),
-                query: Box::new(IRExpr::Literal(Literal::String("q".into()))),
+                query: Box::new(IRExpr::Literal(
+                    Literal::String("q".into()),
+                    value_type(ScalarType::String, false),
+                )),
+                ty: value_type(ScalarType::F32, false),
             }),
             k: Some(Box::new(prop("c", "k_ref"))),
+            ty: value_type(ScalarType::F64, false),
         }],
     );
     let (plan, _) = planned(&op);
@@ -107,13 +137,22 @@ fn rank_fuse_targets_read_the_node_object_in_both_arms() {
             primary: Box::new(IRExpr::Nearest {
                 variable: "a".to_string(),
                 property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param("q".to_string())),
+                query: Box::new(IRExpr::Param(
+                    "q".to_string(),
+                    value_type(ScalarType::String, false),
+                )),
+                ty: value_type(ScalarType::F32, false),
             }),
             secondary: Box::new(IRExpr::Bm25 {
                 field: Box::new(prop("b", "text")),
-                query: Box::new(IRExpr::Literal(Literal::String("q".into()))),
+                query: Box::new(IRExpr::Literal(
+                    Literal::String("q".into()),
+                    value_type(ScalarType::String, false),
+                )),
+                ty: value_type(ScalarType::F32, false),
             }),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         }],
     );
     let (plan, _) = planned(&op);
@@ -123,12 +162,16 @@ fn rank_fuse_targets_read_the_node_object_in_both_arms() {
 
 #[test]
 fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlations() {
-    let query = Box::new(IRExpr::Param("q".to_string()));
+    let query = Box::new(IRExpr::Param(
+        "q".to_string(),
+        value_type(ScalarType::String, false),
+    ));
     let expressions = [
         (
             IRExpr::Search {
                 field: Box::new(prop("b", "text")),
                 query: query.clone(),
+                ty: value_type(ScalarType::Bool, false),
             },
             true,
         ),
@@ -136,6 +179,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
             IRExpr::MatchText {
                 field: Box::new(prop("b", "text")),
                 query: query.clone(),
+                ty: value_type(ScalarType::Bool, false),
             },
             true,
         ),
@@ -144,6 +188,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
                 field: Box::new(prop("b", "text")),
                 query,
                 max_edits: None,
+                ty: value_type(ScalarType::Bool, false),
             },
             false,
         ),
@@ -151,6 +196,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
             IRExpr::Search {
                 field: Box::new(prop("b", "text")),
                 query: Box::new(prop("a", "probe")),
+                ty: value_type(ScalarType::Bool, false),
             },
             false,
         ),
@@ -160,7 +206,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
             let filter = IRExpr::comparison(
                 expression.clone(),
                 CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true)),
+                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
             );
             let mut pipeline = vec![
                 scan("a"),
@@ -213,7 +259,10 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
             IROp::Filter(IRExpr::comparison(
                 prop("x", "state"),
                 CompOp::Eq,
-                IRExpr::Literal(Literal::String(value.to_string())),
+                IRExpr::Literal(
+                    Literal::String(value.to_string()),
+                    value_type(ScalarType::String, false),
+                ),
             )),
         ],
     };
@@ -231,7 +280,7 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
         {
             let filters = spec.filter.as_ref().expect("scoped predicate").gq_filters();
             assert_eq!(filters.len(), 1);
-            let Some((_, _, IRExpr::Literal(Literal::String(value)))) =
+            let Some((_, _, IRExpr::Literal(Literal::String(value), _))) =
                 filters[0].comparison_parts()
             else {
                 panic!("literal state")
@@ -261,9 +310,10 @@ fn a_search_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
                 IRExpr::Search {
                     field: Box::new(prop("b", "text")),
                     query: Box::new(prop("a", "probe")),
+                    ty: value_type(ScalarType::Bool, false),
                 },
                 CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true)),
+                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
             )),
         ],
         vec![prop("b", "slug")],
@@ -313,7 +363,10 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
             let filter = IRExpr::comparison(
                 prop(binding, "state"),
                 CompOp::Eq,
-                IRExpr::Literal(Literal::String("open".into())),
+                IRExpr::Literal(
+                    Literal::String("open".into()),
+                    value_type(ScalarType::String, false),
+                ),
             );
             let mut pipeline = if dependent {
                 vec![

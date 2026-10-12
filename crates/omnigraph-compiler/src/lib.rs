@@ -37,8 +37,10 @@ pub use ir::ParamMap;
 /// The GQ grammar's version, major when it accepts less or a produced shape
 /// changes, minor when it only accepts more (`docs/rfcs/2026-09-14-compatibility-surfaces.md`);
 /// `(2, 0)` introduced the shared expression model;
-/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`).
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 1);
+/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
+/// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
+/// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`).
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 2);
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::ast::Literal;
@@ -60,4 +62,7 @@ pub use query_input::{
     find_read_statement, json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
-pub use types::{Direction, PropType, ScalarType, check_date_literal, check_datetime_literal};
+pub use types::{
+    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
+    check_datetime_literal,
+};

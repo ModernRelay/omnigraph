@@ -171,6 +171,18 @@ pub struct CollectorRowSummary {
     pub foreign_versions: Vec<u64>,
 }
 
+/// One unattached snapshot's candidate tag with its place in its chain (RFC
+/// "Unattached graph branches"): the parent link orders a chain's release
+/// descendants first, and a retained record's link names the ancestors it
+/// keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattachedTagRecord {
+    pub name: String,
+    pub graph_commit_id: String,
+    pub parent_commit_id: String,
+    pub root_commit_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CollectorReport {
     pub branches: Vec<RetainedManifestVersions>,
@@ -179,6 +191,16 @@ pub struct CollectorReport {
     /// Nonce-owned tags whose target can no longer publish, released only by
     /// destructive cleanup after planning. Inspection never mutates storage.
     pub(crate) expired_merge_input_tags: Vec<String>,
+    /// Proposal tags whose unpublished commit can no longer be published
+    /// (RFC "Unpublished graph commits"), released beside the merge-input
+    /// tags by destructive cleanup.
+    pub(crate) expired_unpublished_tags: Vec<String>,
+    /// Candidate tags of expired unattached snapshots, released by
+    /// destructive cleanup in the order [`unattached_release_order`] gives.
+    pub expired_unattached_tags: Vec<UnattachedTagRecord>,
+    /// Candidate tags of live or undecidable snapshots and the ancestors
+    /// they retain: their complete result pins are roots.
+    pub retained_unattached_tags: Vec<UnattachedTagRecord>,
     /// Owners visible in the same graph cut as every physical root.
     pub(crate) live_branch_incarnations: HashSet<String>,
     /// Retired graph trees still supplying an exact root or imported lineage.
@@ -717,6 +739,71 @@ fn record_roots(
     }
 }
 
+/// The ids of the recorded chain ancestors of `id`, nearest first: the walk
+/// follows `parents` and stops at a published parent (one no record names)
+/// or after as many hops as there are records, so a cycle cannot loop.
+fn chain_ancestors<'a>(id: &'a str, parents: &HashMap<&'a str, &'a str>) -> Vec<&'a str> {
+    let mut ancestors = Vec::new();
+    let mut cursor = id;
+    while ancestors.len() < parents.len()
+        && let Some(parent) = parents.get(cursor)
+    {
+        ancestors.push(cursor);
+        cursor = *parent;
+    }
+    ancestors
+}
+
+/// The expired unattached tags a deleting run releases, in release order:
+/// grouped by root, descendants before ancestors (depth descending, then
+/// name). An expired record with a retained descendant, live or
+/// undecidable, is left out with every ancestor of it: a retained
+/// snapshot's bases stay addressable until it is gone.
+pub fn unattached_release_order<'a>(
+    expired: &'a [UnattachedTagRecord],
+    retained: &[UnattachedTagRecord],
+) -> Vec<&'a UnattachedTagRecord> {
+    let parents: HashMap<&str, &str> = expired
+        .iter()
+        .chain(retained)
+        .map(|record| {
+            (
+                record.graph_commit_id.as_str(),
+                record.parent_commit_id.as_str(),
+            )
+        })
+        .collect();
+    let mut blocked = HashSet::new();
+    let mut incomplete_roots = HashSet::new();
+    for record in retained {
+        let ancestors = chain_ancestors(&record.parent_commit_id, &parents);
+        if record.graph_commit_id != record.root_commit_id
+            && !ancestors.contains(&record.root_commit_id.as_str())
+        {
+            incomplete_roots.insert(record.root_commit_id.as_str());
+        }
+        blocked.extend(ancestors);
+    }
+    let mut order: Vec<(&'a UnattachedTagRecord, usize)> = expired
+        .iter()
+        .filter(|record| {
+            !blocked.contains(record.graph_commit_id.as_str())
+                && !incomplete_roots.contains(record.root_commit_id.as_str())
+        })
+        .map(|record| {
+            let depth = chain_ancestors(&record.parent_commit_id, &parents).len();
+            (record, depth)
+        })
+        .collect();
+    order.sort_by(|(a, depth_a), (b, depth_b)| {
+        a.root_commit_id
+            .cmp(&b.root_commit_id)
+            .then(depth_b.cmp(depth_a))
+            .then(a.name.cmp(&b.name))
+    });
+    order.into_iter().map(|(record, _)| record).collect()
+}
+
 /// The merge bases of every pair of captured heads, over the lineages of those
 /// heads. Retired histories supply records no lineage carries.
 async fn retained_merge_bases(
@@ -858,6 +945,8 @@ pub(crate) async fn plan_collection(
     let mut table_tags = HashMap::new();
     let main = open_inventory_branch(db, None).await?;
     let tags = ManifestTagInventory::capture(main.dataset()).await?;
+    let mut unattached_reader =
+        crate::db::manifest::UnattachedInventoryReader::new(&tags, db.root_uri());
     let registry = main.clone();
     let mut main = Some(main);
     for branch in branches {
@@ -929,6 +1018,51 @@ pub(crate) async fn plan_collection(
     }
     let live_count = captured_lineages.len();
     for (name, tag) in &tags.tags {
+        if crate::db::manifest::is_unpublished_tag(name) {
+            let candidate =
+                crate::db::manifest::UnpublishedCommit::from_inventory(&tags, db.root_uri(), name)
+                    .await?;
+            report.cost.manifest_snapshots += 1;
+            match candidate.lifetime {
+                crate::db::manifest::UnpublishedLifetime::Expired(_) => {
+                    report.expired_unpublished_tags.push(name.clone());
+                }
+                crate::db::manifest::UnpublishedLifetime::Live
+                | crate::db::manifest::UnpublishedLifetime::Undecidable(_) => {
+                    report
+                        .protected_manifest_branches
+                        .extend(tag.branch.iter().cloned());
+                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    record_roots(db, &snapshot, &mut roots, &mut tables);
+                }
+            }
+            continue;
+        }
+        if crate::db::manifest::is_unattached_tag(name) {
+            let candidate = unattached_reader.read(name).await?;
+            report.cost.manifest_snapshots += 1;
+            let record = UnattachedTagRecord {
+                name: name.clone(),
+                graph_commit_id: candidate.property.graph_commit_id.clone(),
+                parent_commit_id: candidate.property.parent_commit_id.clone(),
+                root_commit_id: candidate.property.root_commit_id.clone(),
+            };
+            match candidate.lifetime {
+                crate::db::manifest::UnattachedLifetime::Expired(_) => {
+                    report.expired_unattached_tags.push(record);
+                }
+                crate::db::manifest::UnattachedLifetime::Live
+                | crate::db::manifest::UnattachedLifetime::Undecidable(_) => {
+                    report
+                        .protected_manifest_branches
+                        .extend(tag.branch.iter().cloned());
+                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    record_roots(db, &snapshot, &mut roots, &mut tables);
+                    report.retained_unattached_tags.push(record);
+                }
+            }
+            continue;
+        }
         let dead = if let Some(owner) = merge_input_owner(name)? {
             if let Some(view) = views
                 .iter_mut()
@@ -969,6 +1103,32 @@ pub(crate) async fn plan_collection(
             .any(|(_, _, previous)| previous == &head)
         {
             captured_lineages.push((branch, graph, head));
+        }
+    }
+    let releasable: HashSet<String> = unattached_release_order(
+        &report.expired_unattached_tags,
+        &report.retained_unattached_tags,
+    )
+    .into_iter()
+    .map(|record| record.name.clone())
+    .collect();
+    let expired = std::mem::take(&mut report.expired_unattached_tags);
+    for record in expired {
+        if releasable.contains(&record.name) {
+            report.expired_unattached_tags.push(record);
+        } else {
+            let candidate = unattached_reader.read(&record.name).await?;
+            report.cost.manifest_snapshots += 1;
+            report
+                .protected_manifest_branches
+                .extend(candidate.property.native_branch.iter().cloned());
+            record_roots(
+                db,
+                &candidate.snapshot(db.root_uri())?,
+                &mut roots,
+                &mut tables,
+            );
+            report.retained_unattached_tags.push(record);
         }
     }
     let (bases, imported_owners) = retained_merge_bases(db, &captured_lineages, live_count).await?;
@@ -2850,5 +3010,67 @@ mod native_table_tag_tests {
             .await
             .unwrap();
         assert!(inventory.validate().await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod unattached_release_order_tests {
+    use super::*;
+
+    fn record(name: &str, id: &str, parent: &str, root: &str) -> UnattachedTagRecord {
+        UnattachedTagRecord {
+            name: name.to_string(),
+            graph_commit_id: id.to_string(),
+            parent_commit_id: parent.to_string(),
+            root_commit_id: root.to_string(),
+        }
+    }
+
+    fn names(order: Vec<&UnattachedTagRecord>) -> Vec<&str> {
+        order
+            .into_iter()
+            .map(|record| record.name.as_str())
+            .collect()
+    }
+
+    /// Descendants before ancestors within a root, roots apart; a retained
+    /// descendant keeps every ancestor of it while its expired siblings go;
+    /// a cyclic ancestry neither loops nor releases what a retained one reaches.
+    #[test]
+    fn release_order_is_descendants_first_and_a_retained_descendant_keeps_its_ancestors() {
+        let expired = vec![
+            record("b_root", "b", "published", "b"),
+            record("a_root", "a", "published", "a"),
+            record("a_child", "a1", "a", "a"),
+            record("a_grandchild", "a11", "a1", "a"),
+            record("a_sibling", "a2", "a", "a"),
+            record("b_child", "b1", "b", "b"),
+        ];
+        assert_eq!(
+            names(unattached_release_order(&expired, &[])),
+            [
+                "a_grandchild",
+                "a_child",
+                "a_sibling",
+                "a_root",
+                "b_child",
+                "b_root"
+            ]
+        );
+        let retained = vec![record("a_kept", "a111", "a11", "a")];
+        assert_eq!(
+            names(unattached_release_order(&expired, &retained)),
+            ["a_sibling", "b_child", "b_root"],
+            "the retained leaf keeps a11, a1 and a; the sibling path and root b go"
+        );
+        let missing = vec![record("a_kept", "orphan", "missing", "a")];
+        assert_eq!(
+            names(unattached_release_order(&expired, &missing)),
+            ["b_child", "b_root"],
+            "missing ancestry retains every possible ancestor under the recorded root"
+        );
+        let cyclic = vec![record("c_x", "x", "y", "c"), record("c_y", "y", "x", "c")];
+        assert_eq!(unattached_release_order(&cyclic, &[]).len(), 2);
+        assert!(unattached_release_order(&cyclic, &[record("c_kept", "z", "x", "c")]).is_empty());
     }
 }

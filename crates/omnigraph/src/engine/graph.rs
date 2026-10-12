@@ -73,13 +73,31 @@ impl<'a> EmbeddingResolver<'a> {
     }
 }
 
+/// The fusion's output schema: the arm's columns, then the fused score.
+pub(super) fn fused_schema(
+    arm: &arrow_schema::SchemaRef,
+    fused_score: &str,
+) -> arrow_schema::SchemaRef {
+    let mut fields: Vec<arrow_schema::FieldRef> = arm.fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        fused_score,
+        arrow_schema::DataType::Float64,
+        false,
+    )));
+    Arc::new(arrow_schema::Schema::new(fields))
+}
+
 /// Fuse arms sorted by search score and identity; BM25 arms must be uncapped.
-/// Rank each entity once and retain each winning entity's downstream rows.
+/// Rank each entity once, sum `1 / (k + rank)` over the arms that hold it,
+/// and emit every one of its rows with that sum in `fused_score`; the
+/// `Sort` above orders by the sum and the query's `limit` cuts rows there
+/// (RFC 0047 §Total order).
 pub(super) fn fuse_arms(
     primary_batch: &RecordBatch,
     secondary_batch: &RecordBatch,
     rrf: &RrfMode,
     id_col_name: &str,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -131,7 +149,7 @@ pub(super) fn fuse_arms(
     }
 
     let k = rrf.k as f64;
-    let mut scored: Vec<(String, f64)> = all_ids
+    let scored: Vec<(String, f64)> = all_ids
         .iter()
         .map(|id| {
             let p = primary_rank
@@ -145,10 +163,6 @@ pub(super) fn fuse_arms(
             (id.clone(), p + s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(rrf.limit);
-
-    let winning_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
 
     let mut primary_rows: HashMap<String, Vec<u32>> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
@@ -160,11 +174,12 @@ pub(super) fn fuse_arms(
     }
 
     build_fused_batch(
-        &winning_ids,
+        &scored,
         primary_batch,
         &primary_rows,
         secondary_batch,
         &secondary_rows,
+        fused_score,
         memory,
     )
 }
@@ -183,14 +198,15 @@ pub(super) fn extract_id_column_by_name(
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
-/// Gather all rows for `ordered_ids` in entity order, preferring the primary
-/// arm for shared entities and preserving each entity's row order.
-pub(super) fn build_fused_batch(
-    ordered_ids: &[String],
+/// Gather primary rows, then secondary-only rows, in scored entity order
+/// within each arm, preserving each entity's row order and fused score.
+fn build_fused_batch(
+    scored: &[(String, f64)],
     primary_batch: &RecordBatch,
     primary_rows: &HashMap<String, Vec<u32>>,
     secondary_batch: &RecordBatch,
     secondary_rows: &HashMap<String, Vec<u32>>,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -198,40 +214,70 @@ pub(super) fn build_fused_batch(
         .map_err(|error| memory.error(error))?;
     let memory = &work;
     memory.check().map_err(|error| memory.error(error))?;
-    if ordered_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+    let empty = || RecordBatch::new_empty(fused_schema(&primary_batch.schema(), fused_score));
+    if scored.is_empty() {
+        return Ok(empty());
     }
 
-    memory
-        .entries::<RecordBatch>(
-            primary_batch
-                .num_rows()
-                .saturating_add(secondary_batch.num_rows()),
-        )
-        .map_err(|error| memory.error(error))?;
-    let mut row_slices: Vec<RecordBatch> = Vec::with_capacity(ordered_ids.len());
-    for id in ordered_ids {
+    let selected_rows = |id| match (primary_rows.get(id), secondary_rows.get(id)) {
+        (Some(rows), _) => Some((0, rows)),
+        (None, Some(rows)) => Some((1, rows)),
+        (None, None) => None,
+    };
+    let mut counts = [0usize; 2];
+    for (id, _) in scored {
         memory.check().map_err(|error| memory.error(error))?;
-        if let Some(rows) = primary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(primary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
-        } else if let Some(rows) = secondary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(secondary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
+        if let Some((arm, rows)) = selected_rows(id) {
+            counts[arm] = counts[arm].saturating_add(rows.len());
         }
+    }
+    let rows = counts[0].saturating_add(counts[1]);
+    memory
+        .entries::<RecordBatch>(2)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<u32>(rows)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<f64>(rows)
+        .map_err(|error| memory.error(error))?;
+    let mut arms = counts.map(|count| {
+        (
+            Vec::<u32>::with_capacity(count),
+            Vec::<f64>::with_capacity(count),
+        )
+    });
+    for (id, score) in scored {
+        memory.check().map_err(|error| memory.error(error))?;
+        let Some((arm, rows)) = selected_rows(id) else {
+            continue;
+        };
+        let (indices, scores) = &mut arms[arm];
+        indices.extend_from_slice(rows);
+        scores.extend(std::iter::repeat_n(*score, rows.len()));
+    }
+
+    let schema = fused_schema(&primary_batch.schema(), fused_score);
+    let mut row_slices = Vec::with_capacity(2);
+    for (batch, (indices, scores)) in [primary_batch, secondary_batch].into_iter().zip(arms) {
+        if indices.is_empty() {
+            continue;
+        }
+        let gathered = memory
+            .take(batch, &UInt32Array::from(indices))
+            .map_err(|error| memory.error(error))?;
+        let mut columns = gathered.columns().to_vec();
+        columns.push(Arc::new(arrow_array::Float64Array::from(scores)));
+        row_slices.push(
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(OmniError::arrow_internal)?,
+        );
     }
 
     if row_slices.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+        return Ok(empty());
     }
 
-    let schema = row_slices[0].schema();
     memory
         .concat(&schema, &row_slices)
         .map_err(|error| memory.error(error))
@@ -439,11 +485,19 @@ pub(super) async fn prepare_selected_edges(
         .map_err(|error| memory.error(error))?;
     let mut prepared = Vec::with_capacity(step.members().len());
     for member in step.members() {
+        let table = format!("edge:{}", member.edge_type);
+        let dataset = env.snapshot.open_lance_dataset(&table).await?;
+        super::typed_value::check_stored_schema(
+            &dataset,
+            &env.catalog.edge_types[&member.edge_type].arrow_schema,
+            &table,
+            [
+                env.catalog.system_columns.src,
+                env.catalog.system_columns.dst,
+            ],
+        )?;
         prepared.push(PreparedEdge {
-            dataset: env
-                .snapshot
-                .open_lance_dataset(&format!("edge:{}", member.edge_type))
-                .await?,
+            dataset,
             probes: endpoint_probes(member.direction, env.catalog.system_columns),
         });
     }
@@ -548,11 +602,23 @@ pub(crate) enum ModeOrigin {
     Uncosted,
 }
 
-/// The start the plan recorded on `step`, with the two runtime corrections:
-/// a probed index coverage (or a CSR warmed by an earlier operator) re-runs
-/// the cost model before an indexed start, and the indexed start carries the
-/// per-hop policy that switches mid-flight (issue #533). `frontier_rows` is
-/// the breaker's retained frontier; the streaming single hop has none yet.
+impl ModeOrigin {
+    async fn runtime_coverage(
+        &self,
+        probe: impl Future<Output = Result<crate::table_store::IndexCoverage>>,
+    ) -> Option<Result<crate::table_store::IndexCoverage>> {
+        if matches!(self, Self::Costed(inputs)
+            if inputs.coverage_provenance == omnigraph_planner::CoverageProvenance::PinnedIndexFacts)
+        {
+            None
+        } else {
+            Some(probe.await)
+        }
+    }
+}
+
+/// Correct the recorded mode for the observed frontier and warm CSR, probing
+/// coverage only for legacy plans. The indexed start retains its per-hop policy.
 pub(super) async fn decide_expand_start(
     frontier_rows: Option<usize>,
     graph_index: &GraphIndexHandle,
@@ -602,18 +668,32 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-    let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
-    for orientation in endpoint_probes(direction, catalog.system_columns)
-        .iter()
-        .skip(1)
-    {
-        let extra =
-            crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key).await;
-        coverage = match (coverage, extra) {
-            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        };
-    }
+    super::typed_value::check_stored_schema(
+        &edge_ds,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        [catalog.system_columns.src, catalog.system_columns.dst],
+    )?;
+    let coverage = named
+        .origin
+        .runtime_coverage(async {
+            let mut coverage =
+                crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
+            for orientation in endpoint_probes(direction, catalog.system_columns)
+                .iter()
+                .skip(1)
+            {
+                let extra =
+                    crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key)
+                        .await;
+                coverage = match (coverage, extra) {
+                    (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                };
+            }
+            coverage
+        })
+        .await;
 
     let corrected = match &named.origin {
         ModeOrigin::Costed(inputs) => {
@@ -621,7 +701,9 @@ pub(super) async fn decide_expand_start(
             if let Some(observed) = frontier_rows {
                 inputs.frontier_rows = inputs.frontier_rows.min(observed as u64);
             }
-            inputs.coverage = coverage_for_decision(&coverage);
+            if let Some(coverage) = &coverage {
+                inputs.coverage = coverage_for_decision(coverage);
+            }
             inputs.csr_cached = inputs.csr_cached || graph_index.is_built();
             Some(inputs)
         }
@@ -657,7 +739,9 @@ pub(super) async fn decide_expand_start(
     );
     crate::instrumentation::record_expand_path(true);
     memory.metric("expand_indexed", 1);
-    warn_on_degraded_coverage(&coverage, key_col, edge_type);
+    if let Some(coverage) = &coverage {
+        warn_on_degraded_coverage(coverage, key_col, edge_type);
+    }
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
         None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
@@ -794,6 +878,14 @@ where
                 .await?
         }
     };
+    super::typed_value::check_stored_schema(
+        &dataset,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &format!("edge:{edge_type}"),
+        [catalog.system_columns.src, catalog.system_columns.dst]
+            .into_iter()
+            .chain(attach_columns.iter().copied()),
+    )?;
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
@@ -1035,7 +1127,7 @@ pub(super) fn resolve_csr<'g>(
 
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
-/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
+/// Only legacy Named can switch to CSR.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
@@ -1083,7 +1175,7 @@ where
         ExpandExecution::Budgeted(_) => None,
     };
     let budgeted = step.budgeted();
-    let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
+    let max = step.max_hops;
 
     let mut active = match start_indexed {
         Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1467,8 +1559,9 @@ pub(super) fn bulk_anti_join_mask(
 /// state across the swap instead of restarting.
 ///
 /// Id spaces differ per source: Indexed owns a per-traversal interner (both
-/// endpoint types in ONE dense space — see the cross-type single-hop guard in
-/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// endpoint types in ONE dense space, which is sound because
+/// `validate_expand_structure` refuses a cross-type expand a second hop), Csr
+/// borrows the graph index's per-type dictionaries.
 /// A swap therefore translates all live state through the id strings once.
 pub(super) enum ActiveExpandSource<'g> {
     Indexed(Box<IndexedExpandSource>),
@@ -1677,5 +1770,52 @@ mod traversal_scan_admission_tests {
                 .to_string()
                 .contains("physical row count sum overflow")
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use omnigraph_planner::{CoverageProvenance, IndexCoverage};
+
+    /// GQT cannot detect a cached metadata probe; an unpolled future proves its absence.
+    #[tokio::test]
+    async fn pinned_facts_never_poll_the_runtime_probe() {
+        for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+            let mut inputs = ExpandCostInputs {
+                frontier_rows: 1,
+                edge_count: 10,
+                src_node_count: 10,
+                effective_max_hops: 2,
+                max_hops_cap: 10,
+                max_frontier_cap: 100,
+                coverage,
+                coverage_provenance: CoverageProvenance::PinnedIndexFacts,
+                csr_cached: false,
+                probe_factor: 1.0,
+            };
+            assert!(
+                ModeOrigin::Costed(inputs.clone())
+                    .runtime_coverage(async {
+                        panic!("pinned index facts must not trigger a runtime metadata probe")
+                    })
+                    .await
+                    .is_none()
+            );
+            inputs.coverage_provenance = CoverageProvenance::LegacyAssumed;
+            for origin in [
+                ModeOrigin::Costed(inputs),
+                ModeOrigin::Pinned,
+                ModeOrigin::Uncosted,
+            ] {
+                let probe = origin
+                    .runtime_coverage(async { Ok(crate::table_store::IndexCoverage::Indexed) })
+                    .await;
+                assert!(matches!(
+                    probe,
+                    Some(Ok(crate::table_store::IndexCoverage::Indexed))
+                ));
+            }
+        }
     }
 }

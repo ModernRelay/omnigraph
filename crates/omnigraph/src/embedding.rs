@@ -267,10 +267,15 @@ impl EmbeddingClient {
         Self::new(EmbeddingConfig::mock()).expect("mock client builds")
     }
 
+    /// Embed a text `nearest()` query. `input` is the query string, unchanged.
     pub async fn embed_query_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
         self.embed_text(input, expected_dim, EmbedRole::Query).await
     }
 
+    /// Embed stored text. `input` is a record's `@embed` source value,
+    /// unchanged, as `embed_query_text` takes the query: a template on either
+    /// side would leave a record whose source equals the query text away from
+    /// that query's vector.
     pub async fn embed_document_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
         self.embed_text(input, expected_dim, EmbedRole::Document)
             .await

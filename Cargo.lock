@@ -4956,6 +4956,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
+
+[[package]]
 name = "link-section"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5595,12 +5601,13 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",
  "ulid",
+ "url",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5644,6 +5651,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "color-eyre",
  "futures",
@@ -5661,7 +5669,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "time",
@@ -5669,6 +5676,7 @@ dependencies = [
  "url",
  "uuid",
  "workos",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5682,7 +5690,6 @@ dependencies = [
  "omnigraph-storage",
  "serde",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sha2 0.10.9",
  "tempfile",
@@ -5690,6 +5697,7 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5852,6 +5860,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5860,18 +5870,35 @@ version = "0.13.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "base64 0.22.1",
  "futures",
  "libm",
+ "libyaml-rs",
+ "omnigraph-api-types",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-planner",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "unsafe-libyaml",
+ "yaml_serde",
+]
+
+[[package]]
+name = "omnigraph-gqt-served"
+version = "0.13.0"
+dependencies = [
+ "axum",
+ "datatest-stable",
+ "omnigraph-engine",
+ "omnigraph-gqt",
+ "omnigraph-gqt-core",
+ "omnigraph-server",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -5879,6 +5906,7 @@ name = "omnigraph-planner"
 version = "0.13.0"
 dependencies = [
  "arrow-schema",
+ "futures",
  "omnigraph-compiler",
  "serde",
  "serde_json",
@@ -5894,8 +5922,8 @@ dependencies = [
  "color-eyre",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5926,10 +5954,10 @@ dependencies = [
 name = "omnigraph-seams"
 version = "0.13.0"
 dependencies = [
- "serde_yaml",
  "syn",
  "tempfile",
  "toml",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5965,7 +5993,6 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "serde_yaml",
  "serial_test",
  "sha2 0.10.9",
  "subtle",
@@ -5978,6 +6005,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "utoipa",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -8062,19 +8090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap 2.14.0",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "serial_test"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9096,12 +9111,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9941,6 +9950,19 @@ name = "xxhash-rust"
 version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
+]
 
 [[package]]
 name = "yoke"

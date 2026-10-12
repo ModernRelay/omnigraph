@@ -1,4 +1,5 @@
 # issue: none
+# traversal: auto
 # notes: A key equality reduces the source frontier before expansion mode and destination access are chosen.
 
 --- runner

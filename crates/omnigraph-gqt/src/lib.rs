@@ -13,6 +13,7 @@ use omnigraph_gqt_core::{
     Case, ControlStep, ControlWrite, ExecutionHost, Item, QueryStep, Step, StepFail,
     canonical_json, case_session, parse_case, run_session, seed_case,
 };
+pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::future::Future;
@@ -25,6 +26,7 @@ mod concurrent;
 mod discovery;
 mod dst_runner;
 mod measure;
+mod trace;
 pub use discovery::list_cases;
 pub use dst_runner::{
     MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,
@@ -85,18 +87,14 @@ impl ExecutionHost for GqtHost {
         &'a self,
         session: &'a Session,
         step: &'a QueryStep,
+        target: ReadTarget,
         params: &'a ParamMap,
     ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
         async move {
             session
                 .clone()
                 .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(
-                    ReadTarget::branch(&step.branch),
-                    &step.source,
-                    &step.name,
-                    params,
-                )
+                .query(target, &step.source, &step.name, params)
                 .await
                 .map_err(|error| error.to_string())
         }
@@ -154,6 +152,25 @@ fn execute_case<'a>(
         Ok(engine) => execute_case_on_engine(case, path, bless, engine, None),
         Err(error) => futures::future::ready(Err(error)).boxed(),
     }
+}
+
+/// The in-process verdict of a parsed case on a fresh engine, as the
+/// corpus run reaches it, for a conformance test that compares executors.
+pub async fn execute_in_process(case: &Case, path: &Path) -> Result<(), String> {
+    execute_case(case, path, false).await
+}
+
+/// The served verdict of a parsed case against `target`, under the same
+/// host the corpus run uses.
+pub async fn execute_served(case: &Case, target: &ServerTarget) -> Result<(), String> {
+    execute_case_on_server(case, target).await
+}
+
+fn execute_case_on_server<'a>(
+    case: &'a Case,
+    target: &'a ServerTarget,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    omnigraph_gqt_core::execute_steps_served(case, target, &GqtHost)
 }
 
 fn execute_case_on_engine<'a>(

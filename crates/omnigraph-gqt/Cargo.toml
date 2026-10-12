@@ -28,6 +28,8 @@ sha2 = { workspace = true }
 omnigraph-dst = { path = "../omnigraph-dst" }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 sha2 = { workspace = true }

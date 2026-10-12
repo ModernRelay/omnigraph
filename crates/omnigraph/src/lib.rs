@@ -47,7 +47,8 @@ pub(crate) mod table_store;
 pub(crate) mod validate;
 
 pub use blob::{
-    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
+    BLOB_READ_RANGE_MAX_BYTES, BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell,
+    BlobContent, BlobEtag, BlobPrecondition, BlobRead, BlobReader, BlobWriteOutcome,
     EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
     ExternalBlobRef, RangedExternalBlob, StorageRootConflict,
 };
@@ -62,6 +63,10 @@ pub use table_store::IndexCoverage;
 pub struct MutationReceipt {
     pub result: omnigraph_compiler::result::MutationResult,
     pub commit: Option<db::GraphCommit>,
+    /// The branch the write addressed: the request branch, or on a child
+    /// unattached write the recorded target its base inherits (`"main"` for
+    /// main).
+    pub branch: String,
 }
 
 // DST seam: registry access for the harness's Lance-realm fault injector.
