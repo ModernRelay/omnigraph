@@ -4,12 +4,15 @@ use super::{
 
 impl QueryIR {
     /// The read representation accepted by the frozen reference executor.
+    /// `distinct` is not carried: the frozen format predates it, and GQT
+    /// refuses `--- expect same as v1` on a `return distinct` step.
     pub fn erase(&self) -> untyped::QueryIR {
         let Self {
             name,
             params,
             pipeline,
             return_exprs,
+            distinct: _,
             order_by,
             limit,
         } = self;
@@ -648,6 +651,7 @@ mod tests {
                         )),
                     },
                 ],
+                distinct: false,
                 order_by: vec![
                     IROrdering {
                         expr: IRExpr::AliasRef(

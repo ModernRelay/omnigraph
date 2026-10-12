@@ -915,29 +915,6 @@ limit 5
 }
 
 #[test]
-fn test_standalone_nearest_with_alias_ordering_still_rejected() {
-    let catalog = setup_vector();
-    let qf = parse_query(
-        r#"
-query q($vq: Vector(3)) {
-match { $d: Doc }
-return {
-    $d.id_str as score
-}
-order {
-    nearest($d.embedding, $vq),
-    score desc
-}
-limit 5
-}
-"#,
-    )
-    .unwrap();
-    let err = typecheck_query(&catalog, qf.single_decl()).unwrap_err();
-    assert!(err.to_string().contains("T18"));
-}
-
-#[test]
 fn test_rrf_rejects_non_rank_expression_argument() {
     let parse = parse_query(
         r#"
@@ -2016,6 +1993,7 @@ return { $d.name }
             expr: Expr::Literal(Literal::String("unreachable".to_string())),
             alias: None,
         }],
+        distinct: false,
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),

@@ -77,6 +77,8 @@ pub struct CheckedReadQuery {
     pub(crate) params: Vec<CheckedParam>,
     pub(crate) scope: CheckedScope,
     pub(crate) returns: Vec<CheckedReturn>,
+    /// `return distinct`: one row per distinct projected tuple.
+    pub(crate) distinct: bool,
     pub(crate) orders: Vec<CheckedOrder>,
     pub(crate) limit: Option<u64>,
 }
@@ -847,7 +849,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
     for (index, ord) in query.order_clause.iter().enumerate() {
         let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
         reject_blob_read_value(&typed.ty(), &ord.expr)?;
-        bind_order_key(index, &ord.expr, &query.return_clause, &ctx)?;
+        bind_order_key(index, &ord.expr, &query.return_clause, &ctx, query.distinct)?;
         if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
             && ord.explicit
             && !ord.descending
@@ -886,17 +888,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
             "nearest ordering requires a limit clause".to_string(),
         ));
     }
-    if has_standalone_nearest
-        && query
-            .order_clause
-            .iter()
-            .any(|ord| matches!(ord.expr, Expr::AliasRef(_)))
-    {
-        return Err(CompilerError::typed(
-            T18,
-            "alias-based ordering is not supported together with nearest in phase 1".to_string(),
-        ));
-    }
 
     // T9: If any return expression is an aggregate, non-aggregate expressions
     // must be valid group-by keys (PropAccess or Variable).
@@ -904,6 +895,14 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         .return_clause
         .iter()
         .any(|p| matches!(p.expr, Expr::Aggregate { .. }));
+    if query.distinct && has_agg {
+        return Err(CompilerError::typed(
+            T56,
+            "`distinct` on an aggregated return: the group values are already one row each; \
+             drop `distinct` or the aggregate"
+                .to_string(),
+        ));
+    }
     if has_agg {
         for proj in &query.return_clause {
             if !matches!(proj.expr, Expr::Aggregate { .. }) {
@@ -930,22 +929,24 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
             clauses,
         },
         returns,
+        distinct: query.distinct,
         orders,
         limit: query.limit,
     })
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
-/// return list"): a property key sorts through the hidden column, the leading
-/// rank key is the search node's; every other key is a return alias or item.
+/// return list"): a property key sorts through its hidden column (none under
+/// `distinct`), the leading rank key is the search node's; others bind to return.
 fn bind_order_key(
     index: usize,
     key: &Expr,
     return_clause: &[Projection],
     ctx: &TypeContext,
+    distinct: bool,
 ) -> Result<()> {
     let exempt = match key {
-        Expr::PropAccess { .. } => true,
+        Expr::PropAccess { .. } => !distinct,
         Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => index == 0,
         _ => false,
     };
@@ -959,11 +960,14 @@ fn bind_order_key(
     if bound {
         return Ok(());
     }
+    let fix = if distinct {
+        "under `distinct` an order key is a projected value or its alias; add it to return"
+    } else {
+        "add it to return or order by its alias"
+    };
     Err(CompilerError::typed(
         T42,
-        format!(
-            "order key `{key}` does not appear in return; add it to return or order by its alias"
-        ),
+        format!("order key `{key}` does not appear in return; {fix}"),
     ))
 }
 
@@ -3986,7 +3990,7 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
 
 /// T33 admits a projected rank expression only as a repeat of the leading
 /// `order` key, so an alias never leads the order and the walk stops at
-/// `AliasRef` (T18 refuses an alias key beside `nearest`).
+/// `AliasRef`; a `nearest` nested under `rrf` is T21's.
 fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
     match expr {
         Expr::Nearest { .. } => true,
@@ -4007,7 +4011,6 @@ fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
                     .as_deref()
                     .is_some_and(expr_contains_standalone_nearest)
         }
-        // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
         Expr::Binary { left, right, .. }
         | Expr::In {

@@ -1052,6 +1052,7 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             ),
             returned(prop("c", "body"), Some("text"), "text"),
         ],
+        distinct: false,
         order_by: vec![
             IROrdering {
                 expr: prop("c", "rank"),

@@ -148,8 +148,10 @@ subquery_predicate = { agg_func ~ ("(" ~ expr ~ ")")? ~ subquery_block ~ comp_op
 exists_block = { "exists" ~ subquery_block }
 subquery_block = { "{" ~ clause+ ~ "}" }
 
-// Return clause — projections separated by commas or newlines
-return_clause = { "return" ~ "{" ~ projection+ ~ "}" }
+// Return clause — projections separated by commas or newlines; `distinct`
+// keeps one row per distinct projected tuple.
+return_clause = { "return" ~ kw_distinct? ~ "{" ~ projection+ ~ "}" }
+kw_distinct = @{ "distinct" ~ !(ASCII_ALPHANUMERIC | "_") }
 projection = { expr ~ ("as" ~ (reserved_alias | expr_ident))? ~ ","? }
 
 // Order clause
