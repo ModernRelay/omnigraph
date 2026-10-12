@@ -298,6 +298,7 @@ pub(crate) enum TypedExpr {
     },
     Aggregate {
         func: AggFunc,
+        distinct: bool,
         arg: Box<TypedExpr>,
         signature: AggSignature,
     },
@@ -3320,10 +3321,23 @@ fn resolve_expr(
             literal: lit.clone(),
             ty: ResolvedType::Scalar(literal_type(lit)?),
         }),
-        Expr::Aggregate { func, arg } => {
+        Expr::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => {
+            if *distinct && *func != AggFunc::Count {
+                return Err(CompilerError::typed(
+                    T57,
+                    format!(
+                        "`distinct` applies only to `count`; `{func}(distinct …)` is not supported"
+                    ),
+                ));
+            }
             let (arg, signature) = resolve_aggregate(catalog, *func, arg, ctx, params, true)?;
             Ok(TypedExpr::Aggregate {
                 func: *func,
+                distinct: *distinct,
                 arg: Box::new(arg),
                 signature,
             })
@@ -3512,7 +3526,7 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
 fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering]) -> Result<()> {
     match expr {
         Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
-        Expr::Aggregate { func, arg } => match arg.as_ref() {
+        Expr::Aggregate { func, arg, .. } => match arg.as_ref() {
             Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
                 Err(CompilerError::typed(
                     T32,

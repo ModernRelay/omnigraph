@@ -1,0 +1,226 @@
+# issue: 954
+# red_on: 5e530377
+# notes: `count(distinct $x)` counts distinct nodes by identity and
+# notes: `count(distinct $x.prop)` counts distinct non-null values, grouped or
+# notes: ungrouped, in `return` and as an `order` key; plain `count` keeps
+# notes: counting rows beside it. `distinct` under `sum`, `avg`, `min` or
+# notes: `max` is refused at compile time, and `return distinct` over an
+# notes: aggregate stays refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    city: String?
+    age: I64
+}
+
+node Comment {
+    slug: String @key
+    length: I64
+}
+
+edge CommentHasCreator: Comment -> Person
+edge LikesComment: Person -> Comment
+
+--- seed
+{"type":"Person","data":{"slug":"raf","name":"Rafael Alonso","city":"Madrid","age":40}}
+{"type":"Person","data":{"slug":"ann","name":"Ann Lee","city":"Berlin","age":30}}
+{"type":"Person","data":{"slug":"bob","name":"Bob Ray","age":30}}
+{"type":"Person","data":{"slug":"cyd","name":"Ann Lee","city":"Berlin","age":50}}
+{"type":"Comment","data":{"slug":"c1","length":10}}
+{"type":"Comment","data":{"slug":"c2","length":20}}
+{"type":"Comment","data":{"slug":"c3","length":20}}
+{"edge":"CommentHasCreator","from":"c1","to":"raf"}
+{"edge":"CommentHasCreator","from":"c2","to":"raf"}
+{"edge":"CommentHasCreator","from":"c3","to":"raf"}
+{"edge":"LikesComment","from":"ann","to":"c1"}
+{"edge":"LikesComment","from":"ann","to":"c2"}
+{"edge":"LikesComment","from":"ann","to":"c3"}
+{"edge":"LikesComment","from":"bob","to":"c1"}
+{"edge":"LikesComment","from":"cyd","to":"c2"}
+
+--- query
+query likes_counted() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return { count($p2) as likes }
+}
+
+--- expect unordered
+{"likes": 5}
+
+--- expect shape
+likes: I64
+
+--- query
+query likers_counted() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return { count(distinct $p2) as likers }
+}
+
+--- expect unordered
+{"likers": 3}
+
+--- expect shape
+likers: I64
+
+--- query
+query names_counted() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return { count($p2.name) as names, count(distinct $p2.name) as distinct_names }
+}
+
+--- expect unordered
+{"names": 5, "distinct_names": 2}
+
+--- expect shape
+names: I64
+distinct_names: I64
+
+--- query
+query nulls_not_counted() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return { count($p2.city) as cities, count(distinct $p2.city) as distinct_cities }
+}
+
+--- expect unordered
+{"cities": 4, "distinct_cities": 1}
+
+--- expect shape
+cities: I64
+distinct_cities: I64
+
+--- query
+query comments_liked_per_city() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return { $p2.city as city, count(distinct $c) as comments, count($c) as likes }
+    order { count(distinct $c) desc }
+}
+
+--- expect unordered
+{"city": "Berlin", "comments": 3, "likes": 4}
+{"comments": 1, "likes": 1}
+
+--- expect shape
+city: String?
+comments: I64
+likes: I64
+
+--- query
+query distinct_names_ordered() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return {
+        $c.length as length,
+        count(distinct $p2.name) as names,
+        count($p2.name) as likes
+    }
+    order { count(distinct $p2.name) desc }
+    limit 1
+}
+
+--- expect unordered
+{"length": 10, "names": 2, "likes": 2}
+
+--- expect shape
+length: I64
+names: I64
+likes: I64
+
+--- query
+query ordinary_names_ordered() {
+    match {
+        $p: Person { slug: "raf" }
+        $c commentHasCreator $p
+        $p2 likesComment $c
+    }
+    return {
+        $c.length as length,
+        count(distinct $p2.name) as names,
+        count($p2.name) as likes
+    }
+    order { count($p2.name) desc }
+    limit 1
+}
+
+--- expect unordered
+{"length": 20, "names": 1, "likes": 3}
+
+--- expect shape
+length: I64
+names: I64
+likes: I64
+
+--- query
+query every_person_once() {
+    match { $p: Person }
+    return { count(distinct $p) as people }
+}
+
+--- expect unordered
+{"people": 4}
+
+--- expect shape
+people: I64
+
+--- query
+query nothing_matched() {
+    match {
+        $p: Person { slug: "nobody" }
+        $c commentHasCreator $p
+    }
+    return { count(distinct $c) as comments }
+}
+
+--- expect unordered
+{"comments": 0}
+
+--- expect shape
+comments: I64
+
+--- query
+query distinct_under_sum() {
+    match { $p: Person }
+    return { sum(distinct $p.age) as total }
+}
+
+--- expect error: `distinct` applies only to `count`
+
+--- query
+query distinct_return_over_distinct_count() {
+    match { $p: Person }
+    return distinct { count(distinct $p) as people }
+}
+
+--- expect error: `distinct` on an aggregated return

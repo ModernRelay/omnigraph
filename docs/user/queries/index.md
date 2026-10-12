@@ -196,21 +196,21 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, and
-`count`, `sum`, `avg`, `min`, and `max`. Each produces one column named by its
-alias or expression: `$p.name` gives `p.name` and `$p.@id` gives `p.@id`.
-Duplicate column names are refused (`T25`).
+Return expressions include variables, properties, literals, `now()`, and the
+aggregates `count`, `sum`, `avg`, `min`, and `max`. Each gives one column named by
+its alias or expression (`$p.name` gives `p.name`); duplicates are refused (`T25`).
 
 Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
 uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
-`Bool`, `Date`, or `DateTime` columns and preserve their type. Booleans order
-false before true; dates and datetimes order chronologically. With no matches,
-an aggregate-only return gives one row: `count` is 0 and other aggregates are
-null. A return that also projects a group value gives no rows.
+`Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
+dates chronologically). With no matches, an aggregate-only return gives one row
+(`count` 0, the rest null); a return that also projects a group value gives no rows.
 
-A bare node returns one object containing `@id` and every property except
-`Blob` and `Vector`: `$p` produces column `p`. Project a property for one field.
-`count($p)` counts rows; other aggregates require a property (`T8`).
+A bare node returns one object with `@id` and every property except `Blob` and
+`Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
+counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
+counts distinct non-null values, so a node reached by several paths counts once.
+Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as
 `$p.age > 30 as adult`. Its result is `Bool`, or `Bool?` with a nullable operand;

@@ -793,6 +793,7 @@ fn rename_inner_bindings<'a>(
             }
             IRExpr::Aggregate {
                 func: _,
+                distinct: _,
                 arg,
                 signature: _,
             }
@@ -1025,10 +1026,12 @@ fn lower_expr(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
         TypedExpr::Literal { literal, .. } => IRExpr::Literal(literal.clone(), expr.expr_type()),
         TypedExpr::Aggregate {
             func,
+            distinct,
             arg,
             signature,
         } => IRExpr::Aggregate {
             func: *func,
+            distinct: *distinct,
             arg: Box::new(lower(arg)?),
             signature: signature.clone(),
         },

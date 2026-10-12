@@ -901,6 +901,7 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::Aggregate {
                         func,
+                        distinct,
                         arg,
                         signature,
                     },
@@ -964,6 +965,7 @@ impl Lower for Walk<'_, '_> {
                     let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
                         .schema(Arc::clone(&input_schema))
                         .alias(name)
+                        .with_distinct(*distinct)
                         .build()
                         .map(Arc::new)
                         .map_err(OmniError::datafusion)?;

@@ -211,9 +211,9 @@ overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
 `Executed::profile`). The row schema is `explain_version` 4. Saved physical
-plans use a `bound_plan_version: 7` envelope whose `body` contains `plan` and
-`values`; version 7 types each node's ordering and declares ranked scans'
-eligibility and policy. Older unversioned plans and unsupported versions are refused with a
+plans use a `bound_plan_version: 8` envelope whose `body` contains `plan` and
+`values`; version 7 records each aggregate's `distinct` flag, and version 8
+types each node's ordering and declares ranked scans' eligibility and policy. Older unversioned plans and unsupported versions are refused with a
 regeneration instruction, including plans without traversal nodes.
 
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
