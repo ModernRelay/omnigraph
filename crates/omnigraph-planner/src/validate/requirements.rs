@@ -142,6 +142,7 @@ pub struct Requirements {
     /// key is a constant still orders its rows by the identity tie-break.
     pub(crate) ordered: bool,
     pub(crate) limit: Option<u64>,
+    /// Whether the rows are groups: an aggregate return or `return distinct`.
     pub(crate) aggregate: bool,
 }
 
@@ -281,13 +282,20 @@ impl Requirements {
         if search.is_some() {
             keys = &keys[1..];
         }
+        // Group rows (aggregates or `return distinct`) bind every key to the
+        // return item it names, as the planner does, before constants drop.
+        let grouped = ir.distinct
+            || ir
+                .return_exprs
+                .iter()
+                .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
         let order = keys
             .iter()
-            .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .map(|key| IROrdering {
-                expr: crate::optimizer::bind_order_key(&key.expr, &ir.return_exprs),
+                expr: crate::optimizer::bind_order_key(&key.expr, &ir.return_exprs, grouped),
                 descending: key.descending,
             })
+            .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();
         let written_search = search
             .as_ref()
@@ -313,10 +321,7 @@ impl Requirements {
             order,
             ordered: !ir.order_by.is_empty(),
             limit: ir.limit,
-            aggregate: ir
-                .return_exprs
-                .iter()
-                .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. })),
+            aggregate: grouped,
         })
     }
 }

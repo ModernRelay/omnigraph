@@ -1193,3 +1193,31 @@ fn a_constant_order_still_sorts() {
             .unwrap_or_else(|error| panic!("{query}: {error:?}"));
     }
 }
+
+/// `return distinct` groups rows like an aggregate: the planner binds its
+/// order keys to return items, completes the order with every unwritten
+/// group key instead of an identity tie-break, and the query is outside the
+/// exact fragment.
+#[test]
+fn a_distinct_return_sorts_its_groups() {
+    for query in [
+        r#"query q() {
+    match { $d: Doc }
+    return distinct { $d.year, $d.title }
+    order { $d.year }
+    limit 2
+}"#,
+        r#"query q() {
+    match { $d: Doc }
+    return distinct { $d.title, 1 as one }
+    order { $d.title desc, 1 }
+}"#,
+    ] {
+        let fixture = Fixture::new(query, &[]);
+        assert!(fixture.ir.distinct, "{query}");
+        let accepted = fixture
+            .accept(fixture.plan())
+            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+        assert_eq!(accepted.scope(), ValidationScope::InvariantsOnly, "{query}");
+    }
+}

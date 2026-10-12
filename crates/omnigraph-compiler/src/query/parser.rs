@@ -462,6 +462,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
+    let mut distinct = false;
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
@@ -528,8 +529,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                 }
                                 Rule::return_clause => {
                                     for proj in section.into_inner() {
-                                        if let Rule::projection = proj.as_rule() {
-                                            return_clause.push(parse_projection(proj)?);
+                                        match proj.as_rule() {
+                                            Rule::kw_distinct => distinct = true,
+                                            Rule::projection => {
+                                                return_clause.push(parse_projection(proj)?);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -602,6 +607,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         params,
         match_clause,
         return_clause,
+        distinct,
         order_clause,
         limit,
         mutations,

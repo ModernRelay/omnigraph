@@ -1993,6 +1993,7 @@ return { $d.name }
             expr: Expr::Literal(Literal::String("unreachable".to_string())),
             alias: None,
         }],
+        distinct: false,
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),

@@ -178,6 +178,7 @@ fn ir(pipeline: Vec<IROp>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Opera
             .into_iter()
             .map(|expr| projection(expr, &pipeline))
             .collect(),
+        distinct: false,
         pipeline,
         order_by: order_by
             .into_iter()

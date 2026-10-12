@@ -192,6 +192,9 @@ impl Fragment<'_> {
 /// outside the fragment.
 pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
     let ir = input.ir;
+    if ir.distinct {
+        return None;
+    }
     let mut pipeline = ir.pipeline.iter();
     let Some(IROp::NodeScan {
         variable,

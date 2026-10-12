@@ -763,8 +763,8 @@ other cut, a capped sort below the final one or a cut in a correlated
 block's tree, is refused as `row cut`. The order check recomputes the root's
 order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
 a fusion's sort leads with `<binding>._rrf` descending, a search-ordered
-aggregate's with its remaining keys and then every group key it did not
-write, and the planner's tie-break omissions that are comparator
+aggregate's or a `return distinct`'s with its remaining keys and then every
+group key it did not write (group rows take no identity tie-break), and the planner's tie-break omissions that are comparator
 equivalences are accepted: a key already in the comparator, every key when
 the query returns only order keys or constants, and identities of bindings
 the query does not name (anonymous endpoints, cycle temps) after every named

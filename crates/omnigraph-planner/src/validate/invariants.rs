@@ -768,8 +768,8 @@ impl Requirements {
 
     /// The final sort's comparator as RFC 0047 defines it: a ranking's score
     /// (a fused ranking's `_rrf` descending) then the written keys; over a
-    /// search-led aggregate the written keys then every group key not written,
-    /// ascending; no sort where the query orders nothing.
+    /// search-led aggregate or a `return distinct` the written keys then every
+    /// group key not written, ascending; no sort where the query orders nothing.
     fn required_keys(&self) -> Option<Vec<IROrdering>> {
         if self.aggregate {
             // Under a search, groups have no order unless a key remains
@@ -777,8 +777,14 @@ impl Requirements {
             if !self.ordered || (self.search.is_some() && self.order.is_empty()) {
                 return None;
             }
+            // A search-led sort, or a `return distinct` (groups without an
+            // aggregate), is total through every group key it did not write.
+            let distinct = !self
+                .returns
+                .iter()
+                .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
             let mut keys = self.order.clone();
-            if self.search.is_some() {
+            if self.search.is_some() || distinct {
                 for projection in &self.returns {
                     if matches!(projection.expr, IRExpr::Aggregate { .. }) {
                         continue;

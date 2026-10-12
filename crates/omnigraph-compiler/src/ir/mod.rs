@@ -30,6 +30,8 @@ pub struct QueryIR {
     pub params: Vec<IRParam>,
     pub pipeline: Vec<IROp>,
     pub return_exprs: Vec<IRProjection>,
+    /// `return distinct`: one row per distinct projected tuple.
+    pub distinct: bool,
     pub order_by: Vec<IROrdering>,
     pub limit: Option<u64>,
 }

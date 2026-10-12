@@ -1114,3 +1114,7 @@ None.
   from the index facts, with unknown coverage never full. A constant return
   item joined the tie-break equivalences, and an `order` clause whose keys
   all fold to constants still requires the sort by the identity tie-break.
+  `return distinct`, which landed on main meanwhile, is checked as group
+  rows: its order keys bind to return items, its sort is total through
+  every unwritten group key with no identity tie-break, and it is outside
+  the exact fragment.

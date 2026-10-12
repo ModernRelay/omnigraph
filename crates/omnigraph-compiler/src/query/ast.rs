@@ -268,6 +268,8 @@ pub struct QueryDecl {
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,
+    /// `return distinct { … }`: one row per distinct projected tuple.
+    pub distinct: bool,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
     pub mutations: Vec<Mutation>,

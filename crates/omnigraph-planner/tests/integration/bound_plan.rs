@@ -90,6 +90,7 @@ fn query(order_by: IRExpr) -> QueryIR {
                 true,
             )),
         }],
+        distinct: false,
         order_by: vec![IROrdering {
             expr: order_by,
             descending: false,
@@ -356,6 +357,7 @@ fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
                 true,
             )),
         }],
+        distinct: false,
         order_by: vec![],
         limit: Some(3),
     };
