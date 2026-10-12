@@ -649,6 +649,13 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
+      # The run step schedules the test binaries through nextest; the binary
+      # version is pinned so the hosted scheduler matches a local run.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-nextest@0.9.143
+
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -671,7 +678,7 @@ jobs:
       # The run step reuses these binaries (same flags, features, and env).
       - name: Compile the workspace and failpoint test graph
         run: |
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --no-run \
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --timings \
             --features "$FAILPOINT_FEATURES"
 
       - name: Install genuine v0.9 release for upgrade regression
@@ -702,7 +709,6 @@ jobs:
       - name: Run workspace and failpoint tests once
         run: |
           set -euo pipefail
-          test_log="$RUNNER_TEMP/workspace-tests.log"
           # A pull request and a merge-queue entry are gates: stop at the
           # first red suite. Main, tag, and dispatch runs are detection
           # channels: --no-fail-fast, so every independent failure is reported.
@@ -710,47 +716,83 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_EVENT_NAME" != "merge_group" ]]; then
             no_fail_fast+=(--no-fail-fast)
           fi
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
-            --features "$FAILPOINT_FEATURES" \
-            -- --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping v0.9 upgrade e2e:" "$test_log"; then
-            echo "::error::v0.9 upgrade regression skipped despite a configured release binary"
-            exit 1
-          fi
-          grep -Fq "v0.9 refusal and export/import rebuild completed" "$test_log" \
-            || { echo "::error::v0.9 upgrade regression did not complete"; exit 1; }
-          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end \\.\\.\\. ok" "$test_log" \
-            || { echo "::error::exact v0.9 refusal and rebuild regression did not pass"; exit 1; }
-          if grep -Fq "skipping immediate-predecessor v6 upgrade test" "$test_log"; then
-            echo "::error::v6 format fence skipped despite a configured 0.10 release binary"
-            exit 1
-          fi
-          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \\.\\.\\. ok" "$test_log" \
-            || { echo "::error::exact v6 format fence did not pass"; exit 1; }
-          # These real CLI/server/proxy journeys must execute in the ordinary
-          # workspace gate. A removed, filtered or re-ignored owner is not green.
+          # nextest runs every test of every binary through one scheduler, a
+          # process per test, so the process-bound journeys overlap instead of
+          # draining one binary at a time. The `ci` profile
+          # (.config/nextest.toml) writes the JUnit report with captured
+          # output; the owner check below reads it in place of a log.
+          # Warm the executables built by the preceding debug test build.
+          target/debug/omnigraph-bench --version
+          target/debug/omnigraph --version
+          cargo nextest run --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
+            --profile ci ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+            --features "$FAILPOINT_FEATURES"
+          # nextest runs no doctest; `cargo test` did. Keep that owner on the
+          # same graph so a future doctest still runs here.
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --doc \
+            ${no_fail_fast[@]+"${no_fail_fast[@]}"} \
+            --features "$FAILPOINT_FEATURES"
+          # The two upgrade journeys and these real CLI/server/proxy journeys
+          # must execute in the ordinary workspace gate. A removed, filtered or
+          # re-ignored owner is not green, and a journey that skipped its
+          # released binary is not green either. The live-apply journey
+          # (`cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart`)
+          # waits on the CLI's real 500 ms poll interval for about 30 s, so it
+          # is a `nightly:` owner of `tests-slow-nightly.yml` instead. The
+          # owners are modules of the CLI's `integration` binary, so nextest
+          # reports each as `<module>::<name>`.
+          owners=()
           for test_name in \
-            cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
-            remote_server_and_cli_end_to_end_flow \
-            remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
-            remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph \
-            remote_schema_apply_refuses_branched_cluster_backed_graph \
-            remote_read_preserves_projection_order_in_json_and_csv \
-            remote_branch_create_list_merge_flow \
-            remote_merge_delivery_loss_never_replays_committed_effect \
-            remote_deployment_delivery_loss_preserves_owned_completion \
-            remote_branch_delete_removes_branch \
-            remote_export_round_trips_full_branch_graph \
-            remote_ingest_creates_review_branch_and_keeps_it_readable \
-            remote_load_round_trips_and_requires_from_for_new_branches \
-            remote_ingest_reuses_existing_branch_and_merges_updates \
-            remote_policy_enforces_branch_first_cli_workflow \
-            graphs_list_against_multi_graph_server \
-            mutate_if_commit_lost_cas_exits_4_issue_365
+            crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end \
+            crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10 \
+            system_remote::remote_server_and_cli_end_to_end_flow \
+            system_remote::remote_schema_apply_refuses_additive_change_for_cluster_backed_graph \
+            system_remote::remote_schema_apply_refuses_incompatible_change_for_cluster_backed_graph \
+            system_remote::remote_schema_apply_refuses_branched_cluster_backed_graph \
+            system_remote::remote_read_preserves_projection_order_in_json_and_csv \
+            system_remote::remote_branch_create_list_merge_flow \
+            system_remote::remote_merge_delivery_loss_never_replays_committed_effect \
+            system_remote::remote_blob_write_delivery_loss_never_replays_committed_effect \
+            system_remote::remote_merge_statement_delivery_loss_never_replays_committed_effect \
+            system_remote::remote_deployment_delivery_loss_preserves_owned_completion \
+            system_remote::remote_branch_delete_removes_branch \
+            system_remote::remote_export_round_trips_full_branch_graph \
+            system_remote::remote_ingest_creates_review_branch_and_keeps_it_readable \
+            system_remote::remote_load_round_trips_and_requires_from_for_new_branches \
+            system_remote::remote_ingest_reuses_existing_branch_and_merges_updates \
+            system_remote::remote_policy_enforces_branch_first_cli_workflow \
+            system_remote::graphs_list_against_multi_graph_server \
+            system_remote::mutate_if_commit_lost_cas_exits_4_issue_365
           do
-            grep -Fq "test ${test_name} ... ok" "$test_log" \
-              || { echo "::error::required server e2e case did not pass: $test_name"; exit 1; }
+            owners+=(--passed "$test_name")
           done
+          python3 scripts/check-workspace-test-owners.py target/nextest/ci/junit.xml \
+            "${owners[@]}" \
+            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=skipping v0.9 upgrade e2e:" \
+            --output-has "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=v0.9 refusal and export/import rebuild completed" \
+            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10=skipping immediate-predecessor v6 upgrade test"
+
+      # Kept on every run, red or green: per-test durations and the compile's
+      # unit timings are what a change to this job's scheduling is sized from.
+      - name: Retain the nextest JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-workspace-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
+      - name: Retain Cargo build timings
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-workspace-build-timings
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
 
 
@@ -872,32 +914,47 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target"
           echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
 
+      # The owner is the `crossversion_upgrade` module of the CLI's
+      # `integration` binary. The exact case names come from the compiled
+      # inventory (`-- --list` on the same feature graph, so a valid test the
+      # checker's source regex cannot see is still selected), filtered to the
+      # module's `storage_upgrade` cases and written to a file first, so a
+      # failed generator fails the step instead of becoming an empty filter
+      # list; the checker requires every source-derived name in that listing
+      # and the log to equal the file. `crossversion_upgrade::` alone would
+      # add the module's other journeys.
       - name: Run required storage upgrade crossversion tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-crossversion.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1 2>&1 | tee "$test_log"
-          python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log"
+          list_log="$RUNNER_TEMP/storage-upgrade-crossversion-list.log"
+          cases_file="$RUNNER_TEMP/storage-upgrade-crossversion-cases.txt"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" crossversion_upgrade:: -- --list 2>&1 | tee "$list_log"
+          python3 scripts/check-storage-upgrade-ci.py --list-cases crossversion --compiled "$list_log" > "$cases_file"
+          mapfile -t cases < "$cases_file"
+          [ "${#cases[@]}" -gt 0 ] || { echo "::error::the crossversion storage upgrade inventory is empty"; exit 1; }
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" -- --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$test_log"
+          python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$test_log" --cases "$cases_file"
 
       - name: Run required storage upgrade engine tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-engine.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log engine "$test_log"
 
       - name: Run required storage upgrade lance tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-lance.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" lance_version_columns:: -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log lance "$test_log"
 
       - name: Run required storage upgrade protocol tests
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/storage-upgrade-protocol.log"
-          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
+          cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1 2>&1 | tee "$test_log"
           python3 scripts/check-storage-upgrade-ci.py --check-log protocol "$test_log"
 
   v5_v10_format_fence:
@@ -986,14 +1043,14 @@ jobs:
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/v5-v10-format-fence.log"
-          cargo test --locked -p omnigraph-cli --test crossversion_upgrade \
-            current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \
+          cargo test --locked -p omnigraph-cli --test integration \
+            crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
           if grep -Fq "skipping immediate-predecessor v5 upgrade test" "$test_log"; then
             echo "::error::v5↔v10 format fence skipped despite a configured predecessor binary"
             exit 1
           fi
-          grep -Eq "test current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \.\.\. ok" "$test_log" \
+          grep -Eq "test crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \.\.\. ok" "$test_log" \
             || { echo "::error::exact v5↔v10 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
             || { echo "::error::v5↔v10 format fence matched the wrong test set"; exit 1; }
@@ -1140,7 +1197,8 @@ jobs:
         # header_read_timeout for idle keep-alive connections (rustfs#4360,
         # fixed in beta.10), matching the intermittent "error sending request"
         # PUT failures observed here on pooled connections. The S3 suites
-        # (engine s3_storage, server s3, cluster s3_cluster, engine failpoints
+        # (engine `s3_storage` and server `s3`, modules of their `integration`
+        # binaries, cluster s3_cluster, engine failpoints
         # s3_) were validated against the beta.12
         # binary locally before this bump. Keep CI pinned to the immutable
         # multi-arch index digest so upgrades are deliberate.
@@ -1184,24 +1242,45 @@ jobs:
 
       # Compile and execute the selected default targets in one Cargo resolve.
       # A superset prebuild followed by narrower commands would still rebuild
-      # workspace crates under different feature fingerprints.
+      # workspace crates under different feature fingerprints. Both calls
+      # select the same four packages, so they share that one resolve.
+      #
+      # The first call selects modules of the `integration` binaries by
+      # libtest substring filter: `s3_storage::`, `cli_cluster_e2e::` and
+      # `system_local::` take their whole modules; the server's `s3` module is
+      # named test by test because a bare `s3::` also matches the engine's
+      # `write_cost_s3::` cost gate, which stays out of this job. A test added
+      # to the server's `s3` module must be added to this list. The second
+      # call runs the standalone targets unfiltered, as before.
       - name: Run RustFS default integration graph
         if: matrix.shard == 'default'
         run: |
           set -euo pipefail
           test_log="$RUNNER_TEMP/rustfs-default.log"
+          : >"$test_log"
           cargo test --locked \
             -p omnigraph-engine \
             -p omnigraph-server \
             -p omnigraph-cluster \
             -p omnigraph-cli \
-            --test s3_storage \
+            --test integration \
+            -- --nocapture --test-threads=1 \
+            s3_storage:: \
+            cli_cluster_e2e:: \
+            system_local:: \
+            s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
+            s3::server_opens_azure_graph_directly_and_serves_snapshot_and_read \
+            s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
+            s3::server_boots_azure_cluster_from_bare_storage_uri_and_serves_query \
+            2>&1 | tee -a "$test_log"
+          cargo test --locked \
+            -p omnigraph-engine \
+            -p omnigraph-server \
+            -p omnigraph-cluster \
+            -p omnigraph-cli \
             --test lance_surface_guards \
-            --test s3 \
             --test s3_cluster \
-            --test cli_cluster_e2e \
-            --test system_local \
-            -- --nocapture --test-threads=1 2>&1 | tee "$test_log"
+            -- --nocapture --test-threads=1 2>&1 | tee -a "$test_log"
 
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
@@ -1212,18 +1291,18 @@ jobs:
           fi
 
           for test_name in \
-            s3_compatible_graph_lifecycle_works \
-            s3_branch_change_merge_flow_works \
-            s3_public_load_uses_hidden_run_and_publishes \
-            s3_adapter_conditional_writes_contract \
-            s3_schema_apply_migrates_live_graph \
-            s3_fresh_branch_traversal_reuses_main_graph_index_with_etags \
+            s3_storage::s3_compatible_graph_lifecycle_works \
+            s3_storage::s3_branch_change_merge_flow_works \
+            s3_storage::s3_public_load_uses_hidden_run_and_publishes \
+            s3_storage::s3_adapter_conditional_writes_contract \
+            s3_storage::s3_schema_apply_migrates_live_graph \
+            s3_storage::s3_fresh_branch_traversal_reuses_main_graph_index_with_etags \
             public_physical_ref_token_rejects_s3_same_version_aba \
-            server_opens_s3_graph_directly_and_serves_snapshot_and_read \
-            server_boots_cluster_from_bare_storage_uri_and_serves_query \
+            s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
+            s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
             s3_cluster_full_lifecycle_import_apply_serve_evolve_delete \
-            cluster_e2e_s3_live_apply_without_restart \
-            local_cli_s3_end_to_end_init_load_read_flow
+            cli_cluster_e2e::cluster_e2e_s3_live_apply_without_restart \
+            system_local::local_cli_s3_end_to_end_init_load_read_flow
           do
             grep -Eq "test ${test_name} \.\.\. ok" "$test_log" \
               || { echo "::error::required RustFS cell '${test_name}' did not execute normally"; exit 1; }
@@ -1234,7 +1313,7 @@ jobs:
       # performance/cost contracts belong in a dedicated perf harness on a stable
       # runner + own cadence, not on the every-merge correctness path. Moved out of
       # CI pending that harness; run it on demand with a bucket set:
-      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test write_cost_s3
+      #   OMNIGRAPH_S3_TEST_BUCKET=… cargo test -p omnigraph-engine --test integration write_cost_s3::
 
       - name: Run RustFS detached publication retention
         if: matrix.shard == 'failpoints'
@@ -1421,8 +1500,9 @@ jobs:
           # set, so the Lance stack resolves one feature set and compiles
           # once; a per-owner `-p` resolved six graphs, four with the Lance
           # stack, 89 minutes on main (docs/dev/ci.md, cache rule). An owner
-          # names only its target: `--lib`, or `--test <file>`.
-          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
+          # names only its target: `--lib`, `--test <file>`, or
+          # `--test integration` with its `<module>::` prefix.
+          selection=(--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --features "$FAILPOINT_FEATURES")
           require_cell() {
             grep -Eq "test (tests::)?${1} \.\.\. ok" "$test_log" \
               || { echo "::error::required Azure cell '${1}' did not execute normally"; exit 1; }
@@ -1453,10 +1533,10 @@ jobs:
           run_cell azure_optimize_detached_pin_survives_next_write --test failpoints
           run_cell azure_schema_apply_post_commit_failure_leaves_readable_contract --test failpoints
           run_cell azure_cluster_full_lifecycle_import_apply_serve_evolve_delete --test s3_cluster
-          run_cell server_opens_azure_graph_directly_and_serves_snapshot_and_read --test s3
-          run_cell server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test s3
-          run_cell local_cli_azure_end_to_end_init_load_read_flow --test system_local
-          run_cell cluster_e2e_azure_live_apply_without_restart --test cli_cluster_e2e
+          run_cell s3::server_opens_azure_graph_directly_and_serves_snapshot_and_read --test integration
+          run_cell s3::server_boots_azure_cluster_from_bare_storage_uri_and_serves_query --test integration
+          run_cell system_local::local_cli_azure_end_to_end_init_load_read_flow --test integration
+          run_cell cli_cluster_e2e::cluster_e2e_azure_live_apply_without_restart --test integration
 
           if grep -Eiq 'skipping .*azure|skipping .*azurite' "$test_log"; then
             echo "::error::a configured Azure test emitted its unconfigured skip"

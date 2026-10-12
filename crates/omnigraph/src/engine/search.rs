@@ -13,6 +13,7 @@ use super::*;
 /// with the bound query value and this pass's widening and gate verdicts.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SearchMode {
+    pub(super) scalar_index: Option<bool>,
     /// Vector ANN search on the scan's binding.
     pub(super) nearest: Option<NearestTarget>,
     /// Maximum number of IVF payload partitions a nearest scan may search,
@@ -228,11 +229,11 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k)` as the fusion runs it: the rank constant and the fused rows.
+/// `rrf(a, b, k)` as the fusion runs it: the rank constant. The query's
+/// `limit` cuts the fused rows in the `Sort` above the fusion, never here.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RrfMode {
     pub(super) k: u32,
-    pub(super) limit: usize,
 }
 
 #[derive(Debug, PartialEq)]

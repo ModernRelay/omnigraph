@@ -1,6 +1,174 @@
-use omnigraph_planner::{RuntimeFilterKind, RuntimeFilterSpec};
+use omnigraph_planner::{
+    CoverageProvenance, FragmentCoverage, IndexCoverage, IndexFact, IndexKind, RuntimeFilterKind,
+    RuntimeFilterSpec,
+};
 
 use super::*;
+
+fn btree(column: &str, covered: u64) -> IndexFact {
+    IndexFact {
+        name: format!("{column}_idx"),
+        column: column.into(),
+        kind: IndexKind::Btree { usable: true },
+        coverage: Some(FragmentCoverage { covered, total: 2 }),
+    }
+}
+
+fn expand_inputs(plan: &PhysicalPlan) -> &omnigraph_planner::ExpandCostInputs {
+    plan.live()
+        .find_map(|(_, node)| match node {
+            PhysicalNode::Expand { policy, .. } => policy.cost(),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
+    for columns in [SYSTEM_COLUMNS_V3, omnigraph_compiler::SYSTEM_COLUMNS_LEGACY] {
+        let mut ty = node_type("T", Some(1));
+        ty.columns = columns;
+        let fields: Vec<Field> = ty
+            .schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == SYSTEM_COLUMNS_V3.id {
+                    Field::new(columns.id, DataType::Utf8, false)
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        ty.schema = Arc::new(Schema::new(fields));
+        for direction in [Direction::Out, Direction::In, Direction::Both] {
+            let src = btree(columns.src, 2);
+            let dst = btree(columns.dst, 2);
+            let mut duplicate = src.clone();
+            duplicate.name = "other_src".into();
+            duplicate.coverage.as_mut().unwrap().covered = 1;
+            let mut unknown = src.clone();
+            unknown.coverage = None;
+            let mut unusable = src.clone();
+            unusable.kind = IndexKind::Btree { usable: false };
+            for (facts, expected) in [
+                (vec![], false),
+                (vec![src.clone()], direction == Direction::Out),
+                (vec![dst.clone()], direction == Direction::In),
+                (vec![src.clone(), dst.clone()], true),
+                (
+                    vec![btree(columns.src, 1), dst.clone()],
+                    direction == Direction::In,
+                ),
+                (vec![unknown, dst.clone()], direction == Direction::In),
+                (vec![unusable, dst.clone()], direction == Direction::In),
+                (vec![src, duplicate, dst], direction == Direction::In),
+            ] {
+                let mut hop = expand("a", "b", vec![]);
+                let IROp::Expand { edges, .. } = &mut hop else {
+                    unreachable!()
+                };
+                *edges = EdgeSelection::Named(EdgeMember {
+                    edge_type: "knows".into(),
+                    direction,
+                });
+                let op = ir(vec![scan("a"), hop], vec![prop("b", "slug")], vec![]);
+                let source = MemorySource::default()
+                    .with_node_type("T", ty.clone())
+                    .with_expand_statistics("knows", direction, knows_statistics(1))
+                    .with_index_facts("edge:knows", facts.clone());
+                let (plan, _) = physical(&op, &source);
+                let inputs = expand_inputs(&plan);
+                assert_eq!(
+                    inputs.coverage == IndexCoverage::Indexed,
+                    expected,
+                    "{columns:?} {direction:?} {facts:?}"
+                );
+                assert_eq!(
+                    inputs.coverage_provenance,
+                    CoverageProvenance::PinnedIndexFacts
+                );
+            }
+        }
+    }
+}
+
+/// GQT cannot omit fields from an accepted saved-plan envelope.
+#[test]
+fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
+    let op = ir(
+        vec![scan("a"), expand("a", "b", vec![])],
+        vec![prop("b", "slug")],
+        vec![],
+    );
+    let source = source_with_rows(Some(1)).with_expand_statistics(
+        "knows",
+        Direction::Out,
+        knows_statistics(1),
+    );
+    let (plan, _) = physical(&op, &source);
+    let bound = omnigraph_planner::BoundPlan {
+        plan,
+        values: Default::default(),
+    };
+    let encoded = serde_json::to_value(&bound).unwrap();
+    fn edit(value: &mut serde_json::Value, coverage: IndexCoverage, provenance: Option<&str>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("coverage_provenance") {
+                    object.insert("coverage".into(), serde_json::json!(coverage));
+                    match provenance {
+                        Some(p) => {
+                            object.insert("coverage_provenance".into(), serde_json::json!(p));
+                        }
+                        None => {
+                            object.remove("coverage_provenance");
+                        }
+                    }
+                }
+                for child in object.values_mut() {
+                    edit(child, coverage, provenance);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    edit(child, coverage, provenance);
+                }
+            }
+            _ => {}
+        }
+    }
+    for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+        for (provenance, expected) in [
+            (None, CoverageProvenance::LegacyAssumed),
+            (Some("legacy_assumed"), CoverageProvenance::LegacyAssumed),
+            (
+                Some("pinned_index_facts"),
+                CoverageProvenance::PinnedIndexFacts,
+            ),
+        ] {
+            let mut bytes = encoded.clone();
+            edit(&mut bytes, coverage, provenance);
+            let decoded: omnigraph_planner::BoundPlan = serde_json::from_value(bytes).unwrap();
+            assert_eq!(expand_inputs(&decoded.plan).coverage, coverage);
+            assert_eq!(expand_inputs(&decoded.plan).coverage_provenance, expected);
+            assert_eq!(
+                serde_json::from_value::<omnigraph_planner::BoundPlan>(
+                    serde_json::to_value(&decoded).unwrap()
+                )
+                .unwrap(),
+                decoded
+            );
+        }
+    }
+    let mut invalid = encoded;
+    edit(
+        &mut invalid,
+        IndexCoverage::Indexed,
+        Some("future_provenance"),
+    );
+    assert!(serde_json::from_value::<omnigraph_planner::BoundPlan>(invalid).is_err());
+}
 
 #[test]
 fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {

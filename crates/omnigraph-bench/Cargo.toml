@@ -26,11 +26,12 @@ omnigraph-gqt-core = { path = "../omnigraph-gqt-core", version = "0.13.0" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -711,6 +711,39 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
+/// A Blob write receipt: the cell, the state it was left in and the commit
+/// that published it, or that nothing was published.
+pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+    let entity = match output.selector.entity {
+        omnigraph_api_types::BlobEntityKind::Node => "node",
+        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+    };
+    println!("entity: {entity}");
+    println!("type: {}", output.selector.r#type);
+    println!("id: {}", output.selector.id);
+    println!("property: {}", output.selector.property);
+    println!("branch: {}", output.branch);
+    match output.kind {
+        omnigraph_api_types::BlobWriteStateOutput::Managed => {
+            println!("kind: managed");
+            if let Some(size) = output.size {
+                println!("size: {size}");
+            }
+            if let Some(etag) = output.etag.as_deref() {
+                println!("etag: {etag}");
+            }
+        }
+        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+    }
+    if let Some(actor) = output.actor_id.as_deref() {
+        println!("actor: {actor}");
+    }
+    match &output.commit {
+        Some(commit) => println!("commit: {}", commit.graph_commit_id),
+        None => println!("commit: none (the cell was already null)"),
+    }
+}
+
 pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",
@@ -767,6 +800,17 @@ pub(crate) fn print_change_human(output: &ChangeOutput) {
             target,
             merge,
         }) => println!("merged {source} into {target}: {}", merge.as_str()),
+        Some(BranchOutcomeOutput::Published) => println!(
+            "published commit {} on {}",
+            output
+                .commit
+                .as_ref()
+                .map_or("?", |commit| commit.graph_commit_id.as_str()),
+            output.branch
+        ),
+        Some(BranchOutcomeOutput::Dropped { graph_commit_id }) => {
+            println!("dropped commit {graph_commit_id} on {}", output.branch)
+        }
         None => println!(
             "changed {} via {}: {} nodes, {} edges",
             output.branch, output.query_name, output.affected_nodes, output.affected_edges
@@ -781,7 +825,7 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
         println!(
-            "{} graph_branch={} graph_manifest_version={}{}",
+            "{} graph_branch={} graph_manifest_version={}{}{}",
             commit.graph_commit_id,
             branch,
             commit.graph_manifest_version,
@@ -789,8 +833,21 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .actor_id
                 .as_deref()
                 .map(|actor| format!(" actor={}", actor))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            commit_kind_suffix(commit),
         );
+    }
+}
+
+/// ` kind=unattached root=<id>` for an unattached snapshot, empty otherwise:
+/// `published: false` alone does not say whether an id can publish.
+fn commit_kind_suffix(commit: &CommitOutput) -> String {
+    match commit.kind {
+        CommitKindOutput::Unattached => format!(
+            " kind=unattached root={}",
+            commit.root_commit_id.as_deref().unwrap_or("?")
+        ),
+        CommitKindOutput::Published | CommitKindOutput::Unpublished => String::new(),
     }
 }
 
@@ -801,6 +858,20 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
         commit.graph_branch.as_deref().unwrap_or("main")
     );
     println!("graph_manifest_version: {}", commit.graph_manifest_version);
+    if !commit.published {
+        println!("published: false");
+    }
+    println!(
+        "kind: {}",
+        match commit.kind {
+            CommitKindOutput::Published => "published",
+            CommitKindOutput::Unpublished => "unpublished",
+            CommitKindOutput::Unattached => "unattached",
+        }
+    );
+    if let Some(root_commit_id) = &commit.root_commit_id {
+        println!("root_commit_id: {}", root_commit_id);
+    }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);
     }

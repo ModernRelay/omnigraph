@@ -50,6 +50,10 @@ pub enum ManifestConflictDetails {
     /// `PublishedDatasetVersionMismatch`: the caller's expectations (if any) still
     /// hold against the new manifest state, so the publisher will retry.
     RowLevelCasContention,
+    /// A publish addressed an unattached snapshot (RFC "Unattached graph
+    /// branches"), a kind that never publishes; distinct from the
+    /// authority-moved conflict of a publishable proposal.
+    UnattachedCannotPublish { graph_commit_id: String },
 }
 
 #[derive(Debug, Clone, Error)]
@@ -312,6 +316,16 @@ pub enum OmniError {
         expected: String,
         actual: Option<String>,
     },
+    /// A Blob write's `If-Match` precondition did not hold at the write's
+    /// pinned base, so the write had no effect. Distinct from the graph-head
+    /// `PreconditionFailed`: it compares the cell's strong validator, and a
+    /// null or external cell has none. `current_etag` is the managed cell's
+    /// validator at that base, or `None` when the cell has none.
+    #[error(
+        "Blob write precondition failed; the cell's current validator is {}",
+        current_etag.as_deref().unwrap_or("<none>")
+    )]
+    BlobWritePreconditionFailed { current_etag: Option<String> },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -821,6 +835,17 @@ impl OmniError {
         )
     }
 
+    /// The refusal every publish of an unattached snapshot answers before any
+    /// durable effect.
+    pub fn unattached_cannot_publish(graph_commit_id: impl Into<String>) -> Self {
+        let graph_commit_id = graph_commit_id.into();
+        let message = format!("commit '{graph_commit_id}' is unattached and cannot publish");
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message)
+                .with_details(ManifestConflictDetails::UnattachedCannotPublish { graph_commit_id }),
+        )
+    }
+
     pub fn manifest_row_level_cas_contention(message: impl Into<String>) -> Self {
         Self::Manifest(
             ManifestError::new(ManifestErrorKind::Conflict, message)
@@ -861,6 +886,10 @@ impl OmniError {
             expected: expected.into(),
             actual,
         }
+    }
+
+    pub fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
+        Self::BlobWritePreconditionFailed { current_etag }
     }
 
     pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {

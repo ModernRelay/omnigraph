@@ -5,22 +5,29 @@ mod helpers;
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
+use bytes::Bytes;
 use lance::Dataset;
 use omnigraph::db::{
-    GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, StagingVerdict,
+    GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, SnapshotId,
+    StagingVerdict,
 };
 use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
-use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::instrumentation::{
+    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
+use omnigraph::{BlobCell, BlobContent, BlobEtag, BlobPrecondition, BlobWriteOutcome};
 use serial_test::serial;
 
 use helpers::collector::{
-    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain, staged_since,
+    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain,
+    pins_in_history, staged_since,
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
@@ -45,6 +52,64 @@ const RFC023_EXTERNAL_URI_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_URI";
 const RFC023_EXTERNAL_MODE_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_MODE";
 const RFC023_EXTERNAL_PAYLOAD_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_PAYLOAD";
 const RFC023_EXTERNAL_ACTION_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_ACTION";
+
+const BLOB_WRITE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    preview: Blob?
+    note: String?
+}
+"#;
+
+/// `readme` carries content `Hello`, preview `P0` and note `n0`.
+const BLOB_WRITE_SEED: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8=","preview":"base64:UDA=","note":"n0"}}"#;
+
+const BLOB_WRITE_MUTATIONS: &str = r#"
+query set_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+"#;
+
+async fn seed_blob_write_graph(uri: &str) -> Session {
+    let db = helpers::session(Omnigraph::init(uri, BLOB_WRITE_SCHEMA).await.unwrap());
+    db.load_jsonl(BLOB_WRITE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+fn readme(property: &str) -> BlobCell {
+    node_blob_cell("Document", "readme", property)
+}
+
+/// The current validator of a managed cell on `branch`.
+async fn blob_etag(db: &Omnigraph, branch: &str, cell: BlobCell) -> BlobEtag {
+    match db
+        .read_blob_at(ReadTarget::branch(branch), cell)
+        .await
+        .unwrap()
+        .content
+    {
+        BlobContent::Managed { etag, .. } => etag,
+        BlobContent::External(external) => panic!("expected a managed value, got {external:?}"),
+    }
+}
+
+async fn set_readme_note(db: &Session, note: &str) {
+    db.mutate(
+        "main",
+        BLOB_WRITE_MUTATIONS,
+        "set_note",
+        &params(&[("$title", "readme"), ("$note", note)]),
+    )
+    .await
+    .unwrap();
+}
+
+async fn main_commit_count(db: &Omnigraph) -> usize {
+    db.list_commits(Some("main")).await.unwrap().len()
+}
 
 const OCC_UNIQUE_SCHEMA: &str = r#"
 node User {
@@ -212,6 +277,9 @@ fn rfc023_external_writer_process() {
                 "load" => {
                     db.load("main", &payload, mode).await.unwrap();
                 }
+                "load_feature" => {
+                    db.load("feature", &payload, mode).await.unwrap();
+                }
                 "schema_apply_company" => {
                     db.apply_schema(&payload).await.unwrap();
                     let data = if payload.contains("slug: String") {
@@ -271,6 +339,11 @@ fn rfc023_external_writer_process() {
                     )
                     .await
                     .unwrap();
+                }
+                "merge_target_recreated" => {
+                    db.branch_delete("t").await.unwrap();
+                    db.branch_create("t").await.unwrap();
+                    db.load("t", &payload, mode).await.unwrap();
                 }
                 other => panic!("unknown external writer action '{other}'"),
             }
@@ -917,17 +990,10 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A fork collision must be classified by the manifest authority, not by Lance
-// branch versions. When a concurrent first-write legitimately wins the fork
-// race, the loser sees a changed read set — but that is a safe pre-effect
-// retry for Insert. RFC-022 discards and reprepares it automatically, never
-// misclassifying the live fork as an orphan that needs cleanup.
-//
-// Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
-// it parks the first arrival (writer A) at the fork point until released; later
-// arrivals (writer B) fall through. The test waits on the reached condition,
-// lets B win and commit the fork, then releases A.
-#[tokio::test(flavor = "multi_thread")]
+/// A fork collision is classified by the manifest authority, not by Lance
+/// branch versions: the first write that loses the fork race sees a changed
+/// read set and reprepares against the live fork instead of cleaning it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let _scenario = FailScenario::setup();
@@ -938,42 +1004,50 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     main.branch_create("feature").await.unwrap();
 
     let rv = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
+    let probes = QueryIoProbes::default();
 
     let uri_a = uri.clone();
+    let writer_probes = probes.clone();
     let writer_a = tokio::spawn(async move {
         let a = helpers::session(Omnigraph::open(&uri_a).await.unwrap());
-        helpers::mutate_branch(
-            &a,
-            "feature",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        with_query_io_probes(
+            writer_probes,
+            helpers::mutate_branch(
+                &a,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            ),
         )
         .await
     });
 
-    // Wait until A is parked at the fork point.
     rv.wait_until_reached().await;
 
-    // B wins the fork and commits it.
-    let b = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    helpers::mutate_branch(
-        &b,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
+    let external_uri = uri.clone();
+    let external = tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            external_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"Frank","age":41}}"#.to_string(),
+            "load_feature",
+        )
+    })
+    .await;
 
-    // Release A; it resumes, sees that B changed branch authority, discards its
-    // stale attempt, and reprepares Eve against the now-live feature fork.
     rv.release();
-    writer_a
-        .await
+    let writer_result = writer_a.await;
+    external.unwrap().expect("B must publish while A is parked");
+    assert!(!rv.timed_out(), "A must stay parked until B publishes");
+    writer_result
         .unwrap()
         .expect("A's retryable insert must reprepare after B wins the fork");
+    assert_eq!(
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        1,
+        "A must discard its stale attempt after the foreign writer publishes"
+    );
 
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -1288,6 +1362,251 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
     assert_eq!(count_rows(&db, "node:User").await, 1);
     let users = read_table(&db, "node:User").await;
     assert_eq!(collect_column_strings(&users, "name"), vec!["winner"]);
+}
+
+/// A Blob write re-prepared after a competing write evaluates its
+/// precondition against the fresh base, and an unconditional write carries
+/// the row's other cells from that fresh base, never from the stale one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn blob_put_reevaluates_its_precondition_and_recarries_the_row_after_a_competing_write() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
+
+    // The competing write changes only the note, yet it moves the content
+    // cell's validator: the parked put's If-Match no longer holds.
+    let stale = blob_etag(&db, "main", readme("content")).await;
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        let stale = stale.clone();
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"stale"),
+                Some(BlobPrecondition::Tags(vec![stale])),
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    set_readme_note(&db, "n1").await;
+    let competing_commits = main_commit_count(&db).await;
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("the stale If-Match fails against the fresh base");
+    let fresh = blob_etag(&db, "main", readme("content")).await;
+    assert_ne!(fresh, stale, "the competing write moved the validator");
+    assert!(
+        matches!(&error, OmniError::BlobWritePreconditionFailed { current_etag: Some(current) }
+            if current == fresh.as_str()),
+        "the refusal names the fresh validator: {error:?}"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        competing_commits,
+        "the refused put published nothing"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"Hello"
+    );
+    drop(rendezvous);
+
+    // An unconditional put parked while another put replaces the preview and
+    // an update replaces the note: its retry carries both.
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"fresh"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    db.put_blob_at_as(
+        "main",
+        readme("preview"),
+        Bytes::from_static(b"P1"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    set_readme_note(&db, "n2").await;
+    rendezvous.release();
+    let BlobWriteOutcome::Managed { etag, .. } = writer.await.unwrap().unwrap() else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(etag, blob_etag(&db, "main", readme("content")).await);
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"fresh"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("preview")).await,
+        b"P1",
+        "the retry carried the competing preview, not the stale one"
+    );
+    let documents = read_table(&db, "node:Document").await;
+    assert_eq!(collect_column_strings(&documents, "note"), ["n2"]);
+}
+
+/// A Blob write that re-prepares across an accepted-schema change or a
+/// delete-and-recreate of its branch fails closed, without effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn blob_put_fails_closed_when_schema_or_branch_incarnation_changes_between_attempts() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
+    let refused = |error: &OmniError| {
+        matches!(error, OmniError::Manifest(manifest)
+            if manifest.kind == ManifestErrorKind::Conflict
+                && manifest.message.contains("changed incarnation or accepted schema"))
+    };
+    let parked_put = |branch: &'static str| {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                branch,
+                readme("content"),
+                Bytes::from_static(b"lost"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = parked_put("main");
+    rendezvous.wait_until_reached().await;
+    db.apply_schema(&BLOB_WRITE_SCHEMA.replace("note: String?", "note: String?\n    tag: String?"))
+        .await
+        .unwrap();
+    let schema_commits = main_commit_count(&db).await;
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("a schema change refuses the retry");
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(main_commit_count(&db).await, schema_commits);
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"Hello"
+    );
+    drop(rendezvous);
+
+    db.branch_create("feature").await.unwrap();
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = parked_put("feature");
+    rendezvous.wait_until_reached().await;
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("a recreated branch refuses the retry");
+    assert!(refused(&error), "{error:?}");
+    for branch in ["feature", "main"] {
+        assert_eq!(
+            read_managed_blob_bytes(&db, ReadTarget::branch(branch), readme("content")).await,
+            b"Hello"
+        );
+    }
+}
+
+/// The receipt of a Blob put is evidence from its own detached commit: a
+/// write by another process that lands between the put's manifest commit and
+/// its return does not change the ETag the put reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_write_after_publication_cannot_change_a_blob_put_receipt() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(seed_blob_write_graph(&uri).await);
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT);
+    let writer = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"mine"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    // "Zm9yZWlnbg==" is "foreign".
+    let foreign = r#"{"type":"Document","data":{"title":"readme","content":"base64:Zm9yZWlnbg==","preview":"base64:UDA=","note":"n0"}}"#;
+    let external_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer(external_uri, LoadMode::Merge, foreign.to_string())
+    })
+    .await
+    .unwrap()
+    .expect("the foreign write publishes after the parked put's manifest commit");
+    rendezvous.release();
+    let BlobWriteOutcome::Managed {
+        length,
+        etag,
+        commit,
+    } = writer.await.unwrap().unwrap()
+    else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(length, 4);
+
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let at_commit = ReadTarget::snapshot(SnapshotId::new(commit.graph_commit_id.clone()));
+    let BlobContent::Managed {
+        etag: committed, ..
+    } = fresh
+        .read_blob_at(at_commit.clone(), readme("content"))
+        .await
+        .unwrap()
+        .content
+    else {
+        panic!("the put's commit holds a managed value");
+    };
+    assert_eq!(etag, committed, "the receipt names the put's own commit");
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, at_commit, readme("content")).await,
+        b"mine"
+    );
+    assert_ne!(
+        etag,
+        blob_etag(&fresh, "main", readme("content")).await,
+        "the head now holds the foreign write"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, ReadTarget::branch("main"), readme("content")).await,
+        b"foreign"
+    );
 }
 
 /// The coarse token is branch-wide: a commit to a table that the prepared
@@ -2008,6 +2327,675 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     );
 }
 
+/// Create `source` and `target` from main and give each its own insert, so a
+/// merge between them is three-way and reaches its manifest commit.
+async fn diverged_merge_pair(db: &helpers::Session, source: &str, target: &str) {
+    db.branch_create(source).await.unwrap();
+    db.branch_create(target).await.unwrap();
+    for (branch, age) in [(source, 51), (target, 52)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("On-{branch}"))], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Issue 643: merges into independent targets overlap. Merge A parks after
+/// its table effects, before its manifest commit, holding the shared schema
+/// permit and its own source and target branch gates; merge B between two
+/// other branches must run to completion meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn independent_target_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t1").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    let merged_b = tokio::time::timeout(std::time::Duration::from_secs(10), merge_b)
+        .await
+        .expect("a merge into another target must complete while A is parked")
+        .unwrap()
+        .expect("B must merge");
+    assert_eq!(merged_b.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(
+        !merge_a.is_finished(),
+        "A must still be parked before its manifest commit while B published"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643: merges into the same target stay serialized. With merge A
+/// parked before its manifest commit, holding the target's branch gate, a
+/// second merge into that target must wait; once A publishes, B merges on
+/// top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_target_merges_serialize_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t").await;
+    db.branch_create("s2").await.unwrap();
+    db.mutate(
+        "s2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s2")], &[("$age", 53)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let mut merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut merge_b)
+            .await
+            .is_err(),
+        "a merge into the same target must wait while A holds that target's gate"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after A")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "t holds the seed rows, its own insert and both sources' inserts"
+    );
+}
+
+/// Issue 643, delete boundary. Deleting a merge's target while the merge is
+/// parked before its manifest commit waits on the target's gate; the merge
+/// publishes, then the delete succeeds. Deleting its source does not wait:
+/// the merge released the source's gate once its tagged source snapshot was
+/// captured. The merge still publishes that snapshot, and the target keeps
+/// reading the merged row after cleanup reclaims what the deletion retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_target_delete_waits_and_source_delete_does_not_issue_643() {
+    for victim in ["t", "s"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        // An edge only the source adds: the merge adopts the source's
+        // `edge:Knows` pin as the target's, the case a reclaimed source would
+        // break.
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Diana"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        let db = std::sync::Arc::new(db);
+
+        let parked = helpers::failpoint::Rendezvous::park_first(
+            &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        );
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+
+        let delete_db = std::sync::Arc::clone(&db);
+        let mut delete = tokio::spawn(async move { delete_db.branch_delete(victim).await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut delete).await;
+        if victim == "t" {
+            assert!(
+                early.is_err(),
+                "deleting the target must wait while the merge holds its gate"
+            );
+        } else {
+            early
+                .expect("deleting the source must not wait for the merge")
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the source during the merge: {error}"));
+        }
+
+        parked.release();
+        assert_eq!(
+            merge
+                .await
+                .unwrap()
+                .expect("the merge must publish after release")
+                .outcome,
+            omnigraph::db::MergeOutcome::Merged,
+            "deleting {victim}"
+        );
+        if victim == "t" {
+            delete
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the target after the merge: {error}"));
+        } else {
+            let rows = db.cleanup(keep_one()).await.unwrap();
+            assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "node:Person").await,
+                6,
+                "t holds the seed rows, its own insert and the deleted source's"
+            );
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "edge:Knows").await,
+                4,
+                "t reads the edge adopted from the deleted source after cleanup"
+            );
+        }
+        assert!(
+            !db.branch_list().await.unwrap().iter().any(|b| b == victim),
+            "{victim} is gone"
+        );
+    }
+}
+
+/// Issue 643, same-source case: with a merge from `s` into `t1` parked
+/// before its manifest commit, a merge from `s` into `t2` runs to
+/// completion, because a merge holds its source's gate only through
+/// capture. Both land, and each target gets the source's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_source_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t1").await;
+    db.branch_create("t2").await.unwrap();
+    db.mutate(
+        "t2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-t2")], &[("$age", 54)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let first_db = std::sync::Arc::clone(&db);
+    let first = tokio::spawn(async move { first_db.branch_merge("s", "t1").await });
+    parked.wait_until_reached().await;
+
+    let second_db = std::sync::Arc::clone(&db);
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::spawn(async move { second_db.branch_merge("s", "t2").await }),
+    )
+    .await
+    .expect("a second merge from the same source must complete while the first is parked")
+    .unwrap()
+    .expect("the second merge must land");
+    assert_eq!(second.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(!first.is_finished(), "the first merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        first
+            .await
+            .unwrap()
+            .expect("the first merge must land")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and the source's"
+        );
+    }
+}
+
+/// Issue 643, writes on a merge's source: with a merge from `s` into `t`
+/// parked before its manifest commit, an insert on `s` completes. The merge
+/// publishes the source snapshot it captured, so the concurrent insert is not
+/// in `t` until a second merge carries it. The second half parks earlier, at
+/// candidate validation, on a merge whose `Person` change is proven
+/// insert-only: the source table moving past the proven version must not
+/// refuse a merge whose input is the captured, tagged version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn source_write_proceeds_during_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "During-merge")], &[("$age", 63)]),
+        ),
+    )
+    .await
+    .expect("an insert on the merge's source must not wait for the merge")
+    .expect("the insert on the source must land");
+    assert!(!merge.is_finished(), "the merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "s", "node:Person").await,
+        6,
+        "s holds the seed rows, its own insert and the concurrent one"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        6,
+        "t holds the seed rows, its own insert and the source as captured"
+    );
+    assert_eq!(
+        db.branch_merge("s", "t").await.unwrap().outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "a second merge carries the concurrent insert"
+    );
+
+    // The target diverges on `edge:Knows` only, so its `Person` equals the
+    // base and the source's `Person` inserts take the proven pure-insert path.
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("s").await.unwrap();
+    db.branch_create("t").await.unwrap();
+    db.mutate(
+        "s",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s")], &[("$age", 51)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "t",
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Diana"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
+    );
+    let probes = MergeWriteProbes::default();
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(with_merge_write_probes(probes.clone(), async move {
+        merge_db.branch_merge("s", "t").await
+    }));
+    parked.wait_until_reached().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "During-validation")], &[("$age", 64)]),
+        ),
+    )
+    .await
+    .expect("an insert on the merge's source must not wait for candidate validation")
+    .expect("the insert on the source must land");
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the source moving past the proven version must not refuse the merge")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert!(
+        probes.proven_insert_history_read_calls() >= 1,
+        "the merge must have certified the source's Person insertions"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        5,
+        "t holds the seed rows and the source's Person as captured"
+    );
+    assert_eq!(
+        db.branch_merge("s", "t").await.unwrap().outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        6,
+        "a second merge carries the insert made during validation"
+    );
+}
+
+/// Issue 643, failure boundary: merge A fails after its table effects,
+/// before its manifest commit, while merge B into an independent target is
+/// parked mid-merge holding its gates and the shared schema permit. A's
+/// target does not move, B still publishes, and A's gates are released: the
+/// same handle retries A to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn failed_merge_beside_an_independent_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+    let t1_head = branch_head_commit_id(dir.path(), "t1").await.unwrap();
+    let t1_person = helpers::snapshot_branch(&db, "t1")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    parked.wait_until_reached().await;
+
+    {
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("A must not wait on B's gates")
+        .expect_err("A must fail at its injected fault");
+        assert!(
+            error.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "A must fail at the injected fault, not earlier: {error}"
+        );
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t1").await.unwrap(),
+        t1_head,
+        "the failed merge must not move its target's graph head"
+    );
+    assert_eq!(
+        helpers::snapshot_branch(&db, "t1")
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        t1_person,
+        "the failed merge's table effects must stay unpublished"
+    );
+    assert!(
+        !merge_b.is_finished(),
+        "B must still be parked after A failed"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("the failed merge must have released its gates")
+        .expect("the same handle must retry A once the fault stops")
+        .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643, cancellation: a merge whose task is aborted while it is parked
+/// at a seam stops at its first await after the release. On a local store
+/// that falls before its manifest commit, after its table effects at the
+/// later seam; the assertions also accept a merge that published before the
+/// cancel took effect. Either way the target is whole (untouched, or merged
+/// with a new head), the handle stays live (the retry completes and another
+/// write lands), and cleanup succeeds afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cancelled_merge_leaves_the_target_whole_issue_643() {
+    for seam in [
+        &catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        let db = std::sync::Arc::new(db);
+        let head_before = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+        let parked = helpers::failpoint::Rendezvous::park_first(seam);
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+        merge.abort();
+        parked.release();
+        let outcome = merge.await;
+        drop(parked);
+
+        let merged = branch_head_commit_id(dir.path(), "t").await.unwrap() != head_before;
+        let rows = helpers::count_rows_branch(&db, "t", "node:Person").await;
+        let seam = seam.name();
+        match &outcome {
+            Ok(result) => assert_eq!(
+                &result
+                    .as_ref()
+                    .expect("an uncancelled merge must land")
+                    .outcome,
+                &omnigraph::db::MergeOutcome::Merged,
+                "{seam}"
+            ),
+            Err(join) => assert!(join.is_cancelled(), "{seam}: {join}"),
+        }
+        if outcome.is_ok() {
+            assert!(
+                merged,
+                "{seam}: an acknowledged merge moves the target head"
+            );
+        }
+        assert_eq!(
+            rows,
+            if merged { 6 } else { 5 },
+            "{seam}: the target is merged whole or untouched"
+        );
+
+        let retried = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s", "t"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{seam}: the cancelled merge must have released its gates"))
+        .unwrap_or_else(|error| panic!("{seam}: the retry must merge: {error}"));
+        assert_eq!(
+            retried.outcome,
+            if merged {
+                omnigraph::db::MergeOutcome::AlreadyUpToDate
+            } else {
+                omnigraph::db::MergeOutcome::Merged
+            },
+            "{seam}"
+        );
+        db.mutate(
+            "t",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After-cancel")], &[("$age", 56)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{seam}: a later write on the target: {error}"));
+        let rows = db.cleanup(keep_one()).await.unwrap();
+        assert!(
+            rows.iter().all(|row| row.error.is_none()),
+            "{seam}: {rows:?}"
+        );
+        assert_eq!(
+            helpers::count_rows_branch(&db, "t", "node:Person").await,
+            7,
+            "{seam}: seed rows, both inserts, the merged row and the later write"
+        );
+    }
+}
+
+/// Issue 643, branch recreation: another process deletes a merge's target
+/// and creates a branch of the same name while the merge is parked after its
+/// table effects, before its manifest commit. The name now denotes a new
+/// branch lifetime, so the merge must refuse rather than publish into it,
+/// and the recreated target keeps exactly what its own writer put there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    let child_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            child_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"On-t-recreated","age":55}}"#.to_string(),
+            "merge_target_recreated",
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the other process recreates the target");
+    let recreated_head = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+    parked.release();
+    let error = merge
+        .await
+        .unwrap()
+        .expect_err("the merge must refuse a target recreated under its name");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(manifest)
+                if !manifest.publication_in_doubt
+                    && matches!(
+                        &manifest.details,
+                        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                            if member == "branch_identifier:t"
+                    )
+        ),
+        "the refusal must name the target's changed branch identity: {error:?}"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t").await.unwrap(),
+        recreated_head,
+        "the refused merge must not move the recreated target"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "t", "node:Person").await,
+        5,
+        "the recreated target holds the seed rows and its own writer's row only"
+    );
+}
+
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
 /// namespace inventory, so a sibling create with disjoint branch gates must
 /// wait at the gate, then refuse on the collision the first leaves behind.
@@ -2027,18 +3015,20 @@ async fn sibling_branch_creates_exclude_at_the_schema_gate() {
     let first = tokio::spawn(async move { first_db.branch_create("feature").await });
     after_inventory.wait_until_reached().await;
 
+    let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let second_db = std::sync::Arc::clone(&db);
-    let mut second = tokio::spawn(async move {
+    let second = tokio::spawn(async move {
         second_db
             .branch_create_from(ReadTarget::branch("b"), "feature/x")
             .await
     });
-    let overtaking = tokio::time::timeout(std::time::Duration::from_secs(1), &mut second).await;
+    queued.wait_until_reached().await;
     assert!(
-        overtaking.is_err(),
+        !second.is_finished(),
         "a sibling create must wait at the schema gate while the first create sits \
          between its inventory and its native create"
     );
+    queued.release();
 
     after_inventory.release();
     first
@@ -2696,7 +3686,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_no_recovery_sidecars(dir.path());
     assert_no_staging_files(dir.path());
 
-    // The Person rewrite is a detached version and the Tag create is an
+    // The Person column add is a detached version and the Tag create is an
     // unregistered dataset: nothing moved the manifest or any linear HEAD,
     // so reopening has nothing to roll back.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -2720,7 +3710,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_eq!(
         person_head.version().version,
         person_head_before,
-        "a detached rewrite never moves the linear HEAD"
+        "a detached schema evolution never moves the linear HEAD"
     );
     assert!(snapshot.dataset("node:Tag").is_none());
     let live_schema = db.schema_source();
@@ -2729,7 +3719,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
 
     db.apply_schema(&v2_schema)
         .await
-        .expect("the retry rewrites from the pin and reclaims the Tag leftover");
+        .expect("the retry evolves from the pin and reclaims the Tag leftover");
     assert!(db.schema_source().contains("city: String?"));
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
@@ -3071,7 +4061,7 @@ edge WorksAt: Human -> Company
         let error = db
             .apply_schema(desired)
             .await
-            .expect_err("rename+rewrite must stop after its detached table effect");
+            .expect_err("rename + key-property rename must stop after its detached table effect");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial rename error: {error}"
@@ -3081,8 +4071,8 @@ edge WorksAt: Human -> Company
     assert_no_staging_files(dir.path());
     drop(db);
 
-    // The rewrite is a detached version behind the source alias's pin; the
-    // rename was never published. Reopening finds the graph untouched.
+    // The column rename is a detached Project behind the source alias's pin;
+    // the type rename was never published. Reopening finds the graph untouched.
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let snapshot = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -3099,7 +4089,7 @@ edge WorksAt: Human -> Company
     recovered
         .apply_schema(desired)
         .await
-        .expect("the retry publishes the rename and rewrite");
+        .expect("the retry publishes the type and property renames");
     assert_eq!(
         helpers::count_rows(&recovered, "node:Human").await,
         people_before
@@ -3164,7 +4154,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
         assert_eq!(
             head.version().version,
             heads_before[type_name],
-            "{type_name}: a detached rewrite never moves the linear HEAD"
+            "{type_name}: a detached schema evolution never moves the linear HEAD"
         );
     }
     assert_eq!(
@@ -3270,7 +4260,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
             .version()
             .version,
         winner_lance_head,
-        "the abandoned detached rewrite never moved the linear HEAD"
+        "the abandoned detached schema evolution never moved the linear HEAD"
     );
     assert_eq!(
         branch_head_commit_id(dir.path(), "main").await.unwrap(),
@@ -6420,6 +7410,154 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     assert_person_pin_detached(&db, "main", head_before).await;
 }
 
+/// A Blob put and a Blob clear whose publication acknowledgement is lost are
+/// published exactly once: the caller's retry with its old validator is
+/// refused, the cell reads the same from the writer's handle and a fresh
+/// one, and the same handle writes again once the fault stops.
+#[tokio::test]
+#[serial]
+async fn blob_put_and_clear_publish_once_through_a_lost_acknowledgement() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = seed_blob_write_graph(&uri).await;
+    let original = blob_etag(&db, "main", readme("content")).await;
+    let before = main_commit_count(&db).await;
+
+    {
+        let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
+        let error = db
+            .put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"Published"),
+                Some(BlobPrecondition::Tags(vec![original.clone()])),
+                None,
+            )
+            .await
+            .expect_err("the acknowledgement is lost after publication");
+        assert!(
+            error
+                .to_string()
+                .contains("graph_publish.after_manifest_commit"),
+            "the publication boundary must be reached: {error}"
+        );
+    }
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 1,
+        "published exactly once"
+    );
+    let published = blob_etag(&db, "main", readme("content")).await;
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        blob_etag(&fresh, "main", readme("content")).await,
+        published
+    );
+    for handle in [&db, &fresh] {
+        assert_eq!(
+            read_managed_blob_bytes(handle, ReadTarget::branch("main"), readme("content")).await,
+            b"Published"
+        );
+    }
+    let retry = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"Published"),
+            Some(BlobPrecondition::Tags(vec![original])),
+            None,
+        )
+        .await
+        .expect_err("a retry with the old validator finds the published value");
+    assert!(
+        matches!(&retry, OmniError::BlobWritePreconditionFailed { current_etag: Some(current) }
+            if current == published.as_str()),
+        "{retry:?}"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 1,
+        "the retry published nothing"
+    );
+
+    {
+        let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
+        db.clear_blob_at_as(
+            "main",
+            readme("content"),
+            Some(BlobPrecondition::Tags(vec![published.clone()])),
+            None,
+        )
+        .await
+        .expect_err("the clear's acknowledgement is lost after publication");
+    }
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 2,
+        "the clear published exactly once"
+    );
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    for handle in [&db, &fresh] {
+        let error = handle
+            .read_blob_at(ReadTarget::branch("main"), readme("content"))
+            .await
+            .expect_err("a cleared cell has no value and no validator");
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound),
+            "{error:?}"
+        );
+    }
+    let retry = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"again"),
+            Some(BlobPrecondition::Tags(vec![published])),
+            None,
+        )
+        .await
+        .expect_err("the cleared cell rejects its old validator");
+    assert!(
+        matches!(
+            &retry,
+            OmniError::BlobWritePreconditionFailed { current_etag: None }
+        ),
+        "{retry:?}"
+    );
+    assert!(matches!(
+        db.clear_blob_at_as("main", readme("content"), None, None)
+            .await
+            .unwrap(),
+        BlobWriteOutcome::Null { commit: None }
+    ));
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 2,
+        "no duplicate clear"
+    );
+
+    let BlobWriteOutcome::Managed { etag, .. } = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"Next"),
+            None,
+            None,
+        )
+        .await
+        .expect("the same handle writes again once the fault stops")
+    else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(etag, blob_etag(&fresh, "main", readme("content")).await);
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, ReadTarget::branch("main"), readme("preview")).await,
+        b"P0",
+        "every write carried the preview"
+    );
+}
+
 /// Exercise both shared backend contracts locally even without configured cloud fixtures.
 #[tokio::test]
 #[serial]
@@ -8172,12 +9310,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         .unwrap();
     }
     let person_uri = node_table_uri(&db, "Person").await;
-    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
-    let detached_before = raw.list_detached_manifests().await.unwrap().len();
+    let detached_before = detached_versions(&person_uri).await;
     assert!(
-        detached_before >= 3,
+        detached_before.len() >= 3,
         "every write leaves its detached version"
     );
+    let pins = pins_in_history(&db, "main", "node:Person").await;
 
     for pass in 0..2 {
         let stats = db
@@ -8197,9 +9335,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         );
     }
 
-    let detached_after = raw.list_detached_manifests().await.unwrap().len();
+    // Every pinned version is a young proven copy and stays; only the first
+    // load's effect beneath its full-text declaration, a link no commit pins,
+    // is reclaimed.
     assert_eq!(
-        detached_after, detached_before,
+        detached_versions(&person_uri).await,
+        &detached_before & &pins,
         "young proven copies are kept, not reaped"
     );
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
@@ -8547,8 +9688,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 2,
-        "the retry sweeps what the first pass left of the two links and main's pruned base pin: {row:?}"
+        row.manifests_removed, 3,
+        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
+         base load's effect beneath its full-text declaration: {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {
@@ -8627,6 +9769,662 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
         source_rows,
         "the landed merge remains readable without replay"
     );
+}
+
+/// A failed authority probe after the proposal tag of a merge `as commit`
+/// exists releases the tag with the input holds. Rust, not `.gqt`: the
+/// observable is a native tag of a write that returned no id.
+#[tokio::test]
+#[serial]
+async fn merge_as_commit_probe_failure_releases_the_proposal_tag() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.load(
+        "source",
+        r#"{"type":"Person","data":{"name":"probe-failed","age":42}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let native = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    let outcome = {
+        let _probe = catalog::PROPOSE_POST_TAG_PRE_PROBE.fail_once_at(1);
+        db.branch_merge_as_with_options("source", "target", None, true)
+            .await
+    };
+    let error = outcome.unwrap_err();
+    assert!(
+        !error.is_manifest_publish_in_doubt(),
+        "a released tag is a conclusive failure: {error}"
+    );
+    assert!(
+        error.to_string().contains("propose.post_tag_pre_probe"),
+        "{error}"
+    );
+    let tags = native.tags().list().await.unwrap();
+    assert!(
+        !tags.keys().any(|name| name.starts_with("unpublished_")),
+        "a proposal whose input holds are released must not stay addressable: {tags:?}"
+    );
+    assert!(
+        !tags
+            .keys()
+            .any(|name| name.starts_with("__omnigraph_merge_input_v1_")),
+        "a conclusive failure releases the merge input holds: {tags:?}"
+    );
+    assert!(
+        db.list_unpublished_commits(None).await.unwrap().is_empty(),
+        "no unpublished commit is listed after the undone proposal"
+    );
+}
+
+const UNATTACHED_ROOT_QUERY: &str = r#"
+query insert_root($name: String, $age: I32) as unattached branch {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+const UNATTACHED_CHILD_QUERY: &str = r#"
+query insert_child($name: String, $age: I32, $base: String) as unattached branch on $base {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+/// The child declaration with its base spelled as a literal.
+fn unattached_child_on(base: &str) -> String {
+    format!(
+        r#"
+query insert_child($name: String, $age: I32) as unattached branch on "{base}" {{
+    insert Person {{ name: $name, age: $age }}
+}}
+"#
+    )
+}
+
+/// The parameters of one Person insert, with the base id of a child written
+/// by parameter.
+fn person_params(name: &str, age: i64, base: Option<&str>) -> omnigraph_compiler::ir::ParamMap {
+    let mut strings = vec![("$name", name)];
+    if let Some(base) = base {
+        strings.push(("$base", base));
+    }
+    mixed_params(&strings, &[("$age", age)])
+}
+
+async fn person_count_at(db: &Omnigraph, target: ReadTarget) -> usize {
+    db.snapshot_of(target)
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap()
+}
+
+fn manifest_kind(error: &OmniError) -> Option<ManifestErrorKind> {
+    match error {
+        OmniError::Manifest(error) => Some(error.kind),
+        _ => None,
+    }
+}
+
+/// The engine path of RFC "Unattached graph branches" end to end, in Rust
+/// until the GQT runner substitutes `on "${name}"` (plan step 8): root,
+/// children by literal and parameter, reads, refusals, publish refusal, drop.
+#[tokio::test]
+#[serial]
+async fn unattached_root_and_child_write_read_refuse_publish_and_drop() {
+    use omnigraph::db::GraphCommitKind;
+    use omnigraph::error::ManifestConflictDetails;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let main_commits = db.list_commits(Some("main")).await.unwrap();
+    let main_head = main_commits[0].graph_commit_id.clone();
+
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.branch, "main");
+    assert_eq!(root.result.affected_nodes, 1);
+    let root = root
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    assert_eq!(root.kind, GraphCommitKind::Unattached);
+    assert!(!root.published);
+    assert_eq!(
+        root.root_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_eq!(root.parent_commit_id.as_deref(), Some(main_head.as_str()));
+    assert_eq!(root.graph_branch, None);
+    assert!(is_detached_version(root.graph_manifest_version));
+
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.branch, "main");
+    let child = child
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    assert_eq!(child.kind, GraphCommitKind::Unattached);
+    assert_eq!(child.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        child.parent_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_ne!(child.graph_commit_id, root.graph_commit_id);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("grandchild", 3, Some(&child.graph_commit_id)),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("a child by parameter reports its snapshot");
+    assert_eq!(grandchild.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        grandchild.parent_commit_id.as_deref(),
+        Some(child.graph_commit_id.as_str())
+    );
+
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(
+        person_count_at(&db, at(&grandchild.graph_commit_id)).await,
+        main_before + 3
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+    assert_eq!(db.get_commit(&child.graph_commit_id).await.unwrap(), child);
+    assert!(db.list_unpublished_commits(None).await.unwrap().is_empty());
+    let listed: Vec<String> = db
+        .list_unattached_commits(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|commit| commit.graph_commit_id)
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            grandchild.graph_commit_id.clone(),
+            child.graph_commit_id.clone(),
+            root.graph_commit_id.clone()
+        ],
+        "live snapshots list newest first"
+    );
+    assert_eq!(
+        db.commit_target_branch(&child.graph_commit_id)
+            .await
+            .unwrap(),
+        "main"
+    );
+
+    let refused = db
+        .mutate_with_receipt(
+            "feature",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("elsewhere", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused.to_string().contains("is not the recorded target"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&main_head),
+            "insert_child",
+            &person_params("published-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused
+            .to_string()
+            .contains("is not an unattached snapshot"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "insert_child",
+            &person_params("unknown-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("no-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(refused.to_string().contains("is missing"), "{refused}");
+
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let refused = db.publish_commit_as(id, None).await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+        let OmniError::Manifest(manifest_error) = refused else {
+            panic!("a publish refusal is a typed manifest conflict");
+        };
+        assert_eq!(manifest_error.kind, ManifestErrorKind::Conflict);
+        assert_eq!(
+            manifest_error.details,
+            Some(ManifestConflictDetails::UnattachedCannotPublish {
+                graph_commit_id: id.clone()
+            })
+        );
+    }
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+
+    db.drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    for id in [
+        &root.graph_commit_id,
+        &child.graph_commit_id,
+        &grandchild.graph_commit_id,
+    ] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+        assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let repeated = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&repeated), Some(ManifestErrorKind::NotFound));
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+}
+
+/// A child write whose base is dropped between its resolution and its effect
+/// gates refuses under the gates, before any detached table commit: the
+/// table's detached manifests and main are as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn unattached_child_refuses_after_its_base_is_dropped_before_the_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let staged_before = detached_versions(&person_uri).await;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        let query = unattached_child_on(&root.graph_commit_id);
+        tokio::spawn(async move {
+            db.mutate_with_receipt(
+                "main",
+                &query,
+                "insert_child",
+                &person_params("child", 2, None),
+            )
+            .await
+        })
+    };
+    parked.wait_until_reached().await;
+    let dropper = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    dropper
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    parked.release();
+    let refused = writer.await.unwrap().unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    assert!(
+        refused.to_string().contains("dropped before the write"),
+        "{refused}"
+    );
+    assert_eq!(
+        detached_versions(&person_uri).await,
+        staged_before,
+        "the refused child committed no detached table version"
+    );
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+}
+
+/// A root and a child of it on main, written through the engine.
+async fn write_unattached_root_and_child(
+    db: &Session,
+) -> (omnigraph::db::GraphCommit, omnigraph::db::GraphCommit) {
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    (root, child)
+}
+
+/// The detached Person version the snapshot `id` pins.
+async fn person_pin_at(db: &Omnigraph, id: &str) -> u64 {
+    db.snapshot_of(ReadTarget::snapshot(SnapshotId::new(id.to_string())))
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .published_dataset_version()
+}
+
+/// Keep one `__manifest` version per branch and reap at any age: what the
+/// collector roots is the only thing that survives.
+fn keep_one_at_any_age() -> omnigraph::db::CleanupPolicyOptions {
+    omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    }
+}
+
+/// Every detached Person manifest aged to the epoch.
+fn age_detached_manifests(person_uri: &str) {
+    for entry in std::fs::read_dir(std::path::Path::new(person_uri).join("_versions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap().to_string_lossy().starts_with('d') {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+}
+
+async fn unattached_tags(uri: &str) -> std::collections::BTreeSet<String> {
+    helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None)
+        .await
+        .tags()
+        .list()
+        .await
+        .unwrap()
+        .into_keys()
+        .filter(|name| name.starts_with("unattached_"))
+        .collect()
+}
+
+/// A live chain's complete result pins are roots: a cleanup that reaps at
+/// any age keeps the root's and the child's detached Person versions, their
+/// tags and their reads (RFC "Unattached graph branches", collector).
+#[tokio::test]
+#[serial]
+async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    assert_ne!(root_pin, child_pin);
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        plan.roots.contains(&root_pin) && plan.roots.contains(&child_pin),
+        "a live snapshot's pins are roots: {:?}",
+        plan.roots
+    );
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    assert!(
+        report.retained_unattached_tags.iter().any(|record| {
+            record.graph_commit_id == child.graph_commit_id
+                && record.parent_commit_id == root.graph_commit_id
+                && record.root_commit_id == root.graph_commit_id
+        }),
+        "{:?}",
+        report.retained_unattached_tags
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        remaining.contains(&root_pin) && remaining.contains(&child_pin),
+        "the rooted pins survive the reap: {remaining:?}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(db.list_unattached_commits(None).await.unwrap().len(), 2);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&child.graph_commit_id),
+            "insert_child",
+            &person_params("grandchild", 3, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let grandchild_pin = person_pin_at(&db, &grandchild.graph_commit_id).await;
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    let main = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    main.tags().delete(&child_tag).await.unwrap();
+    insert_person(&db, "main", "after-missing-ancestor").await;
+    age_detached_manifests(&person_uri);
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.roots.contains(&grandchild_pin));
+    assert!(plan.roots.contains(&root_pin));
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(remaining.contains(&grandchild_pin));
+    assert!(remaining.contains(&root_pin));
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let refused = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+
+    let refused = db
+        .snapshot_of(at(&grandchild.graph_commit_id))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+}
+
+/// A head advance expires the chain: its pins are no longer roots, cleanup
+/// releases the child's tag before the root's with a readback each, and a
+/// failure between the two leaves the root addressable for the retry.
+#[tokio::test]
+#[serial]
+async fn cleanup_releases_expired_unattached_tags_descendants_first() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    let root_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, root.graph_commit_id
+    );
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone(), child_tag.clone()])
+    );
+    insert_person(&db, "main", "after").await;
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        !plan.roots.contains(&root_pin) && !plan.roots.contains(&child_pin),
+        "an expired snapshot roots nothing: {:?}",
+        plan.roots
+    );
+    assert!(report.retained_unattached_tags.is_empty());
+    let order: Vec<&str> = omnigraph::db::unattached_release_order(
+        &report.expired_unattached_tags,
+        &report.retained_unattached_tags,
+    )
+    .into_iter()
+    .map(|record| record.name.as_str())
+    .collect();
+    assert_eq!(order, [child_tag.as_str(), root_tag.as_str()]);
+
+    let interrupted = {
+        let _fp = catalog::CLEANUP_POST_UNATTACHED_RELEASE.fail_once_at(1);
+        db.cleanup(keep_one_at_any_age()).await.unwrap_err()
+    };
+    assert!(
+        interrupted
+            .to_string()
+            .contains("cleanup.post_unattached_release"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone()]),
+        "the child's tag went first; the root's stays for the retry"
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert!(unattached_tags(&uri).await.is_empty());
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        !remaining.contains(&root_pin) && !remaining.contains(&child_pin),
+        "the unrooted pins are reaped: {remaining:?}"
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before + 1
+    );
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
 }
 
 /// Cancellation preserves accepted inputs until the target's exact publication
@@ -8799,4 +10597,61 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
             .unwrap(),
         2
     );
+}
+
+/// A storage failure met while planning a read (opening a table for its
+/// index facts, or for the scan-access split) reaches the query door as the
+/// injected `Manifest` error itself, not a planner-error wrapper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn planning_source_failures_keep_their_error_class() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Planned")], &[("$age", 7)]),
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    let lookup = params(&[("$name", "Planned")]);
+    for seam in [
+        &catalog::QUERY_INDEX_FACTS_PRE_LOAD,
+        &catalog::QUERY_SCAN_ACCESS_PRE_TABLE_OPEN,
+    ] {
+        let _failpoint = seam.fire_always();
+        let error = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            )
+            .await
+            .expect_err("the injected planning failure must surface");
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::BadRequest
+                        && manifest.message
+                            == format!("injected failpoint triggered: {}", seam.name())
+            ),
+            "{}: {error}",
+            seam.name()
+        );
+    }
+    let rows = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &lookup,
+        )
+        .await
+        .expect("the next read plans and runs");
+    assert_eq!(rows.num_rows(), 1);
 }

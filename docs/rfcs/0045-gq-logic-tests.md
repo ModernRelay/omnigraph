@@ -275,10 +275,13 @@ existing, test-attributed, and given an added line carrying an
 alphanumeric character, not a comment or an attribute, inside its body;
 `N` must be followed by a non-digit or by the end of the line (Rust
 shape) (`issue_5630` never matches issue 563;
-`issue_563_underfill` does). The Rust shape matches only in top-level
+`issue_563_underfill` does). The Rust shape matches in top-level
 test targets, `crates/*/tests/<name>.rs` and `tools/*/tests/<name>.rs`,
-and in-source modules, `crates/*/src/**` and `tools/*/src/**`; helper and
-fixture modules under `tests/` never match (a helper named for an issue
+their `tests/integration/main.rs` roots and direct modules with a bare,
+top-level `mod <name>;` declaration in that root at the head commit, and
+in-source modules, `crates/*/src/**` and `tools/*/src/**`. Attributed
+declarations, path overrides and deeper integration modules are not resolved;
+other helper and fixture modules under `tests/` never match (a helper named for an issue
 is not a test). A plain function, however named, never satisfies the
 gate; an added definition is skipped when its name starts with `_`, when
 the line is a declaration ending in `;`, or when the same name is
@@ -460,9 +463,9 @@ list; no line ever continues a previous entry); a key given twice is
 refused, except `# notes:`, which repeats to carry a multi-line note;
 `# notes:` and `# traversal:` are optional. `# issue:` takes a number in canonical
 spelling (no sign, no leading zeros) or `none`; any other spelling is
-refused. `# traversal:` takes `indexed` or `csr` and pins every
-declaration step to that mode, for cases whose subject is one traversal
-path (Execution semantics owns the default); a statement step traverses
+refused. `# traversal:` takes `auto`, `indexed` or `csr` and prepares indexes.
+`indexed` and `csr` pin every declaration step to that mode; `auto` retains
+cost-based selection. A statement step traverses
 nothing and runs outside the pin. `# traversal:` in a file that names a
 server API (Execution routes, below) is refused: the pin is a task-local seam of the runner process.
 
@@ -484,8 +487,8 @@ in Seams at an explicit step. A step is one of:
   kinds. A seed may use `--- seed generate: v1 seed: <u64>` with the same
   recipe, appending batches in order instead of loading inline JSONL with
   overwrite semantics. Generators include literals, repeated strings,
-  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors
-  and ordinal/uniform/Zipf endpoints. Table `commits` fixes the number of
+  affine ordinals, formatted keys, modulo values, ordinal ranges, vectors,
+  ordinal/uniform/Zipf endpoints and `base64:` Blob values. Table `commits` fixes the number of
   loader calls, with optional `batch_rows` fixing the chunk boundaries.
   A generated load requires at least one nonempty batch; empty recipes are
   admitted only as seeds, and any explicit batch size remains bounded.
@@ -585,7 +588,11 @@ in Seams at an explicit step. A step is one of:
   blocks only and refuses count predicates and a string `nearest` argument,
   so a step using those carries no reference comparison.
 - `--- mutate via <api>` (one API of Execution routes, below) holding exactly one GQ declaration with a mutation body,
-  followed by an optional `--- params` and a mandatory `--- expect` with
+  followed by an optional `--- params` (a JSON object, or a
+  `--- params generate: v1 seed: <u64>` recipe of one generator per
+  parameter, the same for a query step; see the
+  [generated fixture contract](../../crates/omnigraph-gqt/README.md#generated-fixtures-and-loads))
+  and a mandatory `--- expect` with
   mode word `ok` (success, counts unasserted),
   `affected: nodes=<N> edges=<M>` (success with both counts asserted; both
   are required, enumerated rather than summed), or `error: <substring>`.
@@ -693,6 +700,18 @@ header line), loop or no loop, is refused, and inside a params or expect
 body every `${...}` must name the enclosing loop's variable (no enclosing
 loop, or any other name, is refused); no escape syntax exists for a
 literal `${`.
+
+Commit bindings (RFC "Unpublished graph commits") are the one exception
+to the statement-body fence. `--- bind commit $name`, an empty section
+directly after the `--- expect` of a mutation declaration, a `branch merge`
+or a `commit publish` expected to succeed, binds that write's commit id for
+the rest of the case, across `--- restart`; a write with no commit fails
+the step, a name is bound once and used only after its binding, and a
+binding inside a loop is refused. `--- query snapshot: $name` reads at the
+bound commit. A commit control statement whose whole quoted operand is the
+name, `commit publish "${name}"` or `commit drop "${name}"`, is dispatched
+with the bound id substituted, so the engine and the server parse an
+ordinary literal; any other `${` in a statement body stays refused.
 
 Null cells: a seed row sets a nullable property to null by writing JSON
 `null` for it. A result row omits a null cell's key (the Arrow JSON writer,

@@ -70,7 +70,7 @@ gate:
 
 ```bash
 cargo check -p omnigraph-engine --locked
-cargo test -p omnigraph-engine --test traversal
+cargo test -p omnigraph-engine --test integration traversal_indexed::
 ```
 
 Substitute the owning package and existing test target; the coverage map in
@@ -98,7 +98,7 @@ When your change touches the server API surface, regenerate locally and commit
 the result in the same PR:
 
 ```bash
-OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date
+OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test integration openapi::openapi_spec_is_up_to_date
 ```
 
 ### Cargo features

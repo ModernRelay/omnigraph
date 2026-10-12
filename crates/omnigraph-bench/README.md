@@ -47,15 +47,15 @@ Generated selected loads must make one loader call. Prefix writes are refused,
 and at least one following step must carry an explicit verification
 expectation. A restart alone does not meet that requirement.
 
-The prefix derives process-cold, warmed-by-program, or reopened-after-program
-treatment. Settings/show are neutral. Warming requires observed engine-read
+For embedded execution, the prefix derives process-cold, warmed-by-program,
+or reopened-after-program treatment. Settings/show are neutral. Warming requires observed engine-read
 callbacks, not merely a syntactic query whose parameters fail before execution.
 Every repetition uses a fresh process. OS page-cache state is uncontrolled or
 conditioned by the named `gqt-read-set-v1` program; neither page-cache-cold nor
 storage-cold is representable.
 
-The engine operation timer and logical counters close before expectations and
-verification. Reads materialize results within the interval. A selected
+For embedded execution, the engine operation timer and logical counters close
+before expectations and verification. Reads materialize results within the interval. A selected
 restart installs fresh counting storage before timing, measures the engine
 open, and validates its preparation gate after the interval. Generated load
 rows are prepared outside a single-call measurement. Optional merge probes
@@ -72,7 +72,7 @@ watchdog and preparation/verification bounds; the authored whole-file GQT
 budget also applies. The operation alone owns the benchmark clock. Parsing,
 building, restore, warm-up, assertions, archival work, and cleanup are excluded.
 
-Dataset construction runs in a bounded child process. The cache builds at its
+Embedded dataset construction runs in a bounded child process. The cache builds at its
 final `<key>/active` path, closes every engine handle, freezes a never-opened
 `root/` template, retires active, and publishes `fixture-source.json` followed
 by `dataset-build.json`. The parent accepts only after reap, process-group
@@ -102,12 +102,15 @@ or changed published evidence is corruption, never a silent rebuild. Unknown
 unpublished state and uncertain process containment are preserved/quarantined;
 operator inspection must establish quiescence before removing such state.
 
-Final `point_id` binds recipe/query contents, verified dataset logical witness,
-selected ordinal/echo, derived cache treatment, backend, and protocol. It is
+Final `point_id` binds a dataset logical witness, verified by embedded acquisition
+or declared in the served deployment receipt, plus recipe/query contents,
+the selected ordinal/echo, cache treatment, target, network position, backend
+and protocol. It is
 unavailable during syntax-only planning; `planned_sha256` detects duplicate
 content experiments before build. Paths, human case IDs, repetitions, physical
-tree bytes, and cache hits do not change the point. Dataset identity covers
-all live branches' keyed-node properties, edge endpoints/properties and
+tree bytes, and cache hits do not change the point. For embedded acquisition,
+dataset identity is computed from all live branches' keyed-node properties,
+edge endpoints/properties and
 multiplicity, schema/index inventory, and normalized two-parent commit DAGs.
 Generated unkeyed edge IDs, commit ULIDs/timestamps, and physical manifest
 versions are excluded. Explicit IDs authored in a recipe remain bound by its
@@ -130,6 +133,110 @@ release/compiler facts, engine features, and machine identity. Effective
 LTO/codegen/strip options remain unproved without a controlled build receipt.
 Cleanup requires direct-child reap, process-group exit, and clean stdio;
 uncertain containment cannot release a cache entry for safe reuse.
+
+## Served read-only acquisition
+
+`query-shapes-served` and `traversal-served` add server-target variants with
+separate workload sources and point identities. Select one scenario against
+an already provisioned graph:
+
+```bash
+target/release/omnigraph-bench run e2e-query-count-served \
+  --server http://127.0.0.1:8080 --graph bench \
+  --server-receipt /path/to/deployment.json \
+  --server-token-env BENCH_SERVER_TOKEN \
+  --dataset-cache /path/to/client-scratch --repetitions 5 --json
+```
+
+The token option names an existing environment variable; it never takes the
+credential itself on the command line. Choose a separate name outside the
+`LANCE_` and `OMNIGRAPH_` runtime namespaces. The endpoint must use HTTP(S), with no
+URL credentials, query or fragment, and name the server base rather than a
+`/graphs/...` path. Credentials travel to each client worker
+only in its bounded private stdin frame. Durable evidence stores the SHA-256
+of the normalized endpoint, not its raw URL. URL normalization canonicalizes
+the host and default port, then trailing slashes are removed; for example,
+`http://LOCALHOST:80/` becomes `http://localhost`.
+
+Provision and validate the graph once outside acquisition. Supply a JSON
+receipt declaring the deployed server and that graph's dataset. The receipt
+file is at most 8 KiB, and the receipt together with the observed client build
+and machine identity must fit 8 KiB:
+
+```json
+{
+  "format_version": 1,
+  "endpoint_sha256": "<SHA-256 of normalized endpoint>",
+  "graph": "bench",
+  "server": {
+    "package_version": "<deployed version>",
+    "source_commit": "<full lowercase commit hash>",
+    "source_tree_dirty": false,
+    "profile": "release",
+    "cargo_opt_level": "2",
+    "debug_assertions": false,
+    "artifact": {"kind": "executable", "sha256": "<executable SHA-256>"},
+    "target_triple": null,
+    "rustc_version": null,
+    "engine": null
+  },
+  "backend": {"kind": "local-fs", "filesystem": "apfs", "storage_class": "nvme-ssd"},
+  "dataset": {
+    "recipe_sha256": "<selected dataset recipe SHA-256>",
+    "logical_content_sha256": "<validated deployment dataset SHA-256>",
+    "algorithm": "omnigraph-gqt-branches-lineage-equivalence-v1"
+  },
+  "machine": null
+}
+```
+
+Replace every placeholder with deployment evidence. An image digest may use
+`artifact.kind: image` instead. The optional machine, engine, target and
+compiler fields remain absent when unproved; supplied values use the same
+strict types as embedded records. The receipt binds declared facts, not remote
+attestation: the public version API cannot prove the server's source, profile,
+artifact or dataset content. GQT row expectations check the workload results,
+but do not independently verify the declaration. Every served record therefore
+has `claim_eligible: false` and `sut.kind: declared-deployment`.
+
+One invocation accepts one receipt, endpoint and graph. All selected scenarios
+must use that receipt's dataset recipe and backend; incompatible groups fail
+before archive creation or network activity. The groups are discovery sets:
+run their different fixture recipes in separate invocations against matching
+provisioned graphs. A served definition must declare `network_position`; a
+server target without it is refused. For another deployment, author an explicit
+server backend and `same-host`, `same-region`, or `remote` network position in
+custom YAML;
+these declarations enter point identity and are never inferred from the client.
+Explicit `--dataset`/`--queries` pairs are embedded only and refuse `--server`.
+
+The entire schema-less query program must be read-only, including loop bodies
+and verification suffixes. Mutations, loads, restarts, index requirements and
+registered-fixture recipes are refused. Settings prefixes on read steps are
+refused for served acquisition. Acquisition does not seed, restore,
+restart or clean up the server. It creates a fresh client worker per repetition
+and sends only the admitted GQT reads. Timing uses the shared BenchHost boundary
+and includes the selected request and result materialization; warm-up and
+assertions stay outside. The server lifecycle is `long-running-server`, with
+`reset: none` and `attribution: off`. Zero warm-up means uncontrolled server
+preparation; an executed read prefix proves only warmed-by-program. Server OS
+page-cache state always remains uncontrolled. With zero warm-up reads the
+measured request also carries the client's connection setup (TCP, and TLS over
+HTTPS).
+
+The served interval includes request serialization on the client, the server's
+response encoding and the row decoding on the client; the embedded interval
+ends at the engine's Arrow batches, before any JSON rendering. Served and
+embedded points are never pooled, and their timings are not comparable beyond
+that difference.
+
+Client executable and machine evidence are distinct from the declared server
+SUT. Samples report `client_peak_rss_bytes`; server RSS, logical storage calls,
+physical attempts, per-storage-request timing and concurrency witnesses are absent. The
+projection preserves those absences as nulls and marks the SUT evidence
+`declared-deployment`. Killing or reaping a timed-out client proves only client
+containment, not server-side cancellation. Existing clean-client release and
+archive publication guards still apply.
 
 ## Logical references for real graphs
 
@@ -283,12 +390,13 @@ not a sandbox for an adversary racing file types or path entries.
 Passing `--archive <DIR>` changes successful `suite run` finalization from a
 diagnostic-only run into durable telemetry publication. The harness mints one
 session ULID for the command and one invocation ULID per suite entry. Each
-record contains the complete typed run spec, exact point identity, clean source
-commit and declared release-build evidence, executable digest, process-effective machine and
-backend evidence,
-stamped fixture manifest, raw repetition rows, dispersion, logical calls, and
-explicit presence or absence statements for physical attempts, request timing,
-calibration, and concurrency witnesses.
+record contains the complete typed run spec, exact point identity, raw repetition
+rows, dispersion, and explicit evidence-presence facts. Embedded records also
+contain clean source and release-build evidence, an executable digest,
+process-effective machine and backend evidence, a stamped fixture manifest,
+and logical calls. [Served records](#served-read-only-acquisition) keep the
+declared deployment receipt and observed client evidence separate; unavailable
+server measurements remain absent.
 
 A dirty or unproved source tree cannot publish a record because the source
 commit would not honestly describe its provenance. The local CLI rechecks that
@@ -347,7 +455,8 @@ every record-level proof gate, including effective-codegen proof. The current
 local publisher deliberately lacks that proof, so its complete records remain
 useful evidence with `claim_eligible: false`. The projection exposes the
 status, eligibility, and nullable terminal fields.
-Every durable raw sample includes supervisor-observed peak RSS.
+Every durable embedded raw sample includes supervisor-observed peak RSS; served
+samples label that measurement as client peak RSS.
 
 The current archive durability contract is local Unix filesystem durability.
 The content object and immutable pointer are synced through descriptor-rooted
@@ -409,15 +518,18 @@ root and rebuilding it.
 Query callers choose fixed, parameterized names; arbitrary GQ text is not
 accepted. The projection may be deleted at any time and rebuilt without losing
 evidence.
+For `declared-deployment` rows (`sut_evidence` and `backend_evidence`), the
+build, machine and backend columns hold the receipt's declared values, and the
+observed client is in `client_build_json` and `client_machine_json`.
 
 ## Local support envelope
 
 The adapter accepts direct-engine, local-filesystem GQT environments without
 DST seams or concurrent actor blocks. The admitted tuples are APFS with
 local-clonefile or qualified XFS with plain-copy, on the declared NVMe SSD
-backend. The platform probe remains authoritative. Cloud stores, remote
-servers, unproved backend declarations, and OS page-cache eviction claims are
-refused; unsupported diagnostic sources are retained under `benchmarks/deferred/`.
+backend. The platform probe remains authoritative. Cloud stores, unproved embedded backend declarations, and OS page-cache
+eviction claims are refused; the served path uses the explicit deployment
+declarations described above; unsupported diagnostic sources are retained under `benchmarks/deferred/`.
 
 A frozen source is bounded at 512 KiB, the combined plan at 256 KiB, the bound
 request reservation at 512 KiB, and the actual framed request at 1 MiB. The

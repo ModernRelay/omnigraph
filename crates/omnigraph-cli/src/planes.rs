@@ -182,7 +182,8 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             Served | Control | Local => false,
         },
         // The actor rides direct-engine writes (`any` via --store) and cluster
-        // writes; Blob get/stat are reads and never consume it. Served writes
+        // writes; Blob get/stat are reads and never consume it, while Blob
+        // put/clear are writes and do. Served writes
         // resolve the actor from the bearer token
         // (rejected downstream with its own message). On `direct`, full-text
         // rebuild attributes its graph publication; other maintenance verbs
@@ -196,8 +197,9 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
             // so accepting `--as` there is a silent no-op — reject it instead.
             Any => !matches!(
                 cmd,
-                Command::Blob { .. }
-                    | Command::Changes { .. }
+                Command::Blob {
+                    command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+                } | Command::Changes { .. }
                     | Command::Commit { .. }
                     | Command::Query { .. }
             ),
@@ -332,6 +334,8 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Blob { command } => match command {
             BlobCommand::Get { .. } => "blob get",
             BlobCommand::Stat { .. } => "blob stat",
+            BlobCommand::Put { .. } => "blob put",
+            BlobCommand::Clear { .. } => "blob clear",
         },
         Command::Commit { .. } => "commit",
         Command::Changes { command } => match command {

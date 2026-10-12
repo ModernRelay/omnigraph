@@ -876,6 +876,7 @@ pub mod matrix {
                     source,
                     target: Some(target),
                     delete_branch: false,
+                    as_commit: false,
                     settings: None,
                 })
                 .unwrap();
@@ -1157,6 +1158,7 @@ pub async fn http_merge_decision(
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (status, _body) = json_response(

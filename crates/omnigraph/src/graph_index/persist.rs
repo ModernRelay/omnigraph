@@ -731,7 +731,7 @@ mod tests {
     }
 
     /// Header/payload halves round-trip. Stamp verification against a live
-    /// snapshot rides the integration tests in `tests/traversal_adaptive.rs`.
+    /// snapshot rides the integration tests in `tests/integration/traversal_adaptive.rs`.
     #[test]
     fn artifact_round_trips_binary() {
         let index = sample_index();

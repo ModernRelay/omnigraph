@@ -5,7 +5,7 @@ use super::*;
 
 use super::operators::memory::WorkMemory;
 use crate::instrumentation::record_node_scan_projection;
-use crate::table_store::{ScanTuning, TableStore};
+use crate::table_store::{PlannedScan, ScanTuning, TableStore};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::{Expr, col, lit as df_lit};
 use datafusion::scalar::ScalarValue;
@@ -49,6 +49,7 @@ pub(super) struct NodeRead<'n> {
     pub(super) node_type: &'n omnigraph_compiler::catalog::NodeType,
     filter_expr: Option<Expr>,
     fts_query: Option<FullTextSearchQuery>,
+    scalar_index: Option<bool>,
     pub(super) columns: ScanColumns<'n>,
     /// The gate proved the answer empty, or a BM25 filter matched no row: no
     /// Lance read runs.
@@ -56,25 +57,19 @@ pub(super) struct NodeRead<'n> {
 }
 
 impl<'n> NodeRead<'n> {
-    pub(super) async fn resolve(
-        type_name: &str,
+    fn validate(
+        ds: &Dataset,
+        node_type: &omnigraph_compiler::catalog::NodeType,
+        table_key: &str,
         filters: &[IRExpr],
-        params: &ParamMap,
-        snapshot: &Snapshot,
-        catalog: &'n Catalog,
+        catalog: &Catalog,
         search_mode: &SearchMode,
-        binding_columns: Option<&NeededColumns>,
-        memory: &WorkMemory,
-    ) -> Result<Self> {
-        let table_key = format!("node:{}", type_name);
-        let ds = snapshot.open_lance_dataset(&table_key).await?;
-
-        let node_type = &catalog.node_types[type_name];
-        let read_columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
+        read_columns: &ScanColumns<'_>,
+    ) -> Result<()> {
         super::typed_value::check_stored_schema(
-            &ds,
+            ds,
             &node_type.arrow_schema,
-            &table_key,
+            table_key,
             read_columns
                 .stored_columns()
                 .into_iter()
@@ -92,7 +87,69 @@ impl<'n> NodeRead<'n> {
                         .map(|target| target.property.as_str()),
                 ),
         )?;
-        super::typed_value::check_scan_leaves(&ds, filters)?;
+        super::typed_value::check_scan_leaves(ds, filters)?;
+        Ok(())
+    }
+
+    pub(super) fn for_index_split(
+        ds: Dataset,
+        type_name: &str,
+        filters: &[IRExpr],
+        params: &ParamMap,
+        catalog: &'n Catalog,
+        binding_columns: Option<&NeededColumns>,
+    ) -> Result<Self> {
+        if filters.iter().any(is_search_filter) {
+            return Err(OmniError::manifest_internal(
+                "search predicates require runtime scan access",
+            ));
+        }
+        let node_type = &catalog.node_types[type_name];
+        let columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
+        Self::validate(
+            &ds,
+            node_type,
+            &format!("node:{type_name}"),
+            filters,
+            catalog,
+            &SearchMode::default(),
+            &columns,
+        )?;
+        Ok(Self {
+            filter_expr: build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema)),
+            ds,
+            node_type,
+            fts_query: None,
+            scalar_index: Some(true),
+            columns,
+            proven_empty: false,
+        })
+    }
+
+    pub(super) async fn resolve(
+        type_name: &str,
+        filters: &[IRExpr],
+        params: &ParamMap,
+        snapshot: &Snapshot,
+        catalog: &'n Catalog,
+        search_mode: &SearchMode,
+        binding_columns: Option<&NeededColumns>,
+        memory: &WorkMemory,
+    ) -> Result<Self> {
+        let table_key = format!("node:{}", type_name);
+        let ds = snapshot.open_lance_dataset(&table_key).await?;
+
+        let node_type = &catalog.node_types[type_name];
+        let read_columns = ScanColumns::new(node_type, SearchColumns::default(), binding_columns);
+        Self::validate(
+            &ds,
+            node_type,
+            &table_key,
+            filters,
+            catalog,
+            search_mode,
+            &read_columns,
+        )?;
 
         let mut filter_expr =
             build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
@@ -174,8 +231,44 @@ impl<'n> NodeRead<'n> {
             node_type,
             filter_expr,
             fts_query,
+            scalar_index: search_mode.scalar_index,
             columns,
             proven_empty,
+        })
+    }
+
+    fn configure(
+        &self,
+        scanner: &mut ScanTuning<'_>,
+        pipelined_batch: Option<(usize, usize)>,
+    ) -> Result<()> {
+        if let Some(enabled) = self.scalar_index {
+            scanner.use_scalar_index(enabled);
+        }
+        if let Some(expr) = &self.filter_expr {
+            scanner.filter_expr(expr.clone());
+            scanner.prefilter(true);
+        }
+        if let Some((rows, bytes)) = pipelined_batch {
+            scanner.batch_size(rows);
+            scanner.batch_size_bytes(bytes as u64);
+            scanner.batch_readahead(PIPELINED_READAHEAD);
+            scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
+        }
+        if let Some(fts_query) = &self.fts_query {
+            scanner
+                .full_text_search(fts_query.clone())
+                .map_err(|error| OmniError::storage_context("full_text_search", error))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn plan_with_filter(
+        &self,
+    ) -> futures::future::BoxFuture<'static, Result<PlannedScan>> {
+        let projection = self.columns.read_projection();
+        TableStore::scan_plan_with_filter(&self.ds, projection.as_deref(), |scanner| {
+            self.configure(scanner, None)
         })
     }
 
@@ -193,21 +286,7 @@ impl<'n> NodeRead<'n> {
     > {
         let projection = self.columns.read_projection();
         TableStore::scan_plan_with(&self.ds, projection.as_deref(), None, false, |scanner| {
-            if let Some(expr) = &self.filter_expr {
-                scanner.filter_expr(expr.clone());
-                scanner.prefilter(true);
-            }
-            if let Some((rows, bytes)) = pipelined_batch {
-                scanner.batch_size(rows);
-                scanner.batch_size_bytes(bytes as u64);
-                scanner.batch_readahead(PIPELINED_READAHEAD);
-                scanner.io_buffer_size(PIPELINED_IO_BUFFER_BYTES);
-            }
-            if let Some(fts_query) = &self.fts_query {
-                scanner
-                    .full_text_search(fts_query.clone())
-                    .map_err(|error| OmniError::storage_context("full_text_search", error))?;
-            }
+            self.configure(scanner, pipelined_batch)?;
             configure(scanner)
         })
     }

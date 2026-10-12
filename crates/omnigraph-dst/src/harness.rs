@@ -7008,12 +7008,20 @@ mod collector_oracle_tests {
                     .unwrap()
                     .dataset_path
                     .clone();
+                let pinned = snapshot
+                    .open_dataset("node:Person")
+                    .await
+                    .unwrap()
+                    .published_dataset_version();
+                // The base is the manifest main pins; a table's first write
+                // also leaves the effect beneath its full-text declaration,
+                // a link no commit pins.
                 let initial = objects(store.as_ref()).await;
                 let base_manifests: Vec<_> = initial
                     .keys()
                     .filter(|path| {
-                        path.as_ref().contains(&format!("{table}/_versions/d"))
-                            && path.as_ref().ends_with(".manifest")
+                        path.as_ref()
+                            .ends_with(&format!("{table}/_versions/d{pinned}.manifest"))
                     })
                     .cloned()
                     .collect();
