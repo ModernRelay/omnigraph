@@ -7,8 +7,6 @@ timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
-  - target: omnigraph-server
-    storage: local-filesystem
 
 --- schema
 node Doc {
