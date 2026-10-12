@@ -1,6 +1,6 @@
 ---
 rfc: "0030"
-title: "Graph change feed and retained-history contract"
+title: "Graph diffs, change feeds and retained history"
 track: maintainer
 status: accepted
 implementation: partial
@@ -14,7 +14,7 @@ superseded_by: []
 blocked_on: []
 ---
 
-# RFC 0030: Graph change feed and retained-history contract
+# RFC 0030: Graph diffs, change feeds and retained history
 
 > **Detached-only tables disposition:**
 > [RFC: Detached-only tables](2026-09-21-detached-only-tables.md) changed the
@@ -1309,8 +1309,11 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
 
 - **2026-10-12: graph diff.** Adds the graph diff (§8), its evidence gates
   (§9 D0) and phases D1–D3 (§12), and reshapes C6 around the per-commit schema
-  content that storage format 14 retains (§10.1). This entry supersedes these
-  sentences, which the body no longer contains:
+  content that storage format 14 retains (§10.1). The RFC now covers more than
+  the feed, so it is retitled from "Graph change feed and retained-history
+  contract" to "Graph diffs, change feeds and retained history"; the filename
+  is unchanged. This entry supersedes these sentences, which the body no
+  longer contains:
   - status line: "C4+ remain design-stage."
   - §0: "Two public surfaces share one private adjacent-commit enumerator:"
   - §0: "Because current lineage does not retain accepted SchemaIR for every
