@@ -62,9 +62,12 @@ addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and bran
 conflicting control operations. A merge holds its target's branch gate and
 per-table queues through publication, and its source's branch gate only until
 the source snapshot is captured, tagged and proved still current; it takes no
-per-table queue on the source. Writes, index builds and deletes on the source
-therefore do not wait for the merge, and the merge's final re-read still
-refuses a source whose incarnation or schema changed.
+per-table queue on the source. Both gates are taken in sorted branch order, so
+a merge whose source sorts first (`main` always does) holds the source gate
+while it waits for a target another merge holds. Once the source is captured,
+writes, index builds and deletes on the source do not wait for the merge, and
+the merge's final re-read still refuses a source whose incarnation or schema
+changed.
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse
