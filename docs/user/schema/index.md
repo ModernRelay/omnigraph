@@ -174,7 +174,9 @@ rejected. The plan reports the exact unsupported step before anything changes.
 
 A drop removes the declaration from the current schema and reclaims no storage
 at apply. Older commits still read the dropped data until `omnigraph cleanup`
-stops retaining them. A dropped type's data is reclaimed by that cleanup. A
+stops retaining them. Re-adding a property under a dropped name starts a new
+property, so a historical query never reads the dropped values through it; see
+[historical reads](../branching/index.md#historical-reads). A dropped type's data is reclaimed by that cleanup. A
 dropped property's values also stay in the table's current data files, beside
 the properties that remain, until the next `omnigraph optimize`: every
 optimize rewrites each fragment of a table that still stores a dropped

@@ -1061,6 +1061,12 @@ impl Omnigraph {
     /// caller MUST already hold a schema permit (either side); this helper does
     /// not acquire one because the gate is non-reentrant on one task.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        Ok(self.load_accepted_view_with_schema_gate_held().await?.0)
+    }
+
+    /// The accepted catalog and the live view of the current branch it was
+    /// accepted against.
+    async fn load_accepted_view_with_schema_gate_held(&self) -> Result<(Arc<Catalog>, Snapshot)> {
         let current_branch = self
             .coordinator
             .read()
@@ -1074,7 +1080,7 @@ impl Omnigraph {
             .snapshot;
         let (catalog, _) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
-        Ok(catalog)
+        Ok((catalog, snapshot))
     }
 
     /// Accept the contract bytes in this snapshot before reusing its catalog.
@@ -2301,12 +2307,12 @@ impl Omnigraph {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
             return Ok((resolved, catalog));
         }
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         if bind_historical_aliases {
             let catalog = self
                 .catalog_for_image_vintage(&resolved.snapshot, catalog)
                 .await?;
-            resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            resolved.snapshot.bind_catalog_aliases(&catalog, &live)?;
             return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
@@ -2336,7 +2342,7 @@ impl Omnigraph {
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
             .read()
@@ -2352,7 +2358,7 @@ impl Omnigraph {
             .await?,
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
-        snapshot.bind_catalog_aliases(&catalog)?;
+        snapshot.bind_catalog_aliases(&catalog, &live)?;
         Ok((snapshot, catalog))
     }
 

@@ -557,7 +557,14 @@ async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_disti
     let edge_identity = snapshot.dataset("edge:Link").unwrap().identity;
     assert_ne!(node_identity, edge_identity);
 
-    snapshot.bind_catalog_aliases(&catalog).unwrap();
+    // The live view pins the node table at the same version and the edge table
+    // at another one, so only the edge table is read outside the contract.
+    let mut live = snapshot.clone();
+    live.entries
+        .get_mut("edge:Link")
+        .unwrap()
+        .published_dataset_version += 1;
+    snapshot.bind_catalog_aliases(&catalog, &live).unwrap();
 
     assert_eq!(
         snapshot.dataset("node:Link").unwrap().identity,
@@ -567,6 +574,12 @@ async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_disti
         snapshot.dataset("edge:Link").unwrap().identity,
         edge_identity
     );
+    assert!(snapshot.contract_covers("node:Link"));
+    assert!(!snapshot.contract_covers("edge:Link"));
+
+    let current = snapshot.clone();
+    snapshot.bind_catalog_aliases(&catalog, &current).unwrap();
+    assert!(snapshot.contract_covers("edge:Link"));
 }
 
 #[tokio::test]
