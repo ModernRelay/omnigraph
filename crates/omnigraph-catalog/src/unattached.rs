@@ -382,9 +382,10 @@ impl<'a> UnattachedInventoryReader<'a> {
                 "native tag '{name}' is not in the captured inventory"
             ))
         })?;
+        let dataset = self.tags.dataset;
         ManifestCoordinator::unattached_from_tag_sharing(
             self.root_uri,
-            self.inventory.dataset(),
+            dataset,
             &mut self.tags,
             name,
             &tag,
