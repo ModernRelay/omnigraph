@@ -13,9 +13,8 @@
 // Wrapping `branch_merge` in `with_merge_write_probes` (a task-local scope)
 // nests the already-deep merge future one layer deeper, overflowing rustc's
 // default 128 layout-query depth. Bump it for this test crate.
-#![recursion_limit = "512"]
 
-mod helpers;
+use crate::helpers;
 
 use arrow_array::Array;
 use lance::Dataset;
@@ -27,8 +26,8 @@ use omnigraph::{
     BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy, Session,
 };
 
-use helpers::wide_rows::*;
-use helpers::*;
+use crate::helpers::wide_rows::*;
+use crate::helpers::*;
 
 /// Insert `n` brand-new persons (fresh ids) onto `branch`, forking the Person
 /// table onto it. All rows are "new on source" — none collide with base ids.
@@ -1003,8 +1002,9 @@ async fn branch_merge_validation_delta_is_aggregate_bounded_pre_arm() {
     );
     assert_eq!(
         probes.proven_insert_history_read_calls(),
-        2,
-        "each table's one-commit chain is proven by one history read"
+        4,
+        "each table's chain, its first rows and the full-text declaration chained on them, \
+         is proven by one history read per link"
     );
     assert_eq!(
         probes.ordered_cursor_scan_calls(),

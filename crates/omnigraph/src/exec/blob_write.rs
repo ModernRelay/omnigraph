@@ -20,8 +20,8 @@ use super::mutation::{
 };
 use super::staging::{MutationStaging, PendingMode};
 use crate::blob::{
-    BlobCell, BlobDescriptor, BlobEtag, BlobPrecondition, BlobWriteOutcome, entity_label,
-    locate_blob_cell, managed_blob_etag, resolve_blob_cell,
+    BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag, BlobPrecondition,
+    BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag, resolve_blob_cell,
 };
 use crate::changes::EntityKind;
 use crate::db::Omnigraph;
@@ -79,7 +79,7 @@ impl Session {
     ) -> Result<BlobWriteOutcome> {
         let length = u64::try_from(bytes.len())
             .map_err(|_| OmniError::manifest_internal("Blob write payload length exceeds u64"))?;
-        WriteBudget::from_settings(self.settings()).check("Blob write payload bytes", length)?;
+        WriteBudget::from_settings(self.settings()).check(BLOB_WRITE_PAYLOAD_RESOURCE, length)?;
         self.write_blob_cell_as(
             branch,
             cell,

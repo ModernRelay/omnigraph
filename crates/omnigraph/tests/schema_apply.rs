@@ -1,6 +1,7 @@
 mod helpers;
 
 use base64::Engine;
+use lance::index::DatasetIndexExt;
 use std::collections::HashMap;
 #[cfg(feature = "failpoints")]
 use std::sync::Arc;
@@ -509,6 +510,74 @@ async fn parked_writer_blocks_schema_apply() {
         .unwrap()
         .expect("schema apply must complete once the writer's envelope releases");
     assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// Issue 643, schema-apply boundary, and the merge's tripwire (the writer's
+/// is `parked_writer_blocks_schema_apply`): a merge parked before its
+/// manifest commit holds its SHARED schema permit, so a schema apply waits at
+/// the exclusive side. Past the gate the apply refuses at once, because the
+/// merge's source branch exists, so an apply that returns while the merge is
+/// parked means the merge let its permit go early. After the merge publishes,
+/// the apply refuses and the merge's result is intact.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn parked_merge_blocks_schema_apply_issue_643() {
+    use omnigraph::seams::catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("s").await.unwrap();
+    for (branch, name, age) in [("s", "On-s", 61), ("main", "On-main", 62)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+    let db = Arc::new(db);
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    motto: String?\n}");
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "main").await });
+    parked.wait_until_reached().await;
+
+    let schema_db = Arc::clone(&db);
+    let mut schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut schema_task)
+            .await
+            .is_err(),
+        "schema apply must wait behind a merge's held shared schema permit; it \
+         answered while the merge was parked",
+    );
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    let refusal = schema_task
+        .await
+        .unwrap()
+        .expect_err("schema apply refuses while the merge's source branch exists");
+    assert!(
+        refusal
+            .to_string()
+            .contains("schema apply requires a graph with only main"),
+        "{refusal}"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, 6);
 }
 
 /// Read-only opens hold the schema gate through coherent catalog capture.
@@ -3072,6 +3141,102 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         before_commits.len() + 1,
         "metadata-only schema apply must still advance graph_head so it arbitrates concurrent prepared writes"
     );
+}
+
+// A full-text call answers with the index's analyzer at every schema apply.
+// Lance applies the analyzer only through a segment of the index; with none,
+// its flat path tokenizes bare, so "deep" misses "Deep Learning". Declaring a
+// full-text `@index` on a populated table, and adding a full-text property,
+// each publish an untrained segment that carries the analyzer; an evolution
+// keeps the segment of a column it keeps or renames, and `ensure_indices`
+// later builds the postings.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn full_text_analyzer_survives_schema_evolution_issue_904() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    body: String\n}\n";
+    let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
+{"type":"Doc","data":{"slug":"d2","body":"deep dive"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let search = |column: &'static str| {
+        let db = &db;
+        async move {
+            let source = format!(
+                "query docs($q: String) {{ match {{ $d: Doc search($d.{column}, $q) }} return {{ $d.slug }} }}"
+            );
+            first_column_sorted(
+                &query_main(db, &source, "docs", &params(&[("q", "deep")]))
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    let segments = |column: &'static str| {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field(column).unwrap().id;
+            ds.load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.fields.contains(&field))
+                .map(|index| index.fragment_bitmap.as_ref().map(|bitmap| bitmap.len()))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Declaring the full-text index publishes its analyzer with the contract.
+    let declared = "node Doc {\n    slug: String @key\n    body: String @index\n}\n";
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert!(db.apply_schema(declared).await.unwrap().applied);
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .published_dataset_version;
+    assert_eq!(after, before + 1, "the declaration is a table effect");
+    assert_eq!(
+        segments("body").await,
+        [Some(0)],
+        "one untrained segment: the analyzer without postings"
+    );
+    assert_eq!(search("body").await, ["d1", "d2"]);
+
+    // Renaming the column keeps its segment (no second declaration), and an
+    // added full-text property gets its own.
+    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index\n    summary: String? @index\n}\n";
+    assert!(db.apply_schema(evolved).await.unwrap().applied);
+    assert_eq!(segments("text").await, [Some(0)]);
+    assert_eq!(segments("summary").await, [Some(0)]);
+    assert_eq!(search("text").await, ["d1", "d2"]);
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d3","text":"Shallow","summary":"Deep Learning"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("summary").await, ["d3"]);
+
+    // The reconciler builds the postings over the declarations.
+    db.ensure_indices().await.unwrap();
+    assert_eq!(segments("text").await, [Some(2)]);
+    assert_eq!(search("text").await, ["d1", "d2"]);
+    assert_eq!(search("summary").await, ["d3"]);
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is

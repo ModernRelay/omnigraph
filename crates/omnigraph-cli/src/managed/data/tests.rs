@@ -413,7 +413,7 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
     assert_eq!(result.rows.get(), "[{\"value\":42}]");
     let changed = client
         .mutate(
-            "main",
+            Some("main"),
             "mutation m() {}",
             Some("m"),
             None,
@@ -465,7 +465,8 @@ async fn minted_data_credential_is_separate_and_works_after_api_stops() {
 async fn identity_issuance_caches_no_permissions_and_discovers_without_control_calls() {
     let discovery = json!({"graphs":[{"graph_id":"hidden","display_name":"hidden"}]});
     let commit = json!({"graph_commit_id":"head-a","graph_branch":"main","graph_manifest_version":7,
-        "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true});
+        "parent_commit_id":null,"merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true,
+        "kind":"published","root_commit_id":null});
     let data = IntentApiFixture::graph(vec![
         IntentReply::json(200, discovery.clone()),
         IntentReply::json(
@@ -886,6 +887,7 @@ async fn managed_commit_reads_use_exact_cached_read_authority_without_api_or_fal
         "graph_manifest_version":3, "parent_commit_id":"prior",
         "merged_parent_commit_id":"imported-head", "actor_id":"principal:alice",
         "created_at":123456, "published":true,
+        "kind":"published", "root_commit_id":null,
     });
     let server = IntentApiFixture::graph(vec![
         IntentReply::json(200, json!({"commits":[commit.clone()]})),
@@ -1189,7 +1191,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                     "commit-show" => client.get_commit("commit-a").await.unwrap_err(),
                     _ => client
                         .mutate(
-                            "main",
+                            Some("main"),
                             "mutation m() {}",
                             Some("m"),
                             None,

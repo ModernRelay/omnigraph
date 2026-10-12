@@ -50,6 +50,10 @@ pub enum ManifestConflictDetails {
     /// `PublishedDatasetVersionMismatch`: the caller's expectations (if any) still
     /// hold against the new manifest state, so the publisher will retry.
     RowLevelCasContention,
+    /// A publish addressed an unattached snapshot (RFC "Unattached graph
+    /// branches"), a kind that never publishes; distinct from the
+    /// authority-moved conflict of a publishable proposal.
+    UnattachedCannotPublish { graph_commit_id: String },
 }
 
 #[derive(Debug, Clone, Error)]
@@ -828,6 +832,17 @@ impl OmniError {
                     actual_published_dataset_version,
                 },
             ),
+        )
+    }
+
+    /// The refusal every publish of an unattached snapshot answers before any
+    /// durable effect.
+    pub fn unattached_cannot_publish(graph_commit_id: impl Into<String>) -> Self {
+        let graph_commit_id = graph_commit_id.into();
+        let message = format!("commit '{graph_commit_id}' is unattached and cannot publish");
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message)
+                .with_details(ManifestConflictDetails::UnattachedCannotPublish { graph_commit_id }),
         )
     }
 

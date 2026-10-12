@@ -56,7 +56,7 @@ fn legacy_catalog() -> &'static Path {
                     directory
                         .path()
                         .join(format!("cases/{}.case-v1.yaml", scenario.id)),
-                    serde_yaml::to_string(&definition).unwrap(),
+                    yaml_serde::to_string(&definition).unwrap(),
                 )
                 .unwrap();
             }
@@ -80,7 +80,7 @@ fn legacy_catalog() -> &'static Path {
                     .path()
                     .join(format!("suites/{name}/suite-v1.yaml"));
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
-                fs::write(target, serde_yaml::to_string(&suite).unwrap()).unwrap();
+                fs::write(target, yaml_serde::to_string(&suite).unwrap()).unwrap();
             }
             directory
         })

@@ -327,8 +327,8 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         config["graphs"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("second"));
-        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+            .remove(yaml_serde::Value::from("second"));
+        config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
     });
     let bundle = capture_deployment(dir.path()).unwrap();
     // A removed graph may be blocked without a live engine. Observing its
@@ -635,11 +635,11 @@ async fn authenticated_deployment_checks_current_policy_before_every_effect() {
     // Graph removal still requires the existing schema capability in addition
     // to cluster management. A candidate policy cannot grant it retroactively.
     edit_config(dir.path(), |config| {
-        config["graphs"] = serde_yaml::from_str("{}").unwrap();
+        config["graphs"] = yaml_serde::from_str("{}").unwrap();
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("base"));
+            .remove(yaml_serde::Value::from("base"));
     });
     let graph_before = graph_state(dir.path(), "knowledge").await;
     let error = apply_deployment(
@@ -910,9 +910,9 @@ async fn graph_lifecycle_cannot_escape_cluster_root_through_symlink() {
                 config["graphs"]
                     .as_mapping_mut()
                     .unwrap()
-                    .remove(serde_yaml::Value::from("second"));
+                    .remove(yaml_serde::Value::from("second"));
                 config["policies"]["base"]["applies_to"] =
-                    serde_yaml::from_str("[knowledge]").unwrap();
+                    yaml_serde::from_str("[knowledge]").unwrap();
             });
         } else {
             add_second_graph(dir.path());
@@ -1022,11 +1022,11 @@ fn remote_capture_does_not_open_server_storage() {
     }
 }
 
-fn edit_config(dir: &Path, edit: impl FnOnce(&mut serde_yaml::Value)) {
+fn edit_config(dir: &Path, edit: impl FnOnce(&mut yaml_serde::Value)) {
     let path = dir.join(CLUSTER_CONFIG_FILE);
-    let mut value = serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let mut value = yaml_serde::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     edit(&mut value);
-    fs::write(path, serde_yaml::to_string(&value).unwrap()).unwrap();
+    fs::write(path, yaml_serde::to_string(&value).unwrap()).unwrap();
 }
 
 async fn graph_state(dir: &Path, graph: &str) -> (omnigraph::db::SchemaContractDigest, u64) {
@@ -1075,9 +1075,9 @@ async fn current_policy_authorizes_policy_edits_rebinding_and_removal() {
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("base"));
+            .remove(yaml_serde::Value::from("base"));
         config["policies"]["replacement"] =
-            serde_yaml::from_str("file: ./replacement.policy.yaml\napplies_to: [knowledge]\n")
+            yaml_serde::from_str("file: ./replacement.policy.yaml\napplies_to: [knowledge]\n")
                 .unwrap();
     });
     bootstrap(dir.path()).await;
@@ -1086,7 +1086,7 @@ async fn current_policy_authorizes_policy_edits_rebinding_and_removal() {
         config["policies"]
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("replacement"));
+            .remove(yaml_serde::Value::from("replacement"));
     });
     bootstrap(dir.path()).await;
     let (state, _) = execution::read_existing(&store).await.unwrap();
@@ -1134,12 +1134,12 @@ async fn provider_crud_binding_and_blob_updates_preserve_graph_identity() {
     let original = graph_state(dir.path(), "knowledge").await;
     for model in ["mock:first", "mock:second"] {
         edit_config(dir.path(), |config| {
-            config["providers"] = serde_yaml::from_str(&format!(
+            config["providers"] = yaml_serde::from_str(&format!(
                 "embedding:\n  selected:\n    kind: mock\n    model: {model}\n"
             ))
             .unwrap();
             config["graphs"]["knowledge"]["embedding_provider"] = "selected".into();
-            config["graphs"]["knowledge"]["external_blobs"] = serde_yaml::from_str(
+            config["graphs"]["knowledge"]["external_blobs"] = yaml_serde::from_str(
                 "allow:\n  - base: s3://trusted-bucket/data/\n    scope: server_safe\n",
             )
             .unwrap();
@@ -1151,10 +1151,10 @@ async fn provider_crud_binding_and_blob_updates_preserve_graph_identity() {
         config
             .as_mapping_mut()
             .unwrap()
-            .remove(serde_yaml::Value::from("providers"));
+            .remove(yaml_serde::Value::from("providers"));
         let graph = config["graphs"]["knowledge"].as_mapping_mut().unwrap();
-        graph.remove(serde_yaml::Value::from("embedding_provider"));
-        graph.remove(serde_yaml::Value::from("external_blobs"));
+        graph.remove(yaml_serde::Value::from("embedding_provider"));
+        graph.remove(yaml_serde::Value::from("external_blobs"));
     });
     bootstrap(dir.path()).await;
     let store = ClusterStore::for_config_dir(dir.path());
@@ -1204,8 +1204,8 @@ async fn graph_removal_deletes_exact_managed_root_and_retains_peers() {
             config["graphs"]
                 .as_mapping_mut()
                 .unwrap()
-                .remove(serde_yaml::Value::from("second"));
-            config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+                .remove(yaml_serde::Value::from("second"));
+            config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
         });
         let captured = capture_deployment(dir.path()).unwrap();
         if initial_root == "foreign" {
@@ -1396,7 +1396,7 @@ async fn corrupt_catalog_payloads_refuse_without_repair_or_candidate_authority()
                 config["graphs"]["knowledge"]
                     .as_mapping_mut()
                     .unwrap()
-                    .remove(serde_yaml::Value::from("queries"));
+                    .remove(yaml_serde::Value::from("queries"));
             });
         }
         let captured = capture_deployment(dir.path()).unwrap();
@@ -1435,9 +1435,9 @@ async fn configuration_management_does_not_require_unrelated_graph_data_read() {
     )
     .unwrap();
     edit_config(dir.path(), |config| {
-        config["policies"]["base"]["applies_to"] = serde_yaml::from_str("[knowledge]").unwrap();
+        config["policies"]["base"]["applies_to"] = yaml_serde::from_str("[knowledge]").unwrap();
         config["policies"]["closed"] =
-            serde_yaml::from_str("file: ./closed.policy.yaml\napplies_to: [second]\n").unwrap();
+            yaml_serde::from_str("file: ./closed.policy.yaml\napplies_to: [second]\n").unwrap();
     });
     bootstrap(dir.path()).await;
     unlock(root).await;

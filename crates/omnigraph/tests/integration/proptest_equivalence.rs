@@ -14,8 +14,6 @@
 //! the Expand mode with a session's `traversal` setting, so nothing leaks across
 //! shrink/cases and no `#[serial]` is needed.
 
-mod helpers;
-
 use std::collections::HashSet;
 
 use arrow_array::{Array, StringArray};
@@ -28,7 +26,7 @@ use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 
-use helpers::*;
+use crate::helpers::*;
 
 /// Small SHARED key alphabet — Person and Company keys are both drawn from this,
 /// so cross-type id collisions are common.

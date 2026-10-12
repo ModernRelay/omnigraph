@@ -115,6 +115,13 @@ needs no new action: a mutation `as commit` is a `change` on its branch and a
 merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
 can omit `as commit`; this is a voluntary review workflow, not an approval
 boundary (see [Unpublished graph commits](../../rfcs/2026-10-10-unpublished-graph-commits.md)).
+A mutation `as unattached branch` is likewise a `change` on the branch it
+records as its target: the first write's branch, and for a write `on "<id>"`
+the target the base snapshot recorded, whatever branch the request names.
+`commit list --unattached` and a query `--snapshot <id>` of an unattached
+snapshot need `read` on that recorded target; `commit show <id>` keeps its
+scope-free `read`; `commit drop` takes `commit_drop` on the recorded target as
+for an unpublished commit (see [Unattached graph branches](../../rfcs/2026-10-11-unattached-graph-branches.md)).
 
 ## Validate and test
 

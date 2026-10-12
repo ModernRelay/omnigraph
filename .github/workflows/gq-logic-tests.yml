@@ -251,8 +251,8 @@ jobs:
           RUSTFLAGS: ""
         run: |
           set -euo pipefail
-          cargo test -p omnigraph-gqt-served -p omnigraph-cli -p omnigraph-server -p omnigraph-gqt --test gqt_served_smoke --locked --timings gqt_server_binary_round_trip -- --exact --include-ignored --nocapture | tee target/gqt-served-smoke.log
-          grep -Fx 'test gqt_server_binary_round_trip ... ok' target/gqt-served-smoke.log
+          cargo test -p omnigraph-gqt-served -p omnigraph-cli -p omnigraph-server -p omnigraph-gqt --test integration --locked --timings gqt_served_smoke::gqt_server_binary_round_trip -- --exact --include-ignored --nocapture | tee target/gqt-served-smoke.log
+          grep -Fx 'test gqt_served_smoke::gqt_server_binary_round_trip ... ok' target/gqt-served-smoke.log
 
       - name: Retain GQT invocation reports
         if: always() && needs.classify_changes.outputs.run_gqt == 'true' && matrix.mode != 'dst-clippy' && matrix.mode != 'served'

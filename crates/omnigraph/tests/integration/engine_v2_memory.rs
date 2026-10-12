@@ -783,7 +783,7 @@ query without_matching_friend() {
 }
 
 /// The GQT pins results and planned demand; this owner pins memory admission
-/// before fanout. Scale coverage: tests/repro_issue_703.rs.
+/// before fanout. Scale coverage: tests/integration/repro_issue_703.rs.
 #[tokio::test]
 #[serial]
 async fn expand_projects_unused_destination_payload_before_fanout_issue_703() {

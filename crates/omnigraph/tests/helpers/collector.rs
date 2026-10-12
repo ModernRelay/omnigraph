@@ -52,6 +52,26 @@ pub async fn table_uri(db: &Omnigraph, type_name: &str) -> String {
     )
 }
 
+/// Every version of `table_key` a commit on `branch` pins. A chain's links
+/// below its pinned tip (a full-text declaration chained on an effect, an
+/// optimize or merge chain) are not among them.
+pub async fn pins_in_history(db: &Omnigraph, branch: &str, table_key: &str) -> BTreeSet<u64> {
+    let mut pins = BTreeSet::new();
+    for commit in db.list_commits(Some(branch)).await.unwrap() {
+        let snapshot = db
+            .snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+                commit.graph_commit_id.clone(),
+            )))
+            .await
+            .unwrap();
+        if snapshot.dataset(table_key).is_some() {
+            let pinned = snapshot.open_dataset(table_key).await.unwrap();
+            pins.insert(pinned.published_dataset_version());
+        }
+    }
+    pins
+}
+
 pub async fn detached_versions(table_uri: &str) -> BTreeSet<u64> {
     open_dataset_head_exact(table_uri, None)
         .await

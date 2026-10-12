@@ -77,8 +77,8 @@ const DETACHED_VERSION_RETRIES: u32 = 20;
 /// Write `rows` as the hot row set of `dataset`'s version + 1, and `cold` as
 /// a cold fragment of that version. The schema metadata carries over from
 /// `dataset`, a served stamp, and the new version is stamped with the format
-/// this binary writes: a v14 branch becomes v15 in the CAS that writes its
-/// first registry rows. Returns the hot batch beside the new version.
+/// this binary writes: a branch below it takes the current stamp in the CAS
+/// that writes its first rows. Returns the hot batch beside the new version.
 pub(crate) async fn overwrite(
     dataset: Dataset,
     rows: &ManifestRows,

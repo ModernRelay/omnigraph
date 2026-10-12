@@ -30,15 +30,16 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
-    BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
-    BranchListOutput, BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest,
-    BranchOutcomeOutput, ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest,
-    ChangeFeedOutput, ChangeOpOutput, ChangeOutput, ChangeRequest, CommitChangesOutput,
-    CommitListOutput, CommitOutput, EntityKindOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphDiscoveryResponse, GraphListResponse, InvokeStoredQueryRequest, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    change_baseline_output, change_feed_output, change_scope, commit_changes_output, commit_output,
-    read_output, schema_apply_output, show_read_output, snapshot_payload,
+    BlobReadQuery, BlobStatOutput, BlobWriteOutput, BlobWriteQuery, BranchCreateOutput,
+    BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutcome,
+    BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput, ChangeBaselineOutput,
+    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
+    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, EntityKindOutput,
+    ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse, GraphListResponse,
+    InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaOutput,
+    SettingsRequest, SnapshotOutput, branch_list_read_output, change_baseline_output,
+    change_feed_output, change_scope, commit_changes_output, commit_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite};
@@ -48,13 +49,14 @@ use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
 use crate::blob_cli::{
-    BlobRangeRequest, blob_cell, blob_read_target, blob_url, external_response_headers,
-    managed_response_headers, map_embedded_blob_error, remote_blob_error, whole_external_uri,
+    BlobRangeRequest, blob_cell, blob_read_target, blob_url, blob_write_cell, blob_write_url,
+    external_response_headers, managed_response_headers, map_embedded_blob_error,
+    remote_blob_error, whole_external_uri,
 };
 use crate::cli::CliLoadMode;
 use crate::graph_http::{ApiContractError, GraphHttpClient};
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, branch_statement_change_request,
+    PreconditionFailedCli, apply_bearer_token, apply_server_flag, branch_statement_change_request,
     branch_statement_query_request, is_remote_uri, precondition_failed_cli, query_params_from_json,
     remote_json, remote_json_bounded, remote_no_content, remote_response_json_bounded, remote_url,
     resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag,
@@ -730,6 +732,52 @@ impl GraphClient {
         }
     }
 
+    /// `commit list --unattached`: the live unattached snapshots whose
+    /// recorded target is `branch` (`None` = main),
+    /// `GET /commits?unattached=true` or the engine's listing.
+    pub(crate) async fn list_unattached_commits(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<CommitListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let url = match branch {
+                    Some(branch) => remote_url(
+                        base_url,
+                        &["commits"],
+                        &[("branch", branch), ("unattached", "true")],
+                    )?,
+                    None => remote_url(base_url, &["commits"], &[("unattached", "true")])?,
+                };
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    url,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_read_session(uri, &[]).await?;
+                let commits = db
+                    .list_unattached_commits(branch)
+                    .await?
+                    .iter()
+                    .map(commit_output)
+                    .collect::<Vec<_>>();
+                Ok(CommitListOutput { commits })
+            }
+        }
+    }
+
     pub(crate) async fn get_commit(&self, commit_id: &str) -> Result<CommitOutput> {
         match self {
             GraphClient::Remote {
@@ -1060,7 +1108,7 @@ impl GraphClient {
     /// A `--set` value travels in the `settings` field of `POST /mutate`.
     pub(crate) async fn mutate(
         &self,
-        branch: &str,
+        branch: Option<&str>,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
@@ -1084,7 +1132,7 @@ impl GraphClient {
                     query: query_source.to_string(),
                     name: query_name.map(ToOwned::to_owned),
                     params: params_json.cloned(),
-                    branch: Some(branch.to_string()),
+                    branch: branch.map(str::to_string),
                     settings: Self::remote_settings(settings)?,
                 })?;
                 remote_json_bounded(
@@ -1105,7 +1153,7 @@ impl GraphClient {
                 let session = Self::open_write_session(uri, settings).await?;
                 let actor = actor.as_deref();
                 let receipt = session
-                    .mutate_as_with_expected_head_receipt(
+                    .mutate_as_with_optional_branch_receipt(
                         branch,
                         query_source,
                         &selected_name,
@@ -1126,7 +1174,7 @@ impl GraphClient {
                         }
                     })?;
                 Ok(ChangeOutput {
-                    branch: branch.to_string(),
+                    branch: receipt.branch,
                     query_name: selected_name,
                     affected_nodes: receipt.result.affected_nodes,
                     affected_edges: receipt.result.affected_edges,
@@ -1988,6 +2036,80 @@ impl GraphClient {
         }
     }
 
+    /// `blob put` (with `bytes`) or `blob clear` (without): one Blob cell
+    /// write, sent once. The embedded arm calls the engine with the parsed
+    /// precondition; the served arm sends `if_match` as the `If-Match` header
+    /// the server parses the same way. Both answer the same receipt.
+    pub(crate) async fn blob_write(
+        &self,
+        query: &BlobWriteQuery,
+        bytes: Option<bytes::Bytes>,
+        if_match: Option<&str>,
+        precondition: Option<omnigraph::BlobPrecondition>,
+    ) -> Result<BlobWriteOutput> {
+        let branch = query.branch.as_deref().unwrap_or("main");
+        match self {
+            GraphClient::Embedded { uri, actor } => {
+                let session = Self::open_write_session(uri, &[]).await?;
+                let cell = blob_write_cell(query);
+                let outcome = match bytes {
+                    Some(bytes) => {
+                        session
+                            .put_blob_at_as(branch, cell, bytes, precondition, actor.as_deref())
+                            .await
+                    }
+                    None => {
+                        session
+                            .clear_blob_at_as(branch, cell, precondition, actor.as_deref())
+                            .await
+                    }
+                }
+                .map_err(|error| match error {
+                    // The body a server answers, so `--json` is transport-uniform.
+                    error @ omnigraph::error::OmniError::BlobWritePreconditionFailed { .. } => {
+                        PreconditionFailedCli {
+                            output: omnigraph_server::engine_error_output(error),
+                            http_status: None,
+                            retry_after: None,
+                        }
+                        .into()
+                    }
+                    other => color_eyre::eyre::Report::from(other),
+                })?;
+                Ok(omnigraph_api_types::blob_write_output(
+                    query.into(),
+                    branch,
+                    &outcome,
+                    actor.clone(),
+                ))
+            }
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let url = blob_write_url(base_url, query)?;
+                let request = match bytes {
+                    Some(bytes) => http
+                        .request(Method::PUT, url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                        .body(bytes),
+                    None => http.request(Method::DELETE, url),
+                };
+                let request = apply_bearer_token(request, token.as_deref());
+                let request = match if_match {
+                    Some(tags) => request.header(reqwest::header::IF_MATCH, tags),
+                    None => request,
+                };
+                let response = http.send(request).await?;
+                remote_response_json_bounded(response, token.as_deref(), *response_limit)
+                    .await
+                    .map_err(verified_blob_precondition)
+            }
+        }
+    }
+
     /// `graphs list` — enumerate the graphs a multi-graph server serves
     /// (`GET /graphs`). Reached only through registry-addressed clients
     /// (`resolve_registry` / the D7 probe's `registry_client`), which always
@@ -2084,6 +2206,34 @@ fn validate_content_range(
         bail!("Blob server returned an inconsistent Content-Range");
     }
     Ok(())
+}
+
+/// A served Blob write's 412 whose only detail is `blob_precondition_failure`
+/// is a verified request precondition, treated as a graph-commit one is: the
+/// whole command exits 4 when it was the command's only effectful request.
+fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::eyre::Report {
+    match error.downcast::<crate::helpers::RemoteErrorCli>() {
+        Ok(remote)
+            if remote.status == StatusCode::PRECONDITION_FAILED
+                && remote.output.blob_precondition_failure.is_some()
+                && remote.output.code == Some(omnigraph_api_types::ErrorCode::Conflict)
+                && crate::command_outcome::single_request()
+                && {
+                    let mut rest = remote.output.clone();
+                    rest.blob_precondition_failure = None;
+                    crate::command_outcome::is_plain_refusal(&rest)
+                } =>
+        {
+            PreconditionFailedCli {
+                output: remote.output,
+                http_status: Some(StatusCode::PRECONDITION_FAILED.as_u16()),
+                retry_after: remote.retry_after,
+            }
+            .into()
+        }
+        Ok(remote) => remote.into(),
+        Err(error) => error,
+    }
 }
 
 /// Shared spelling of the change-surface filters across the three verbs; one
@@ -2635,7 +2785,7 @@ mod tests {
                         _ => (
                             client
                                 .mutate(
-                                    "main",
+                                    Some("main"),
                                     "mutation m() {}",
                                     Some("m"),
                                     None,
@@ -2825,7 +2975,14 @@ mod tests {
             (
                 "mutate",
                 client
-                    .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+                    .mutate(
+                        Some("main"),
+                        "mutation m() {}",
+                        Some("m"),
+                        None,
+                        None,
+                        &settings,
+                    )
                     .await
                     .map(|_| ()),
             ),
@@ -2924,12 +3081,19 @@ mod tests {
             .await
             .unwrap();
         client
-            .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+            .mutate(
+                Some("main"),
+                "mutation m() {}",
+                Some("m"),
+                None,
+                None,
+                &settings,
+            )
             .await
             .unwrap();
         client
             .mutate(
-                "main",
+                Some("main"),
                 "mutation m() {}",
                 Some("m"),
                 None,
@@ -2944,7 +3108,7 @@ mod tests {
             .unwrap();
 
         client
-            .mutate("main", "mutation m() {}", Some("m"), None, None, &[])
+            .mutate(Some("main"), "mutation m() {}", Some("m"), None, None, &[])
             .await
             .unwrap();
         let requests = server.workflow_requests();

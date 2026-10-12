@@ -10,7 +10,9 @@ use crate::storage_layer::WriteBudget;
 use crate::storage_layer::{
     KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, ProvenInsertChunk,
 };
-use crate::table_store::{MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows};
+use crate::table_store::{
+    MATERIALIZED_BLOB_PAYLOAD_BYTES, certified_insert_absence_rows, is_full_text_declaration,
+};
 use futures::StreamExt;
 use omnigraph_compiler::settings::MergeLineage;
 
@@ -992,8 +994,9 @@ fn opened_at_pin(dataset: &Dataset, entry: &crate::db::DatasetEntry) -> bool {
 }
 
 /// Walk the source's chain of commits by `read_version` links down to either
-/// base pin, certifying each as an exact-id fenced insert; the new fragments
-/// are the source's fragments the base lacks, and the rows are the chain's.
+/// base pin, certifying each as an exact-id fenced insert or a full-text
+/// declaration (which moves no row); the new fragments are the source's
+/// fragments the base lacks, and the rows are the chain's.
 async fn proven_chain_fragments(
     source: &Dataset,
     base: &Dataset,
@@ -1007,12 +1010,16 @@ async fn proven_chain_fragments(
         let identity = crate::table_store::StagedTransactionIdentity::recorded_by(&dataset)?;
         crate::instrumentation::record_proven_insert_history_read();
         let transaction = dataset.read_transaction().await.ok()??;
-        let rows = certified_insert_absence_rows(
-            &transaction,
-            identity.read_version,
-            id_field_id,
-            expected_schema_preorder_ids,
-        )?;
+        let rows = if is_full_text_declaration(&transaction, identity.read_version) {
+            0
+        } else {
+            certified_insert_absence_rows(
+                &transaction,
+                identity.read_version,
+                id_field_id,
+                expected_schema_preorder_ids,
+            )?
+        };
         proven_rows = proven_rows.checked_add(rows)?;
         if base_pins.contains(&transaction.read_version) {
             let base_ids: std::collections::HashSet<u64> = base
@@ -1409,10 +1416,12 @@ async fn revalidate_proven_pure_insert_source(
             None,
         ));
     };
+    // The proof reads `proven.source`, opened at the captured version the
+    // merge-input tag retains, so a later pin on the same table is not a
+    // change of input.
     if live_entry.identity != proven.source_identity
         || live_entry.dataset_path != proven.source_table_path
         || live_entry.native_dataset_branch != proven.source_table_branch
-        || pin_version(live_entry) != proven.source_version
     {
         return Err(OmniError::manifest_read_set_changed(
             format!("branch_merge_source_dataset:{table_key}"),
@@ -1428,7 +1437,7 @@ async fn revalidate_proven_pure_insert_source(
                 live_entry.identity,
                 live_entry.dataset_path,
                 live_entry.native_dataset_branch,
-                live_entry.published_dataset_version
+                pin_version(live_entry)
             )),
         ));
     }
@@ -4190,14 +4199,16 @@ struct MergeChain {
     links: Vec<SnapshotHandle>,
     uuids: Vec<String>,
     witness: crate::table_store::StagingWitness,
+    declared_full_text: Vec<String>,
 }
 
 impl MergeChain {
-    fn new(witness: crate::table_store::StagingWitness) -> Self {
+    fn new(witness: crate::table_store::StagingWitness, declared_full_text: Vec<String>) -> Self {
         Self {
             links: Vec::new(),
             uuids: Vec::new(),
             witness,
+            declared_full_text,
         }
     }
 
@@ -4225,7 +4236,7 @@ async fn commit_detached_merge_stage(
 ) -> Result<SnapshotHandle> {
     let (detached, identity) = target_db
         .storage()
-        .commit_staged_detached(current, staged, &chain.witness)
+        .commit_staged_detached(current, staged, &chain.witness, &chain.declared_full_text)
         .await?;
     chain.links.push(detached.clone());
     chain.uuids.push(identity.uuid);
@@ -4310,7 +4321,10 @@ async fn publish_rewritten_merge_table(
     // Every chunk commits detached from the previous one (RFC 0067): a
     // failure anywhere leaves the chain as reclaimable garbage and the
     // target's linear HEAD untouched.
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     for (payload, semantics) in [
         (&staged.inserts, KeyedWriteSemantics::StrictInsert),
         (&staged.updates, KeyedWriteSemantics::KnownPresentUpdate),
@@ -4646,7 +4660,10 @@ async fn publish_proven_pure_insert_adopt(
         )
         .await?;
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     let committed = commit_keyed_stream_chunks(
         target_db,
         table_key,
@@ -4724,7 +4741,10 @@ async fn publish_adopted_delta(
     // but `WhenMatched::Fail` is still required: a concurrent same-key writer
     // must conflict rather than letting this optimization bypass the fence.
     // The adapter keeps wide vector/blob rows streaming and batch-bounded.
-    let mut chain = MergeChain::new(target_txn.authority.staging_witness()?);
+    let mut chain = MergeChain::new(
+        target_txn.authority.staging_witness()?,
+        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+    );
     if let Some(insert_table) = &delta.inserts {
         current_ds = commit_staged_keyed_chunks(
             target_db,
@@ -5027,10 +5047,28 @@ impl Omnigraph {
         }
 
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let _branch_guards = self
-            .write_queue()
-            .acquire_branches(&[source_branch.clone(), target_branch.clone()])
-            .await;
+        // The target gate is held through publication: it keeps a target
+        // delete/recreate from reusing the name underneath the plan (ABA) and
+        // serializes merges into one target. The source gate is held only
+        // until the source snapshot is captured, tagged and proved still
+        // current below; from then on the tagged snapshot is the merge's
+        // input, so writes and deletes on the source do not wait for the merge.
+        // Both are taken in the sorted order `acquire_branches` uses, so the
+        // pair cannot deadlock with another multi-branch acquirer.
+        let queue = self.write_queue();
+        let (source_gate, _target_gate) = if source_branch <= target_branch {
+            let source_gate = queue.acquire_branch(source_branch.as_deref()).await;
+            (
+                source_gate,
+                queue.acquire_branch(target_branch.as_deref()).await,
+            )
+        } else {
+            let target_gate = queue.acquire_branch(target_branch.as_deref()).await;
+            (
+                queue.acquire_branch(source_branch.as_deref()).await,
+                target_gate,
+            )
+        };
         // Capture each branch as one coherent RFC-022 authority token plus
         // immutable snapshot. The target token is the coarse publish read set;
         // the source token pins the exact merge input without requiring the
@@ -5113,6 +5151,7 @@ impl Omnigraph {
                 return Err(error);
             }
         };
+        drop(source_gate);
         let is_fast_forward = head_is_base || same_graph_state(&base_snapshot, &target_txn.base);
         // The handle remains bound to its original branch throughout the merge.
         // The captured transaction supplies every physical and publish target.
@@ -5542,18 +5581,17 @@ impl Omnigraph {
         //
         // This bridge still coexists with legacy maintenance writers that take
         // only `(table, branch)` queues. Acquire the conservative all-catalog
-        // envelope for BOTH source and target, in the global sorted order, then
-        // re-read both manifest branches before the first effect. Planning
-        // remains outside table queues, but no plan derived from a stale
-        // source/target snapshot can cross into physical effects.
+        // envelope for the target, in the global sorted order, then re-read
+        // both manifest branches before the first effect. Planning remains
+        // outside table queues, but no plan derived from a stale target
+        // snapshot can cross into physical effects. The source's queues are
+        // not taken: its input is the tagged snapshot captured above, so a
+        // write, index build or delete on the source may proceed; the re-read
+        // still refuses a source whose incarnation or schema changed by then.
         let final_revalidation_timing = crate::instrumentation::start_merge_timing(
             crate::instrumentation::MergeTimingPhase::FinalRevalidation,
         );
-        let active_branch_for_keys = target_branch.map(str::to_string);
-        let merge_branches = [
-            source_branch.map(str::to_string),
-            active_branch_for_keys.clone(),
-        ];
+        let merge_branches = [target_branch.map(str::to_string)];
         let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
         let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
 

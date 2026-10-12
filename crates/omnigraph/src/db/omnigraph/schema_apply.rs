@@ -465,6 +465,35 @@ where
         }
     }
 
+    // A full-text index the desired schema declares on a table this apply
+    // neither adds, evolves nor drops (a new `@index`) is declared in this
+    // publication by an untrained segment, so no search on it runs without
+    // its analyzer; the postings are built off the critical path. An evolved
+    // table declares its full-text columns in its evolution's commits.
+    let mut declared_tables = BTreeMap::<String, Vec<String>>::new();
+    for type_name in desired_catalog.node_types.keys() {
+        let table_key = schema_table_key(SchemaTypeKind::Node, type_name);
+        if added_tables.contains(&table_key)
+            || evolved_tables.contains(&table_key)
+            || dropped_tables.contains(&table_key)
+        {
+            continue;
+        }
+        let source_table_key = renamed_tables.get(&table_key).unwrap_or(&table_key);
+        let accepted = super::table_ops::declared_full_text_columns(
+            accepted_catalog.as_ref(),
+            source_table_key,
+        );
+        let columns: Vec<String> =
+            super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)
+                .into_iter()
+                .filter(|column| !accepted.contains(column))
+                .collect();
+        if !columns.is_empty() {
+            declared_tables.insert(table_key, columns);
+        }
+    }
+
     let mut table_registrations =
         BTreeMap::<String, (crate::db::manifest::TableIdentity, String)>::new();
     let mut table_updates =
@@ -702,7 +731,15 @@ where
                     )?;
                     let (detached, transaction) = db
                         .storage()
-                        .commit_staged_detached(existing, staged, &witness)
+                        .commit_staged_detached(
+                            existing,
+                            staged,
+                            &witness,
+                            &super::table_ops::declared_full_text_columns(
+                                &desired_catalog,
+                                table_key,
+                            ),
+                        )
                         .await?;
                     (detached, Some(transaction))
                 }
@@ -785,23 +822,39 @@ where
             // each a detached commit of the previous; the pin names the tip.
             // Neither writes a data file, so every surviving index keeps its
             // coverage and no row or Blob payload is read.
+            let declared =
+                super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
             let mut tip_transaction = None;
             while let Some(staged) = db
                 .storage()
                 .stage_schema_evolution(&tip, &mut evolution)
                 .await?
             {
+                // A step that adds a full-text column, or meets one newly
+                // declared, chains that column's analyzer segment.
                 let (next, transaction) = db
                     .storage()
-                    .commit_staged_detached(tip, staged, &witness)
+                    .commit_staged_detached(tip, staged, &witness, &declared)
                     .await?;
                 tip = next;
                 tip_transaction = Some(transaction);
                 fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
             }
-            let Some(transaction) = tip_transaction else {
-                // The table already has the target schema: nothing to publish.
-                continue;
+            let (tip, transaction) = match tip_transaction {
+                Some(transaction) => (tip, transaction),
+                // The table already has the target schema: only a newly
+                // declared full-text index can still need a commit.
+                None => match db
+                    .storage()
+                    .commit_full_text_declarations(tip, &declared, &witness)
+                    .await?
+                {
+                    Some(declared) => {
+                        fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+                        declared
+                    }
+                    None => continue,
+                },
             };
             let state = db.storage().table_state(&dataset_uri, &tip).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
@@ -823,12 +876,63 @@ where
             );
         }
 
-        // Index-only changes (AddConstraint, i.e. adding an `@index`) are pure
-        // metadata: the new `@index` intent is recorded in the desired catalog/IR
-        // persisted below, and the physical index is materialized off the critical
-        // path by `ensure_indices`/`optimize` (iss-848). Schema apply touches no
-        // table data for them, so there is no per-table loop here and no pin.
-        // Reads stay correct meanwhile via a scan.
+        // An added `@index` records its intent in the desired catalog/IR
+        // persisted below; a full-text one is also declared on its table
+        // here. Every postings build (and every other index kind) happens off
+        // the critical path in `ensure_indices`/`optimize`; reads scan
+        // uncovered fragments meanwhile.
+        for (table_key, columns) in &declared_tables {
+            let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+            let entry = snapshot.dataset(source_table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema apply targeting '{}'",
+                    source_table_key, table_key
+                ))
+            })?;
+            let source_ds = existing_heads.remove(source_table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "missing preflighted source table '{}' for schema apply",
+                    source_table_key
+                ))
+            })?;
+            let identity = table_identity_for_schema_key(&desired_ir, table_key)?;
+            if identity != entry.identity {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply declaration '{}' changed table identity {} to {}",
+                    table_key, entry.identity, identity
+                )));
+            }
+            let witness = crate::table_store::StagingWitness::new(
+                &base_branch_identifier,
+                base_graph_head.as_deref(),
+            )?;
+            let Some((detached, transaction)) = db
+                .storage()
+                .commit_full_text_declarations(source_ds, columns, &witness)
+                .await?
+            else {
+                continue;
+            };
+            let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
+            let state = db.storage().table_state(&dataset_uri, &detached).await?;
+            let version_metadata = state
+                .version_metadata
+                .with_staged(state.version, transaction.uuid.clone())
+                .with_last_linear_version(entry.version_metadata.last_linear_version());
+            expected_table_versions.insert(identity, entry.published_dataset_version);
+            table_updates.insert(
+                identity,
+                crate::db::DatasetUpdate {
+                    identity,
+                    type_key: table_key.clone(),
+                    published_dataset_version: entry.published_dataset_version + 1,
+                    native_dataset_branch: None,
+                    entity_count: state.row_count,
+                    version_metadata,
+                },
+            );
+            fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+        }
 
         let mut manifest_changes = Vec::new();
         let mut expected_versions = crate::db::manifest::ExpectedTableVersions::new();
