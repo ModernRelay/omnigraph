@@ -374,7 +374,8 @@ what still can merge, then deletes or exports the rest.
 
 ### Code survey
 
-Each assumption above was checked in code at commit `a3af0c85`:
+Each assumption above was checked in code at commit `a3af0c85`; the facts
+quoted in Motivation and Design were rechecked at `f53bf4fb`:
 
 - Contract rows: only schema apply and the system-column upgrade produce
   `ManifestChange::SchemaContract` outside tests; the publisher carries the
