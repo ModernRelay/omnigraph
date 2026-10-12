@@ -24,14 +24,46 @@ use crate::helpers::{
     with_setting, with_traversal,
 };
 
-/// A warm same-branch read must do ZERO `__manifest` object-store reads and must
-/// not open the commit graph, even at commit-history depth. Wrapped in
+/// The one `__manifest` request a warm read's freshness probe leaves in the
+/// tracker: its HEAD of the held version's manifest. Its HEAD of the next
+/// version answers "not found", which the tracker does not record, and it
+/// lists nothing; any other recorded request is a manifest open or scan.
+fn assert_only_the_probe_head(manifest_reads: u64, context: &str) {
+    let reads = last_manifest_reads();
+    assert_eq!(manifest_reads, 1, "{context}: {reads:#?}");
+    assert!(
+        reads.len() == 1 && reads[0].contains("/_versions/") && reads[0].ends_with(".manifest"),
+        "{context}: the one `__manifest` request is the probe's HEAD of the held version: {reads:#?}"
+    );
+}
+
+/// A warm named-branch read's recorded `__manifest` requests: the branch's
+/// `BranchContents` lifetime witness and the probe's HEAD of the held version
+/// in the branch tree, never a manifest body.
+fn assert_branch_witness_and_probe_head(reads: &[String]) {
+    assert_eq!(reads.len(), 2, "{reads:#?}");
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.contains("_refs/branches/feature") && read.ends_with(".json")),
+        "the branch-lifetime witness is read: {reads:#?}"
+    );
+    assert!(
+        reads.iter().any(|read| read.contains("/tree/feature")
+            && read.contains("/_versions/")
+            && read.ends_with(".manifest")),
+        "the other request is the probe's HEAD of the held branch version: {reads:#?}"
+    );
+}
+
+/// A warm same-branch read must not open or scan `__manifest` and must not
+/// open the commit graph, even at commit-history depth. Wrapped in
 /// `cost_harness`, so `manifest_reads` is ground truth: the warm-coordinator
-/// freshness probe rides the long-lived handle (which now carries the tracker) and
-/// is served from Lance's cached manifest at 0 store reads, so this `== 0` also
-/// catches any future warm-handle scan a per-op tracker would miss. Fails before
-/// Fix 1, where the read path re-opens a fresh coordinator and scans both internal
-/// tables.
+/// freshness probe rides the long-lived handle (which now carries the tracker),
+/// and its HEAD of the held manifest version is the one request recorded, so
+/// this also catches any future warm-handle scan a per-op tracker would miss.
+/// Fails before Fix 1, where the read path re-opens a fresh coordinator and
+/// scans both internal tables.
 #[tokio::test]
 async fn warm_same_branch_read_does_no_resolution_opens() {
     cost_harness(async {
@@ -55,9 +87,9 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         // data table by location+version instead of via the namespace, so the
         // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
         // of an internal table that grows with commit count.
-        assert_eq!(
-            io.manifest_reads, 0,
-            "warm same-branch read must not scan __manifest (resolution or per-table)"
+        assert_only_the_probe_head(
+            io.manifest_reads,
+            "warm same-branch read must not scan __manifest (resolution or per-table)",
         );
         assert_eq!(
             io.version_probes, 1,
@@ -78,7 +110,7 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
 
 /// Reading a branch's storage-format stamp (`omnigraph snapshot`, the served
 /// `GET /snapshot`) costs what any warm read costs: one version probe and no
-/// `__manifest` read. The stamp comes from the snapshot's own manifest version,
+/// `__manifest` read beyond its HEAD. The stamp comes from the snapshot's own manifest version,
 /// so it describes the same graph version as the tables beside it, where the
 /// stamp was once read by resolving the branch again and opening `__manifest`
 /// at its newest version.
@@ -95,7 +127,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
             omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION
         );
         assert_eq!(io.version_probes, 1, "{io:?}");
-        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_only_the_probe_head(io.manifest_reads, &format!("{io:?}"));
         assert_eq!(io.internal_open_count, 0, "{io:?}");
 
         let (pair, io) = measure(async {
@@ -114,7 +146,7 @@ async fn warm_stamp_read_costs_one_version_probe() {
                 .graph_manifest_version()
         );
         assert_eq!(io.version_probes, 1, "{io:?}");
-        assert_eq!(io.manifest_reads, 0, "{io:?}");
+        assert_only_the_probe_head(io.manifest_reads, &format!("{io:?}"));
         assert_eq!(io.internal_open_count, 0, "{io:?}");
     })
     .await;
@@ -140,9 +172,9 @@ async fn multi_table_query_does_no_manifest_scans() {
         .await;
         out.unwrap();
 
-        assert_eq!(
-            io.manifest_reads, 0,
-            "a multi-table read must not scan __manifest once per touched table"
+        assert_only_the_probe_head(
+            io.manifest_reads,
+            "a multi-table read must not scan __manifest once per touched table",
         );
     })
     .await;
@@ -465,10 +497,8 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         assert_eq!(io.version_probes, 1);
         assert_eq!(io.internal_open_count, 0);
         assert_eq!(io.manifest_scan_count, 0);
-        assert_eq!(io.manifest_reads, 1);
-        let reads = last_manifest_reads();
-        assert_eq!(reads.len(), 1);
-        assert!(reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"));
+        assert_eq!(io.manifest_reads, 2);
+        assert_branch_witness_and_probe_head(&last_manifest_reads());
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
             "feature",
@@ -490,13 +520,14 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         .await;
         out.unwrap();
 
-        assert_eq!(io.manifest_reads, 1, "warm branch read must spend exactly one read on the native branch-lifetime witness; reads: {:#?}", last_manifest_reads());
-        let reads = last_manifest_reads();
-        assert_eq!(reads.len(), 1);
-        assert!(
-            reads[0].contains("_refs/branches/feature") && reads[0].ends_with(".json"),
-            "the sole warm named-branch read must be BranchContents, not a manifest body: {reads:#?}"
+        assert_eq!(
+            io.manifest_reads,
+            2,
+            "warm branch read must spend one read on the native branch-lifetime witness and one \
+             on the probe's HEAD; reads: {:#?}",
+            last_manifest_reads()
         );
+        assert_branch_witness_and_probe_head(&last_manifest_reads());
         assert_eq!(
             io.version_probes, 1,
             "warm branch read probes only the requested branch once"
@@ -1473,7 +1504,7 @@ async fn repeat_warm_read_reuses_table_handles() {
             warm.data_reads, 0,
             "a warm repeat read must reuse the held handle (0 table opens)"
         );
-        assert_eq!(warm.manifest_reads, 0, "warm repeat read: 0 manifest opens");
+        assert_only_the_probe_head(warm.manifest_reads, "warm repeat read: 0 manifest opens");
         assert_eq!(
             warm.version_probes, 1,
             "warm repeat read: exactly one version probe"

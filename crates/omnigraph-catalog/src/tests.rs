@@ -9669,10 +9669,11 @@ impl object_store::ObjectStore for HistoryGetStore {
     }
 }
 
-/// The freshness probe asks for the versions after the held one by name.
-/// `latest_version_id` lists `_versions/`, and on a store whose listing is
-/// ordered (S3, and Lance's in-memory stores) that one request carries up to
-/// a thousand keys on every warm read.
+/// The freshness probe asks for the held version and the ones after it by
+/// name. `latest_version_id` lists `_versions/`, and on a store whose listing
+/// is ordered (S3, and Lance's in-memory stores) that one request carries up
+/// to a thousand keys on every warm read. A removed `__manifest` still fails
+/// the probe: every name is absent there, so the listing answers.
 #[tokio::test]
 async fn freshness_probe_asks_for_the_next_version_by_name() {
     use arrow_array::ArrayRef;
@@ -9713,34 +9714,46 @@ async fn freshness_probe_asks_for_the_next_version_by_name() {
         sent.drain();
         sent.drain_lists();
 
-        // Unchanged: one HEAD of version 2, answered "not found".
+        // Unchanged: version 1 is found and version 2 is absent.
         let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
         assert_eq!(latest.version, 1, "v2_paths={v2_paths}");
-        assert_eq!(sent.drain(), (0, 1, 1), "v2_paths={v2_paths}");
-        assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
-
-        // Another writer commits once: version 2 is found, 3 is absent.
-        append().await;
-        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
-        assert_eq!(latest.version, 2, "v2_paths={v2_paths}");
         assert_eq!(sent.drain(), (0, 1, 2), "v2_paths={v2_paths}");
         assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
 
-        // A gap longer than the probe's steps: the listing answers.
-        for _ in 0..FRESHNESS_PROBE_STEPS {
-            append().await;
-        }
+        // Another writer commits once: versions 1 and 2 are found, 3 is absent.
+        append().await;
         let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        assert_eq!(latest.version, 2, "v2_paths={v2_paths}");
+        assert_eq!(sent.drain(), (0, 1, 3), "v2_paths={v2_paths}");
+        assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
+
+        // A gap of more than two versions: the listing answers.
+        append().await;
+        append().await;
+        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        assert_eq!(latest.version, 4, "v2_paths={v2_paths}");
+        assert_eq!(sent.drain(), (0, 0, 3), "v2_paths={v2_paths}");
+        assert_eq!(sent.drain_lists(), 1, "v2_paths={v2_paths}");
+
+        // A removed `__manifest`: no name answers, and the listing's "not
+        // found" fails the probe instead of reporting the held version.
+        held.object_store(None)
+            .await
+            .unwrap()
+            .remove_dir_all(held.branch_location().path)
+            .await
+            .unwrap();
+        sent.drain();
+        sent.drain_lists();
+        let error = probe_dataset_latest_incarnation(&held, None)
+            .await
+            .unwrap_err();
         assert_eq!(
-            latest.version,
-            1 + 1 + FRESHNESS_PROBE_STEPS as u64,
-            "v2_paths={v2_paths}"
+            error.storage_failure().map(|failure| failure.kind),
+            Some(StorageFailureKind::NotFound),
+            "v2_paths={v2_paths}: {error}"
         );
-        assert_eq!(
-            sent.drain(),
-            (0, 0, FRESHNESS_PROBE_STEPS),
-            "v2_paths={v2_paths}"
-        );
+        assert_eq!(sent.drain(), (0, 2, 2), "v2_paths={v2_paths}");
         assert_eq!(sent.drain_lists(), 1, "v2_paths={v2_paths}");
     }
 }

@@ -829,10 +829,6 @@ impl CapturedManifestProbe {
     }
 }
 
-/// Versions above the held one the freshness probe asks for by name before
-/// it lists `_versions/` instead.
-const FRESHNESS_PROBE_STEPS: usize = 2;
-
 /// The latest attached version of `dataset`'s location (main or the branch
 /// tree it is checked out on), asked for by name from the version it holds.
 ///
@@ -841,28 +837,35 @@ const FRESHNESS_PROBE_STEPS: usize = 2;
 /// keys however few of them are new, and a warm read pays it on every query.
 /// Attached versions are contiguous: Lance writes version `v + 1` only with a
 /// put-if-absent over a read of `v`, and nothing deletes a version of a live
-/// branch's `__manifest`, so the first absent name above the held version
-/// ends the history. (`cleanup` collects a retired branch's whole tree; the
-/// named-branch probe's identifier read catches that.) A reclamation of old
-/// `__manifest` versions must keep every version above one a live handle
-/// holds. The probe HEADs `v + 1`, `v + 2`,
-/// … for at most [`FRESHNESS_PROBE_STEPS`] names; a longer gap, a detached
-/// handle or any answer other than "not found" falls back to the listing,
-/// which stays the authority. Like the listing, it relies on the store
-/// showing a completed write to a later request.
+/// branch's `__manifest`, so while the held version `v` exists the first
+/// absent name above it ends the history. (`cleanup` collects a retired
+/// branch's whole tree; the named-branch probe's identifier read catches
+/// that.) A reclamation of old `__manifest` versions must keep every version
+/// above one a live handle holds.
+///
+/// The probe HEADs `v` and `v + 1` together, then `v + 2` when `v + 1`
+/// exists. `v` must answer: a removed or unreadable `__manifest` answers "not
+/// found" for every name, and only the listing reports it as the failure it
+/// is. A gap of more than two versions, a detached handle, an absent `v` or
+/// any error falls back to the listing, which stays the authority. Like the
+/// listing, the probe relies on the store showing a completed write to a
+/// later request.
 async fn latest_attached_version(dataset: &Dataset) -> lance::Result<u64> {
     let held = dataset.version().version;
     if !lance_table::format::is_detached_version(held) {
         let scheme = dataset.manifest_location().naming_scheme;
         let base = dataset.branch_location().path;
         let store = dataset.object_store(None).await?;
-        let mut latest = held;
-        for _ in 0..FRESHNESS_PROBE_STEPS {
-            match store.exists(&scheme.manifest_path(&base, latest + 1)).await {
-                Ok(true) => latest += 1,
-                Ok(false) => return Ok(latest),
-                Err(_) => break,
+        let [at, next, after] = [held, held + 1, held + 2].map(|v| scheme.manifest_path(&base, v));
+        let (held_present, next_present) = futures::join!(store.exists(&at), store.exists(&next));
+        match (held_present, next_present) {
+            (Ok(true), Ok(false)) => return Ok(held),
+            (Ok(true), Ok(true)) => {
+                if let Ok(false) = store.exists(&after).await {
+                    return Ok(held + 1);
+                }
             }
+            _ => {}
         }
     }
     dataset.latest_version_id().await
