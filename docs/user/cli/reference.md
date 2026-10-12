@@ -41,12 +41,12 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
 | `query` | Run a read query, or the `branch list`, `show`, or `explain` statement | direct or served |
-| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge` | Manage graph branches; `merge --as-commit` leaves the merge unpublished | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits) or one commit's entity changes; publish an unpublished commit onto its recorded target branch, or drop it | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
@@ -135,13 +135,13 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. `omnigraph upgrade`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v15, offline and
-in place, keeping branches and commit history, and stamps a v14 graph to v15
-with one metadata-only commit per live branch; stop every process using the
-graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 15 only. `check_passed`, `already_current` (a
-v15 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 15, `unsupported_target`)
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v16, offline and
+in place, keeping branches and commit history, and stamps a v14 or v15 graph
+to v16 with one metadata-only commit per live branch; stop every process using
+the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 16 only. `check_passed`, `already_current` (a
+v16 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 16, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster

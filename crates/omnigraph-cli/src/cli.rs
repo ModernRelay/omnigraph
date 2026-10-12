@@ -290,7 +290,7 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the current format this binary serves (v15); other formats are rebuilt by export and load
+    /// the current format this binary serves (v16); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
@@ -943,6 +943,10 @@ pub(crate) enum CommitCommand {
         /// (`as commit` writes awaiting `commit publish`) instead of its history
         #[arg(long)]
         unpublished: bool,
+        /// List the live unattached snapshots whose recorded target is the
+        /// branch (`as unattached branch` writes) instead of its history
+        #[arg(long, conflicts_with = "unpublished")]
+        unattached: bool,
         #[arg(long)]
         json: bool,
     },
@@ -955,8 +959,8 @@ pub(crate) enum CommitCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Drop an unpublished commit: its id stops resolving and its held merge
-    /// inputs are released
+    /// Drop an unpublished commit or an unattached snapshot: the id and every
+    /// unattached descendant stop resolving and held merge inputs are released
     Drop {
         /// Graph URI
         #[arg(long)]

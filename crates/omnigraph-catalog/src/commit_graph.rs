@@ -11,6 +11,24 @@ use crate::error::{OmniError, Result};
 use crate::history;
 use crate::state::{BlockRun, LineageRegistry, MergeEdge};
 
+/// What a graph commit is on the wire: a commit of a branch's lineage, a
+/// publishable proposal (RFC "Unpublished graph commits"), or an unattached
+/// snapshot that is never published (RFC "Unattached graph branches").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphCommitKind {
+    #[default]
+    Published,
+    Unpublished,
+    Unattached,
+}
+
+impl GraphCommitKind {
+    pub fn is_published(self) -> bool {
+        self == Self::Published
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GraphCommit {
     pub graph_commit_id: String,
@@ -23,14 +41,25 @@ pub struct GraphCommit {
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
     pub created_at: i64,
-    /// `false` for an unpublished commit: a proposal readable by its id and
-    /// invisible to every branch read until it is published.
+    /// `false` for an unpublished commit or an unattached snapshot: readable
+    /// by its id and invisible to every branch read; always `kind.is_published()`.
     #[serde(default = "published_by_default")]
     pub published: bool,
+    /// Serialized only for the two unpublished kinds: a published commit's
+    /// encoding is unchanged by its arrival.
+    #[serde(default, skip_serializing_if = "kind_is_published")]
+    pub kind: GraphCommitKind,
+    /// The root of an unattached snapshot's chain, `None` for the other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_commit_id: Option<String>,
 }
 
 fn published_by_default() -> bool {
     true
+}
+
+fn kind_is_published(kind: &GraphCommitKind) -> bool {
+    kind.is_published()
 }
 
 impl GraphCommit {
@@ -713,6 +742,8 @@ pub fn graph_commit_from_manifest_row(row: crate::GraphLineageRow) -> GraphCommi
         actor_id: row.actor_id,
         created_at: row.created_at,
         published: true,
+        kind: GraphCommitKind::Published,
+        root_commit_id: None,
     }
 }
 
@@ -1568,6 +1599,8 @@ mod tests {
             actor_id: None,
             created_at: 0,
             published: true,
+            kind: GraphCommitKind::Published,
+            root_commit_id: None,
         }
     }
 

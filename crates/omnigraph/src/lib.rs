@@ -63,6 +63,10 @@ pub use table_store::IndexCoverage;
 pub struct MutationReceipt {
     pub result: omnigraph_compiler::result::MutationResult,
     pub commit: Option<db::GraphCommit>,
+    /// The branch the write addressed: the request branch, or on a child
+    /// unattached write the recorded target its base inherits (`"main"` for
+    /// main).
+    pub branch: String,
 }
 
 // DST seam: registry access for the harness's Lance-realm fault injector.

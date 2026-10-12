@@ -1321,6 +1321,68 @@ insert Person {
 }
 
 #[test]
+fn unattached_base_parameter_must_be_a_declared_non_nullable_string() {
+    let catalog = setup();
+    let declared = parse_query(
+        "query add($name: String, $base: String) as unattached branch on $base {\n    insert Person { name: $name }\n}\n",
+    )
+    .unwrap();
+    let CheckedQuery::Mutation(checked) =
+        typecheck_query_decl(&catalog, declared.single_decl()).unwrap()
+    else {
+        panic!("expected mutation typecheck result");
+    };
+    assert_eq!(
+        checked.write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param("base".to_string())),
+        }
+    );
+    let literal = parse_query(
+        "query add($name: String) as unattached branch on \"01ARZ3NDEKTSV4RRFFQ69G5FAV\" {\n    insert Person { name: $name }\n}\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        typecheck_query_decl(&catalog, literal.single_decl()),
+        Ok(CheckedQuery::Mutation(_))
+    ));
+
+    for (params, expected) in [
+        (
+            "$name: String",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is not declared",
+        ),
+        (
+            "$name: String, $base: I32",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `I32`",
+        ),
+        (
+            "$name: String, $base: String?",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `String?`",
+        ),
+        (
+            "$name: String, $base: [String]",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `[String]`",
+        ),
+        (
+            "$name: String, $base: [String]?",
+            "T55: `on $base` needs a declared `String` parameter; `$base` is `[String]?`",
+        ),
+    ] {
+        let source = format!(
+            "query add({params}) as unattached branch on $base {{\n    insert Person {{ name: $name }}\n}}\n"
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query_decl(&catalog, qf.single_decl()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("type error: {expected}"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn test_mutation_insert_missing_required_property() {
     let catalog = setup();
     let qf = parse_query(
@@ -1957,7 +2019,7 @@ return { $d.name }
         order_clause: Vec::new(),
         limit: None,
         mutations: Vec::new(),
-        as_commit: false,
+        write_mode: MutationWriteMode::Publish,
     };
     let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
     assert_eq!(

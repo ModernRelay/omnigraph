@@ -4196,7 +4196,7 @@
           "commits"
         ],
         "summary": "List commits, most recent first.",
-        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`.",
+        "description": "`branch` selects which history to list: a named branch returns the history\nreachable from that branch's head (the main commits inherited up to the\nfork plus the branch-authored commits); omitting it returns `main`'s\nhistory. There is no cross-branch listing. Ordering is part of the\ncontract — newest first by (graph-manifest version, created-at, commit id) — and\na future `cursor`/`limit` pagination will be keyset-based on that same\norder. Read-only.\n\n`unpublished=true` lists instead the unpublished commits whose recorded\ntarget is `branch` (writes `as commit` awaiting `commit publish`), newest\nfirst; each carries `published: false`. `unattached=true` lists instead\nthe live unattached snapshots whose recorded target is `branch` (writes\n`as unattached branch`), newest first, each with `kind: \"unattached\"`;\nthe two filters together are refused (400).",
         "operationId": "cluster_listCommits",
         "parameters": [
           {
@@ -4223,6 +4223,15 @@
             "name": "unpublished",
             "in": "query",
             "description": "`true` lists the unpublished commits whose recorded target is `branch`\n(writes `as commit` awaiting `commit publish`), newest first, instead\nof the branch's history.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "unattached",
+            "in": "query",
+            "description": "`true` lists the live unattached snapshots whose recorded target is\n`branch` (writes `as unattached branch`), newest first, instead of\nthe branch's history. Refused together with `unpublished`.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -4587,8 +4596,8 @@
         "tags": [
           "commits"
         ],
-        "summary": "Drop an unpublished commit.",
-        "description": "**Irreversible.** Runs under `commit_drop` on the commit's recorded target\nbranch; a denial answers the 404 an unknown id answers. A published commit\nis never dropped (409). The GQ statement `commit drop \"<id>\"` on\n`POST /mutate` runs the same body.",
+        "summary": "Drop an unpublished commit or an unattached snapshot.",
+        "description": "**Irreversible.** Runs under `commit_drop` on the commit's recorded target\nbranch; a denial answers the 404 an unknown id answers. A published commit\nis never dropped (409). Dropping an unattached snapshot also drops every\nunattached descendant, the root's whole chain included. The GQ statement\n`commit drop \"<id>\"` on `POST /mutate` runs the same body.",
         "operationId": "cluster_dropCommit",
         "parameters": [
           {
@@ -4603,7 +4612,7 @@
           {
             "name": "commit_id",
             "in": "path",
-            "description": "Unpublished commit identifier",
+            "description": "Unpublished commit or unattached snapshot identifier",
             "required": true,
             "schema": {
               "type": "string"
@@ -4624,7 +4633,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Commit dropped: its id stops resolving and its held merge inputs are released",
+            "description": "Commit dropped: the requested id and every unattached descendant lost addressability, and a proposal's held merge inputs are released",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -5115,7 +5124,7 @@
           "commits"
         ],
         "summary": "Publish an unpublished commit onto its recorded target branch.",
-        "description": "The target is the branch the commit recorded when it was written `as\ncommit`, so the request carries no body. Runs under `commit_publish` on\nthat branch; a denial answers the 404 an unknown id answers. The GQ\nstatement `commit publish \"<id>\"` on `POST /mutate` runs the same body.",
+        "description": "The target is the branch the commit recorded when it was written `as\ncommit`, so the request carries no body. Runs under `commit_publish` on\nthat branch; a denial answers the 404 an unknown id answers. An\nunattached snapshot (`as unattached branch`) never publishes: 409 with\ncode `unattached_cannot_publish`, after the same authorization. The GQ\nstatement `commit publish \"<id>\"` on `POST /mutate` runs the same body.",
         "operationId": "cluster_publishCommit",
         "parameters": [
           {
@@ -5235,7 +5244,7 @@
             }
           },
           "409": {
-            "description": "The target's state moved under the proposal's authority",
+            "description": "The target's state moved under the proposal's authority (code `conflict`), or the commit is unattached and cannot publish (code `unattached_cannot_publish`, no durable effect)",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -9167,7 +9176,7 @@
           },
           "branch": {
             "type": "string",
-            "description": "The branch that received the effect. For a branch statement: the\ncreated branch, the deleted branch (gone by the time this is read),\nor the merge target."
+            "description": "The branch that received the effect, or the recorded target of an\nunattached write (a child inherits its base's target whatever the\nrequest named). For a branch statement: the created branch, the\ndeleted branch (gone by the time this is read), or the merge target."
           },
           "commit": {
             "oneOf": [
@@ -9281,6 +9290,15 @@
           }
         }
       },
+      "CommitKindOutput": {
+        "type": "string",
+        "description": "`published`: a commit of a branch's lineage. `unpublished`: a proposal\n(`as commit`) awaiting `commit publish`. `unattached`: an unattached\nsnapshot (`as unattached branch`), which never publishes.",
+        "enum": [
+          "published",
+          "unpublished",
+          "unattached"
+        ]
+      },
       "CommitListOutput": {
         "type": "object",
         "required": [
@@ -9300,7 +9318,8 @@
         "required": [
           "graph_commit_id",
           "graph_manifest_version",
-          "created_at"
+          "created_at",
+          "kind"
         ],
         "properties": {
           "actor_id": {
@@ -9329,6 +9348,10 @@
             "format": "int64",
             "minimum": 0
           },
+          "kind": {
+            "$ref": "#/components/schemas/CommitKindOutput",
+            "description": "Which kind of commit this is. Required on the wire; a legacy receipt\nwithout it derives `published` or `unpublished` from `published`."
+          },
           "merged_parent_commit_id": {
             "type": [
               "string",
@@ -9343,7 +9366,14 @@
           },
           "published": {
             "type": "boolean",
-            "description": "`false` for an unpublished commit (a write `as commit`): readable by\nits id, invisible to every branch read, until `commit publish`.\n`graph_manifest_version` is then the detached version holding it."
+            "description": "`false` for an unpublished commit (a write `as commit`) or an\nunattached snapshot (a write `as unattached branch`): readable by its\nid, invisible to every branch read; only the former publishes.\n`graph_manifest_version` is then the detached version holding it.\nAlways `kind == published`."
+          },
+          "root_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The root of an unattached snapshot's chain, the snapshot's own id on\na root; `null` for the other kinds."
           }
         }
       },
@@ -9517,6 +9547,7 @@
           "not_found",
           "method_not_allowed",
           "conflict",
+          "unattached_cannot_publish",
           "too_many_requests",
           "service_unavailable",
           "graph_unavailable",

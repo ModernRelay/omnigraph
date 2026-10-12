@@ -312,6 +312,62 @@ fn parity_mutate() {
             "{arm} no-op mutation must not invent a commit"
         );
     }
+
+    let (l, r) = p.run(&["branch", "create", "feature", "--json"]);
+    assert_parity("branch create for unattached writes", &l, &r);
+    let (local_root, remote_root) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query root() as unattached branch { insert Person { name: \"Root\", age: 8 } }",
+        "--json",
+    ]);
+    for (arm, root) in [("local", local_root), ("remote", remote_root)] {
+        assert!(root.status.success(), "{arm} unattached root: {root:?}");
+        let root = parse_stdout_json(&root);
+        let base = root["commit"]["graph_commit_id"].as_str().unwrap();
+        let source = format!(
+            "query child() as unattached branch on \"{base}\" {{ \
+             insert Person {{ name: \"Child\", age: 9 }} }}"
+        );
+        let run = |args: &[&str]| {
+            let mut command = cli();
+            command.args(args);
+            if arm == "local" {
+                command
+                    .arg("--store")
+                    .arg(&p.local)
+                    .arg("--as")
+                    .arg(PARITY_ACTOR);
+            } else {
+                command
+                    .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+                    .arg("--server")
+                    .arg(&p.server.base_url)
+                    .arg("--graph")
+                    .arg(PARITY_GRAPH_ID);
+            }
+            command.output().unwrap()
+        };
+        let refused = run(&["mutate", "--branch", "main", "-e", &source]);
+        assert!(
+            !refused.status.success(),
+            "{arm} explicit main: {refused:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("is not the recorded target"),
+            "{arm} explicit main: {refused:?}"
+        );
+        let inherited = run(&["mutate", "-e", &source, "--json"]);
+        assert!(
+            inherited.status.success(),
+            "{arm} omitted branch: {inherited:?}"
+        );
+        let inherited = parse_stdout_json(&inherited);
+        assert_eq!(inherited["branch"], "feature", "{arm} receipt target");
+        assert_eq!(inherited["affected_nodes"], 1, "{arm} child rows");
+    }
 }
 
 #[test]

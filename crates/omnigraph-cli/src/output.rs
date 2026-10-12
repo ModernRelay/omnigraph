@@ -825,7 +825,7 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
     for commit in commits {
         let branch = commit.graph_branch.as_deref().unwrap_or("main");
         println!(
-            "{} graph_branch={} graph_manifest_version={}{}",
+            "{} graph_branch={} graph_manifest_version={}{}{}",
             commit.graph_commit_id,
             branch,
             commit.graph_manifest_version,
@@ -833,8 +833,21 @@ pub(crate) fn print_commit_list_human(commits: &[CommitOutput]) {
                 .actor_id
                 .as_deref()
                 .map(|actor| format!(" actor={}", actor))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            commit_kind_suffix(commit),
         );
+    }
+}
+
+/// ` kind=unattached root=<id>` for an unattached snapshot, empty otherwise:
+/// `published: false` alone does not say whether an id can publish.
+fn commit_kind_suffix(commit: &CommitOutput) -> String {
+    match commit.kind {
+        CommitKindOutput::Unattached => format!(
+            " kind=unattached root={}",
+            commit.root_commit_id.as_deref().unwrap_or("?")
+        ),
+        CommitKindOutput::Published | CommitKindOutput::Unpublished => String::new(),
     }
 }
 
@@ -847,6 +860,17 @@ pub(crate) fn print_commit_human(commit: &CommitOutput) {
     println!("graph_manifest_version: {}", commit.graph_manifest_version);
     if !commit.published {
         println!("published: false");
+    }
+    println!(
+        "kind: {}",
+        match commit.kind {
+            CommitKindOutput::Published => "published",
+            CommitKindOutput::Unpublished => "unpublished",
+            CommitKindOutput::Unattached => "unattached",
+        }
+    );
+    if let Some(root_commit_id) = &commit.root_commit_id {
+        println!("root_commit_id: {}", root_commit_id);
     }
     if let Some(parent_commit_id) = &commit.parent_commit_id {
         println!("parent_commit_id: {}", parent_commit_id);

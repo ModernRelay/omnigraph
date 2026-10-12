@@ -222,11 +222,15 @@ schema v14 keeps a buffer of a branch's latest commits there, as
 head and the current `table` rows, released on `HISTORY_RELEASE_BYTES` (or
 the lower `history_release_bytes` a session set), and
 older commits in Lance files under `__history`. Schema v15 adds released-run
-and merge-edge registry rows. A branch's highest-ID fragment holds its hot
+and merge-edge registry rows. Schema v16 adds the reserved
+`unattached_<root>_<commit id>` tags, each naming a detached `__manifest`
+version that holds one unattached graph branch snapshot under the version 2
+candidate property. A branch's highest-ID fragment holds its hot
 rows; other fragments hold cold registry rows reused by the publisher.
-Generic `optimize` preserves this layout. A v14 branch is stamped v15 by its
-first publication, with no offline conversion.
-Normal open serves v14 and v15 only; a graph at any other stamp is refused and rebuilt
+Generic `optimize` preserves this layout. A v14 or v15 branch is stamped v16
+by its first publication or by the stamp-only route of `omnigraph upgrade`,
+with no offline conversion.
+Normal open serves v14 to v16 only; a graph at any other stamp is refused and rebuilt
 by export and load, and the
 system-column respelling is a separate step on a served graph. Older binaries
 must not expose retired refs as live branches.

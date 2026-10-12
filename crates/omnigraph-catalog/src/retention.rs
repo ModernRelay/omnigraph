@@ -209,6 +209,7 @@ impl ManifestTagInventory {
         for name in tags.keys() {
             merge_input_owner(name)?;
             crate::branch_names::unpublished_tag_commit_id(name)?;
+            crate::branch_names::unattached_tag_parts(name)?;
         }
         Ok(Self {
             dataset: dataset.clone(),

@@ -1055,6 +1055,19 @@ impl ApiError {
         }
     }
 
+    /// HTTP 409 with [`ErrorCode::UnattachedCannotPublish`]: a publish
+    /// addressed an unattached snapshot, a kind that never publishes; no
+    /// durable effect happened.
+    fn unattached_cannot_publish(message: impl Into<String>) -> Self {
+        Self {
+            completion_uncertain: false,
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::UnattachedCannotPublish),
+            message: message.into().into_boxed_str(),
+            details: None,
+        }
+    }
+
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
@@ -1389,6 +1402,9 @@ impl ApiError {
                             actual,
                         },
                     ),
+                    Some(ManifestConflictDetails::UnattachedCannotPublish { .. }) => {
+                        Self::unattached_cannot_publish(err.message)
+                    }
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),

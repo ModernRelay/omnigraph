@@ -724,6 +724,13 @@ decide_seam! {
 }
 
 decide_seam! {
+    /// After one expired unattached tag's release is confirmed and before
+    /// the next one's: the released descendant is gone, its ancestors stay
+    /// addressable, and a retried cleanup finishes upward.
+    pub static CLEANUP_POST_UNATTACHED_RELEASE = ("cleanup.post_unattached_release", Unreachable, [Fail]);
+}
+
+decide_seam! {
     /// After cleanup's entry checks, before it captures authority and
     /// acquires its schema/branch/table GC gate set: the one window where a
     /// failure aborts the whole run (per-table GC failures are isolated).
@@ -855,7 +862,14 @@ async fn cleanup_detached_only(
         .buffer_unordered(concurrency)
         .collect()
         .await;
-    if !plan.expired_merge_input_tags.is_empty() || !plan.expired_unpublished_tags.is_empty() {
+    let unattached_release = super::collector::unattached_release_order(
+        &plan.expired_unattached_tags,
+        &plan.retained_unattached_tags,
+    );
+    if !plan.expired_merge_input_tags.is_empty()
+        || !plan.expired_unpublished_tags.is_empty()
+        || !unattached_release.is_empty()
+    {
         let manifest =
             crate::db::manifest::ManifestCoordinator::collector_branch_under_control_gates(
                 db.root_uri(),
@@ -872,6 +886,23 @@ async fn cleanup_detached_only(
             crate::db::manifest::unpublished::release_unpublished_tag(manifest.dataset(), name)
                 .await?;
         }
+        let mut unattached_tags_released: u64 = 0;
+        for record in &unattached_release {
+            crate::db::manifest::unattached::release_unattached_tag_confirmed(
+                manifest.dataset(),
+                &record.name,
+            )
+            .await?;
+            unattached_tags_released += 1;
+            fail(&CLEANUP_POST_UNATTACHED_RELEASE)?;
+        }
+        tracing::info!(
+            target: "omnigraph::cleanup",
+            unattached_tags_released,
+            unattached_tags_retained = plan.retained_unattached_tags.len(),
+            unattached_tags_blocked = plan.expired_unattached_tags.len() - unattached_release.len(),
+            "cleanup released the expired unattached branch tags"
+        );
     }
     let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {

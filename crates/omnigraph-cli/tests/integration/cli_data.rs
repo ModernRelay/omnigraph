@@ -3510,6 +3510,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 let mut shown = body.clone();
                 if let Some(commit) = shown.get_mut("commit").filter(|commit| commit.is_object()) {
                     commit["published"] = json!(true);
+                    commit["kind"] = json!("published");
+                    commit["root_commit_id"] = json!(null);
                 }
                 assert_eq!(parse_stdout_json(&output), shown);
             } else {
@@ -3594,6 +3596,8 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                 let mut shown = body.clone();
                 if let Some(commit) = shown.get_mut("commit").filter(|commit| commit.is_object()) {
                     commit["published"] = json!(true);
+                    commit["kind"] = json!("published");
+                    commit["root_commit_id"] = json!(null);
                 }
                 assert_eq!(parse_stdout_json(&output), shown);
             }

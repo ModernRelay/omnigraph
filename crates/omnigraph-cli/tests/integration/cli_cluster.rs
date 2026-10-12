@@ -1408,6 +1408,8 @@ fn managed_data_issue_633_direct_load_and_commit_preserve_ambient_targets() {
                 });
                 let mut shown = commit.clone();
                 shown["published"] = serde_json::json!(true);
+                shown["kind"] = serde_json::json!("published");
+                shown["root_commit_id"] = serde_json::json!(null);
                 let reply = match operation {
                     "load" => serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,

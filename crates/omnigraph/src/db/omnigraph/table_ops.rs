@@ -1324,6 +1324,10 @@ pub(crate) enum Publication {
     /// Write an unpublished commit (RFC "Unpublished graph commits"): the
     /// branch head is unchanged, and a merge carries its held inputs.
     Propose(Option<crate::db::manifest::UnpublishedMergeInputs>),
+    /// Write an unattached snapshot (RFC "Unattached graph branches"): a
+    /// root over the live head or a child over its base snapshot; the branch
+    /// head is unchanged and the snapshot never publishes.
+    Unattached(crate::db::manifest::UnattachedWriteBase),
 }
 
 async fn publish_prepared(
@@ -1356,6 +1360,22 @@ async fn publish_prepared(
                     &lineage_intent,
                     &expectation,
                     merge,
+                )
+                .await
+        }
+        Publication::Unattached(base) => {
+            let intent = crate::db::manifest::UnattachedIntent {
+                branch: expectation.branch.clone(),
+                actor_id: lineage_intent.actor_id.clone(),
+                created_at: lineage_intent.created_at,
+            };
+            coordinator
+                .propose_unattached(
+                    changes,
+                    expected_table_versions,
+                    &intent,
+                    &expectation,
+                    &base,
                 )
                 .await
         }

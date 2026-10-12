@@ -732,6 +732,52 @@ impl GraphClient {
         }
     }
 
+    /// `commit list --unattached`: the live unattached snapshots whose
+    /// recorded target is `branch` (`None` = main),
+    /// `GET /commits?unattached=true` or the engine's listing.
+    pub(crate) async fn list_unattached_commits(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<CommitListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let url = match branch {
+                    Some(branch) => remote_url(
+                        base_url,
+                        &["commits"],
+                        &[("branch", branch), ("unattached", "true")],
+                    )?,
+                    None => remote_url(base_url, &["commits"], &[("unattached", "true")])?,
+                };
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    url,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_read_session(uri, &[]).await?;
+                let commits = db
+                    .list_unattached_commits(branch)
+                    .await?
+                    .iter()
+                    .map(commit_output)
+                    .collect::<Vec<_>>();
+                Ok(CommitListOutput { commits })
+            }
+        }
+    }
+
     pub(crate) async fn get_commit(&self, commit_id: &str) -> Result<CommitOutput> {
         match self {
             GraphClient::Remote {
@@ -1062,7 +1108,7 @@ impl GraphClient {
     /// A `--set` value travels in the `settings` field of `POST /mutate`.
     pub(crate) async fn mutate(
         &self,
-        branch: &str,
+        branch: Option<&str>,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
@@ -1086,7 +1132,7 @@ impl GraphClient {
                     query: query_source.to_string(),
                     name: query_name.map(ToOwned::to_owned),
                     params: params_json.cloned(),
-                    branch: Some(branch.to_string()),
+                    branch: branch.map(str::to_string),
                     settings: Self::remote_settings(settings)?,
                 })?;
                 remote_json_bounded(
@@ -1107,7 +1153,7 @@ impl GraphClient {
                 let session = Self::open_write_session(uri, settings).await?;
                 let actor = actor.as_deref();
                 let receipt = session
-                    .mutate_as_with_expected_head_receipt(
+                    .mutate_as_with_optional_branch_receipt(
                         branch,
                         query_source,
                         &selected_name,
@@ -1128,7 +1174,7 @@ impl GraphClient {
                         }
                     })?;
                 Ok(ChangeOutput {
-                    branch: branch.to_string(),
+                    branch: receipt.branch,
                     query_name: selected_name,
                     affected_nodes: receipt.result.affected_nodes,
                     affected_edges: receipt.result.affected_edges,
@@ -2739,7 +2785,7 @@ mod tests {
                         _ => (
                             client
                                 .mutate(
-                                    "main",
+                                    Some("main"),
                                     "mutation m() {}",
                                     Some("m"),
                                     None,
@@ -2929,7 +2975,14 @@ mod tests {
             (
                 "mutate",
                 client
-                    .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+                    .mutate(
+                        Some("main"),
+                        "mutation m() {}",
+                        Some("m"),
+                        None,
+                        None,
+                        &settings,
+                    )
                     .await
                     .map(|_| ()),
             ),
@@ -3028,12 +3081,19 @@ mod tests {
             .await
             .unwrap();
         client
-            .mutate("main", "mutation m() {}", Some("m"), None, None, &settings)
+            .mutate(
+                Some("main"),
+                "mutation m() {}",
+                Some("m"),
+                None,
+                None,
+                &settings,
+            )
             .await
             .unwrap();
         client
             .mutate(
-                "main",
+                Some("main"),
                 "mutation m() {}",
                 Some("m"),
                 None,
@@ -3048,7 +3108,7 @@ mod tests {
             .unwrap();
 
         client
-            .mutate("main", "mutation m() {}", Some("m"), None, None, &[])
+            .mutate(Some("main"), "mutation m() {}", Some("m"), None, None, &[])
             .await
             .unwrap();
         let requests = server.workflow_requests();

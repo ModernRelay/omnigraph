@@ -79,7 +79,7 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline upgrade to stamp 15, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 16, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
 commit to its activation commit; the value is the `UpgradeIntent`, whose
 `source_format` names the route. Ordinary

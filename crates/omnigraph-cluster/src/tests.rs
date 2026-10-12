@@ -2887,6 +2887,8 @@ fn offline_deployment_graph_completion_reserve_covers_maximum_serialized_engine_
         actor_id: Some(actor.clone()),
         created_at: i64::MIN,
         published: true,
+        kind: omnigraph::db::GraphCommitKind::Published,
+        root_commit_id: None,
     };
     // Decode the engine's opaque type, so a new serialized token field makes
     // this bound review fail instead of silently remaining absent from a mock.

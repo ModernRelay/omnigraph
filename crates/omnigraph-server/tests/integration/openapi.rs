@@ -1561,6 +1561,17 @@ fn commit_output_schema_has_expected_fields() {
     assert!(props.contains_key("actor_id"));
     assert!(props.contains_key("created_at"));
     assert!(props.contains_key("published"));
+    assert!(props.contains_key("kind"));
+    assert!(props.contains_key("root_commit_id"));
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        required.iter().any(|field| field.as_str() == Some("kind")),
+        "kind is required on the wire: {required:?}"
+    );
+    assert_eq!(
+        doc["components"]["schemas"]["CommitKindOutput"]["enum"],
+        serde_json::json!(["published", "unpublished", "unattached"])
+    );
 }
 
 #[test]
@@ -1645,6 +1656,7 @@ fn error_code_schema_has_expected_variants() {
             "not_found",
             "method_not_allowed",
             "conflict",
+            "unattached_cannot_publish",
             "too_many_requests",
             "service_unavailable",
             "graph_unavailable",
