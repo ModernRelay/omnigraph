@@ -420,18 +420,7 @@ async fn login_with(
             })?;
         match reply {
             Ok(tokens) => {
-                let (saved, body) = renewal::accept(origin, config, tokens, None).await?;
-                if let Err(error) = check_account(organization, &saved.identity.account_id) {
-                    saved.revoke().await;
-                    return Err(error);
-                }
-                if let Err(error) = renewal::save(store, &saved) {
-                    // We cannot retain the new renewable session. Revoke it
-                    // when possible without obscuring the custody failure.
-                    saved.revoke().await;
-                    return Err(error);
-                }
-                return Ok(body);
+                return accept_device(store, origin, config, provider, tokens, organization).await;
             }
             Err(error) if error.code() == Some("authorization_pending") => {}
             Err(error) if error.code() == Some("slow_down") => {
@@ -440,6 +429,41 @@ async fn login_with(
             Err(error) => return Err(provider::failure(&error)),
         }
     }
+}
+
+async fn accept_device(
+    store: &dyn Store,
+    origin: &str,
+    config: provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    organization: Option<&str>,
+) -> Result<Value> {
+    let (saved, body) = tokio::time::timeout(Duration::from_secs(35), async {
+        let tokens = renewal::select_device_organization(
+            store,
+            origin,
+            &config,
+            provider,
+            tokens,
+            organization,
+        )
+        .await?;
+        renewal::accept(origin, config, tokens, None).await
+    })
+    .await
+    .map_err(|_| renewal::unknown())??;
+    if let Err(error) = check_account(organization, &saved.identity.account_id) {
+        saved.revoke().await;
+        return Err(error);
+    }
+    if let Err(error) = renewal::save(store, &saved) {
+        // We cannot retain the new renewable session. Revoke it when possible
+        // without obscuring the custody failure or touching another session.
+        saved.revoke().await;
+        return Err(error);
+    }
+    Ok(body)
 }
 
 pub(super) async fn login(origin: String, organization: Option<&str>) -> Result<Value> {

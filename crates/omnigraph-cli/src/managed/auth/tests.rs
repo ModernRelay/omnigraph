@@ -51,9 +51,13 @@ pub(super) fn tokens(seconds: i64, user: &str) -> Value {
 }
 
 pub(super) fn metadata(seconds: i64, principal: &str) -> IntentReply {
+    metadata_for(seconds, principal, "org_test")
+}
+
+fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentReply {
     IntentReply::json(
         200,
-        json!({"data":{"principal_id":principal,"account_id":"org_test","kind":"human","scopes":{},
+        json!({"data":{"principal_id":principal,"account_id":organization,"kind":"human","scopes":{},
         "expires_at":OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()+seconds).unwrap().format(&Rfc3339).unwrap()},"meta":{}}),
     )
 }
@@ -456,15 +460,13 @@ fn discovery_v2_has_no_tenant_selector_and_rejects_v1() {
 #[tokio::test]
 #[ignore = "nightly: one real 5 s device-flow poll interval"]
 async fn device_login_refuses_another_organization_before_saving_credentials() {
-    let api = IntentApiFixture::new(vec![
-        metadata(120, "principal_one"),
-        IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
-    ]);
+    let api = IntentApiFixture::new(vec![]);
     let transport = MockTransport::with(vec![
         (
             200,
             json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":30,"interval":5}),
         ),
+        (200, tokens(120, "user_one")),
         (200, tokens(120, "user_one")),
     ]);
     let store = MemoryStore::default();
@@ -479,10 +481,289 @@ async fn device_login_refuses_another_organization_before_saving_credentials() {
     .unwrap_err();
     assert_eq!(error.body["type"], "organization_mismatch");
     assert!(store.0.borrow().is_empty());
-    assert_eq!(api.requests()[1].path, "/v1/auth/logout");
-    for request in transport.requests.lock().unwrap().iter() {
+    assert!(api.requests().is_empty());
+    for request in transport.requests.lock().unwrap().iter().take(2) {
         let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
         assert!(body.get("organization_id").is_none());
     }
+    api.assert_complete();
+}
+
+fn rewrite_claim(tokens: &mut Value, field: &str, value: Value) {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let parts: Vec<_> = tokens["access_token"]
+        .as_str()
+        .unwrap()
+        .split('.')
+        .collect();
+    let mut claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    claims[field] = value;
+    tokens["access_token"] = json!(format!(
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(claims.to_string()),
+        parts[2]
+    ));
+}
+
+fn device_tokens(organization: Option<&str>, session: &str, refresh: &str) -> Value {
+    let mut value = tokens(120, "user_one");
+    value["organization_id"] = json!(organization);
+    value["refresh_token"] = json!(refresh);
+    rewrite_claim(&mut value, "org_id", json!(organization));
+    rewrite_claim(&mut value, "sid", json!(session));
+    value
+}
+
+async fn cache_original_session(store: &MemoryStore, origin: &str) {
+    let original = device_tokens(Some("org_test"), "cached_session", "cached-refresh");
+    let (saved, _) = renewal::accept(
+        origin,
+        config(),
+        serde_json::from_value(original).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    renewal::save(store, &saved).unwrap();
+}
+
+#[tokio::test]
+async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_organization() {
+    for initial_org in [None, Some("org_unenrolled")] {
+        let api = IntentApiFixture::new(vec![
+            metadata(120, "principal_one"),
+            metadata_for(120, "principal_one", "org_other"),
+        ]);
+        let store = MemoryStore::default();
+        cache_original_session(&store, &api.origin).await;
+        let before = store.0.borrow().clone();
+        let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+        let transport = MockTransport::with(vec![(200, selected.clone())]);
+        let result = accept_device(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(initial_org, "fresh_session", "fresh-refresh"))
+                .unwrap(),
+            Some("org_other"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["data"]["account_id"], "org_other");
+        assert_eq!(result["data"]["principal_id"], "principal_one");
+        for (key, value) in before.iter().filter(|(key, _)| *key != &api.origin) {
+            assert_eq!(store.0.borrow().get(key), Some(value));
+        }
+        let original_index: Value = serde_json::from_str(&before[&api.origin]).unwrap();
+        let index: Value = serde_json::from_str(&store.0.borrow()[&api.origin]).unwrap();
+        assert_eq!(
+            index["sessions"]["org_test"],
+            original_index["sessions"]["org_test"]
+        );
+        assert_eq!(index["sessions"].as_object().unwrap().len(), 2);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"client_id":"client_test","grant_type":"refresh_token","refresh_token":"fresh-refresh","organization_id":"org_other","ip_address":null,"device_id":null,"user_agent":null})
+        );
+        assert_eq!(
+            api.requests().len(),
+            2,
+            "only the selected device bearer reaches the API"
+        );
+        assert_eq!(
+            api.requests()[1].headers["authorization"],
+            format!("Bearer {}", selected["access_token"].as_str().unwrap())
+        );
+        assert!(!result.to_string().contains("selected-refresh"));
+        assert!(!result.to_string().contains("fresh-refresh"));
+        api.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn fresh_device_selection_refuses_substitutions_without_changing_cached_custody() {
+    for change in [
+        "organization",
+        "user",
+        "subject",
+        "session",
+        "issuer",
+        "client",
+        "expiry",
+        "response_organization",
+        "provider_denial",
+        "uncertain_exchange",
+        "target_denial",
+    ] {
+        let mut responses = vec![metadata(120, "principal_one")];
+        if change == "target_denial" {
+            responses.push(IntentReply::json(401, json!({"type":"unauthenticated"})));
+        }
+        let api = IntentApiFixture::new(responses);
+        let store = MemoryStore::default();
+        cache_original_session(&store, &api.origin).await;
+        let before = store.0.borrow().clone();
+        let mut selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+        let mut status = 200;
+        match change {
+            "organization" => {
+                selected["organization_id"] = json!("org_wrong");
+                rewrite_claim(&mut selected, "org_id", json!("org_wrong"));
+            }
+            "user" => selected["user"]["id"] = json!("user_other"),
+            "subject" => rewrite_claim(&mut selected, "sub", json!("user_other")),
+            "session" => rewrite_claim(&mut selected, "sid", json!("cached_session")),
+            "issuer" => rewrite_claim(&mut selected, "iss", json!("https://other.example")),
+            "client" => rewrite_claim(&mut selected, "client_id", json!("client_other")),
+            "expiry" => rewrite_claim(&mut selected, "exp", json!(0)),
+            "response_organization" => selected["organization_id"] = json!("org_wrong"),
+            "provider_denial" => {
+                status = 400;
+                selected = json!({"error":"invalid_grant","message":"fresh-refresh"});
+            }
+            "uncertain_exchange" => {
+                status = 503;
+                selected = json!({"error":"unavailable","message":"fresh-refresh"});
+            }
+            "target_denial" => {}
+            _ => unreachable!(),
+        }
+        let transport = MockTransport::with(vec![(status, selected)]);
+        let error = accept_device(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(
+                Some("org_test"),
+                "fresh_session",
+                "fresh-refresh",
+            ))
+            .unwrap(),
+            Some("org_other"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !error.body.to_string().contains("fresh-refresh"),
+            "{change}"
+        );
+        assert!(
+            !error.body.to_string().contains("selected-refresh"),
+            "{change}"
+        );
+        assert_eq!(*store.0.borrow(), before, "{change}");
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            1,
+            "no replay or fallback: {change}"
+        );
+        assert_eq!(
+            api.requests().len(),
+            if change == "target_denial" { 2 } else { 1 },
+            "no substituted bearer is accepted or revoked: {change}"
+        );
+        api.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn fresh_device_cannot_select_or_revoke_an_existing_cached_session() {
+    for malformed in [false, true] {
+        let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+        let store = MemoryStore::default();
+        cache_original_session(&store, &api.origin).await;
+        if malformed {
+            let key = store
+                .0
+                .borrow()
+                .keys()
+                .find(|key| key.starts_with("credential:"))
+                .unwrap()
+                .clone();
+            store.0.borrow_mut().insert(key, "invalid".into());
+        }
+        let before = store.0.borrow().clone();
+        let transport = MockTransport::with(vec![]);
+        let error = accept_device(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(
+                Some("org_test"),
+                "cached_session",
+                "fresh-refresh",
+            ))
+            .unwrap(),
+            Some("org_other"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.body["type"],
+            if malformed {
+                "credential_invalid"
+            } else {
+                "session_identity_mismatch"
+            }
+        );
+        assert_eq!(*store.0.borrow(), before);
+        assert!(transport.requests.lock().unwrap().is_empty());
+        assert_eq!(api.requests().len(), 1);
+        api.assert_complete();
+    }
+}
+
+#[tokio::test]
+async fn selected_device_custody_failure_revokes_only_the_new_verified_session() {
+    struct RefusingStore<'a>(&'a MemoryStore);
+    impl Store for RefusingStore<'_> {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            self.0.get(key)
+        }
+        fn put(&self, _: &str, _: &str) -> Result<()> {
+            Err(keychain_failed())
+        }
+        fn remove(&self, _: &str) -> Result<()> {
+            panic!("existing custody must not be removed")
+        }
+    }
+    let api = IntentApiFixture::new(vec![
+        metadata(120, "principal_one"),
+        metadata_for(120, "principal_one", "org_other"),
+        IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
+    ]);
+    let store = MemoryStore::default();
+    cache_original_session(&store, &api.origin).await;
+    let before = store.0.borrow().clone();
+    let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
+    let transport = MockTransport::with(vec![(200, selected.clone())]);
+    let error = accept_device(
+        &RefusingStore(&store),
+        &api.origin,
+        config(),
+        &transport.provider(),
+        serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
+        Some("org_other"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.body["type"], "keychain_unavailable");
+    assert_eq!(*store.0.borrow(), before);
+    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    let requests = api.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].path, "/v1/auth/logout");
+    assert_eq!(
+        requests[2].headers["authorization"],
+        format!("Bearer {}", selected["access_token"].as_str().unwrap())
+    );
     api.assert_complete();
 }

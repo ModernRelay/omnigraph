@@ -233,24 +233,13 @@ Add `--managed` to select the managed service explicitly. Without it, `cluster`
 uses self-hosted configuration or an explicit server/root and ignores managed
 folder context. The flag can appear before or after the subcommand.
 
-`omnigraph login --api ORIGIN [--organization ORG_ID]` reuses valid cached access
-or prints a WorkOS
-AuthKit verification URL and user code. The OS keychain holds provider-bound
-access and rotating refresh credentials; old opaque sessions are not reused.
-Access lasts at most 15 minutes; silent renewal ends eight hours after sign-in.
-Normal commands never open browser login. Login JSON reports identity and
-expiry metadata, never credentials. Temporary errors preserve cached access;
-an uncertain refresh is never replayed and may require explicit login.
-See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
-for binding, coordination and refresh bounds.
+| Session command | Behavior |
+|---|---|
+| `omnigraph login --api ORIGIN [--organization ORG_ID]` | Reuse cached access or print a WorkOS device verification URL/code; credentials stay in the OS keychain, JSON contains identity/expiry only |
+| `omnigraph logout --api ORIGIN [--organization ORG_ID]` | Clear only the selected organization's control credentials and request provider revocation; `provider_revocation_confirmed` reports its outcome; accepted work continues |
+| `omnigraph use CLUSTER_ID --api ORIGIN [--organization ORG_ID] [--config DIR] [--json]` | Verify cluster access and atomically bind the selected directory |
 
-`omnigraph logout --api ORIGIN [--organization ORG_ID]` requests provider-session
-revocation and clears only that organization's local control credentials. Its
-`provider_revocation_confirmed` result reports whether
-revocation succeeded. Accepted work continues. Named-server login is unchanged.
-
-`omnigraph use CLUSTER_ID --api ORIGIN [--organization ORG_ID] [--config DIR] [--json]` verifies access
-to the cluster, then atomically writes `DIR/.omnigraph/context`:
+The secret-free `DIR/.omnigraph/context` is:
 
 ```yaml
 version: 2
@@ -259,29 +248,18 @@ api: https://control.example
 organization_id: org_customer
 ```
 
-The context contains no secret. Managed commands read it only from the selected
-`--config` directory, which defaults to `.`. Parent directories are not searched.
 The folder pins the organization. Without a folder or `--organization`, exactly
-one cached organization for the API may be selected. Multiple organizations
-refuse rather than choosing the latest sign-in. First login can let the hosted
-provider flow select an organization; explicit selection must match the verified
-result. Each organization has its own device session and refresh token. A running
-command keeps its verified account and principal through renewal and polling.
-Ordinary commands refuse conflicting explicit selection before a request.
-Fully explicit `login` and `logout` select the named session independently of
-the folder. Fully explicit `use` verifies cluster access and replaces the
-folder binding; it can replace an obsolete or invalid regular context, but
-still refuses symbolic links and special files.
+one cached organization may be selected; ambiguity refuses. Explicit fresh login
+selects the requested organization using only its new device session. Failed or
+uncertain selection leaves cached sessions unchanged and requires fresh login.
 
-Discovery and context version 2 require fresh managed login and binding. To
-replace an old version 1 context, sign in with explicit `--api` and
-`--organization`, then run `use CLUSTER_ID --api ORIGIN --organization ORG_ID`.
-Existing named-server credentials and direct graph access are unaffected.
-Reading an existing binding refuses unknown fields or versions and malformed
-files. Symbolic links, special files and files over 16 KiB always refuse,
-including during explicit rebinding. API addresses must be origins without credentials, path,
-query, or fragment. HTTPS is required except for exact localhost,
-127.0.0.1, and `[::1]` API hosts used for local integration.
+Fully explicit `login`/`logout` select independently of the folder; ordinary
+commands refuse conflicts. To replace an old or invalid regular context, sign in
+with `--api` and `--organization`, then run fully explicit `use`. Context lookup
+uses only `--config` (default `.`); links, special files and files over 16 KiB refuse.
+
+See the [authentication contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
+for origin validation, separate organization sessions, identity pins and renewal bounds.
 
 | Managed command | Behavior |
 |---|---|

@@ -47,7 +47,7 @@ struct Claims {
     iss: String,
     sub: String,
     sid: String,
-    org_id: String,
+    org_id: Option<String>,
     client_id: String,
     iat: i64,
     exp: i64,
@@ -65,6 +65,14 @@ pub(super) fn timestamp(value: &str) -> Result<OffsetDateTime> {
 }
 
 fn claims(token: &str, config: &provider::Config, allow_expired: bool) -> Result<Claims> {
+    let claims = provider_claims(token, config, allow_expired)?;
+    claims.org_id.as_ref().ok_or_else(invalid)?;
+    Ok(claims)
+}
+
+// A fresh device session can be organizationless. Saved credentials and resource
+// verification still use claims(), which requires an organization.
+fn provider_claims(token: &str, config: &provider::Config, allow_expired: bool) -> Result<Claims> {
     validate_token(token)?;
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
@@ -77,8 +85,9 @@ fn claims(token: &str, config: &provider::Config, allow_expired: bool) -> Result
     let now = OffsetDateTime::now_utc().unix_timestamp();
     if claims.iss != config.issuer
         || claims.client_id != config.client_id
-        || !claims.org_id.starts_with("org_")
-        || super::super::organization_id(&claims.org_id).is_err()
+        || claims.org_id.as_ref().is_some_and(|org| {
+            !org.starts_with("org_") || super::super::organization_id(org).is_err()
+        })
         || [&claims.sub, &claims.sid].iter().any(|s| {
             s.is_empty() || s.len() > 1024 || s.chars().any(|c| c.is_control() || c.is_whitespace())
         })
@@ -123,7 +132,7 @@ fn parse(raw: &str, origin: &str) -> Result<Session> {
     if saved.version != 2
         || saved.origin != origin
         || canonical_origin(origin)? != origin
-        || saved.identity.account_id != decoded.org_id
+        || Some(saved.identity.account_id.as_str()) != decoded.org_id.as_deref()
         || saved.identity.subject != decoded.sub
         || saved.identity.session_id != decoded.sid
         || saved.identity.principal_id.is_empty()
@@ -240,6 +249,63 @@ pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn select_device_organization(
+    store: &dyn Store,
+    origin: &str,
+    config: &provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    organization: Option<&str>,
+) -> Result<workos::AuthenticateResponse> {
+    let initial = provider_claims(tokens.access_token.as_ref(), config, false)?;
+    validate_token(tokens.refresh_token.as_ref())?;
+    if tokens.user.id != initial.sub || tokens.organization_id != initial.org_id {
+        return Err(invalid());
+    }
+    // A provider response must be a new session before it can be selected or
+    // revoked. Existing token pairs stay untouched under the caller's origin lock.
+    for (org, selected) in index(store, origin)?.sessions {
+        let raw = store.get(&selected)?.ok_or_else(invalid)?;
+        let cached = parse(&raw, origin)?;
+        if key(&cached)? != selected || cached.identity.account_id != org {
+            return Err(invalid());
+        }
+        if cached.config.issuer == config.issuer
+            && cached.config.client_id == config.client_id
+            && cached.identity.session_id == initial.sid
+        {
+            return Err(Failure::refused(
+                "session_identity_mismatch",
+                "device sign-in reused a cached session; start a fresh provider sign-in",
+            ));
+        }
+    }
+    let Some(organization) = organization else {
+        return Ok(tokens);
+    };
+    super::super::organization_id(organization)?;
+    if initial.org_id.as_deref() == Some(organization) {
+        return Ok(tokens);
+    }
+    let selected = provider
+        .refresh(tokens.refresh_token.as_ref(), organization)
+        .await
+        .map_err(|error| provider::failure(&error))?;
+    let claims = claims(selected.access_token.as_ref(), config, false)?;
+    if selected.user.id != initial.sub
+        || claims.sub != initial.sub
+        || claims.sid != initial.sid
+        || selected.organization_id != claims.org_id
+    {
+        return Err(Failure::refused(
+            "session_identity_mismatch",
+            "organization selection changed the device sign-in identity",
+        ));
+    }
+    super::check_account(Some(organization), claims.org_id.as_deref().unwrap())?;
+    Ok(selected)
+}
+
 pub(super) async fn verify(
     origin: &str,
     config: &provider::Config,
@@ -259,7 +325,7 @@ pub(super) async fn verify(
     let principal = bounded_string(data, "principal_id", 1024)?;
     let expires = bounded_string(data, "expires_at", 128)?;
     let expiry = timestamp(expires)?;
-    if account != decoded.org_id
+    if Some(account) != decoded.org_id.as_deref()
         || data["kind"] != "human"
         || !data["scopes"].is_object()
         || expiry <= OffsetDateTime::now_utc()
@@ -333,7 +399,7 @@ pub(super) async fn accept(
     Ok((saved, output))
 }
 
-fn unknown() -> Failure {
+pub(super) fn unknown() -> Failure {
     Failure::refused(
         "refresh_outcome_unknown",
         "renewal may have completed; run login --api explicitly to recover",

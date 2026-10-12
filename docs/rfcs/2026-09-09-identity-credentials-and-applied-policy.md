@@ -289,12 +289,22 @@ once. Another shell's login cannot retarget that command, even within the same
 organization. Refresh must retain the entire selected identity and original
 eight-hour deadline. Logout removes only the selected organization's custody.
 
-First login may use the organization's selection in the hosted provider flow;
-an explicit `--organization` must match the resource-verified result before it
-is saved. Device initiation/exchange use only the official SDK parameters;
-the CLI does not invent an organization parameter or switch organizations by
-refreshing or cloning another organization's session. Refresh names only the
-already selected organization. Ambiguous cached selection refuses. A version 1
+First login may use the organization's selection in the hosted provider flow.
+For explicit `--organization`, a fresh device response for another organization
+or no organization is selected through the provider's documented refresh
+`organization_id` parameter before resource-server acceptance. Only that fresh
+response's refresh token may be exchanged, once; no intermediate credential is
+saved. The exchange must preserve the expected provider, client, user and session
+and return the requested organization, whose bearer the API verifies before
+custody. The initial organization need not be enrolled at the API. Indexed
+credentials are inspected read-only to refuse a provider-session collision
+before selection or revocation; their token pairs are never used or changed.
+Selection and resource-server verification share one 35-second budget. An
+uncertain selection requires a new explicit device login, without replay.
+Device initiation/exchange use only the official SDK parameters. Ordinary
+renewal names only the already selected organization and retains the complete
+identity; it cannot switch or clone an existing organization's session.
+Ambiguous cached selection refuses. A version 1
 managed session or context requires fresh sign-in and binding. The data cache
 also separates API, organization and cluster; its independent expiry and
 explicit clearing contract remain unchanged.
