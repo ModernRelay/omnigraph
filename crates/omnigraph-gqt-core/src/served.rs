@@ -20,9 +20,9 @@ use std::time::Duration;
 use crate::{
     Bindings, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep,
     MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput, QueryExpect, QueryStep, Seed,
-    ShowStep, Step, StepFail, WriteExpect, bound_snapshot, check_error_expect, check_rows_json,
-    expectation_evidence, merge_outcome_word, operation, record_binding, resolve_operand,
-    step_kind, step_label, substitute,
+    ShowStep, Step, StepFail, WriteExpect, bound_snapshot, bound_source, check_error_expect,
+    check_rows_json, expectation_evidence, merge_outcome_word, operation, record_binding,
+    resolve_operand, step_kind, step_label, substitute_all,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -157,36 +157,39 @@ async fn execute_served_inner<H: ExecutionHost>(
                     case.source_lines.get(&ordinal).map(|line| *line as u64),
                     step_kind(step),
                 );
-                let outcome = match step {
-                    Step::Query(q) => query(host, &client, q, binding, &bindings).await,
-                    Step::Mutate(m) => mutate(host, &client, m, binding).await.and_then(|commit| {
-                        record_binding(
-                            &mut bindings,
-                            m.bind.as_deref(),
-                            commit,
-                            &step_label(ordinal, "mutate", binding),
-                        )
-                    }),
-                    Step::Load(l) => load(host, &client, l, binding).await,
-                    Step::Control(c) => control(host, &client, c, binding, &bindings)
-                        .await
-                        .and_then(|commit| {
-                            record_binding(
-                                &mut bindings,
-                                c.bind.as_deref(),
-                                commit,
-                                &step_label(ordinal, c.name, binding),
-                            )
-                        }),
-                    Step::List(l) => list(host, &client, l, binding).await,
-                    Step::Show(s) => show(host, &client, s, binding).await,
-                    Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
-                        Err(StepFail::new(
-                            step_label(ordinal, step_kind(step), binding),
-                            "unsupported_environment: refused by served admission".into(),
-                        ))
-                    }
-                };
+                let outcome =
+                    match step {
+                        Step::Query(q) => query(host, &client, q, binding, &bindings).await,
+                        Step::Mutate(m) => mutate(host, &client, m, binding, &bindings)
+                            .await
+                            .and_then(|commit| {
+                                record_binding(
+                                    &mut bindings,
+                                    m.bind.as_deref(),
+                                    commit,
+                                    &step_label(ordinal, "mutate", binding),
+                                )
+                            }),
+                        Step::Load(l) => load(host, &client, l, binding).await,
+                        Step::Control(c) => control(host, &client, c, binding, &bindings)
+                            .await
+                            .and_then(|commit| {
+                                record_binding(
+                                    &mut bindings,
+                                    c.bind.as_deref(),
+                                    commit,
+                                    &step_label(ordinal, c.name, binding),
+                                )
+                            }),
+                        Step::List(l) => list(host, &client, l, binding).await,
+                        Step::Show(s) => show(host, &client, s, binding).await,
+                        Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
+                            Err(StepFail::new(
+                                step_label(ordinal, step_kind(step), binding),
+                                "unsupported_environment: refused by served admission".into(),
+                            ))
+                        }
+                    };
                 host.measure_step_end(ordinal as u64);
                 host.record("assertion", || match &outcome {
                     Ok(()) => serde_json::json!({"status": "passed"}),
@@ -432,11 +435,14 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
 fn wire_params(
     params: Option<&ParamsInput>,
     binding: Option<(&str, &str)>,
+    bindings: &Bindings,
 ) -> Result<Option<Value>, String> {
     params
         .map(|params| match params {
-            ParamsInput::Literal(raw) => serde_json::from_str::<Value>(&substitute(raw, binding))
-                .map_err(|e| format!("params are not valid JSON: {e}")),
+            ParamsInput::Literal(raw) => {
+                serde_json::from_str::<Value>(&substitute_all(raw, binding, bindings))
+                    .map_err(|e| format!("params are not valid JSON: {e}"))
+            }
             ParamsInput::Generated(generated) => generated.generate(),
         })
         .transpose()
@@ -494,7 +500,7 @@ async fn query(
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "query", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let params = match wire_params(step.params_raw.as_ref(), binding) {
+    let params = match wire_params(step.params_raw.as_ref(), binding, bindings) {
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
@@ -538,10 +544,12 @@ async fn mutate(
     client: &ServerClient,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
+    bindings: &Bindings,
 ) -> Result<Option<String>, StepFail> {
     let label = step_label(step.ordinal, "mutate", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let params = match wire_params(step.params_raw.as_ref(), binding) {
+    let source = bound_source(step, bindings).map_err(&fail)?;
+    let params = match wire_params(step.params_raw.as_ref(), binding, bindings) {
         Ok(params) => params,
         Err(e) => {
             return match &step.expect {
@@ -557,10 +565,10 @@ async fn mutate(
         }
     };
     let request = ChangeRequest {
-        query: step.source.clone(),
+        query: source.into_owned(),
         name: Some(step.name.clone()),
         params,
-        branch: Some(step.branch.clone()),
+        branch: step.branch_spelled.then(|| step.branch.clone()),
         settings: None,
     };
     let outcome = operation(

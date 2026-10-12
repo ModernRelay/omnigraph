@@ -271,9 +271,28 @@ pub struct QueryDecl {
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
     pub mutations: Vec<Mutation>,
-    /// `as commit` before the body: the mutation's result is an unpublished
-    /// commit. Never set on a read declaration (the parser refuses it).
-    pub as_commit: bool,
+    /// The clause before the body. Only `Publish` on a read declaration (the
+    /// parser refuses the other two there).
+    pub write_mode: MutationWriteMode,
+}
+
+/// Where a mutation's result goes: the branch head (`Publish`), an
+/// unpublished commit (`as commit`), or an unattached snapshot
+/// (`as unattached branch [on <base>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationWriteMode {
+    Publish,
+    AsCommit,
+    Unattached { base: Option<UnattachedBase> },
+}
+
+/// The `on` operand of `as unattached branch`: the base snapshot's id as a
+/// quoted literal, or the name (without `$`) of a `String` parameter that
+/// carries it per invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnattachedBase {
+    Literal(String),
+    Param(String),
 }
 
 #[derive(Debug, Clone)]

@@ -47,6 +47,10 @@ commit_publish = { kw_publish ~ string_lit }
 commit_drop    = { kw_drop ~ string_lit }
 // `as commit`: the write's result is an unpublished commit.
 as_commit_clause = { kw_as ~ kw_commit }
+// `as unattached branch [on <base>]`: the write's result is an unattached
+// snapshot, a root of the request branch's head or a child of the named
+// unattached snapshot (a quoted id or a `String` parameter).
+as_unattached_clause = { kw_as ~ kw_unattached ~ kw_branch ~ (kw_on ~ (string_lit | variable))? }
 
 kw_branch = @{ "branch" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -62,11 +66,13 @@ kw_show   = @{ "show" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_all    = @{ "all" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_as     = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_commit = @{ "commit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unattached = @{ "unattached" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_on     = @{ "on" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_publish = @{ "publish" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_drop   = @{ "drop" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 query_decl = {
-    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ as_commit_clause? ~ "{"
+    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ query_annotation* ~ (as_commit_clause | as_unattached_clause)? ~ "{"
         ~ query_body
     ~ "}"
 }

@@ -147,7 +147,7 @@ fn success<T: Serialize>(value: &T, json_output: bool) -> ExitCode {
             &json!({"cli_output_version":1,"ok":true,"value":value,"diagnostics":[]}),
         )
     } else {
-        match serde_yaml::to_string(value) {
+        match yaml_serde::to_string(value) {
             Ok(text) => {
                 print!("{text}");
                 ExitCode::SUCCESS
@@ -497,7 +497,7 @@ fn generate(args: &InitArgs) -> Result<PathBuf, Vec<Diagnostic>> {
         groups: BTreeMap::new(),
         run: vec![args.name.clone()],
     };
-    let yaml = serde_yaml::to_string(&config)
+    let yaml = yaml_serde::to_string(&config)
         .map_err(|e| problem("config_serialization_error", e.to_string()))?;
     Catalog::from_source(&output, &yaml)?.resolve(None, None)?;
     let mut file = fs::OpenOptions::new()

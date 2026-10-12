@@ -171,7 +171,7 @@ each crate alone resolves a different graph (`omnigraph-gqt` enables the
 engine's `test-util` and depends on `omnigraph-dst`), and three selections
 cost three engine builds, about 20 minutes each warm. The guard is a source
 walk whose crate declares no workspace crate (its dev-dependencies are
-`serde_yaml`, `syn`, `tempfile` and `toml`), so it adds no second engine
+`yaml_serde`, `syn`, `tempfile` and `toml`), so it adds no second engine
 build. The benchmark units include the fixture parity test against the
 generated branch-merge corpus case.
 The dispatch owner also checks external-store admission and persistence.

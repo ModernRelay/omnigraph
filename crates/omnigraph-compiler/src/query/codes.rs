@@ -68,6 +68,7 @@ codes! {
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
     T54 = "a relevance ranking does not accept the asc modifier";
+    T55 = "an unattached base parameter is undeclared or not a String";
 }
 
 #[cfg(test)]

@@ -16,7 +16,8 @@ use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
     GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
     LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
-    PublishPrecondition, SchemaContractRow, UnpublishedCommit, UnpublishedMergeInputs,
+    PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
+    UnattachedWriteBase, UnpublishedCommit, UnpublishedMergeInputs,
 };
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
@@ -612,16 +613,25 @@ impl GraphCoordinator {
         };
         match record {
             Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
-            None => match self.unpublished_commit(id).await? {
-                Some(candidate) => {
+            None => {
+                if let Some(candidate) = self.unpublished_commit(id).await? {
                     candidate.require_readable()?;
-                    Ok(CommitState {
+                    return Ok(CommitState {
                         commit: candidate.graph_commit(),
                         snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
-                    })
+                    });
                 }
-                None => Err(commit_not_found(snapshot_id)),
-            },
+                match self.unattached_commit(id).await? {
+                    Some(candidate) => {
+                        candidate.require_readable()?;
+                        Ok(CommitState {
+                            commit: candidate.graph_commit(),
+                            snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                        })
+                    }
+                    None => Err(commit_not_found(snapshot_id)),
+                }
+            }
         }
     }
 
@@ -629,6 +639,18 @@ impl GraphCoordinator {
     /// resolution missed: one tag read on a miss of a published id.
     async fn unpublished_commit(&self, id: &str) -> Result<Option<UnpublishedCommit>> {
         ManifestCoordinator::unpublished_commit(
+            self.root_uri(),
+            &self.manifest.control_session(),
+            id,
+        )
+        .await
+    }
+
+    /// The unattached snapshot `id` names, read after the published and the
+    /// proposal resolutions missed: one tag listing on a miss of a canonical
+    /// ULID, nothing for any other id spelling.
+    async fn unattached_commit(&self, id: &str) -> Result<Option<UnattachedCommit>> {
+        ManifestCoordinator::unattached_commit(
             self.root_uri(),
             &self.manifest.control_session(),
             id,
@@ -670,7 +692,11 @@ impl GraphCoordinator {
         if let Some(record) = self.record_in_live_branches(id).await? {
             return Ok(graph_commit_from_manifest_row(record.commit));
         }
-        match self.unpublished_commit(id).await? {
+        if let Some(candidate) = self.unpublished_commit(id).await? {
+            candidate.require_readable()?;
+            return Ok(candidate.graph_commit());
+        }
+        match self.unattached_commit(id).await? {
             Some(candidate) => {
                 candidate.require_readable()?;
                 Ok(candidate.graph_commit())
@@ -892,6 +918,34 @@ impl GraphCoordinator {
         let mut commit = graph_commit_from_manifest_row(outcome.head);
         commit.graph_manifest_version = outcome.detached_version;
         commit.published = false;
+        commit.kind = crate::db::GraphCommitKind::Unpublished;
+        Ok(commit)
+    }
+
+    /// Write `changes` as an unattached snapshot (RFC "Unattached graph
+    /// branches") under the exact `authority` the chain's root captured: a
+    /// root over the live head or a child over the snapshot `base` names.
+    /// The head and this coordinator's view stay as captured. The commit
+    /// reports the detached version it lives at, its root and
+    /// `published: false`.
+    pub(crate) async fn propose_unattached(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: &UnattachedIntent,
+        authority: &GraphHeadExpectation,
+        base: &UnattachedWriteBase,
+    ) -> Result<GraphCommit> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .propose_unattached(changes, expected_table_versions, intent, authority, base)
+            .await?;
+        let mut commit = graph_commit_from_manifest_row(outcome.head);
+        commit.graph_manifest_version = outcome.detached_version;
+        commit.published = false;
+        commit.kind = crate::db::GraphCommitKind::Unattached;
+        commit.root_commit_id = Some(outcome.root_commit_id);
         Ok(commit)
     }
 
@@ -1261,6 +1315,8 @@ mod tests {
             actor_id: None,
             created_at: 0,
             published: true,
+            kind: crate::db::GraphCommitKind::Published,
+            root_commit_id: None,
         }
     }
 

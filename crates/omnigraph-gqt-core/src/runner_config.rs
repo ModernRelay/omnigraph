@@ -289,6 +289,8 @@ mod tests {
             "name: it's Alice & Bob",
             "name: <<",
             "\"<<\": value",
+            "'<<': value",
+            "\u{feff}name: café\r\n",
             "name: '&literal *literal !literal <<'",
             "name: \"escaped \\\" &literal\"",
             "name: 'it''s &literal'",
@@ -299,7 +301,7 @@ mod tests {
             "a: [true, 1, null, {b: ~}]",
         ] {
             assert!(
-                yaml::<serde_yaml::Value>(text, "test body").is_ok(),
+                yaml::<yaml_serde::Value>(text, "test body").is_ok(),
                 "{text}"
             );
         }
@@ -323,20 +325,42 @@ mod tests {
             "a: !<tag:example.org,2026:v> value",
             "%TAG !e! tag:example.org,2026:\n---\na: value",
             "a: {<<: {b: 1}}",
+            "? <<\n: {b: 1}",
+            "&root {a: 1}",
+            "!custom [1, 2]",
+            "a: *missing",
+            "? [a, b]\n: value",
+            "a: 1\n---\nb: 2",
+            "a: 1\n...\n---\nb: 2",
+            "name: \"unterminated",
+            "name: \0",
         ] {
             assert!(
-                yaml::<serde_yaml::Value>(text, "test body").is_err(),
+                yaml::<yaml_serde::Value>(text, "test body").is_err(),
                 "{text}"
             );
         }
         assert_eq!(
-            yaml::<serde_yaml::Value>("true: 1", "test body").unwrap_err(),
+            yaml::<yaml_serde::Value>("true: 1", "test body").unwrap_err(),
             "invalid_case: YAML mapping keys must be strings; `true` reads as a boolean, quote it"
         );
         assert!(
-            yaml::<serde_yaml::Value>("a: 1\na: 2", "generated recipe")
+            yaml::<yaml_serde::Value>("a: 1\na: 2", "generated recipe")
                 .unwrap_err()
                 .starts_with("invalid_case: invalid generated recipe: ")
+        );
+        let scalars = yaml::<serde_json::Value>(
+            "on: on\noff: off\nyes: yes\nno: no\nleading: 001\nquoted: '001'\nexponent: 1e3\nmax: 18446744073709551615\nempty: null\nflag: true\n",
+            "test body",
+        )
+        .unwrap();
+        assert_eq!(
+            scalars,
+            serde_json::json!({
+                "on": "on", "off": "off", "yes": "yes", "no": "no",
+                "leading": "001", "quoted": "001", "exponent": 1000.0,
+                "max": u64::MAX, "empty": null, "flag": true,
+            })
         );
     }
     #[test]

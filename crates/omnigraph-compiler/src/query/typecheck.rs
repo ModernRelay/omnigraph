@@ -189,7 +189,7 @@ pub struct CheckedMutationQuery {
     pub(crate) name: String,
     pub(crate) params: Vec<CheckedParam>,
     pub(crate) ops: Vec<CheckedMutationOp>,
-    pub(crate) as_commit: bool,
+    pub(crate) write_mode: MutationWriteMode,
 }
 
 #[derive(Debug, Clone)]
@@ -657,6 +657,7 @@ pub enum CheckedQuery {
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
     if !query.mutations.is_empty() {
         let (params, param_types) = checked_params(&query.params)?;
+        typecheck_unattached_base(&query.write_mode, &param_types)?;
         let mut ops = Vec::with_capacity(query.mutations.len());
         for mutation in &query.mutations {
             ops.push(typecheck_mutation(catalog, mutation, &param_types)?);
@@ -665,7 +666,7 @@ pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<Chec
             name: query.name.clone(),
             params,
             ops,
-            as_commit: query.as_commit,
+            write_mode: query.write_mode.clone(),
         }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
@@ -690,6 +691,33 @@ pub fn infer_query_result_schema(catalog: &Catalog, query: &CheckedReadQuery) ->
         .map(|item| projection_field(catalog, &item.inferred_name, &item.expr.expr_type()))
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// `on $base` names a declared, non-nullable `String` parameter (T55).
+fn typecheck_unattached_base(
+    write_mode: &MutationWriteMode,
+    param_types: &HashMap<String, PropType>,
+) -> Result<()> {
+    let MutationWriteMode::Unattached {
+        base: Some(UnattachedBase::Param(name)),
+    } = write_mode
+    else {
+        return Ok(());
+    };
+    match param_types.get(name) {
+        Some(ty) if ty.scalar == ScalarType::String && !ty.nullable && !ty.list => Ok(()),
+        Some(ty) => Err(CompilerError::typed(
+            T55,
+            format!(
+                "`on $base` needs a declared `String` parameter; `${name}` is `{}`",
+                ty.display_name()
+            ),
+        )),
+        None => Err(CompilerError::typed(
+            T55,
+            format!("`on $base` needs a declared `String` parameter; `${name}` is not declared"),
+        )),
+    }
 }
 
 /// The declarations in source order, each with the type selected for its

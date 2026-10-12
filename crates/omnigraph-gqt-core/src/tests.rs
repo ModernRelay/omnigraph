@@ -931,6 +931,71 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
     );
 }
 
+const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
+const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    insert Person { name: \"carol\" }\n}\n--- expect ok\n";
+
+/// A whole quoted `on "${name}"` base operand needs its binding first, is the
+/// id in the compiled source, and admits no other `${` in the body; a params
+/// body spells a bound name; a header records whether it spelled `branch:`.
+#[test]
+fn unattached_base_operand_resolves_its_binding() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    insert Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(root)),
+        Item::Step(Step::Mutate(child)),
+        Item::Step(Step::Mutate(by_param)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected three mutate steps, got {:?}", case.items);
+    };
+    assert_eq!(root.base_binding, None);
+    assert!(!root.branch_spelled);
+    assert_eq!(child.base_binding.as_deref(), Some("r"));
+    assert!(!child.branch_spelled);
+    assert_eq!(by_param.base_binding, None);
+    assert!(by_param.branch_spelled);
+    assert_eq!(by_param.branch, "feature");
+    let mut bindings = Bindings::new();
+    assert_eq!(
+        bound_source(child, &bindings).unwrap_err(),
+        "`${r}` is not bound at this step"
+    );
+    bindings.insert("r".into(), "hb1-r".into());
+    let source = bound_source(child, &bindings).unwrap();
+    assert!(
+        source.contains("as unattached branch on \"hb1-r\" {"),
+        "{source}"
+    );
+    assert!(!source.contains("${"));
+    assert_eq!(bound_source(root, &bindings).unwrap(), root.source.as_str());
+    let params = build_params(
+        by_param.params_raw.as_ref(),
+        &by_param.ast_params,
+        None,
+        &bindings,
+    )
+    .unwrap();
+    assert_eq!(params.get("base"), Some(&Literal::String("hb1-r".into())));
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{CHILD}")),
+        "`${r}` is not bound; `--- bind commit $r` must precede this step"
+    );
+    let elsewhere = CHILD.replace("name: \"carol\"", "name: \"${r}\"");
+    assert_eq!(
+        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
+        "line 21: `${` may appear only inside a params or expect body"
+    );
+    let unbound_param =
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}--- params\n{{\"n\": \"${{r}}\"}}\n{EXPECT_OK}");
+    assert_eq!(
+        refusal("x", &unbound_param),
+        "`${` in a params or expect body is refused outside a loop"
+    );
+}
+
 /// The `branch:` argument routes a declaration step to its branch and a
 /// `branch list` rows step is compared and shape-checked as a read step;
 /// what this pins is the `outcome:` mismatch, which names both words.
@@ -2516,7 +2581,13 @@ async fn pinned_step_runs_only_its_pinned_path() {
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
         };
-        let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+        let params = build_params(
+            step.params_raw.as_ref(),
+            &step.decl.params,
+            None,
+            &Bindings::new(),
+        )
+        .unwrap();
         let (outcome, counts) = under_traversal(
             Some(mode),
             session.query(
@@ -2603,7 +2674,13 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
 /// own pin plumbing expands on the csr path only.
 async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
     assert_eq!(session.settings().traversal(), Traversal::Csr, "{stage}");
-    let params = build_params(step.params_raw.as_ref(), &step.decl.params, None).unwrap();
+    let params = build_params(
+        step.params_raw.as_ref(),
+        &step.decl.params,
+        None,
+        &Bindings::new(),
+    )
+    .unwrap();
     let (outcome, counts) = under_traversal(
         pinned_mode(session),
         session.query(

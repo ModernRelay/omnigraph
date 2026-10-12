@@ -26,7 +26,7 @@ color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util"] }
 reqwest = { workspace = true, features = ["blocking", "stream"] }
 futures = { workspace = true }

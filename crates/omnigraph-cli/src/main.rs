@@ -5,9 +5,9 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitOutput,
-    ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotDatasetOutput, query_file_refusals,
+    BlobContentKindOutput, BlobStatOutput, BranchOutcomeOutput, ChangeOutput, CommitKindOutput,
+    CommitOutput, ErrorOutput, GraphBatchDeclarationOutput, GraphBatchLoadOutput, ReadOutput,
+    SchemaApplyOutput, SnapshotDatasetOutput, query_file_refusals,
 };
 use omnigraph_cluster::{
     DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
@@ -827,6 +827,7 @@ async fn run(cli: Cli) -> Result<()> {
                 uri,
                 branch,
                 unpublished,
+                unattached,
                 json,
             } => {
                 let client = match managed_data {
@@ -843,7 +844,9 @@ async fn run(cli: Cli) -> Result<()> {
                         .await?
                     }
                 };
-                let payload = if unpublished {
+                let payload = if unattached {
+                    client.list_unattached_commits(branch.as_deref()).await?
+                } else if unpublished {
                     client.list_unpublished_commits(branch.as_deref()).await?
                 } else {
                     client.list_commits(branch.as_deref()).await?
@@ -1661,7 +1664,6 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let params_json = load_params_json(&params)?;
             let has_target = branch.is_some();
-            let branch = resolve_branch(branch, None, "main");
             let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
@@ -1719,7 +1721,7 @@ async fn run(cli: Cli) -> Result<()> {
                         }
                         client
                             .mutate(
-                                &branch,
+                                branch.as_deref(),
                                 &query_source,
                                 name.as_deref(),
                                 params_json.as_ref(),
@@ -1747,7 +1749,7 @@ async fn run(cli: Cli) -> Result<()> {
                         &name,
                         true,
                         params_json.as_ref(),
-                        Some(branch),
+                        branch,
                         None,
                         if_commit.as_deref(),
                     )

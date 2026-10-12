@@ -364,7 +364,7 @@ fn load_seed_manifest(path: &Path) -> Result<ResolvedSeedManifest> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or(std::env::current_dir()?);
-    let manifest: SeedManifest = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+    let manifest: SeedManifest = yaml_serde::from_str(&fs::read_to_string(path)?)?;
     let raw_seed = manifest
         .sources
         .as_ref()
