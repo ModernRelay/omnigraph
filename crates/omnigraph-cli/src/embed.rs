@@ -565,15 +565,16 @@ fn embedding_source_text<'a>(
 #[derive(Debug, PartialEq, Eq)]
 enum VectorChange {
     Embedded,
-    /// The record has no source text, so its vector was removed.
+    /// The record has no source text, so its target value was removed.
     Removed,
-    /// The record has no source text and had no vector.
+    /// The record has no source text and had no target value.
     Unchanged,
 }
 
 /// Set the record's vector to the embedding of its source text. A record
-/// without source text keeps no vector: one derived from anything else would
-/// not answer a `nearest()` query for that text.
+/// without source text keeps no target value: a vector derived from anything
+/// else would not answer a `nearest()` query for that text, and a null or an
+/// empty placeholder is no vector either.
 async fn embed_row(
     row: &mut EmbedRow,
     spec: &EmbedTypeSpec,
@@ -588,11 +589,10 @@ async fn embed_row(
         bail!("cannot embed non-entity seed records");
     };
     let Some(text) = embedding_source_text(type_name, data, &spec.source, line_number)? else {
-        if embedding_missing(data.get(&spec.target)) {
-            return Ok(VectorChange::Unchanged);
-        }
-        data.remove(&spec.target);
-        return Ok(VectorChange::Removed);
+        return Ok(match data.remove(&spec.target) {
+            Some(_) => VectorChange::Removed,
+            None => VectorChange::Unchanged,
+        });
     };
     let embedding = client.embed_document_text(text, dimension).await?;
     data.insert(spec.target.clone(), json!(embedding));
@@ -681,14 +681,18 @@ mod tests {
             assert_eq!(change, VectorChange::Unchanged, "{data}");
             assert_eq!(vector(row), None, "{data}");
 
-            let mut stale = data.clone();
-            stale["embedding"] = json!([0.1, 0.2]);
-            let mut row = issue(stale);
-            let change = embed_row(&mut row, &title_spec(), 8, &client, 1)
-                .await
-                .unwrap();
-            assert_eq!(change, VectorChange::Removed, "{data}");
-            assert_eq!(vector(row), None, "{data}");
+            // A stale vector, a null, or an empty placeholder (which a load
+            // refuses for a `Vector(N)`) all leave with the record's source.
+            for target in [json!([0.1, 0.2]), json!([]), json!(null)] {
+                let mut stale = data.clone();
+                stale["embedding"] = target.clone();
+                let mut row = issue(stale);
+                let change = embed_row(&mut row, &title_spec(), 8, &client, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(change, VectorChange::Removed, "{data} with {target}");
+                assert_eq!(vector(row), None, "{data} with {target}");
+            }
         }
     }
 

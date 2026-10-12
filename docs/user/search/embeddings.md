@@ -117,13 +117,13 @@ property whose value it embeds:
 declares; a spec that lists none or several is refused. The command does not
 read the schema, so keep `target`, `fields`, and `dimension` equal to the
 `@embed` declaration and its `Vector(N)`. The source's string value is embedded
-unchanged, as described under [Schema annotation](#schema-annotation). A record
-whose source is absent, null, or blank gets no vector; a source value that is
-not a string is refused.
+unchanged, as described under [Schema annotation](#schema-annotation). A
+processed record whose source is absent, null, or blank gets no vector: whatever
+its target held, including a null or an empty list, is removed and counted as
+cleaned. A source value that is not a string is refused.
 
 By default it fills missing vectors. Use `--reembed-all` to replace selected
-vectors or `--clean` to remove them. A replaced record whose source is absent,
-null, or blank loses its vector and is counted as cleaned. `--type` and
-`--select` restrict the records processed. A seed manifest can be supplied with
-`--seed` instead of separate input, output, and spec paths; its `embeddings`
-entry takes the same shape as the spec.
+vectors or `--clean` to remove them. `--type` and `--select` restrict the
+records processed. A seed manifest can be supplied with `--seed` instead of
+separate input, output, and spec paths; its `embeddings` entry takes the same
+shape as the spec.
