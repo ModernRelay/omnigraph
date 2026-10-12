@@ -41,7 +41,6 @@ codes! {
     T15 = "traversal hop bounds or nearest operands are invalid";
     T16 = "update is not supported for edge types";
     T17 = "nearest ordering requires a limit";
-    T18 = "alias ordering cannot be combined with nearest";
     T19 = "search or fuzzy operands are invalid";
     T20 = "match_text or bm25 operands are invalid";
     T21 = "rrf operands are invalid or its ordering lacks a limit";
