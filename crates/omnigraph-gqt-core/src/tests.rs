@@ -2704,14 +2704,6 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 }
 
 #[test]
-fn admits_ordered_expect_on_an_rrf_led_order() {
-    let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n    limit 3\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
-    parse_case("x", &text).unwrap();
-}
-
-#[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
     let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
                  return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
@@ -2726,6 +2718,33 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
         "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
     );
     parse_case("x", &text).unwrap();
+}
+
+#[test]
+fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
+    for ranking in [
+        "nearest($p.vec, $v)",
+        "bm25($p.name, $t)",
+        "rrf(nearest($p.vec, $v), bm25($p.name, $t))",
+    ] {
+        let query = format!(
+            "--- query\nquery q($v: Vector(4), $t: String) {{\n\
+             match {{ $p: Person }}\nreturn distinct {{ $p.name }}\n\
+             order {{ {ranking} }}\nlimit 3\n}}\n"
+        );
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
+        assert!(refusal("x", &text).contains("rank-only `return distinct`"));
+        let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
+        parse_case("x", &text).unwrap();
+        for accepted in [
+            query.replace("return distinct", "return"),
+            query.replace(ranking, &format!("{ranking}, $p.name")),
+            query.replace(ranking, "$p.name"),
+        ] {
+            let text = format!("{HDR}{SCHEMA}{SEED}{accepted}--- expect ordered\n{SHAPE}");
+            parse_case("x", &text).unwrap();
+        }
+    }
 }
 
 const SET_MERGE_OFF: &str = "--- mutate\nset merge_lineage = off;\n--- expect ok\n";

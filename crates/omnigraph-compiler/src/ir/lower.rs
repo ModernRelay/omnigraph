@@ -202,6 +202,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
         params: lower_params(&query.params),
         pipeline,
         return_exprs,
+        distinct: query.distinct,
         order_by,
         limit: query.limit,
     };
