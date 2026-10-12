@@ -1015,7 +1015,16 @@ fn walk_expr(
         | Expr::Variable(_)
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
-        Expr::Aggregate { func: _, arg } => {
+        Expr::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => {
+            if reject_edge_type && *distinct {
+                return Err(format!(
+                    "expect same as v1: the reference engine does not support `{func}(distinct …)`"
+                ));
+            }
             walk_expr(arg, params, needs_indices, reject_edge_type)?
         }
         Expr::Binary { left, op: _, right }

@@ -805,6 +805,7 @@ pub(super) fn validate_plan_values(
                 }
                 IRExpr::Aggregate {
                     func: _,
+                    distinct: _,
                     arg,
                     signature: _,
                 }

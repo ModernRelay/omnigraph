@@ -65,6 +65,7 @@ fn metadata_count_rewrite_converges() {
         vec![scan("c")],
         vec![IRExpr::Aggregate {
             func: AggFunc::Count,
+            distinct: false,
             arg: Box::new(IRExpr::Variable(
                 "c".to_string(),
                 omnigraph_compiler::ExprType::Node {

@@ -1213,7 +1213,7 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
     assert_eq!(
         explain["aggregates"][0],
         serde_json::json!({
-            "column": "total", "func": "sum", "input": "I64", "accumulator": "exact_integer",
+            "column": "total", "func": "sum", "distinct": false, "input": "I64", "accumulator": "exact_integer",
             "overflow": "round_to_nearest", "result": "F64?"
         })
     );
