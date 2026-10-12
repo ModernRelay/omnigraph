@@ -8688,15 +8688,17 @@ impl lance::io::WrappingObjectStore for SmallScanProbeMarker {
     }
 }
 
-/// Counts the requests `__history` is sent by verb, "not found" GETs included
-/// (Lance's tracker records only successful GETs); with `refuse_suffix` a
-/// suffix range is refused before it is sent, as `object_store`'s Azure client does.
+/// Counts the requests a wrapped store (`__history` through [`Self::probes`])
+/// is sent by verb, "not found" GETs and HEADs included (Lance's tracker
+/// records only successful GETs); with `refuse_suffix` a suffix range is
+/// refused before it is sent, as `object_store`'s Azure client does.
 #[derive(Debug, Default, Clone)]
 pub(super) struct HistoryGets {
     refuse_suffix: bool,
     sent: Arc<std::sync::atomic::AtomicUsize>,
     absent: Arc<std::sync::atomic::AtomicUsize>,
     heads: Arc<std::sync::atomic::AtomicUsize>,
+    lists: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HistoryGets {
@@ -8715,6 +8717,11 @@ impl HistoryGets {
             count.swap(0, std::sync::atomic::Ordering::Relaxed)
         };
         (take(&self.sent), take(&self.absent), take(&self.heads))
+    }
+
+    /// The listings since the last call.
+    pub(super) fn drain_lists(&self) -> usize {
+        self.lists.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -8801,6 +8808,9 @@ impl object_store::ObjectStore for HistoryGetStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.gets
+            .lists
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.original.list(prefix)
     }
 
@@ -8808,6 +8818,9 @@ impl object_store::ObjectStore for HistoryGetStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> object_store::Result<object_store::ListResult> {
+        self.gets
+            .lists
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.original.list_with_delimiter(prefix).await
     }
 
@@ -8818,6 +8831,82 @@ impl object_store::ObjectStore for HistoryGetStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         self.original.copy_opts(from, to, options).await
+    }
+}
+
+/// The freshness probe asks for the versions after the held one by name.
+/// `latest_version_id` lists `_versions/`, and on a store whose listing is
+/// ordered (S3, and Lance's in-memory stores) that one request carries up to
+/// a thousand keys on every warm read.
+#[tokio::test]
+async fn freshness_probe_asks_for_the_next_version_by_name() {
+    use arrow_array::ArrayRef;
+    async fn commit(uri: &str, mode: WriteMode, enable_v2_manifest_paths: bool) {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                mode,
+                enable_v2_manifest_paths,
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    for v2_paths in [true, false] {
+        let uri = format!("shared-memory://freshness-{}/__manifest", ulid::Ulid::new());
+        let append = || commit(&uri, WriteMode::Append, v2_paths);
+        commit(&uri, WriteMode::Create, v2_paths).await;
+        let sent = HistoryGets::default();
+        let held = DatasetBuilder::from_uri(&uri)
+            .with_store_params(lance::io::ObjectStoreParams {
+                object_store_wrapper: Some(Arc::new(sent.clone())),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(held.version().version, 1);
+        sent.drain();
+        sent.drain_lists();
+
+        // Unchanged: one HEAD of version 2, answered "not found".
+        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        assert_eq!(latest.version, 1, "v2_paths={v2_paths}");
+        assert_eq!(sent.drain(), (0, 1, 1), "v2_paths={v2_paths}");
+        assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
+
+        // Another writer commits once: version 2 is found, 3 is absent.
+        append().await;
+        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        assert_eq!(latest.version, 2, "v2_paths={v2_paths}");
+        assert_eq!(sent.drain(), (0, 1, 2), "v2_paths={v2_paths}");
+        assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
+
+        // A gap longer than the probe's steps: the listing answers.
+        for _ in 0..FRESHNESS_PROBE_STEPS {
+            append().await;
+        }
+        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        assert_eq!(
+            latest.version,
+            1 + 1 + FRESHNESS_PROBE_STEPS as u64,
+            "v2_paths={v2_paths}"
+        );
+        assert_eq!(
+            sent.drain(),
+            (0, 0, FRESHNESS_PROBE_STEPS),
+            "v2_paths={v2_paths}"
+        );
+        assert_eq!(sent.drain_lists(), 1, "v2_paths={v2_paths}");
     }
 }
 
