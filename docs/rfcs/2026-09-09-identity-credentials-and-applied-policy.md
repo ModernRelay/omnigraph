@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-06
+updated: 2026-10-12
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -271,7 +271,8 @@ of a particular deployment remain separate from the accepted library contract.
 This extension replaces the opaque managed login/session brokerage described
 in RFC 0052 with direct AuthKit public-client
 device login and refresh through the official SDK. Login metadata pins the
-provider family, client, issuer, organization and fixed endpoints. The API
+provider family, client, issuer and fixed endpoints. Discovery version 2 has
+no organization field: the verified session and folder context bind it. The API
 verifies the raw access token and returns stable principal identity. The CLI
 uses a new OS-keychain namespace, an eight-hour absolute renewable deadline,
 serialized refresh with a pending-before-send marker and atomic credential
@@ -279,6 +280,24 @@ replacement, and no automatic retry after an uncertain exchange. Old managed
 sessions require new login. The API and CLI switch together; no broker
 compatibility path or gradual authentication migration is required.
 Direct/static configuration remains supported.
+
+The version 2 keychain namespace holds a separate device session for each
+canonical API and organization. A bounded index contains at most 128 selected
+organizations per API; credential records retain the exact provider, account,
+principal, subject and session identity. A command selects one organization
+once. Another shell's login cannot retarget that command, even within the same
+organization. Refresh must retain the entire selected identity and original
+eight-hour deadline. Logout removes only the selected organization's custody.
+
+First login may use the organization's selection in the hosted provider flow;
+an explicit `--organization` must match the resource-verified result before it
+is saved. Device initiation/exchange use only the official SDK parameters;
+the CLI does not invent an organization parameter or switch organizations by
+refreshing or cloning another organization's session. Refresh names only the
+already selected organization. Ambiguous cached selection refuses. A version 1
+managed session or context requires fresh sign-in and binding. The data cache
+also separates API, organization and cluster; its independent expiry and
+explicit clearing contract remain unchanged.
 
 Normal native data commands acquire a self-only identity credential before
 execution. A permission refusal never triggers login or mutation replay.

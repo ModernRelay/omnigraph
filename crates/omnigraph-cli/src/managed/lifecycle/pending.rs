@@ -174,7 +174,10 @@ pub(super) fn record(config: &Path, api: &str, identity: &Identity) -> Result<()
 
 pub(super) fn bind(config: &Path, context: &Context) -> Result<()> {
     if let Some(existing) = read_context(config)? {
-        if existing.api == context.api && existing.cluster == context.cluster {
+        if existing.api == context.api
+            && existing.cluster == context.cluster
+            && existing.organization_id == context.organization_id
+        {
             return Ok(());
         }
         return Err(Failure::refused(

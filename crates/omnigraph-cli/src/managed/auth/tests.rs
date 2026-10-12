@@ -23,11 +23,10 @@ impl Store for MemoryStore {
 
 pub(super) fn config() -> provider::Config {
     provider::Config {
-        version: 1,
+        version: 2,
         provider: "workos_authkit".into(),
         client_id: "client_test".into(),
         issuer: "https://issuer.example".into(),
-        organization_id: "org_test".into(),
         authorization_endpoint: "https://api.workos.com/user_management/authorize".into(),
         device_authorization_endpoint: "https://api.workos.com/user_management/authorize/device"
             .into(),
@@ -135,6 +134,7 @@ async fn explicit_automation_resolves_its_own_principal_before_data_cache_reuse(
     let principal = selected_principal_with(
         &store,
         &api.origin,
+        Some("org_test"),
         Some("automation-access".into()),
         Some(api.origin.clone()),
     )
@@ -225,7 +225,7 @@ async fn official_sdk_uses_public_client_device_and_refresh_without_secret_or_re
     provider.device(&config()).await.unwrap();
     provider.poll("secret-device").await.unwrap();
     let error = provider
-        .refresh("secret-refresh", &config())
+        .refresh("secret-refresh", "org_test")
         .await
         .err()
         .unwrap();
@@ -279,7 +279,7 @@ async fn cached_login_does_not_restart_provider_authorization() {
     let store = MemoryStore::default();
     renewal::save(&store, &saved).unwrap();
     let provider = MockTransport::with(vec![]);
-    let output = login_with(&store, &api.origin, config(), &provider.provider())
+    let output = login_with(&store, &api.origin, config(), &provider.provider(), None)
         .await
         .unwrap();
     assert_eq!(output["data"]["principal_id"], "principal_one");
@@ -301,7 +301,7 @@ async fn device_login_polls_the_provider_and_never_the_old_broker() {
         (200, tokens(120, "user_one")),
     ]);
     let store = MemoryStore::default();
-    let output = login_with(&store, &api.origin, config(), &transport.provider())
+    let output = login_with(&store, &api.origin, config(), &transport.provider(), None)
         .await
         .unwrap();
     assert_eq!(output["data"]["principal_id"], "principal_one");
@@ -333,7 +333,7 @@ async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
         json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
     )]);
     let store = MemoryStore::default();
-    let error = login_with(&store, &api.origin, config(), &transport.provider())
+    let error = login_with(&store, &api.origin, config(), &transport.provider(), None)
         .await
         .unwrap_err();
     assert_eq!(error.body["type"], "device_expired");
@@ -367,11 +367,122 @@ async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
         ),
         (200, tokens(120, "user_one")),
     ]);
-    let error = login_with(&RefusingStore, &api.origin, config(), &transport.provider())
-        .await
-        .unwrap_err();
+    let error = login_with(
+        &RefusingStore,
+        &api.origin,
+        config(),
+        &transport.provider(),
+        None,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.body["type"], "keychain_unavailable");
     assert_eq!(api.requests()[1].path, "/v1/auth/logout");
     assert!(api.requests()[1].headers["authorization"].starts_with("Bearer ey"));
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn signing_into_another_organization_starts_its_own_device_flow() {
+    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let (saved, _) = renewal::accept(
+        &api.origin,
+        config(),
+        serde_json::from_value(tokens(120, "user_one")).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let store = MemoryStore::default();
+    renewal::save(&store, &saved).unwrap();
+    let before = store.0.borrow().clone();
+    let transport = MockTransport::with(vec![(
+        200,
+        json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":1,"interval":5}),
+    )]);
+    let error = login_with(
+        &store,
+        &api.origin,
+        config(),
+        &transport.provider(),
+        Some("org_other"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.body["type"], "device_expired");
+    assert_eq!(*store.0.borrow(), before);
+    let requests = transport.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, config().device_authorization_endpoint);
+    let body: Value = serde_json::from_slice(requests[0].body.as_ref().unwrap()).unwrap();
+    assert_eq!(body, json!({"client_id":"client_test"}));
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn explicit_organization_must_match_the_verified_automation_account() {
+    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let result = select_with(
+        &MemoryStore::default(),
+        &api.origin,
+        Some("org_other"),
+        Some("automation".into()),
+        Some(api.origin.clone()),
+    )
+    .await;
+    assert_eq!(result.err().unwrap().body["type"], "organization_mismatch");
+    assert_eq!(api.requests().len(), 1);
+    api.assert_complete();
+}
+
+#[test]
+fn discovery_v2_has_no_tenant_selector_and_rejects_v1() {
+    let value = serde_json::to_value(config()).unwrap();
+    assert_eq!(value["version"], 2);
+    assert!(value.get("organization_id").is_none());
+    let mut legacy = value.clone();
+    legacy["version"] = json!(1);
+    assert!(
+        serde_json::from_value::<provider::Config>(legacy)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+    let mut tenant = value;
+    tenant["organization_id"] = json!("org_test");
+    assert!(serde_json::from_value::<provider::Config>(tenant).is_err());
+}
+
+#[tokio::test]
+#[ignore = "nightly: one real 5 s device-flow poll interval"]
+async fn device_login_refuses_another_organization_before_saving_credentials() {
+    let api = IntentApiFixture::new(vec![
+        metadata(120, "principal_one"),
+        IntentReply::json(200, json!({"data":{"logged_out":true},"meta":{}})),
+    ]);
+    let transport = MockTransport::with(vec![
+        (
+            200,
+            json!({"device_code":"device-secret","user_code":"ABCD","verification_uri":"https://auth.example/device","expires_in":30,"interval":5}),
+        ),
+        (200, tokens(120, "user_one")),
+    ]);
+    let store = MemoryStore::default();
+    let error = login_with(
+        &store,
+        &api.origin,
+        config(),
+        &transport.provider(),
+        Some("org_other"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.body["type"], "organization_mismatch");
+    assert!(store.0.borrow().is_empty());
+    assert_eq!(api.requests()[1].path, "/v1/auth/logout");
+    for request in transport.requests.lock().unwrap().iter() {
+        let body: Value = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+        assert!(body.get("organization_id").is_none());
+    }
     api.assert_complete();
 }

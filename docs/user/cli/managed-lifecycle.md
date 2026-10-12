@@ -11,10 +11,10 @@ selects the service for a cluster command.
 Log in to your control API, then use an unbound configuration directory:
 
 ```sh
-omnigraph login --api https://control.example
+omnigraph login --api https://control.example --organization org_customer
 mkdir customer-demo
 omnigraph cluster create --managed customer-demo --api https://control.example \
-  --config customer-demo --no-wait --json
+  --organization org_customer --config customer-demo --no-wait --json
 ```
 
 The service reserves a fresh cluster and operation. The CLI writes its managed
@@ -32,11 +32,13 @@ cancel creation. Follow the saved operation explicitly:
 ```sh
 omnigraph cluster operation --managed OPERATION_ID --config customer-demo --json
 omnigraph cluster operation --managed OPERATION_ID --api https://control.example \
-  --wait --timeout 600 --json
+  --organization org_customer --wait --timeout 600 --json
 ```
 
-An operation can be inspected with `--api` before a folder is bound. If both an
-origin and an existing folder context are present, they must agree. Private
+An operation can be inspected with `--api` before a folder is bound. If an
+explicit origin or organization accompanies an existing folder context, they
+must agree. Unbound commands accept `--organization`; omission selects only a sole
+cached organization for that API. Multiple cached organizations refuse. Private
 clusters still require the connection reported by your service, such as an
 explicit port forward; `ready` does not imply a public endpoint.
 

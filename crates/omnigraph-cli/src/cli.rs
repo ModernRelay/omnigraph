@@ -392,6 +392,9 @@ pub(crate) enum Command {
         /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
         api: Option<String>,
+        /// Select the managed organization; never changes an existing session account.
+        #[arg(long, requires = "api", conflicts_with = "name")]
+        organization: Option<String>,
         /// The token. Prefer piping via stdin over this flag (shell
         /// history).
         #[arg(long)]
@@ -406,6 +409,9 @@ pub(crate) enum Command {
         /// Revoke the managed session and remove its OS keychain entry.
         #[arg(long)]
         api: Option<String>,
+        /// Select the managed organization; never changes an existing session account.
+        #[arg(long, requires = "api", conflicts_with = "name")]
+        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -414,6 +420,9 @@ pub(crate) enum Command {
         cluster_id: String,
         #[arg(long)]
         api: String,
+        /// Select the managed organization.
+        #[arg(long)]
+        organization: Option<String>,
         #[arg(long, default_value = ".")]
         config: PathBuf,
         #[arg(long)]
@@ -625,6 +634,9 @@ pub(crate) enum ClusterCommand {
         name: String,
         #[arg(long)]
         api: String,
+        /// Select the organization when the folder is not yet bound.
+        #[arg(long)]
+        organization: Option<String>,
         /// Unbound configuration folder to bind after creation.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -699,6 +711,9 @@ pub(crate) enum ClusterCommand {
         /// API origin for recovery before a folder context exists.
         #[arg(long)]
         api: Option<String>,
+        /// Select the organization when the folder is not yet bound.
+        #[arg(long)]
+        organization: Option<String>,
         /// Poll until the operation reaches its canonical outcome.
         #[arg(long)]
         wait: bool,
