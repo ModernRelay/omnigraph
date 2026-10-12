@@ -1262,7 +1262,13 @@ async fn a_fusion_replays() {
     let db = docs(&dir).await;
     let mut params = ParamMap::from([("t".to_string(), Literal::String("needle".to_string()))]);
     params.insert("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]));
-    let Replayed { result, search, .. } = replayed(&db, DOC_QUERIES, "fused", &params).await;
+    let Replayed {
+        result,
+        search,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(result.len(), 3);
     let kinds: Vec<&str> = search
         .iter()
@@ -1273,6 +1279,56 @@ async fn a_fusion_replays() {
         ["gate", "probes"],
         "the fusion's gate records one verdict, then its nearest arm its probe attempts: {search:#?}"
     );
+
+    // A predicate the query never wrote, placed above the fusion rather than
+    // in an arm, is refused at the replay door instead of dropping rows.
+    let mut forged = plan.clone();
+    let fuse = forged
+        .plan
+        .live()
+        .find(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. }))
+        .map(|(id, _)| id)
+        .expect("the fused query plans a RankFuse");
+    let parent = forged
+        .plan
+        .live()
+        .find(|(_, node)| node.inputs().contains(&fuse))
+        .map(|(id, _)| id)
+        .expect("the fusion feeds a parent");
+    let properties = forged.plan.properties(fuse).cloned().unwrap();
+    let never = forged.plan.add(PhysicalNode::Filter {
+        input: fuse,
+        filters: vec![omnigraph_compiler::ir::IRExpr::Literal(
+            Literal::Bool(false),
+            omnigraph_compiler::ExprType::from_prop(&omnigraph_compiler::PropType::scalar(
+                omnigraph_compiler::ScalarType::Bool,
+                false,
+            )),
+        )],
+    });
+    forged.plan.set_properties(never, properties);
+    match forged.plan.node_mut(parent) {
+        Some(PhysicalNode::Sort { input, .. }) => *input = never,
+        other => panic!("the fusion's parent is a sort: {other:?}"),
+    }
+    let error = match db
+        .replay_bound_plan(
+            "main",
+            &with_plan(&envelope, serde_json::to_value(&forged).unwrap()),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(replay) => panic!(
+            "a filter above the fusion replayed: {:?}",
+            rows_of(&replay.result)
+        ),
+    };
+    assert!(
+        matches!(&error, OmniError::Manifest(error) if error.kind == ManifestErrorKind::BadRequest),
+        "{error}"
+    );
+    assert!(error.to_string().contains("predicate origin"), "{error}");
 
     // Two nearest arms record their attempts apart, one decision per scan.
     let mut params =

@@ -55,24 +55,57 @@ fn pipeline(
     Ok(nodes)
 }
 
+/// One pipeline a query's eligibility constrains: `own`, the nodes that
+/// produce its rows, and `after`, the nodes those rows pass through above a
+/// fusion (empty without one).
+struct Constrained {
+    own: Vec<NodeId>,
+    after: Vec<NodeId>,
+}
+
+impl Constrained {
+    /// Every node the pipeline's rows reach.
+    fn reached(&self) -> Vec<NodeId> {
+        self.own.iter().chain(&self.after).copied().collect()
+    }
+}
+
 /// The pipelines whose rows a query's eligibility constrains: one per `rrf`
-/// arm, each its own copy of the match, or the whole top level.
+/// arm, each its own copy of the match, followed by the nodes above the
+/// fusion; or the whole top level.
 fn constrained_pipelines(
     plan: &PhysicalPlan,
     budget: &mut Budget,
-) -> Result<Vec<Vec<NodeId>>, ValidationError> {
+) -> Result<Vec<Constrained>, ValidationError> {
     let top = pipeline(plan, plan.root(), budget)?;
     let fuse = top.iter().find_map(|id| match plan.node(*id) {
-        Some(PhysicalNode::RankFuse { arms, .. }) => Some(arms.clone()),
+        Some(PhysicalNode::RankFuse { arms, .. }) => Some((*id, arms.clone())),
         _ => None,
     });
-    match fuse {
-        Some(arms) => arms
-            .iter()
-            .map(|arm| pipeline(plan, arm.input, budget))
-            .collect(),
-        None => Ok(vec![top]),
+    let Some((fuse, arms)) = fuse else {
+        return Ok(vec![Constrained {
+            own: top,
+            after: Vec::new(),
+        }]);
+    };
+    let mut below = HashSet::new();
+    let mut arm_pipelines = Vec::new();
+    for arm in &arms {
+        let own = pipeline(plan, arm.input, budget)?;
+        below.extend(own.iter().copied());
+        arm_pipelines.push(own);
     }
+    let after: Vec<NodeId> = top
+        .into_iter()
+        .filter(|id| *id != fuse && !below.contains(id))
+        .collect();
+    Ok(arm_pipelines
+        .into_iter()
+        .map(|own| Constrained {
+            own,
+            after: after.clone(),
+        })
+        .collect())
 }
 
 /// Every conjunct a pipeline's nodes test, wherever placement put it, with
@@ -154,11 +187,26 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let pipelines = constrained_pipelines(plan, budget)?;
-        for nodes in &pipelines {
-            self.check_bindings(plan, nodes)?;
-            self.check_eligibility(plan, nodes, input, budget)?;
-            self.check_blocks(plan, nodes)?;
+        // A fused query's eligibility belongs inside each arm (retention);
+        // what its rows pass through after the fusion is checked with the
+        // arm for origin, extra traversals and blocks.
+        for pipeline in &constrained_pipelines(plan, budget)? {
+            let reached = pipeline.reached();
+            self.check_bindings(plan, &reached)?;
+            self.check_eligibility(plan, &pipeline.own, &reached, input, budget)?;
+            self.check_blocks(plan, &pipeline.own)?;
+            if let Some(id) = pipeline
+                .after
+                .iter()
+                .find(|id| matches!(plan.node(**id), Some(PhysicalNode::AntiJoin { .. })))
+            {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!(
+                        "node {id} decides a correlated block above the fusion, outside every arm"
+                    ),
+                ));
+            }
         }
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_search(plan)?;
@@ -269,28 +317,33 @@ impl Requirements {
     }
 
     /// The conjuncts a pipeline tests are exactly the ones the query
-    /// requires: every required conjunct is tested somewhere in it, and every
-    /// conjunct it tests is required, a constant `true` (which constrains
-    /// nothing) or the canonical identity of a written key equality on the
-    /// same scan.
+    /// requires: every required conjunct is tested among `retained` (an
+    /// `rrf` arm's own nodes), and every conjunct tested anywhere its rows
+    /// reach, after a fusion included, is required, a constant `true` (which
+    /// constrains nothing) or the canonical identity of a written key
+    /// equality on the same scan.
     fn check_eligibility(
         &self,
         plan: &PhysicalPlan,
-        nodes: &[NodeId],
+        retained: &[NodeId],
+        reached: &[NodeId],
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let placed = conjuncts(plan, nodes);
-        budget.visit(u64::try_from(placed.len() + self.eligibility.len()).unwrap_or(u64::MAX))?;
-        let placed_set: HashSet<&IRExpr> = placed.iter().map(|(_, conjunct)| conjunct).collect();
+        let kept = conjuncts(plan, retained);
+        let placed = conjuncts(plan, reached);
+        budget.visit(
+            u64::try_from(kept.len() + placed.len() + self.eligibility.len()).unwrap_or(u64::MAX),
+        )?;
+        let kept_set: HashSet<&IRExpr> = kept.iter().map(|(_, conjunct)| conjunct).collect();
         if let Some(missing) = self
             .eligibility
             .iter()
-            .find(|required| !placed_set.contains(required))
+            .find(|required| !kept_set.contains(required))
         {
             // The same text under other stored types is a retyped conjunct.
             let text = missing.to_string();
-            let detail = if placed
+            let detail = if kept
                 .iter()
                 .any(|(_, conjunct)| conjunct.to_string() == text)
             {
