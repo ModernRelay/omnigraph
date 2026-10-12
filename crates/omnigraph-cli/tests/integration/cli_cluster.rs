@@ -1714,8 +1714,8 @@ fn managed_use_verifies_access_before_writing_context() {
             .arg("--json"),
     );
     assert_eq!(parse_stdout_json(&output), body);
-    let context: serde_yaml::Value =
-        serde_yaml::from_slice(&fs::read(temp.path().join(".omnigraph/context")).unwrap()).unwrap();
+    let context: yaml_serde::Value =
+        yaml_serde::from_slice(&fs::read(temp.path().join(".omnigraph/context")).unwrap()).unwrap();
     assert_eq!(context["version"], 1);
     assert_eq!(context["cluster"], "managed-test");
     assert_eq!(context["api"].as_str(), Some(api.origin.as_str()));

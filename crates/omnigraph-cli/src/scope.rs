@@ -245,7 +245,7 @@ mod tests {
     use super::*;
 
     fn cfg(yaml: &str) -> OperatorConfig {
-        serde_yaml::from_str(yaml).unwrap()
+        yaml_serde::from_str(yaml).unwrap()
     }
 
     fn flags<'a>() -> ScopeFlags<'a> {
