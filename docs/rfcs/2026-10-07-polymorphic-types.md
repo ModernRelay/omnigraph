@@ -132,8 +132,12 @@ edge RelatedTo: Subject -> Subject
   constraint forms remain refused until their enforcement is specified.
   Property-level annotations on interface properties keep today's meaning:
   they are applied to each implementor that inherits the property.
-  Redeclaring an interface property in a node and dropping one of its
-  constraint annotations is a lint warning, no longer a silent drop.
+  A node that redeclares an interface property must give it the identical
+  type, as today, and may add constraints but never drop an inherited `@key`
+  or `@unique`. Today a redeclared `slug: String` silently loses the
+  interface's `@key`: in the prototype the same slug then loaded as two rows.
+  With keys as the public address, that silently breaks addressing, so it
+  becomes a refusal. Dropping any other inherited annotation is a lint warning.
 - An edge endpoint is a node type, an interface, or an inline union
   `A | B | …` whose members are node types or interfaces. Its member set is
   the union of each member's concrete closure.
@@ -189,12 +193,29 @@ query non_people($q: String) {
 |---|---|
 | `$x: I` | Every concrete implementor of interface `I`, through interface inheritance. |
 | `$x: A \| B` | The union of the members' sets; members may be interfaces. |
-| `$x.p` | Legal when `p` is declared on `I` (or inherited by it). For a union, legal when every member has `p` under the alternation rule: same scalar and list shape, nullable if any member is, enum domains combined, enum with String becomes String. Otherwise a type error that names the narrowing to use. |
-| `$x.@type` | The concrete type's canonical name, a non-null String. |
+| `$x.p` | Legal when `p` is declared on `I` (or inherited by it), and typed exactly as `I` declares it. For a union, each declared member contributes one type (a node type its property type, an interface its declared type) and the alternation rule joins those: same scalar and list shape, nullable if any member is, enum domains combined, enum with String becomes String. Otherwise a type error that names the narrowing to use. |
+| `$x.@type` | The concrete type's canonical name, a non-null String. A rename changes it. |
+| `$x.@type_id` | The concrete type's `StableTypeId`, the type half of the node's packed reference, as a non-null decimal String. A rename keeps it, so clients cache and route by it. |
 | `$x is T`, `$x is not T`, `$x is A \| B` | A non-null Bool type test. `T` must overlap the binding's set. |
 | `$x: T` after an earlier binding of `$x` | Intersects the two sets. An empty intersection is a type error. Rebinding to a subtype is no longer T50. |
 | `$e.@src_type`, `$e.@dst_type` | The endpoint types of a bound edge, as canonical names, read from the packed references. |
-| `return { $x }` | Unchanged for a concrete binding. For a multi-member set, a struct of `@id`, `@type` and the readable properties. |
+| `return { $x }` | Unchanged for a concrete binding. For an interface or union binding, a struct of `@id`, `@type` and the readable properties, even while the set has one member. |
+
+***Result schemas never depend on the member set.*** Adding or removing an
+implementor changes which rows an abstract binding returns, never a column's
+type, the legality of a property read, or the shape of `return { $x }`. A UI
+component that declares the row shape a stored query must fill can rely on
+that. The prototype confirmed it: applying a new implementor left a calendar
+query's result schema byte-identical. Joining a union over its concrete
+closure instead would break this: the first implementor added to an interface
+inside a union could turn a column nullable or widen an enum to `String`.
+
+Ordering ties break on the packed reference, so an abstract binding's total
+order is its `order` keys, then `@type_id`, then the row id. That makes keyset
+paging by filters exact across members, because each arm evaluates the filter
+on its own table. A paging surface for stored queries (a cursor carrying the
+snapshot and the last row's order tuple) is a separate RFC; it needs this
+total order and a `limit` that can be a parameter, which GQ lacks today.
 
 Traversal endpoints use the same sets. A traversal's destination set is the
 edge's endpoint set, intersected with any declared type of the destination
@@ -217,9 +238,12 @@ recurses across Person and Organization with one shortest-distance search.
 
 Refusals:
 
-- `bm25`, `search`, `fuzzy` and `match_text` on a binding whose set has more
-  than one member are refused. Full-text scores are computed per dataset and
-  are not comparable across tables.
+- `bm25` on a binding whose set has more than one member is refused. Lance
+  computes BM25 statistics per index, so scores are not comparable across
+  tables.
+- `search`, `fuzzy` and `match_text` produce no score; they are membership
+  filters. They run per arm when every member has an inverted index on the
+  property, and are refused, naming the member, otherwise.
 - `nearest` is admitted when the vector property and its `@embed` model are
   declared on the interface and every member records the same model and
   dimension.
@@ -255,8 +279,16 @@ query touch($slug: String) {
 - `update I set … where …` and `delete I where …` are typed against the
   interface. They apply to every member and publish once, under the existing
   rule that a query cannot mix writes with deletes. Assignments may name only
-  properties readable on `I`; the `where` may use those properties, `@id` and
-  `@type`.
+  properties readable on `I`; the `where` may use those properties, `@id`,
+  `@type` and `@type_id`.
+- Arms are resolved after parameters are bound, so pruning applies to
+  parameterised type predicates too. A component that edits a row by its type
+  and address (`where @type_id = $t and slug = $s`) touches one table instead
+  of opening every member. A bound type that is not a member of `I` is a typed
+  refusal, not zero rows. A member whose predicate matches nothing stages
+  nothing (on main a zero-match update already stages and publishes nothing),
+  so an N-member update costs one staged table commit per matching member and
+  one manifest publication.
 - A polymorphic endpoint with more than one member is written with its
   concrete type: `Type($id)` in GQ, `from_type` or `to_type` in a load or
   graph-batch envelope. The type must be a member of the endpoint set.
@@ -275,7 +307,10 @@ query touch($slug: String) {
 - `omnigraph schema plan` reports the new step kinds (below) and their tier.
 - An abstract binding opens one dataset per member. A cold first read pays one
   dataset open per member type, and arms open concurrently within the query's
-  resource bounds.
+  resource bounds. The table-handle cache holds at least every table in the
+  accepted catalog. Today it holds 64, so a 75-member interface evicts its own
+  handles: in the prototype a warm repeat of a 75-member keyed lookup reopened
+  55 to 61 tables, against none at 60 members.
 - Every schema migration in this RFC is a schema apply, and schema apply
   refuses while any branch other than `main` exists. A graph that keeps
   long-lived branches lands them before widening an endpoint.
@@ -363,9 +398,22 @@ upgraded current format, and historical abstract bindings remain refused.
   forward, reverse, two-hop and negation traversals with one scan per edge
   table and rows routed by their endpoint types, and no per-pair members were
   needed.
-- `$x.@type` lowers to a String literal for a singleton set and to a
-  query-only `~node_type` column otherwise, as `$e.@type` does with
-  `~edge_type`. A type test remains a typed, non-null Boolean expression.
+- `$x.@type_id` and `$x.@type` are two expressions over one identity source,
+  the concrete type of the row. For a singleton set both fold to literals.
+  Otherwise the identity source is the query-only `~node_type_id` column
+  (`UInt64`): each union-scan arm emits its member's `StableTypeId` as a
+  constant, and an expansion emits the type half of the packed destination.
+  `~node_type` (Utf8) is derived from it through the captured catalog's
+  canonical names, never stored or carried as identity. Dedup, cycle closing,
+  tie-breaks and cursors use the packed reference, whose high half is
+  `~node_type_id`; only `@type` projections and comparisons read the name.
+  `@type_id` is projected as a decimal string, because a `u64` is unsafe as a
+  JSON number past 2^53. Literals and parameters compared with it parse to
+  `u64`, and a non-numeric bound value is a typed refusal. Neither column is
+  pushed into a member scan: before predicates are placed, each arm folds both
+  to its constants. `filter_pushable` refuses query-only columns. In the
+  prototype, `$e.@type = "Task"` was pushed into the member scans and failed
+  with "Unable to get field named `~node_type`". A type test remains a typed, non-null Boolean expression.
   Within each arm, its concrete type can replace the test with a Boolean
   constant and simplify the enclosing expression. Projecting a type test
   never removes rows; negation and disjunction preserve Boolean semantics.
@@ -390,28 +438,55 @@ upgraded current format, and historical abstract bindings remain refused.
 ### Planning and execution
 
 - **Union scan.** An abstract binding becomes one new logical and physical
-  node over N pinned table specs, one per member. It lowers through `Lower` to
-  one OmniGraph operator, so a plan keeps one operator per node. Each arm
-  carries its own pushed filter and projection, resolved through the member's
-  satisfying property. Each arm is cast to the binding's joined types and
-  gains a Utf8 `~node_type` column; the plan mirrors carry no Arrow
-  `Dictionary` or `Union` type. The operator streams arms and opens their
-  datasets concurrently. DataFusion's `UnionExec` is not used unchanged: its
-  output partitioning is the sum of its inputs', the engine executes only
-  partition 0 of the root, and it never compares input types.
+  node over N arms, one per member. It lowers through `Lower` to one OmniGraph
+  operator, so a plan keeps one operator per node. Each arm is resolved on its
+  own:
+  - its table pin and projection;
+  - its filter, resolved through the member's satisfying property, with the
+    type columns folded to the arm's constants;
+  - its index facts, scan-access decision and statistics;
+  - its late materialization, where refetched rows carry their arm and go
+    back to that member's table.
+
+  Each arm is cast to the interface's declared types and gains the
+  `~node_type_id` and `~node_type` columns; the plan mirrors carry no Arrow
+  `Dictionary` or `Union` type. The operator opens and streams arms
+  concurrently, within the query's I/O bounds, and keeps member order.
+  DataFusion's `UnionExec` is not used unchanged: its output partitioning is
+  the sum of its inputs', the engine executes only partition 0 of the root,
+  and it never compares input types.
+- **No single-table shortcut sees an abstract type.** The prototype first
+  intercepted interfaces inside one scan function. Merged with main
+  (`80b3cfeb`), every path that keys on one table broke or degraded:
+  - the pipelined table read opened `node:<Interface>`;
+  - late materialization (`HydrateColumns`) refused every ordered, limited
+    interface query, because it refetches by row address from one table;
+  - scan access recorded `sequential` for the interface, which replays as no
+    scalar index on every arm, while the same filter on one member used an
+    `index_probe`;
+  - an unfiltered `count($x)` became one metadata count on a table that does
+    not exist.
+
+  Each of these consumers takes the union node and resolves per arm, or
+  refuses it. A test asserts that no table key of an abstract type reaches
+  `open_lance_dataset`.
 - **Pruning.** A rebinding intersection removes excluded arms. A filtering
   expression containing type tests or `@type` comparisons removes an arm only
   when simplifying the complete filter proves that the arm cannot contribute
-  a row. Pruned members are never opened.
-- **Cost.** Estimates sum across members. Key equality bounds each member to
-  one row. `count($x)` over an unfiltered abstract binding sums one
-  `MetadataCount` per member.
+  a row. Parameters are bound by then, so `@type = $type` and
+  `@type_id = $t` prune too. Pruned members are never opened.
+- **Cost.** Estimates and statistics are per arm and sum across arms. Key
+  equality bounds each member to one row through its own index. `count($x)`
+  over an unfiltered abstract binding sums one `MetadataCount` per member.
+  Explain shows each arm's access path.
 - **Expansion.** A polymorphic expansion is a selection, so it declares
   `ExpandPolicy::Budgeted` and `IndexedScan` and shares the traversal-work
   counter. One `src IN (frontier)` scan of an edge table serves every
   destination type; rows are routed by the type half of their packed
   destination. Admission charges each edge table's physical rows once per
-  probe window. `ExpandExec` emits `{dst}.~node_type` beside `{dst}.__id`. The
+  probe window. `ExpandExec` emits `{dst}.~node_type_id` (the packed
+  destination's type half) and the derived `{dst}.~node_type` beside
+  `{dst}.__id`. The
   interner, frontier and visited set are keyed by the packed reference, which
   makes mixed-type recursion correct where colliding keys would otherwise
   merge distinct nodes.
@@ -496,27 +571,71 @@ upgraded current format, and historical abstract bindings remain refused.
 | Rename interface (`@rename_from`) | supported | none |
 | Add `implements` when the node already declares every inherited property compatibly | supported; validated if a uniqueness obligation is introduced or widened | none; satisfaction links change |
 | Add `implements` with missing nullable properties | supported; validated if a uniqueness obligation is introduced or widened | today's add-property path for those properties |
+| Add a node type that implements an interface | supported | a new table; no result schema changes |
+| Add a nullable interface property | supported (already on main) | metadata-only `AddProperty` on every inheriting member, in one publication; a member that already declares it identically gains a link |
+| Add a required interface property | refused (OG-MF-103) | metadata only when every member already declares it identically, or there are no members |
+| Rename an interface property (`@rename_from`) | supported (already on main) | `RenameProperty` on each member; a member that redeclares it needs its own matching `@rename_from` in the same migration |
+| Widen an interface property's enum | supported (already on main) | `ExtendEnum` on each member |
+| Remove an interface property | destructive, per member, each named in the plan | the column leaves every inheriting member's table; members that redeclare it keep theirs; refused while a stored query reads it through the interface |
+| Other interface property type or nullability change | refused (OG-MF-106) until phase 4 | |
 | Generalize an endpoint from `C` to an interface or union containing `C` | supported, keyed and unkeyed edges alike | none; existing rows already carry `C` in their packed endpoints |
 | Remove `implements`, remove an interface, narrow an endpoint | validated (the OG-MF-104 tier) | refused while any row's endpoint names a removed member, or a registered stored query depends on it |
+| Reuse a name released by a rename or drop, as a different kind, in the same apply | refused | "interface 'Event' reuses the name node 'Event' gave up in this migration; apply the rename first" |
 | Fold an edge family into one polymorphic edge | explicit copy | rows of the named source edge types are copied into the new edge; the sources are tombstoned |
 
 Schema apply keeps its main-only, single-live-branch restriction and its one
 manifest publication. Every step above fits that publication.
 
+A stored query ***depends on*** member `M` of `I` when it fails to typecheck
+against the desired catalog: type tests, rebindings and `@type`/`@type_id`
+literals naming a non-member are type errors. A parameterised type has no
+static dependency and is refused at run time. Mentioning `I` alone is not a
+dependency, so one view over an interface never blocks removing `implements`
+from a member. The data dependency is any row whose endpoint names `M`.
+Cluster apply preflight already typechecks the desired queries against the
+desired catalog, so a query and the schema can change in one apply; a
+standalone apply has no registry, so served startup refuses instead. The
+registry also records, per stored query, each binding name's kind and
+`StableTypeId` and the result descriptor, and refuses when a name later
+resolves to a different kind or id or the descriptor changes. A fork that
+renames `node Event` and later adds `interface Event` therefore cannot silently
+widen an old `$e: Event` view.
+
 ### Wire, API and descriptor
 
-- Read results gain a `@type` column only where a query projects it. Abstract
-  bindings encode as ordinary flat columns. Arrow-json has no `Union` encoder,
-  and the descriptor refuses `Union`, so no result uses one.
+- Read results gain `@type` and `@type_id` columns only where a query projects
+  them. Abstract bindings encode as ordinary flat columns. Arrow-json has no
+  `Union` encoder, and the descriptor refuses `Union`, so no result uses one.
+- Every read response carries the schema hash (`schema_ir_hash`) as a field and
+  a header, so a client knows which catalog a type name belongs to. Today a read
+  carries only `graph_commit_id`, and no route exposes a type id or schema hash.
 - `ChangeEndpointsOutput`, export lines and load envelopes gain optional
   `from_type`/`to_type`, present only for polymorphic endpoints.
-- A structured, read-gated catalog route lists node types, interfaces with
-  their members, and edges with expanded endpoint sets. Clients stop
-  re-deriving implementor sets from `.pg` text. OpenAPI parity tests force
-  each consumer to classify it.
-- Type-name filters on the change feed and export accept an interface name.
-  They expand it to members when the cursor is created and record the
-  expansion in the cursor.
+- A structured, read-gated catalog route returns what a generic shell needs to
+  show views and build create and edit forms. Today only `/schema` returns
+  schema information, as raw `.pg` text. The route returns:
+  - per type: `type_id` (decimal string), kind, implemented interfaces
+    (closure), and type-level `@description`/`@instruction`;
+  - per property: name, scalar kind, list, vector dimension, nullability, enum
+    values, annotations, and whether a form must not ask for it (`@embed` or
+    generated);
+  - `@key` and `@unique` tuples;
+  - per interface: properties, inherited interfaces and current members;
+  - per edge: cardinality, properties and expanded endpoint sets;
+  - top level: `schema_identity_domain` and the schema hash, also sent as an
+    `ETag`.
+
+  Clients stop re-deriving implementor sets from `.pg` text. OpenAPI parity
+  tests force each consumer to classify it.
+- Type-name filters on the change feed and export accept an interface name. It
+  is kept as written and expanded per commit, against that commit's accepted
+  catalog, as main already matches type names per commit interval. When a
+  polled commit changes the member set of a filtered interface, the poll ends
+  with a typed `ChangeScopeMembershipChanged` refusal carrying the added and
+  removed members and a cursor positioned before that commit; the client
+  re-baselines. Adding `implements` writes no rows, so a feed cannot report
+  the new member's existing rows as changes. Expanding once at cursor creation
+  would freeze membership, and a live view would miss a member added later.
 - The operation descriptor lists every member type in `reads` and `writes`.
 
 ### Policy
@@ -527,8 +646,21 @@ read of the same graph on the same branch, and an interface-wide mutation is a
 `change`, so nothing changes. When per-type rules arrive (the planned
 `predicate_for`), the planner expands each abstract binding to concrete types
 before evaluating policy. `implements` never confers a permission, because a
-`schema_apply` holder could otherwise widen read access. A traversal treats an
-endpoint whose type is denied as filtered, never as a dangling reference.
+`schema_apply` holder could otherwise widen read access.
+
+A denied member never silently thins a result:
+- A read whose binding or traversal destination includes a member the actor
+  may not read is refused with a typed `policy_denied_member` error, unless the
+  query removes that member (a type test, a rebinding, or type pruning).
+- An interface-wide mutation with a denied arm is refused before staging,
+  never partly applied.
+- Row-level predicates inside an allowed type may filter. The response then
+  carries `policy_filtered: true`, with no counts, so a view can say its
+  results are partial.
+
+Filtering a denied arm instead would make `count` and a view's completeness
+wrong with no signal. A denied endpoint is never rendered as a dangling
+reference.
 
 ## Invariants
 
@@ -547,8 +679,9 @@ endpoint whose type is denied as filtered, never as a dangling reference.
   interface projection change cost, never membership or results.
 - **8, loud integrity failures.** Ambiguous direction, an unknown or
   non-member endpoint type, an untyped polymorphic endpoint, cross-member
-  cardinality violations and an untyped expansion over a polymorphic edge are
-  typed refusals.
+  cardinality violations, an untyped expansion over a polymorphic edge, a
+  non-member type in an interface-wide mutation, a policy-denied member and a
+  feed membership change are typed refusals. No result is silently partial.
 - **9, typed semantics.** Type sets, selections, type tests and pruning live
   in AST, IR and plan structures. Type filters are structured predicates.
 - **11, bounded resources.** Union arms run within the query's memory and
@@ -592,6 +725,10 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 | Concrete supertypes (`node Employee extends Person`) | Raises key-scope and reclassification questions. Knowledge graphs model this by composition. Deferred. |
 | Named unions as a declaration kind | Marker interfaces cover reuse. Inline unions cover closed endpoint sets. Deferred. |
 | Resolve untyped polymorphic endpoints by probing every member table | Hides an N-table cost in every write, and turns colliding keys into errors at write time. Typed endpoints are the default, and probing is an unresolved question. |
+| Join a union's property types over its concrete closure | Matches the alternation rule literally, but adding an implementor to an interface inside a union could change a stored query's result schema. Joining declared member types keeps result schemas independent of membership. |
+| Filter a policy-denied member's rows | Simple, but makes `count` and a view's completeness silently wrong. Refusing unless the query removes the member keeps results whole. |
+| Expand an interface feed filter once, when the cursor is created | Needs no new refusal, but freezes membership: a live view misses every member added later. |
+| Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion over N arms keyed by packed reference is plausible later; today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. |
 
 Prior art. Gel (EdgeDB) keeps a table per concrete type and compiles abstract
 reads to a per-query `UNION ALL`, with `__type__` as a per-table constant.
@@ -670,6 +807,48 @@ What the prototype found, and where each landed:
 With the prototype's changes, the existing suites still passed: 465 compiler
 tests, the planner suites, 706 engine tests, and all 275 GQT cases.
 
+The prototype was then merged with main at `80b3cfeb` (now at `00bee952`,
+findings also in `UI_BINDING_FINDINGS.md`). On the merged build: 471 compiler
+tests, the planner suites (115), 468 engine library tests, 573 engine
+integration tests (with CI's `RUST_MIN_STACK`), and all 333 GQT cases pass,
+two after a rerun at a 10-second timeout under machine load. The merged build
+still uses string identity; its union-scan findings below do not depend on the
+identity representation.
+
+### UI components bound to interfaces
+
+A second review tested the design against a consumer it was not drawn around:
+forkable templates whose components (calendar, kanban, timeline, inbox) bind to
+stored queries over interfaces, read the catalog route, edit through
+interface-wide `update`, and identify rows by type and address. Twelve probes
+ran against the prototype, before and after the merge with main; claims about
+code were spot-checked on `origin/main`.
+
+| # | Question | Finding | Where it lives now |
+|---|---|---|---|
+| 1 | Result typing | Members must match the interface type exactly, so interface columns are stable; union joins over the concrete closure would not be. A redeclared key property silently loses `@key`. | Declared-type rule under Queries; inherited-key refusal under Schema. |
+| 2 | Interface-property migrations | Main already fans out add, drop, rename and enum widening to every member; the table covered none. | Migration table. |
+| 3 | Stable type identity | Renames keep `StableTypeId`, but nothing exposed it or a schema hash. | `@type_id`, schema hash, catalog route. |
+| 4 | Order, limit, paging | Correct while the union is a leaf; on main every ordered, limited interface query failed in `HydrateColumns`. No paging surface. | Per-arm late materialization; packed-reference tie-break; paging deferred. |
+| 5 | Type filters and counts | `@type = "Task"` was pushed into member scans and failed; a bare `count` failed. | Per-arm folding; pruning after parameter binding; member-wise counts. |
+| 6 | Indexes per arm | On main the plan records `sequential` for every arm. | Per-arm access, shown in explain. |
+| 7 | Search | `search`/`fuzzy`/`match_text` are membership filters, refused needlessly. | Refusal narrowed to `bm25`. |
+| 8 | Wide interfaces | 75 members: about 10× a single-type lookup locally; the 64-entry handle cache reopened 55 to 61 tables per warm query. | Concurrent arms; cache sized to the catalog; threshold below. |
+| 9 | Component writes | Zero-match members stage nothing, but every member was opened. | Arm pruning after parameter binding. |
+| 10 | Catalog route | Too thin for a create form; no schema version. | Field list and `ETag`. |
+| 11 | Live views | Expanding at cursor creation freezes membership. | Per-commit expansion and membership refusal. |
+| 12 | Remove-`implements` dependency | "Depends" was undefined. | Typecheck-based rule and registry pinning. |
+| 13 | Per-type policy | A denied member was silently filtered. | Refusal unless narrowed. |
+| 14 | Shared core name collision | `interface Event` and `node Event` coexist on main; reusing a renamed name changes stored queries silently. | One namespace; same-apply reuse refused; registry pinning. |
+
+Packed references dissolve none of these: they concern typing, planning,
+catalog and lifecycle contracts, not stored identity. Local measurements for
+the wide case (75 members, local disk): an Entity-wide keyed lookup took 38 to
+47 ms cold and 28 to 37 ms warm with arms run one after another, and 25 to
+28 ms cold and 20 to 23 ms warm with 16 concurrent arms, against about 3 ms cold
+and 2 ms warm for one type. The S3 figure in the acceptance threshold is a
+target, not a measurement.
+
 ### Tests to extend
 
 Following [the test map](../dev/testing.md), these existing owners are
@@ -699,15 +878,29 @@ extended:
     A pre-phase-3 binary refuses `interface-unique`, including empty interfaces.
   - Generalizing a keyed edge keeps every existing row matchable by its key.
   - Plan-replay tests: every member pin.
+  - No table key of an abstract type reaches `open_lance_dataset`, across the
+    pipelined read, late materialization, scan access, metadata count and
+    contains join.
+  - An ordered, limited interface query returning vector and struct columns.
+  - Adding an implementor leaves every stored query's result descriptor
+    unchanged; redeclaring an inherited `@key` without it is refused.
+  - Type filters prune arms after parameter binding; a non-member type in an
+    interface-wide mutation is refused; zero-match arms stage nothing.
 - **GQT:** cases that mirror the issue-659 suite. They cover union scans,
   narrowing, projected type-test true/false values without row loss, negated
   tests and disjunctions accepted by the other operand, `@type` ordering with
   colliding keys, mixed-type
   recursion, empty interfaces, historical refusal, `bm25` refusal and
   forced-CSR refusal before phase 3, on the local filesystem and on
-  deterministic object storage.
+  deterministic object storage. One case projects and filters both `@type`
+  and `@type_id`, renames a member, and checks that the name changes while the
+  stable id does not, both while the interface has one member and after it
+  grows to two.
 - **DST:** concurrent writes to a polymorphic edge with cascades.
 - **Reference engine:** refuses the new IR.
+- **Server:** catalog-route fields and `ETag`; schema hash on reads; feed
+  `ChangeScopeMembershipChanged`; `policy_denied_member` once per-type rules
+  exist.
 - **Tower:** catalog-route parity and grammar capability gating.
 
 Acceptance thresholds:
@@ -720,6 +913,8 @@ Acceptance thresholds:
   refusal, as the alternation suite does.
 - Generalizing an endpoint on a table of one million edges touches no data
   file.
+- A keyed lookup on a 75-member interface on S3 completes within 2× a single
+  keyed lookup when warm, and opens no table twice.
 
 ### Defects found during the investigation
 
@@ -730,6 +925,11 @@ Acceptance thresholds:
 - Tower's insert-edge key pre-check finds the edge by `(name, from, to)`. For
   a polymorphic edge it would skip the check, and a keyed insert would upsert.
   Tower changes this before it enables polymorphic edges.
+- A node that redeclares an inherited key property silently loses the
+  interface's `@key` today, so the same slug loads as two rows. Phase 0
+  refuses it.
+- `interface Event` and `node Event` can coexist today; the node wins name
+  resolution.
 
 ## Rollout
 
@@ -739,22 +939,28 @@ graph.
 
 1. **Phase 0, groundwork.**
    - Validate interface properties at declaration.
-   - Warn when a redeclaration drops an interface constraint.
-   - Refuse new interface and node name collisions; support interface rename.
+   - Refuse a redeclaration that drops an inherited `@key` or `@unique`; warn
+     on other dropped annotations.
+   - Refuse new interface and node name collisions and same-apply name reuse
+     across kinds; support interface rename.
    - Allow metadata-only `implements` additions, subject to schema validation
      once interface-wide constraints exist.
    - Make the three lowering sites handle type sets.
 2. **Phase 1, abstract bindings.**
-   - Query surface: interface and union bindings, `@type`, type tests and
-     narrowing.
-   - Execution: union scans, interface-wide `nearest`, and interface-wide
-     `update`/`delete`.
-   - Interface inheritance behind `interface-inheritance`, and the catalog
-     route.
+   - Query surface: interface and union bindings, `@type`, `@type_id`, type
+     tests and narrowing.
+   - Execution: the union-scan node with per-arm resolution, covering every
+     single-table consumer; pruning after parameter binding; concurrent arms
+     and a handle cache sized to the catalog; interface-wide `nearest`, and
+     interface-wide `update`/`delete`.
+   - Interface inheritance behind `interface-inheritance`; the catalog route
+     with its full field list; the schema hash on reads; stored-query pinning
+     of binding kinds and ids.
 3. **Phase 2, polymorphic edges.**
    - Endpoint declarations behind `polymorphic-endpoints`.
    - Typed endpoint writes, validation, cascade, loads, export and
-     change-feed endpoint types.
+     change-feed endpoint types; per-commit expansion of interface filters with
+     the membership refusal.
    - Budgeted indexed traversal.
    - Generalization changes schema metadata only. Folding stages copied rows
      and source-table retirement, then publishes them together.
@@ -794,6 +1000,14 @@ required to admit phases 1 and 2.
 - **Interface-named policy rules.** Should they exist under per-type
   authorization, compiled to the current member set and re-checked on every
   schema apply?
+- **Paging surface.** An opaque cursor on stored-query invocation, carrying the
+  snapshot and the last row's order tuple, or GQ syntax such as
+  `after $cursor`? Either needs the total order and a `limit` that can be a
+  parameter.
+- **Feed membership changes.** Refuse with `ChangeScopeMembershipChanged`, as
+  specified, or report membership events inline in the feed?
+- **Removing an interface property.** One step that drops a column from N
+  tables, or a plan that must list each member explicitly?
 
 ## Decision log
 
@@ -814,3 +1028,14 @@ endpoint generalization is metadata-only even for keyed edges. Folding still
 copies rows. Type tests retain Boolean expression semantics. Interface-wide
 uniqueness ships with its own feature fence and schema-admission validation;
 export/load preserves the identity RFC's logical-key contract across graphs.
+
+2026-10-12: added the contracts from a review against interface-bound UI
+components, which packed references do not cover: declared-type result
+schemas, `@type_id` as an expression separate from `@type` over the packed
+type half, a union-scan node resolved per arm (every single-table shortcut
+broke on main), pruning after parameter binding for reads and interface-wide
+mutations, the catalog route's fields and schema hash, per-commit feed
+expansion with a membership refusal, refusal of policy-denied members,
+interface-property migration rows, the inherited-key refusal, one namespace
+with stored-query pinning, and concurrent arms with a handle cache sized to the
+catalog.
