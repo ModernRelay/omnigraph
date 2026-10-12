@@ -41,6 +41,7 @@ pub(super) async fn index_split(source: &QuerySource<'_>, spec: &ScanSpec) -> Re
     let read = NodeRead::for_index_split(
         dataset.clone(),
         type_name,
+        source.snapshot.contract_covers(&spec.table.type_key),
         &filters,
         source.params.shared(),
         source.catalog,

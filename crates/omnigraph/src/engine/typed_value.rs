@@ -7,6 +7,11 @@ use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::ir::IRParam;
 use omnigraph_compiler::types::ExprType;
 
+use crate::error::{
+    missing_graph_property_at_snapshot, renamed_graph_property_at_snapshot,
+    unwitnessed_graph_property_at_snapshot,
+};
+
 /// Fill omitted nullable declarations and refuse omitted required ones.
 /// Bound values, including the invocation's sampled clock, stay unchanged.
 pub(crate) fn fill_declared_params(params: &mut ParamMap, declared: &[IRParam]) -> Result<()> {
@@ -380,33 +385,33 @@ pub(super) fn check_output_schema(actual: &Schema, declared: &Schema, hidden: bo
 
 /// Check the schema of the dataset that was actually opened at the pinned
 /// version, for every consumed physical column. A historical dataset may omit
-/// unrelated newer declarations. Consumed fields must match type and nullability.
+/// unrelated newer declarations. Consumed fields must match type and nullability,
+/// and a consumed property must be the declared property lifetime
+/// ([`stored_field`]); `contract_covers` is the view's
+/// `Snapshot::contract_covers` for `table`.
 pub(super) fn check_stored_schema<'a>(
     dataset: &Dataset,
     declared: &Schema,
     table: &str,
+    contract_covers: bool,
     consumed: impl IntoIterator<Item = &'a str>,
 ) -> Result<()> {
     let stored = Schema::from(dataset.schema());
-    check_stored_fields(&stored, declared, table, consumed)
+    check_stored_fields(&stored, declared, table, contract_covers, consumed)
 }
 
 fn check_stored_fields<'a>(
     stored: &Schema,
     declared: &Schema,
     table: &str,
+    contract_covers: bool,
     consumed: impl IntoIterator<Item = &'a str>,
 ) -> Result<()> {
     for name in consumed {
         let expected = declared.field_with_name(name).map_err(|_| {
             OmniError::manifest_internal(format!("consumed {table}.{name} has no declared field"))
         })?;
-        let actual = stored.field_with_name(expected.name()).map_err(|_| {
-            OmniError::manifest_internal(format!(
-                "stored {table} has no declared field '{}'",
-                expected.name()
-            ))
-        })?;
+        let actual = stored_field(stored, expected, table, contract_covers)?;
         if actual.data_type() != expected.data_type()
             || actual.is_nullable() != expected.is_nullable()
         {
@@ -423,9 +428,72 @@ fn check_stored_fields<'a>(
     Ok(())
 }
 
+/// The stored field a declared column reads in the opened table version.
+///
+/// A property is its persisted stable property id, never its name. Where the
+/// accepted contract was published with the opened version, its names name
+/// that version's columns, and a column that is not the declared lifetime is
+/// an integrity failure. A historical version is read under the current
+/// contract, so the column of the declared name may be a dropped property's
+/// (a same-name re-add) and the declared property may sit under an earlier
+/// name (a rename since) or nowhere (an addition since): each refuses like a
+/// type absent at the snapshot. A column written before 0.10 carries no id
+/// and proves no lifetime, so a historical version refuses it, as Blob reads
+/// do. System columns carry no id and resolve by name.
+fn stored_field<'s>(
+    stored: &'s Schema,
+    expected: &Field,
+    table: &str,
+    contract_covers: bool,
+) -> Result<&'s Field> {
+    let name = expected.name();
+    let internal =
+        || OmniError::manifest_internal(format!("stored {table} has no declared field '{name}'"));
+    let Some(declared_id) = expected
+        .metadata()
+        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+    else {
+        return stored.field_with_name(name).map_err(|_| internal());
+    };
+    if let Ok(actual) = stored.field_with_name(name) {
+        match actual
+            .metadata()
+            .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+        {
+            Some(stored_id) if stored_id == declared_id => return Ok(actual),
+            None if contract_covers => return Ok(actual),
+            None => {
+                return Err(OmniError::manifest(unwitnessed_graph_property_at_snapshot(
+                    table, name,
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    if contract_covers {
+        return Err(internal());
+    }
+    let renamed = stored.fields().iter().find(|field| {
+        field
+            .metadata()
+            .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+            == Some(declared_id)
+    });
+    Err(OmniError::manifest(match renamed {
+        Some(field) => renamed_graph_property_at_snapshot(table, name, field.name()),
+        None => missing_graph_property_at_snapshot(table, name),
+    }))
+}
+
 /// A pushed filter consumes physical columns directly, so validate its stored
 /// leaf declarations against the opened dataset before pushdown can hide them.
-pub(super) fn check_scan_leaves(dataset: &Dataset, filters: &[IRExpr]) -> Result<()> {
+pub(super) fn check_scan_leaves(
+    dataset: &Dataset,
+    declared: &Schema,
+    table: &str,
+    contract_covers: bool,
+    filters: &[IRExpr],
+) -> Result<()> {
     let stored = Schema::from(dataset.schema());
     for filter in filters {
         let mut result = Ok(());
@@ -437,9 +505,10 @@ pub(super) fn check_scan_leaves(dataset: &Dataset, filters: &[IRExpr]) -> Result
                 return;
             };
             result = (|| {
-                let actual = stored
+                let expected = declared
                     .field_with_name(property)
                     .map_err(OmniError::arrow_internal)?;
+                let actual = stored_field(&stored, expected, table, contract_covers)?;
                 let ExprType::Value { nullable, .. } = ty else {
                     return Err(OmniError::manifest_internal(
                         "pushed property carries a node type",
@@ -839,6 +908,7 @@ pub(super) fn validate_plan_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ManifestErrorKind;
     use omnigraph_compiler::query::ast::Param;
     use omnigraph_compiler::types::PropType;
 
@@ -1019,12 +1089,82 @@ mod tests {
             Field::new("title", DataType::Utf8, false),
             Field::new("legacy", DataType::Utf8, false),
         ]);
-        assert!(check_stored_fields(&stored, &declared, "node:Doc", ["title"]).is_ok());
+        assert!(check_stored_fields(&stored, &declared, "node:Doc", false, ["title"]).is_ok());
         for consumed in ["rating", "legacy", "unknown"] {
-            assert!(check_stored_fields(&stored, &declared, "node:Doc", [consumed]).is_err());
+            assert!(
+                check_stored_fields(&stored, &declared, "node:Doc", false, [consumed]).is_err()
+            );
         }
         let widened = Schema::new(vec![Field::new("title", DataType::Utf8, true)]);
-        assert!(check_stored_fields(&widened, &declared, "node:Doc", ["title"]).is_err());
+        assert!(check_stored_fields(&widened, &declared, "node:Doc", false, ["title"]).is_err());
+    }
+
+    /// A property resolves by its stable property id. A version the accepted
+    /// contract was published with must hold every declared lifetime under its
+    /// name; a historical version may not, and refuses each mismatch typed.
+    #[test]
+    fn historical_schema_binds_properties_by_stable_property_id() {
+        let marked = |name: &str, id: Option<&str>| {
+            let field = Field::new(name, DataType::Utf8, true);
+            match id {
+                Some(id) => field.with_metadata(HashMap::from([(
+                    crate::db::STABLE_PROPERTY_ID_METADATA_KEY.to_string(),
+                    id.to_string(),
+                )])),
+                None => field,
+            }
+        };
+        let declared = Schema::new(vec![
+            Field::new("__id", DataType::Utf8, false),
+            marked("title", Some("1")),
+            marked("note", Some("7")),
+            marked("remark", Some("5")),
+            marked("age", Some("9")),
+        ]);
+        let stored = Schema::new(vec![
+            Field::new("__id", DataType::Utf8, false),
+            marked("title", Some("1")),
+            marked("note", Some("3")),
+            marked("memo", Some("5")),
+        ]);
+        let check = |stored: &Schema, covers: bool, column: &str| {
+            check_stored_fields(stored, &declared, "node:Doc", covers, [column])
+        };
+        let refusal = |stored: &Schema, column: &str| match check(stored, false, column) {
+            Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::BadRequest => {
+                error.message
+            }
+            other => panic!("historical {column} must refuse as BadRequest; got {other:?}"),
+        };
+        for covers in [true, false] {
+            assert!(check(&stored, covers, "__id").is_ok());
+            assert!(check(&stored, covers, "title").is_ok());
+        }
+        assert_eq!(
+            refusal(&stored, "note"),
+            "property 'note' of node type 'Doc' does not exist at this snapshot"
+        );
+        assert_eq!(
+            refusal(&stored, "remark"),
+            "property 'remark' of node type 'Doc' is named 'memo' at this snapshot; a historical query cannot read a property across a rename"
+        );
+        assert_eq!(
+            refusal(&stored, "age"),
+            "property 'age' of node type 'Doc' does not exist at this snapshot"
+        );
+        for column in ["note", "remark", "age"] {
+            assert!(matches!(
+                check(&stored, true, column),
+                Err(OmniError::Manifest(ref error)) if error.kind == ManifestErrorKind::Internal
+            ));
+        }
+
+        let unmarked = Schema::new(vec![marked("note", None)]);
+        assert!(check(&unmarked, true, "note").is_ok());
+        assert_eq!(
+            refusal(&unmarked, "note"),
+            "property 'note' of node type 'Doc' has no persisted property-lifetime witness at this snapshot"
+        );
     }
 
     #[test]
@@ -1032,9 +1172,14 @@ mod tests {
         let declared = Schema::new(vec![Field::new("amount", DataType::Int32, false)]);
         let widened = Schema::new(vec![Field::new("amount", DataType::Int32, true)]);
         let changed = Schema::new(vec![Field::new("amount", DataType::Int64, false)]);
-        assert!(check_stored_fields(&declared, &declared, "node:Account", ["amount"]).is_ok());
-        assert!(check_stored_fields(&widened, &declared, "node:Account", ["amount"]).is_err());
-        assert!(check_stored_fields(&changed, &declared, "node:Account", ["amount"]).is_err());
+        for covers in [true, false] {
+            let check = |stored: &Schema| {
+                check_stored_fields(stored, &declared, "node:Account", covers, ["amount"])
+            };
+            assert!(check(&declared).is_ok());
+            assert!(check(&widened).is_err());
+            assert!(check(&changed).is_err());
+        }
         assert!(check_output_schema(&widened, &declared, false).is_ok());
         assert!(check_output_schema(&changed, &declared, false).is_err());
         let nulls: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None]));

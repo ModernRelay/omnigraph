@@ -124,6 +124,38 @@ pub fn missing_graph_type_at_snapshot(table_key: &str) -> String {
     )
 }
 
+/// The current property's lifetime is not in the table version a historical
+/// read pins: it was added since, or the column of that name there belongs to
+/// a dropped property.
+pub fn missing_graph_property_at_snapshot(table_key: &str, property: &str) -> String {
+    format!(
+        "property '{property}' of {} does not exist at this snapshot",
+        graph_type_subject(table_key)
+    )
+}
+
+/// The current property's lifetime is in the pinned table version under the
+/// name it had before a rename.
+pub fn renamed_graph_property_at_snapshot(
+    table_key: &str,
+    property: &str,
+    stored_name: &str,
+) -> String {
+    format!(
+        "property '{property}' of {} is named '{stored_name}' at this snapshot; a historical query cannot read a property across a rename",
+        graph_type_subject(table_key)
+    )
+}
+
+/// The pinned table version stores the column without a stable property id,
+/// so it cannot show which property lifetime the column belongs to.
+pub fn unwitnessed_graph_property_at_snapshot(table_key: &str, property: &str) -> String {
+    format!(
+        "property '{property}' of {} has no persisted property-lifetime witness at this snapshot",
+        graph_type_subject(table_key)
+    )
+}
+
 fn format_key_conflict(type_key: &str) -> String {
     format!("{} already has this id", graph_type_subject(type_key))
 }
