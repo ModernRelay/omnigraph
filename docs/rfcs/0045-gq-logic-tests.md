@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-28
+updated: 2026-10-12
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -600,6 +600,18 @@ in Seams at an explicit step. A step is one of:
   there is no row expect on a mutate step.
 - `--- restart`, body empty: drop the store handle and reopen it from the
   same URI before the next step.
+- `--- diff`, `--- merge-base` and `--- merge-dry-run`, body empty: the graph
+  diff surfaces of RFC 0030 §8, which are not GQ statements. `--- diff`
+  names its sides as `from: <side> to: <side>`, as `source: <branch>` with an
+  optional `target: <branch>` (`main` when absent), or as `commit: <side>`,
+  where a side is a branch name or a bound `$name`; it follows every page and
+  takes `ordered` or `unordered` rows, one JSON object per change in the wire
+  shape with `type` spelled as the type's name and compared whatever its key
+  order, or `error: <substring>`. `--- merge-base source: <branch>
+  [target: <branch>]` takes `commit $name`, the bound commit the base must be,
+  or `error: <substring>`. `--- merge-dry-run source: <branch>
+  [target: <branch>]` takes the `branch merge` expects (`ok`, `outcome:`,
+  `error:`) and fails if the dry run reports a commit.
 - A settings step (a `--- mutate` whose body is a `set ...;` statement) and a
   show step (a `--- query` whose body is `show ...;`) take no `via`: their
   headers stay bare, a `via` on them is refused with the grammar, they
@@ -2662,3 +2674,11 @@ historical command and configuration descriptions are not migration aliases.
   `order_key_aggregate_or_node_binds_to_return_item.gqt` (§Evidence and
   tests) and `engine_v1_refuses_compound_predicates.gqt` to
   `compound_and_bare_boolean_filters.gqt`.
+- 2026-10-12, graph diff steps: `--- diff`, `--- merge-base` and
+  `--- merge-dry-run` join the step kinds (§File format) for the surfaces of
+  RFC 0030 §8, with the `expect commit $name` mode for a merge base. A
+  `--- query` step cannot hold them: its rows answer a GQ statement under a
+  typed result schema, and a diff is paged change records that RFC 0030 keeps
+  out of GQ. The engine and DST targets call the engine, and the served target
+  sends the HTTP routes, so one case pins all three. Additive: no earlier
+  sentence is superseded.

@@ -1,0 +1,128 @@
+# issue: none
+# notes: A graph diff compares its endpoints and never folds history (RFC 0030 §8.2): a reverted update,
+# notes: an insert later deleted and an equal reinsert produce nothing; a changed reinsert is one update;
+# notes: an insert later updated is one insert with the final image. A commit's own diff is its change.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"hank","age":40}}
+{"type":"Person","data":{"name":"ivan","age":20}}
+
+--- mutate
+query mark() {
+    insert Person { name: "start", age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $start
+
+--- mutate
+query alice_ages() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query alice_reverts() {
+    update Person set { age: 30 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query gina_arrives() {
+    insert Person { name: "gina", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query gina_leaves() {
+    delete Person where name = "gina"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query hank_leaves() {
+    delete Person where name = "hank"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query hank_returns() {
+    insert Person { name: "hank", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ivan_leaves() {
+    delete Person where name = "ivan"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ivan_returns_older() {
+    insert Person { name: "ivan", age: 21 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query jill_arrives() {
+    insert Person { name: "jill", age: 18 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query jill_ages() {
+    update Person set { age: 19 } where name = "jill"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $last
+
+--- diff from: $start to: main
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"ivan","op":"update","before":{"properties":{"name":"ivan","age":20}},"after":{"properties":{"name":"ivan","age":21}}}
+{"kind":"node","type":"Person","id":"jill","op":"insert","after":{"properties":{"name":"jill","age":19}}}
+
+--- diff commit: $last
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"jill","op":"update","before":{"properties":{"name":"jill","age":18}},"after":{"properties":{"name":"jill","age":19}}}
+
+--- diff from: main to: $start
+
+--- expect unordered
+{"kind":"node","type":"Person","id":"jill","op":"delete","before":{"properties":{"name":"jill","age":19}}}
+{"kind":"node","type":"Person","id":"ivan","op":"update","before":{"properties":{"name":"ivan","age":21}},"after":{"properties":{"name":"ivan","age":20}}}
+
+--- diff from: main to: main
+
+--- expect ordered

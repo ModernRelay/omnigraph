@@ -1,0 +1,72 @@
+# issue: none
+# notes: Graph diff refusals (RFC 0030 §8): a side naming nothing is a typed not-found, a merge dry run
+# notes: answers a conflicting merge's own conflict list and writes nothing, and a missing branch has no
+# notes: merge base.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- diff from: main to: nowhere
+
+--- expect error: 'nowhere' names no branch and no commit
+
+--- merge-base source: nowhere
+
+--- expect error: not found
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query feature_bob() {
+    update Person set { age: 41 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query main_bob() {
+    update Person set { age: 42 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- merge-dry-run source: feature
+
+--- expect error: merge conflicts
+
+--- query
+query bob_on_main() {
+    match { $p: Person { name: "bob" } }
+    return { $p.age }
+}
+
+--- expect unordered
+{"p.age": 42}
+
+--- expect shape
+p.age: I32
+
+--- mutate
+branch merge feature into main
+
+--- expect error: merge conflicts

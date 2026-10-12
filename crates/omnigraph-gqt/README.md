@@ -130,6 +130,22 @@ inherits its base's recorded target. A name is bound once, before every use,
 outside a loop, and survives `--- restart`; the served path binds from the
 `ChangeOutput.commit` the route answered and sends `snapshot` on the read.
 
+Three steps cover the graph diff surfaces (RFC 0030 §8). A `--- diff` step
+names its sides as `from: <side> to: <side>` (a two-point diff),
+`source: <branch>` with an optional `target: <branch>` (a branch diff against
+the merge base; `main` when unspelled), or `commit: <side>` (one commit's own
+changes, `commit changes`). A side is a branch name or a bound `$name`. Its
+expect is `ordered` or `unordered` rows, one JSON object per change in the
+wire shape with `type` spelled as the type's name, or `error:`. Rows compare
+as JSON whatever their key order; the step follows every page.
+`--- merge-base source: <branch> [target: <branch>]` expects
+`--- expect commit $name`, the bound commit the merge base must be, or `error:`.
+`--- merge-dry-run source: <branch> [target: <branch>]` takes a merge's own
+`outcome:` and `error:` expects and fails if the dry run reports a commit. The
+engine and DST paths call the engine; the served path sends `GET /diff`,
+`GET /branches/diff`, `GET /commits/{id}/changes`, `GET /branches/merge-base`
+and `POST /branches/merge` with `dry_run: true`.
+
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;

@@ -44,9 +44,10 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
-| `branch create/list/delete/merge` | Manage graph branches; `merge --as-commit` leaves the merge unpublished | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
+| `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
@@ -169,8 +170,7 @@ and one request to 300 seconds; uncertain writes are never automatically
 retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
 permissions, ordinary addressing, and reconciliation.
 
-Change-feed commands, cursor checkpointing, and baseline recovery are described
-in [Changes and Change Feeds](../branching/changes.md).
+Diffs, branch review and change feeds: [Changes, Diffs and Change Feeds](../branching/changes.md).
 
 ## Blob commands
 

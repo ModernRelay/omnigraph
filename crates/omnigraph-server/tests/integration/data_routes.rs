@@ -1989,6 +1989,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (status, body) = json_response(
@@ -3485,6 +3486,7 @@ async fn branch_merge_statement_conflict_matches_the_route_409() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (route_status, route_body) = json_response(
@@ -5225,6 +5227,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -5378,6 +5381,7 @@ async fn branch_merge_delete_branch_retires_parent_with_live_child() {
         target: Some("main".to_string()),
         delete_branch: true,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -5438,6 +5442,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
         target: Some("feature".to_string()),
         delete_branch: true,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -6763,6 +6768,230 @@ async fn mutate_graph_commit_precondition_issue_365() {
         StatusCode::OK,
         "fresh branch must accept its read token on the first write: {body}"
     );
+}
+
+// ─── Graph diff routes ──────────────────────────────────────────────────────
+
+/// One `insert_person` through `POST /mutate` on `branch`.
+async fn insert_person_on(app: &axum::Router, branch: &str, name: &str) {
+    let (status, body) = json_response(
+        app,
+        json_post(
+            "/mutate",
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "insert_person",
+                "params": {"name": name, "age": 30},
+                "branch": branch
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn change_ids(page: &Value) -> Vec<(String, String)> {
+    page["changes"]
+        .as_array()
+        .expect("a diff page lists its changes")
+        .iter()
+        .map(|change| {
+            (
+                change["id"].as_str().unwrap().to_string(),
+                change["op"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_routes_review_a_branch_against_its_merge_base() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let fork = main_head_commit_id(&app).await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    insert_person_on(&app, "feature", "Second").await;
+    insert_person_on(&app, "main", "MainOnly").await;
+
+    let (status, base) = get_json(&app, g("/branches/merge-base?source=feature")).await;
+    assert_eq!(status, StatusCode::OK, "{base}");
+    assert_eq!(base["source"], "feature");
+    assert_eq!(base["target"], "main");
+    assert_eq!(base["merge_base"]["graph_commit_id"], fork.as_str());
+
+    // The branch form pages like any change surface; every page names the
+    // base and the source head it resolved first.
+    let (status, first) = get_json(&app, g("/branches/diff?source=feature&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["base_commit_id"], fork.as_str());
+    assert_eq!(first["from_commit_id"], fork.as_str());
+    assert_eq!(first["to_commit_id"], base["source_commit_id"]);
+    assert!(first.get("cause").is_none(), "a diff carries no cause");
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("two changes, pages of one");
+    insert_person_on(&app, "feature", "Late").await;
+    let (status, second) = get_json(
+        &app,
+        g(&format!(
+            "/branches/diff?source=feature&target=main&limit=1&page_token={token}"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["to_commit_id"], first["to_commit_id"]);
+    let mut reviewed = change_ids(&first);
+    reviewed.extend(change_ids(&second));
+    assert!(second["next_page_token"].is_null());
+    assert_eq!(
+        reviewed,
+        vec![
+            ("Featured".to_string(), "insert".to_string()),
+            ("Second".to_string(), "insert".to_string()),
+        ]
+    );
+
+    // The two-point form compares the heads, so main's own insert reads as a
+    // delete; a commit id names a side as well as a branch does.
+    let (status, heads) = get_json(&app, g("/diff?from=main&to=feature")).await;
+    assert_eq!(status, StatusCode::OK, "{heads}");
+    assert!(
+        change_ids(&heads).contains(&("MainOnly".to_string(), "delete".to_string())),
+        "{heads}"
+    );
+    let (status, since_fork) = get_json(&app, g(&format!("/diff?from={fork}&to=main"))).await;
+    assert_eq!(status, StatusCode::OK, "{since_fork}");
+    assert_eq!(
+        change_ids(&since_fork),
+        vec![("MainOnly".to_string(), "insert".to_string())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_routes_refuse_malformed_and_unknown_sides() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    for (uri, status, needle) in [
+        (
+            "/diff?from=main",
+            StatusCode::BAD_REQUEST,
+            "query parameter 'to' is required",
+        ),
+        (
+            "/diff?from=main&to=main&branch=main",
+            StatusCode::BAD_REQUEST,
+            "unknown query parameter 'branch'",
+        ),
+        (
+            "/diff?from=main&to=main&limit=0",
+            StatusCode::BAD_REQUEST,
+            "greater than zero",
+        ),
+        (
+            "/diff?from=main&to=nowhere",
+            StatusCode::NOT_FOUND,
+            "'nowhere' names no branch and no commit",
+        ),
+        (
+            "/branches/diff?target=main",
+            StatusCode::BAD_REQUEST,
+            "query parameter 'source' is required",
+        ),
+        (
+            "/branches/diff?source=nowhere",
+            StatusCode::NOT_FOUND,
+            "branch 'nowhere' not found",
+        ),
+        (
+            "/branches/merge-base?source=feature&limit=1",
+            StatusCode::BAD_REQUEST,
+            "unknown query parameter 'limit'",
+        ),
+    ] {
+        let (got, body) = get_json(&app, g(uri)).await;
+        assert_eq!(got, status, "{uri}: {body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains(needle),
+            "{uri}: {body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_dry_run_answers_the_merge_without_writing() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    branch_one_commit_ahead(&app, "feature", "Featured").await;
+    let head = main_head_commit_id(&app).await;
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "target": "main", "dry_run": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward");
+    assert!(body["commit"].is_null(), "{body}");
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a dry run moves nothing"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/branches/merge",
+            &json!({"source": "feature", "dry_run": true, "as_commit": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("a dry run writes nothing")
+    );
+
+    // The real merge after the dry run answers the outcome the dry run did.
+    let (status, body) = json_response(
+        &app,
+        json_post("/branches/merge", &json!({"source": "feature"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward");
+    assert!(
+        body.get("dry_run").is_none(),
+        "a merge omits the dry-run flag"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_dry_run_conflict_matches_the_merge_409() {
+    let temp = divergent_alice_graph().await;
+    let graph = graph_path(temp.path());
+    let app = build_app(
+        AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap(),
+    );
+    let mut bodies = Vec::new();
+    for dry_run in [true, false] {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/branches/merge",
+                &json!({"source": "feature", "target": "main", "dry_run": dry_run}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        bodies.push(body);
+    }
+    assert_eq!(bodies[0]["merge_conflicts"], bodies[1]["merge_conflicts"]);
+    assert_eq!(bodies[0]["error"], bodies[1]["error"]);
 }
 
 // ─── Commit entity changes route ────────────────────────────────────────────

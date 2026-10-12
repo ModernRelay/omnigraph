@@ -2023,7 +2023,7 @@ async fn people_as_of(db: &Session, commit: &omnigraph::db::GraphCommit) -> usiz
 #[tokio::test]
 async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
     use omnigraph::changes::{
-        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart, ChangeFilter,
+        ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope, ChangeFeedStart,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -2072,14 +2072,14 @@ async fn by_id_reads_of_held_commits_issue_no_request_to_history() {
                     "state of the commit {age} publishes before the head"
                 );
             }
-            reader
-                .diff_commits(
-                    &main[2].graph_commit_id,
-                    &main[1].graph_commit_id,
-                    &ChangeFilter::default(),
-                )
-                .await
-                .unwrap();
+            helpers::graph_diff(
+                &reader,
+                &main[2].graph_commit_id,
+                &main[1].graph_commit_id,
+                &ChangeFeedScope::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 history.requests(),
                 (0, 0),

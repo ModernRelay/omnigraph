@@ -48,6 +48,9 @@ pub enum GqtOperationKind {
     Show,
     Restart,
     Concurrent,
+    Diff,
+    MergeBase,
+    MergeDryRun,
 }
 impl From<StepKind> for GqtOperationKind {
     fn from(kind: StepKind) -> Self {
@@ -65,6 +68,9 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::Show => Self::Show,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
+            StepKind::Diff => Self::Diff,
+            StepKind::MergeBase => Self::MergeBase,
+            StepKind::MergeDryRun => Self::MergeDryRun,
         }
     }
 }

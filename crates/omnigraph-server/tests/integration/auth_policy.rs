@@ -443,6 +443,9 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
         (Method::GET, "/commits"),
         (Method::GET, "/commits/unknown"),
         (Method::GET, "/commits/unknown/changes"),
+        (Method::GET, "/diff"),
+        (Method::GET, "/branches/diff"),
+        (Method::GET, "/branches/merge-base"),
         (Method::GET, "/changes"),
         (Method::POST, "/changes/baseline"),
     ] {
@@ -1683,6 +1686,114 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         forbidden.code, unknown.code,
         "forbidden and unknown must share the same error code"
     );
+
+    // A graph diff resolves each side before it authorizes the branch the side
+    // resolves to, so a forbidden side, commit or branch, answers exactly as a
+    // side that names nothing.
+    let get = |uri: String| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&uri))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, readable) = json_response(&app, get("/diff?from=main&to=main".into())).await;
+    assert_eq!(status, StatusCode::OK, "{readable}");
+    for (forbidden_side, unknown_side) in [
+        (feature_commit.as_str(), unknown_id),
+        ("feature", "no-such-branch"),
+    ] {
+        let (forbidden_status, forbidden) =
+            json_response(&app, get(format!("/diff?from=main&to={forbidden_side}"))).await;
+        let (unknown_status, unknown) =
+            json_response(&app, get(format!("/diff?from=main&to={unknown_side}"))).await;
+        assert_eq!(forbidden_status, StatusCode::NOT_FOUND, "{forbidden}");
+        assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown}");
+        assert_eq!(
+            forbidden["error"],
+            format!("'{forbidden_side}' names no branch and no commit")
+        );
+        assert_eq!(forbidden["code"], unknown["code"]);
+    }
+    // The branch routes name their branches outright: a read denial is a 403,
+    // and a dry run is a read of both branches.
+    for uri in [
+        "/branches/diff?source=feature",
+        "/branches/merge-base?source=feature",
+    ] {
+        let (status, body) = json_response(&app, get(uri.into())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"source": "feature", "dry_run": true}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// A merge dry run is a read of both branches: an actor with `read` and no
+/// `branch_merge` grant may run it, and still may not merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    db.load_with_receipt(
+        "feature",
+        r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  team: [act-bruno]\nrules:\n  - id: read\n    allow: {actors: {group: team}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![("act-bruno".to_string(), "team-token".to_string())],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let merge = |dry_run: bool| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"source": "feature", "dry_run": dry_run}).to_string(),
+            ))
+            .unwrap()
+    };
+    let (status, body) = json_response(&app, merge(true)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["outcome"], "fast_forward");
+    assert_eq!(body["dry_run"], true);
+    let (status, body) = json_response(&app, merge(false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1841,6 +1952,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (deny_status, deny_body) = json_response(
@@ -2219,6 +2331,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
         target: Some("main".to_string()),
         delete_branch: false,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(
@@ -2292,6 +2405,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
         target: Some("main".to_string()),
         delete_branch: true,
         as_commit: false,
+        dry_run: false,
         settings: None,
     };
     let (merge_status, merge_body) = json_response(

@@ -123,6 +123,9 @@ pub fn step_kind(step: &Step) -> &'static str {
         Step::Show(_) => "show",
         Step::Restart { .. } => "restart",
         Step::Concurrent(_) => "concurrent",
+        Step::Diff(_) => "diff",
+        Step::MergeBase(_) => "merge-base",
+        Step::MergeDryRun(_) => "merge-dry-run",
     }
 }
 
@@ -147,6 +150,9 @@ pub enum Step {
     Show(ShowStep),
     Restart { ordinal: usize },
     Concurrent(ConcurrentStep),
+    Diff(DiffStep),
+    MergeBase(MergeBaseStep),
+    MergeDryRun(MergeDryRunStep),
 }
 
 impl Step {
@@ -161,6 +167,9 @@ impl Step {
             Self::Show(s) => s.ordinal,
             Self::Restart { ordinal } => *ordinal,
             Self::Concurrent(s) => s.ordinal,
+            Self::Diff(s) => s.ordinal,
+            Self::MergeBase(s) => s.ordinal,
+            Self::MergeDryRun(s) => s.ordinal,
         }
     }
 
@@ -176,7 +185,10 @@ impl Step {
             | Step::Control(_)
             | Step::Settings(_)
             | Step::Restart { .. }
-            | Step::Concurrent(_) => None,
+            | Step::Concurrent(_)
+            | Step::Diff(_)
+            | Step::MergeBase(_)
+            | Step::MergeDryRun(_) => None,
         }
     }
 
@@ -190,7 +202,10 @@ impl Step {
             | Step::Control(_)
             | Step::Settings(_)
             | Step::Restart { .. }
-            | Step::Concurrent(_) => None,
+            | Step::Concurrent(_)
+            | Step::Diff(_)
+            | Step::MergeBase(_)
+            | Step::MergeDryRun(_) => None,
         }
     }
 }
@@ -319,6 +334,99 @@ pub enum WriteExpect {
 pub enum MergeExpect {
     Write(WriteExpect),
     Outcome(MergeOutcome),
+}
+
+/// A `--- diff` step (RFC 0030 §8): one graph diff or one commit's own diff,
+/// run to its last page, its changes compared as JSON rows.
+#[derive(Debug)]
+pub struct DiffStep {
+    ordinal: usize,
+    pub sides: DiffSides,
+    expect: DiffExpect,
+}
+
+/// What a `--- diff` step compares. A side is a branch name, or `$name` for
+/// the commit a `--- bind commit $name` captured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffSides {
+    /// `from: <side> to: <side>`: the net changes between two read targets.
+    Between { from: String, to: String },
+    /// `source: <branch>` and `target: <branch>` (`main` when unspelled): what
+    /// the source changed since its merge base with the target.
+    Branch { source: String, target: String },
+    /// `commit: <side>`: one commit's own changes (`commit changes`).
+    Commit { commit: String },
+}
+
+/// A diff step's expect: the change rows, or an error.
+#[derive(Debug)]
+pub enum DiffExpect {
+    /// One JSON object per change: `kind`, `type` (the type's name), `id`,
+    /// `op`, and `before` / `after` images as the wire spells them.
+    Rows {
+        ordered: bool,
+        rows: Vec<Value>,
+    },
+    Error {
+        needle: String,
+    },
+}
+
+/// `--- merge-base source: <branch> [target: <branch>]`: the commit a merge
+/// of the source into the target would classify against.
+#[derive(Debug)]
+pub struct MergeBaseStep {
+    ordinal: usize,
+    pub source: String,
+    pub target: String,
+    expect: MergeBaseExpect,
+}
+
+/// A merge-base step's expect: `commit $name` or an error.
+#[derive(Debug)]
+pub enum MergeBaseExpect {
+    Commit { name: String },
+    Error { needle: String },
+}
+
+/// `--- merge-dry-run source: <branch> [target: <branch>]`: the merge run
+/// through validation without a write, judged with a merge's own expects.
+#[derive(Debug)]
+pub struct MergeDryRunStep {
+    ordinal: usize,
+    pub source: String,
+    pub target: String,
+    expect: MergeExpect,
+}
+
+impl DiffStep {
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub fn expect(&self) -> &DiffExpect {
+        &self.expect
+    }
+}
+
+impl MergeBaseStep {
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub fn expect(&self) -> &MergeBaseExpect {
+        &self.expect
+    }
+}
+
+impl MergeDryRunStep {
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub fn expect(&self) -> &MergeExpect {
+        &self.expect
+    }
 }
 
 /// A `--- query` step holding `branch list`: one `name` column, rows in
@@ -601,8 +709,13 @@ enum ExpectHeader {
     Ordered,
     Ok,
     Error(String),
-    Affected { nodes: usize, edges: usize },
+    Affected {
+        nodes: usize,
+        edges: usize,
+    },
     Outcome(MergeOutcome),
+    /// `commit $name`: the commit a `--- bind commit $name` captured.
+    Commit(String),
 }
 
 /// The one argument a `--- query` or `--- mutate` header takes,
@@ -809,6 +922,12 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
             ));
         };
         return Ok(ExpectHeader::Outcome(outcome));
+    }
+    if let Some(var) = rest.strip_prefix("commit ") {
+        let var = var.trim();
+        let name = parse_loop_var(var)
+            .map_err(|_| format!("`--- expect commit {var}`: a name is $[a-z][a-z0-9_]*"))?;
+        return Ok(ExpectHeader::Commit(name));
     }
     if rest == "unordered" {
         return Ok(ExpectHeader::Unordered);
@@ -1240,6 +1359,20 @@ enum Pending {
     /// A `--- concurrent` block awaiting the bare `--- expect` that names
     /// each session's outcome.
     Concurrent(ConcurrentStep),
+    Diff {
+        ordinal: usize,
+        sides: DiffSides,
+    },
+    MergeBase {
+        ordinal: usize,
+        source: String,
+        target: String,
+    },
+    MergeDryRun {
+        ordinal: usize,
+        source: String,
+        target: String,
+    },
 }
 
 /// Whether `text` holds the statement `<statement> <name>` at any position:
@@ -1339,7 +1472,10 @@ fn complete_list_step(
                 needle: needle.clone(),
             }
         }
-        ExpectHeader::Ok | ExpectHeader::Affected { .. } | ExpectHeader::Outcome(_) => {
+        ExpectHeader::Ok
+        | ExpectHeader::Affected { .. }
+        | ExpectHeader::Outcome(_)
+        | ExpectHeader::Commit(_) => {
             return Err("`branch list` takes `unordered`, `ordered`, or `error:`".into());
         }
     };
@@ -1400,7 +1536,8 @@ fn complete_show_step(
         ExpectHeader::Error(_)
         | ExpectHeader::Ok
         | ExpectHeader::Affected { .. }
-        | ExpectHeader::Outcome(_) => {
+        | ExpectHeader::Outcome(_)
+        | ExpectHeader::Commit(_) => {
             return Err(format!(
                 "`{}` takes `unordered` or `ordered`; it returns the settings rows and does not fail",
                 show_statement_name(id)
@@ -1438,8 +1575,111 @@ fn complete_settings_step(
         | ExpectHeader::Ordered
         | ExpectHeader::Error(_)
         | ExpectHeader::Affected { .. }
-        | ExpectHeader::Outcome(_) => {
+        | ExpectHeader::Outcome(_)
+        | ExpectHeader::Commit(_) => {
             Err("a settings step takes `ok`; `set` and `reset` return no rows and no counts".into())
+        }
+    }
+}
+
+fn commit_expect_refusal() -> String {
+    "`expect commit $name` is accepted on a `--- merge-base` step only".into()
+}
+
+/// The `key: value` arguments of a step header, each key once and from
+/// `allowed`.
+fn parse_step_arguments(
+    kind: &str,
+    rest: &str,
+    allowed: &[&str],
+) -> Result<HashMap<String, String>, String> {
+    let mut args = HashMap::new();
+    let mut tokens = rest.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let Some(key) = token.strip_suffix(':').filter(|key| allowed.contains(key)) else {
+            let keys: Vec<String> = allowed.iter().map(|key| format!("`{key}:`")).collect();
+            return Err(format!(
+                "`--- {kind}` takes {} as `key: value`, got `{token}`",
+                keys.join(", ")
+            ));
+        };
+        let Some(value) = tokens.next() else {
+            return Err(format!("`--- {kind}` argument `{key}:` needs a value"));
+        };
+        if args.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!("`--- {kind}` names `{key}:` twice"));
+        }
+    }
+    Ok(args)
+}
+
+/// A diff step's expect: change rows, one JSON object per line, or an error.
+fn complete_diff_expect(mode: &ExpectHeader, section: &Section<'_>) -> Result<DiffExpect, String> {
+    match mode {
+        ExpectHeader::Ordered | ExpectHeader::Unordered => {
+            let mut rows = Vec::new();
+            for (index, line) in &section.body {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let row: Value = serde_json::from_str(line).map_err(|e| {
+                    format!("line {}: a diff row is one JSON object: {e}", index + 1)
+                })?;
+                if !row.is_object() {
+                    return Err(format!("line {}: a diff row is one JSON object", index + 1));
+                }
+                rows.push(row);
+            }
+            Ok(DiffExpect::Rows {
+                ordered: matches!(mode, ExpectHeader::Ordered),
+                rows,
+            })
+        }
+        ExpectHeader::Error(needle) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            Ok(DiffExpect::Error {
+                needle: needle.clone(),
+            })
+        }
+        ExpectHeader::Ok
+        | ExpectHeader::Affected { .. }
+        | ExpectHeader::Outcome(_)
+        | ExpectHeader::Commit(_) => {
+            Err("a `--- diff` step takes `ordered` or `unordered` rows, or `error:`".into())
+        }
+    }
+}
+
+/// A merge-base step's expect: `commit $name` naming a bound commit, or an
+/// error.
+fn complete_merge_base_expect(
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+    bound_names: &HashSet<String>,
+) -> Result<MergeBaseExpect, String> {
+    match mode {
+        ExpectHeader::Commit(name) => {
+            refuse_nonempty_body(&section.body, "an `expect commit` section")?;
+            if !bound_names.contains(name) {
+                return Err(format!(
+                    "`expect commit ${name}`: `${name}` is not bound; `--- bind commit ${name}` must precede this step"
+                ));
+            }
+            Ok(MergeBaseExpect::Commit { name: name.clone() })
+        }
+        ExpectHeader::Error(needle) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            Ok(MergeBaseExpect::Error {
+                needle: needle.clone(),
+            })
+        }
+        ExpectHeader::Ok
+        | ExpectHeader::Ordered
+        | ExpectHeader::Unordered
+        | ExpectHeader::Affected { .. }
+        | ExpectHeader::Outcome(_) => {
+            Err("a `--- merge-base` step takes `commit $name` or `error:`".into())
         }
     }
 }
@@ -1473,6 +1713,7 @@ fn complete_write_expect(
         ExpectHeader::Outcome(_) => {
             Err("`expect outcome:` is accepted on a `branch merge` step only".into())
         }
+        ExpectHeader::Commit(_) => Err(commit_expect_refusal()),
         ExpectHeader::Affected { .. } => Err(affected_refusal(name)),
         ExpectHeader::Unordered | ExpectHeader::Ordered => Err(rows_refusal(name)),
     }
@@ -1588,6 +1829,7 @@ fn complete_decl_step(
         (ExpectHeader::Outcome(_), _) => {
             Err("`expect outcome:` is accepted on a `branch merge` step only".into())
         }
+        (ExpectHeader::Commit(_), _) => Err(commit_expect_refusal()),
         (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => Err(
             "a mutate step takes `ok`, `affected:`, or `error:`; mutation results carry no rows"
                 .into(),
@@ -1807,7 +2049,17 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement) or load step; no seam is crossed by a query step yet".into(),
             );
         }
-        if matches!(kind, "query" | "mutate" | "load" | "restart" | "concurrent") {
+        if matches!(
+            kind,
+            "query"
+                | "mutate"
+                | "load"
+                | "restart"
+                | "concurrent"
+                | "diff"
+                | "merge-base"
+                | "merge-dry-run"
+        ) {
             source_lines.insert(ordinal + 1, section.header_line + 1);
             awaiting_seam_step = false;
         }
@@ -2165,6 +2417,15 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     Some(Pending::Load { .. }) => {
                         return Err("a generated load takes no params".into());
                     }
+                    Some(
+                        Pending::Diff { .. }
+                        | Pending::MergeBase { .. }
+                        | Pending::MergeDryRun { .. },
+                    ) => {
+                        return Err(
+                            "a diff, merge-base or merge-dry-run step takes no params".into()
+                        );
+                    }
                     None => {
                         return Err(format!(
                             "line {}: `--- params` must directly follow a query or mutate section",
@@ -2342,6 +2603,31 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     Some(Pending::Concurrent(_)) => {
                         unreachable!("a pending concurrent block is completed above")
                     }
+                    Some(Pending::Diff { ordinal, sides }) => Step::Diff(DiffStep {
+                        ordinal,
+                        sides,
+                        expect: complete_diff_expect(&mode, section)?,
+                    }),
+                    Some(Pending::MergeBase {
+                        ordinal,
+                        source,
+                        target,
+                    }) => Step::MergeBase(MergeBaseStep {
+                        ordinal,
+                        source,
+                        target,
+                        expect: complete_merge_base_expect(&mode, section, &bound_names)?,
+                    }),
+                    Some(Pending::MergeDryRun {
+                        ordinal,
+                        source,
+                        target,
+                    }) => Step::MergeDryRun(MergeDryRunStep {
+                        ordinal,
+                        source,
+                        target,
+                        expect: complete_merge_expect(&mode, section)?,
+                    }),
                     None => {
                         return Err(format!(
                             "line {}: `--- expect` has no query or mutate step to bind to",
@@ -2355,6 +2641,83 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 } else {
                     push_step(&mut items, &mut open_loop, completed);
                 }
+            }
+            "diff" | "merge-base" | "merge-dry-run" => {
+                if pending.is_some() {
+                    return Err(format!(
+                        "line {}: the previous step is missing its `--- expect`",
+                        section.header_line + 1
+                    ));
+                }
+                refuse_nonempty_body(&section.body, &format!("`--- {kind}`"))?;
+                // A `$name` side names a bound commit; it must be bound before.
+                let side = |value: &String| -> Result<String, String> {
+                    if let Some(name) = value.strip_prefix('$')
+                        && !bound_names.contains(name)
+                    {
+                        return Err(format!(
+                            "`--- {kind}` side `{value}` is not bound; `--- bind commit {value}` must precede this step"
+                        ));
+                    }
+                    Ok(value.clone())
+                };
+                ordinal += 1;
+                pending = Some(if kind == "diff" {
+                    let args = parse_step_arguments(
+                        kind,
+                        rest,
+                        &["from", "to", "source", "target", "commit"],
+                    )?;
+                    let sides = match (
+                        args.get("from"),
+                        args.get("to"),
+                        args.get("source"),
+                        args.get("target"),
+                        args.get("commit"),
+                    ) {
+                        (Some(from), Some(to), None, None, None) => DiffSides::Between {
+                            from: side(from)?,
+                            to: side(to)?,
+                        },
+                        (None, None, Some(source), target, None) => DiffSides::Branch {
+                            source: source.clone(),
+                            target: target.cloned().unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                        },
+                        (None, None, None, None, Some(commit)) => DiffSides::Commit {
+                            commit: side(commit)?,
+                        },
+                        _ => {
+                            return Err(
+                                "`--- diff` takes `from:` and `to:`, `source:` with an optional `target:`, or `commit:`"
+                                    .into(),
+                            );
+                        }
+                    };
+                    Pending::Diff { ordinal, sides }
+                } else {
+                    let args = parse_step_arguments(kind, rest, &["source", "target"])?;
+                    let source = args
+                        .get("source")
+                        .cloned()
+                        .ok_or_else(|| format!("`--- {kind}` needs `source:`"))?;
+                    let target = args
+                        .get("target")
+                        .cloned()
+                        .unwrap_or_else(|| MAIN_BRANCH.to_string());
+                    if kind == "merge-base" {
+                        Pending::MergeBase {
+                            ordinal,
+                            source,
+                            target,
+                        }
+                    } else {
+                        Pending::MergeDryRun {
+                            ordinal,
+                            source,
+                            target,
+                        }
+                    }
+                });
             }
             "bind" => {
                 if pending.is_some() {
@@ -3523,6 +3886,249 @@ async fn run_control_step(
     }
 }
 
+/// A diff side as the engine and server take it: `$name` replaced by the
+/// commit it names, anything else as spelled.
+pub fn resolve_side(side: &str, bindings: &Bindings) -> Result<String, String> {
+    match side.strip_prefix('$') {
+        Some(name) => bindings
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("`{side}` is not bound at this step")),
+        None => Ok(side.to_string()),
+    }
+}
+
+/// One change as a diff step compares it: its wire spelling with the type
+/// named rather than identified, since the opaque type id differs between
+/// graphs.
+pub fn diff_row(change: &omnigraph_api_types::EntityChangeOutput) -> Value {
+    let mut row = serde_json::to_value(change).expect("change outputs serialize");
+    row["type"] = Value::String(change.r#type.name.clone());
+    row
+}
+
+/// Judge a diff step's rows (in order or as a multiset) or its error.
+pub fn check_diff_expect(
+    host: &impl ExecutionHost,
+    expect: &DiffExpect,
+    outcome: Result<Vec<Value>, String>,
+) -> Result<(), String> {
+    match expect {
+        DiffExpect::Rows { ordered, rows } => {
+            let got = outcome.map_err(|e| format!("`diff` failed: {e}"))?;
+            let render = |rows: &[Value]| -> Vec<String> {
+                let mut lines: Vec<String> = rows.iter().map(canonical_json).collect();
+                if !ordered {
+                    lines.sort();
+                }
+                lines
+            };
+            let (want, got) = (render(rows), render(&got));
+            if want == got {
+                Ok(())
+            } else {
+                Err(format!(
+                    "diff rows mismatch\n  expected:\n    {}\n  actual:\n    {}",
+                    want.join("\n    "),
+                    got.join("\n    ")
+                ))
+            }
+        }
+        DiffExpect::Error { needle } => {
+            check_error_expect(host, needle, outcome, "the diff succeeded")
+        }
+    }
+}
+
+/// Every change a diff step names, page by page through the engine.
+async fn engine_diff_rows(
+    session: &Session,
+    sides: &DiffSides,
+    bindings: &Bindings,
+) -> Result<Vec<Value>, String> {
+    let scope = omnigraph::changes::ChangeFeedScope::default();
+    let mut rows = Vec::new();
+    let mut token: Option<String> = None;
+    if let DiffSides::Commit { commit } = sides {
+        let id = resolve_side(commit, bindings)?;
+        loop {
+            let page = session
+                .commit_changes_page(&id, &scope, token.as_deref(), None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            rows.extend(
+                page.block
+                    .changes
+                    .iter()
+                    .map(|change| diff_row(&omnigraph_api_types::entity_change_output(change))),
+            );
+            match page.next_page_token {
+                Some(next) => token = Some(next),
+                None => return Ok(rows),
+            }
+        }
+    }
+    let sides = match sides {
+        DiffSides::Between { from, to } => omnigraph::changes::GraphDiffSides::Between {
+            from: resolve_side(from, bindings)?,
+            to: resolve_side(to, bindings)?,
+        },
+        DiffSides::Branch { source, target } => omnigraph::changes::GraphDiffSides::Branch {
+            source: source.clone(),
+            target: target.clone(),
+        },
+        DiffSides::Commit { .. } => unreachable!("the commit form returned above"),
+    };
+    loop {
+        let page = session
+            .diff_page(&omnigraph::changes::GraphDiffRequest {
+                sides: sides.clone(),
+                scope: scope.clone(),
+                page_token: token.clone(),
+                max_changes: None,
+                max_bytes: None,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        rows.extend(
+            page.changes
+                .iter()
+                .map(|change| diff_row(&omnigraph_api_types::entity_change_output(change))),
+        );
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => return Ok(rows),
+        }
+    }
+}
+
+async fn run_diff_step(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &DiffStep,
+    binding: Option<(&str, &str)>,
+    bindings: &Bindings,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "diff", binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    let outcome = operation(
+        host,
+        step.ordinal,
+        engine_diff_rows(session, &step.sides, bindings),
+    )
+    .await
+    .map_err(&fail)?;
+    host.observe(|| format!("actual diff: {outcome:?}"));
+    check_diff_expect(host, &step.expect, outcome).map_err(fail)
+}
+
+/// Judge a merge-base step's commit against the bound one, or its error.
+pub fn check_merge_base_expect(
+    host: &impl ExecutionHost,
+    expect: &MergeBaseExpect,
+    outcome: Result<String, String>,
+    bindings: &Bindings,
+) -> Result<(), String> {
+    match expect {
+        MergeBaseExpect::Commit { name } => {
+            let want = bindings
+                .get(name)
+                .ok_or_else(|| format!("`${name}` is not bound at this step"))?;
+            let got = outcome.map_err(|e| format!("`merge-base` failed: {e}"))?;
+            if &got == want {
+                Ok(())
+            } else {
+                Err(format!(
+                    "merge base mismatch: expected `${name}` ({want}), got {got}"
+                ))
+            }
+        }
+        MergeBaseExpect::Error { needle } => {
+            check_error_expect(host, needle, outcome, "`merge-base` succeeded")
+        }
+    }
+}
+
+async fn run_merge_base_step(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &MergeBaseStep,
+    binding: Option<(&str, &str)>,
+    bindings: &Bindings,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "merge-base", binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    let outcome = operation(
+        host,
+        step.ordinal,
+        session.merge_base(&step.source, &step.target),
+    )
+    .await
+    .map_err(&fail)?
+    .map(|base| base.merge_base.graph_commit_id)
+    .map_err(|e| e.to_string());
+    host.observe(|| format!("actual merge base: {outcome:?}"));
+    check_merge_base_expect(host, &step.expect, outcome, bindings).map_err(fail)
+}
+
+/// Judge a dry run as a merge step is judged; a dry run that reports a
+/// commit fails whatever was expected.
+pub fn check_dry_run_expect(
+    host: &impl ExecutionHost,
+    expect: &MergeExpect,
+    outcome: Result<(MergeOutcome, bool), String>,
+) -> Result<(), String> {
+    if let Ok((_, true)) = &outcome {
+        return Err("a dry run reported a commit".into());
+    }
+    let outcome = outcome.map(|(outcome, _)| outcome);
+    match expect {
+        MergeExpect::Write(expect) => check_write_expect(host, "merge-dry-run", expect, outcome),
+        MergeExpect::Outcome(want) => match outcome {
+            Ok(got) if got == *want => Ok(()),
+            Ok(got) => Err(format!(
+                "merge outcome mismatch: expected `{}`, got `{}`",
+                merge_outcome_word(*want),
+                merge_outcome_word(got)
+            )),
+            Err(e) => Err(format!("`merge-dry-run` failed: {e}")),
+        },
+    }
+}
+
+async fn run_merge_dry_run_step(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &MergeDryRunStep,
+    binding: Option<(&str, &str)>,
+) -> Result<(), StepFail> {
+    let label = step_label(step.ordinal, "merge-dry-run", binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    let outcome = operation(
+        host,
+        step.ordinal,
+        session.branch_merge_dry_run(&step.source, &step.target),
+    )
+    .await
+    .map_err(&fail)?
+    .map(|result| (result.outcome, result.commit.is_some()))
+    .map_err(|e| e.to_string());
+    host.observe(|| format!("actual dry run: {outcome:?}"));
+    check_dry_run_expect(host, &step.expect, outcome).map_err(fail)
+}
+
 async fn run_mutate_step(
     host: &impl ExecutionHost,
     session: &Session,
@@ -3820,6 +4426,13 @@ async fn execute_steps_inner<H: ExecutionHost>(
                     Step::Settings(s) => run_settings_step(host, &mut session, s, binding),
                     Step::Show(s) => run_show_step(host, &session, s, binding),
                     Step::Concurrent(c) => host.concurrent_step(&session, case, c).await,
+                    Step::Diff(d) => run_diff_step(host, &session, d, binding, &bindings).await,
+                    Step::MergeBase(m) => {
+                        run_merge_base_step(host, &session, m, binding, &bindings).await
+                    }
+                    Step::MergeDryRun(m) => {
+                        run_merge_dry_run_step(host, &session, m, binding).await
+                    }
                     Step::Restart { ordinal } => {
                         generation += 1;
                         host.observe(|| format!("lifetime: reopen generation {generation}"));
@@ -3968,6 +4581,23 @@ fn expectation_evidence(step: &Step) -> Value {
         }
         Step::Show(s) => read_expect_evidence(&s.expect),
         Step::Restart { .. } => serde_json::json!({"kind": "restart", "storage": "preserved"}),
+        Step::Diff(d) => serde_json::json!({
+            "kind": "diff",
+            "sides": format!("{:?}", d.sides),
+            "expect": format!("{:?}", d.expect),
+        }),
+        Step::MergeBase(m) => serde_json::json!({
+            "kind": "merge-base",
+            "source": m.source,
+            "target": m.target,
+            "expect": format!("{:?}", m.expect),
+        }),
+        Step::MergeDryRun(m) => serde_json::json!({
+            "kind": "merge-dry-run",
+            "source": m.source,
+            "target": m.target,
+            "expect": format!("{:?}", m.expect),
+        }),
         Step::Concurrent(c) => serde_json::json!({
             "kind": "concurrent",
             "sessions": c.sessions.iter().map(|s| serde_json::json!({"label": s.label, "branch": s.branch, "kind": s.kind.name(), "expect": format!("{:?}", s.expect)})).collect::<Vec<_>>(),
@@ -4075,6 +4705,9 @@ pub enum StepKind {
     Show,
     Restart,
     Concurrent,
+    Diff,
+    MergeBase,
+    MergeDryRun,
 }
 
 #[derive(Clone, Debug)]
@@ -4145,6 +4778,9 @@ impl Step {
             Self::Show(_) => StepKind::Show,
             Self::Restart { .. } => StepKind::Restart,
             Self::Concurrent(_) => StepKind::Concurrent,
+            Self::Diff(_) => StepKind::Diff,
+            Self::MergeBase(_) => StepKind::MergeBase,
+            Self::MergeDryRun(_) => StepKind::MergeDryRun,
         }
     }
 }

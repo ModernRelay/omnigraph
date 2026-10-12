@@ -336,6 +336,13 @@ pub struct BranchMergeRequest {
     /// with `delete_branch`, whose source the proposal still holds.
     #[serde(default)]
     pub as_commit: bool,
+    /// Run the merge through classification and validation and stop: the
+    /// response reports the outcome the merge would have now, a conflict
+    /// fails with the same `409` a merge returns, and nothing is written.
+    /// A read of both branches; refused together with `as_commit` and
+    /// `delete_branch`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Session settings for this request (the Session settings RFC); see [`SettingsRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRequest>,
@@ -390,6 +397,10 @@ pub struct BranchMergeOutput {
     /// `branch_deleted` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_delete_error_details: Option<ErrorOutput>,
+    /// `true` for a dry run: `outcome` is what the merge would do now, and
+    /// `commit` is `null` because nothing was written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -878,6 +889,97 @@ pub struct CommitChangesQuery {
     /// change-feed execution.
     #[serde(default)]
     pub set: Vec<String>,
+}
+
+/// One bounded page of a graph diff: the net entity changes between two
+/// resolved commits, in the commit diff's entity shape and order. There is no
+/// cause: a range has no single author.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DiffOutput {
+    /// The commit the `from` side resolved to; for a branch diff, the merge
+    /// base.
+    pub from_commit_id: String,
+    /// The commit the `to` side resolved to; for a branch diff, the source
+    /// head.
+    pub to_commit_id: String,
+    /// The merge base, present only for a branch diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit_id: Option<String>,
+    pub changes: Vec<EntityChangeOutput>,
+    /// Continue THIS bounded response; later pages answer for the same two
+    /// commits. Absent on the final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// Query parameters for a two-point graph diff.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DiffQuery {
+    /// Read target the diff starts from: a branch name (its head now) or a
+    /// graph commit id. A string naming both is refused.
+    pub from: String,
+    /// Read target the diff ends at, spelled as `from`.
+    pub to: String,
+    /// Opaque continuation from the preceding page of this response.
+    pub page_token: Option<String>,
+    /// Maximum changes per page. Server default applies when absent; above
+    /// the public ceiling the request fails with 413.
+    pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
+    #[serde(default)]
+    pub kind: Vec<EntityKindOutput>,
+    /// Repeatable filter: accepted-schema type name.
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
+    #[serde(default)]
+    pub op: Vec<ChangeOpOutput>,
+}
+
+/// Query parameters for a branch diff: what `source` changed since its merge
+/// base with `target`.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BranchDiffQuery {
+    /// Branch whose changes are reported.
+    pub source: String,
+    /// Branch the source is compared against. Defaults to `main`.
+    pub target: Option<String>,
+    /// Opaque continuation from the preceding page of this response.
+    pub page_token: Option<String>,
+    /// Maximum changes per page, as for `GET /diff`.
+    pub limit: Option<usize>,
+    /// Repeatable filter: node | edge.
+    #[serde(default)]
+    pub kind: Vec<EntityKindOutput>,
+    /// Repeatable filter: accepted-schema type name.
+    #[serde(default)]
+    pub r#type: Vec<String>,
+    /// Repeatable filter: insert | update | delete.
+    #[serde(default)]
+    pub op: Vec<ChangeOpOutput>,
+}
+
+/// Query parameters for the merge base of two branches.
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct MergeBaseQuery {
+    /// Branch that would be merged.
+    pub source: String,
+    /// Branch that would receive the merge. Defaults to `main`.
+    pub target: Option<String>,
+}
+
+/// The commit a merge of `source` into `target` would classify against, and
+/// the two heads it was computed from.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MergeBaseOutput {
+    pub source: String,
+    pub target: String,
+    pub source_commit_id: String,
+    pub target_commit_id: String,
+    pub merge_base: CommitOutput,
 }
 
 /// Query parameters for the change feed poll.
@@ -2166,6 +2268,30 @@ pub fn commit_changes_output(page: &omnigraph::changes::CommitChangesPage) -> Co
             .map(entity_change_output)
             .collect(),
         next_page_token: page.next_page_token.clone(),
+    }
+}
+
+pub fn diff_output(page: &omnigraph::changes::GraphDiffPage) -> DiffOutput {
+    DiffOutput {
+        from_commit_id: page.from_commit_id.clone(),
+        to_commit_id: page.to_commit_id.clone(),
+        base_commit_id: page.base_commit_id.clone(),
+        changes: page.changes.iter().map(entity_change_output).collect(),
+        next_page_token: page.next_page_token.clone(),
+    }
+}
+
+pub fn merge_base_output(
+    source: &str,
+    target: &str,
+    base: &omnigraph::changes::MergeBase,
+) -> MergeBaseOutput {
+    MergeBaseOutput {
+        source: source.to_string(),
+        target: target.to_string(),
+        source_commit_id: base.source_commit_id.clone(),
+        target_commit_id: base.target_commit_id.clone(),
+        merge_base: commit_output(&base.merge_base),
     }
 }
 

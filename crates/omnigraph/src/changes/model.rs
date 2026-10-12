@@ -194,6 +194,55 @@ pub struct CommitChangesPage {
     pub next_page_token: Option<String>,
 }
 
+/// The two sides of a graph diff, as the caller names them. A side is a read
+/// target: a live branch name, meaning its head when the diff is captured, or
+/// a graph commit id (published, an unpublished proposal, or an unattached
+/// snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphDiffSides {
+    /// The net transition from `from`'s state to `to`'s state.
+    Between { from: String, to: String },
+    /// What `source` changed since its merge base with `target`: the merge
+    /// base and the source head, captured together.
+    Branch { source: String, target: String },
+}
+
+/// One graph diff request. `None` limits take the server-owned defaults; a
+/// page token continues the response whose sides it was minted for and keeps
+/// the endpoints that response resolved.
+#[derive(Debug, Clone)]
+pub struct GraphDiffRequest {
+    pub sides: GraphDiffSides,
+    pub scope: ChangeFeedScope,
+    pub page_token: Option<String>,
+    pub max_changes: Option<usize>,
+    pub max_bytes: Option<u64>,
+}
+
+/// One bounded page of a graph diff: net entity changes between two resolved
+/// graph commits, without a cause (a range has no single author). The
+/// endpoints are the exact commits the first page resolved; every
+/// continuation answers for them, whatever the named branches did since.
+#[derive(Debug, Clone)]
+pub struct GraphDiffPage {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    /// The merge base, present for [`GraphDiffSides::Branch`]; equal to
+    /// `from_commit_id` there.
+    pub base_commit_id: Option<String>,
+    pub changes: Vec<GraphEntityChange>,
+    pub next_page_token: Option<String>,
+}
+
+/// The merge base of a source and a target branch, with the heads it was
+/// computed from.
+#[derive(Debug, Clone)]
+pub struct MergeBase {
+    pub source_commit_id: String,
+    pub target_commit_id: String,
+    pub merge_base: GraphCommit,
+}
+
 /// Graph-vocabulary feed filter. Empty dimensions match everything; the
 /// canonical digest of this scope binds page tokens and feed cursors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

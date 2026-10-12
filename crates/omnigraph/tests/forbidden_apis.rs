@@ -310,8 +310,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "resolved_branch_of"),
     ("db/omnigraph.rs", "sync_branch"),
     ("db/omnigraph.rs", "resolve_snapshot"),
-    ("db/omnigraph.rs", "diff_between"),
-    ("db/omnigraph.rs", "diff_commits"),
+    ("db/omnigraph.rs", "diff_page"),
+    ("db/omnigraph.rs", "merge_base"),
+    ("db/omnigraph.rs", "diff_read_target_branch"),
+    ("exec/merge.rs", "branch_merge_dry_run"),
     ("db/omnigraph.rs", "commit_changes_page"),
     ("db/omnigraph.rs", "poll_change_feed"),
     ("db/omnigraph.rs", "capture_change_baseline"),
@@ -458,11 +460,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "resolve_commit",
-    ),
-    (
-        "db/graph_coordinator.rs",
-        "GraphCoordinator",
-        "resolve_commit_range",
     ),
     (
         "db/graph_coordinator.rs",
@@ -1100,11 +1097,6 @@ durable_calls! {
     // candidate scan + parent before-image probe and the full-merge fallback.
     // Read-only — it stages and publishes nothing.
     ("changes/candidate_scan.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
-    // Net-diff cross-branch path: the same typed row comparison over two
-    // pinned snapshot handles, plus the same-lineage path reading each
-    // side's schema to resolve its system column spellings (RFC 0040
-    // Historical reads). Read-only — the diff stages and publishes nothing.
-    ("changes/mod.rs", ".dataset()", 11, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),

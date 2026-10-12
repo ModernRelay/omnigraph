@@ -229,9 +229,9 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |
 | `/graphs/{id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
-| `/graphs/{id}/branches` | Branch management and merge |
+| `/graphs/{id}/branches` | Branch management and merge, a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
 | `/graphs/{id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history, per-commit changes, and the unpublished commits of a branch (`GET /commits?unpublished=true`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
-| `/graphs/{id}/changes` | Poll a branch feed or establish a baseline |
+| `/graphs/{id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
@@ -332,11 +332,11 @@ them. `PUT` and `DELETE` replace or clear the cell; see [Blob values](../blobs.m
 ## Changes and baselines
 
 `GET /graphs/{id}/commits/{commit_id}/changes` compares a commit with its first
-parent. `GET /graphs/{id}/changes` polls complete branch commits; the terminal
-response supplies its durable cursor. Unreadable history returns `410 change_feed_gap`.
-`POST /graphs/{id}/changes/baseline` streams entities, then a snapshot commit and
-resume cursor. See [Changes and Change Feeds](../branching/changes.md) for
-pagination, checkpointing and recovery.
+parent, `GET /graphs/{id}/diff?from=&to=` any two points, and `/branches/diff`
+a branch with its merge base. `GET /graphs/{id}/changes` polls branch commits
+and returns a durable cursor; unreadable history returns `410 change_feed_gap`.
+`POST /graphs/{id}/changes/baseline` streams entities, a snapshot commit and a
+resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 
 ## Errors and retries
 

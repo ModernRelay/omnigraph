@@ -216,10 +216,13 @@ needs. Branch deletion can likewise end access to branch-only history.
 
 ## Changes and feeds
 
-Inspect the logical changes made by one commit:
+Inspect the logical changes made by one commit, compare two points, or review
+what a branch changed since it left `main`:
 
 ```bash
 omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph diff --from <commit-id> --to main --store graph.omni --json
+omnigraph branch diff feature --store graph.omni --json
 ```
 
 For continuous consumption, `omnigraph changes poll` follows complete commits
@@ -227,7 +230,7 @@ on one branch and returns an opaque resume cursor. If cleanup has reclaimed
 required history, create a coherent snapshot and new cursor with
 `omnigraph changes baseline`.
 
-See [Changes and Change Feeds](changes.md) for filters, pagination, cursor
-checkpointing, and `410` retention-gap recovery.
+See [Changes, Diffs and Change Feeds](changes.md) for filters, pagination,
+cursor checkpointing, and `410` retention-gap recovery.
 
 See [Merging Branches](merge.md) for merge outcomes and conflict handling.

@@ -771,6 +771,7 @@ async fn run(cli: Cli) -> Result<()> {
                 into,
                 delete_branch,
                 as_commit,
+                dry_run,
                 settings,
                 json,
             } => {
@@ -786,9 +787,11 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 let into = resolve_branch(into, None, "main");
-                echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                if !dry_run {
+                    echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                }
                 let payload = client
-                    .branch_merge(&source, &into, delete_branch, as_commit, &settings)
+                    .branch_merge(&source, &into, delete_branch, as_commit, dry_run, &settings)
                     .await?;
                 // Keep the successful merge receipt on stdout; optional
                 // deletion has its own structured result and human warning.
@@ -800,6 +803,13 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 if json {
                     print_json(&payload)?;
+                } else if payload.dry_run {
+                    println!(
+                        "dry run: merging {} into {} would be: {} (nothing was written)",
+                        payload.source,
+                        payload.target,
+                        payload.outcome.as_str()
+                    );
                 } else {
                     match payload.commit.as_ref().filter(|commit| !commit.published) {
                         Some(commit) => println!(
@@ -821,7 +831,83 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            BranchCommand::Diff {
+                uri,
+                source,
+                into,
+                limit,
+                page_token,
+                kinds,
+                types,
+                ops,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let sides = client::DiffSidesArg::Branch {
+                    source: &source,
+                    target: &into,
+                };
+                run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+            }
+            BranchCommand::MergeBase {
+                uri,
+                source,
+                into,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let output = client.merge_base(&source, &into).await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_merge_base_human(&output);
+                }
+            }
         },
+        Command::Diff {
+            uri,
+            from,
+            to,
+            limit,
+            page_token,
+            kinds,
+            types,
+            ops,
+            json,
+        } => {
+            let client = client::GraphClient::resolve(
+                capability,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+            )
+            .await?;
+            let sides = client::DiffSidesArg::Between {
+                from: &from,
+                to: &to,
+            };
+            run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+        }
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,
@@ -2450,4 +2536,67 @@ fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
             omnigraph::storage::redacted_storage_uri(&status.canonical_root)
         );
     }
+}
+
+/// Print a graph diff: one page when `page_token` is given (the raw escape
+/// hatch), otherwise every page in turn, each emitted before the next is
+/// fetched.
+#[allow(clippy::too_many_arguments)]
+async fn run_diff(
+    client: &client::GraphClient,
+    sides: client::DiffSidesArg<'_>,
+    page_token: Option<String>,
+    limit: Option<usize>,
+    kinds: Vec<cli::ChangeKindArg>,
+    types: Vec<String>,
+    ops: Vec<cli::ChangeOpArg>,
+    json: bool,
+) -> Result<()> {
+    let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
+        kinds.into_iter().map(Into::into).collect();
+    let ops: Vec<omnigraph_api_types::ChangeOpOutput> = ops.into_iter().map(Into::into).collect();
+    let filter = client::ChangeFilterArgs {
+        kinds: &kinds,
+        types: &types,
+        ops: &ops,
+    };
+    if let Some(page_token) = page_token.as_deref() {
+        let page = client
+            .diff_page(sides, Some(page_token), limit, &filter)
+            .await?;
+        if json {
+            print_json(&page)?;
+        } else {
+            print_diff_human(&page);
+        }
+        return Ok(());
+    }
+    let mut next_page_token: Option<String> = None;
+    if json {
+        let mut output = DiffJsonStream::new(io::BufWriter::new(io::stdout()));
+        loop {
+            let page = client
+                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+        let _ = output.finish()?;
+    } else {
+        let mut output = DiffHumanStream::new();
+        loop {
+            let page = client
+                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }

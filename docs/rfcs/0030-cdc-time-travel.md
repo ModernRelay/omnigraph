@@ -27,9 +27,9 @@ blocked_on: []
 > the feed contract, which is entity changes, the exact ordered comparison as
 > authority and fallback, cursors, and retention gaps.
 
-C0–C3 are implemented. The §4.4 ordering, client-pagination, and
-continuation-size gates are closed as recorded in §14. The graph diff phases
-D1–D3 (§8) and C4–C6 remain design-stage.
+C0–C3 and the graph diff phases D1–D3 (§8) are implemented. The §4.4
+ordering, client-pagination, and continuation-size gates are closed as
+recorded in §14. C4–C6 remain design-stage.
 
 **Depends on:** RFC 0013 Phase 7 graph lineage, RFC 0022 snapshot capture and
 publication, RFC 0023 exact-`id` table fencing, and RFC 0028 immutable table
@@ -51,9 +51,8 @@ exact logical before/after values. Public results do not expose tables,
 datasets, fragments, physical versions, row addresses, or storage ordering
 keys.
 
-Two shipped public surfaces share one private adjacent-commit enumerator, and a
-third, design-stage surface shares its type-lifetime pairing and image
-comparison:
+Three public surfaces share one private enumerator of the entity changes
+between two pinned graph snapshots:
 
 1. A **finite commit entity diff** compares one exact graph commit with its
    first parent. It is an inspection result. A `next_page_token` may continue a
@@ -62,7 +61,7 @@ comparison:
    first-parent order. Its cursor means the caller has consumed every complete
    commit through one position; it advances only after the final page of that
    commit.
-3. A **graph diff** (§8, design-stage) compares any two graph read targets, or
+3. A **graph diff** (§8) compares any two graph read targets, or
    a branch with its merge base, and returns the net entity changes between
    them in the same entity shape, without a cause.
 
@@ -166,10 +165,10 @@ The required durable authority already exists:
   not a second registry or a table identifier.
 - Every current v6 graph table is created with stable row IDs and exact
   non-null logical `id` as its unenforced primary key.
-- `diff_between` and `diff_commits` compare two graph snapshots, including
-  table creation, removal, rename, and cross-lineage ID comparison. They are
-  embedded Rust APIs only: no CLI, HTTP or MCP surface calls them, and they
-  return the table-shaped `ChangeSet` that §8 retires.
+- `Omnigraph::diff_page` compares any two graph snapshots, including renamed
+  and cross-lineage type lifetimes, through the commit diff's enumerator
+  (§8). It replaced the embedded-only, table-shaped `diff_between` and
+  `diff_commits`.
 - Every graph commit record written at storage format 14 or later carries the
   accepted schema identity it was written under and names its schema content
   (`schema_content_hash`), an immutable `__history/schemas/` object holding
@@ -177,7 +176,7 @@ The required durable authority already exists:
   older stamp shares one contract across its pre-upgrade commits
   ([schema contract in the manifest](2026-09-30-schema-contract-in-manifest.md)).
 - `CommitGraph::merge_base` computes the merge base branch merge classifies
-  against; no public surface reports it.
+  against; `branch merge-base` reports it (§8.4).
 
 Two version names require precise scope:
 
@@ -638,11 +637,11 @@ proven monotonic index.
 
 ## 8. Graph diff and the existing net diff
 
-### 8.1 What the shipped surfaces leave open
+### 8.1 What the commit diff and the feed left open
 
 The commit diff and the feed answer what one commit changed and what a branch's
-first-parent history changed, commit by commit. Two questions have no public
-answer:
+first-parent history changed, commit by commit. Before D1–D3, two questions had
+no public answer:
 
 - **Reviewing a branch.** Branches exist so that a change can be inspected
   before it merges, but no surface reports what a branch changed since it left
@@ -704,15 +703,18 @@ only, refuses with `schema_boundary` until C6 defines how to cross it.
 Changes use the §3.1 entity shape and §4.4 order, with no cause: a range
 collapsed across commits has no single honest actor or commit. The response
 carries the resolved `from` and `to` commit ids and, for the branch form,
-`base`. A page token of a new `diff-page` kind binds the graph identity, both
-resolved endpoints, the filter digest and the position; it is never accepted
-as a feed cursor. Filters are the §3.3 kind, type and operation filters. An
+`base`. A page token of a new `diff-page` kind binds the graph identity, a
+digest of the request's sides (their form and spelled names, never a raw
+branch name), both resolved endpoints, the filter digest and the position; it
+is never accepted as a feed cursor or a commit page token. Filters are the §3.3 kind, type and operation filters. An
 unreadable endpoint maps to the §6 typed outcomes.
 
 Authorization is `read` on the branch each endpoint resolves to. A commit
 endpoint authorizes against its authored branch, or against the recorded
-target of a proposal or snapshot, and a forbidden endpoint is reported as not
-found, as the commit diff does.
+target of a proposal or snapshot. The two-point route resolves a side before
+it authorizes it, so a forbidden side is reported exactly as a side that names
+nothing (`404`), as the commit diff does. The branch form and the merge base
+name their branches outright and answer a read denial with `403`.
 
 Cost: a type lifetime whose `to` pin is one proving transaction past its `from`
 pin may use the §14 candidate pruning. Every other changed lifetime takes the
@@ -745,9 +747,11 @@ also lets a caller replay a branch's own commits through the feed with
 `--start after:<base>`.
 
 `branch merge --dry-run` runs the merge's base resolution, three-way
-classification and constraint validation, reports the outcome
-(`already_up_to_date`, `fast_forward` or `merged`), the structured conflict
-list and change counts per type and operation, and stops. It is a read:
+classification and constraint validation and stops. It reports the outcome
+(`already_up_to_date`, `fast_forward` or `merged`), or fails with the merge's
+own structured conflict list. It reports no change counts: a merge that adopts
+a table's pointer computes no row delta for it, so counts would need a second
+diff, and `branch diff` already answers what changes. It is a read:
 
 - it requires `read` on both branches, not merge rights;
 - it captures its inputs as an ordinary read snapshot, without merge-input
@@ -767,7 +771,7 @@ answers whether the merge would succeed, without a write.
 | `diff --from <REV> --to <REV>` | `GET /graphs/{id}/diff?from=&to=` | Net changes between two read targets |
 | `branch diff <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/diff?source=&target=` | What the source changed since its merge base with the target |
 | `branch merge-base <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/merge-base?source=&target=` | The merge base commit |
-| `branch merge <SOURCE> --dry-run` | `POST /graphs/{id}/branches/merge` with `dry_run: true` | Merge outcome, conflicts and counts, without a write |
+| `branch merge <SOURCE> --dry-run` | `POST /graphs/{id}/branches/merge` with `dry_run: true` | Merge outcome or conflicts, without a write |
 | `commit changes <ID>`, unchanged | `GET /graphs/{id}/commits/{commit_id}/changes`, unchanged | One commit's changes with its cause |
 
 The diff commands take the existing `--kind`, `--type`, `--op`, `--limit`,
@@ -778,11 +782,12 @@ records rather than query rows.
 
 ### 8.6 Retiring the table-shaped diff
 
-`diff_between` and `diff_commits` become one engine call that returns pages of
-the §3.1 entity shape, which the CLI and server use. The table-shaped
-`ChangeSet`, `EntityChange` and `ChangeStats`, and with them the stamp path's
-update rule, are removed once their callers, the DST harness and engine tests,
-move to it. The planner's `SnapshotDiff` operation already models this pair;
+`diff_between` and `diff_commits` became one engine call,
+`Omnigraph::diff_page`, which returns pages of the §3.1 entity shape and which
+the CLI and server use. The table-shaped `ChangeSet`, `EntityChange`,
+`ChangeStats`, `ChangeFilter` and `ChangeOp`, the stamp path with its update
+rule, and the adjacency classifier only `diff_commits` read are removed; the
+DST harness and the engine tests moved to the graph diff. The planner's `SnapshotDiff` operation already models this pair;
 its registry routes no diff until an integration lands with differential
 evidence, so routing D1 through it is an implementation choice that needs that
 evidence.
@@ -883,9 +888,9 @@ server `integration/data_routes.rs` and `integration/openapi.rs`; CLI
 - A same-value rewrite across a linear interval of pre-detached history
   reports no change, proving the stamp path's update rule is gone.
 - Branch form: the result excludes target commits after the base; the
-  reported base equals branch merge's base on the merge truth-table fixtures,
-  ties included; after the target was merged into the source, only the
-  source's own net changes since the newest base appear.
+  reported base is the one branch merge classifies against, because one
+  function computes both; after the target was merged into the source, only
+  the source's own net changes since the newest base appear.
 - Endpoints: a branch, a published commit, a proposal and an unattached
   snapshot all resolve; a string naming both a branch and a commit is refused;
   pages after a concurrent commit on either branch still answer for the pinned
@@ -1032,7 +1037,7 @@ and must return to this RFC's format audit before landing.
 | C6 — schema boundary crossing | Decode each endpoint under its archived schema; cross additive changes with one schema record per block and no synthetic entity changes; other schema changes keep refusing until §10.1's decisions are made | No new persisted authority; consumers opt in through cursor and page-token scope |
 | D1 — two-point graph diff | `diff --from --to` and `GET /diff` over one engine call in the §3.1 shape; ambiguity refusal; `diff-page` token; retirement of the table-shaped `ChangeSet` | Net comparison of any two read targets |
 | D2 — branch review | `branch merge-base` and `branch diff`, with base and source head captured together | Branches reviewable without a write |
-| D3 — merge dry run | Read-only base resolution, classification and validation reporting outcome, conflicts and counts | Merge feasibility without merge rights |
+| D3 — merge dry run | Read-only base resolution, classification and validation reporting the outcome or the conflicts | Merge feasibility without merge rights |
 
 C0 deliberately does **not** add a second coordinator or an O(history log
 history) ancestry index. `CommitGraph` already holds the warm lineage
@@ -1363,3 +1368,22 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
       `query --snapshot` on the proposal refuse with "expired and awaits
       cleanup", `commit publish` fails its head precondition, and
       `commit drop` succeeds.
+- **2026-10-12: D1–D3 implemented.** `Omnigraph::diff_page` (two-point and
+  branch forms, the `diff-page` token, typed `AmbiguousReadTarget` and
+  `ReadTargetNotFound`), `Omnigraph::merge_base`,
+  `Session::branch_merge_dry_run`, `GET /diff`, `GET /branches/diff`,
+  `GET /branches/merge-base`, `dry_run` on `POST /branches/merge`, and the CLI
+  `diff`, `branch diff`, `branch merge-base` and `branch merge --dry-run`.
+  The table-shaped diff is retired (§8.6). Two decisions changed in
+  implementation: the dry run reports no change counts (§8.4, whose sentence
+  "reports the outcome …, the structured conflict list and change counts per
+  type and operation, and stops" it supersedes), and the `diff-page` token also
+  binds a digest of the request's sides. Evidence: engine `changes.rs`
+  graph-diff tests and the dry run inside every `merge_truth_table` cell (zero
+  object-store writes, the merge's own outcome); server `data_routes.rs` and
+  `auth_policy.rs` route and policy tests; CLI `parity_matrix.rs`
+  `parity_diff_over_shared_history` and `parity_branch_review`; GQT cases
+  `graph_diff_branch_review.gqt`, `graph_diff_merge_proposal.gqt`,
+  `graph_diff_net_range.gqt` and `graph_diff_refusals.gqt` on the engine, DST
+  and served targets (RFC 0045's new `--- diff`, `--- merge-base` and
+  `--- merge-dry-run` steps).

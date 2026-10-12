@@ -1,8 +1,9 @@
-# Changes and Change Feeds
+# Changes, Diffs and Change Feeds
 
-OmniGraph can describe what one commit changed or deliver an ordered feed of
-changes on a branch. Both surfaces report logical nodes and edges, not storage
-details.
+OmniGraph can describe what one commit changed, compare any two points in
+history, review what a branch changed, or deliver an ordered feed of changes
+on a branch. Every surface reports logical nodes and edges, not storage
+details, in one change shape.
 
 HTTP calls follow the [HTTP contract](../operations/server.md#http-contract),
 including the required request header and response check before consuming a
@@ -40,6 +41,58 @@ A parentless commit returns `409` with reason `parentless_commit`. A diff
 that crosses a schema boundary returns `409` with reason
 `schema_boundary`; take a new baseline instead of treating either response
 as an empty change.
+
+## Compare two points
+
+```bash
+omnigraph diff --from <commit-id> --to main --store graph.omni --json
+```
+
+Each side is a branch name, meaning its head when the diff starts, or a commit
+id: a published commit, an unpublished proposal, or an unattached snapshot. A
+string that names both a branch and a commit is refused; name the branch's
+head by its commit id instead. The equivalent HTTP route is
+`GET /graphs/{graph_id}/diff?from=<side>&to=<side>`.
+
+The result is the net change from the `from` state to the `to` state, in the
+`commit changes` change shape and order, with `from_commit_id` and
+`to_commit_id` naming the exact commits the sides resolved to. There is no
+`cause`: a range of commits has no single author. Intermediate history is not
+replayed, so an update that was later reverted produces nothing, and a delete
+followed by an equal reinsert produces nothing. A diff from a commit's first
+parent to the commit equals that commit's `commit changes`, without the cause.
+
+Comparing two branch heads also shows what the target changed since the
+branches diverged, reversed. To review a branch, use the branch form below.
+
+The kind, type and operation filters, `--limit` and `--page-token` work as for
+`commit changes`. A page token keeps the commits the first page resolved, so
+later pages answer for them even after the branches move. A diff across a
+schema change returns `409` with reason `schema_boundary`, and a side whose
+history was reclaimed returns `410` with `change_feed_gap`.
+
+Cost grows with the size of each changed type, not with the number of
+changes: apart from a single commit, every changed type is compared in full.
+Types unchanged between the two points are skipped.
+
+## Review a branch
+
+```bash
+omnigraph branch diff feature --into main --store graph.omni --json
+omnigraph branch merge-base feature --into main --store graph.omni --json
+```
+
+`branch diff` reports what `feature` changed since its merge base with `main`
+(`main` when `--into` is omitted): the net change from the merge base to the
+head of `feature`. Changes `main` made after the merge base do not appear. The
+response also names the base as `base_commit_id`. `branch merge-base` prints
+that commit alone, the one a merge of `feature` into `main` would classify
+against. It is useful for replaying the branch's own commits with
+`changes poll --branch feature --start after:<merge-base>`.
+
+The HTTP routes are `GET /graphs/{graph_id}/branches/diff?source=&target=` and
+`GET /graphs/{graph_id}/branches/merge-base?source=&target=`. To see whether
+the merge would succeed, run it as a [dry run](merge.md#preview-a-merge).
 
 ## Follow a branch
 
@@ -83,8 +136,8 @@ and `page_token` parameters are mutually exclusive.
 
 ## Recover from a retention gap
 
-A cursor does not prevent `cleanup` from reclaiming old history. When a feed
-or commit diff can no longer be read, the server returns `410` with
+A cursor does not prevent `cleanup` from reclaiming old history. When a feed,
+commit diff or diff can no longer be read, the server returns `410` with
 `change_feed_gap`, including `first_unreadable_commit_id` and, when
 available, the rejected `cursor`. Retrying the same cursor cannot close the
 gap; install a new baseline:
@@ -118,7 +171,9 @@ resumed feed begins with commits after the captured snapshot.
 
 Baseline kind and type filters select the snapshot contents. An operation
 filter applies only to the resumed feed. Baselines require the `export`
-policy action; commit changes and feed polling require `read`.
+policy action; commit changes, diffs and feed polling require `read`. A diff
+needs `read` on the branch each side resolves to; a side the actor cannot read
+answers `404` exactly as a side that names nothing.
 
 The CLI's durable `--out` installation is available on POSIX platforms. The
 file contains only snapshot entity records, not the terminal handshake. The CLI

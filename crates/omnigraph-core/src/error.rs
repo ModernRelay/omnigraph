@@ -231,6 +231,17 @@ pub enum OmniError {
     /// an arbitrary storage `NotFound` as branch absence.
     #[error("branch '{branch}' not found")]
     BranchNotFound { branch: String },
+    /// A graph diff endpoint names neither a live branch nor a resolvable
+    /// graph commit. Carries only the caller's own spelling.
+    #[error("'{target}' names no branch and no commit")]
+    ReadTargetNotFound { target: String },
+    /// A graph diff endpoint names both a live branch and a resolvable graph
+    /// commit. Refused rather than resolved by precedence, so the same string
+    /// never silently means a different snapshot.
+    #[error(
+        "'{target}' names both a branch and a commit; rename the branch, or name its head by commit id"
+    )]
+    AmbiguousReadTarget { target: String },
     /// A change page or feed can no longer be reconstructed contiguously:
     /// cleanup reclaimed a published dataset version one of its commits pins. Recovery is
     /// the exact baseline handshake, never a retried continuation.

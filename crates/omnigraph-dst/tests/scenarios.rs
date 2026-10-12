@@ -413,7 +413,7 @@ fn dst_open_crash_is_effect_free() {
 /// model's state at that moment), re-read EVERY recorded commit through
 /// `ReadTarget::Snapshot` at final audit (snapshot equality: persons via raw
 /// scan + edges via a real traversal), pass the conservative Person
-/// `diff_commits` check over every adjacent pair — and replay identically,
+/// graph diff check over every adjacent pair — and replay identically,
 /// history commit ids included.
 #[test]
 #[serial]
