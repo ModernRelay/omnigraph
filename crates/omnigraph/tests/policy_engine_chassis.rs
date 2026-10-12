@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
@@ -130,9 +130,13 @@ async fn apply_schema_as_denies_when_policy_rejects_actor() {
     let (db, _engine) = init_with_policy(&dir).await;
 
     let desired = additive_schema();
-    let result = db
-        .apply_schema_as(&desired, SchemaApplyOptions::default(), Some("act-denied"))
-        .await;
+    let before = db.list_commits(None).await.unwrap();
+    assert_denied(
+        db.prepare_schema_apply_as(&desired, Some("act-denied"))
+            .await,
+        "prepare_schema_apply_as",
+    );
+    let result = db.apply_schema_as(&desired, Some("act-denied")).await;
 
     match result {
         Err(OmniError::Policy(msg)) => {
@@ -144,6 +148,7 @@ async fn apply_schema_as_denies_when_policy_rejects_actor() {
         Err(other) => panic!("expected OmniError::Policy, got: {other:?}"),
         Ok(_) => panic!("expected denial — act-denied should not be able to SchemaApply"),
     }
+    assert_eq!(db.list_commits(None).await.unwrap(), before);
 }
 
 #[tokio::test]
@@ -152,11 +157,130 @@ async fn apply_schema_as_allows_when_policy_permits_actor() {
     let (db, _engine) = init_with_policy(&dir).await;
 
     let desired = additive_schema();
+    let before = db.list_commits(None).await.unwrap();
+    let prepared = db
+        .prepare_schema_apply_as(&desired, Some("act-allowed"))
+        .await
+        .unwrap();
+    assert_denied(
+        db.apply_prepared_schema_as(&prepared, Some("act-denied"))
+            .await,
+        "apply_prepared_schema_as",
+    );
+    assert_denied(
+        db.reconcile_schema_apply_as(&prepared, Some("act-denied"))
+            .await,
+        "reconcile_schema_apply_as",
+    );
+
+    // Persisted intent is not a policy capability. Reopening under a policy
+    // that revokes this actor must refuse even though preparation was allowed.
+    let revoked_source = POLICY_YAML
+        .replace("writers: [act-allowed]", "writers: [act-other]")
+        .replace(
+            "readers: [act-denied]",
+            "readers: [act-denied, act-allowed]",
+        );
+    let (revoked, _revoked_engine) = install_policy_source(
+        Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+        dir.path(),
+        &revoked_source,
+    );
+    assert_denied(
+        revoked
+            .apply_prepared_schema_as(&prepared, Some("act-allowed"))
+            .await,
+        "apply_prepared_schema_as after revocation",
+    );
+    assert_denied(
+        revoked
+            .reconcile_schema_apply_as(&prepared, Some("act-allowed"))
+            .await,
+        "reconcile_schema_apply_as after revocation",
+    );
+    assert_eq!(db.list_commits(None).await.unwrap(), before);
+    assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
     let result = db
-        .apply_schema_as(&desired, SchemaApplyOptions::default(), Some("act-allowed"))
+        .apply_prepared_schema_as(&prepared, Some("act-allowed"))
         .await
         .expect("act-allowed should be able to SchemaApply");
     assert!(result.applied);
+    assert_eq!(
+        result.commit.as_ref().unwrap().actor_id.as_deref(),
+        Some("act-allowed")
+    );
+    assert_eq!(
+        result.commit.as_ref().unwrap().parent_commit_id.as_deref(),
+        Some(before[0].graph_commit_id.as_str())
+    );
+    assert!(
+        !db.apply_schema_as(&desired, Some("act-allowed"))
+            .await
+            .unwrap()
+            .applied
+    );
+}
+
+#[tokio::test]
+async fn runtime_binding_views_share_engine_authority_and_keep_policy_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, _) = init_with_policy(&dir).await;
+    let replacement_source = POLICY_YAML.replace("act-allowed", "act-replacement");
+    let policy = Arc::new(
+        PolicyEngine::load_graph_from_source(&replacement_source, dir.path().to_str().unwrap())
+            .unwrap(),
+    );
+    let replacement = original
+        .with_runtime_bindings(
+            Some(policy as Arc<dyn PolicyChecker>),
+            None,
+            omnigraph::ExternalBlobPolicy::Deny,
+        )
+        .unwrap();
+    assert!(original.shares_runtime_owner(&replacement));
+    let before = original.list_commits(None).await.unwrap();
+    let desired = additive_schema();
+    assert_denied(
+        replacement
+            .prepare_schema_apply_as(&desired, Some("act-allowed"))
+            .await,
+        "replacement revokes original actor",
+    );
+    original
+        .prepare_schema_apply_as(&desired, Some("act-allowed"))
+        .await
+        .unwrap();
+    assert_eq!(original.list_commits(None).await.unwrap(), before);
+    replacement
+        .apply_schema_as(&desired, Some("act-replacement"))
+        .await
+        .unwrap();
+    assert_eq!(
+        original.schema_contract_digest(),
+        replacement.schema_contract_digest()
+    );
+    assert_eq!(
+        original.list_commits(None).await.unwrap(),
+        replacement.list_commits(None).await.unwrap()
+    );
+    let reopened = Omnigraph::open_read_only(dir.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!original.shares_runtime_owner(&reopened));
+    let unprotected = replacement
+        .with_runtime_bindings(None, None, omnigraph::ExternalBlobPolicy::Deny)
+        .unwrap();
+    assert!(replacement.shares_runtime_owner(&unprotected));
+    unprotected
+        .prepare_schema_apply_as(&desired, None)
+        .await
+        .unwrap();
+    assert_denied(
+        replacement
+            .prepare_schema_apply_as(&desired, Some("act-allowed"))
+            .await,
+        "removing policy from a new view leaves predecessor immutable",
+    );
 }
 
 #[tokio::test]
@@ -245,6 +369,49 @@ async fn mutate_as_allows_when_policy_permits_actor() {
     )
     .await
     .expect("act-allowed should be able to Change on main");
+}
+
+/// A Blob put or clear enforces `change` on its branch for the supplied actor
+/// before it opens anything, like every other Mutation-protocol writer.
+#[tokio::test]
+async fn blob_put_and_clear_enforce_change_for_the_actor() {
+    const SCHEMA: &str = "node Document { title: String @key content: Blob? }\n";
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    {
+        let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+        db.load_jsonl(
+            r#"{"type":"Document","data":{"title":"doc"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    }
+    let (db, _engine) = install_policy(Omnigraph::open(uri).await.unwrap(), dir.path());
+    let cell = || node_blob_cell("Document", "doc", "content");
+    let bytes = || bytes::Bytes::from_static(b"payload");
+
+    assert_denied(
+        db.put_blob_at_as("main", cell(), bytes(), None, Some("act-denied"))
+            .await,
+        "put_blob_at_as",
+    );
+    assert_denied(
+        db.clear_blob_at_as("main", cell(), None, Some("act-denied"))
+            .await,
+        "clear_blob_at_as",
+    );
+    let no_actor = db.put_blob_at_as("main", cell(), bytes(), None, None).await;
+    assert!(
+        matches!(no_actor, Err(OmniError::Policy(_))),
+        "an installed policy refuses a write without an actor: {no_actor:?}"
+    );
+    db.put_blob_at_as("main", cell(), bytes(), None, Some("act-allowed"))
+        .await
+        .expect("act-allowed may Change on main");
+    db.clear_blob_at_as("main", cell(), None, Some("act-allowed"))
+        .await
+        .expect("act-allowed may Change on main");
 }
 
 #[tokio::test]
@@ -529,4 +696,75 @@ async fn full_text_rebuild_enforces_selected_branch_before_effects_and_records_a
         main_after[0].graph_commit_id,
         main_before[0].graph_commit_id
     );
+}
+
+#[tokio::test]
+async fn schema_settlement_authorizes_current_executor_and_preserves_original_authorship() {
+    use omnigraph::db::{SchemaApplySettlement, SchemaNonPublicationProof};
+    for original_wins in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _) = init_with_policy(&dir).await;
+        let original = db
+            .prepare_schema_apply_as(&additive_schema(), Some("act-allowed"))
+            .await
+            .unwrap();
+        let fence = db
+            .prepare_schema_settlement_as(&original, Some("act-allowed"))
+            .await
+            .unwrap();
+        assert_denied(
+            db.prepare_schema_settlement_as(&original, Some("act-denied"))
+                .await,
+            "prepare_schema_settlement_as",
+        );
+        assert_denied(
+            db.settle_prepared_schema_as(&original, &fence, Some("act-denied"))
+                .await,
+            "settle_prepared_schema_as",
+        );
+        if original_wins {
+            db.apply_prepared_schema_as(&original, Some("act-allowed"))
+                .await
+                .unwrap();
+        }
+        let source = POLICY_YAML
+            .replace("writers: [act-allowed]", "writers: [act-other]")
+            .replace(
+                "readers: [act-denied]",
+                "readers: [act-denied, act-allowed]",
+            );
+        let (recovery, _) = install_policy_source(
+            Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+            dir.path(),
+            &source,
+        );
+        let before = recovery.list_commits(None).await.unwrap();
+        assert_denied(
+            recovery
+                .settle_prepared_schema_as(&original, &fence, Some("act-allowed"))
+                .await,
+            "authored fence is not a capability after revocation",
+        );
+        assert_eq!(recovery.list_commits(None).await.unwrap(), before);
+        let result = recovery
+            .settle_prepared_schema_as(&original, &fence, Some("act-other"))
+            .await
+            .unwrap();
+        let commit = match result {
+            SchemaApplySettlement::Committed { commit, .. } if original_wins => commit,
+            SchemaApplySettlement::NotPublished {
+                proof: SchemaNonPublicationProof::Fence { commit, .. },
+            } if !original_wins => commit,
+            other => panic!("wrong authorized settlement: {other:?}"),
+        };
+        assert_eq!(
+            commit.actor_id.as_deref(),
+            Some("act-allowed"),
+            "adoption must not rewrite authored lineage"
+        );
+        assert_eq!(
+            commit.graph_manifest_version,
+            original.base_manifest_version() + 1
+        );
+    }
 }

@@ -37,6 +37,7 @@ pub mod instrumentation;
 pub(crate) use omnigraph_core::lance_access;
 pub(crate) use omnigraph_core::{dataset_index, staging};
 pub mod loader;
+pub(crate) mod ordered_cursor;
 pub(crate) mod runtime_cache;
 pub mod seams;
 pub mod session;
@@ -46,9 +47,10 @@ pub(crate) mod table_store;
 pub(crate) mod validate;
 
 pub use blob::{
-    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
+    BLOB_READ_RANGE_MAX_BYTES, BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell,
+    BlobContent, BlobEtag, BlobPrecondition, BlobRead, BlobReader, BlobWriteOutcome,
     EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
-    ExternalBlobRef,
+    ExternalBlobRef, RangedExternalBlob, StorageRootConflict,
 };
 pub use changes::EntityKind;
 pub use omnigraph_compiler::settings;

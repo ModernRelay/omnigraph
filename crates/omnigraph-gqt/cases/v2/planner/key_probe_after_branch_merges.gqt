@@ -1,0 +1,114 @@
+# issue: none
+# traversal: auto
+# notes: Merges never extend index coverage; key_to_id on main must still return child-inserted, child-updated and main-inserted rows exactly once.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+
+--- mutate
+branch create child
+
+--- expect ok
+
+--- mutate branch: child
+query add_gamma() {
+    insert Person { slug: "gamma", age: 33 }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge child into main
+
+--- expect outcome: fast_forward
+
+--- query
+set engine = v2;
+query fast_forwarded($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "gamma"}
+--- expect unordered
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+
+--- mutate branch: child
+query bump_alpha() {
+    update Person set { age: 44 } where slug = "alpha"
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query add_delta() {
+    insert Person { slug: "delta", age: 55 }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge child into main
+
+--- expect outcome: merged
+
+--- query
+set engine = v2;
+query merged_update($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "alpha"}
+--- expect unordered
+{"p.age":44}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+
+--- query
+set engine = v2;
+query merged_main_insert($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "delta"}
+--- expect unordered
+{"p.age":55}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+
+--- query
+set engine = v2;
+query merged_child_insert($s: String) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "gamma"}
+--- expect unordered
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id

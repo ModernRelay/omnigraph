@@ -9,6 +9,29 @@ source branch into a target branch. The merge base, source, and target are
 resolved once; final publication revalidates their exact graph and native-ref
 identities.
 
+Merge first tries to prove the same merge base from the captured recent commits
+and already cached history, within a fixed visit budget. An inconclusive proof
+uses the full lineage reader. A successful proof does not validate unread
+history: missing, malformed, or conflicting settled records outside the proof
+may remain undetected until a history read reaches them.
+
+The inconclusive case walks the commit graph from both heads by generation
+(`commit_graph.rs`, `lazy_merge_base_search`), reading a commit it does not
+hold from its `__history` block. Each branch's `__manifest` also carries a
+block registry (`history_block` and `history_merge` rows, storage format 15):
+one row per released first-parent run of a block, with its slot range, the
+generation and parent of its first slot, and one row per merge commit inside
+the run. The walk crosses a registered block from its last slot to its first
+without a read and reads blocks for commits no row covers and for final
+candidates tied on distance and generation. The publisher writes the rows when it releases
+a run and refuses a run whose commits are not the chain their ids claim, so a
+block without rows is walked from its records. Registry rows past
+`REGISTRY_HOT_ROWS` live in cold fragments of `__manifest` that a publish
+reuses by reference. A registry push repacks smaller cold fragments; a merge
+caches them by data-file path and imports only rows absent from the target.
+`optimize` preserves this fragment layout; only the catalog publisher repacks it.
+See the [block registry RFC](../rfcs/2026-10-10-merge-base-block-registry.md).
+
 ## Per-table decision
 
 For every table lifetime present in the accepted catalogs, merge compares:
@@ -41,12 +64,22 @@ table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or
 payload copy, and external blob descriptors stay external. Numeric table
 versions are not compared across refs: the publication's manifest version
-orders the registration within the graph branch (RFC 0062).
+orders the registration within the graph branch (RFC 0062). Main is the
+exception twice: after an empty source delta it keeps its own registration
+(see Publication and recovery), and for a source table on a pre-v11 fork it
+applies the delta at a new version of its own lineage.
 
 The source's registration metadata stays with an adopted pointer. A later
 target write stages detached on that same dataset from the adopted pin; no
 table fork is created. Pointer adoption still computes any required
-validation delta and runs the shared constraint evaluator.
+validation delta and runs the shared constraint evaluator, except for a
+`FastForward` whose candidates are all proven pure inserts into node types
+with no `@unique`, `@range`, `@check` or enum property
+(`proven_fast_forward_needs_no_validation`). For that delta the evaluator reads
+nothing from the target; it would only check that no two new rows share a key,
+which the source's certified exact-`id` inserts already rule out. The skip
+follows the outcome, so it also bypasses the 32 MiB validation budget: such a
+`FastForward` can publish a delta larger than a `Merged` merge accepts.
 
 ## Proven insertion route
 
@@ -71,6 +104,10 @@ filter-bearing Update shape. It performs no target MergeInsert join or target
 ID preflight. The marker is not a signature and raw Lance writers remain
 unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
+The effective `write_max_bytes` is captured once. It accompanies the exact
+planned chunk rows through staging and publication, so scanner batch choices
+cannot change the admitted transaction boundaries.
+
 ## General route
 
 The `merge_lineage` session setting at `on` (the release default, `verify` in
@@ -86,7 +123,8 @@ compares their results.
 
 The fallback is an ordered three-way cursor merge. Each cursor streams one
 snapshot's rows in `id` order in two phases so no payload column ever reaches
-a SortExec input:
+a SortExec input. The change feed and export's `id` order walk tables through
+the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
 
 - a narrow ordered scan sorts only `id` + `_rowid` + `_rowaddr` (8,192 rows
   and 32 MiB per decoded batch as targets — a few dozen bytes per sorted row);
@@ -99,8 +137,9 @@ a SortExec input:
   row-width shape — the width estimate that plans chunk sizes only reduces
   retries, it is never load-bearing for the bound. A single indivisible row
   wider than the ceiling still hydrates alone;
-- Blob columns hydrate as descriptors; Blob-bearing rows are materialized
-  under the same operation budget;
+- Blob columns hydrate as descriptors; materialized Blob payloads share one
+  operation-wide `write_max_bytes` allowance (default 32 MiB), independent of
+  the row-and-descriptor allowance used for each write chunk;
 - selected new IDs stage as strict inserts, existing IDs as known-present
   updates, and removals as deletes;
 - the transaction plan is pre-minted and bounded before recovery arm;
@@ -154,16 +193,22 @@ chunks publish sequentially inside the one recovery envelope, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four, five for a non-bound target. Every publish rewrites the live
+merges at four, five for a non-bound target. A `FastForward` whose target head
+is not the merge base, such as a second merge from the same source, opens the
+base like a diverged merge and compares the two states in memory. Every
+publish rewrites the live
 `__manifest` rows into new files, normally one fragment (Lance splits a write
 at 1,048,576 rows per file), so a scan no longer pays per-fragment and
 per-deletion-file requests. Pages within a file are still read separately; the
 local history curve measured 40-41 requests per write from 1 to 1,024 prior
-publications, which is a measurement, not a guarantee. The rows still include history (`graph_commit` and every
-`table_version` registration), so the bytes decoded grow with retained
-history. Read-only scans reduce one Arrow batch at a time; the publish scan
-retains every batch, because the copy-on-write publish rewrites them, so
-publication memory grows with retained history. Each `__manifest` version
+publications, which is a measurement, not a guarantee. The rows hold the
+`table` rows, the head `graph_commit` row and the buffered `settled_commit`
+and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
+`history_release_bytes` a session set) bounds, so the bytes
+decoded per scan no longer grow with retained history; older commits live in
+`__history` and are read only when a history read needs them. Read-only scans
+reduce one Arrow batch at a time; the publish scan retains every batch,
+because the copy-on-write publish rewrites them. Each `__manifest` version
 keeps its own copy of the rows and no path prunes `__manifest` versions yet.
 
 Successful local publication preserves the existing coherent projection after
@@ -270,8 +315,16 @@ the CAS the merge is complete; nothing follows the publication.
 The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
 
 - `AlreadyUpToDate` — source adds no target-visible change;
-- `FastForward` — the target adopts source state without a divergent
-  three-way result;
+- `FastForward` — the target's state equals the merge base's: equal
+  `schema_contract` and `same_manifest_state` for every table
+  (`same_graph_state`). A target head that is the base needs no comparison
+  (`head_is_base`). Every publishing merge, a fast forward included, writes its
+  own commit, so after a fast forward the target head is no longer the base of
+  the next merge from the same source, and the state comparison decides it.
+  The comparison is by registration, so it can answer `Merged` when an earlier
+  fast forward left main on its own registration for a table: after an empty
+  source delta (see Publication and recovery), or for a source table on a
+  pre-v11 fork, whose delta main applies at a new version of its own lineage;
 - `Merged` — a productive three-way merge publishes a new graph commit.
 
 Both publishing outcomes carry their own `GraphCommit`; `AlreadyUpToDate`
@@ -284,11 +337,11 @@ structured error; it cannot replace the successful merge receipt. See
 ## Owners
 
 - `crates/omnigraph/src/exec/merge.rs` — classification and execution.
-- `crates/omnigraph/tests/merge_truth_table.rs` — operation-pair semantics.
-- `crates/omnigraph/tests/merge_fast_forward.rs` — pointer/proven-insert routes
+- `crates/omnigraph/tests/integration/merge_truth_table.rs` — operation-pair semantics.
+- `crates/omnigraph/tests/integration/merge_fast_forward.rs` — pointer/proven-insert routes
   and bounded fallback.
-- `crates/omnigraph/tests/branching.rs` — branch identity and Blob behavior.
-- `crates/omnigraph/tests/merge_cost.rs` — delta scope and manifest-history
+- `crates/omnigraph/tests/integration/branching.rs` — branch identity and Blob behavior.
+- `crates/omnigraph/tests/integration/merge_cost.rs` — delta scope and manifest-history
   cost contracts, not semantics.
 - `crates/omnigraph-core/src/instrumentation.rs` — route and timing probes.
 

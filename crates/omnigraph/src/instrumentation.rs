@@ -7,8 +7,8 @@ pub use omnigraph_core::instrumentation::{
     CountingStorageAdapter, MergeTimingReading, MergeWriteProbes, ProbedStores,
     QueryBlockingPauseGuard, QueryExecutionMetrics, QueryIoProbes, QueryLadderReport,
     QueryMemoryProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, StageWriteProbes,
-    StorageReadCounts, with_merge_write_probes, with_query_io_probes, with_query_memory_limit,
-    with_query_memory_probes, with_stage_write_probes,
+    StorageReadCounts, capture_query_io_probes, with_merge_write_probes, with_query_io_probes,
+    with_query_memory_limit, with_query_memory_probes, with_stage_write_probes,
 };
 
 // Keep this list sorted. Benchmark admission independently derives the same

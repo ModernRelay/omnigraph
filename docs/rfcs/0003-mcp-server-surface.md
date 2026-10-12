@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-08-23
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -147,7 +147,7 @@ Each built-in **reuses the exact `PolicyAction` its HTTP route already enforces*
 | `branches_create` | graph | mutate | `BranchCreate` |
 | `branches_delete` | graph | mutate | `BranchDelete` |
 | `branches_merge` | graph | mutate | `BranchMerge` |
-| `schema_apply` (`allow_data_loss`) | graph | mutate | `SchemaApply` |
+| `schema_apply` | graph | mutate | `SchemaApply` |
 | **stored query** (`find_user`, …) | graph | inferred | `InvokeQuery` (coarse; `InvokeQuery{name}` after PR 0b) + inner `Read`/`Change` |
 
 There is **no `Ingest` and no separate `snapshot`/`Export` action** — `ingest` enforces `Change`, `snapshot` enforces `Read`. (`Export` exists but maps to the `/export` route, which this RFC does not expose as a tool.)
@@ -173,7 +173,7 @@ Resources (§5.5): `omnigraph://schema`, `omnigraph://branches` (parity), plus `
 
 `nullable == false` → param is in `required`. Annotations: `mutation` → `{readOnlyHint:false, destructiveHint:true}`; else `{readOnlyHint:true}`. `description` → tool description; `instruction` → appended to description (or `_meta`). (The shipped registry checker already warns when a catalogued query declares a `Vector` param an LLM can't supply.)
 
-For built-in tools the schema is hand-authored from the route DTO; e.g. `query` → `{source: string, branch?: string, params?: object}`; `schema_apply` → `{schema: string, allow_data_loss?: boolean}`; `ingest` → `{ndjson: string, mode?: "merge"|"append"|"overwrite", branch?: string}`.
+For built-in tools the schema is hand-authored from the route DTO; e.g. `query` → `{source: string, branch?: string, params?: object}`; `schema_apply` → `{schema: string}`; `ingest` → `{ndjson: string, mode?: "merge"|"append"|"overwrite", branch?: string}`.
 
 ### 5.4 `tools/list` (Cedar-filtered) and `tools/call` (dispatch + masking)
 
@@ -295,3 +295,9 @@ Once parity lands, **collapse to one implementation**: the in-server MCP is cano
 6. **Stateless POST-only** confirmed (no near-term server-initiated messages) — revisit only if subscriptions land.
 7. **Legacy alias tools** (`read`/`change`): keep for client compat (the shipped package uses them), or drop and rely on `query`/`mutate`?
 8. **PR 0b shape:** per-query scope as a Cedar *resource* (`StoredQuery::"find_user"`) vs a `query_name` *context attribute* + policy condition — affects how `allow InvokeQuery [list]` is authored.
+
+## Decision log
+
+- 2026-10-02: The `schema_apply` tool loses its `allow_data_loss` argument,
+  following the removal of that field from the schema-apply route: a drop
+  reclaims nothing at apply, so there is no destructive mode to select.

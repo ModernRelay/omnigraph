@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - Ragnor Comerford (@ragnorc)
 created: 2026-09-01
-updated: 2026-09-30
+updated: 2026-10-05
 discussion: "https://github.com/ModernRelay/omnigraph/pull/791"
 supersedes: []
 superseded_by: []
@@ -51,8 +51,8 @@ engine v2, the only query engine since v0.12.0 (PR #795), and on the compiler.
    validation for a defined exact-search subset.
 
 Boundaries that do not change: no storage format change, no change to BM25 or
-vector scoring, the deprecated `POST /read` envelope stays byte-stable, the
-frozen reference engine keeps its bytes, and GQ gains no syntax.
+vector scoring, the frozen reference engine keeps its bytes, and GQ gains
+no syntax.
 
 Related decisions: [Shared expression model](2026-09-24-shared-expression-model.md)
 owns the query surface this RFC works within; RFC 0048
@@ -282,7 +282,6 @@ of the internal rewrite-validation guarantee.
 - `embedding_coverage` is `known` with counts only when the run already
   established them, and `unknown` otherwise. Exact counts on request belong to
   RFC 0048's result metadata contract.
-- The deprecated `POST /read` envelope carries neither array.
 
 The extension is one additive change to the envelope, made together with the
 result column types that the self-contained server testing RFC needs.
@@ -905,6 +904,9 @@ None.
 
 ## Decision log
 
+- 2026-10-05: Aligned this proposal with the maintainer-authorized removal of
+  deprecated HTTP routes. Removed Summary's `/read` byte-stability clause and
+  the read-descriptor exception for its envelope. The proposal remains draft.
 - 2026-09-01: first draft opened in PR #606, written against engine v1.
 - 2026-09-19: accepted as drafted in PR #606.
 - 2026-09-28: rewritten against engine v2 (`main` `b14c22c5`) and returned

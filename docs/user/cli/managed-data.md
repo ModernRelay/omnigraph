@@ -18,7 +18,7 @@ needed. A valid cached graph credential for your cached sign-in avoids an
 unrelated API session check; an explicit automation token verifies its own
 principal before reusing that cache. Authentication refresh never replays a
 submitted mutation. Explicit
-`cluster token --ttl 1h` remains available for credential administration.
+`cluster token --managed --ttl 1h` remains available for credential administration.
 
 The issuer must support identity credentials and admit your principal to the
 selected cluster. The credential proves who you are and which cluster you
@@ -29,13 +29,12 @@ or `change`. Ad-hoc query and mutation source uses `read` or `change`
 respectively. Control-plane admin or apply permission does not confer graph
 permission.
 
-When a changed policy is applied and activated by a server restart, it governs
-the next request using the same credential. Editing a source file alone has
-no effect. Schema changes retain the [cluster configuration
-workflow](../operations/policy.md#actions); identity credentials do not bypass
-its ownership or permission checks.
+Apply graph policy grants, revocations and binding changes through the cluster
+configuration workflow; editing a source file alone has no effect. Changes use the
+[cluster configuration workflow](../clusters/index.md#deploy-without-restarting);
+identity credentials do not bypass its ownership or permission checks.
 
-Normal issuance takes neither `--graph` nor `--actions`; choose a graph on the
+Issuance takes no `--graph`; choose a graph on the
 operation that needs it. `--ttl` accepts seconds or an `s`, `m`, `h`, or `d`
 suffix, defaults to one hour, and must be between 60 seconds and 24 hours.
 The service can shorten the requested lifetime. Issuer clock tolerance is
@@ -61,7 +60,7 @@ omnigraph graphs list --server prod --discovery --json
 Without `--discovery`, an explicit server keeps the existing graph-metadata
 listing and requires `graph_list` policy permission. The CLI does not guess
 the credential type from a token's appearance. A server that lacks discovery
-support, or a static or legacy credential, refuses this route without falling
+support, or a static credential, refuses this route without falling
 back to another inventory.
 
 ## Cached access and routing
@@ -77,7 +76,7 @@ keychain; unattended clients needing a raw token use the issuance API directly.
 Managed `query`, `mutate`, `load`, `commit list`/`show`, and `graphs list`
 read `.omnigraph/context` only in the current directory; graph-specific
 commands require `--graph`. After
-`cluster token --config DIR`, run these commands from `DIR`; no parent
+`cluster token --managed --config DIR`, run these commands from `DIR`; no parent
 directory is searched. Ordinary data requests go directly to the cached
 endpoint without contacting the control
 API. They keep working during an API outage until the token expires or its
@@ -95,7 +94,7 @@ parents and actor attribution are evidence to reconcile; a timeout alone
 never proves that a mutation failed to commit.
 
 Missing or expired identity credentials are acquired before a graph request;
-malformed caches and expired restricted credentials refuse without fallback.
+malformed or unsupported caches refuse without fallback.
 The server decides policy permissions. An explicit `--server`, `--profile`,
 `--store`, or `--cluster` selects ordinary addressing and follows that
 command's existing support
@@ -121,46 +120,14 @@ omnigraph query find_person --profile staging --graph knowledge --json
 
 Ordinary token settings never supply managed authority. Global `--direct`
 continues to select ordinary addressing and credentials, including when the
-context is malformed. Existing `cluster --direct` remains valid. Without
-managed context, existing data commands retain their behavior.
-
-## Legacy restricted credentials
-
-For an issuer that still supports the older restricted profile, request it
-explicitly by supplying both a graph and
-the exact action ceiling:
-
-```bash
-omnigraph cluster token --graph knowledge --actions read,change,invoke_query --ttl 1h
-```
-
-The provider-authenticated service uses version-2 identity issuance only and
-rejects this legacy request. The CLI retains the syntax for compatible older
-issuers; it never converts requested action restrictions into identity-only
-authority.
-
-Accepted actions are `read`, `export`, `change`, `branch_create`,
-`branch_delete`, `branch_merge`, `invoke_query`, and `graph_list`. Duplicate
-actions, wildcards, `admin`, `config_manage`, and `schema_apply` refuse. Both
-the signed ceiling and applied Cedar policy must allow an operation. The CLI
-rejects operations outside the cached ceiling before a request. Managed
-`graphs list` requires an identity credential; it never upgrades a restricted
-credential to gain discovery access. The legacy HTTP metadata catalog retains
-its graph filtering.
-
-Existing restricted caches keep their version and exact grants. An explicit
-`--actions` request is never ignored or silently changed to an identity
-credential. An unsupported issuance profile refuses and preserves the previous
-cache. Running normal `cluster token` is an explicit request to replace it
-with the identity profile, subject to the issuer's admission check. Older CLI
-versions that only understand restricted credentials cannot use that cache;
-they must be upgraded or use explicit restricted issuance.
+context is malformed. `cluster` commands without `--managed` never read managed
+context. Without managed context, existing data commands retain their behavior.
 
 ## Clear a credential
 
-`cluster token --clear [--config DIR]` forgets that cluster's local data
+`cluster token --managed --clear [--config DIR]` forgets that cluster's local data
 entry, independently of the control-plane session. Do not combine `--clear`
-with `--graph`, `--actions`, or `--ttl`. Clearing is not server revocation:
+with `--graph` or `--ttl`. Clearing is not server revocation:
 copies remain usable until expiry or signing-key retirement. `logout --api`
 clears local login credentials and requests provider-session revocation;
 `provider_revocation_confirmed` reports whether that request succeeded.
@@ -181,19 +148,29 @@ omnigraph load --graph knowledge --data batch-02.jsonl --mode append --branch re
 Every load requires `change` for that graph. `--from` additionally requires
 `branch_create` when creating the target branch. Applied Cedar policy owns
 target change permission and the base-to-target creation permission.
-Identity credentials add no action ceiling. The legacy restricted profile
-additionally requires `change` and, whenever `--from` is present,
-`branch_create` in the same graph grant. `invoke_query` is not required for loading.
+Identity credentials add no action ceiling. `invoke_query` is not required for loading.
 Review and merge use the existing branch operations and their separate
 permissions; a load does not merge its target branch.
 
 One managed load accepts at most **32 MiB (33,554,432 bytes)** of input. The
 CLI checks this before sending the request. Incremental `append` and `merge`
-also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds;
-strict loads check projected in-memory size too. The NDJSON byte bound does
-not prove that a batch fits those [engine limits](../mutations/index.md#limits-and-conflicts).
-Split prepared inputs into suitable batches, preserving endpoint dependencies
-and recording each batch's returned commit.
+also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds, plus
+**32 MiB across retained keyed batches** and a separate parsed-payload estimate
+across types. Strict loads check projected in-memory size too. The NDJSON byte
+bound does not prove that a batch fits those
+[engine limits](../mutations/index.md#limits-and-conflicts).
+Split prepared `append` and `merge` inputs into suitable batches, preserving
+endpoint dependencies and recording each batch's returned commit. Blob values carry
+their own [limits](../blobs.md#limits).
+
+`overwrite` also refuses when the IDs it removes exceed **32 MiB per
+operation**, summed over all touched types. Each removed ID is charged its UTF-8
+length plus 24 bytes, so the allowance holds 671,088 IDs of 26 bytes, the
+length of a generated ID. Entities loaded without a `@key` and without an
+explicit `id` get a new generated ID on every load, so overwriting them removes
+every committed ID of that type. A delete and the edges it cascades to draw on
+the same allowance. No setting changes it. An overwrite cannot be split; a
+delete can be split into several commits.
 
 The request has a **300-second deadline**, including receipt download, with
 at most **10 seconds to connect** and **8 MiB of response data**. The CLI

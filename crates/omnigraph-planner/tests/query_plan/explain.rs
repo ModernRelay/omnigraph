@@ -19,7 +19,10 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
                 dst_filters: vec![IRExpr::comparison(
                     prop("b", "state"),
                     CompOp::Eq,
-                    IRExpr::Literal(Literal::String("open".into())),
+                    IRExpr::Literal(
+                        Literal::String("open".into()),
+                        value_type(ScalarType::String, false),
+                    ),
                 )],
                 edge_binding: None,
             },
@@ -167,10 +170,16 @@ fn physical_expand_carries_its_pinned_edge_version() {
 #[test]
 fn physical_anti_join_predicate_reads_back_equal() {
     let predicate = omnigraph_compiler::ir::SubqueryPredicate {
-        func: AggFunc::Max,
-        arg: Some(prop("x", "rank")),
+        left: omnigraph_compiler::ir::BlockAggregateExpr::Aggregate {
+            func: AggFunc::Max,
+            arg: Box::new(prop("x", "rank")),
+            signature: omnigraph_compiler::AggSignature {
+                arg: value_type(ScalarType::String, true),
+                result: value_type(ScalarType::String, true),
+            },
+        },
         op: CompOp::Gt,
-        right: IRExpr::Param("since".to_string()),
+        right: IRExpr::Param("since".to_string(), value_type(ScalarType::String, false)),
     };
     let op = ir(
         vec![
@@ -197,7 +206,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
         plan: physical,
         values: omnigraph_planner::ValueTable {
             params: Arc::new(
-                [("since".to_string(), Literal::Integer(3))]
+                [("since".to_string(), Literal::String("3".into()))]
                     .into_iter()
                     .collect(),
             ),
@@ -228,16 +237,17 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         name: "q".to_string(),
         params: vec![],
         pipeline: vec![scan("c")],
-        return_exprs: vec![IRProjection {
-            expr: prop("c", "slug"),
-            alias: None,
-        }],
+        return_exprs: vec![projection(prop("c", "slug"), &[scan("c")])],
         order_by: vec![
             IROrdering {
                 expr: IRExpr::Nearest {
                     variable: "c".to_string(),
                     property: "embedding".to_string(),
-                    query: Box::new(IRExpr::Param("q".to_string())),
+                    query: Box::new(IRExpr::Param(
+                        "q".to_string(),
+                        value_type(ScalarType::String, false),
+                    )),
+                    ty: value_type(ScalarType::F32, false),
                 },
                 descending: false,
             },
@@ -291,6 +301,8 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
             "kind": "nearest",
             "property": "embedding",
             "query": "$q",
+            "typed_query": {"op":"param", "gq":"$q", "type":"String", "args":[]},
+            "typed_score": {"op":"property", "gq":"$c._distance", "type":"F32", "args":[]},
             "fetch": 10,
             "nprobes": null,
             "scope": "order",
@@ -304,13 +316,17 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
 }
 
 /// A bare search order plans the score `Sort` the engine runs, with the
-/// query's limit as its fetch; a fusion plans none, since it orders its own
-/// rows, and each arm keeps every cross-binding conjunct in its own subtree.
+/// query's limit as its fetch; a fusion plans the same `Sort` over its fused
+/// score column, and each arm keeps every cross-binding conjunct in its subtree.
 #[test]
 fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     let bm25 = IRExpr::Bm25 {
         field: Box::new(prop("c", "text")),
-        query: Box::new(IRExpr::Param("t".to_string())),
+        query: Box::new(IRExpr::Param(
+            "t".to_string(),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     let (plan, _) = physical(
         &ir(vec![scan("c")], vec![prop("c", "slug")], vec![bm25.clone()]),
@@ -332,10 +348,15 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
         primary: Box::new(IRExpr::Nearest {
             variable: "c".to_string(),
             property: "embedding".to_string(),
-            query: Box::new(IRExpr::Param("q".to_string())),
+            query: Box::new(IRExpr::Param(
+                "q".to_string(),
+                value_type(ScalarType::String, false),
+            )),
+            ty: value_type(ScalarType::F32, false),
         }),
         secondary: Box::new(bm25),
         k: None,
+        ty: value_type(ScalarType::F64, false),
     };
     let contains = IRExpr::comparison(prop("c", "text"), CompOp::StringContains, prop("n", "slug"));
     let residual = IRExpr::comparison(prop("n", "slug"), CompOp::Ne, prop("c", "slug"));
@@ -355,15 +376,16 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     );
     let json = plan.to_json();
     assert_eq!(json["node"], "Page");
-    assert_eq!(json["inputs"][0]["node"], "Projection");
-    let fuse = &json["inputs"][0]["inputs"][0];
+    let sort = &json["inputs"][0];
+    assert_eq!(sort["node"], "Sort");
+    assert_eq!(sort["keys"], serde_json::json!(["$c._rrf desc"]));
+    assert_eq!(sort["fetch"], 10);
+    assert_eq!(sort["inputs"][0]["node"], "Projection");
+    let fuse = &sort["inputs"][0]["inputs"][0];
     assert_eq!(fuse["node"], "RankFuse");
     assert_eq!(fuse["limit"], 10);
     assert!(fuse["k"].is_null());
-    assert_eq!(
-        fuse["properties"]["ordering"],
-        serde_json::json!(["rrf($c, $c) desc"])
-    );
+    assert!(fuse["properties"]["ordering"].is_null());
     let arms = fuse["inputs"].as_array().expect("two arm inputs");
     assert_eq!(arms.len(), 2);
     assert_ne!(arms[0]["id"], arms[1]["id"]);
@@ -395,10 +417,12 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
     assert_ne!(arms[0]["inputs"][1]["id"], arms[1]["inputs"][1]["id"]);
     assert_eq!(arms[0]["inputs"][1]["ranked"]["fetch"], 10);
     assert!(arms[1]["inputs"][1]["ranked"]["fetch"].is_null());
-    assert!(
-        !plan
-            .live()
-            .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+    assert_eq!(
+        plan.live()
+            .filter(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+            .count(),
+        1,
+        "one Sort above the fusion, none inside an arm"
     );
 }
 
@@ -438,7 +462,8 @@ fn a_cross_join_side_keeps_its_operators_and_a_query_explain_has_no_pipelines() 
         omnigraph_planner::RouteOverride::Registry,
         &bounds(),
     );
-    let explain = decision.explain();
+    let decision = futures::executor::block_on(decision.finalize(&source()));
+    let explain = decision.explain().unwrap();
     assert_eq!(explain.route, "engine");
     assert!(explain.physical_plan.is_some());
     assert!(explain.pipelines.is_none());

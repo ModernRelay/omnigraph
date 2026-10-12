@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
@@ -22,6 +22,16 @@ pub struct Diagnostic {
     pub code: String,
     pub path: String,
     pub message: String,
+}
+
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} at {}: {}",
+            self.code, self.path, self.message
+        )
+    }
 }
 
 impl Diagnostic {
@@ -141,28 +151,51 @@ where
 }
 
 pub(crate) fn read_yaml_file(path: &Path, noun: &str) -> Result<String, Diagnostic> {
-    let file = File::open(path).map_err(|error| {
+    read_text_file(path, MAX_YAML_BYTES, noun)
+}
+
+pub(crate) fn read_text_file(
+    path: &Path,
+    max_bytes: usize,
+    noun: &str,
+) -> Result<String, Diagnostic> {
+    let failure = |message: String| {
         Diagnostic::error(
             format!("{noun}_read_error"),
             path.display().to_string(),
-            format!("could not open {noun} file: {error}"),
+            message,
         )
-    })?;
-    let mut source = String::new();
-    file.take(MAX_YAML_BYTES as u64 + 1)
-        .read_to_string(&mut source)
-        .map_err(|error| {
-            Diagnostic::error(
-                format!("{noun}_read_error"),
-                path.display().to_string(),
-                format!("could not read {noun} file as UTF-8: {error}"),
-            )
-        })?;
-    if source.len() > MAX_YAML_BYTES {
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| failure(format!("could not open {noun} file: {e}")))?;
+    let metadata = file.metadata().map_err(|e| failure(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(failure(format!("{noun} must be a regular file")));
+    }
+    if metadata.len() > max_bytes as u64 {
         return Err(Diagnostic::error(
             format!("{noun}_yaml_too_large"),
             path.display().to_string(),
-            format!("{noun} YAML must be <= {MAX_YAML_BYTES} bytes"),
+            format!("{noun} must be <= {max_bytes} bytes"),
+        ));
+    }
+    let mut source = String::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut source)
+        .map_err(|e| failure(format!("could not read {noun} as UTF-8: {e}")))?;
+    if source.len() > max_bytes {
+        return Err(Diagnostic::error(
+            format!("{noun}_yaml_too_large"),
+            path.display().to_string(),
+            format!("{noun} must be <= {max_bytes} bytes"),
         ));
     }
     Ok(source)
@@ -184,6 +217,17 @@ pub(crate) fn typed_sha256<T: Serialize>(value: &T) -> Result<String, Diagnostic
     let mut digest = Sha256::new();
     digest.update(bytes);
     Ok(format!("{:x}", digest.finalize()))
+}
+
+/// True for exactly 64 lowercase hexadecimal characters.
+pub fn digest(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn valid_kebab_id(value: &str) -> bool {

@@ -1,6 +1,7 @@
 //! `RankFuseExec` drains and ranks both arms by score, fused identity, and
 //! downstream row keys. `fuse_arms` sums reciprocal ranks per entity and
-//! reconstructs each winner's output in fused order.
+//! emits every arm row with that sum in the fused score column; the `Sort`
+//! above orders and cuts (RFC 0047 §Total order).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -17,7 +18,7 @@ use datafusion::physical_plan::{
 
 use super::memory::WorkMemory;
 use super::{breaker_properties, breaker_stream, conform_positional, drain_one, external, polled};
-use crate::engine::graph::fuse_arms;
+use crate::engine::graph::{fuse_arms, fused_schema};
 use crate::engine::search::RrfMode;
 use crate::error::OmniError;
 
@@ -34,6 +35,8 @@ pub(crate) struct RankFuseExec {
     secondary: Arc<dyn ExecutionPlan>,
     rrf: RrfMode,
     id_column: String,
+    /// The fused score column appended after the primary arm's columns.
+    fused_score: String,
     orders: [ArmOrder; 2],
     row_tiebreak: Vec<String>,
     properties: Arc<PlanProperties>,
@@ -46,15 +49,17 @@ impl RankFuseExec {
         secondary: Arc<dyn ExecutionPlan>,
         rrf: RrfMode,
         id_column: String,
+        fused_score: String,
         orders: [ArmOrder; 2],
         row_tiebreak: Vec<String>,
     ) -> Self {
-        let schema = primary.schema();
+        let schema = fused_schema(&primary.schema(), &fused_score);
         Self {
             primary,
             secondary,
             rrf,
             id_column,
+            fused_score,
             orders,
             row_tiebreak,
             properties: breaker_properties(schema),
@@ -67,8 +72,8 @@ impl fmt::Debug for RankFuseExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RankFuseExec")
             .field("id_column", &self.id_column)
+            .field("fused_score", &self.fused_score)
             .field("k", &self.rrf.k)
-            .field("limit", &self.rrf.limit)
             .finish_non_exhaustive()
     }
 }
@@ -77,10 +82,10 @@ impl DisplayAs for RankFuseExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RankFuseExec: on={}, k={}, limit={}, arms=[{} {}, {} {}]",
+            "RankFuseExec: on={}, score={}, k={}, arms=[{} {}, {} {}]",
             self.id_column,
+            self.fused_score,
             self.rrf.k,
-            self.rrf.limit,
             self.orders[0].score_column,
             direction(self.orders[0].descending),
             self.orders[1].score_column,
@@ -173,6 +178,7 @@ impl ExecutionPlan for RankFuseExec {
             secondary,
             self.rrf,
             self.id_column.clone(),
+            self.fused_score.clone(),
             self.orders.clone(),
             self.row_tiebreak.clone(),
         )))
@@ -191,6 +197,7 @@ impl ExecutionPlan for RankFuseExec {
         let secondary = self.secondary.execute(0, Arc::clone(&ctx))?;
         let rrf = self.rrf;
         let id_column = self.id_column.clone();
+        let fused_score = self.fused_score.clone();
         let orders = self.orders.clone();
         let row_tiebreak = self.row_tiebreak.clone();
         let declared = Arc::clone(&schema);
@@ -218,8 +225,15 @@ impl ExecutionPlan for RankFuseExec {
                             &row_tiebreak,
                             &reservation,
                         )?;
-                        let fused = fuse_arms(&primary, &secondary, &rrf, &id_column, &reservation)
-                            .map_err(external)?;
+                        let fused = fuse_arms(
+                            &primary,
+                            &secondary,
+                            &rrf,
+                            &id_column,
+                            &fused_score,
+                            &reservation,
+                        )
+                        .map_err(external)?;
                         conform_positional(fused, &declared).map_err(external)
                     })
                     .await
@@ -272,8 +286,9 @@ mod tests {
         let fused = fuse_arms(
             &ranked,
             &ranked,
-            &RrfMode { k: 60, limit: 1 },
+            &RrfMode { k: 60 },
             "p.__id",
+            "p._rrf",
             &memory,
         )
         .unwrap();
@@ -282,5 +297,12 @@ mod tests {
             crate::engine::graph::extract_id_column_by_name(&fused, &edge_type).unwrap(),
             types
         );
+        let scores = fused
+            .column_by_name("p._rrf")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[2.0 / 61.0; 3]);
     }
 }

@@ -22,7 +22,10 @@ with its first parent. Each response includes:
   optional actor, and authorship time in Unix microseconds.
 - `changes`: inserts with `after`, updates with `before` and `after`,
   and deletes with `before`. Each image contains `properties`; an edge image
-  also contains `endpoints: {from, to}`.
+  also contains `endpoints: {from, to}`. A Blob property holds its export
+  value (`base64:…` or an external URI), or, for a stored reference to a byte
+  range of an object, `{"uri", "offset", "length"}` (see
+  [Blobs](../blobs.md)).
 
 Filter with repeatable `--kind node|edge`, `--type <name>`, and
 `--op insert|update|delete` options. `--limit` defaults to 1,000 and may be
@@ -102,6 +105,12 @@ one terminal record:
 ```json
 {"baseline":{"snapshot_commit_id":"...","resume_cursor":"..."}}
 ```
+
+Snapshot records use the export line format, and a Blob property holds the
+same value shapes as a change image. That includes the
+`{"uri", "offset", "length"}` object for a stored reference to a byte range of
+an object, which export refuses; a snapshot holding one does not reload with
+`load` (see [Blobs](../blobs.md)).
 
 An interrupted stream has no terminal record and therefore no usable cursor.
 Install the complete snapshot durably before saving `resume_cursor`; the

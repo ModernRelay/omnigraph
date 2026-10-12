@@ -1,0 +1,46 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64
+
+--- restart
+
+--- query
+query grouped_fanout() {
+    match { $p: Person $p knows $q }
+    return { $p.team, count($q) as n }
+}
+--- expect unordered
+{"p.team":"g0","n":10}
+{"p.team":"g1","n":10}
+--- expect shape
+p.team: String
+n: I64

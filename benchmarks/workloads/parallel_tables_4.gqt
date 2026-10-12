@@ -1,0 +1,83 @@
+# issue: none
+# notes: One mutation changes 4 tables; exact touched and untouched rows. No actor-overlap claim.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query update_tables() {
+    update T0 set { value: 1 } where key = "row"
+    update T1 set { value: 1 } where key = "row"
+    update T2 set { value: 1 } where key = "row"
+    update T3 set { value: 1 } where key = "row"
+}
+--- expect affected: nodes=4 edges=0
+
+--- query branch: main
+query current_rows() { match { $r: T0 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T1 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T2 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T3 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: T0 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T1 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T2 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T3 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":1}
+--- expect shape
+key: String
+value: I64

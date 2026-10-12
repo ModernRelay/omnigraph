@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use futures::StreamExt;
 use lance::index::DatasetIndexExt;
 
-use crate::db::commit_graph::{CommitGraph, GraphCommit, MergeBaseResolver};
+use crate::db::commit_graph::{CommitGraph, GraphCommit, Lineage, MergeBaseResolver};
 use crate::db::manifest::retention::{ManifestTagInventory, incarnation_digest, merge_input_owner};
 use crate::db::manifest::{CatalogSnapshot, CollectorBranch, DatasetEntry, ManifestCoordinator};
 use crate::db::omnigraph::Omnigraph;
@@ -179,6 +179,10 @@ pub struct CollectorReport {
     /// Nonce-owned tags whose target can no longer publish, released only by
     /// destructive cleanup after planning. Inspection never mutates storage.
     pub(crate) expired_merge_input_tags: Vec<String>,
+    /// Proposal tags whose unpublished commit can no longer be published
+    /// (RFC "Unpublished graph commits"), released beside the merge-input
+    /// tags by destructive cleanup.
+    pub(crate) expired_unpublished_tags: Vec<String>,
     /// Owners visible in the same graph cut as every physical root.
     pub(crate) live_branch_incarnations: HashSet<String>,
     /// Retired graph trees still supplying an exact root or imported lineage.
@@ -591,7 +595,10 @@ struct BranchView {
     identifier: String,
     manifest_version: u64,
     head: Option<String>,
-    commit_graph: Option<CommitGraph>,
+    commit_graph: CommitGraph,
+    /// The lineage of the captured head, read when a staging's judgement
+    /// first needs it.
+    ancestry: Option<Lineage>,
     /// The branch's first-parent lineage strictly below the snapshot's head,
     /// walked as far as a staging's judgement needed it.
     lineage: HashSet<String>,
@@ -603,7 +610,7 @@ impl BranchView {
     /// Whether `commit` sits on the branch's first-parent lineage strictly
     /// below the snapshot's head. The walk starts at that head, so a commit
     /// published after the snapshot is never found.
-    async fn lineage_holds(&mut self, db: &Omnigraph, commit: &str) -> Result<bool> {
+    async fn lineage_holds(&mut self, commit: &str) -> Result<bool> {
         if self.lineage.contains(commit) {
             return Ok(true);
         }
@@ -612,23 +619,17 @@ impl BranchView {
             let Some(head) = self.head.clone() else {
                 return Ok(false);
             };
-            if self.commit_graph.is_none() {
-                self.commit_graph = Some(match &self.branch {
-                    Some(branch) => CommitGraph::open_at_branch(db.root_uri(), branch).await?,
-                    None => CommitGraph::open(db.root_uri()).await?,
-                });
-            }
-            self.lineage_cursor = self
-                .commit_graph
-                .as_ref()
-                .and_then(|graph| graph.get_commit(&head))
-                .and_then(|commit| commit.parent_commit_id);
+            let ancestry = self.commit_graph.lineage().await?;
+            self.lineage_cursor = ancestry
+                .get_commit(&head)
+                .and_then(|commit| commit.parent_commit_id.clone());
+            self.ancestry = Some(ancestry);
         }
-        let graph = self.commit_graph.as_ref();
+        let ancestry = self.ancestry.as_ref();
         while let Some(id) = self.lineage_cursor.take() {
-            self.lineage_cursor = graph
-                .and_then(|graph| graph.get_commit(&id))
-                .and_then(|commit| commit.parent_commit_id)
+            self.lineage_cursor = ancestry
+                .and_then(|ancestry| ancestry.get_commit(&id))
+                .and_then(|commit| commit.parent_commit_id.clone())
                 .filter(|parent| !self.lineage.contains(parent));
             self.lineage.insert(id.clone());
             if id == commit {
@@ -646,8 +647,10 @@ fn incarnation_key(identifier: &lance::dataset::refs::BranchIdentifier) -> Resul
     })
 }
 
-/// The `__manifest` versions `keep` and `cutoff` retain (the per-table rule of
-/// `cleanup_old_versions` per branch), HEAD always among them and, with
+/// The `__manifest` versions `keep` and `cutoff` retain: the newest-N /
+/// newer-than rule of Lance's `cleanup_old_versions`, applied to graph commits
+/// (`__manifest` versions) per branch rather than to a table's Lance versions.
+/// HEAD is always among them and, with
 /// `keep_base` (a graph branch, deleting), its oldest: the fork-point merge base.
 fn retained_versions(
     versions: &[lance::dataset::Version],
@@ -718,8 +721,8 @@ fn record_roots(
     }
 }
 
-/// The same lazy import frontier as merge, evaluated entirely from captured
-/// live lineages. Retired histories supply records no current branch carries.
+/// The merge bases of every pair of captured heads, over the lineages of those
+/// heads. Retired histories supply records no lineage carries.
 async fn retained_merge_bases(
     db: &Omnigraph,
     branches: &[(Option<String>, CommitGraph, Option<String>)],
@@ -728,6 +731,10 @@ async fn retained_merge_bases(
     let mut bases = BTreeMap::new();
     let mut imported_owners = HashSet::new();
     let mut retired = None;
+    let mut lineages = Vec::with_capacity(branches.len());
+    for (_, graph, _) in branches {
+        lineages.push(graph.lineage().await?);
+    }
     for left in 0..branches.len() {
         for right in left + 1..branches.len() {
             let (Some(source_head), Some(target_head)) =
@@ -738,9 +745,8 @@ async fn retained_merge_bases(
             if source_head == target_head {
                 continue;
             }
-            let source = branches[left].1.snapshot();
-            let target = branches[right].1.snapshot();
-            let mut resolver = MergeBaseResolver::new(&source, &target, source_head, target_head);
+            let (source, target) = (&lineages[left], &lineages[right]);
+            let mut resolver = MergeBaseResolver::new(source, target, source_head, target_head);
             for (name, graph, _) in branches[..live_count].iter().rev() {
                 if !resolver.search().needs_import() {
                     break;
@@ -751,8 +757,10 @@ async fn retained_merge_bases(
             }
             if resolver.search().needs_import() {
                 if retired.is_none() {
-                    retired =
-                        Some(ManifestCoordinator::retired_commit_graphs(db.root_uri()).await?);
+                    retired = Some(
+                        ManifestCoordinator::retired_commit_graphs(db.root_uri(), &db.history)
+                            .await?,
+                    );
                 }
                 for (native, graph) in retired.as_ref().expect("retired histories were loaded") {
                     if !resolver.search().needs_import() {
@@ -815,6 +823,28 @@ impl TableTagInventory {
     }
 }
 
+// Listing precedes cleanup's control-gate acquisition; a listed branch can
+// retire while cleanup waits for its gate. The report-only path holds no gates.
+// A missing inventory member invalidates the whole capture, just like a changed
+// identity or head. Only the matching typed branch miss proves this conflict:
+// missing manifests, malformed refs and other storage failures keep their cause.
+async fn open_inventory_branch(db: &Omnigraph, branch: Option<&str>) -> Result<CollectorBranch> {
+    ManifestCoordinator::collector_branch_under_control_gates(
+        db.root_uri(),
+        branch,
+        &db.control_session(),
+    )
+    .await
+    .map_err(|error| match error {
+        OmniError::BranchNotFound { branch: missing } if branch == Some(missing.as_str()) => {
+            OmniError::manifest_conflict(format!(
+                "collector branch '{missing}' disappeared during capture; retry cleanup"
+            ))
+        }
+        other => other,
+    })
+}
+
 /// Plan one run over `branches` (every live graph branch), deleting nothing.
 pub(crate) async fn plan_collection(
     db: &Omnigraph,
@@ -830,12 +860,7 @@ pub(crate) async fn plan_collection(
     let mut roots = PinRoots::new();
     let mut tables = TableLocations::new();
     let mut table_tags = HashMap::new();
-    let main = ManifestCoordinator::collector_branch_under_control_gates(
-        db.root_uri(),
-        None,
-        &db.control_session(),
-    )
-    .await?;
+    let main = open_inventory_branch(db, None).await?;
     let tags = ManifestTagInventory::capture(main.dataset()).await?;
     let registry = main.clone();
     let mut main = Some(main);
@@ -844,14 +869,7 @@ pub(crate) async fn plan_collection(
             None => main.take().ok_or_else(|| {
                 OmniError::manifest_internal("collector captured main more than once")
             })?,
-            Some(_) => {
-                ManifestCoordinator::collector_branch_under_control_gates(
-                    db.root_uri(),
-                    branch.as_deref(),
-                    &db.control_session(),
-                )
-                .await?
-            }
+            Some(_) => open_inventory_branch(db, branch.as_deref()).await?,
         };
         report.cost.manifest_snapshots += 1;
         report
@@ -882,29 +900,27 @@ pub(crate) async fn plan_collection(
             rows.entry(location).or_default().push(entry);
         }
         let snapshot = opened.snapshot().await?;
-        let graph = opened.commit_graph().await?;
-        let effective_head = snapshot
-            .graph_head(branch.as_deref())
-            .map(str::to_string)
-            .or(graph.head_commit_id().await?);
-        captured_lineages.push((branch.clone(), graph.capture(), effective_head));
+        let graph = opened.commit_graph(&db.history).await?;
+        let effective_head = Some(graph.head().graph_commit_id.clone());
+        captured_lineages.push((branch.clone(), graph.clone(), effective_head));
         for version in &retained {
             if *version == head_version {
                 record_roots(db, &snapshot, &mut roots, &mut tables);
                 continue;
             }
-            let pinned =
-                ManifestCoordinator::snapshot_at(db.root_uri(), branch.as_deref(), *version)
-                    .await?;
+            let pinned = opened.snapshot_at(*version, &db.history).await?;
             report.cost.manifest_snapshots += 1;
-            record_roots(db, &pinned, &mut roots, &mut tables);
+            if let Some(pinned) = pinned {
+                record_roots(db, &pinned, &mut roots, &mut tables);
+            }
         }
         views.push(BranchView {
             branch: branch.clone(),
             identifier: incarnation_key(opened.identifier())?,
             manifest_version: head_version,
             head: snapshot.graph_head(branch.as_deref()).map(str::to_string),
-            commit_graph: Some(graph),
+            commit_graph: graph,
+            ancestry: None,
             lineage: HashSet::new(),
             lineage_cursor: None,
             lineage_started: false,
@@ -917,6 +933,26 @@ pub(crate) async fn plan_collection(
     }
     let live_count = captured_lineages.len();
     for (name, tag) in &tags.tags {
+        if crate::db::manifest::is_unpublished_tag(name) {
+            let candidate =
+                crate::db::manifest::UnpublishedCommit::from_inventory(&tags, db.root_uri(), name)
+                    .await?;
+            report.cost.manifest_snapshots += 1;
+            match candidate.lifetime {
+                crate::db::manifest::UnpublishedLifetime::Expired(_) => {
+                    report.expired_unpublished_tags.push(name.clone());
+                }
+                crate::db::manifest::UnpublishedLifetime::Live
+                | crate::db::manifest::UnpublishedLifetime::Undecidable(_) => {
+                    report
+                        .protected_manifest_branches
+                        .extend(tag.branch.iter().cloned());
+                    let snapshot = candidate.snapshot(db.root_uri())?;
+                    record_roots(db, &snapshot, &mut roots, &mut tables);
+                }
+            }
+            continue;
+        }
         let dead = if let Some(owner) = merge_input_owner(name)? {
             if let Some(view) = views
                 .iter_mut()
@@ -925,7 +961,7 @@ pub(crate) async fn plan_collection(
                 if view.head == owner.graph_head {
                     false
                 } else if let Some(head) = owner.graph_head.as_deref() {
-                    view.lineage_holds(db, head).await?
+                    view.lineage_holds(head).await?
                 } else {
                     true
                 }
@@ -945,17 +981,13 @@ pub(crate) async fn plan_collection(
             .extend(tag.branch.iter().cloned());
         report.cost.manifest_snapshots += 1;
         record_roots(db, &pinned.snapshot, &mut roots, &mut tables);
-        let graph = pinned.commit_graph(db.root_uri()).await?;
+        let graph = pinned.commit_graph(db.root_uri(), &db.history).await?;
         let branch = tag
             .branch
             .as_deref()
             .map(crate::branch_names::logical_branch_name)
             .map(str::to_string);
-        let head = pinned
-            .snapshot
-            .graph_head(branch.as_deref())
-            .map(str::to_string)
-            .or(graph.head_commit_id().await?);
+        let head = Some(graph.head().graph_commit_id.clone());
         if !captured_lineages
             .iter()
             .any(|(_, _, previous)| previous == &head)
@@ -1015,12 +1047,7 @@ pub(crate) async fn plan_collection(
         ));
     }
     for view in &views {
-        let current = ManifestCoordinator::collector_branch_under_control_gates(
-            db.root_uri(),
-            view.branch.as_deref(),
-            &db.control_session(),
-        )
-        .await?;
+        let current = open_inventory_branch(db, view.branch.as_deref()).await?;
         report.cost.manifest_rechecks += 1;
         if current.head_version() != view.manifest_version
             || incarnation_key(current.identifier())? != view.identifier
@@ -1427,7 +1454,7 @@ async fn judge_outside(
                 "no staging witness recorded; a writer from before the witness staged it"
                     .to_string(),
             ),
-            Some(witness) => judge_staging(db, &witness, views, post_inventory_live).await?,
+            Some(witness) => judge_staging(&witness, views, post_inventory_live).await?,
         };
         if !matches!(verdict, StagingVerdict::Dead(_)) {
             plan.borrowed_origins
@@ -1743,7 +1770,6 @@ async fn referenced_paths(
 /// Keep captured head decisions; judge absent owners only against a complete
 /// authority inventory captured after the staging list. Native IDs never recur.
 async fn judge_staging(
-    db: &Omnigraph,
     witness: &StagingWitness,
     views: &mut [BranchView],
     post_inventory_live: &BTreeSet<String>,
@@ -1775,7 +1801,7 @@ async fn judge_staging(
             view.head.as_deref().unwrap_or("none")
         )));
     };
-    Ok(if view.lineage_holds(db, recorded).await? {
+    Ok(if view.lineage_holds(recorded).await? {
         StagingVerdict::Dead(format!(
             "the branch's head moved past {recorded} to {}",
             view.head.as_deref().unwrap_or("none")
@@ -2002,7 +2028,9 @@ mod borrowed_origin_tests {
     use super::*;
     use crate::Session;
     use crate::db::ReadTarget;
-    use crate::db::manifest::{DatasetUpdate, ManifestChange, TableVersionMetadata};
+    use crate::db::manifest::{
+        DatasetUpdate, HistoryReleaseBytes, ManifestChange, TableVersionMetadata,
+    };
     use crate::loader::LoadMode;
     use crate::settings::SessionSettings;
     use arrow_array::{Array, Int32Array, StringArray};
@@ -2116,7 +2144,7 @@ mod borrowed_origin_tests {
             .unwrap()
             .with_last_linear_version(Some(native_version));
         let lineage = db
-            .new_lineage_intent_for_branch(Some("legacy"), None)
+            .new_lineage_intent_for_branch(Some("legacy"), None, HistoryReleaseBytes::PRODUCTION)
             .await
             .unwrap();
         coordinator
@@ -2324,7 +2352,9 @@ mod overlay_retention_tests {
     use super::*;
     use crate::Session;
     use crate::db::ReadTarget;
-    use crate::db::manifest::{DatasetUpdate, ManifestChange, TableVersionMetadata};
+    use crate::db::manifest::{
+        DatasetUpdate, HistoryReleaseBytes, ManifestChange, TableVersionMetadata,
+    };
     use crate::loader::LoadMode;
     use crate::settings::SessionSettings;
     use arrow_array::{Array, Int32Array};
@@ -2429,7 +2459,10 @@ mod overlay_retention_tests {
         let version = overlay.version().version;
         if !foreign {
             let mut coordinator = ManifestCoordinator::open(uri).await.unwrap();
-            let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
+            let lineage = db
+                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
+                .await
+                .unwrap();
             coordinator
                 .commit_changes_with_lineage(
                     &[ManifestChange::Update(DatasetUpdate {
@@ -2567,7 +2600,9 @@ mod native_table_tag_tests {
     use super::*;
     use crate::Session;
     use crate::db::ReadTarget;
-    use crate::db::manifest::{DatasetUpdate, ManifestChange, TableVersionMetadata};
+    use crate::db::manifest::{
+        DatasetUpdate, HistoryReleaseBytes, ManifestChange, TableVersionMetadata,
+    };
     use crate::loader::LoadMode;
     use crate::settings::SessionSettings;
     use arrow_array::{Array, StringArray};
@@ -2592,7 +2627,7 @@ mod native_table_tag_tests {
             .unwrap()
             .clone();
         let lineage = db
-            .new_lineage_intent_for_branch(Some("legacy"), None)
+            .new_lineage_intent_for_branch(Some("legacy"), None, HistoryReleaseBytes::PRODUCTION)
             .await
             .unwrap();
         coordinator

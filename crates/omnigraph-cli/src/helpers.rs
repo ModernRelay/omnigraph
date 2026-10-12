@@ -8,7 +8,7 @@ use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
+    BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
 };
 use omnigraph_compiler::settings::SettingId;
 
@@ -591,35 +591,7 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
             }
             _ => text,
         };
-        if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
-                && error
-                    .precondition_failure
-                    .as_ref()
-                    .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
-                && error.code.is_none()
-                && crate::command_outcome::single_request()
-                && {
-                    let mut rest = error.clone();
-                    rest.precondition_failure = None;
-                    crate::command_outcome::is_plain_refusal(&rest)
-                };
-            if verified_precondition {
-                return Err(PreconditionFailedCli {
-                    output: error,
-                    http_status: Some(status.as_u16()),
-                    retry_after,
-                }
-                .into());
-            }
-            return Err(RemoteErrorCli {
-                output: error,
-                status,
-                retry_after,
-            }
-            .into());
-        }
-        bail!("server returned {}: {}", status, text);
+        return Err(remote_refusal(status, text, retry_after, expected_commit));
     }
     if response_limit.is_some() {
         // Serde errors can include rejected field values, including a reflected secret.
@@ -628,6 +600,67 @@ async fn remote_response_json_with_precondition<T: DeserializeOwned>(
     } else {
         Ok(serde_json::from_str(&text)?)
     }
+}
+
+/// A non-success response as the typed refusal every remote call raises: a
+/// verified 412 as [`PreconditionFailedCli`], any other `ErrorOutput` body as
+/// [`RemoteErrorCli`], a body that is not one as the status and text.
+fn remote_refusal(
+    status: reqwest::StatusCode,
+    text: String,
+    retry_after: Option<String>,
+    expected_commit: Option<&str>,
+) -> color_eyre::eyre::Report {
+    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+        let verified_precondition = status == reqwest::StatusCode::PRECONDITION_FAILED
+            && error
+                .precondition_failure
+                .as_ref()
+                .is_some_and(|details| Some(details.expected.as_str()) == expected_commit)
+            && error.code.is_none()
+            && crate::command_outcome::single_request()
+            && {
+                let mut rest = error.clone();
+                rest.precondition_failure = None;
+                crate::command_outcome::is_plain_refusal(&rest)
+            };
+        if verified_precondition {
+            return PreconditionFailedCli {
+                output: error,
+                http_status: Some(status.as_u16()),
+                retry_after,
+            }
+            .into();
+        }
+        return RemoteErrorCli {
+            output: error,
+            status,
+            retry_after,
+        }
+        .into();
+    }
+    color_eyre::eyre::eyre!("server returned {}: {}", status, text)
+}
+
+/// [`remote_json`] for a route whose success carries no body
+/// (`DELETE /commits/{id}` answers 204): a refusal is raised as there, a
+/// success decodes nothing.
+pub(crate) async fn remote_no_content(
+    client: &crate::graph_http::GraphHttpClient,
+    method: Method,
+    url: String,
+    bearer_token: Option<&str>,
+) -> Result<()> {
+    let request = apply_bearer_token(client.request(method, url), bearer_token);
+    let response = client.send(request).await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry_after = crate::command_outcome::retry_after(response.headers())
+        .map(|value| crate::command_outcome::scrub_backoff(value, bearer_token));
+    let text = response.text().await?;
+    Err(remote_refusal(status, text, retry_after, None))
 }
 
 /// The graph URI a command addresses (RFC-011): the scope-resolved URI string
@@ -936,6 +969,15 @@ pub(crate) fn control_write_at_read_door(write: &BranchWrite) -> String {
     )
 }
 
+/// The server's refusal for `commit publish` or `commit drop` sent through
+/// `query`: a control write, under the statement's own name.
+pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
+        write.statement_name(),
+    )
+}
+
 /// The server's refusal for `branch list` sent through `mutate`.
 pub(crate) fn read_at_write_door() -> String {
     branch_statement_refusals::with_statement(
@@ -1036,7 +1078,7 @@ pub(crate) async fn execute_query_lint(
     }
 
     let uri = resolve_local_uri(cli_uri, "lint")?;
-    let db = Omnigraph::open(&uri).await?;
+    let db = crate::admission::open_read_only(&uri, None).await?;
     Ok(lint_query_file(
         &db.catalog(),
         &query_source,
@@ -1110,7 +1152,11 @@ pub(crate) async fn execute_queries_validate(
                     continue;
                 }
             };
-        let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
+        let db = crate::admission::open_read_only(
+            &serving_graph.root.to_string_lossy(),
+            snapshot.state_cas.as_deref(),
+        )
+        .await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();
         for b in &report.breakages {
@@ -1271,69 +1317,6 @@ pub(crate) async fn execute_queries_list(
         }
     }
     Ok(())
-}
-
-pub(crate) fn legacy_change_request_body(
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-) -> Value {
-    let mut body = serde_json::json!({
-        "query_source": query_source,
-        "branch": branch,
-    });
-    if let Some(name) = query_name {
-        body["query_name"] = Value::String(name.to_string());
-    }
-    if let Some(params) = params_json {
-        body["params"] = params.clone();
-    }
-    body
-}
-
-pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
-    if args.len() >= 3 {
-        let sub = args[1].to_str();
-        let sub2 = args[2].to_str();
-        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
-            let suffix = sub2.unwrap();
-            eprintln!(
-                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
-            );
-            // Drop the leading `query` token AND normalize `check` -> `lint`.
-            // `check` is no longer a clap visible_alias (MR-981 §6), so the
-            // rewritten argv must reach the canonical `lint` subcommand
-            // directly. Result for `omnigraph query check --query foo.gq`:
-            //   `omnigraph lint --query foo.gq`.
-            let mut out = Vec::with_capacity(args.len() - 1);
-            out.push(args[0].clone());
-            out.push(OsString::from("lint"));
-            out.extend(args[3..].iter().cloned());
-            return out;
-        }
-    }
-    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
-        match sub {
-            "read" => {
-                eprintln!("warning: `omnigraph read` is deprecated; use `omnigraph query` instead")
-            }
-            "change" => eprintln!(
-                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
-            ),
-            "check" => {
-                eprintln!("warning: `omnigraph check` is deprecated; use `omnigraph lint` instead");
-                // Rewrite the top-level subcommand to `lint`; pass through the rest.
-                let mut out = Vec::with_capacity(args.len());
-                out.push(args[0].clone());
-                out.push(OsString::from("lint"));
-                out.extend(args[2..].iter().cloned());
-                return out;
-            }
-            _ => {}
-        }
-    }
-    args
 }
 
 #[cfg(test)]

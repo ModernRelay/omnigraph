@@ -1,0 +1,46 @@
+# issue: none
+# notes: Exact equal current rows after different past payload/batch recipes; historical row images and compaction are not asserted.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"row-0","value":0,"payload":"final"}
+{"key":"row-1","value":0,"payload":"final"}
+{"key":"row-2","value":0,"payload":"final"}
+{"key":"row-3","value":0,"payload":"final"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"row-0","value":0,"payload":"final"}
+{"key":"row-1","value":0,"payload":"final"}
+{"key":"row-2","value":0,"payload":"final"}
+{"key":"row-3","value":0,"payload":"final"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"row-0","value":0,"payload":"final"}
+{"key":"row-1","value":0,"payload":"final"}
+{"key":"row-2","value":0,"payload":"final"}
+{"key":"row-3","value":0,"payload":"final"}
+--- expect shape
+key: String
+value: I64
+payload: String

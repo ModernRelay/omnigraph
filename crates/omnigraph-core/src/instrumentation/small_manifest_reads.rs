@@ -15,7 +15,7 @@ use object_store::{
 
 use crate::error::{OmniError, Result};
 
-const MAX_SCAN_FILE_BYTES: u64 = 64 * 1024;
+const MAX_SCAN_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A scan-local store for small manifest data files; larger or indirect layouts retain their reader.
 pub async fn manifest_scan_dataset(dataset: &Dataset) -> Result<Dataset> {

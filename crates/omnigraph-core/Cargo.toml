@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-core"
-version = "0.11.0"
+version = "0.13.0"
 edition = "2024"
 description = "Shared base of the omnigraph engine crates: error type, Lance dataset access, request instrumentation, Lance native ref control and dataset addressing."
 license = "MIT"
@@ -14,9 +14,10 @@ dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io"]
 test-util = []
 
 [dependencies]
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.11.0" }
-omnigraph-seams = { path = "../omnigraph-seams", version = "0.11.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.11.0" }
+globset = { workspace = true }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.13.0" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.13.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 datafusion = { workspace = true }

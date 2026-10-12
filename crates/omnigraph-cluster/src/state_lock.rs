@@ -87,16 +87,26 @@ pub(crate) struct StateLockGuard {
     uri: String,
     kind: StorageKind,
     lock: StateLockFile,
+    release_on_drop: bool,
 }
 
 impl StateLockGuard {
     pub(crate) fn lock_id(&self) -> &str {
         self.lock.lock_id()
     }
+
+    /// V2 admission must survive cancellation and process abandonment. Only
+    /// an explicit, settled release may remove its persisted exclusion.
+    pub(crate) fn hold_on_drop(&mut self) {
+        self.release_on_drop = false;
+    }
 }
 
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         match self.kind {
             StorageKind::Local => {
                 let path = self.uri.trim_start_matches("file://");
@@ -166,6 +176,7 @@ pub(crate) async fn acquire_state_lock(
             uri: lock_uri.to_string(),
             kind: storage.kind(),
             lock,
+            release_on_drop: true,
         }));
     }
     Ok(StateLockAcquire::Held)

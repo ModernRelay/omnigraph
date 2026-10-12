@@ -8,7 +8,7 @@
 //! never checkpoint a partial block. The server persists no consumer state —
 //! every position lives in the caller-owned opaque cursor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::enumerate::{
     self, CommitEnumeration, ContinuationKey, PageBudget, enumerate_commit_changes,
@@ -24,19 +24,28 @@ use super::token::{
     KIND_FEED_PAGE, cursor_rejected,
 };
 use crate::db::Snapshot;
-use crate::db::commit_graph::GraphCommit;
-use crate::db::manifest::ManifestCoordinator;
+use crate::db::commit_graph::Lineage;
+use crate::db::manifest::{CommitBuffer, HistoryRecord, ManifestCoordinator, history};
 use crate::error::{OmniError, Result};
 use crate::table_store::TableStore;
 
-/// One coherent capture of a branch for feed derivation: head, incarnation
-/// witness, genesis, and the full lineage projection.
+/// One coherent capture of a branch for feed derivation: the head with its
+/// snapshot, the buffer beside it, the incarnation witness, the genesis, and
+/// the lineage of the head.
 pub(crate) struct ChangeFeedCut {
     pub(crate) branch: Option<String>,
     pub(crate) head: String,
+    /// The record of `head` and the graph as of it, from the `__manifest`
+    /// version that held it.
+    pub(crate) head_record: HistoryRecord,
+    pub(crate) head_snapshot: Snapshot,
+    /// The buffer of that `__manifest` version: the state of a commit it holds
+    /// is read from it with no request.
+    pub(crate) buffer: CommitBuffer,
+    pub(crate) control_session: std::sync::Arc<lance::session::Session>,
     pub(crate) witness: String,
     pub(crate) genesis: String,
-    pub(crate) commits: HashMap<String, GraphCommit>,
+    pub(crate) lineage: Lineage,
     /// Forward first-parent child index over this cut's head→genesis chain:
     /// chain member → its unique child ON the chain (head has none). Built
     /// during cut construction by the same walk that finds genesis, it makes
@@ -279,16 +288,13 @@ pub(crate) async fn poll(
     let mut budget = PageBudget::new(max_changes, max_bytes);
     let mut blocks: Vec<GraphChangeBlock> = Vec::new();
     let mut after_completed = position.after_commit_id.clone();
-    // The parent snapshot of chain[0] is the position commit's snapshot; each
-    // child snapshot is then reused as the next edge's parent, so a poll costs
-    // one manifest snapshot resolution per commit examined plus one.
-    let mut parent_snapshot = commit_snapshot(root_uri, cut, &after_completed).await?;
+    let mut snapshots = PollSnapshots::read(root_uri, cut, &after_completed, &chain).await?;
+    let mut parent_snapshot = snapshots.of(&after_completed).await?;
 
     for (index, commit_id) in chain.iter().enumerate() {
-        let commit = cut
-            .commits
-            .get(commit_id)
-            .expect("chain commits come from the projection");
+        let commit = cut.lineage.get_commit(commit_id).ok_or_else(|| {
+            OmniError::manifest_internal(format!("lineage is missing commit '{commit_id}'"))
+        })?;
         let boundary_stop =
             |blocks: Vec<GraphChangeBlock>, after: &str| -> Result<ChangeFeedPage> {
                 Ok(ChangeFeedPage {
@@ -308,7 +314,7 @@ pub(crate) async fn poll(
             return boundary_stop(blocks, &after_completed);
         }
 
-        let child_snapshot = match commit_snapshot(root_uri, cut, commit_id).await {
+        let child_snapshot = match snapshots.of(commit_id).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return first_or_boundary(
@@ -434,34 +440,77 @@ fn first_or_boundary(
     }
 }
 
-async fn commit_snapshot(root_uri: &str, cut: &ChangeFeedCut, commit_id: &str) -> Result<Snapshot> {
-    let commit = cut.commits.get(commit_id).ok_or_else(|| {
-        OmniError::manifest_internal(format!(
-            "lineage projection is missing commit '{commit_id}'"
-        ))
-    })?;
-    let snapshot = Snapshot::wrap(
-        ManifestCoordinator::snapshot_at(
+/// The snapshots of the commits one poll examines.
+struct PollSnapshots<'a> {
+    root_uri: &'a str,
+    cut: &'a ChangeFeedCut,
+    /// The records of the commits among them that the cut holds neither as
+    /// its head nor in its buffer, from one scan of `__history`; no scan when
+    /// the cut holds them all.
+    settled: HashMap<String, HistoryRecord>,
+    /// The native refs this poll has proven live.
+    live: HashSet<String>,
+}
+
+impl<'a> PollSnapshots<'a> {
+    async fn read(
+        root_uri: &'a str,
+        cut: &'a ChangeFeedCut,
+        position: &str,
+        chain: &[String],
+    ) -> Result<Self> {
+        let ids: Vec<&str> = std::iter::once(position)
+            .chain(chain.iter().map(String::as_str))
+            .filter(|id| *id != cut.head && cut.buffer.get(id).is_none())
+            .collect();
+        let settled = history::read_records_of(root_uri, &cut.control_session, &ids).await?;
+        Ok(Self {
             root_uri,
-            commit.graph_branch.as_deref(),
-            commit.graph_manifest_version,
-        )
-        .await?,
-    );
-    // The cut was captured earlier; this reopen happens later and lock-free by
-    // `(manifest branch, version)`. A named branch deleted and recreated at the
-    // same version in that window would reopen the REPLACEMENT bytes under the
-    // captured commit's label. Each commit is the head of its own
-    // `manifest_version`, so a matching incarnation must still report this exact
-    // commit as that branch's head; fail closed otherwise rather than emit
-    // another branch's rows as this commit's changes. Main cannot undergo
-    // branch-name ABA, but the check is structural and harmless there.
-    if snapshot.graph_head(commit.graph_branch.as_deref()) != Some(commit_id) {
-        return Err(OmniError::manifest(format!(
-            "change feed commit '{commit_id}' has no persisted native-branch incarnation witness at the reopened snapshot; the branch was deleted and recreated during the poll"
-        )));
+            cut,
+            settled,
+            live: HashSet::new(),
+        })
     }
-    Ok(snapshot)
+
+    /// The graph as of `commit_id`: the cut's snapshot for its head, else the
+    /// `table` rows of the commit's record, from the cut's buffer or from
+    /// `__history`. Refused once the incarnation that wrote it is not live.
+    async fn of(&mut self, commit_id: &str) -> Result<Snapshot> {
+        let (commit, snapshot) = if commit_id == self.cut.head {
+            (
+                self.cut.head_record.commit.clone(),
+                self.cut.head_snapshot.clone(),
+            )
+        } else if let Some(buffered) = self.cut.buffer.get(commit_id) {
+            let record = self
+                .cut
+                .buffer
+                .record_of(buffered, &self.cut.head_record.tables);
+            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            (record.commit, snapshot)
+        } else {
+            let record = self.settled.remove(commit_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "graph commit '{commit_id}' is an ancestor of the head of this branch and \
+                     `__history` does not hold its record"
+                ))
+            })?;
+            let snapshot = Snapshot::wrap(record.snapshot(self.root_uri)?);
+            (record.commit, snapshot)
+        };
+        if let Some(native) = &commit.native_branch
+            && !self.live.contains(native)
+        {
+            ManifestCoordinator::ensure_incarnation_live(
+                self.root_uri,
+                &self.cut.control_session,
+                &commit,
+            )
+            .await?;
+            self.live.insert(native.clone());
+        }
+        Ok(snapshot)
+    }
 }
 
 fn resolve_position(

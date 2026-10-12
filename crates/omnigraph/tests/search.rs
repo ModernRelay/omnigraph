@@ -137,7 +137,7 @@ query nearest_hops($q: Vector(4)) {
 }
 "#;
 
-/// Issue #563 mechanism fixture (symptom twin: `tests/repro_issue_563.rs`): every
+/// Issue #563 mechanism fixture (symptom twin: `tests/integration/repro_issue_563.rs`): every
 /// chunk matches, but only chunks 8..=11, mid score order, have an edge, so a
 /// BM25 scan capped near `limit` could not fill the join.
 const UNDERFILL_SCHEMA: &str = r#"
@@ -337,6 +337,8 @@ fn first_two_strings(result: &QueryResult) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The user indexes on `node:Doc` that hold postings. A full-text declaration
+/// (an untrained segment, an empty fragment bitmap) holds none.
 async fn doc_user_index_count(db: &Omnigraph) -> usize {
     let ds = snapshot_main(db)
         .await
@@ -348,7 +350,13 @@ async fn doc_user_index_count(db: &Omnigraph) -> usize {
         .await
         .unwrap()
         .iter()
-        .filter(|idx| !is_system_index(idx))
+        .filter(|idx| {
+            !is_system_index(idx)
+                && idx
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| !bitmap.is_empty())
+        })
         .count()
 }
 
@@ -2002,6 +2010,45 @@ async fn injected_embedding_config_is_used_instead_of_env() {
     .unwrap();
 
     assert_eq!(result_slugs(&result)[0], "alpha-doc");
+
+    // Warmed clients stay immutable: replacing a provider must not reuse the
+    // old view's initialized embedding client or alter its same-space check.
+    let replacement = session(
+        db.with_runtime_bindings(
+            None,
+            Some(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
+                provider: omnigraph::embedding::Provider::Mock,
+                model: "test-model-b".to_string(),
+                base_url: String::new(),
+                api_key: String::new(),
+            })),
+            omnigraph::ExternalBlobPolicy::Deny,
+        )
+        .unwrap(),
+    );
+    assert!(db.shares_runtime_owner(&replacement));
+    let error = query_main(
+        &replacement,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("test-model-a") && error.contains("test-model-b"),
+        "{error}"
+    );
+    let original = query_main(
+        &db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&original)[0], "alpha-doc");
 }
 
 // ─── BM25 search ────────────────────────────────────────────────────────────
@@ -2254,7 +2301,11 @@ async fn rrf_fuses_two_vector_queries() {
     )
     .await
     .unwrap();
-    assert_eq!(result_slugs(&r), vec!["rl-intro", "ml-intro", "dl-basics"]);
+    assert_eq!(
+        result_slugs(&r),
+        vec!["rl-intro", "dl-basics", "ml-intro"],
+        "rl-intro sits in both windows (1/63 + 1/62); ml-intro and dl-basics each lead one arm and miss the other's window of three, tie at 1/61, and the id tie-break orders dl before ml (RFC 0047 §One total order)"
+    );
 }
 
 #[tokio::test]
@@ -2603,5 +2654,82 @@ async fn load_commit_creates_inverted_indices_for_string_annotations() {
         user_indices.len(),
         4,
         "expected id BTree index plus key-property and title/body inverted indices"
+    );
+}
+
+const ANALYZER_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String @index
+}
+node Note {
+    slug: String @key
+    body: String @index
+}
+"#;
+
+const ANALYZER_QUERIES: &str = r#"
+query docs($q: String) {
+    match { $d: Doc search($d.body, $q) }
+    return { $d.slug }
+}
+query notes($q: String) {
+    match { $n: Note search($n.body, $q) }
+    return { $n.slug }
+}
+"#;
+
+/// A full-text call answers with the index's analyzer after every data write,
+/// before any reconciliation: a table's first rows, an overwrite load (a Lance
+/// overwrite drops every index), and a type's first rows on a branch. Lance
+/// applies the analyzer only through a segment of the index, and with none its
+/// flat path tokenizes bare, so "deep" would miss "Deep Learning".
+#[tokio::test]
+async fn full_text_analyzer_holds_after_first_rows_and_overwrites_issue_904() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, ANALYZER_SCHEMA).await.unwrap());
+    let rows = |kind: &str, prefix: &str| {
+        format!(
+            "{{\"type\":\"{kind}\",\"data\":{{\"slug\":\"{prefix}1\",\"body\":\"Deep Learning\"}}}}\n\
+             {{\"type\":\"{kind}\",\"data\":{{\"slug\":\"{prefix}2\",\"body\":\"deep dive\"}}}}"
+        )
+    };
+    let hits = |branch: &'static str, query: &'static str| {
+        let db = &db;
+        async move {
+            first_column_sorted(
+                &query_branch(
+                    db,
+                    branch,
+                    ANALYZER_QUERIES,
+                    query,
+                    &params(&[("q", "deep")]),
+                )
+                .await
+                .unwrap(),
+            )
+        }
+    };
+
+    db.load("main", &rows("Doc", "d"), LoadMode::Merge)
+        .await
+        .unwrap();
+    assert_eq!(hits("main", "docs").await, ["d1", "d2"], "first rows");
+
+    db.ensure_indices().await.unwrap();
+    db.load("main", &rows("Doc", "d"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(hits("main", "docs").await, ["d1", "d2"], "overwrite");
+
+    db.branch_create("feature").await.unwrap();
+    db.load("feature", &rows("Note", "n"), LoadMode::Merge)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits("feature", "notes").await,
+        ["n1", "n2"],
+        "a type's first rows on a branch"
     );
 }

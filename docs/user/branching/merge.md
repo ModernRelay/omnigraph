@@ -37,7 +37,14 @@ it with a `table version … already exists` error.
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
-- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Fast-forward**: the target still has the merge base's schema and table
+  versions, so it takes the source's state. The check reads state, not
+  history: a target merged again from a branch it fast-forwarded before, with
+  no write in between, fast-forwards again. One exception: when a
+  fast-forward into `main` carried a table whose changes cancel out on the
+  branch, or a table on a fork left by a branch created before storage format
+  v11, `main` ends on its own version of that table, so a later merge from
+  that branch can report **Merged**. The merged data is the same.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
@@ -99,11 +106,17 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
-A merge classifies both sides against their merge base, the nearest commit
-both branches descend from, counting a merged branch as an ancestor. Two
-branches that each merged the same third branch therefore share that
-branch's commit as their base, and an entity only one of them changed after
-that import merges cleanly. The record of such a commit lives in the branch
+A merge classifies both sides against their merge base, the newest commit
+both branches descend from, counting a merged branch as an ancestor: a
+commit both branches descend from that no other such commit descends from.
+When two such commits are each not an ancestor of the other, the base is the
+one nearest the two heads (the fewest commits between it and the heads,
+summed), then the one with the higher generation (its distance from the
+first commit along the longest path), then the one with the smaller commit
+id. Two branches that
+each merged the same third branch therefore share that branch's commit as
+their base, and an entity only one of them changed after that import merges
+cleanly. The record of such a commit lives in the branch
 it was merged from, and the merge can read it from a live branch or retained
 retired history. Cleanup preserves the exact selected base and the retired
 histories needed to resolve it. Recreating the logical branch name cannot
@@ -170,5 +183,8 @@ Indexes do not define merge correctness. Newly merged entities remain queryable 
 when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
+
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

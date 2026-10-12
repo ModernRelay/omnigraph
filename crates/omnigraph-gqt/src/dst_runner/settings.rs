@@ -159,6 +159,7 @@ mod tests {
                 "OMNIGRAPH_ANN_NPROBES",
                 "OMNIGRAPH_LOAD_CONCURRENCY",
                 "OMNIGRAPH_TRAVERSAL_WORK_LIMIT",
+                "OMNIGRAPH_HISTORY_RELEASE_BYTES",
             ] {
                 assert!(
                     settings

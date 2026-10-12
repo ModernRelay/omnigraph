@@ -7,31 +7,26 @@
 //!
 //! Two dials:
 //!
-//! * `optimize_all_datasets` — Lance `compact_files` on every dataset. Rewrites
-//!   small fragments into fewer large ones, then **publishes the compacted
-//!   versions together in one `__manifest` batch** so each persisted
-//!   `table_version` column tracks the compacted Lance HEAD (reads pin the
-//!   published dataset version, so without the publish compaction would be invisible to readers and would break the
-//!   HEAD-vs-manifest precondition of schema apply / strict writes). Compaction
-//!   is content-preserving (Lance `Operation::Rewrite` "reorganizes data
-//!   without semantic modification"), so old fragments remain reachable via
-//!   older dataset versions until `cleanup` runs.
-//! * `cleanup_all_datasets` — Lance `cleanup_old_versions` on every dataset.
-//!   Removes manifests (and their unique fragments) older than the configured
-//!   retention, capped at the oldest main-dataset version inherited by any live
-//!   lazy graph branch. Destructive to unreferenced version history — callers
-//!   should gate this behind an explicit confirm flag at the CLI layer.
-//!
-//! Both orchestrate the graph's node + edge datasets from main authority;
-//! cleanup preserves both Lance-referenced native branch history and the
-//! graph-level lazy-branch references Lance cannot observe.
+//! * `optimize_all_datasets` — stages Lance compaction on every dataset as
+//!   detached commits and **publishes them together in one `__manifest`
+//!   batch**, so each registration's pin names the compacted version (reads
+//!   pin the published dataset version, so without the publish compaction
+//!   would be invisible to readers). Compaction is content-preserving (Lance
+//!   `Operation::Rewrite` "reorganizes data without semantic modification"),
+//!   so old fragments remain reachable through older `__manifest` versions
+//!   until `cleanup` stops retaining them.
+//! * `cleanup_all_datasets` — the engine's tracing collector
+//!   (`collector.rs`); stock `cleanup_old_versions` is never called on a
+//!   graph table. `--keep` / `--older-than` choose the retained `__manifest`
+//!   versions per live branch; the collector keeps every file those
+//!   versions, tags and merge bases reach and deletes the rest. Destructive
+//!   to unreferenced version history — callers should gate this behind an
+//!   explicit confirm flag at the CLI layer.
 
 use std::time::Duration;
 
 use futures::stream::StreamExt;
-use lance::dataset::optimize::{
-    CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
-};
+use lance::dataset::optimize::{CompactionMetrics, CompactionOptions};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 use super::*;
@@ -219,8 +214,8 @@ decide_seam! {
 /// graph visibility envelope. Physical dataset work remains bounded-parallel,
 /// but every productive dataset stages detached and the batch publishes once
 /// with an exact pin CAS, so one public Optimize produces at most one graph
-/// commit. The final physical `__manifest` compaction remains outside that
-/// graph-visible envelope because the system dataset is read directly at HEAD.
+/// commit. The publisher owns main's `__manifest` fragment layout; maintenance
+/// only removes obsolete automatic-cleanup configuration from that dataset.
 pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimizeStats>> {
     let _export_exclusion = db.reserve_export_destructive_control()?;
     db.ensure_schema_state_valid().await?;
@@ -241,7 +236,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
-    // Retain main through the final physical-only __manifest compaction.
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
 
     let table_keys = all_table_keys(&catalog);
@@ -273,8 +267,6 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
         })
         .collect::<Vec<_>>();
 
-    // NB: do NOT early-return when `table_tasks` is empty (a schema with no
-    // node/edge types) — the internal system tables below must still be compacted.
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
 
     let preparations: Vec<Result<OptimizePreparation>> = futures::stream::iter(table_tasks)
@@ -331,7 +323,9 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
             .iter()
             .any(|update| update.type_key.starts_with("edge:"));
         if any_committed {
-            let lineage = db.new_lineage_intent_for_branch(None, None).await?;
+            let lineage = db
+                .new_lineage_intent_for_branch(None, None, HistoryReleaseBytes::PRODUCTION)
+                .await?;
             super::table_ops::commit_updates_on_branch_with_expected(
                 db,
                 None,
@@ -340,6 +334,7 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
                 None,
                 &authority_txn,
                 lineage,
+                super::table_ops::Publication::Publish,
             )
             .await?;
         }
@@ -357,29 +352,9 @@ pub async fn optimize_all_datasets(db: &Omnigraph) -> Result<Vec<DatasetOptimize
     drop(table_guards);
     drop(schema_permit);
 
-    // Compact the internal system tables too (RFC-013 step 2). They are not
-    // catalog-tracked, so they take a separate, simpler path (`compact_internal_table`):
-    // compact in place, no manifest publish. Appended after the
-    // data-table stats so the data-table cache invalidation above is computed from
-    // data-table stats only; each internal compaction does its own coordinator
-    // refresh for cache coherence.
     let mut all = stats.into_iter().map(Ok).collect::<Vec<Result<_>>>();
-    // `__manifest` is always present (created at init).
-    let root = db.root_uri();
-    let internal_tables: [(&str, String); 1] =
-        [("__manifest", crate::db::manifest::manifest_uri(root))];
-    for (table_key, uri) in internal_tables {
-        all.push(compact_internal_table(db, table_key, uri).await);
-    }
+    all.push(clear_manifest_auto_cleanup(db).await);
 
-    // Persist the CSR/CSC adjacency artifact for the post-optimize snapshot,
-    // so cold traversals load topology with one GET instead of scanning every
-    // edge table. Optimize is the ONLY writer of this artifact (the query
-    // path only loads); it is derived, regenerable data content-addressed by
-    // the edge tables' physical identity, so a crash mid-write leaves an
-    // object the loader rejects and rebuilds around — best-effort by design,
-    // like the physical `__manifest` compaction above it, and running under
-    // the still-held main branch gate so the snapshot it keys on is settled.
     if let Err(error) = persist_graph_index_artifact(db, &catalog, edge_tables_committed).await {
         tracing::warn!(
             target: "omnigraph::optimize",
@@ -473,10 +448,12 @@ async fn prepare_optimize_table(
         .open_pinned_for_write(&task.full_path, &task.entry)
         .await?;
 
+    // The same plan `stage_compaction` executes: a fragment still holding a
+    // dropped property's values is compaction work even when Lance's planner
+    // would leave the table alone.
     let options = CompactionOptions::default();
-    let will_compact = plan_compaction(snapshot.dataset(), &options)
-        .await
-        .map_err(OmniError::storage)?
+    let will_compact = TableStore::plan_table_compaction(snapshot.dataset(), &options)
+        .await?
         .num_tasks()
         > 0;
     let needs_reindex = TableStore::has_foldable_unindexed_fragments(snapshot.dataset()).await?;
@@ -578,6 +555,7 @@ async fn apply_optimize_table_effects(
     let full_path = work.full_path;
     let base = work.initial_snapshot;
     let witness = work.witness;
+    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
     let options = CompactionOptions::default();
     let mut chain = Vec::new();
@@ -589,7 +567,7 @@ async fn apply_optimize_table_effects(
     {
         let (rewrite, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         metrics = compaction_metrics;
         tip = rewrite;
@@ -606,7 +584,7 @@ async fn apply_optimize_table_effects(
         }
         let (folded, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         tip = folded;
         tip_identity = Some(identity);
@@ -640,7 +618,7 @@ async fn apply_optimize_table_effects(
         }
         let (indexed, identity) = db
             .storage()
-            .commit_staged_detached(tip, staged, &witness)
+            .commit_staged_detached(tip, staged, &witness, &declared_full_text)
             .await?;
         tip = indexed;
         tip_identity = Some(identity);
@@ -678,20 +656,8 @@ async fn apply_optimize_table_effects(
     })
 }
 
-/// Bound on the app-level retry of an internal-table compaction against a
-/// concurrent live writer (see [`is_retryable_lance_conflict`]).
-const COMPACTION_RETRY_BUDGET: u32 = 5;
+const INTERNAL_CONFIG_RETRY_BUDGET: u32 = 5;
 
-/// A Lance commit error that means "a concurrent writer preempted us; reload the
-/// dataset and rerun." `compact_files` commits via `commit_compaction` ->
-/// `apply_commit` *directly* — unlike the merge-insert path it is NOT wrapped in
-/// `execute_with_retry`, so a `Rewrite`-vs-`Merge`/`Update`/`Delete` `check_txn`
-/// conflict propagates raw instead of being rebased or converted to
-/// `TooMuchWriteContention`. Lance's transaction spec prescribes that the
-/// *application* reruns these, which is what `compact_internal_table` does — so a
-/// maintenance compaction (a physical op) never fails a live write (a logical op),
-/// invariant 7. (`TooMuchWriteContention` is included for the exhausted-retry form
-/// some commit paths surface.)
 fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
     matches!(
         err,
@@ -701,9 +667,7 @@ fn is_retryable_lance_conflict(err: &lance::Error) -> bool {
     )
 }
 
-/// Strip a stored `lance.auto_cleanup.*` config so an internal table's linear
-/// `compact_files` commit cannot fire Lance's version GC; returns whether a
-/// config commit (which advances Lance HEAD) cleared anything.
+/// Remove automatic GC configuration, returning whether Lance HEAD advanced.
 async fn clear_stale_auto_cleanup_config(
     ds: &mut lance::Dataset,
 ) -> std::result::Result<bool, lance::Error> {
@@ -724,96 +688,34 @@ async fn clear_stale_auto_cleanup_config(
     Ok(true)
 }
 
-/// Compact the INTERNAL system table (`__manifest`) in place.
-///
-/// Unlike catalog data tables, the internal tables are not tracked in the
-/// `__manifest` (they ARE the manifest / the lineage DAG): readers open them at
-/// their latest Lance HEAD, so compaction just advances that HEAD and the next
-/// reader transparently observes the compacted version. That makes this path much
-/// simpler than [`apply_optimize_table_effects`] — no manifest publish (nothing to publish
-/// to), and no detached staging. Crash safety does NOT rest on
-/// single-commit atomicity: `compact_files` can emit a `ReserveFragments` commit
-/// before the final `Rewrite` (and the config strip is a separate commit before
-/// both), so this advances HEAD over one or more commits. That is safe
-/// because every one of those commits is content-preserving and the table is read
-/// at HEAD — a crash at any point leaves the table readable and content-identical,
-/// and the next `optimize` re-plans. Internal tables carry no Lance index (only
-/// `object_id`'s unenforced-PK schema metadata), so no `optimize_indices`.
-///
-/// Concurrency: no application lock, but `compact_files` does NOT auto-retry a
-/// semantic conflict — its `Operation::Rewrite` commits through `apply_commit`
-/// directly (not the merge-insert `execute_with_retry` path), so a `Rewrite`
-/// vs concurrent `Update`/`Merge`/`Delete` `check_txn` conflict propagates raw.
-/// We own the retry here (see [`is_retryable_lance_conflict`]): on a retryable
-/// conflict, reopen at the new HEAD and rerun. A follow-up coordinator `refresh`
-/// makes the warm internal-table handles observe the compacted HEAD
-/// deterministically (the version probe would also self-heal on the next read).
-async fn compact_internal_table(
-    db: &Omnigraph,
-    table_key: &str,
-    uri: String,
-) -> Result<DatasetOptimizeStats> {
-    // App-level retry against concurrent live writers. compact_files does NOT
-    // auto-retry a Rewrite-vs-live-write conflict (see is_retryable_lance_conflict),
-    // so optimize would otherwise fail spuriously on a live graph. On a retryable
-    // conflict we re-open at the new HEAD and rerun — the canonical Lance-consumer
-    // pattern. Each attempt opens fresh because the conflict means the version moved.
-    for attempt in 0..COMPACTION_RETRY_BUDGET {
+/// Remove stored automatic GC configuration without changing manifest fragments.
+async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeStats> {
+    let uri = crate::db::manifest::manifest_uri(db.root_uri());
+    for attempt in 0..INTERNAL_CONFIG_RETRY_BUDGET {
         let handle = db.storage().open_dataset_head(&uri, None).await?;
         let mut ds = handle.into_dataset();
-
-        // Keep optimize non-destructive by construction (see clear_stale_auto_cleanup_config).
-        // Returns whether it committed a config-strip (which advances Lance HEAD).
-        let cleared_config = match clear_stale_auto_cleanup_config(&mut ds).await {
-            Ok(cleared) => cleared,
-            Err(e) => {
-                if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) {
-                    continue;
+        match clear_stale_auto_cleanup_config(&mut ds).await {
+            Ok(cleared) => {
+                if cleared {
+                    db.coordinator.write().await.refresh().await?;
                 }
-                return Err(OmniError::storage(e));
-            }
-        };
-
-        let options = CompactionOptions::default();
-        let plan = plan_compaction(&ds, &options)
-            .await
-            .map_err(OmniError::storage)?;
-        if plan.num_tasks() == 0 {
-            // No compaction work, but a config-strip still advanced HEAD — refresh
-            // the warm coordinator handles so they observe it deterministically
-            // (same cache-coherence step the successful-compaction path takes
-            // below; otherwise they stay pinned until the next version probe).
-            if cleared_config {
-                db.coordinator.write().await.refresh().await?;
-            }
-            return Ok(DatasetOptimizeStats::compacted(
-                table_key.to_string(),
-                &CompactionMetrics::default(),
-                false,
-            ));
-        }
-
-        match compact_files(&mut ds, options, None).await {
-            Ok(metrics) => {
-                // Cache coherence: re-open the warm coordinator's internal-table
-                // handles at the compacted HEAD (they live in `db.coordinator`, not
-                // the data-table `runtime_cache`).
-                db.coordinator.write().await.refresh().await?;
                 return Ok(DatasetOptimizeStats::compacted(
-                    table_key.to_string(),
-                    &metrics,
-                    true,
+                    "__manifest".to_string(),
+                    &CompactionMetrics::default(),
+                    false,
                 ));
             }
-            Err(e) if attempt + 1 < COMPACTION_RETRY_BUDGET && is_retryable_lance_conflict(&e) => {
+            Err(error)
+                if attempt + 1 < INTERNAL_CONFIG_RETRY_BUDGET
+                    && is_retryable_lance_conflict(&error) =>
+            {
                 continue;
             }
-            Err(e) => return Err(OmniError::storage(e)),
+            Err(error) => return Err(OmniError::storage(error)),
         }
     }
     Err(OmniError::manifest_conflict(format!(
-        "internal-table compaction of {table_key} exhausted {COMPACTION_RETRY_BUDGET} \
-         retries against concurrent writers"
+        "manifest auto-cleanup configuration removal exhausted {INTERNAL_CONFIG_RETRY_BUDGET} retries"
     )))
 }
 
@@ -828,10 +730,11 @@ decide_seam! {
     pub static CLEANUP_PRE_GATES = ("cleanup.pre_gates", Unreachable, [Fail]);
 }
 
-/// Run Lance `cleanup_old_versions` on every node + edge dataset on `main`,
-/// using [`CleanupPolicyOptions`]. The latest manifest is always preserved
-/// regardless (Lance invariant), and the requested cutoff is capped at the
-/// oldest main-dataset version inherited by a live lazy graph branch.
+/// Reclaim unretained table versions with the engine collector
+/// (`collector.rs`), never stock `cleanup_old_versions`. [`CleanupPolicyOptions`]
+/// chooses the `__manifest` versions each live branch retains (every branch
+/// head always among them); the collector keeps every file a retained
+/// version, tag or merge base reaches and deletes the rest.
 pub async fn cleanup_all_datasets(
     db: &Omnigraph,
     options: CleanupPolicyOptions,
@@ -952,7 +855,7 @@ async fn cleanup_detached_only(
         .buffer_unordered(concurrency)
         .collect()
         .await;
-    if !plan.expired_merge_input_tags.is_empty() {
+    if !plan.expired_merge_input_tags.is_empty() || !plan.expired_unpublished_tags.is_empty() {
         let manifest =
             crate::db::manifest::ManifestCoordinator::collector_branch_under_control_gates(
                 db.root_uri(),
@@ -965,6 +868,10 @@ async fn cleanup_detached_only(
             &plan.expired_merge_input_tags,
         )
         .await?;
+        for name in &plan.expired_unpublished_tags {
+            crate::db::manifest::unpublished::release_unpublished_tag(manifest.dataset(), name)
+                .await?;
+        }
     }
     let reconciled = reconcile_frozen_native_forks(db, native_plan, plan).await?;
     if !reconciled.reclaimed.is_empty() {
@@ -1581,10 +1488,7 @@ mod tests {
     use super::*;
     use crate::loader::LoadMode;
 
-    /// The internal-table compaction retry classifier: a concurrent live writer
-    /// preempting our `Rewrite` is retryable (Lance prescribes app-rerun, and
-    /// compact_files does not auto-retry it); a non-conflict error is not (must not
-    /// be masked by a blind retry).
+    /// Native commit conflicts allow configuration cleanup to reopen and retry.
     #[test]
     fn retryable_lance_conflicts_are_classified() {
         assert!(is_retryable_lance_conflict(

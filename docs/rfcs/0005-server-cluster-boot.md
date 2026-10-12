@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-10
-updated: 2026-09-06
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,16 @@ blocked_on: []
 ---
 
 # RFC 0005: Server boot from cluster state
+
+> **Later-RFC disposition:** three accepted RFCs changed this one.
+> [RFC 0006](0006-object-storage-cluster-roots.md): `--cluster` accepts
+> object-storage roots, not only a local directory (Non-Goals).
+> [RFC 0008](0008-retire-omnigraph-yaml.md): `omnigraph.yaml` server boot is
+> removed (Non-Goals, the `--config` exclusivity in D1, D6).
+> [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md):
+> activation is online, boot takes cluster admission, and `cluster import` /
+> `cluster refresh` are removed (Non-Goals, D2, D4, D7). Current: `--cluster`
+> boot, serving the applied revision, and the serving metadata of D3.
 
 **Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses. (5) Graph-attributed startup failures quarantine that graph by default; operators can restore all-or-nothing boot with `--require-all-graphs` / `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
 **Builds on:** Phase 4 complete ([RFC 0004](0004-cluster-graph-schema-apply.md)): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Current normative context: [cluster control plane](../dev/control-plane.md).

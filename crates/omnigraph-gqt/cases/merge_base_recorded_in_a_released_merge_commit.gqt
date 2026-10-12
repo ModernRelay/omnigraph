@@ -1,0 +1,89 @@
+# issue: none
+# notes: The first merge records s's head as merged_parent_commit_id; four bumps under set
+# notes: history_release_bytes = 2048; release it; after a restart the second merge of s bases on it (merged, not conflicting).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":0}}
+{"type":"Person","data":{"name":"bob","age":0}}
+
+--- mutate
+set history_release_bytes = 2048;
+
+--- expect ok
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate
+branch create s from b
+
+--- expect ok
+
+--- mutate branch: s
+query set_bob_on_s_once() {
+    update Person set { age: 1 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b
+query diverge_target() {
+    update Person set { age: 1 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s into b
+
+--- expect outcome: merged
+
+--- loop $i 1 5
+--- mutate branch: b
+query bump_alice($n: I32) {
+    update Person set { age: $n } where name = "alice"
+}
+--- params
+{"n": ${i}}
+--- expect affected: nodes=1 edges=0
+--- endloop
+
+--- restart
+
+--- mutate branch: s
+query set_bob_on_s_twice() {
+    update Person set { age: 2 } where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s into b
+
+--- expect outcome: merged
+
+--- query branch: b
+query people_after_second_merge() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"alice","p.age":4}
+{"p.name":"bob","p.age":2}
+
+--- expect shape
+p.name: String
+p.age: I32

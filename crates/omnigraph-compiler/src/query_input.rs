@@ -7,6 +7,7 @@ use crate::error::CompilerError;
 use crate::ir::ParamMap;
 use crate::query::ast::{Literal, Param, QueryDecl};
 use crate::query::parser::parse_query;
+use crate::types::{check_date_literal, check_datetime_literal};
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
 const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
@@ -470,7 +471,7 @@ fn json_value_to_literal_typed(
         }
         "Date" => match value {
             Value::String(value) => {
-                crate::types::check_date_literal(value)
+                check_date_literal(value)
                     .map_err(|reason| RunInputError::message(format!("param '{key}': {reason}")))?;
                 Ok(Literal::Date(value.clone()))
             }
@@ -486,7 +487,11 @@ fn json_value_to_literal_typed(
             }),
         },
         "DateTime" => match value {
-            Value::String(value) => Ok(Literal::DateTime(value.clone())),
+            Value::String(value) => {
+                check_datetime_literal(value)
+                    .map_err(|reason| RunInputError::message(format!("param '{key}': {reason}")))?;
+                Ok(Literal::DateTime(value.clone()))
+            }
             other => Err(match mode {
                 JsonParamMode::Standard => {
                     RunInputError::message(format!("param '{}': expected datetime string", key))

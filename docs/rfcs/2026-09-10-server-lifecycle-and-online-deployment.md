@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-09-10
-updated: 2026-09-29
+updated: 2026-10-03
 discussion: https://github.com/ModernRelay/omnigraph/pull/697
 supersedes: []
 superseded_by:
@@ -18,7 +18,7 @@ blocked_on: []
 # RFC: Server lifecycle and online deployment
 
 > **Superseded on 2026-09-29** by [Server runtime and online deployment](2026-09-29-server-runtime-and-online-deployment.md).
-> The replacement remains a draft and is not implemented. This document is
+> The replacement is accepted with implementation and qualification gates. This document is
 > retained as historical rationale; its obsolete mechanisms and dependencies
 > are not current implementation requirements.
 
@@ -521,7 +521,7 @@ restore same-process progress; unverifiable or unsupported cases remain blocked.
 Optimize, rebuild and cleanup use the same designated writer, admission and
 operation ownership. Productive user-table maintenance stages detached versions
 and publishes their pins in one graph commit; promotion preserves that result.
-Physical compaction of main's `__manifest` preserves content outside that publication, and
+Automatic-cleanup configuration removal preserves main's `__manifest` content outside that publication, and
 cleanup does not manufacture a graph-content commit. An independent optimizer process, even in the
 same container, is another writer and cannot rely on server-local locks.
 

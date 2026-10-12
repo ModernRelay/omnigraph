@@ -27,6 +27,7 @@ use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, BlobRead, BlobReader, Ex
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::ApiError;
+use crate::redacted_cause::RedactedCause;
 
 const SNAPSHOT_ID_HEADER: HeaderName = HeaderName::from_static("omnigraph-snapshot-id");
 
@@ -241,16 +242,14 @@ fn serve_external(reference: &ExternalBlobRef, snapshot_id: &str) -> Result<Resp
     // Sending the bare URI for a ranged descriptor would silently return
     // bytes outside the logical Blob cell, while proxying or translating the
     // range is deliberately outside V1. Fail before headers instead.
-    if reference.offset != 0 || reference.length.is_some() {
-        return Err(ApiError::internal(
-            "ranged external Blob descriptors cannot be redirected safely",
-        ));
-    }
+    let uri = reference.whole_object_uri().map_err(|_| {
+        ApiError::internal("ranged external Blob descriptors cannot be redirected safely")
+    })?;
     let mut response = empty_response(StatusCode::FOUND);
     insert_header(
         response.headers_mut(),
         LOCATION,
-        &reference.uri,
+        uri,
         "external Blob redirect URI",
     )?;
     response
@@ -482,17 +481,28 @@ async fn read_chunk(
     permits: Arc<Semaphore>,
     range: Range<u64>,
 ) -> Result<Bytes, io::Error> {
-    let permit = permits
-        .acquire_owned()
-        .await
-        .map_err(|_| io::Error::other("managed Blob response byte budget closed unexpectedly"))?;
     let start = range.start;
     let end = range.end;
-    let expected = end - start;
-    let bytes = reader.read_range(range).await.map_err(|_error| {
-        // Engine/storage errors can contain physical object paths or
-        // credentials. Neither logs nor the HTTP body may expose them.
+    let permit = permits.acquire_owned().await.map_err(|_| {
         tracing::error!(
+            error_kind = "blob_payload_permit_closed",
+            range_start = start,
+            range_end = end,
+            "managed Blob response byte budget closed unexpectedly"
+        );
+        io::Error::other("managed Blob response byte budget closed unexpectedly")
+    })?;
+    let expected = end - start;
+    let bytes = reader.read_range(range).await.map_err(|error| {
+        // Engine/storage errors can contain physical object paths or
+        // credentials. Neither logs nor the HTTP body may expose them: log
+        // only the error's class, never its text.
+        let cause = RedactedCause::of(&error);
+        tracing::error!(
+            error_kind = "blob_payload_read",
+            error_variant = cause.variant,
+            storage_kind = ?cause.storage_kind,
+            manifest_kind = ?cause.manifest_kind,
             range_start = start,
             range_end = end,
             "managed Blob payload read failed"
@@ -501,6 +511,14 @@ async fn read_chunk(
     })?;
     let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     if actual != expected {
+        tracing::error!(
+            error_kind = "blob_payload_short_read",
+            range_start = start,
+            range_end = end,
+            returned_bytes = actual,
+            expected_bytes = expected,
+            "managed Blob range returned an unexpected byte count"
+        );
         return Err(io::Error::other(format!(
             "managed Blob range returned {actual} bytes; expected {expected}"
         )));
@@ -971,6 +989,8 @@ mod tests {
 
     #[tokio::test]
     async fn body_error_does_not_expose_engine_or_physical_storage_detail() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         let error = read_chunk(
             Arc::new(FailingReader),
             Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS)),
@@ -980,6 +1000,101 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "managed Blob payload read failed");
         assert!(!error.to_string().contains("private-bucket"));
+
+        // The log names the failure's class and range, never its text.
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_payload_read""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+            "manifest_kind=None",
+            "range_start=0",
+            "range_end=1",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in ["private-bucket", "physical/object", "s3://"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
+
+    #[derive(Clone)]
+    struct ShortReader;
+
+    impl RangeReader for ShortReader {
+        fn read_range(&self, _range: Range<u64>) -> BoxFuture<'static, Result<Bytes, OmniError>> {
+            Box::pin(async { Ok(Bytes::from_static(b"x")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn short_read_logs_the_range_and_both_byte_counts() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let error = read_chunk(
+            Arc::new(ShortReader),
+            Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS)),
+            4..7,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "managed Blob range returned 1 bytes; expected 3"
+        );
+
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_payload_short_read""#,
+            "range_start=4",
+            "range_end=7",
+            "returned_bytes=1",
+            "expected_bytes=3",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_permit_semaphore_logs_its_kind() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let permits = Arc::new(Semaphore::new(BLOB_BODY_MAX_RETAINED_CHUNKS));
+        permits.close();
+        let reader = FakeReader::default();
+        let calls = Arc::clone(&reader.calls);
+        read_chunk(Arc::new(reader), permits, 0..1)
+            .await
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let logs = capture.output();
+        let expected = r#"error_kind="blob_payload_permit_closed""#;
+        assert!(logs.contains(expected), "missing {expected}: {logs}");
+    }
+
+    #[test]
+    fn redacted_cause_names_the_cause_under_completion_evidence() {
+        let storage = || {
+            OmniError::Storage(omnigraph::error::StorageFailure::new(
+                omnigraph::error::StorageFailureKind::Unknown,
+                "storage: s3://private-bucket/physical/object",
+            ))
+        };
+        for error in [
+            storage().before_effect(),
+            storage()
+                .with_completion_evidence(omnigraph::error::CompletionEvidence::Uncertain)
+                .before_effect(),
+        ] {
+            let cause = RedactedCause::of(&error);
+            assert_eq!(cause.variant, "Storage");
+            assert_eq!(
+                cause.storage_kind,
+                Some(omnigraph::error::StorageFailureKind::Unknown)
+            );
+            assert!(cause.manifest_kind.is_none());
+        }
     }
 
     #[tokio::test]

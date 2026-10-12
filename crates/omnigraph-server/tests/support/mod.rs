@@ -20,7 +20,7 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
-use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ReadRequest};
+use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, QueryRequest};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, ProcessDefaults, build_app};
 use serde_json::{Value, json};
@@ -89,19 +89,6 @@ rules:
       actors: { group: team }
       actions: [branch_create]
       target_branch_scope: unprotected
-"#;
-
-pub const SCHEMA_APPLY_POLICY_YAML: &str = r#"
-version: 1
-groups:
-  admins: [act-ragnor]
-protected_branches: [main]
-rules:
-  - id: admins-schema-apply
-    allow:
-      actors: { group: admins }
-      actions: [schema_apply]
-      target_branch_scope: protected
 "#;
 
 pub fn fixture(name: &str) -> PathBuf {
@@ -228,28 +215,6 @@ rules:
       actors: { group: readers }
       actions: [read]
       branch_scope: any
-"#;
-
-pub const STORED_QUERY_SCHEMA_APPLY_POLICY_YAML: &str = r#"
-version: 1
-groups:
-  admins: [act-ragnor]
-protected_branches: [main]
-rules:
-  - id: admins-can-invoke
-    allow:
-      actors: { group: admins }
-      actions: [invoke_query]
-  - id: admins-can-read
-    allow:
-      actors: { group: admins }
-      actions: [read]
-      branch_scope: any
-  - id: admins-can-schema-apply
-    allow:
-      actors: { group: admins }
-      actions: [schema_apply]
-      target_branch_scope: protected
 "#;
 
 pub const FIND_PERSON_GQ: &str =
@@ -495,7 +460,7 @@ pub fn additive_schema_with_nickname() -> String {
 
 pub fn schema_without_age() -> String {
     // Drop the nullable `age` column from the test schema. Used by the
-    // HTTP soft/hard drop tests below.
+    // HTTP drop tests.
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
         .replace("    age: I32?\n", "")
@@ -721,7 +686,7 @@ pub mod matrix {
                 .oneshot(
                     Request::builder()
                         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .uri(g("/change"))
+                        .uri(g("/mutate"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -790,9 +755,9 @@ pub mod matrix {
         /// `get_person` query from `test.gq` for identity rather than
         /// just count.
         pub async fn person_exists(&self, branch: &str, name: &str) -> bool {
-            let body = serde_json::to_vec(&ReadRequest {
-                query_source: include_str!("../../../omnigraph/tests/fixtures/test.gq").to_string(),
-                query_name: Some("get_person".to_string()),
+            let body = serde_json::to_vec(&QueryRequest {
+                query: include_str!("../../../omnigraph/tests/fixtures/test.gq").to_string(),
+                name: Some("get_person".to_string()),
                 params: Some(json!({ "name": name })),
                 branch: Some(branch.to_string()),
                 snapshot: None,
@@ -805,7 +770,7 @@ pub mod matrix {
                 .oneshot(
                     Request::builder()
                         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .uri(g("/read"))
+                        .uri(g("/query"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -858,7 +823,7 @@ pub mod matrix {
         /// C6: insert a uniquely-named sentinel on main and verify it
         /// landed. Catches engine-state poisoning where a cell's
         /// concurrent ops left the engine half-broken — subsequent
-        /// /change either deadlocks or returns a non-200.
+        /// /mutate either deadlocks or returns a non-200.
         pub async fn assert_post_op_sentinel(&self, cell: &str, sentinel: &str) {
             let body = serde_json::to_vec(&ChangeRequest {
                 query: MUTATION_QUERIES.to_string(),
@@ -874,7 +839,7 @@ pub mod matrix {
                 .oneshot(
                     Request::builder()
                         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .uri(g("/change"))
+                        .uri(g("/mutate"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -885,7 +850,7 @@ pub mod matrix {
             assert_eq!(
                 r.status(),
                 StatusCode::OK,
-                "[{}] post-op sentinel /change on main failed (engine poisoned?)",
+                "[{}] post-op sentinel /mutate on main failed (engine poisoned?)",
                 cell
             );
             assert!(
@@ -911,6 +876,7 @@ pub mod matrix {
                     source,
                     target: Some(target),
                     delete_branch: false,
+                    as_commit: false,
                     settings: None,
                 })
                 .unwrap();
@@ -956,7 +922,7 @@ pub mod matrix {
                     .oneshot(
                         Request::builder()
                             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                            .uri(g("/change"))
+                            .uri(g("/mutate"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
                             .body(Body::from(body))
@@ -1143,7 +1109,7 @@ pub async fn http_change_decision(
         &app,
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/change"))
+            .uri(g("/mutate"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
@@ -1192,6 +1158,7 @@ pub async fn http_merge_decision(
         source: "feature".to_string(),
         target: Some("main".to_string()),
         delete_branch: false,
+        as_commit: false,
         settings: None,
     };
     let (status, _body) = json_response(
@@ -1210,6 +1177,28 @@ pub async fn http_merge_decision(
         StatusCode::OK => ParityDecision::Allow,
         StatusCode::FORBIDDEN => ParityDecision::Deny,
         other => panic!("unexpected HTTP status for branch_merge: {other}"),
+    }
+}
+
+/// Bootstrap through the production v2 protocol and hand off a fully settled
+/// fixture to the server. These tests own every writer of the temporary root.
+pub async fn apply_cluster_fixture(config_dir: &Path) {
+    let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
+    let captured = omnigraph_cluster::capture_deployment(config_dir).unwrap();
+    let applied = omnigraph_cluster::apply_deployment(config_dir, None, &caller, |_, _, _| {})
+        .await
+        .unwrap();
+    assert!(
+        matches!(applied, omnigraph_cluster::DeploymentLookup::Complete { ref result } if result.converged),
+        "{applied:?}"
+    );
+    let status = omnigraph_cluster::deployment_status(captured.canonical_root(), None, &caller)
+        .await
+        .unwrap();
+    if let Some(lock_id) = status.lock_id {
+        omnigraph_cluster::force_unlock_storage_root(captured.canonical_root(), &lock_id)
+            .await
+            .unwrap();
     }
 }
 
@@ -1240,10 +1229,7 @@ graphs:
         ),
     )
     .unwrap();
-    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
-    assert!(import.ok, "{:?}", import.diagnostics);
-    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
-    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    apply_cluster_fixture(temp.path()).await;
     temp
 }
 

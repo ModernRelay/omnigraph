@@ -13,8 +13,10 @@ use datafusion::physical_plan::stream::{
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use super::memory::WorkMemory;
+use crate::instrumentation::{with_query_io_probes, with_query_memory_probes};
 
 /// A single producer sends each batch and its reservation in the same order.
 pub(super) struct BatchSender {
@@ -90,6 +92,15 @@ pub(super) fn producer_stream<F>(
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
+    let owner = match memory.register_owned_work() {
+        Ok(owner) => owner,
+        Err(error) => {
+            return Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::once(async move { Err(error) }),
+            ));
+        }
+    };
     let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), 2);
     let (leases, receiver) = mpsc::channel(2);
     let sender = BatchSender {
@@ -98,19 +109,25 @@ where
     };
     let io = crate::instrumentation::capture_query_io_probes();
     let probes = crate::instrumentation::current_query_memory_probes();
-    builder.spawn(async move {
-        let work = async move {
-            let work = memory.blocking(move |memory| body(memory, sender));
-            match io {
-                Some(probes) => crate::instrumentation::with_query_io_probes(probes, work).await,
-                None => work.await,
+    let worker = owner.child();
+    builder.spawn(
+        owner.own(Box::pin(
+            async move {
+                let work = async move {
+                    let work = memory.blocking_owned(worker, move |memory| body(memory, sender));
+                    match io {
+                        Some(probes) => with_query_io_probes(probes, work).await,
+                        None => work.await,
+                    }
+                };
+                match probes {
+                    Some(probes) => with_query_memory_probes(probes, work).await,
+                    None => work.await,
+                }
             }
-        };
-        match probes {
-            Some(probes) => crate::instrumentation::with_query_memory_probes(probes, work).await,
-            None => work.await,
-        }
-    });
+            .in_current_span(),
+        )),
+    );
     let baseline = metrics.map(|metrics| BaselineMetrics::new(metrics, 0));
     let counts = metrics.map(|metrics| {
         datafusion::physical_plan::metrics::MetricBuilder::new(metrics).counter("output_batches", 0)
@@ -156,6 +173,7 @@ mod tests {
 
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
+    use futures::FutureExt;
 
     use super::*;
     use crate::engine::context::{QueryContext, query_memory_limit};
@@ -301,6 +319,7 @@ mod tests {
         let pause = probes.pause_blocking_work();
         with_query_memory_probes(probes.clone(), async {
             let context = QueryContext::new(query_memory_limit()).unwrap();
+            let settlement = context.owned_workers();
             let memory =
                 Arc::new(WorkMemory::new(context.task_ctx(), "producer cancellation").unwrap());
             let stream =
@@ -322,10 +341,130 @@ mod tests {
             assert!(probes.reserved_bytes() >= 4_096);
             drop(stream);
             drop(context);
+            let observer = settlement.clone();
+            let waiter = tokio::spawn(async move { observer.wait().await });
+            tokio::task::yield_now().await;
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            assert!(settlement.wait().now_or_never().is_none());
+            assert!(probes.active_blocking_work() > 0);
+            assert!(probes.reserved_bytes() >= 4_096);
             pause.release();
-            released(&probes).await;
+            tokio::time::timeout(Duration::from_secs(3), settlement.wait())
+                .await
+                .expect("cancelling a settlement observer must not release the worker");
+            assert_eq!(probes.active_blocking_work(), 0);
+            assert_eq!(probes.reserved_bytes(), 0);
         })
         .await;
+    }
+
+    /// Executes the same return boundary as a real query while a producer is
+    /// still running; GQT cannot pause a worker or inspect an unreturned result.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_return_waits_for_owned_producers_on_success_and_error() {
+        #[derive(Clone, Copy, Debug)]
+        enum Completion {
+            Success,
+            Error,
+            PollPanic,
+            DropPanic,
+        }
+
+        struct Execution {
+            stream: Option<SendableRecordBatchStream>,
+            completion: Completion,
+        }
+
+        impl Future for Execution {
+            type Output = std::result::Result<u32, &'static str>;
+
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                drop(self.stream.take());
+                std::task::Poll::Ready(match self.completion {
+                    Completion::Error => Err("query error sentinel"),
+                    Completion::PollPanic => panic!("query poll panic sentinel"),
+                    _ => Ok(42),
+                })
+            }
+        }
+
+        impl Drop for Execution {
+            fn drop(&mut self) {
+                if matches!(self.completion, Completion::DropPanic) {
+                    panic!("query drop panic sentinel");
+                }
+            }
+        }
+
+        for completion in [
+            Completion::Success,
+            Completion::Error,
+            Completion::PollPanic,
+            Completion::DropPanic,
+        ] {
+            let probes = QueryMemoryProbes::default();
+            let pause = probes.pause_blocking_work();
+            with_query_memory_probes(probes.clone(), async {
+                let context = QueryContext::new(query_memory_limit()).unwrap();
+                let memory = Arc::new(
+                    WorkMemory::new(context.task_ctx(), "query return ownership").unwrap(),
+                );
+                let stream =
+                    producer_stream(schema(), memory, None, |memory, _sender| async move {
+                        memory.grow(4_096)?;
+                        memory.checkpoint()?;
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    });
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !pause.entered() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("producer must reach its charged checkpoint");
+                let returned = std::panic::AssertUnwindSafe(context.run_owned(Execution {
+                    stream: Some(stream),
+                    completion,
+                }))
+                .catch_unwind();
+                tokio::pin!(returned);
+                assert!(
+                    futures::poll!(returned.as_mut()).is_pending(),
+                    "{completion:?} must retain its result or panic until the worker releases"
+                );
+                assert!(probes.active_blocking_work() > 0);
+                assert!(probes.reserved_bytes() >= 4_096);
+                pause.release();
+                let returned = tokio::time::timeout(Duration::from_secs(3), returned)
+                    .await
+                    .unwrap();
+                match completion {
+                    Completion::Success => assert_eq!(returned.unwrap(), Ok(42)),
+                    Completion::Error => {
+                        assert_eq!(returned.unwrap(), Err("query error sentinel"));
+                    }
+                    Completion::PollPanic | Completion::DropPanic => {
+                        let expected = if matches!(completion, Completion::PollPanic) {
+                            "query poll panic sentinel"
+                        } else {
+                            "query drop panic sentinel"
+                        };
+                        assert_eq!(
+                            returned.unwrap_err().downcast_ref::<&str>(),
+                            Some(&expected)
+                        );
+                    }
+                }
+                assert_eq!(probes.active_blocking_work(), 0);
+                assert_eq!(probes.reserved_bytes(), 0);
+            })
+            .await;
+        }
     }
 
     /// Injects a producer error and a panic; no query reaches either from a case.
@@ -335,6 +474,7 @@ mod tests {
             let probes = QueryMemoryProbes::default();
             with_query_memory_probes(probes.clone(), async {
                 let context = QueryContext::new(query_memory_limit()).unwrap();
+                let settlement = context.owned_workers();
                 let memory =
                     Arc::new(WorkMemory::new(context.task_ctx(), "producer failure").unwrap());
                 let mut stream =
@@ -358,7 +498,11 @@ mod tests {
                 assert!(error.to_string().contains(expected), "{error}");
                 drop(stream);
                 drop(context);
-                released(&probes).await;
+                tokio::time::timeout(Duration::from_secs(3), settlement.wait())
+                    .await
+                    .expect("failed or panicked producers must release their child ownership");
+                assert_eq!(probes.active_blocking_work(), 0);
+                assert_eq!(probes.reserved_bytes(), 0);
             })
             .await;
         }

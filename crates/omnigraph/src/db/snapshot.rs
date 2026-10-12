@@ -187,6 +187,19 @@ impl SnapshotDataset {
         self.inner.has_fts_index(column).await
     }
 
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        self.inner.has_fts_postings(column).await
+    }
+
+    /// The names of this version's built index entries, read from the raw
+    /// index-metadata section; untrained full-text segments index no row
+    /// and are left out. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        self.inner.built_index_names().await
+    }
+
     /// Whether this dataset has a user vector index on physical `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
         self.inner.has_vector_index(column).await
@@ -202,7 +215,7 @@ impl Snapshot {
         Self { inner }
     }
 
-    #[cfg(any(all(test, feature = "failpoints"), feature = "test-util"))]
+    #[cfg(feature = "test-util")]
     pub(crate) fn raw(&self) -> &omnigraph_catalog::Snapshot {
         &self.inner
     }
@@ -218,6 +231,16 @@ impl Snapshot {
         root_uri: &str,
     ) -> Result<omnigraph_catalog::SchemaContractRow> {
         omnigraph_catalog::ManifestCoordinator::read_schema_contract_for_snapshot(
+            root_uri,
+            &self.inner,
+        )
+        .await
+    }
+
+    /// The internal-schema (storage-format) stamp of this snapshot's own
+    /// `__manifest` version.
+    pub(crate) async fn internal_schema_stamp(&self, root_uri: &str) -> Result<Option<u32>> {
+        omnigraph_catalog::ManifestCoordinator::internal_schema_stamp_for_snapshot(
             root_uri,
             &self.inner,
         )

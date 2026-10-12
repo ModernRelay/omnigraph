@@ -26,7 +26,9 @@ Load and mutation input use one String representation:
 New external references are denied by default. A cluster-served graph must list
 allowed URI bases in its graph configuration. Direct `--store` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
-external references. Credentials must not appear in stored URIs.
+external references. Credentials must not appear in stored URIs. An allowed
+base must lie outside the cluster's storage root and every graph root; see
+[External Blob references](clusters/config.md#external-blob-references).
 
 Write mode determines ownership:
 
@@ -34,10 +36,113 @@ Write mode determines ownership:
   reference;
 - incremental inserts, upserts, updates, append/merge loads, and branch merges
   that write entities copy allowed source bytes into graph-managed storage;
-- an existing external reference remains readable and exportable even when new
-  external ingress is disabled.
+- an existing external reference remains readable even when new external
+  ingress is disabled, and exportable when it names its whole object (see
+  below).
+
+An `update` never reads the old value of a Blob it assigns. It carries every
+other Blob cell of a matched row: it reads the cell and rewrites it as managed
+bytes. Carrying a stored external reference therefore needs the graph's
+external Blob policy to admit the reference's source. Otherwise the update
+fails with a 400 that names the type, id, and property; assign that property in
+the same update, to a new value or to null, to replace or clear the reference
+without reading it.
+
+Only a graph written outside OmniGraph can hold a stored reference to a byte
+range of an object. Export writes an external reference as a bare URI, which
+reloads as the whole object, so export refuses a ranged reference instead of
+widening it. Change-feed images, the change-feed baseline and entity reads by
+id describe it exactly, as `{"uri": …, "offset": …, "length": …}` with a
+positive `length`, without reading the object. The feed passes the commit that
+holds it like any other, and a baseline taken while the row exists succeeds;
+that baseline does not reload with `load`. A stored descriptor with an offset
+but no length is refused as a Blob integrity error.
 
 OmniGraph never deletes the object named by an external reference.
+
+### Replacing one Blob value
+
+One Blob cell of an existing node or edge, addressed by exact id like a Blob
+read, can be replaced or cleared without a load or a mutation. Over HTTP,
+`PUT` stores the raw request body as a managed value and `DELETE` clears the
+cell:
+
+```http
+PUT /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
+Omnigraph-Http-Api: 0.13
+Content-Type: application/octet-stream
+If-Match: "<current ETag>"
+
+<raw bytes>
+```
+
+An embedded `Session` does the same with `put_blob_at_as` and
+`clear_blob_at_as`. A put returns the stored length, its ETag and the commit.
+Clearing a cell that is already null publishes nothing and returns no commit.
+
+Each write that changes the cell is one graph commit and needs the `change`
+action on the branch. Neither verb inserts a row: a missing entity is
+`NotFound` (404). Clearing a property that is not nullable is refused (400).
+The write never reads the cell's old value. Lance replaces whole rows, so the row's other cells
+are carried as an `update` carries them: a stored external reference among
+them needs the external Blob policy to admit its source, and their managed
+payloads count toward the operation's Blob payload allowance, `write_max_bytes`,
+together with the new value.
+
+A precondition makes the write conditional on the cell's current value: over
+HTTP an `If-Match` field, embedded a `BlobPrecondition`. A list of entity tags
+(`BlobPrecondition::Tags`) holds when the current ETag is one of them; weak tags
+never match. `*` (`BlobPrecondition::AnyExisting`) holds when the cell is not
+null. When it fails, the write changes nothing and returns
+`BlobWritePreconditionFailed`, over HTTP a `412` whose
+`blob_precondition_failure.current_etag` and `ETag` header carry the cell's
+current ETag when it holds a managed value. A malformed `If-Match` is a `400`. A commit that
+lands while the write is in flight makes it start again from the new head and
+check again, so a stale ETag fails instead of overwriting the newer value; a
+write without a precondition replaces whatever is current. A schema apply or a
+delete and recreate of the branch landing in that window refuses the write
+with a conflict instead.
+
+The returned ETag is the one a read at the returned commit reports. When a call
+fails after its commit became durable, for example because its acknowledgement
+was lost, the value is published once; read the cell for its current ETag
+before retrying with a precondition.
+
+Over HTTP:
+
+- `PUT` takes a `Content-Type: application/octet-stream` body of at most the
+  server's `write_max_bytes` (32 MiB by default), inclusive; a request cannot
+  change it. Another media type is a `415`. A larger body is a `413`, refused
+  before any of it is read when `Content-Length` declares it, and a body that
+  does not arrive before the server's body deadline is a `408`;
+- both verbs take `branch` (default `main`) and refuse `snapshot` or any other
+  unknown parameter with a `400`. A missing branch is a `404`;
+- `change` is authorized before the body is read;
+- success is a `200` with a receipt: `selector`, `branch`, `kind` (`managed` or
+  `null`), `size` and `etag` for a managed value, `actor_id`, and `commit`,
+  which is `null` only for a clear of a cell that was already null. A `PUT` also
+  returns the `ETag` header;
+- once the server admits a write it finishes it even if the client
+  disconnects, so a lost response means the write may have landed: read the
+  cell before writing again.
+
+From the CLI, `blob put` stores the bytes of `--file` or stdin and `blob clear`
+nulls the cell. Both take `--branch`, `--if-match` and `--json`, and print the
+receipt the server returns:
+
+```bash
+omnigraph blob put node Document manual content --file manual.pdf \
+  --if-match '"<current ETag>"' --store graph.omni
+omnigraph blob clear node Document manual content --server prod --graph knowledge
+```
+
+The CLI refuses input over 32 MiB and a malformed `--if-match` before it
+addresses the graph. The value must also fit `write_max_bytes`: the process's
+`OMNIGRAPH_WRITE_MAX_BYTES` for a `--store` write, the server's for a served
+one. `--as` names the actor of a `--store` write; a served
+write takes its actor from the bearer token. A served Blob `412` exits 4, as a
+graph-commit precondition does; an embedded one exits 1. Each write is sent
+once: after an unknown outcome, read the cell before writing again.
 
 ## Query behavior
 
@@ -46,8 +151,9 @@ filtered, ordered, or aggregated. Write them through load or mutation
 assignment, then read an individual Blob value through the dedicated CLI or
 HTTP surface.
 
-There are no `blob put` or `blob clear` commands. Use the normal graph write
-path so Blob changes remain part of an atomic graph commit.
+To replace or clear one value, use the CLI, HTTP or embedded writes in
+[Replacing one Blob value](#replacing-one-blob-value); each is an atomic graph
+commit.
 
 ## CLI reads
 
@@ -94,7 +200,7 @@ Servers expose the same logical selector with GET and HEAD:
 
 ```http
 GET /graphs/knowledge/blob?entity=node&type=Document&id=manual&property=content&branch=main
-Omnigraph-Http-Api: 0.12
+Omnigraph-Http-Api: 0.13
 ```
 
 Both methods follow the [HTTP contract](operations/server.md#http-contract),
@@ -117,11 +223,58 @@ in `Location`. The server does not fetch, sign, authorize, or proxy that object
 and does not claim its size or ETag. A persisted ranged external descriptor
 fails loudly instead of redirecting to a wider value.
 
-## Limits and lifecycle
+## Limits
 
-One embedded managed range read returns at most 4 MiB. Read larger values in
-consecutive ranges; the CLI and HTTP server stream them without requiring one
-whole-value buffer.
+Blob limits bound the memory one operation needs. An operation over a limit
+fails before it changes the graph. Over HTTP it returns `413` with a
+`resource_limit` detail naming the `resource`, its `limit` and the `actual`
+value observed. For a write, the CLI reports the same three fields; the
+`omnigraph blob` commands report an over-limit range read as
+`Blob read range exceeds the limit`. Split the work into smaller operations
+and retry.
+
+| Limit | Applies to | Reported resource |
+|---|---|---|
+| `write_max_bytes` decoded bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
+| `write_max_bytes` decoded bytes | One `base64:` value in an insert or update mutation; a statement's values add up across its Blob properties and an update's matched rows. A load reports its decoded bytes under the `for <table>` and `per operation` names | `decoded blob input bytes per operation` |
+| `write_max_bytes` row bytes per type and across all touched types | Incremental writes: `append` and `merge` loads, inserts and updates. Counts ordinary columns, Blob descriptors and Arrow bookkeeping; excludes logical Blob payload buffers | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation`, `keyed parsed entity bytes for <table>`, `keyed parsed entity bytes per operation` |
+| `write_max_bytes` logical Blob payload bytes | One incremental write across all types: inline payloads, copied external payloads and Blob values carried by updates or by a Blob put count together | `materialized blob payload bytes`, `decoded blob input bytes per operation` |
+| `write_max_bytes` bytes, inclusive | The bytes of one Blob put, embedded or the body of an HTTP `PUT`, checked before the write opens a table | `Blob write payload bytes` |
+| `write_max_bytes` Blob payload bytes | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |
+| 8,192 external references | One write operation or merge | `external Blob reference cells` |
+| 32 MiB of retained URI metadata | One write operation or merge. Every copy of a URI the operation keeps counts, plus 24 bytes per copy: admission keeps each reference's text twice and each distinct object's normalized URI twice, so distinct URIs reach the limit at about 8 MiB of text | `external Blob URI metadata bytes` |
+| 64 KiB | One external URI | `external Blob URI bytes` |
+| 4 MiB | One embedded managed range read | `Blob read range bytes` |
+
+Superseded versions of a key written in one operation count as input
+(`decoded blob input bytes per operation`) until the last-write-wins fold.
+An update of a row inserted earlier in the same mutation is such a version:
+it carries the pending row's Blob, so that payload counts twice, the carried
+copy as `materialized blob payload bytes`.
+
+[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts
+`1..=33554432`. Payload and row allowances are independent: a payload exactly
+at the limit fits when its row and descriptors also fit. Repeated external
+references each count their payload length even when one fetch serves them.
+External-only admission can also report `materialized external blob payload bytes`.
+
+`<table>` names the type as `node:<Type>` or `edge:<Type>`, for example
+`keyed entity bytes for node:Document`.
+
+The HTTP load request body is also capped at 32 MiB. That cap counts the
+encoded request, so one request carries about 24 MiB of decoded `base64:`
+data. A Blob `PUT` carries raw bytes, not `base64:` text, so its 32 MiB body
+holds a full 32 MiB value. Every HTTP request other than a load (`/load` and
+`/load/ndjson`) or a Blob `PUT` is bounded by the default 1 MiB request body
+limit, so a `base64:` literal in an HTTP mutation hits that limit first.
+
+Values larger than these limits stay readable. The CLI and the HTTP server
+read managed values in 4 MiB ranges, so a large value streams without a
+whole-value buffer, and one HTTP response holds at most two ranges at a time.
+`omnigraph optimize` bounds the Blob payload of each compaction batch
+separately; see [Optimize](operations/maintenance.md#optimize).
+
+## Lifecycle
 
 Blob readers stay pinned to the snapshot selected when they were opened. They
 never switch to newer bytes when a branch advances. Branch deletion and

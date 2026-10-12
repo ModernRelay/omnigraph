@@ -1,0 +1,74 @@
+# issue: none
+# notes: Bounded issue-query representative: 20 people, two hubs with ten outgoing edges each, and 1024-dimensional generated vectors. Scale, vectors and publication batches differ from the former Rust workload; this has a new timing identity.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I64
+    team: String
+    body: String @index
+    bio: String
+    embedding: Vector(1024)
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 20
+    commits: 1
+    batch_rows: 20
+    columns:
+      name: {kind: key, prefix: p, width: 6}
+      age: {kind: modulo, modulus: 100}
+      team: {kind: key, prefix: g, width: 0, modulo: 10}
+      body:
+        kind: ranges
+        ranges:
+          - {end: 1, value: "plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team  needle"}
+          - {end: 10, value: "plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team "}
+          - {end: 11, value: "plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team  needle"}
+        fallback: "plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team plain filler words about a person and a team "
+      bio: {kind: repeat, text: "synthetic person biography ", count: 40}
+      embedding: {kind: vector, dimensions: 1024}
+  - kind: edge
+    name: Knows
+    rows: 10
+    commits: 1
+    batch_rows: 10
+    start: 0
+    id: {kind: key, prefix: e, width: 3}
+    from: {kind: literal, value: p000000}
+    to: {kind: key, prefix: p, width: 6}
+    columns: {}
+  - kind: edge
+    name: Knows
+    rows: 10
+    commits: 1
+    batch_rows: 10
+    start: 10
+    id: {kind: key, prefix: e, width: 3}
+    from: {kind: literal, value: p000001}
+    to: {kind: key, prefix: p, width: 6}
+    columns: {}
+
+--- query
+query fixture_people() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":20}
+--- expect shape
+n: I64
+
+--- query
+query fixture_edges() { match { $p: Person $p knows $q } return { count($q) as n } }
+--- expect unordered
+{"n":20}
+--- expect shape
+n: I64

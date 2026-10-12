@@ -29,7 +29,7 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.11.0
+- Version surveyed: 0.13.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 11.0.0
 - Workspace: compiler, planner (logical/physical plans and optimizer), storage,
@@ -129,12 +129,14 @@ its Cargo package is `omnigraph-engine`.
 cargo build --workspace --locked
 
 # Canonical CI test graph
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
-# Focused examples
-cargo test -p omnigraph-engine --test traversal_indexed
+# Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
+# binary (one link per crate, not one per file); a file stays a separate binary only when its tests
+# need their own process. CI selects a module's test as `--test integration <module>::<name>`.
+cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
 
@@ -148,8 +150,10 @@ python3 scripts/check-docs.py
 python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
 cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
-python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
+python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
+python3 scripts/check-workspace-test-owners.py --self-test   # after editing the `Test Workspace` owner list or .config/nextest.toml
 typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
 ```
 
@@ -186,12 +190,18 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
   assertions; when the reported symptom additionally needs scale to
-  manifest, a second `#[ignore]`d test in a `tests/repro_issue_*.rs` target
-  guards it, and the two cross-reference each other in comments.
+  manifest, a second test guards it, a `.gqt` case under
+  `crates/omnigraph-gqt/cases_slow/` when the format can express the symptom
+  and an `#[ignore]`d test in a `tests/integration/repro_issue_*.rs` module otherwise,
+  and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
-  (`instrument:`, `hunt:`, `heavy-repro:`, or the environment it needs);
-  expensive regression repros use `heavy-repro:` and thereby enroll in the
-  nightly job.
+  (`instrument:`, `hunt:`, `heavy-repro:`, `nightly:`, or the environment it
+  needs); expensive regression repros use `heavy-repro:`, a test that waits
+  out a real production deadline or runs a whole CLI journey on the real poll
+  interval uses `nightly:`, and both enroll by exact name in
+  `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
+  with `--run-ignored only` and refuses a run in which an enrolled name did
+  not pass.
 - Engine v1 is frozen: every file under
   `crates/omnigraph-reference-engine/src/` is pinned by
   `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only
@@ -206,6 +216,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
+- Title a pull request `type(scope)!: description` and read the title back
+  after opening it; the `PR Title` check refuses every other shape, and the
+  squash subject on `main` is that title
+  ([CONTRIBUTING.md](CONTRIBUTING.md), Pull Requests).
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

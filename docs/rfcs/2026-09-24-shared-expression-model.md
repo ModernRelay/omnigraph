@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-24
-updated: 2026-09-27
+updated: 2026-10-02
 discussion: null
 supersedes: []
 superseded_by: []
@@ -249,10 +249,9 @@ Arrow rejects a null in a non-nullable field
 Arrow backstop covers the scalar path only; the new check covers every
 property type, `Blob` included, so a null result assigned to a
 non-nullable `Blob` property is refused with the same typed error before
-the batch. Clearing a nullable `Blob` stays outside this RFC: today a null
-assigned to a nullable `Blob` property takes the copy-the-old-value branch
-of `apply_assignments` (`exec/mutation.rs:458-477`) and keeps the old value
-instead of clearing it, a pre-existing defect tracked separately.
+the batch. A null assigned to a nullable `Blob` property clears the cell:
+`apply_assignments` (`exec/mutation.rs:458`) builds a null Blob column for
+it, and the update's scan never reads the assigned cell's old value.
 
 A `prop_match` is typed apart from an assignment. An assignment takes the
 property's type. An inline match on a scalar property takes the property's
@@ -1279,3 +1278,10 @@ None.
   reference in `omnigraph-reference-engine`, and a user sees no gate
   error. `order_clause_aggregate_refused.gqt` is renamed
   `order_key_aggregate_or_node_binds_to_return_item.gqt`.
+- 2026-10-02, amendment from the PR that made an update's null clear a
+  nullable `Blob`: the defect this RFC left outside its scope is fixed.
+  Superseded sentence in "Grammar": "Clearing a nullable `Blob` stays outside
+  this RFC: today a null assigned to a nullable `Blob` property takes the
+  copy-the-old-value branch of `apply_assignments` (`exec/mutation.rs:458-477`)
+  and keeps the old value instead of clearing it, a pre-existing defect
+  tracked separately."

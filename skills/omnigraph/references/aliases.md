@@ -93,7 +93,7 @@ Or per-alias (`format: jsonl`), or per-call (`--format jsonl`).
 - **`csv`** — for spreadsheets or line-count-heavy analysis
 - **`table`** — default human view; don't use in automation
 
-`--format arrow` is accepted by the parser in 0.11.0 but always fails with "has
+`--format arrow` is accepted by the parser in 0.12.0 but always fails with "has
 no text rendering"; never set it as an alias or `defaults.output` format.
 
 Query row spelling follows [`queries.md`](queries.md#system-fields-and-result-values):

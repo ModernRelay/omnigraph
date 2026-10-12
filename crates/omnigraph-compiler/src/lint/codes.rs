@@ -26,7 +26,7 @@ pub struct DiagnosticCode {
     pub short: &'static str,
 }
 
-// ─── Destructive (DS) — data-loss; always requires explicit opt-in ──────────
+// ─── Destructive (DS) — data-loss ────────────────────────────────────────────
 
 /// Reserved: dropping an entire graph (schema-level). Not yet emitted.
 pub const OG_DS_101: DiagnosticCode = DiagnosticCode {

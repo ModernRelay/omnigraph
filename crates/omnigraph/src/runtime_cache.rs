@@ -679,7 +679,7 @@ edge Likes: Person -> Person {}
             let ctx =
                 omnigraph_compiler::query::typecheck::typecheck_query(catalog, &decl).unwrap();
             CompiledRead::Query(Arc::new(
-                omnigraph_compiler::lower_query(catalog, &decl, &ctx).unwrap(),
+                omnigraph_compiler::lower_query(catalog, &ctx).unwrap(),
             ))
         };
         let cache = CompiledQueryCache::default();

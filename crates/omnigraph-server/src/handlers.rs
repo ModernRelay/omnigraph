@@ -3,7 +3,11 @@
 //! verbatim from lib.rs in the modularization).
 
 use super::*;
+use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::operations::OwnedResult;
+use crate::redacted_cause::RedactedCause;
+use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
+use crate::serving::GraphRequest;
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
@@ -18,6 +22,7 @@ async fn owned_write<T, F>(
     state: &AppState,
     admission: AdmissionGuard,
     ingress: IngressLease,
+    graph: GraphRequest,
     operation: F,
 ) -> std::result::Result<T, ApiError>
 where
@@ -26,17 +31,20 @@ where
 {
     state
         .operations
-        .submit((admission, ingress), async move { operation.await.into() })?
+        .submit((admission, ingress, graph), async move {
+            operation.await.into()
+        })?
         .result()
         .await
 }
 
 mod dispatch;
 use dispatch::{
-    Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
+    CommitControlOutcome, Door, ReadDispatch, classify, commit_control_body,
+    commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
     read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_settings_at_deprecated_route, refuse_statement_envelope, refuse_wrong_door,
-    run_branch_statement, session_with_prefix, show_at_write_door,
+    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
+    session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -66,10 +74,11 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
 ///
 /// Unauthenticated, and therefore minimal: it reports whether this replica
 /// is serving or draining, the applied `config_digest` it booted from, the
-/// ledger revision and CAS it read, and how many graphs it serves and does
-/// not serve. Graph ids stay behind authenticated catalog endpoints. Answers
-/// 503 once shutdown has begun; `/healthz` stays 200 while the process is
-/// alive.
+/// ledger revision and CAS it read, and registry/ready/loading/blocked counts. Graph
+/// ids stay behind authenticated catalog endpoints. Partial availability is
+/// ready but degraded after loading finishes; loading, no available graph or
+/// shutdown returns 503. A valid
+/// empty registry is ready. `/healthz` reports liveness independently.
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -77,7 +86,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
     operation_id = "readiness",
     responses(
         (status = 200, description = "Serving", body = ReadinessOutput),
-        (status = 503, description = "Draining", body = ReadinessOutput),
+        (status = 503, description = "Graphs loading, no graph available or stopping", body = ReadinessOutput),
     ),
 )]
 pub(crate) async fn server_ready(
@@ -85,22 +94,46 @@ pub(crate) async fn server_ready(
 ) -> (StatusCode, Json<ReadinessOutput>) {
     let draining = state.draining.load(std::sync::atomic::Ordering::SeqCst)
         || state.operations.snapshot().closed;
-    let served_graph_count = state.routing().registry.list().len();
-    let quarantined_graph_count = state.quarantined_graphs().len();
+    let entries = state.routing().registry.entries();
+    let served_graph_count = entries.len();
+    let ready_graph_count = entries
+        .iter()
+        .filter(|entry| matches!(entry, GraphEntry::Ready(_)))
+        .count();
+    let loading_graph_count = entries
+        .iter()
+        .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
+        .count();
+    let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
+    let ready =
+        !draining && loading_graph_count == 0 && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
-        ready: !draining,
-        status: if draining { "draining" } else { "serving" }.to_string(),
+        ready,
+        status: if draining {
+            "draining"
+        } else if loading_graph_count > 0 {
+            "loading"
+        } else if !ready {
+            "blocked"
+        } else if blocked_graph_count > 0 {
+            "degraded"
+        } else {
+            "serving"
+        }
+        .to_string(),
         booted_serving_digest: state.witness.booted_serving_digest.clone(),
         state_revision: state.witness.state_revision,
         state_cas: state.witness.state_cas.clone(),
         served_graph_count,
-        quarantined_graph_count,
+        ready_graph_count,
+        loading_graph_count,
+        blocked_graph_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
-    let status = if draining {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+    let status = if ready {
         StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(output))
 }
@@ -130,10 +163,10 @@ pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
-    let registry = &state.routing().registry;
+    let snapshot = state.routing().registry.snapshot_ref();
 
-    // Server-level Cedar gate. `state.server_policy` is loaded from the
-    // cluster-scoped policy bundle at startup. When no server policy is
+    // Capture management authorization and inventory from one activated
+    // registry snapshot. When no server policy is
     // configured, `authorize_request_server` falls through to the MR-723
     // default-deny semantics (every non-Read action denied for an
     // authenticated actor). `GraphList` is not `Read`, so without a server
@@ -141,7 +174,7 @@ pub(crate) async fn server_graphs_list(
     // the registry until the operator explicitly authorizes it).
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
-        state.server_policy.as_deref(),
+        snapshot.server_policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::GraphList,
             branch: None,
@@ -149,29 +182,50 @@ pub(crate) async fn server_graphs_list(
         },
     )?;
 
-    let may_list = |id: &str| {
-        actor
-            .as_ref()
-            .is_none_or(|actor| actor.0.permits_graph_listing(id))
-    };
-    let mut graphs: Vec<GraphInfo> = registry
-        .list()
-        .into_iter()
-        .filter(|handle| may_list(handle.key.graph_id.as_str()))
-        .map(|handle| GraphInfo {
-            graph_id: handle.key.graph_id.as_str().to_string(),
-            uri: handle.uri.clone(),
+    let stopping = state.draining.load(std::sync::atomic::Ordering::SeqCst)
+        || state.operations.snapshot().closed;
+    let mut graphs: Vec<GraphInfo> = snapshot
+        .graphs
+        .values()
+        .map(|entry| {
+            let failure = match &entry {
+                GraphEntry::Loading(_) | GraphEntry::Ready(_) | GraphEntry::Transitioning(_) => {
+                    None
+                }
+                GraphEntry::Blocked(graph) => Some(graph.failure),
+            };
+            let available = !stopping && matches!(entry, GraphEntry::Ready(_));
+            GraphInfo {
+                graph_id: entry.key().graph_id.as_str().to_string(),
+                uri: entry.uri().to_string(),
+                state: if stopping {
+                    GraphAvailability::Stopping
+                } else {
+                    match &entry {
+                        GraphEntry::Loading(_) => GraphAvailability::Loading,
+                        GraphEntry::Ready(_) => GraphAvailability::Ready,
+                        GraphEntry::Transitioning(_) => GraphAvailability::Transitioning,
+                        GraphEntry::Blocked(_) => GraphAvailability::Blocked,
+                    }
+                },
+                read_available: available,
+                write_available: available,
+                failure,
+                action: if stopping {
+                    GraphAvailabilityAction::WaitForRestart
+                } else {
+                    match &entry {
+                        GraphEntry::Loading(_) => GraphAvailabilityAction::WaitForStartup,
+                        GraphEntry::Ready(_) => GraphAvailabilityAction::None,
+                        GraphEntry::Transitioning(_) => GraphAvailabilityAction::WaitForTransition,
+                        GraphEntry::Blocked(_) => GraphAvailabilityAction::ApplyCorrectionOrRestart,
+                    }
+                },
+            }
         })
         .collect();
     graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
-    Ok(Json(GraphListResponse {
-        graphs,
-        quarantined: state
-            .quarantined_graphs()
-            .into_iter()
-            .filter(|id| may_list(id))
-            .collect(),
-    }))
+    Ok(Json(GraphListResponse { graphs }))
 }
 
 #[utoipa::path(
@@ -196,15 +250,14 @@ pub(crate) async fn server_graphs_discovery(
             "graph discovery requires an admitted identity credential",
         ));
     }
-    // Both sets come from the accepted boot inventory. Never scan storage or
+    // Identity comes from the complete startup registry. Never scan storage or
     // include per-graph status, roots, diagnostics, schema, or policy contents.
     let ids: std::collections::BTreeSet<String> = state
         .routing()
         .registry
-        .list()
+        .entries()
         .into_iter()
-        .map(|handle| handle.key.graph_id.as_str().to_owned())
-        .chain(state.quarantined_graphs())
+        .map(|entry| entry.key().graph_id.as_str().to_owned())
         .collect();
     Ok(Json(GraphDiscoveryResponse {
         graphs: ids
@@ -252,6 +305,9 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/readyz",
     "/graphs",
     "/graphs/discovery",
+    "/cluster/plan",
+    "/cluster/deployments",
+    "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",
 ];
 
@@ -389,12 +445,12 @@ pub(crate) async fn require_bearer_auth(
 }
 
 /// Routing middleware (RFC-011 cluster-only). Resolves the active graph
-/// for the request and injects `Arc<GraphHandle>` as an extension so
-/// handlers can extract it via `Extension<Arc<GraphHandle>>`.
+/// for the request and injects `GraphRequest` as an extension so
+/// handlers can extract it via `Extension<GraphRequest>`.
 ///
 /// Routes are always nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
-/// the registry. Returns 404 if the graph is not registered.
+/// the registry. Unknown graphs return 404; authorized blocked graphs return 503.
 ///
 /// The middleware fires AFTER `require_bearer_auth`, so the actor is
 /// already in the request extensions (or auth was off entirely).
@@ -403,7 +459,6 @@ pub(crate) async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let registry = &state.routing.registry;
     // `Router::nest("/graphs/{graph_id}", inner)` rewrites
     // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
     // The pre-rewrite URI is preserved in the `OriginalUri`
@@ -425,18 +480,12 @@ pub(crate) async fn resolve_graph_handle(
         })?;
     let graph_id = GraphId::try_from(graph_id_str.to_string())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if let Some(actor) = request.extensions_mut().get_mut::<AuthenticatedActor>() {
-        if !actor.select_graph(&graph_id) {
-            return Err(ApiError::forbidden("credential does not permit this graph"));
-        }
-    }
     let key = GraphKey::cluster(graph_id.clone());
-    let handle = match registry.get(&key) {
-        RegistryLookup::Ready(handle) => handle,
-        RegistryLookup::Gone => {
-            return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
-        }
-    };
+    let handle = resolve_registered_graph(
+        &state,
+        &key,
+        request.extensions().get::<AuthenticatedActor>(),
+    )?;
 
     // Per-request observability. `Span::current().record` would silently
     // no-op here because no upstream `#[tracing::instrument(...)]` macro
@@ -446,6 +495,79 @@ pub(crate) async fn resolve_graph_handle(
 
     request.extensions_mut().insert(handle);
     ingress::admit(&state, request, next).await
+}
+
+/// HTTP and MCP share identity and unavailable-graph disclosure.
+pub(crate) fn resolve_registered_graph(
+    state: &AppState,
+    key: &GraphKey,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<GraphRequest, ApiError> {
+    let (captured, server_policy) = state
+        .routing()
+        .registry
+        .capture_with_policy(&state.operations, key)?;
+    let (policy, invalid_policy, message) = match captured {
+        RegistryCapture::Loading(graph) => (
+            graph.policy.clone(),
+            false,
+            "graph is loading; wait for its startup attempt to complete",
+        ),
+        RegistryCapture::Ready(handle) => return Ok(handle),
+        RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
+        RegistryCapture::Transitioning(view) => (
+            view.policy.clone(),
+            false,
+            "graph admission is closed for a serving transition",
+        ),
+        RegistryCapture::Blocked(graph) => (
+            graph.policy.clone(),
+            matches!(
+                graph.failure,
+                StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
+            ),
+            "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
+        ),
+    };
+    // Invalid policy is not equivalent to the operator choosing no policy.
+    // Both startup failures and transitions preserve authorization before
+    // disclosing a known graph's unavailability.
+    let readable = !invalid_policy
+        && matches!(
+            authorize(
+                actor,
+                policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".into()),
+                    target_branch: None,
+                }
+            )?,
+            Authz::Allowed
+        );
+    let listable = readable
+        || matches!(
+            authorize(
+                actor,
+                server_policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                }
+            )?,
+            Authz::Allowed
+        );
+    if !listable {
+        return Err(ApiError::not_found("graph not found"));
+    }
+    Err(ApiError {
+        completion_uncertain: false,
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: Some(ErrorCode::GraphUnavailable),
+        message: message.into(),
+        details: None,
+    })
 }
 
 pub(crate) fn log_policy_decision(
@@ -480,11 +602,10 @@ pub(crate) enum Authz {
 /// and reserving `Err` for operational failures (401 missing bearer, 500
 /// policy-evaluation error). Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
-///     graph's Cedar rules govern read/change/branch_*/schema_apply.
-///   * Management handler — passes `state.server_policy.as_deref()` so
-///     server-level Cedar rules govern `graph_list` (the only shipped
-///     server-scoped action; runtime `graph_create` / `graph_delete`
-///     are deferred until a managed cluster catalog lands).
+///     graph's Cedar rules govern read/change/branch_*.
+///   * Management handler — captures the current registry snapshot policy so
+///     server-level Cedar rules govern management access coherently with its
+///     graph inventory.
 ///
 /// The MR-731 invariant lives inside this function: actor identity is
 /// supplied as a separate argument from the resolved bearer match. The
@@ -498,11 +619,6 @@ pub(crate) fn authorize(
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
     if let Some(actor) = actor {
-        if !actor.permits_action(request.action) {
-            return Ok(Authz::Denied(
-                "credential does not permit this action".to_string(),
-            ));
-        }
         if actor.source == AuthSource::SignedData && policy.is_none() {
             return Ok(Authz::Denied(
                 "signed data credentials require an applied Cedar policy permit".to_string(),
@@ -521,7 +637,7 @@ pub(crate) fn authorize(
         //   return 403. Closes the "configured auth but forgot the
         //   policy file" trap from MR-723.
         // * Either of the above with a **server-scoped** action
-        //   (`graph_list`, future `graph_create`/`graph_delete`).
+        //   (`graph_list`, `config_manage`).
         //
         // Server-scoped actions are always denied here, regardless of
         // mode or actor presence. The management surface leaks server
@@ -532,25 +648,21 @@ pub(crate) fn authorize(
         // runtime state means the docstring contract on
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
-        // operator's only path to enabling it is configuring a
-        // cluster-scoped policy bundle, applying the cluster, and
-        // restarting the server.
+        // cluster must be bootstrapped with an explicit cluster-scoped
+        // policy bundle.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
-                "server-scoped actions require an explicit cluster policy bundle \
-                 applied with `omnigraph cluster apply` and served after restart — \
-                 the management surface is closed by default in every runtime state, \
-                 including --unauthenticated, so that server topology is never exposed \
-                 without operator opt-in."
+                "server-scoped actions require an applied cluster policy permit; \
+                 declare the cluster policy when bootstrapping. The management surface \
+                 is closed by default, including with --unauthenticated."
                     .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
-                 applied policy bundle). Only `read` actions are permitted; configure \
-                 a graph or cluster policy bundle in the cluster config, run \
-                 `omnigraph cluster apply`, and restart the server to enable other actions."
+                 applied policy bundle). Only `read` actions are permitted. Other \
+                 actions require an applied graph policy."
                     .to_string(),
             ));
         }
@@ -618,7 +730,7 @@ pub(crate) fn authorize_request(
 /// published dataset version, entity count) for every backing dataset on the
 /// branch. Defaults to `main` when `branch` is omitted. Read-only.
 pub(crate) async fn server_snapshot(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
@@ -632,6 +744,8 @@ pub(crate) async fn server_snapshot(
             target_branch: None,
         },
     )?;
+    // One resolution: the stamp is read from the snapshot's own manifest
+    // version, so both halves of the response describe one graph version.
     let (snapshot, internal_schema_version) = {
         let db = &handle.engine;
         let snapshot = db
@@ -639,7 +753,7 @@ pub(crate) async fn server_snapshot(
             .await
             .map_err(ApiError::from_omni)?;
         let internal_schema_version = db
-            .internal_schema_version_of(ReadTarget::branch(branch.as_str()))
+            .internal_schema_version_at(&snapshot)
             .await
             .map_err(ApiError::from_omni)?;
         (snapshot, internal_schema_version)
@@ -647,81 +761,6 @@ pub(crate) async fn server_snapshot(
     let output = snapshot_payload(&branch, &snapshot, internal_schema_version)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(output))
-}
-
-/// Header values that flag a response as coming from a deprecated route
-/// (RFC 9745 / RFC 8288) and point at the canonical successor.
-pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName, HeaderValue); 2] {
-    [
-        (
-            HeaderName::from_static("deprecation"),
-            HeaderValue::from_static("true"),
-        ),
-        (
-            HeaderName::from_static("link"),
-            HeaderValue::from_static(successor_link),
-        ),
-    ]
-}
-
-#[utoipa::path(
-    post,
-    path = "/read",
-    tag = "queries",
-    operation_id = "read",
-    request_body = ReadRequest,
-    responses(
-        (status = 200, description = "Legacy token-free query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = LegacyReadOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(
-    note = "use POST /query instead; /read is kept indefinitely with a byte-stable envelope"
-)]
-/// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
-///
-/// Execute a GQ read query. The route is kept indefinitely with a byte-stable
-/// envelope; cell spelling follows the JSON writer. A `settings` field, and
-/// a `set` or `reset` prefix in the source, are refused: the route runs under
-/// the process defaults alone. New integrations
-/// should target `POST /query`, which has clean field names (`query` /
-/// `name`) and a 400-on-mutation guard. Responses from this route include
-/// `Deprecation: true` and `Link: <query>; rel="successor-version"`
-/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
-/// signal.
-pub(crate) async fn server_read(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ReadRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<LegacyReadOutput>), ApiError> {
-    if request.settings.is_some() {
-        return Err(ApiError::bad_request(
-            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
-        ));
-    }
-    let session = state.session(&handle, None)?;
-    let output = run_query(
-        handle,
-        session,
-        actor.as_ref().map(|Extension(actor)| actor),
-        Door::Read,
-        &request.query_source,
-        request.query_name.as_deref(),
-        request.params.as_ref(),
-        request.branch,
-        request.snapshot,
-    )
-    .await?
-    .into_read_output()?;
-    Ok((
-        deprecation_headers("<query>; rel=\"successor-version\""),
-        Json(output.into()),
-    ))
 }
 
 #[utoipa::path(
@@ -732,22 +771,20 @@ pub(crate) async fn server_read(
     request_body = QueryRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
-        (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, or its deprecated alias POST /change, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Full-text index requires explicit rebuilding; full_text_index_rebuild_required is not cleared by retrying", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Execute an inline read query (friendlier-named alternative to `POST /read`).
+/// Execute an inline read query.
 ///
 /// Designed for ad-hoc exploration and AI-agent tool-use: short field
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
-/// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
-/// write queries. It shares `POST /read` target semantics (branch xor
-/// snapshot) and the same Cedar action (Read), while its canonical response
-/// additionally carries the pinned graph-commit token.
+/// -- use `POST /mutate` for writes. Select a branch or snapshot and obtain
+/// the pinned graph-commit token with the response. Cedar authorizes Read.
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
@@ -762,7 +799,7 @@ pub(crate) async fn server_read(
 /// request's target and `params`.
 pub(crate) async fn server_query(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<QueryRequest>, JsonRejection>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
@@ -864,7 +901,7 @@ struct BlobBinaryBody(Vec<u8>);
 /// descriptors redirect without target-store I/O. Authorization and target
 /// resolution share the exact helper used by `/query`.
 pub(crate) async fn server_blob_get(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
@@ -872,7 +909,7 @@ pub(crate) async fn server_blob_get(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_get(read, &headers)
+    blob_transport::serve_blob_get(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
 #[utoipa::path(
@@ -928,7 +965,7 @@ pub(crate) async fn server_blob_get(
 /// fallback. It never calls `BlobReader::read_range`; Range and If-Range are
 /// deliberately ignored while If-None-Match is still evaluated.
 pub(crate) async fn server_blob_head(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: HeaderMap,
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
@@ -936,7 +973,305 @@ pub(crate) async fn server_blob_head(
     let query = parse_blob_read_query(query)?;
     let read = read_blob_for_delivery(&handle, actor.as_ref().map(|Extension(actor)| actor), query)
         .await?;
-    blob_transport::serve_blob_head(read, &headers)
+    blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
+}
+
+#[utoipa::path(
+    put,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "putBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. Weak tags never match. The write evaluates it against the branch head it applies to."),
+    ),
+    request_body(
+        content = inline(BlobBinaryBody),
+        content_type = "application/octet-stream",
+        description = "The raw bytes to store: at most 33554432 bytes (32 MiB), inclusive."
+    ),
+    responses(
+        (status = 200, description = "The bytes are published in one graph commit", body = BlobWriteOutput,
+            headers(
+                ("ETag" = String, description = "Strong validator of the stored value; equals `etag` in the body"),
+            )),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 408, description = "The request body did not arrive before the body deadline", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
+        (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Replace one Blob value of an existing node or edge with the request body.
+///
+/// The cell's old value is never read; the entity's other cells are carried
+/// unchanged. Authorization of `change` on the branch runs before the body is
+/// read. Once admitted the write is owned by the server: a disconnect loses
+/// only the response, never cancels or replays the write.
+pub(crate) async fn server_blob_put(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+    request: Request,
+) -> std::result::Result<Response, ApiError> {
+    let ingress = request
+        .extensions()
+        .get::<IngressLease>()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing ingress reservation"))?;
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(request.headers())?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/octet-stream"))
+    {
+        return Err(ApiError::unsupported_media_type(
+            "a Blob put requires Content-Type: application/octet-stream",
+        ));
+    }
+    let declared = match request.headers().get(CONTENT_LENGTH) {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| ApiError::bad_request("invalid Content-Length"))?,
+        ),
+    };
+    let limit = state.blob_put_limit();
+    if let Some(declared) = declared.filter(|declared| *declared > limit) {
+        return Err(blob_put_too_large(limit, declared));
+    }
+
+    let deadline = request
+        .extensions()
+        .get::<ingress::BodyDeadline>()
+        .copied()
+        .ok_or_else(|| ApiError::internal("missing request body deadline"))?;
+    let bytes = tokio::time::timeout_at(
+        deadline.0,
+        collect_blob_put_body(request.into_body(), declared, limit),
+    )
+    .await
+    .map_err(|_| ingress::body_timeout())??;
+    ingress
+        .shrink(bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .put_blob_at_as(&branch, cell, bytes, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "clearBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. A null cell satisfies neither form."),
+    ),
+    responses(
+        (status = 200, description = "The cell is null. `commit` is the clear's publication, or `null` when the cell already was null and nothing was published", body = BlobWriteOutput),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob or non-nullable property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The entity's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Set one nullable Blob value of an existing node or edge to null.
+///
+/// Clearing a cell that is already null publishes nothing. Like a put, the
+/// clear is owned by the server once admitted.
+pub(crate) async fn server_blob_delete(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(&headers)?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, 0)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .clear_blob_at_as(&branch, cell, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+fn parse_blob_write_query(
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<BlobWriteQuery, ApiError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ApiError::bad_request(format!(
+            "invalid Blob write query parameters: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+fn blob_write_precondition(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<omnigraph::BlobPrecondition>, ApiError> {
+    api::parse_blob_if_match(
+        headers
+            .get_all(axum::http::header::IF_MATCH)
+            .iter()
+            .map(|value| value.as_bytes()),
+    )
+    .map_err(ApiError::bad_request)
+}
+
+/// A Blob write needs `change` on its branch, checked before any body byte
+/// is read.
+fn authorize_blob_write(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: &str,
+) -> std::result::Result<(), ApiError> {
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
+fn blob_write_cell(query: BlobWriteQuery) -> omnigraph::BlobCell {
+    omnigraph::BlobCell {
+        entity: match query.entity {
+            api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
+            api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+        },
+        type_name: query.r#type,
+        id: query.id,
+        property: query.property,
+    }
+}
+
+/// The refusal of a put body over the limit: the same resource, limit and
+/// message the engine reports for an oversized embedded put.
+fn blob_put_too_large(limit: u64, actual: u64) -> ApiError {
+    ApiError::from_omni(OmniError::resource_limit(
+        omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE,
+        limit,
+        actual,
+    ))
+}
+
+/// Collect a put body into one buffer, sized from a declared length that is
+/// already within the limit. The engine adopts the buffer without a copy.
+async fn collect_blob_put_body(
+    body: Body,
+    declared: Option<u64>,
+    limit: u64,
+) -> std::result::Result<Bytes, ApiError> {
+    let capacity = declared.map_or(Ok(0), usize::try_from).map_err(|_| {
+        ApiError::bad_request("Content-Length does not fit in this platform's memory")
+    })?;
+    let mut data = Vec::with_capacity(capacity);
+    let mut body = body.into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::bad_request(format!("failed to read Blob request body: {err}"))
+        })?;
+        let actual = data.len().saturating_add(chunk.len()) as u64;
+        if actual > limit {
+            return Err(blob_put_too_large(limit, actual));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if declared.is_some_and(|declared| declared != data.len() as u64) {
+        return Err(ApiError::bad_request(
+            "Blob request body length does not match its Content-Length",
+        ));
+    }
+    Ok(Bytes::from(data))
+}
+
+/// A write receipt with its `ETag` header when the cell holds a managed value.
+fn blob_write_response(output: BlobWriteOutput) -> std::result::Result<Response, ApiError> {
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = output.etag.as_deref() {
+        headers.insert(
+            axum::http::header::ETAG,
+            axum::http::HeaderValue::from_str(etag)
+                .map_err(|_| ApiError::internal("a managed Blob ETag is not a header value"))?,
+        );
+    }
+    Ok((StatusCode::OK, headers, Json(output)).into_response())
 }
 
 fn parse_blob_read_query(
@@ -955,9 +1290,10 @@ async fn read_blob_for_delivery(
     actor: Option<&AuthenticatedActor>,
     query: BlobReadQuery,
 ) -> std::result::Result<omnigraph::BlobRead, ApiError> {
-    let target = resolve_authorized_read_target(handle, actor, query.branch, query.snapshot)
-        .await
-        .map_err(redact_blob_api_error)?;
+    let target =
+        resolve_authorized_read_target_with_cause(handle, actor, query.branch, query.snapshot)
+            .await
+            .map_err(|(mapped, cause)| redact_blob_api_error(mapped, "target", cause))?;
     let entity = match query.entity {
         api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
         api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
@@ -981,13 +1317,39 @@ async fn read_blob_for_delivery(
 /// graph-level Blob surface. Selector/auth/not-found failures retain their
 /// typed client disposition; every pre-header internal failure is redacted.
 fn map_blob_read_error(error: OmniError) -> ApiError {
-    redact_blob_api_error(ApiError::from_omni(error))
+    let (mapped, cause) = engine_error_with_cause(error);
+    redact_blob_api_error(mapped, "cell", cause)
 }
 
-fn redact_blob_api_error(mapped: ApiError) -> ApiError {
+/// Log a 500 the transport built itself before response headers. Its message
+/// describes the server's own refusal and holds no engine text, so the
+/// response is returned as built.
+fn log_blob_transport_internal(refused: &ApiError) {
+    if refused.status == StatusCode::INTERNAL_SERVER_ERROR {
+        error!(
+            error_kind = "blob_pre_header_internal",
+            stage = "transport",
+            error_variant = "unclassified",
+            "Blob delivery failed before response headers"
+        );
+    }
+}
+
+/// Redact a pre-header internal failure. The log carries the stage and the
+/// error's class (never its message, which can hold object URIs or
+/// credentials); the response carries a constant.
+fn redact_blob_api_error(
+    mapped: ApiError,
+    stage: &'static str,
+    cause: Option<RedactedCause>,
+) -> ApiError {
     if mapped.status == StatusCode::INTERNAL_SERVER_ERROR {
         error!(
             error_kind = "blob_pre_header_internal",
+            stage,
+            error_variant = cause.map_or("unclassified", |cause| cause.variant),
+            storage_kind = ?cause.and_then(|cause| cause.storage_kind),
+            manifest_kind = ?cause.and_then(|cause| cause.manifest_kind),
             "Blob delivery failed before response headers"
         );
         ApiError::internal("Blob delivery failed before response headers")
@@ -1023,7 +1385,7 @@ fn redact_blob_api_error(mapped: ApiError) -> ApiError {
 /// Read-only.
 pub(crate) async fn server_export(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1055,9 +1417,12 @@ pub(crate) async fn server_export(
         .await
         .map_err(ApiError::from_omni)?;
     let producer_queue_lease = Arc::clone(&queue_lease);
-    let (tx, body_stream) = export_transport::channel(queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease, "export");
     tokio::spawn(
         async move {
+            // Declared first so wrapped producer/input resources drop before
+            // the final graph request owner on every exit path.
+            let _producer_graph = handle;
             let _producer_observer = observer;
             let _producer_input = input;
             // The producer half prevents disconnect from recycling queue bytes
@@ -1067,17 +1432,7 @@ pub(crate) async fn server_export(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served export response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -1086,13 +1441,7 @@ pub(crate) async fn server_export(
                     // Cancelling the pinned export future drops its move-only cut.
                 }
                 (cut, result) = &mut export => {
-                    let error = result.err().map(|error| std::io::Error::other(error.to_string()));
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, result.err()).await;
                 }
             }
         }
@@ -1173,9 +1522,9 @@ fn reject_graph_commit_expected_head(
 }
 
 /// Shared backend for `/mutate` (canonical), `/mutate/if-graph-commit`,
-/// `/change` (deprecated alias), and the stored-mutation arm of
+/// and the stored-mutation arm of
 /// `/queries/{name}`. Returns the bare `ChangeOutput`; each route handler
-/// wraps it (the alias also attaches Deprecation headers).
+/// wraps it.
 ///
 /// Order: parse and classify first; a branch statement then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise
@@ -1185,7 +1534,7 @@ fn reject_graph_commit_expected_head(
 /// one), then the `Change` check, admission, selection, and the engine call.
 pub(crate) async fn run_mutate(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     session: Session,
     actor: Option<&AuthenticatedActor>,
@@ -1197,7 +1546,6 @@ pub(crate) async fn run_mutate(
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let file = classify(query)?;
-    refuse_settings_at_deprecated_route(door, &file.settings)?;
     refuse_process_settings(&file.settings)?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
@@ -1216,6 +1564,18 @@ pub(crate) async fn run_mutate(
                 }
                 BranchStmt::List => Err(read_at_write_door()),
             };
+        }
+        FileBody::Commit(write) => {
+            if door == Door::Query {
+                return Err(commit_write_at_read_door(&write));
+            }
+            refuse_statement_envelope(
+                branch.is_some(),
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return run_commit_statement(&state, &handle, &session, actor, ingress, write).await;
         }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
         FileBody::Explain(_) => {
@@ -1255,7 +1615,7 @@ pub(crate) async fn run_mutate(
     let query = query.to_owned();
     let expected_head = expected_head.map(str::to_owned);
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .mutate_as_with_expected_head_receipt(
                 &branch,
@@ -1280,24 +1640,19 @@ pub(crate) async fn run_mutate(
     .await
 }
 
-/// Shared backend for `/query` (canonical), `/read` (deprecated alias), and
-/// the stored-read arm of `/queries/{name}`.
+/// Shared backend for `/query` and the stored-read arm of `/queries/{name}`.
 ///
 /// Order: parse and classify first; `branch list` then passes
 /// [`refuse_wrong_door`] and [`refuse_statement_envelope`], and otherwise runs
 /// the handler body of `GET /branches` (a scope-free `read` check); `show`
 /// passes the same refusals and the same scope-free `read` check before it
-/// reads the session's effective settings. At the deprecated `Read` door a
-/// `set` or `reset` prefix is refused by
-/// [`refuse_settings_at_deprecated_route`] before any of that, as the
-/// `settings` field of `/read` is. A
-/// declared query resolves and authorizes its read target, is refused at
-/// every door but `Read` when it contains mutations, and runs.
+/// reads the session's effective settings. A declared query resolves and
+/// authorizes its read target, refuses mutations, and runs.
 ///
 /// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
 /// reads use the bounded server observer lane, so there is no `state.workload` consumer.
 pub(crate) async fn run_query(
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     session: Session,
     actor: Option<&AuthenticatedActor>,
     door: Door,
@@ -1308,7 +1663,6 @@ pub(crate) async fn run_query(
     snapshot: Option<String>,
 ) -> std::result::Result<ReadDispatch, ApiError> {
     let file = classify(query)?;
-    refuse_settings_at_deprecated_route(door, &file.settings)?;
     refuse_process_settings(&file.settings)?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
@@ -1327,12 +1681,15 @@ pub(crate) async fn run_query(
                 BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
             };
         }
+        FileBody::Commit(write) => {
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return Err(commit_write_at_read_door(&write));
+        }
         FileBody::Show(id) => {
-            if matches!(door, Door::Read | Door::Change) {
-                return Err(ApiError::bad_request(
-                    crate::api::branch_statement_refusals::DEPRECATED_ROUTE,
-                ));
-            }
             refuse_statement_envelope(
                 branch.is_some() || snapshot.is_some(),
                 name.is_some() || params_json.is_some(),
@@ -1351,7 +1708,7 @@ pub(crate) async fn run_query(
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if door != Door::Read && !query_decl.mutations.is_empty() {
+    if !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
@@ -1382,9 +1739,25 @@ pub(crate) async fn resolve_authorized_read_target(
     branch: Option<String>,
     snapshot: Option<String>,
 ) -> std::result::Result<ReadTarget, ApiError> {
+    resolve_authorized_read_target_with_cause(handle, actor, branch, snapshot)
+        .await
+        .map_err(|(mapped, _)| mapped)
+}
+
+/// [`resolve_authorized_read_target`], also returning the log-safe class of
+/// an engine failure beside the mapped error, so a redacting caller can log
+/// the class the mapping discards. Refusals that are not engine failures
+/// carry no class.
+async fn resolve_authorized_read_target_with_cause(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+) -> std::result::Result<ReadTarget, (ApiError, Option<RedactedCause>)> {
     if branch.is_some() && snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "request may specify branch or snapshot, not both",
+        return Err((
+            ApiError::bad_request("request may specify branch or snapshot, not both"),
+            None,
         ));
     }
 
@@ -1396,7 +1769,7 @@ pub(crate) async fn resolve_authorized_read_target(
             .resolved_branch_of(target.clone())
             .await
             .map(|branch| branch.or_else(|| Some("main".to_string())))
-            .map_err(ApiError::from_omni)?,
+            .map_err(engine_error_with_cause)?,
         ReadTarget::Snapshot(_) => None,
     };
     authorize_request(
@@ -1407,76 +1780,14 @@ pub(crate) async fn resolve_authorized_read_target(
             branch: policy_branch,
             target_branch: None,
         },
-    )?;
+    )
+    .map_err(|refused| (refused, None))?;
     Ok(target)
 }
 
-#[utoipa::path(
-    post,
-    path = "/change",
-    tag = "mutations",
-    operation_id = "change",
-    request_body = ChangeRequest,
-    responses(
-        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
-        (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(
-    note = "use POST /mutate instead; /change retains its request and execution semantics"
-)]
-/// **Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.
-///
-/// Apply a GQ mutation to a branch. The deprecated route retains its request
-/// and execution semantics, while its response uses the current canonical
-/// vocabulary; a `settings` field is refused, since the route runs under the
-/// process defaults alone. New integrations should target `POST /mutate`.
-/// Responses include `Deprecation: true` and
-/// `Link: <mutate>; rel="successor-version"` headers per RFC 9745 / RFC 8288
-/// so SDKs and proxies can surface the signal.
-pub(crate) async fn server_change(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    headers: axum::http::HeaderMap,
-    request: std::result::Result<Json<ChangeRequest>, JsonRejection>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
-    let Json(request) = request
-        .map_err(|rejection| ApiError::json_rejection("invalid mutation request", rejection))?;
-    reject_graph_commit_expected_head(&headers, "/mutate/if-graph-commit")?;
-    if request.settings.is_some() {
-        return Err(ApiError::bad_request(
-            crate::api::query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE,
-        ));
-    }
-    let session = state.session(&handle, None)?;
-    let output = run_mutate(
-        state,
-        handle,
-        ingress,
-        session,
-        actor.as_ref().map(|Extension(actor)| actor),
-        Door::Change,
-        &request.query,
-        request.name.as_deref(),
-        request.params.as_ref(),
-        request.branch,
-        None,
-    )
-    .await?;
-    Ok((
-        deprecation_headers("<mutate>; rel=\"successor-version\""),
-        Json(output),
-    ))
+fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>) {
+    let cause = RedactedCause::of(&error);
+    (ApiError::from_omni(error), Some(cause))
 }
 
 #[utoipa::path(
@@ -1510,8 +1821,7 @@ pub(crate) async fn server_change(
 /// Conditional callers use `POST /mutate/if-graph-commit`, which requires and
 /// validates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.
 ///
-/// Pairs with `POST /query` (read-only). The legacy `POST /change` route
-/// has identical semantics and is kept as a deprecated alias.
+/// Pairs with `POST /query` (read-only).
 ///
 /// The GQ statements `branch create`, `branch delete`, and `branch merge`
 /// (grammar: `BranchStmt` in `omnigraph-compiler`) are also served
@@ -1522,7 +1832,7 @@ pub(crate) async fn server_change(
 /// send it to `POST /query`.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
@@ -1580,7 +1890,7 @@ pub(crate) async fn server_mutate(
 /// precondition header; conditional callers must use this route.
 pub(crate) async fn server_mutate_if_graph_commit(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     headers: axum::http::HeaderMap,
@@ -1664,7 +1974,7 @@ pub(crate) fn parse_optional_invoke_body(
 /// actor can't run (the intended double-gate signal).
 pub(crate) async fn server_invoke_query(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
@@ -1707,7 +2017,7 @@ pub(crate) async fn server_invoke_query(
 /// servers return 404 instead of ignoring an unknown conditional header.
 pub(crate) async fn server_invoke_query_if_graph_commit(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
@@ -1729,7 +2039,7 @@ pub(crate) async fn server_invoke_query_if_graph_commit(
 
 async fn invoke_stored_query(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     actor: Option<Extension<AuthenticatedActor>>,
     name: String,
@@ -1796,7 +2106,7 @@ async fn invoke_stored_query(
     }
 
     info!(
-        graph = %handle.uri,
+        graph_id = %handle.key.graph_id,
         actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
         query = %query_name,
         kind = if is_mutation { "mutate" } else { "read" },
@@ -1871,7 +2181,7 @@ async fn invoke_stored_query(
 /// per query yet, so it can list a query whose `invoke_query` the caller
 /// lacks (a known gap until per-query authorization lands).
 pub(crate) async fn server_list_queries(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
     authorize_request(
@@ -1912,7 +2222,7 @@ pub(crate) async fn server_list_queries(
 /// Useful for clients that want to introspect available types and properties
 /// before constructing GQ queries. Read-only.
 pub(crate) async fn server_schema_get(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<SchemaOutput>, ApiError> {
     authorize_request(
@@ -1932,108 +2242,6 @@ pub(crate) async fn server_schema_get(
         schema_source,
         system_columns: Some(system_columns.into()),
     }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/schema/apply",
-    tag = "mutations",
-    operation_id = "applySchema",
-    request_body = SchemaApplyRequest,
-    responses(
-        (status = 200, description = "Schema apply results", body = SchemaApplyOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a schema migration.
-///
-/// Cluster-backed servers reject this route with `409 Conflict`; operators
-/// must apply schema changes through `omnigraph cluster apply` and restart.
-///
-/// Diffs `schema_source` against the current schema and applies the resulting
-/// migration steps (add/drop type, add/drop property, etc.). **Destructive**:
-/// some steps drop data. Returns the list of steps applied; if `applied` is
-/// false the diff was unsupported and no changes were made.
-pub(crate) async fn server_schema_apply(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<SchemaApplyRequest>,
-) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
-    let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
-        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
-    authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::SchemaApply,
-            branch: None,
-            target_branch: Some("main".to_string()),
-        },
-    )?;
-    // Disable HTTP schema apply on cluster-backed serving AFTER the Cedar gate,
-    // so an unauthorized actor gets a 403 (not a 409 that would disclose the
-    // server is cluster-backed): 401 → 403 → 409, never leak topology before
-    // authorization. An authorized actor gets the actionable 409 signpost.
-    if state.routing().config_path.is_some() {
-        return Err(ApiError::conflict(
-            "server-side schema apply is disabled for cluster-backed serving; \
-             update the cluster config, run `omnigraph cluster apply`, and restart \
-             the server.",
-        ));
-    }
-    let est_bytes = request.schema_source.len() as u64;
-    let admission = state
-        .workload
-        .try_admit(&actor_arc, est_bytes)
-        .map_err(ApiError::from_workload_reject)?;
-    let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
-        let result = {
-            let db = &handle.engine;
-            let registry = handle.queries.as_deref();
-            let label = handle.key.graph_id.as_str().to_string();
-            // Engine-layer policy enforcement (MR-722): pass the resolved
-            // actor through so apply_schema_as can call enforce() with the
-            // authoritative identity. With a policy installed in AppState,
-            // engine-side enforcement re-checks the same decision the
-            // HTTP-layer authorize_request just made above. PR #3 collapses
-            // the redundancy.
-            db.apply_schema_as_with_catalog_check(
-                &request.schema_source,
-                omnigraph::db::SchemaApplyOptions {
-                    allow_data_loss: request.allow_data_loss,
-                },
-                actor_id.as_deref(),
-                |catalog| {
-                    if let Some(registry) = registry {
-                        validate_registry_against_catalog(registry, catalog, &label)?;
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(ApiError::from_omni)?
-        };
-        // Physical indexes are derived state. Schema apply records intent only;
-        // explicit `ensure_indices` / `optimize` maintenance owns convergence on
-        // every surface, including a long-lived server. Keeping the handler free
-        // of detached physical writes also makes a successful response describe
-        // the complete effect envelope of this request.
-        Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
-    })
-    .await
 }
 
 /// Authorize one load target without touching request data.
@@ -2083,12 +2291,12 @@ async fn authorize_load_scope(
     )
 }
 
-/// Shared body for JSON `POST /load` and `POST /ingest` (deprecated):
+/// JSON `POST /load`:
 /// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
 /// bulk `load_as`, and the `IngestOutput` mapping.
-async fn run_ingest(
+async fn run_json_load(
     state: AppState,
-    handle: Arc<GraphHandle>,
+    handle: GraphRequest,
     ingress: IngressLease,
     actor: Option<&AuthenticatedActor>,
     request: IngestRequest,
@@ -2109,7 +2317,7 @@ async fn run_ingest(
         .map_err(ApiError::from_workload_reject)?;
     let session = state.session(&handle, None)?;
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .load_as_with_receipt(
                 &branch,
@@ -2124,6 +2332,7 @@ async fn run_ingest(
         Ok(ingest_receipt_output(
             handle.uri.as_str(),
             &receipt,
+            &session.catalog(),
             mode,
             actor_id,
         ))
@@ -2159,18 +2368,15 @@ async fn run_ingest(
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
 /// or when the load produces conflicting writes.
-///
-/// The legacy `POST /ingest` route has identical semantics and is kept as a
-/// deprecated alias.
 pub(crate) async fn server_load(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     Ok(Json(
-        run_ingest(
+        run_json_load(
             state,
             handle,
             ingress,
@@ -2241,7 +2447,7 @@ async fn collect_graph_batch_body(body: Body) -> std::result::Result<Bytes, ApiE
 /// the ordinary graph commit is visible.
 pub(crate) async fn server_load_ndjson(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<GraphBatchLoadQuery>,
     request: Request,
@@ -2315,7 +2521,7 @@ pub(crate) async fn server_load_ndjson(
 
     let session = state.session(&handle, None)?;
     let actor_id = actor_id.map(str::to_owned);
-    owned_write(&state, admission, ingress, async move {
+    owned_write(&state, admission, ingress, handle.clone(), async move {
         let receipt = session
             .load_graph_batch_as_with_receipt(
                 &branch,
@@ -2327,58 +2533,13 @@ pub(crate) async fn server_load_ndjson(
             .await
             .map_err(ApiError::from_omni)?;
         Ok(Json(graph_batch_load_receipt_output(
-            &receipt, mode, actor_id,
+            &receipt,
+            &session.catalog(),
+            mode,
+            actor_id,
         )))
     })
     .await
-}
-
-#[utoipa::path(
-    post,
-    path = "/ingest",
-    tag = "mutations",
-    operation_id = "ingest",
-    request_body = IngestRequest,
-    responses(
-        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)", body = IngestOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Prepared load authority changed before effects", body = ErrorOutput),
-        (status = 413, description = "Load input or external Blob admission exceeds a bounded per-operation entity or byte ceiling", body = ErrorOutput),
-        (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-#[deprecated(note = "use POST /load instead; /ingest retains its parser and branch defaults")]
-/// **Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.
-///
-/// Bulk-load NDJSON data into a branch. The deprecated route retains its
-/// parser and branch defaults, but its response uses the current canonical
-/// vocabulary. New integrations should target `POST /load`. Responses
-/// include `Deprecation: true` and `Link: <load>; rel="successor-version"`
-/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
-pub(crate) async fn server_ingest(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    Extension(ingress): Extension<IngressLease>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<IngestRequest>,
-) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
-    let output = run_ingest(
-        state,
-        handle,
-        ingress,
-        actor.as_ref().map(|Extension(actor)| actor),
-        request,
-    )
-    .await?;
-    Ok((
-        deprecation_headers("<load>; rel=\"successor-version\""),
-        Json(output),
-    ))
 }
 
 #[utoipa::path(
@@ -2398,7 +2559,7 @@ pub(crate) async fn server_ingest(
 /// Returns branch names sorted by name in byte order. Read-only. The GQ statement
 /// `branch list` on `POST /query` runs the same body.
 pub(crate) async fn server_branch_list(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
     let branches = branch_list_body(&handle, actor.as_ref().map(|Extension(actor)| actor)).await?;
@@ -2463,7 +2624,7 @@ async fn branch_list_body(
 /// the same body.
 pub(crate) async fn server_branch_create(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
@@ -2490,7 +2651,7 @@ pub(crate) async fn server_branch_create(
 /// `branch_create` check on (`from`, `name`), admission, the engine call.
 async fn branch_create_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
     from: &str,
@@ -2519,7 +2680,7 @@ async fn branch_create_body(
     let from = from.to_owned();
     let name = name.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         engine
             .branch_create_from_as(ReadTarget::branch(&from), &name, actor_id.as_deref())
             .await
@@ -2568,7 +2729,7 @@ pub(crate) struct BranchPath {
 /// body.
 pub(crate) async fn server_branch_delete(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(BranchPath { branch }): Path<BranchPath>,
@@ -2586,7 +2747,7 @@ pub(crate) async fn server_branch_delete(
 /// statement: the `branch_delete` check on `name`, admission, the engine call.
 async fn branch_delete_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
     name: &str,
@@ -2611,7 +2772,7 @@ async fn branch_delete_body(
     let engine = Arc::clone(&handle.engine);
     let name = name.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         engine
             .branch_delete_as(&name, actor_id.as_deref())
             .await
@@ -2657,13 +2818,18 @@ async fn branch_delete_body(
 /// (without the deletion composition) and answers the same 409 on conflict.
 pub(crate) async fn server_branch_merge(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(ingress): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
     request: std::result::Result<Json<BranchMergeRequest>, JsonRejection>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid branch merge request", rejection))?;
+    if request.as_commit && request.delete_branch {
+        return Err(ApiError::bad_request(
+            "a merge `as_commit` keeps its source until the commit is published or dropped; drop `delete_branch`",
+        ));
+    }
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, request.settings.as_ref())?;
@@ -2671,12 +2837,13 @@ pub(crate) async fn server_branch_merge(
     let actor = actor.map(|Extension(actor)| actor);
     state
         .operations
-        .submit((admission, ingress), async move {
+        .submit((admission, ingress, handle.clone()), async move {
             let result = match session
-                .branch_merge_as(
+                .branch_merge_as_with_options(
                     &request.source,
                     &target,
                     actor.as_ref().map(|actor| actor.actor_id.as_ref()),
+                    request.as_commit,
                 )
                 .await
                 .map_err(ApiError::from_omni)
@@ -2718,23 +2885,25 @@ pub(crate) async fn server_branch_merge(
 /// Body shared by `POST /branches/merge` and the `branch merge` statement:
 /// the `branch_merge` check on (`source`, `target`), admission, the engine
 /// call. A conflict surfaces as `ApiError::merge_conflict` (409).
+#[allow(clippy::too_many_arguments)]
 async fn branch_merge_body(
     state: &AppState,
-    handle: &GraphHandle,
+    handle: &GraphRequest,
     session: &Session,
     actor: Option<&AuthenticatedActor>,
     ingress: IngressLease,
     source: &str,
     target: &str,
+    as_commit: bool,
 ) -> std::result::Result<MergeResult, ApiError> {
     let admission = admit_branch_merge(state, handle, actor, source, target)?;
     let session = session.clone();
     let source = source.to_owned();
     let target = target.to_owned();
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
-    owned_write(state, admission, ingress, async move {
+    owned_write(state, admission, ingress, handle.clone(), async move {
         session
-            .branch_merge_as(&source, &target, actor_id.as_deref())
+            .branch_merge_as_with_options(&source, &target, actor_id.as_deref(), as_commit)
             .await
             .map_err(ApiError::from_omni)
     })
@@ -2825,8 +2994,12 @@ async fn delete_merged_source_branch(
 /// contract — newest first by (graph-manifest version, created-at, commit id) — and
 /// a future `cursor`/`limit` pagination will be keyset-based on that same
 /// order. Read-only.
+///
+/// `unpublished=true` lists instead the unpublished commits whose recorded
+/// target is `branch` (writes `as commit` awaiting `commit publish`), newest
+/// first; each carries `published: false`.
 pub(crate) async fn server_commit_list(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
@@ -2843,12 +3016,13 @@ pub(crate) async fn server_commit_list(
             target_branch: None,
         },
     )?;
-    let commits = {
-        let db = &handle.engine;
-        db.list_commits(Some(branch.as_str()))
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let db = &handle.engine;
+    let commits = if query.unpublished {
+        db.list_unpublished_commits(Some(branch.as_str())).await
+    } else {
+        db.list_commits(Some(branch.as_str())).await
+    }
+    .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
         commits: commits.iter().map(api::commit_output).collect(),
     }))
@@ -2883,7 +3057,7 @@ pub(crate) struct CommitPath {
 /// Returns the commit's graph-manifest version, parent commit(s), and creation
 /// metadata. Read-only.
 pub(crate) async fn server_commit_show(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
@@ -2903,6 +3077,103 @@ pub(crate) async fn server_commit_show(
             .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::commit_output(&commit)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/commits/{commit_id}/publish",
+    tag = "commits",
+    operation_id = "publishCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 200, description = "The commit as published on its recorded target branch; a published id is answered as it stands", body = api::CommitOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its publication is not permitted", body = ErrorOutput),
+        (status = 409, description = "The target's state moved under the proposal's authority", body = ErrorOutput),
+        (status = 412, description = "The target head moved past the commit's captured parent; the commit can only be dropped", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Publish an unpublished commit onto its recorded target branch.
+///
+/// The target is the branch the commit recorded when it was written `as
+/// commit`, so the request carries no body. Runs under `commit_publish` on
+/// that branch; a denial answers the 404 an unknown id answers. The GQ
+/// statement `commit publish "<id>"` on `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_publish(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    let CommitControlOutcome { commit, .. } = commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Publish {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    commit
+        .map(Json)
+        .ok_or_else(|| ApiError::internal("commit publish answered no commit"))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/commits/{commit_id}",
+    tag = "commits",
+    operation_id = "dropCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 204, description = "Commit dropped: its id stops resolving and its held merge inputs are released"),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its drop is not permitted", body = ErrorOutput),
+        (status = 409, description = "The commit is published", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Drop an unpublished commit.
+///
+/// **Irreversible.** Runs under `commit_drop` on the commit's recorded target
+/// branch; a denial answers the 404 an unknown id answers. A published commit
+/// is never dropped (409). The GQ statement `commit drop "<id>"` on
+/// `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_drop(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Drop {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) fn read_target_from_request(
@@ -2954,9 +3225,24 @@ pub(crate) fn query_params_from_json(
 #[cfg(test)]
 mod change_route_error_tests {
     use super::*;
+    use crate::test_log_capture::Capture;
+
+    /// Assert the captured log carries every `expected` spelling and none of
+    /// the `leaked` ones.
+    fn assert_log(capture: &Capture, expected: &[&str], leaked: &[&str]) {
+        let logs = capture.output();
+        for expected in expected {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in leaked {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
 
     #[test]
     fn change_route_error_hides_substrate_paths() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let leaky =
             "/srv/data/graph/nodes/0000000a-0000000b.lance: No such file or directory".to_string();
         let mapped = change_route_error(OmniError::Storage(omnigraph::error::StorageFailure::new(
@@ -2969,10 +3255,21 @@ mod change_route_error_tests {
             "change route leaked a substrate path: {}",
             mapped.message()
         );
+        assert_log(
+            &capture,
+            &[
+                r#"error_kind="change_route_internal""#,
+                r#"error_variant="Storage""#,
+                "storage_kind=Some(Unknown)",
+            ],
+            &[".lance", "/srv/data", "No such file"],
+        );
     }
 
     #[test]
     fn change_route_error_hides_internal_manifest_table_keys() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let mapped = change_route_error(OmniError::manifest_internal(
             "invalid table key 'node:SecretType' at internal version 7",
         ));
@@ -2982,10 +3279,20 @@ mod change_route_error_tests {
             "change route leaked an internal table key: {}",
             mapped.message()
         );
+        assert_log(
+            &capture,
+            &[
+                r#"error_variant="Manifest""#,
+                "manifest_kind=Some(Internal)",
+            ],
+            &["node:SecretType", "internal version"],
+        );
     }
 
     #[test]
     fn change_route_error_passes_only_allowlisted_graph_errors_through() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         // Even Manifest::NotFound is too broad for the shared mapper. Only a
         // route that knows which public graph resource it looked up may turn
         // that category into a fixed 404.
@@ -3040,10 +3347,22 @@ mod change_route_error_tests {
         });
         assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!mapped.message().contains("node:Secret"));
+        // Neither the collapsed failures nor the contextual 404 log the text
+        // the response withholds, even at debug level.
+        assert_log(
+            &capture,
+            &[
+                r#"public_message=commit 'x' not found"#,
+                r#"error_variant="ResourceLimitExceeded""#,
+            ],
+            &["node:Secret", "/srv/private"],
+        );
     }
 
     #[test]
     fn change_route_recovery_exposes_id_but_redacts_internal_reason() {
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("debug"));
         let mapped = change_route_error(OmniError::RecoveryRequired {
             operation_id: "op-public".to_string(),
             reason: "sidecar /srv/private/recovery.json names node:Secret".to_string(),
@@ -3056,15 +3375,223 @@ mod change_route_error_tests {
             Some(crate::ApiErrorDetails::RecoveryRequired(details))
                 if details.operation_id == "op-public"
         ));
+        assert_log(
+            &capture,
+            &["change route requires recovery", "operation_id=op-public"],
+            &["/srv/private", "node:Secret", "sidecar"],
+        );
     }
 }
 
 #[cfg(test)]
 mod blob_error_tests {
     use super::*;
+    use std::fmt;
+
+    use futures::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    /// Wraps every graph-catalog store a probed task opens so that each read
+    /// fails as an object store would, with a physical URI in its message.
+    /// Resolving a snapshot target reopens the graph catalog at the
+    /// snapshot's version, so this is a storage failure inside target
+    /// resolution.
+    #[derive(Debug)]
+    struct CatalogReadFault;
+
+    impl lance::io::WrappingObjectStore for CatalogReadFault {
+        fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(CatalogReadFaultStore { target })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CatalogReadFaultStore {
+        target: Arc<dyn ObjectStore>,
+    }
+
+    impl fmt::Display for CatalogReadFaultStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "CatalogReadFaultStore({})", self.target)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CatalogReadFaultStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            _options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            Err(object_store::Error::PermissionDenied {
+                path: format!("s3://private-bucket/{location}"),
+                source: "GET denied".into(),
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&ObjectPath>,
+            offset: &ObjectPath,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.target.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A storage failure while the Blob route resolves a snapshot target this
+    /// handle does not hold (the read goes to `__history`) for a policy-gated
+    /// actor reaches the log with its class; the client sees the redacted 500.
+    #[tokio::test]
+    async fn blob_delivery_logs_the_class_of_a_target_resolution_storage_failure() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        Omnigraph::init(
+            uri,
+            "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+        )
+        .await
+        .unwrap();
+        let engine = Omnigraph::open(uri).await.unwrap();
+        let snapshot = omnigraph::db::SnapshotId::new(
+            "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        let policy: PolicyConfig = serde_yaml::from_str(
+            "version: 1\n\
+             groups:\n  team: [act-alice]\n\
+             rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",
+        )
+        .unwrap();
+        let handle = GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("graph").unwrap()),
+            uri: uri.to_string(),
+            engine: Arc::new(engine),
+            policy: Some(Arc::new(PolicyCompiler::compile(&policy, "graph").unwrap())),
+            queries: None,
+        };
+        let actor = AuthenticatedActor::cluster_static(Arc::from("act-alice"));
+        let query = || api::BlobReadQuery {
+            entity: api::BlobEntityKind::Node,
+            r#type: "Document".to_string(),
+            id: "missing".to_string(),
+            property: "content".to_string(),
+            branch: None,
+            snapshot: Some(snapshot.as_str().to_string()),
+        };
+
+        let unarmed = read_blob_for_delivery(&handle, Some(&actor), query())
+            .await
+            .unwrap_err();
+        assert_ne!(
+            unarmed.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unarmed, the request reads `__history`, finds no such commit and is refused"
+        );
+
+        let probes = omnigraph::instrumentation::QueryIoProbes {
+            manifest_wrapper: Some(Arc::new(CatalogReadFault)),
+            ..Default::default()
+        };
+        // Positive control: the engine error text names the bucket, so the
+        // absence checks below test the redaction, not an already-clean error.
+        let raw = omnigraph::instrumentation::with_query_io_probes(
+            probes.clone(),
+            handle.engine.resolved_branch_of(read_target_from_request(
+                None,
+                Some(snapshot.as_str().to_string()),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert!(raw.to_string().contains("private-bucket"), "{raw}");
+        let response = omnigraph::instrumentation::with_query_io_probes(
+            probes,
+            read_blob_for_delivery(&handle, Some(&actor), query()),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "with the fault installed on this task, the read of `__history` fails in the object store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(output.error, "Blob delivery failed before response headers");
+        assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="target" error_variant="Storage""#,
+            "storage_kind=Some(",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for absent in ["unclassified", "private-bucket", "denied"] {
+            assert!(!logs.contains(absent), "log carries {absent}: {logs}");
+        }
+    }
 
     #[tokio::test]
     async fn pre_header_internal_errors_do_not_expose_physical_storage_or_identity() {
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
         for (error, secret) in [
             (
                 OmniError::Storage(omnigraph::error::StorageFailure::new(
@@ -3090,9 +3617,11 @@ mod blob_error_tests {
             assert!(!String::from_utf8_lossy(&body).contains(secret));
         }
 
-        let response = redact_blob_api_error(ApiError::internal(
-            "snapshot manifest at s3://private-bucket/graph/__manifest",
-        ))
+        let response = redact_blob_api_error(
+            ApiError::internal("snapshot manifest at s3://private-bucket/graph/__manifest"),
+            "target",
+            None,
+        )
         .into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3100,6 +3629,31 @@ mod blob_error_tests {
         let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(output.error, "Blob delivery failed before response headers");
         assert!(!String::from_utf8_lossy(&body).contains("private-bucket"));
+
+        // The server log names each failure's class and stage, never its text.
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="blob_pre_header_internal""#,
+            r#"stage="cell""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+            r#"error_variant="BlobIntegrity""#,
+            r#"stage="target""#,
+            r#"error_variant="unclassified""#,
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in [
+            "private-bucket",
+            "tenant-a",
+            "token",
+            "secret",
+            "node:Secret",
+            "incarnation",
+            "__manifest",
+        ] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
     }
 }
 
@@ -3242,7 +3796,7 @@ pub(crate) fn parse_change_query(
 /// a large commit continues via the opaque `page_token`. `set=` values are
 /// validated and select nothing in this release.
 pub(crate) async fn server_commit_changes(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     Path(CommitPath { commit_id }): Path<CommitPath>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
@@ -3311,7 +3865,7 @@ fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), A
 fn change_route_not_found(error: OmniError, public_message: String) -> ApiError {
     match error {
         OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound => {
-            tracing::debug!(internal_error = %manifest, %public_message, "change resource not found");
+            tracing::debug!(%public_message, "change resource not found");
             ApiError::not_found(public_message)
         }
         other => change_route_error(other),
@@ -3338,8 +3892,9 @@ fn change_route_commit_lookup_error(error: OmniError, commit_id: &str) -> ApiErr
 /// This is intentionally an allowlist. Only variants whose types guarantee
 /// graph-vocabulary fields cross the wire. Everything else — including broad
 /// `Manifest::BadRequest` / conflict categories and any future `OmniError`
-/// variant — is logged and collapsed to a fixed 500 so adding an engine error
-/// can never accidentally expose an internal storage identifier or sidecar.
+/// variant — is logged by its class and collapsed to a fixed 500 so adding an
+/// engine error can never accidentally expose an internal storage identifier
+/// or sidecar, in the response or in the log.
 fn change_route_error(error: OmniError) -> ApiError {
     match error {
         OmniError::ResourceLimitExceeded {
@@ -3366,18 +3921,23 @@ fn change_route_error(error: OmniError) -> ApiError {
         | OmniError::ChangeFeedGap { .. }
         | OmniError::CommitHasNoParent { .. }
         | OmniError::ChangeSchemaBoundary { .. }) => ApiError::from_omni(safe),
-        OmniError::RecoveryRequired {
-            operation_id,
-            reason,
-        } => {
-            tracing::warn!(%operation_id, %reason, "change route requires recovery");
+        // The reason is engine text; the operation ID is what recovery needs.
+        OmniError::RecoveryRequired { operation_id, .. } => {
+            tracing::warn!(%operation_id, "change route requires recovery");
             ApiError::recovery_required(
                 "recovery required before changes can be read".to_string(),
                 operation_id,
             )
         }
         other => {
-            tracing::error!(error = %other, "change route internal error");
+            let cause = RedactedCause::of(&other);
+            tracing::error!(
+                error_kind = "change_route_internal",
+                error_variant = cause.variant,
+                storage_kind = ?cause.storage_kind,
+                manifest_kind = ?cause.manifest_kind,
+                "change route internal error"
+            );
             ApiError::internal("internal error while reading changes")
         }
     }
@@ -3455,7 +4015,7 @@ fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, 
 /// terminal cursor together with its blocks. The server holds no consumer
 /// state. `set=` values are validated and select nothing in this release.
 pub(crate) async fn server_changes_feed(
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
@@ -3533,7 +4093,7 @@ pub(crate) async fn server_changes_feed(
 /// resume cursor's feed scope.
 pub(crate) async fn server_changes_baseline(
     State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
+    Extension(handle): Extension<GraphRequest>,
     Extension(observer): Extension<operations::ReadObserver>,
     Extension(input): Extension<IngressLease>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -3563,19 +4123,13 @@ pub(crate) async fn server_changes_baseline(
         .capture_served_change_baseline_cut(&branch, &scope)
         .await
         .map_err(change_route_error)?;
-    let terminal_record = {
-        let mut line = serde_json::to_vec(&api::ChangeBaselineRecord {
-            baseline: api::change_baseline_output(&handshake),
-        })
-        .map_err(|error| ApiError::internal(format!("encode baseline record: {error}")))?;
-        line.push(b'\n');
-        Bytes::from(line)
-    };
-
     let producer_queue_lease = Arc::clone(&queue_lease);
-    let (tx, body_stream) = export_transport::channel(queue_lease);
+    let (tx, body_stream) = export_transport::channel(queue_lease, "change_baseline");
     tokio::spawn(
         async move {
+            // Declared first so wrapped producer/input resources drop before
+            // the final graph request owner on every exit path.
+            let _producer_graph = handle;
             let _producer_observer = observer;
             let _producer_input = input;
             let _producer_queue_lease = producer_queue_lease;
@@ -3583,17 +4137,7 @@ pub(crate) async fn server_changes_baseline(
             let data_tx = tx.clone();
             let export = cut.write_chunks(move |chunk| {
                 let data_tx = data_tx.clone();
-                async move {
-                    data_tx
-                        .send(export_transport::ExportFrame::Data(Bytes::from(chunk)))
-                        .await
-                        .map_err(|_| {
-                            OmniError::Io(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "served baseline response closed",
-                            ))
-                        })
-                }
+                async move { data_tx.send_chunk(chunk).await }
             });
             tokio::pin!(export);
             tokio::select! {
@@ -3605,27 +4149,16 @@ pub(crate) async fn server_changes_baseline(
                     // The structural guarantee: the terminal handshake record is
                     // sent ONLY after every snapshot record succeeded. A failed or
                     // interrupted stream carries no usable cursor.
-                    let error = match result {
-                        Ok(()) => {
-                            match tx
-                                .send(export_transport::ExportFrame::Data(terminal_record))
-                                .await
-                            {
-                                Ok(()) => None,
-                                Err(_) => Some(std::io::Error::new(
-                                    std::io::ErrorKind::BrokenPipe,
-                                    "served baseline response closed",
-                                )),
-                            }
-                        }
-                        Err(error) => Some(std::io::Error::other(error.to_string())),
+                    let failure = match result {
+                        Ok(()) => tx
+                            .send_json_line(&api::ChangeBaselineRecord {
+                                baseline: api::change_baseline_output(&handshake),
+                            })
+                            .await
+                            .err(),
+                        Err(error) => Some(error),
                     };
-                    let _ = tx
-                        .send(export_transport::ExportFrame::Terminal {
-                            cut: Box::new(cut),
-                            error,
-                        })
-                        .await;
+                    tx.finish(cut, failure).await;
                 }
             }
         }

@@ -3,8 +3,7 @@
 
 use super::{
     DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, branch_statement_change_request,
-    branch_statement_query_request, legacy_change_request_body, normalize_bearer_token,
-    resolve_remote_bearer_token, sync_dir,
+    branch_statement_query_request, normalize_bearer_token, resolve_remote_bearer_token, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -20,47 +19,6 @@ fn embedded_cli_preserves_complete_storage_diagnostic_without_reprefixing() {
 
     assert_eq!(report.to_string(), diagnostic);
     assert!(!report.to_string().contains("storage: storage"));
-}
-
-#[test]
-fn legacy_change_request_body_uses_legacy_field_names() {
-    // `mutate`'s `POST /change` arm uses the current route DTO spelling:
-    // required `query_source` and optional `query_name`.
-    let body = legacy_change_request_body(
-        "query insert_person($n: String) { insert Person { name: $n } }",
-        Some("insert_person"),
-        "main",
-        Some(&json!({ "n": "Alice" })),
-    );
-    assert_eq!(
-        body["query_source"].as_str(),
-        Some("query insert_person($n: String) { insert Person { name: $n } }"),
-    );
-    assert_eq!(body["query_name"].as_str(), Some("insert_person"));
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
-    // Keep this route's exact DTO keys on the wire.
-    assert!(
-        body.get("query").is_none(),
-        "legacy /change body must not carry the renamed `query` key; got {body}"
-    );
-    assert!(
-        body.get("name").is_none(),
-        "legacy /change body must not carry the renamed `name` key; got {body}"
-    );
-}
-
-#[test]
-fn legacy_change_request_body_omits_optional_fields_when_unset() {
-    let body = legacy_change_request_body(
-        "query find() { match { $p: Person } return { $p.name } }",
-        None,
-        "main",
-        None,
-    );
-    assert_eq!(body["branch"].as_str(), Some("main"));
-    assert!(body.get("query_name").is_none());
-    assert!(body.get("params").is_none());
 }
 
 #[test]
@@ -83,6 +41,25 @@ fn branch_statement_requests_carry_the_source_alone() {
             "params": null,
             "branch": null,
         })
+    );
+}
+
+#[test]
+fn branch_merge_as_commit_excludes_delete_branch() {
+    use clap::Parser;
+    let error = crate::cli::Cli::try_parse_from([
+        "omnigraph",
+        "branch",
+        "merge",
+        "feature",
+        "--as-commit",
+        "--delete-branch",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(
+        crate::cli::Cli::try_parse_from(["omnigraph", "branch", "merge", "feature", "--as-commit"])
+            .is_ok()
     );
 }
 

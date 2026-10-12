@@ -19,7 +19,7 @@ codes! {
     Q001 = "the source does not match the grammar at this position";
     Q002 = "a query declaration is missing its parameter list";
     Q003 = "a settings statement is refused";
-    Q004 = "a branch, show or explain statement is misplaced or malformed";
+    Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
 
     // Typechecker.
@@ -52,8 +52,7 @@ codes! {
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";
     T36 = "an alias cannot be projected";
-    T37 = "rrf cannot be projected";
-    T38 = "a search predicate must stand alone or be compared with true";
+    T38 ="a search predicate must stand alone or be compared with true";
     T39 = "an exists or aggregate block must reference an outer-bound variable";
     T40 = "an aggregate block argument or comparison value is invalid";
     T41 = "a filter or Boolean expression has invalid operands";
@@ -69,6 +68,7 @@ codes! {
     T51 = "unknown type";
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
+    T54 = "a relevance ranking does not accept the asc modifier";
 }
 
 #[cfg(test)]

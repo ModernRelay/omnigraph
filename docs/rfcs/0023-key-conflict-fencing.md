@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-07-10
-updated: 2026-08-23
+updated: 2026-10-04
 discussion: null
 supersedes: []
 superseded_by: []
@@ -20,6 +20,15 @@ blocked_on: []
 > internal schema v6. References below to a future MemWAL fold are historical;
 > RFC 0026 was rejected and removed. See
 > [the current ingestion design](../dev/ingestion.md).
+
+> **RFC 0067 disposition:** [RFC 0067](0067-detached-table-commits.md) removed
+> the recovery sidecar. Historical: every "before sidecar arm", "under one
+> recovery sidecar", `RecoveryRequired`, and recovery-barrier passage, chiefly
+> in §5.1, §6, §10, and §11.2. Current: the fencing decision, which is the
+> entity identity column as the primary key (`id`, or `__id` under
+> [RFC 0040](0040-system-column-namespace.md)), no keyed bare `Append`, the key
+> filter on every keyed insert and upsert, the 8,192-row and 32 MiB bounds, and
+> typed `KeyConflict`.
 
 **Surveyed:** omnigraph 0.8.1 (`main`); Lance 9.0.0-rc.1 at git rev
 `cec0b7dffe2d85c7e66dbe9d1f3891c297903a1d`; full Lance transaction,

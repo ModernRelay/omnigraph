@@ -60,14 +60,14 @@ Ranking functions lead the `order` clause. `nearest` and `rrf` require `limit N`
 BM25 alone does not, though a limit keeps output bounded. `nearest` sorts by
 ascending distance and `bm25` by descending relevance; secondary keys follow
 the score, then entity IDs break ties. This order also holds through traversals.
-A bounded BM25 scan with no secondary keys may select equal-score rows at its
-cutoff by scan order before the final sort.
+A `bm25` ordering reads every text match before the final sort, so equal-score
+rows at a `limit` cutoff are chosen by the secondary keys and then entity ID,
+not by scan order.
 
 Omit a direction on a search key: `bm25(...)` always ranks by descending score
 (`asc`/`desc` are ignored), and a direction after `nearest(...)` is a parse
-error. Only one search function may lead `order`; a second one fails when the
-query runs ("search functions must lead the order clause"), even though `lint`
-passes.
+error. Only one search function may lead `order`; one in a later position is
+refused at type checking (`T42`), so `lint` reports it.
 
 ### Vector similarity
 
@@ -149,8 +149,9 @@ Filter with graph traversal before invoking vector or text ranking. Ranking over
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-        $a: InformationArtifact { slug: $artifact_slug }
+        $c: Chunk                                 // declare the ranked binding first
         $c partOfArtifact $a                      // scope: only this artifact's chunks
+        $a.slug = $artifact_slug
     }
     return { $c.text }
     order { nearest($c.embedding, $q) }           // rank: vector similarity within scope
@@ -159,6 +160,12 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 ```
 
 Don't rank over the entire chunk set if you know a traversal can narrow it first.
+
+Declare the ranked binding first and reach the scoping node through the
+traversal. A `nearest` or `bm25` order, alone or as an `rrf` arm, on a variable
+that a traversal introduces (`$a: InformationArtifact { … }` first, then
+`$c partOfArtifact $a`, ranked on `$c`) is refused when the query runs:
+"a traversal destination, which engine v2 does not support".
 
 A standalone `nearest` ordering widens an underfilled candidate set, finally
 using an exact scan if needed to fill the limit with available survivors.
@@ -176,10 +183,13 @@ whole-type pass on every execution. `OMNIGRAPH_RRF_GATE_RATIO` and
 pushes into a `nearest` or `rrf` scan; leave them unset in normal operation.
 
 `OMNIGRAPH_ANN_NPROBES` and `OMNIGRAPH_RRF_PLAN` are not free tunables. Each is
-the process default of a `process`-scope session setting (`ann_nprobes`,
-`rrf_plan`): the server reads it once at startup and the CLI once per run, a
+the process default of a session setting (`ann_nprobes`, `request` scope;
+`rrf_plan`, `process` scope): the server reads it once at startup and the CLI once per run, a
 value outside the setting's row refuses that start instead of running a
-default, and `show all;` reports the setting with its value and source.
+default, and `show all;` reports the setting with its value and source. An
+ad-hoc query may set `ann_nprobes` for itself (`set ann_nprobes = 40;` before
+the declaration, `--set ann_nprobes=40`, or the `settings` field of
+`POST /query`); `rrf_plan` is refused in a served request.
 
 ## Model / Config
 
@@ -206,6 +216,6 @@ For a served graph, declare a named provider under `providers.embedding` in
 be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
-After upgrading a Lance 9/10 store, full-text queries can require
-`rebuild-full-text-indexes` on each live branch. Ordinary reads and vector
+Full-text indexes built before Lance 11 (the v0.9 era) can still require
+`rebuild-full-text-indexes` on each live branch before full-text queries run. Ordinary reads and vector
 search do not depend on that rebuild; see [`commands.md`](commands.md#rebuild-full-text-indexes--explicit-analyzer-upgrade).

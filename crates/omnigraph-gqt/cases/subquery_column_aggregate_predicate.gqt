@@ -25,6 +25,7 @@ node Artifact {
     created: Date
     published: Bool
     big: U64?
+    weight: F32?
 }
 edge ArtifactOwnedByActor: Artifact -> Actor {}
 
@@ -32,10 +33,10 @@ edge ArtifactOwnedByActor: Artifact -> Actor {}
 {"type":"Actor","data":{"slug":"zero"}}
 {"type":"Actor","data":{"slug":"small"}}
 {"type":"Actor","data":{"slug":"large"}}
-{"type":"Artifact","data":{"slug":"s1","size":10,"score":-2.5,"label":"a","created":"2024-01-10","published":false}}
-{"type":"Artifact","data":{"slug":"s2","size":21,"created":"2024-02-10","published":false}}
-{"type":"Artifact","data":{"slug":"l1","size":50,"score":0.5,"label":"c","created":"2024-03-10","published":false}}
-{"type":"Artifact","data":{"slug":"l2","size":70,"score":4.5,"label":"d","created":"2025-06-01","published":true,"big":18446744073709551615}}
+{"type":"Artifact","data":{"slug":"s1","size":10,"score":-2.5,"label":"a","created":"2024-01-10","published":false,"weight":0.1}}
+{"type":"Artifact","data":{"slug":"s2","size":21,"created":"2024-02-10","published":false,"weight":0.5}}
+{"type":"Artifact","data":{"slug":"l1","size":50,"score":0.5,"label":"c","created":"2024-03-10","published":false,"weight":0.25}}
+{"type":"Artifact","data":{"slug":"l2","size":70,"score":4.5,"label":"d","created":"2025-06-01","published":true,"big":18446744073709551615,"weight":0.75}}
 {"edge":"ArtifactOwnedByActor","from":"s1","to":"small"}
 {"edge":"ArtifactOwnedByActor","from":"s2","to":"small"}
 {"edge":"ArtifactOwnedByActor","from":"l1","to":"large"}
@@ -133,6 +134,10 @@ query newest_artifact_after_a_date($since: Date) {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate max($m.created): max(Date) extremum error -> Date?
+type max($m.created): Date?
+no cast max($m.created)
 
 --- query
 query oldest_artifact_before_a_date_literal() {
@@ -148,6 +153,8 @@ query oldest_artifact_before_a_date_literal() {
 {"n.slug":"small"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate min($m.created): min(Date) extremum error -> Date?
 
 --- query
 query scan_introduced_block_binding_loads_the_argument() {
@@ -181,6 +188,9 @@ query count_over_a_column_counts_its_values() {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate count($m.label): count(String?) count error -> I64?
+type count($m.label): I64?
 
 --- query
 query null_bound_satisfies_nothing($s: String?) {
@@ -197,6 +207,9 @@ query null_bound_satisfies_nothing($s: String?) {
 --- expect unordered
 --- expect shape
 n.slug: String
+--- expect plan
+type max($m.label): String?
+type $s: String?
 
 --- query
 query unsigned_above_the_signed_range_is_kept() {
@@ -212,6 +225,10 @@ query unsigned_above_the_signed_range_is_kept() {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate max($m.big): max(U64?) extremum error -> U64?
+cast 0: I64 -> U64
+no cast max($m.big)
 
 --- query
 query largest_label() {
@@ -227,6 +244,8 @@ query largest_label() {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate max($m.label): max(String?) extremum error -> String?
 
 --- query
 query sum_over_a_string_is_refused() {
@@ -238,7 +257,7 @@ query sum_over_a_string_is_refused() {
     }
     return { $n.slug }
 }
---- expect error: T8: sum requires numeric type, got String
+--- expect error: T8: sum requires numeric type, got String?
 
 --- query
 query date_aggregate_against_a_number_is_refused() {
@@ -250,7 +269,7 @@ query date_aggregate_against_a_number_is_refused() {
     }
     return { $n.slug }
 }
---- expect error: T40: cannot compare max over a block (Date) with I64
+--- expect error: T40: cannot compare max over a block (Date?) with I64
 
 --- query
 query count_null_values_and_empty_input_are_zero() {
@@ -267,6 +286,8 @@ query count_null_values_and_empty_input_are_zero() {
 {"n.slug":"small"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate count($m.big): count(U64?) count error -> I64?
 
 --- query
 query float_average_skips_null_values($mean: F64) {
@@ -299,3 +320,62 @@ query largest_boolean() {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+--- expect plan
+block aggregate max($m.published): max(Bool) extremum error -> Bool?
+
+
+--- query
+query minimum_f32_retains_its_declared_domain() {
+    match {
+        $n: Actor
+        min($m.weight) { $m artifactOwnedByActor $n } = 0.10000000149011612
+    }
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"small"}
+--- expect shape
+n.slug: String
+--- expect plan
+block aggregate min($m.weight): min(F32?) extremum error -> F32?
+cast 0.10000000149011612: F64 -> F32
+no cast min($m.weight)
+
+--- query
+query maximum_f32_widens_only_after_finalization($bound: F64) {
+    match {
+        $n: Actor
+        max($m.weight) { $m artifactOwnedByActor $n } > $bound
+    }
+    return { $n.slug }
+}
+--- params
+{"bound":0.5}
+--- expect unordered
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+--- expect plan
+block aggregate max($m.weight): max(F32?) extremum error -> F32?
+cast max($m.weight): F32? -> F64?
+no cast $bound
+
+--- query
+query count_over_a_node_is_row_count($bound: U64) {
+    match {
+        $n: Actor
+        count($m) { $m artifactOwnedByActor $n } >= $bound
+    }
+    return { $n.slug }
+}
+--- params
+{"bound":2}
+--- expect unordered
+{"n.slug":"small"}
+{"n.slug":"large"}
+--- expect shape
+n.slug: String
+--- expect plan
+type count: I64
+cast count: I64 -> exact_integer
+cast $bound: U64 -> exact_integer

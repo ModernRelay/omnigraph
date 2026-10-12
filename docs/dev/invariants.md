@@ -51,7 +51,13 @@ five more changes like this one?**
    staged file nothing references, which a retry ignores. `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
-   abandonment. Published table effects and the accepted schema contract
+   abandonment. The one explicitly requested exception is an unpublished
+   commit (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)):
+   its detached `__manifest` version is reachable by its graph commit id
+   through the reserved tag `unpublished_<id>`, which acknowledges durable
+   snapshot addressability with `published: false` and never branch
+   visibility; the branch still changes only at the later ordinary
+   publication, and the tag expires with the captured target authority. Published table effects and the accepted schema contract
    are complete in one manifest publication; no contract-file installation
    remains. There is no side record to classify. The collector holds two properties
    on every run: safety, that every pin of every retained `__manifest`
@@ -83,6 +89,18 @@ five more changes like this one?**
    mutations, polymorphism, policy predicates, and future planner capabilities
    belong in AST, IR, and typed plan structures. Do not smuggle semantics
    through strings, transport flags, global state, or side tables.
+   Expressions and parameter declarations retain the compiler's type.
+   Numeric comparison conversions are explicit Cast nodes; execution and scan
+   pushdown never select a domain from values. The internal exact integer
+   carrier cannot appear in a declared property, parameter or public result.
+   Mutation statements retain the compiler-selected node or edge target;
+   execution does not choose again when both namespaces contain the same name.
+   Binding validates every declared parameter, including unused declarations;
+   replay validates used values against the retained leaves. Projection fields
+   come from those declarations, including empty results. Opened Lance fields
+   must match the accepted storage schema in type and nullability. Derived
+   operator fields may widen nullable flags, but values may not violate a
+   declared non-null constraint.
 
 10. **Trust is established at the boundary and enforced at the engine.** HTTP
     resolves bearer tokens to actors; a client never supplies its trusted actor
@@ -135,10 +153,27 @@ different:
   durable graph visibility;
 - maintained parallel truth or cold full-history reconstruction per request.
 
+Cases an RFC has argued: the flat locator objects and legacy data files under
+`__history/legacy/`, written once by the storage upgrade (from stamp 8, 9 or 13), in the
+[RFC 0068 amendment](../rfcs/0068-graph-commit-record.md#why-this-is-not-a-deny-list-shape).
+
 ## Current support boundaries
 
-- The server is cluster-only. Runtime graph add/remove is performed by
-  `cluster apply` followed by restart, not an HTTP mutation.
+- The server is cluster-only and ledger v2 is the sole operational protocol.
+  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
+  under existing writer admission.
+  Runtime views share engine authority and retain immutable request bindings.
+  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
+  conversion is explicit and preserves data; no v1 executor remains. Removing
+  a graph declaration authorizes deletion of its exact managed root and all
+  retained history, after affected admission closes and admitted work drains.
+  The existing ledger records deletion intent before effects and owns resumption
+  through verified root absence. Adoption and missing-root recreation remain
+  unsupported; unexpected roots and schema drift refuse rather than infer
+  identity from matching text.
+  One outstanding durable authority owns completion/recovery. Generic drain
+  does not prove native-I/O settlement or authorize lock release; excluded raw
+  and older writers remain an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity
   smoke proof is complete.
@@ -146,8 +181,7 @@ different:
   process-local gate ordering. Its contract and table references publish
   together; the removed file-installation protocol supplies no distributed
   lock. Branch creation/deletion and cleanup retain their existing
-  single-writer-process control boundary. Explicit storage conversion
-  requires operator-enforced quiescence.
+  single-writer-process control boundary.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 

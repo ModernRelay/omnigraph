@@ -115,7 +115,7 @@ crash: the storage wrapper stops forwarding, same process judges) and
 **lane B** (real death: a parent spawns `dst_child`, waits on the fsync'd
 barrier line at completion #k, SIGKILLs, then recovers and judges from the
 oplog). Lane B ships as a labeled preview; see `src/lane_b.rs`
-and `tests/lane_b.rs`.
+and `tests/integration/lane_b.rs`.
 
 ## Fault axes
 
@@ -131,11 +131,6 @@ and `tests/lane_b.rs`.
   and live-handle owners require counted delivery and full report replay;
   the latter also requires later model-changing writes without reopening.
   These process-wide decision seams require serialized scenario ownership.
-- **Legacy contract read weather**: `run_legacy_upgrade_read_weather` exercises
-  offline upgrade admission on flat-v11 fixtures. Stale source, bit rot,
-  truncation and latent errors must reach validation; refused attempts preserve
-  stored objects, and a clean retry preserves data and graph lineage.
-  Current-format serving reads its schema contract through Lance.
 
 ## Known limits
 

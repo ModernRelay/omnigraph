@@ -455,9 +455,23 @@ mod tests {
             IRExpr::PropAccess {
                 variable: "m".to_string(),
                 property: "mid".to_string(),
+                ty: omnigraph_compiler::types::ExprType::from_prop(
+                    &omnigraph_compiler::types::PropType::scalar(
+                        omnigraph_compiler::types::ScalarType::String,
+                        false,
+                    ),
+                ),
             },
             CompOp::Eq,
-            IRExpr::Literal(Literal::String("never".to_string())),
+            IRExpr::Literal(
+                Literal::String("never".to_string()),
+                omnigraph_compiler::types::ExprType::from_prop(
+                    &omnigraph_compiler::types::PropType::scalar(
+                        omnigraph_compiler::types::ScalarType::String,
+                        false,
+                    ),
+                ),
+            ),
         );
         let memory = Arc::new(WorkMemory::new(ctx, "test join").unwrap());
         let stream = producer_stream(schema, memory, None, move |memory, sender| async move {

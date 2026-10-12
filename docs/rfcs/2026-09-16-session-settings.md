@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-16
-updated: 2026-09-27
+updated: 2026-10-07
 discussion: null
 supersedes: []
 superseded_by: []
@@ -92,7 +92,7 @@ logic-test runner; this document gives it the statement and nothing else.
 The boundary that does not change: nothing is written to `__manifest` or
 anywhere in the store; the `/branches` routes and every response type keep
 their fields; three request types gain one optional field, `settings`,
-honored at four routes and refused at the two deprecated ones, and the two
+honored at four routes, and the two
 `GET` change routes one optional `set` query parameter; there is still no
 current branch, checkout or identity carried
 between requests, since every request keeps naming its branch and its actor;
@@ -214,16 +214,10 @@ door (defined below: RFC 0055's word for the route or CLI verb a statement
 enters through), which is `POST /query` and `omnigraph query`, and takes the
 scope-free `read` authorization `GET /branches` and `branch list` take
 (`authorize_scope_free_read`, `omnigraph-server/src/handlers.rs`: the
-graph's Cedar `read` gate with no branch in the request). The deprecated
-`POST /read` and `POST /change` serve no statement and refuse a `settings`
-field and any `set` or `reset` prefix alike, with HTTP 400 `the deprecated
-/read and /change routes take no settings, neither a settings field nor a
-set or reset prefix; use POST /query or POST /mutate`
-(`query_file_refusals::SETTINGS_AT_DEPRECATED_ROUTE`); a `show` at `/read`
-is RFC 0055's `DEPRECATED_ROUTE` refusal. At the write door (below), `/change`
-included, `show` is refused with the same HTTP 400 that RFC 0055 gives
+graph's Cedar `read` gate with no branch in the request). At the write door
+(below), `show` is refused with the same HTTP 400 that RFC 0055 gives
 `branch list` at `/mutate`, the statement in the message being `show engine`
-or `show all`.
+or `show all`. The removed `/read` and `/change` routes return 404.
 
 A name outside the definition, a value of the wrong type, a value outside the
 declared values or range, and a `process` setting arriving in a request are
@@ -307,9 +301,9 @@ through. A setting reaches the engine through three of them.
 
 **CLI.** `omnigraph query` and `omnigraph mutate` parse the source before
 sending, as they do today for a branch statement (`omnigraph-cli/src/main.rs:1155`,
-`:1221`). Both, the verbs that run a routed operation without GQ text
+`:1221`). These commands, the verbs that run a routed operation without GQ text
 (`omnigraph branch merge`, the commit-changes and change-feed verbs), and
-`omnigraph load` and `omnigraph ingest` gain a repeatable `--set name=value`;
+`omnigraph load` accept a repeatable `--set name=value`;
 the value is written in GQ spelling, the same as after `=` in a `set` line
 (`--set engine=v2`, `--set merge_lineage=verify`), and every `--set` goes
 through `SettingId::parse_assignment`, the one `name=value` door, shared
@@ -318,15 +312,15 @@ with the `set=` query parameter (HTTP). Embedded (`GraphClient::Embedded`,
 environment and the `--set` values and calls it with the file, whose `set`
 lines apply to that call (Prefix application, Design); a `process` setting
 is accepted from all three, by the `process` scope rule (The settings), and
-an embedded `load` or `ingest` applies its `--set` to the session it loads
+an embedded `load` applies its `--set` to the session it loads
 through. Remote (`GraphClient::Remote`, `client.rs:71`), the CLI sends the
 GQ text unchanged and the `--set` values in the request's `settings` field,
 so the server sees the same two inputs an embedded run does, and applies the
 scope rule; a remote `--set` of a `process` setting is refused by the CLI
 before anything is sent, with the fifth message, since the typed field
-cannot carry it. A served `load` or `ingest` refuses any `--set` with `load
-and ingest take --set only on an embedded store; the served load and ingest
-routes carry no settings field` (`SETTINGS_AT_SERVED_LOAD`,
+cannot carry it. A served `load` refuses any `--set` with `load
+takes --set only on an embedded store; the served load routes carry no settings
+field` (`SETTINGS_AT_SERVED_LOAD`,
 `omnigraph-cli/src/client.rs`), since neither route's request type has a
 field to carry it and a value could only be dropped. On the commit-changes
 and change-feed verbs a `--set` is validated and sent as `set=`; nothing
@@ -338,15 +332,7 @@ per-declaration line `output.rs:145-150` prints today.
 **HTTP.** Three request types carry the field to a settings-aware
 operation: `POST /query` (`QueryRequest`), `POST /mutate` and
 `POST /mutate/if-graph-commit` (`ChangeRequest`; the field is honored alike
-on both), and `POST /branches/merge` (`BranchMergeRequest`). The deprecated
-`POST /change` carries `ChangeRequest` too, and the deprecated `POST /read`
-(`ReadRequest`) carries `settings` as raw JSON only so the refusal can name
-the field; both serve no statement and refuse a present `settings` field and
-any `set` or `reset` prefix in the source with the
-`SETTINGS_AT_DEPRECATED_ROUTE` message (The statements;
-`omnigraph-server/src/handlers.rs`, `server_read` and `server_change`;
-`handlers/dispatch.rs`, `refuse_settings_at_deprecated_route`), running
-their legacy bodies under the process defaults alone. The three types gain
+on both), and `POST /branches/merge` (`BranchMergeRequest`). The three types gain
 one optional field, `settings`: `SettingsRequest`,
 hand-written in `omnigraph-api-types` with one `Option<T>` field per
 `request` row, `#[serde(deny_unknown_fields, rename_all = "snake_case")]`,
@@ -817,31 +803,23 @@ known gap changes.
 ## Compatibility and reversibility
 
 **Wire.** Within the Summary's boundary, the wire change is one optional
-field, `settings`, on three request types, honored at four routes and
-refused at the deprecated `/read` and `/change`, and one optional repeatable
-query parameter, `set`, on the two `GET` change routes; absent means the
-process defaults. Additive: a client that never sends them sees no change.
-An older server that does not know the field drops it silently (the three
-request types carry no `deny_unknown_fields`, `api-types/src/lib.rs:191`,
-`:708`, `:734`, `:889`) and answers 200 under `v1`. That is accepted as a
-tradeoff: an older server drops the field, which is harmless for the
-answer-preserving settings and changes approximate rows for `ann_nprobes`;
-a client that needs the cap checks the server version, and a client that
-must know sends a `show` first (`show merge_lineage;` at rollout
-step 1, `show engine;` after step 2), which an older server answers with a
-parse-error 400. The parameter
-an older server refuses the way it refuses any unknown change-surface
-parameter (`handlers.rs:2840`). The field is a typed struct, so the OpenAPI
-golden (`crates/omnigraph-server/tests/openapi.rs`) shows each `request`
+field, `settings`, on three request types, honored at four routes, and one
+optional repeatable query parameter, `set`, on the two `GET` change routes;
+absent means the process defaults. CLI and server require the current [HTTP
+contract](2026-09-30-v012-http-admission.md); older-server fallback is unsupported. Query and mutation request
+bodies refuse unknown fields. The typed field means the OpenAPI golden
+(`crates/omnigraph-server/tests/openapi.rs`) shows each `request`
 setting's type and values, and a future `request` setting is a visible
 schema change. No response type changes. The routes that reach no `request`
-setting take nothing: `/schema`, `/schema/apply`, `/snapshot`, `/commits`,
+setting take nothing: `/schema`, `/snapshot`, `/commits`,
 `/commits/{commit_id}`, `/blob`, `/export`, `/changes/baseline`, `/load`,
-`/load/ndjson` and `/ingest` (these three reach only the `process` setting
+`/load/ndjson` (these two reach only the `process` setting
 `stage_write_concurrency`), `/branches` create, delete and list (`GET
 /branches` included), `/graphs`, `/queries`, `/openapi.json`, the health
 routes; `POST /queries/{name}` and `POST /queries/{name}/if-graph-commit`
-are Unresolved question 1.
+are Unresolved question 1. `/read`, `/change`, `/ingest`, and `/schema/apply`
+are absent. Standalone `schema apply` uses direct storage; served schema changes
+use `cluster apply --server URL --config DIR`.
 
 **Language.** `set`, `reset` and `show` are legal only before the first
 statement of a file, so every file that parses today keeps its meaning; a
@@ -1032,10 +1010,8 @@ refused with HTTP 400 and the fifth message, and in the `settings` field
 with HTTP 400 and serde's unknown-field message; the typed `settings` field
 round-trips each `request` setting and its `show` source is `request`; text
 overrides the field; `POST /mutate/if-graph-commit` honors the field like
-`/mutate`; `show engine;` at `/mutate` is the wrong-door 400 and at `/read`
-the `DEPRECATED_ROUTE` refusal; a `settings` field, and a `set` or `reset`
-prefix in the source, at `/read` and at `/change` is 400
-`SETTINGS_AT_DEPRECATED_ROUTE`; a file of only `set` lines is 400 `a file of
+`/mutate`; `show engine;` at `/mutate` is the wrong-door 400; removed routes
+return 404 without graph effects. A file of only `set` lines is 400 `a file of
 only settings lines carries no statement` at `/query` and `/mutate`;
 `GET /changes?set=engine=v2` records a planner decision (rollout step 2; at
 step 1 `?set=merge_lineage=off` is accepted and selects nothing) and
@@ -1200,3 +1176,16 @@ routed) follows step 2.
   reworded. The rest of the body's `v1` text records the draft. Engine v1
   is the frozen test reference `omnigraph-reference-engine`, reached only
   through a GQT step's `--- expect same as v1`.
+
+- 2026-10-05: The maintainer requested removal of compatibility interfaces.
+  The Summary, statements, transport doors, wire compatibility, and server
+  tests now omit retained `/read`, `/change`, `/ingest`, and `/schema/apply`
+  behavior. This replaces their former settings-specific refusal contracts
+  and the older-server fallback with the v0.12 contract. CLI `ingest` is
+  removed; `load` retains its embedded settings behavior. `schema apply` is
+  direct-only and served schema changes use cluster deployment. The earlier
+  decision-log entries record the original rollout.
+
+- 2026-10-07: Replaced Compatibility and reversibility's sentence requiring
+  the v0.12 HTTP contract with the current admission decision, which now requires
+  exactly `0.13`. Settings do not negotiate an independent wire version.

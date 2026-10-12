@@ -1,0 +1,61 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000599","p.age":99}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- query
+query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000599","p.age":99}
+--- expect shape
+p.name: String
+p.age: I64
+
+--- restart
+
+--- query
+query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"p000590","p.age":90}
+{"p.name":"p000591","p.age":91}
+{"p.name":"p000592","p.age":92}
+{"p.name":"p000593","p.age":93}
+{"p.name":"p000594","p.age":94}
+{"p.name":"p000595","p.age":95}
+{"p.name":"p000596","p.age":96}
+{"p.name":"p000597","p.age":97}
+{"p.name":"p000598","p.age":98}
+{"p.name":"p000599","p.age":99}
+--- expect shape
+p.name: String
+p.age: I64

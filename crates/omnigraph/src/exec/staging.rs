@@ -27,7 +27,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::storage_layer::{
-    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, SnapshotHandle, StagedHandle,
+    DeletedIdBudget, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingUsage, SnapshotHandle,
+    StagedHandle, WriteBudget, retain_keyed_batch, retained_keyed_bytes,
 };
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
@@ -77,9 +78,7 @@ impl PendingTable {
 
     fn total_bytes(&self) -> Result<u64> {
         self.batches.iter().try_fold(0_u64, |bytes, batch| {
-            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                OmniError::manifest_internal("pending keyed batch bytes exceed u64")
-            })?;
+            let batch_bytes = crate::table_store::write_batch_bytes(batch)?.rows;
             bytes
                 .checked_add(batch_bytes)
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
@@ -118,6 +117,10 @@ pub(crate) struct MutationStaging {
     pub(crate) paths: HashMap<String, StagedTablePath>,
     /// In-memory accumulated batches per table (insert/update path).
     pub(crate) pending: HashMap<String, PendingTable>,
+    /// Monotonic retained-batch accounting, updated only by `append_batch`.
+    pending_bytes: u64,
+    pending_payload_bytes: u64,
+    write_budget: WriteBudget,
     /// Per-table delete predicates from delete-touching ops. D₂ guarantees a
     /// table is write-XOR-delete within one query, so this never overlaps
     /// `pending`. Staged as one combined `stage_delete` per table at
@@ -127,6 +130,7 @@ pub(crate) struct MutationStaging {
     /// rows: validation recounts the srcs a delete empties, and the staged
     /// delete records them on its transaction as the commit's change set.
     pub(crate) deleted_ids: HashMap<String, Vec<String>>,
+    pub(crate) deleted_id_budget: DeletedIdBudget,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
     /// tables whose first or any subsequent touch was a strict op
@@ -148,6 +152,18 @@ decide_seam! {
 }
 
 impl MutationStaging {
+    pub(crate) fn new(write_budget: WriteBudget) -> Self {
+        Self {
+            write_budget,
+            deleted_id_budget: DeletedIdBudget::new(write_budget),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn write_budget(&self) -> WriteBudget {
+        self.write_budget
+    }
+
     /// Capture pre-write metadata on first touch of a table. Subsequent
     /// touches preserve the original `paths` and `expected_versions`
     /// entries; `op_kinds` upgrades to the strictest kind seen so far so
@@ -255,7 +271,15 @@ impl MutationStaging {
                 )));
             }
         }
-        if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+        let batch_usage = crate::table_store::write_batch_bytes(&batch)?;
+        let batch_bytes = batch_usage.rows;
+        let pending_payload_bytes = self
+            .pending_payload_bytes
+            .checked_add(batch_usage.payload)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("pending Blob payload byte count overflow")
+            })?;
+        let pending_bytes = if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
             let existing_rows = self
                 .pending
                 .get(table_key)
@@ -275,20 +299,21 @@ impl MutationStaging {
                 Some(existing) => existing.total_bytes()?,
                 None => 0,
             };
-            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                OmniError::manifest_internal("pending keyed batch bytes exceed u64")
-            })?;
             let bytes = existing_bytes
                 .checked_add(batch_bytes)
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
-            if bytes > KEYED_WRITE_MAX_BYTES {
-                return Err(OmniError::resource_limit(
-                    format!("keyed entity bytes for {table_key}"),
-                    KEYED_WRITE_MAX_BYTES,
-                    bytes,
-                ));
-            }
-        }
+            self.write_budget
+                .check(format!("keyed entity bytes for {table_key}"), bytes)?;
+            self.write_budget.check(
+                "decoded blob input bytes per operation",
+                pending_payload_bytes,
+            )?;
+            retained_keyed_bytes(self.pending_bytes, batch_bytes, self.write_budget)?
+        } else {
+            self.pending_bytes
+                .checked_add(batch_bytes)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?
+        };
         let entry = self
             .pending
             .entry(table_key.to_string())
@@ -299,6 +324,8 @@ impl MutationStaging {
             entry.mode = PendingMode::Upsert;
         }
         entry.batches.push(batch);
+        self.pending_bytes = pending_bytes;
+        self.pending_payload_bytes = pending_payload_bytes;
         Ok(())
     }
 
@@ -318,14 +345,14 @@ impl MutationStaging {
     /// own scan, for validation (so cardinality recounts an emptied src). The
     /// caller scans with a dedup filter that excludes prior-scheduled matches, so
     /// no id is recorded twice across statements.
-    pub(crate) fn record_deleted_ids(&mut self, table_key: &str, ids: &[String]) {
+    pub(crate) fn record_deleted_ids(&mut self, table_key: &str, ids: Vec<String>) {
         if ids.is_empty() {
             return;
         }
         self.deleted_ids
             .entry(table_key.to_string())
             .or_default()
-            .extend(ids.iter().cloned());
+            .extend(ids);
     }
 
     /// Delete predicates already recorded for `table_key` by earlier delete
@@ -393,7 +420,7 @@ impl MutationStaging {
     /// keyed-write fence, while bytes include every pending table so one graph
     /// mutation cannot multiply the 32 MiB retained-memory budget by touching
     /// several tables.
-    pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<(u64, u64)> {
+    pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<PendingUsage> {
         let rows = u64::try_from(
             self.pending
                 .get(table_key)
@@ -401,12 +428,11 @@ impl MutationStaging {
                 .unwrap_or(0),
         )
         .map_err(|_| OmniError::manifest_internal("pending keyed row count exceeds u64"))?;
-        let bytes = self.pending.values().try_fold(0_u64, |total, pending| {
-            total
-                .checked_add(pending.total_bytes()?)
-                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
-        })?;
-        Ok((rows, bytes))
+        Ok(PendingUsage {
+            rows,
+            bytes: self.pending_bytes,
+            payload_bytes: self.pending_payload_bytes,
+        })
     }
 
     /// `true` if neither pending writes nor delete predicates have any state —
@@ -450,8 +476,12 @@ impl MutationStaging {
             expected_versions,
             paths,
             pending,
+            pending_bytes: _,
+            pending_payload_bytes: _,
+            write_budget,
             delete_predicates,
             deleted_ids,
+            deleted_id_budget: _,
             op_kinds: _,
         } = self;
 
@@ -472,7 +502,12 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-            let table = prepare_pending_table(&table_key, table, db.catalog().system_columns)?;
+            let table = prepare_pending_table(
+                &table_key,
+                table,
+                db.catalog().system_columns,
+                write_budget,
+            )?;
             // Finish the per-table last-write-wins fold before looking at URI
             // inputs. A superseded row is not part of the graph operation and
             // must not trigger policy checks, source probes, or byte charges.
@@ -506,17 +541,34 @@ impl MutationStaging {
             .collect::<Vec<_>>();
         let copied_external_blob_bytes =
             external_blob_preflight.materialized_payload_bytes(&copied_external_blob_uris)?;
-        if copied_external_blob_bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                "materialized external blob payload bytes",
-                KEYED_WRITE_MAX_BYTES,
-                copied_external_blob_bytes,
-            ));
+        write_budget.check(
+            "materialized external blob payload bytes",
+            copied_external_blob_bytes,
+        )?;
+        let mut retained_batch_bytes = 0;
+        let mut payload_bytes = copied_external_blob_bytes;
+        for (_, table, _, _) in &stage_inputs {
+            if table.mode != PendingMode::Overwrite {
+                retained_batch_bytes =
+                    retain_keyed_batch(retained_batch_bytes, &table.batch, write_budget)?;
+                payload_bytes = payload_bytes
+                    .checked_add(crate::table_store::write_batch_bytes(&table.batch)?.payload)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "materialized Blob payload byte count overflow",
+                        )
+                    })?;
+            }
         }
+        write_budget.check(
+            crate::table_store::MATERIALIZED_BLOB_PAYLOAD_BYTES,
+            payload_bytes,
+        )?;
 
         // Only after the complete operation has passed policy, source, and
         // aggregate-copy admission do we read payload bytes. Reuse remains
         // batch-bounded so this vector cannot retain an operation-sized cache.
+        let mut materialized_keyed_bytes = 0;
         for (table_key, table, _, _) in &mut stage_inputs {
             table.batch = match table.mode {
                 PendingMode::StrictInsert | PendingMode::Upsert => {
@@ -526,6 +578,7 @@ impl MutationStaging {
                             table.batch.clone(),
                             &external_blob_preflight,
                             db.catalog().system_columns,
+                            write_budget,
                         )
                         .await?
                 }
@@ -538,6 +591,10 @@ impl MutationStaging {
                         db.catalog().system_columns,
                     )?,
             };
+            if table.mode != PendingMode::Overwrite {
+                materialized_keyed_bytes =
+                    retain_keyed_batch(materialized_keyed_bytes, &table.batch, write_budget)?;
+            }
         }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
         let mut staged_entries: Vec<StagedTableEntry> =
@@ -549,7 +606,7 @@ impl MutationStaging {
                     if stage_idx > 0 {
                         fail(&LOAD_BETWEEN_TABLE_STAGES)?;
                     }
-                    stage_pending_table(db, table_key, table, path, expected).await
+                    stage_pending_table(db, table_key, table, path, expected, write_budget).await
                 },
             ))
             .buffered(concurrency)
@@ -635,6 +692,7 @@ fn prepare_pending_table(
     table_key: &str,
     table: PendingTable,
     system_columns: SystemColumns,
+    write_budget: WriteBudget,
 ) -> Result<PreparedPendingTable> {
     if table.batches.is_empty() {
         return Err(OmniError::manifest_internal(format!(
@@ -650,10 +708,7 @@ fn prepare_pending_table(
                 .try_fold((0_u64, 0_u64), |(rows, bytes), batch| {
                     let batch_rows = u64::try_from(batch.num_rows())
                         .map_err(|_| OmniError::manifest_internal("keyed batch rows exceed u64"))?;
-                    let batch_bytes =
-                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
-                            OmniError::manifest_internal("keyed batch bytes exceed u64")
-                        })?;
+                    let batch_bytes = crate::table_store::write_batch_bytes(batch)?.rows;
                     Ok::<_, OmniError>((
                         rows.checked_add(batch_rows).ok_or_else(|| {
                             OmniError::manifest_internal("keyed row count overflow")
@@ -670,13 +725,7 @@ fn prepare_pending_table(
                 rows,
             ));
         }
-        if bytes > KEYED_WRITE_MAX_BYTES {
-            return Err(OmniError::resource_limit(
-                format!("keyed entity bytes for {table_key}"),
-                KEYED_WRITE_MAX_BYTES,
-                bytes,
-            ));
-        }
+        write_budget.check(format!("keyed entity bytes for {table_key}"), bytes)?;
     }
 
     let mode = table.mode;
@@ -702,6 +751,7 @@ async fn stage_pending_table(
     table: PreparedPendingTable,
     path: StagedTablePath,
     expected: u64,
+    write_budget: WriteBudget,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
@@ -725,6 +775,7 @@ async fn stage_pending_table(
                     combined,
                     KeyedWriteSemantics::StrictInsert,
                     db.catalog().system_columns,
+                    write_budget,
                 )
                 .await?
         }
@@ -736,6 +787,7 @@ async fn stage_pending_table(
                     combined,
                     KeyedWriteSemantics::Upsert,
                     db.catalog().system_columns,
+                    write_budget,
                 )
                 .await?
         }
@@ -825,6 +877,10 @@ pub(crate) struct CommittedMutation {
     /// publisher checks them together with native branch identity, exact graph
     /// head, and schema identity as one authority precondition.
     pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
+    /// Each table's detached commit, keyed by table: the exact version its
+    /// pin will name, before publication. A Blob write reads its validator
+    /// evidence from here, never from a branch head.
+    pub(crate) detached: Vec<(String, crate::storage_layer::SnapshotHandle)>,
     /// The write envelope: shared schema permit, coarse branch gate, and
     /// sorted `(table, branch)` guards. The caller MUST hold the complete
     /// set across manifest publish (see `commit_all`) so no same-process
@@ -933,6 +989,7 @@ impl StagedMutation {
             return Ok(CommittedMutation {
                 updates: Vec::new(),
                 expected_versions,
+                detached: Vec::new(),
                 gates,
             });
         }
@@ -953,6 +1010,7 @@ impl StagedMutation {
 
         let witness = txn.authority.staging_witness()?;
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
+        let mut detached_tables = Vec::with_capacity(staged.len());
         for entry in staged {
             let StagedTableEntry {
                 table_key,
@@ -967,9 +1025,13 @@ impl StagedMutation {
                     table_key
                 ))
             })?;
+            let declared_full_text = crate::db::omnigraph::table_ops::declared_full_text_columns(
+                &txn.catalog,
+                &table_key,
+            );
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(dataset, staged_write, &witness)
+                .commit_staged_detached(dataset, staged_write, &witness, &declared_full_text)
                 .await?;
             let state = db.storage().table_state(&path.full_path, &detached).await?;
             let target = expected_version + 1;
@@ -978,6 +1040,7 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            detached_tables.push((table_key.clone(), detached));
             updates.push(DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key,
@@ -992,6 +1055,7 @@ impl StagedMutation {
         Ok(CommittedMutation {
             updates,
             expected_versions,
+            detached: detached_tables,
             gates,
         })
     }

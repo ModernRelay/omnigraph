@@ -25,13 +25,13 @@ The optional top-level `id` supplies entity identity. `data` holds user properti
 
 The strict parser rejects duplicate members, unknown fields, reserved physical columns, malformed envelopes, and noncanonical supplied entity IDs. It accepts logical type and property names only; callers never select physical datasets, lanes, fragments, or bindings.
 
-The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects.
+The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects. Keyed modes bound parser estimates and retained row data across tables with the session's `write_max_bytes` (default 32 MiB). Logical Blob payloads have their own allowance of the same size.
 
 ### Compatibility loader
 
 `POST /graphs/{graph_id}/load` and the engine `load_as` accept a JSON envelope whose `data` field contains loader-compatible NDJSON. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
-`POST /graphs/{graph_id}/ingest`, the CLI `ingest` command, and the engine `ingest*` methods are deprecated compatibility aliases over the same loader. They do not have a separate fast path or durability contract. New integrations use `load` or `/load/ndjson`.
+The engine `ingest*` methods are deprecated aliases over the same loader, with no separate fast path or durability contract. CLI and HTTP integrations use `load` or `/load/ndjson`.
 
 ## Transaction contract
 
@@ -55,7 +55,7 @@ Load modes are shared across the surfaces:
 
 One batch may touch several logical declarations. Cross-table visibility is still atomic: readers see all published table versions or none. An error after recovery is armed returns recovery-required rather than claiming rollback or success.
 
-The write envelope is bounded before arm. Keyed work is limited to 8,192 retained rows and 32 MiB of exact retained Arrow data per table, with operation-wide limits for carried external Blob payloads and other retained plans. The HTTP strict-batch body has its own 32 MiB ceiling. These limits bound one commit; clients split larger imports into explicit batches and accept one graph commit per batch.
+The write envelope is bounded before arm. Keyed work is limited to 8,192 retained rows per table. The session's `write_max_bytes` (default 32 MiB) independently bounds retained row data, logical Blob payloads and parsing estimates, preserving the existing table and operation scopes. An Overwrite load collects committed IDs absent from its replacement under a separate removed-ID allowance of the same size; each ID is charged its UTF-8 length plus 24 bytes. Overwrite keeps its bulk-input behavior and is exempt from keyed aggregate row/batch limits. See [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own fixed 32 MiB ceiling. Clients split larger incremental imports into explicit batches and accept one graph commit per batch.
 
 ## Blob and index behavior
 
@@ -74,7 +74,7 @@ If an application needs durable acceptance before graph visibility, put an exter
 ## Test owners
 
 - Parser, batching, branch creation, modes, bounds, and actor attribution: in-source `crates/omnigraph/src/loader/` tests.
-- Atomic table staging and recovery: `crates/omnigraph/tests/writes.rs`, `recovery.rs`, and `failpoints.rs`.
-- Strict and compatibility HTTP routes: `crates/omnigraph-server/tests/data_routes.rs`, auth coverage, and `openapi.rs`.
-- CLI local/remote behavior and deprecation signal: `crates/omnigraph-cli/tests/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
+- Atomic table staging and recovery: `crates/omnigraph/tests/writes.rs`, `integration/recovery.rs`, and `failpoints.rs`.
+- Strict and compatibility HTTP routes: `crates/omnigraph-server/tests/integration/data_routes.rs`, auth coverage, and `integration/openapi.rs`.
+- CLI local/remote behavior and deprecation signal: `crates/omnigraph-cli/tests/integration/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
 - Absence of retired durable surfaces: `crates/omnigraph/tests/forbidden_apis.rs` and configuration rejection tests.

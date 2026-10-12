@@ -56,8 +56,9 @@ manifest version match the captured transaction; otherwise it opens the target
 coordinator from durable state. The publisher independently reads fresh authority
 and enforces the exact graph-head precondition on every attempt. Successful
 publication returns a taken coordinator to the one-entry merge cache; failure
-drops it. Commit IDs and timestamps are minted for the captured branch without
-reloading manifest history. The existing schema and branch gates still serialize
+drops it. The intent nonce and timestamps are minted for the captured branch
+without reloading manifest history; the publish wraps the nonce into the
+addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
 conflicting control operations. A merge holds its target's branch gate and
 per-table queues through publication, and its source's branch gate only until
 the source snapshot is captured, tagged and proved still current; it takes no
@@ -148,10 +149,11 @@ physical-effect proofs:
 | Writer | Physical adapter | Publication |
 |---|---|---|
 | Mutation / Load | One exact staged keyed, overwrite, or delete transaction per touched table | One graph commit |
-| SchemaApply | Existing-table detached rewrites; original added-type Create or qualified reuse/detached replacement; complete table delta and replacement schema-contract row | One main-branch graph commit |
+| SchemaApply | Existing-table metadata-only schema evolution (a detached `Project` for renamed and dropped columns, then a detached `Merge` adding nullable columns over the unchanged fragments; no data file written, no row read); original added-type Create or qualified reuse/detached replacement; complete table delta and replacement schema-contract row | One main-branch graph commit |
 | BranchMerge | Onto main: a pointer switch, main's registration taking the source's pin. Into a named branch: a chain of detached chunk commits (proven insertion chain or bounded ordered diff) published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
-| Optimize | One detached compaction `Rewrite` per productive table, chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
+| Optimize | One detached compaction `Rewrite` per productive table (Lance's plan plus every fragment still holding a dropped column), chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
+| Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
 
 Native graph-branch create/delete is a control exception. `BranchContents` is
 the logical authority; clone/delete residue is derived physical state and is
@@ -212,17 +214,22 @@ still does, or when no `__manifest` version ever named it and the authority
 its transaction properties record is provably gone. Nothing defers a table's
 collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
 
-Optimize plans each table's compaction from its pin and stages the rewrite
-detached with fragment ids above the base's high-water mark, so it needs no
-`ReserveFragments`; a lagging scalar or vector index is rebuilt whole as a
-detached commit chained on the rewrite under its name (Lance 11 folds only
-through a linear commit), keeping a vector index's partition count; the batch
-publishes once with an exact CAS on every planned pin, and a pin a concurrent
-writer moved fails the run with a read-set conflict so the next run re-plans.
-A failure before publication leaves unpublished staging the collector
-reclaims once it is dead. A strict mutation prepared before Optimize's
-publication reports the same read-set conflict as it would after any other
-writer.
+Optimize plans each table's compaction from its pin
+(`TableStore::plan_table_compaction`): Lance's plan, plus a task of its own
+for every other fragment whose data or overlay files still list a field id the
+schema lacks, the values of a dropped column. The rewrite scans the current
+schema only, so its files hold no dropped value; this is how a drop is erased,
+deterministically, whatever Lance's size and deletion heuristics select. It
+stages the rewrite detached with fragment ids above the base's high-water
+mark, so it needs no `ReserveFragments`; a lagging scalar or vector index is
+rebuilt whole as a detached commit chained on the rewrite under its name
+(Lance 11 folds only through a linear commit), keeping a vector index's
+partition count; the batch publishes once with an exact CAS on every planned
+pin, and a pin a concurrent writer moved fails the run with a read-set
+conflict so the next run re-plans. A failure before publication leaves
+unpublished staging the collector reclaims once it is dead. A strict mutation
+prepared before Optimize's publication reports the same read-set conflict as
+it would after any other writer.
 
 The index writer (`ensure_indices` and the explicit full-text rebuild)
 follows the same protocol: it opens each productive table at its pin, stages
@@ -232,9 +239,56 @@ publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 
-Schema apply stages each existing-table rewrite as a detached Overwrite of
-the table's pin and publishes it one logical version past the published
-version. An added type uses its identity-derived path, which a retry derives
+Every writer commits a table effect through
+`TableStore::commit_staged_detached`, which takes the table's declared
+full-text columns. Lance applies a full-text analyzer only through a segment
+of the index, so a version holding rows and no segment for a declared column
+would match with a bare tokenizer (no lowercasing, no stemming). A table's
+first rows and an overwrite load (an overwrite drops every index) produce such
+a version, as does a schema evolution that adds a full-text column; when the
+committed version holds no segment for a declared column, the gateway chains
+an untrained, certified segment (an empty fragment bitmap, no postings) in a
+second detached commit under the same witness and returns that version to
+pin. The gateway decides this before the commit from the base version's index
+metadata and the effect's operation, as Lance's manifest build decides (an
+overwrite keeps no index, an index commit swaps the segments it removes for
+the ones it adds, and any other operation keeps a segment of every index whose
+column remains), resolving each column by field id in the schema the version
+will have, so a renamed column keeps its index; Lance's commit loads the same
+metadata, so the check adds no storage request. Schema apply declares a
+full-text `@index` it adds to a table it does not evolve the same way, beside
+the contract. The index writer builds postings where no segment covers a
+fragment, and the branch-merge insertion proof steps over a declaration link,
+which moves no row. The system-column upgrade keeps every index and declares
+none.
+
+Schema apply changes an existing table's columns by metadata-only Lance
+commits (`TableStore::stage_schema_evolution`). Renamed and dropped columns
+commit as one detached `Operation::Project` of the table's pin, the surviving
+columns keeping their field ids, metadata and indexes; added nullable columns
+commit as a detached `Operation::Merge` over the unchanged fragments, with
+field ids above every id the data files reference, which fragments that lack
+them read as null. Lance refuses a Merge that renames a field, so a table with
+both kinds chains the Merge on the Project, and the pin names the tip; either
+way the table publishes one logical version past its published version. No
+data file is written and no row or Blob payload is read, so the apply's memory
+and I/O do not grow with the rows or payload bytes the table stores; they
+still grow with its fragment, schema and index metadata, because planning
+walks the fragment inventory, the Merge carries it and each detached commit
+serializes it. Every surviving index keeps its coverage, and a stored external
+Blob descriptor, ranged or not, is never rebuilt. A dropped column's values
+stay in the data files until the next optimize rewrites every fragment holding
+them (above); `cleanup` then deletes the old files once no retained version
+references them. The collector retains every live branch's head and creation
+point and every tagged version, so a branch created before that optimize keeps
+the old files, merged or not, until it is deleted. Every evolved table's
+commits are planned once, from its manifest, before the first effect, and the
+effects stage exactly that plan, each step checking that its base has the
+columns the previous step left. A column whose type or nullability would change refuses at
+planning; the schema planner emits no such step. The physical column order
+follows the catalog.
+
+An added type uses its identity-derived path, which a retry derives
 again from the accepted allocator. Retry preserves that path and every
 existing version. It can reuse an original empty, stable-row-ID version-one
 Create with the desired physical schema. If that original Create has another
@@ -252,6 +306,49 @@ both are complete and only the disposable in-memory view may need refresh.
 There are no staged root contract files, schema-apply sentinel or durable
 post-publication install. The system-column upgrade uses the same publication
 boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+
+`prepare_schema_apply_as` binds the canonical root and schema identity domain,
+exact main-branch authority, numeric manifest base, desired contract, actor and
+a preallocated intent nonce before table effects; the published commit id
+`hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by the intent names
+the commit through `commit_id_answers`, never by equality. Preparation supports a
+read-only handle: it captures authority and plans, without issuing native writes.
+`apply_prepared_schema_as` rechecks that authority and the current policy under
+the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
+publish only at `M + 1`, and metadata-only contention that preserves graph HEAD
+still refuses rather than rebasing. Version-1 intents are rejected; this is an
+internal protocol change, not a graph-storage format change. An effectful success
+returns the operation's own `GraphCommit` and contract identity, not a later head
+observation. The prepared
+value is execution input, not an authorization grant or a distributed writer
+fence.
+
+A schema no-op requires the exact source and accepted contract. Changed comments
+or formatting publish a replacement contract and lineage once while preserving
+every table pin. An empty migration plan alone cannot certify the desired
+source. The ordinary apply API uses the same preparation, execution and
+exact-version rule, including refusal on head-preserving metadata contention.
+
+`reconcile_schema_apply_as` only reads retained, exact publication evidence and
+returns `Committed`, `NoOp` or `Unknown`. It checks the single candidate manifest
+version immediately after the prepared base, without walking history. Missing
+evidence, including metadata-only interposition, stays unknown; a no-op requires
+the exact captured base still to be current. Reconciliation neither applies the
+schema nor authorizes replay. Callers still own durable intent recording,
+evidence retention and fencing the previous owner before they can establish
+terminal non-publication.
+
+For a durably accepted invocation, `prepare_schema_settlement_as` issues a
+separate neutral lineage intent bound to that original and its one `M + 1`.
+The caller persists it before `settle_prepared_schema_as` can publish its fence.
+A verified occupied candidate or exact fence receipt proves `NotPublished`;
+missing evidence remains `Unknown`. A stale no-op certificate is `NoOpRefused`.
+Settlement never replays the original schema, authorizes adopting a foreign
+contract into the achieved projection, or proves accepted native I/O has stopped. Prior-owner quiescence, current policy,
+exclusive admission and protected evidence remain caller obligations. These
+engine boundaries do not enable online server activation; the deployment
+protocol remains in the
+[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
 
 Branch merge follows it too. A merge onto main is a pointer switch: main's
 registration takes the source's pin, and the merge stages no fenced insert,
@@ -296,8 +393,32 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   existing ID;
 - upsert updates or inserts without changing modes on retry;
 - a bare Lance Append is not a production graph-table write;
-- one table's keyed input is bounded to 8,192 rows and 32 MiB before any
-  effect.
+- one table's keyed input is bounded to 8,192 rows and the effective
+  `write_max_bytes` (default 32 MiB) before its data is staged.
+
+Insert/update mutations and keyed Append/Merge loads also cap the sum of
+retained row data across tables at `write_max_bytes`
+(`retained keyed batch bytes per operation`). Admission starts with
+`get_array_memory_size`, subtracting only typed logical Blob payload buffer
+capacity. Offsets, validity, URI descriptors and ordinary columns remain in
+the row account; shared buffers may be counted more than once. Logical Blob
+payload lengths have an independent allowance of the same size. Payload
+accounts count logical payload lengths; builder over-capacity (up to about one
+third) is outside them. Pending-aware
+update scans charge both accounts, including their initial pending input.
+The keyed parse spool separately caps its row estimate and decoded Blob bytes.
+Inline and copied external payload lengths are admitted together before GETs;
+materialized row and payload accounts are checked again before staging.
+
+Delete mutations, cascades and Overwrite's removed-ID detection stream matches
+under one `write_max_bytes` removed-ID allowance per operation, charging each
+ID's UTF-8 length plus one 24-byte `String` slot before copying it.
+Overwrite's bulk input is not subject to the keyed aggregate row/batch limits.
+These are representation limits, not a combined allocator/RSS budget; native
+scan buffers, conversion copies and validation's derived state are outside them.
+Refusal precedes the current
+operation's fragment staging and publication, though writable open may have
+completed earlier schema work and a load may already have created its branch.
 
 An insertion-only transaction may carry the internal
 `omnigraph.insert_absence = "v1"` certificate after its absence and physical
@@ -356,9 +477,11 @@ payload ranges before reading bytes or staging any effect.
 
 Overwrite can preserve an allowed external descriptor through Lance
 `WriteParams`. Keyed writes and row-writing merge paths materialize selected
-external bytes under the operation's 32 MiB budget because Lance's MergeInsert
+external bytes under the operation's `write_max_bytes` Blob payload budget because Lance's MergeInsert
 surface has no equivalent reference-preservation hook. A pointer-only branch
-adoption does no source I/O. See [blob.md](blob.md).
+adoption does no source I/O. An update never reads the Blobs it assigns; a
+carried stored external reference the policy refuses fails as
+`StoredExternalBlobDenied` before effects. See [blob.md](blob.md).
 
 ## Failure outcomes
 
@@ -371,10 +494,14 @@ adoption does no source I/O. See [blob.md](blob.md).
 | Any writer fails before publication, after any detached effect | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
 | A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
-| A sidecar from a build that predates detached commits is present | A read-write open and the storage upgrade refuse until that build has resolved it |
+| A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
+| `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
+| `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
+| A proposal tag's creation or deletion reports an ambiguous result | The tag is read back: a matching tag is success, a differing tag an integrity error, an unavailable readback `manifest_publish_in_doubt` |
 
 An acknowledgement is returned only after the manifest commit is durable and
-visible.
+visible; for a write `as commit`, after the proposal tag is durable and the
+captured target authority was re-probed unchanged.
 
 ## Policy and attribution
 

@@ -262,6 +262,20 @@ pub enum OmniError {
     /// or a misleading malformed-request response.
     #[error("external blob source '{uri}' is unavailable: {reason}")]
     ExternalBlobSource { uri: String, reason: String },
+    /// An update must carry a stored external Blob reference that the graph's
+    /// policy refuses to read; `ExternalBlobPolicy` refuses caller input
+    /// instead. `uri` is the policy's normalized, credential-free spelling.
+    #[error(
+        "{} id '{entity_id}' property '{property}' stores external Blob reference '{uri}', which this update must read to carry the row, and the graph's external Blob policy does not admit it ({reason}); assign '{property}' in the same update (a new value or null) to replace it without reading it, or admit its base in the graph's external Blob policy",
+        graph_type_subject(type_key)
+    )]
+    StoredExternalBlobDenied {
+        type_key: String,
+        entity_id: String,
+        property: String,
+        uri: String,
+        reason: String,
+    },
     /// Persisted dataset or Blob state contradicted the logical Blob contract.
     /// This is a typed integrity failure rather than a generic storage string so
     /// callers never reinterpret corrupt identity, metadata, or descriptors as
@@ -298,6 +312,16 @@ pub enum OmniError {
         expected: String,
         actual: Option<String>,
     },
+    /// A Blob write's `If-Match` precondition did not hold at the write's
+    /// pinned base, so the write had no effect. Distinct from the graph-head
+    /// `PreconditionFailed`: it compares the cell's strong validator, and a
+    /// null or external cell has none. `current_etag` is the managed cell's
+    /// validator at that base, or `None` when the cell has none.
+    #[error(
+        "Blob write precondition failed; the cell's current validator is {}",
+        current_etag.as_deref().unwrap_or("<none>")
+    )]
+    BlobWritePreconditionFailed { current_etag: Option<String> },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -847,6 +871,10 @@ impl OmniError {
             expected: expected.into(),
             actual,
         }
+    }
+
+    pub fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
+        Self::BlobWritePreconditionFailed { current_etag }
     }
 
     pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {

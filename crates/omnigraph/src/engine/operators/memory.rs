@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::array::ArrayData;
 use datafusion::arrow::buffer::Buffer;
@@ -23,10 +23,11 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use lance_datafusion::exec::HardCapBatchSizeExec;
 
+use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(in crate::engine) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -38,6 +39,7 @@ pub(in crate::engine) struct QueryResources {
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
+    work: QueryWorkScope,
 }
 
 /// Monotonic statement-wide work admission. Child operators and repeated
@@ -117,13 +119,14 @@ pub(in crate::engine) struct BatchLease {
 impl QueryResources {
     #[cfg(test)]
     pub(in crate::engine) fn new(pool: Arc<dyn MemoryPool>, limit: u64) -> Self {
-        Self::with_traversal_limit(pool, limit, None)
+        Self::with_traversal_limit(pool, limit, None, QueryWorkScope::default())
     }
 
     pub(in crate::engine) fn with_traversal_limit(
         pool: Arc<dyn MemoryPool>,
         limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        work: QueryWorkScope,
     ) -> Self {
         crate::instrumentation::record_query_memory_pool(&pool);
         let registry_memory = MemoryConsumer::new("graph allocation registry").register(&pool);
@@ -134,6 +137,7 @@ impl QueryResources {
             probes: crate::instrumentation::current_query_memory_probes(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
+            work,
         }
     }
 
@@ -288,6 +292,38 @@ impl WorkMemory {
         T: Send + 'static,
         F: std::future::Future<Output = DfResult<T>> + Send + 'static,
     {
+        let owner = self.register_owned_work()?;
+        self.blocking_owned(owner, body).await
+    }
+
+    pub(in crate::engine) fn register_owned_work(&self) -> DfResult<QueryWorkLease> {
+        self.resources.work.register()
+    }
+
+    /// The producer already registered before spawning. Its registration can
+    /// still hand work to a blocking child after the query closes admission.
+    pub(in crate::engine) async fn blocking_owned<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
+        let child = owner.child();
+        owner.own(Box::pin(self.blocking_body(child, body))).await
+    }
+
+    async fn blocking_body<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
         let cancellation = self.cancel_on_drop();
         let memory = Arc::clone(self);
         let io_probes = crate::instrumentation::capture_query_io_probes();
@@ -317,7 +353,12 @@ impl WorkMemory {
             let worker_wake = Arc::clone(&wake);
             let elapsed = elapsed.clone();
             let mut guard = crate::instrumentation::query_blocking_work_guard();
+            let owned = owner.child().own((work, memory));
+            let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
+                let mut owned = owned;
+                let _span = span.enter();
+                let (work, memory) = &mut owned.value;
                 guard.started();
                 let guard = Arc::new(guard);
                 let checkpoint_guard = Arc::clone(&guard);
@@ -329,14 +370,15 @@ impl WorkMemory {
                     Ok(()) => work.as_mut().poll(&mut context),
                     Err(error) => std::task::Poll::Ready(Err(error)),
                 };
-                (work, state)
+                owned.with_output(state)
             });
             let abort = AbortBlockingOnDrop(job.abort_handle());
-            let (returned, state) = job.await.map_err(|error| {
+            let returned = job.await.map_err(|error| {
                 DataFusionError::Execution(format!("graph worker failed: {error}"))
             })?;
             drop(abort);
-            work = returned;
+            let ((returned_work, _), state) = returned.into_inner();
+            work = returned_work;
             match state {
                 std::task::Poll::Ready(result) => {
                     cancellation.disarm();
@@ -413,6 +455,11 @@ impl WorkMemory {
             batches: Mutex::new(Vec::new()),
             cancelled: Arc::clone(&self.cancelled),
         })
+    }
+
+    /// The query pool's size, which the plan's assumed memory limit set.
+    pub(in crate::engine) fn pool_bytes(&self) -> u64 {
+        self.resources.limit
     }
 
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
@@ -645,13 +692,13 @@ impl WorkMemory {
         self.take_admitted(batch, indices, name, 1)
     }
 
-    fn take_admitted(
+    /// The picked bytes of a take and its scratch bytes. A null index copies
+    /// no row: it costs what a null row of the column costs.
+    fn take_estimate(
         &self,
         batch: &RecordBatch,
         indices: &UInt32Array,
-        name: &str,
-        factor: usize,
-    ) -> DfResult<RecordBatch> {
+    ) -> DfResult<(usize, usize)> {
         let mut bytes = 0usize;
         let mut scratch_bytes = 0usize;
         for column in batch.columns() {
@@ -661,18 +708,38 @@ impl WorkMemory {
             let picked = match flat_take_size(&data, indices) {
                 Some(flat) => flat,
                 None => {
+                    let mut null_row = None;
                     let mut picked = 0usize;
-                    for row in indices.values() {
+                    for row in indices.iter() {
                         self.check()?;
-                        picked = picked
-                            .saturating_add(slice_memory_size(&data, *row as usize, 1)?)
-                            .saturating_add(16);
+                        let row_bytes = match row {
+                            Some(row) => slice_memory_size(&data, row as usize, 1)?,
+                            None => match null_row {
+                                Some(bytes) => bytes,
+                                None => {
+                                    let null = ArrayData::new_null(data.data_type(), 1);
+                                    *null_row.insert(slice_memory_size(&null, 0, 1)?)
+                                }
+                            },
+                        };
+                        picked = picked.saturating_add(row_bytes).saturating_add(16);
                     }
                     picked
                 }
             };
             bytes = bytes.saturating_add(picked).saturating_add(128);
         }
+        Ok((bytes, scratch_bytes))
+    }
+
+    fn take_admitted(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+        factor: usize,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.take_estimate(batch, indices)?;
         let admitted = self.resources.reservation(
             name,
             bytes.saturating_mul(factor).saturating_add(scratch_bytes),
@@ -687,11 +754,92 @@ impl WorkMemory {
         self.hold(&result)?;
         Ok(result)
     }
+
+    /// The bytes `interleave_once` admits for the rows of `batches` at
+    /// `picks` (`(batch, row)`) before Arrow builds them: each pick copies its
+    /// row once, a row picked twice is copied twice, plus Arrow's scratch. A
+    /// caller sizes a window by it before it interleaves.
+    pub(in crate::engine) fn interleave_bytes(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<usize> {
+        let (picked, scratch) = self.interleave_estimate(batches, picks)?;
+        Ok(picked.saturating_add(scratch))
+    }
+
+    /// The picked bytes of an interleave and its scratch bytes, column by
+    /// column as `take_estimate` counts a take.
+    fn interleave_estimate(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<(usize, usize)> {
+        let Some(first) = batches.first() else {
+            return Ok((0, 0));
+        };
+        let mut bytes = 0usize;
+        let mut scratch_bytes = 0usize;
+        for column in 0..first.num_columns() {
+            let data: Vec<ArrayData> = batches
+                .iter()
+                .map(|batch| batch.column(column).to_data())
+                .collect();
+            scratch_bytes = scratch_bytes.saturating_add(take_scratch_size(&data[0], picks.len()));
+            let mut picked = 0usize;
+            for &(batch, row) in picks {
+                self.check()?;
+                let data = data.get(batch).ok_or_else(|| {
+                    DataFusionError::Internal(format!("interleave pick of absent batch {batch}"))
+                })?;
+                picked = picked
+                    .saturating_add(slice_memory_size(data, row, 1)?)
+                    .saturating_add(16);
+            }
+            bytes = bytes.saturating_add(picked).saturating_add(128);
+        }
+        Ok((bytes, scratch_bytes))
+    }
+
+    /// The rows of `batches` at `picks`, in pick order, under `schema`: the
+    /// copy is admitted once at `interleave_bytes` while Arrow builds it, then
+    /// only the result is held.
+    pub(in crate::engine) fn interleave_once(
+        &self,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+        name: &str,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.interleave_estimate(batches, picks)?;
+        let admitted = self
+            .resources
+            .reservation(name, bytes.saturating_add(scratch_bytes))?;
+        let columns = (0..schema.fields().len())
+            .map(|column| {
+                let arrays: Vec<&dyn Array> = batches
+                    .iter()
+                    .map(|batch| batch.column(column).as_ref())
+                    .collect();
+                arrow_select::interleave::interleave(&arrays, picks)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let result = RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(picks.len())),
+        )?;
+        drop(admitted);
+        self.hold(&result)?;
+        Ok(result)
+    }
 }
 
 /// An upper bound on the picked bytes of a flat or fixed-size-list column
 /// without a slice per row: 16 per row, 2 more when nullable, the row's own
-/// bytes and offset. `None` for the variable nested and dictionary kinds.
+/// bytes and offset. A null index copies no bytes of a variable-width value
+/// (Arrow's byte take skips it); fixed-width values are allocated for every
+/// index. `None` for the variable nested and dictionary kinds.
 fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
     let rows = indices.len();
     let per_row = if data.nulls().is_some() { 18 } else { 16 };
@@ -702,18 +850,22 @@ fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
             .saturating_mul(field.data_type().primitive_width()?),
         DataType::Utf8 | DataType::Binary => {
             let offsets = data.buffers()[0].typed_data::<i32>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(4)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(4)
             })
         }
         DataType::LargeUtf8 | DataType::LargeBinary => {
             let offsets = data.buffers()[0].typed_data::<i64>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(8)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(8)
             })
         }
         DataType::Boolean => rows,
@@ -871,10 +1023,12 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::context::QueryContext;
     use arrow_array::{BooleanArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::context::SessionConfig;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use futures::FutureExt;
 
     #[test]
     fn traversal_work_is_shared_by_children_and_repeated_workers_issue_659() {
@@ -883,6 +1037,7 @@ mod tests {
             pool,
             65_536,
             NonZeroU64::new(5),
+            QueryWorkScope::default(),
         ));
         let ctx = Arc::new(
             TaskContext::default()
@@ -1106,6 +1261,74 @@ mod tests {
         }
     }
 
+    /// A take admits one copy per index and a null row per null index, in the
+    /// flat path (a text column) and the per-row path (a struct over it): 64
+    /// null slots whose raw value names a 512 KiB row admit a few KiB, and
+    /// four repetitions of that row admit four copies per column, which a
+    /// 4 MiB pool holding the batch refuses before Arrow builds them; an
+    /// interleave over one-row batches admits each pick the same way. A case
+    /// cannot write null indices.
+    #[test]
+    fn a_take_admits_a_copy_per_index_and_a_null_row_per_null_index() {
+        use arrow_array::{StringArray, StructArray};
+        use datafusion::arrow::buffer::NullBuffer;
+        let wide = "x".repeat(512 * 1024);
+        let text: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some(wide.as_str()), Some("y")]));
+        let field = Arc::new(Field::new("text", DataType::Utf8, true));
+        let nested: Arc<dyn Array> = Arc::new(StructArray::from(vec![(
+            Arc::clone(&field),
+            Arc::clone(&text),
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            field.as_ref().clone(),
+            Field::new("nested", nested.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![text, nested]).unwrap();
+        let (pool, memory) = test_memory(4 * 1_048_576);
+        memory.hold(&batch).unwrap();
+        let nulls = UInt32Array::new(vec![0u32; 64].into(), Some(NullBuffer::new_null(64)));
+        let (picked, scratch) = memory.take_estimate(&batch, &nulls).unwrap();
+        let admitted = picked + scratch;
+        assert!(
+            admitted < 16 * 1024,
+            "null indices admitted {admitted} bytes"
+        );
+        let taken = memory.take_once(&batch, &nulls, "test take").unwrap();
+        assert_eq!(taken.num_rows(), 64);
+        assert!(
+            taken
+                .columns()
+                .iter()
+                .all(|column| column.null_count() == 64)
+        );
+        let repeated = UInt32Array::from(vec![0u32; 4]);
+        assert!(memory.take_estimate(&batch, &repeated).unwrap().0 >= 8 * 512 * 1024);
+        assert!(
+            memory.take_once(&batch, &repeated, "test take").is_err(),
+            "four copies of the row in two columns exceed the pool"
+        );
+        // An interleave over one-row batches counts each pick the same way.
+        let rows = [batch.slice(0, 1), batch.slice(1, 1)];
+        let picks = [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
+        assert!(memory.interleave_bytes(&rows, &picks[..2]).unwrap() < 2 * 1_048_576);
+        assert!(memory.interleave_bytes(&rows, &picks).unwrap() >= 8 * 512 * 1024);
+        let two = memory
+            .interleave_once(&batch.schema(), &rows, &picks[..2], "test interleave")
+            .unwrap();
+        assert_eq!(two, batch);
+        assert!(
+            memory
+                .interleave_once(&batch.schema(), &rows, &picks, "test interleave")
+                .is_err(),
+            "four copies of the wide row in two columns exceed the pool"
+        );
+        drop(two);
+        drop(taken);
+        drop(memory);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     /// Pins the runtime to one blocking thread; a case cannot size the runtime.
     #[test]
     fn one_blocking_thread_can_poll_nested_work_and_async_io() {
@@ -1170,5 +1393,117 @@ mod tests {
             .await
             .expect("cancelled pending chunk retained its future");
         });
+    }
+
+    /// Cancels a submitted worker behind a busy blocking thread; GQT cannot
+    /// control the runtime queue or distinguish submission from execution.
+    #[test]
+    fn cancelling_queued_work_keeps_ownership_until_the_job_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let context = QueryContext::new(1_048_576).unwrap();
+            let settlement = context.owned_workers();
+            let memory = Arc::new(WorkMemory::new(context.task_ctx(), "queued worker").unwrap());
+            let pool = Arc::clone(&memory.resources.pool);
+            memory.grow(4_096).unwrap();
+            let ran = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&ran);
+            let (submitted, ready) = tokio::sync::oneshot::channel();
+            let query = tokio::spawn(async move {
+                submitted.send(()).unwrap();
+                memory
+                    .blocking(move |_| async move {
+                        observed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            });
+            ready.await.unwrap();
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+            drop(context);
+            assert!(settlement.wait().now_or_never().is_none());
+            assert!(pool.reserved() >= 4_096);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+                .await
+                .expect("aborted queued closure must release its registration");
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(pool.reserved(), 0);
+        });
+    }
+
+    /// A cancelled blocking job can finish with a value that itself owns
+    /// resources; settlement must follow destruction of that abandoned output.
+    /// Its destructor tolerates a closed channel so a failed assertion cannot panic twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_worker_retains_ownership_through_output_destruction() {
+        struct HeldOutput {
+            _memory: Arc<WorkMemory>,
+            dropping: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for HeldOutput {
+            fn drop(&mut self) {
+                let _ = self.dropping.take().unwrap().send(());
+                let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+        let context = QueryContext::new(1_048_576).unwrap();
+        let settlement = context.owned_workers();
+        let memory = Arc::new(WorkMemory::new(context.task_ctx(), "abandoned output").unwrap());
+        let pool = Arc::clone(&memory.resources.pool);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release_worker, worker_held) = std::sync::mpsc::channel();
+        let (dropping, drop_started) = tokio::sync::oneshot::channel();
+        let (release_output, release) = std::sync::mpsc::channel();
+        let query = tokio::spawn(async move {
+            memory
+                .blocking(move |memory| async move {
+                    memory.grow(4_096)?;
+                    started.send(()).unwrap();
+                    worker_held
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Ok(HeldOutput {
+                        _memory: memory,
+                        dropping: Some(dropping),
+                        release,
+                    })
+                })
+                .await
+        });
+        ready.await.unwrap();
+        query.abort();
+        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
+        drop(context);
+        release_worker.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), drop_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            settlement.wait().now_or_never().is_none(),
+            "a completed poll's output remains owned until its destructor finishes"
+        );
+        assert!(pool.reserved() >= 4_096);
+        release_output.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+            .await
+            .unwrap();
+        assert_eq!(pool.reserved(), 0);
     }
 }

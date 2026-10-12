@@ -151,19 +151,16 @@ historical raw notes are not checked against today's moving documentation.
 
 With the documentation environment active, release preparation creates a
 versioned snapshot and updates `docs/releases/README.md` from committed inputs
-and an explicit date. Before the first v0.12.0 snapshot, finalize `legacy` in
-`release.json`: it must name a durable, already-landed ancestor containing the
-exact current unreleased v0.12.0 document. If upstream release-note edits landed
-after the configured pin, update the pin to a landed source containing those
-edits before preparing the snapshot. CI never updates it automatically. For
-that first snapshot only:
+and an explicit date:
 
 ```bash
-python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01 --replace-legacy
+python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01
 ```
 
-Replace the example date with the intended release date. For later releases
-omit `--replace-legacy`. `--replace` regenerates an existing
+Replace the example date with the intended release date. A release that still
+carries a hand-written document names it with `legacy` in `release.json`, a
+durable, already-landed ancestor containing that exact document, and passes
+`--replace-legacy` for its first snapshot. `--replace` regenerates an existing
 generated snapshot before its tag exists. Nothing moves, deletes or stages
 fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
 `--initial-release` for comparison runs. A snapshot must agree with the version,
@@ -201,14 +198,13 @@ backfills; v0.12.0 onward require a valid snapshot. Edge releases are unchanged.
 After publication, update the configuration for the next release: set its base
 to the release just published, advance the version and set `legacy` to `null`.
 
-The existing v0.12.0 document is a one-time migration baseline. During adoption,
-previews and documentation checks use its current unreleased body from the
-selected tree, including upstream edits made after the configured pin. Working
-previews also include local edits. New entries go in `changelog.d/`. Snapshot
-preparation freezes the baseline against the finalized pin and refuses any
-mismatch; publication regenerates from that pinned source. The baseline body
-precedes new sections in the first snapshot; later releases list upgrade actions
-first. Generated snapshots still require exact verification, and existing
+The hand-written v0.12.0 document was converted into two notes before its
+snapshot, `changelog.d/a-release-highlights.added.md` and
+`changelog.d/a-compatibility-and-behavior-changes.changed.md`, so v0.12.0 is
+generated from notes alone and its `legacy` is `null`. A `legacy` baseline is
+frozen against its pin at snapshot preparation, any mismatch is refused, and
+publication regenerates from the pinned source with the baseline body ahead of
+the note sections. Generated snapshots require exact verification, and existing
 published documents and URLs stay unchanged.
 
 ## Review checklist
