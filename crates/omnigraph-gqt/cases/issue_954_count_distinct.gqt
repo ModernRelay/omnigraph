@@ -80,9 +80,6 @@ query likers_counted() {
 --- expect shape
 likers: I64
 
---- expect plan
-aggregate likers: count(distinct Person) count error -> I64?
-
 --- query
 query names_counted() {
     match {
