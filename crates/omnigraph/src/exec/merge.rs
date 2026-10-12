@@ -1416,10 +1416,12 @@ async fn revalidate_proven_pure_insert_source(
             None,
         ));
     };
+    // The proof reads `proven.source`, opened at the captured version the
+    // merge-input tag retains, so a later pin on the same table is not a
+    // change of input.
     if live_entry.identity != proven.source_identity
         || live_entry.dataset_path != proven.source_table_path
         || live_entry.native_dataset_branch != proven.source_table_branch
-        || pin_version(live_entry) != proven.source_version
     {
         return Err(OmniError::manifest_read_set_changed(
             format!("branch_merge_source_dataset:{table_key}"),
@@ -1435,7 +1437,7 @@ async fn revalidate_proven_pure_insert_source(
                 live_entry.identity,
                 live_entry.dataset_path,
                 live_entry.native_dataset_branch,
-                live_entry.published_dataset_version
+                pin_version(live_entry)
             )),
         ));
     }

@@ -362,8 +362,11 @@ table's pin naming `base + 1` as its `published_dataset_version` and the
 chain's tip as its `staged_version`, whatever the chain's length. The
 pure-insert proof walks the branch's commit chain by `read_version` links
 from the source pin back to the base pin (`try_proven_pure_insert_history`,
-`proven_chain_fragments` in `exec/merge.rs`); lineage candidate discovery
-(`plan_lineage_merge`) compares the base and side manifests and walks no
+`proven_chain_fragments` in `exec/merge.rs`). The source pin is the
+captured one the merge-input tag retains: a write to the source table after
+capture does not refuse the merge, while a source table whose identity, path
+or native ref changed does (`revalidate_proven_pure_insert_source`).
+Lineage candidate discovery (`plan_lineage_merge`) compares the base and side manifests and walks no
 chain. A failure anywhere before publication leaves the target untouched
 and the chain as unpublished staging; a target that advanced meanwhile
 makes the merge lose its manifest CAS and return the ordinary conflict.
