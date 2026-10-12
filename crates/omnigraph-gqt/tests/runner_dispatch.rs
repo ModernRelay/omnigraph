@@ -1366,8 +1366,11 @@ fn measure_counts_schema_contract_requests_issue_817() {
     // first write, and Lance's detached commit loads the base's indexes. Behind
     // a strict insert's inline transaction the index section lies outside the
     // tail block the open read, and Lance opens the manifest again without the
-    // size it already learned: that HEAD is the one read a step may repeat.
-    let repeated_manifest_heads = |step: u64| -> u64 {
+    // size it already learned: that HEAD is one read a step may repeat. The
+    // other is the catalog freshness probe's HEAD of the held `__manifest`
+    // version, which a write makes when it captures its branch and again when
+    // it revalidates that capture.
+    let repeated_heads = |step: u64, class: &str| -> u64 {
         let group = measurements
             .iter()
             .find(|group| group["slot"] == "step" && group["step"] == step)
@@ -1377,7 +1380,7 @@ fn measure_counts_schema_contract_requests_issue_817() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|request| request["class"] == "table_meta" && request["verb"] == "head")
+            .filter(|request| request["class"] == class && request["verb"] == "head")
             .filter(|request| !seen.insert(request["path"].as_str().unwrap().to_string()))
             .count() as u64
     };
@@ -1389,14 +1392,20 @@ fn measure_counts_schema_contract_requests_issue_817() {
         );
         assert_eq!(
             counts["repeat_reads"],
-            repeated_manifest_heads(step),
+            repeated_heads(step, "table_meta") + repeated_heads(step, "manifest_meta"),
             "step {step}: neither the inline contract nor table data repeats a read, \
-             except the reopen of an indexed table's manifest"
+             except the reopen of an indexed table's manifest and the freshness \
+             probe's HEAD of the held `__manifest` version"
         );
     }
     assert_eq!(
-        repeated_manifest_heads(2),
+        repeated_heads(2, "table_meta"),
         1,
         "the second insert reopens the first insert's manifest for its index section"
+    );
+    assert_eq!(
+        repeated_heads(3, "manifest_meta"),
+        0,
+        "a read probes its branch's freshness once"
     );
 }
