@@ -59,7 +59,15 @@ publication returns a taken coordinator to the one-entry merge cache; failure
 drops it. The intent nonce and timestamps are minted for the captured branch
 without reloading manifest history; the publish wraps the nonce into the
 addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
-conflicting control operations.
+conflicting control operations. A merge holds its target's branch gate and
+per-table queues through publication, and its source's branch gate only until
+the source snapshot is captured, tagged and proved still current; it takes no
+per-table queue on the source. Both gates are taken in sorted branch order, so
+a merge whose source sorts first (`main` always does) holds the source gate
+while it waits for a target another merge holds. Once the source is captured,
+writes, index builds and deletes on the source do not wait for the merge, and
+the merge's final re-read still refuses a source whose incarnation or schema
+changed.
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse
@@ -358,8 +366,11 @@ table's pin naming `base + 1` as its `published_dataset_version` and the
 chain's tip as its `staged_version`, whatever the chain's length. The
 pure-insert proof walks the branch's commit chain by `read_version` links
 from the source pin back to the base pin (`try_proven_pure_insert_history`,
-`proven_chain_fragments` in `exec/merge.rs`); lineage candidate discovery
-(`plan_lineage_merge`) compares the base and side manifests and walks no
+`proven_chain_fragments` in `exec/merge.rs`). The source pin is the
+captured one the merge-input tag retains: a write to the source table after
+capture does not refuse the merge, while a source table whose identity, path
+or native ref changed does (`revalidate_proven_pure_insert_source`).
+Lineage candidate discovery (`plan_lineage_merge`) compares the base and side manifests and walks no
 chain. A failure anywhere before publication leaves the target untouched
 and the chain as unpublished staging; a target that advanced meanwhile
 makes the merge lose its manifest CAS and return the ordinary conflict.

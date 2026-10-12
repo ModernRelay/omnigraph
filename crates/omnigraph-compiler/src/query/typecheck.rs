@@ -886,17 +886,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
             "nearest ordering requires a limit clause".to_string(),
         ));
     }
-    if has_standalone_nearest
-        && query
-            .order_clause
-            .iter()
-            .any(|ord| matches!(ord.expr, Expr::AliasRef(_)))
-    {
-        return Err(CompilerError::typed(
-            T18,
-            "alias-based ordering is not supported together with nearest in phase 1".to_string(),
-        ));
-    }
 
     // T9: If any return expression is an aggregate, non-aggregate expressions
     // must be valid group-by keys (PropAccess or Variable).
@@ -3986,7 +3975,7 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
 
 /// T33 admits a projected rank expression only as a repeat of the leading
 /// `order` key, so an alias never leads the order and the walk stops at
-/// `AliasRef` (T18 refuses an alias key beside `nearest`).
+/// `AliasRef`; a `nearest` nested under `rrf` is T21's.
 fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
     match expr {
         Expr::Nearest { .. } => true,
@@ -4007,7 +3996,6 @@ fn expr_contains_standalone_nearest(expr: &Expr) -> bool {
                     .as_deref()
                     .is_some_and(expr_contains_standalone_nearest)
         }
-        // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
         Expr::Rrf { .. } => false,
         Expr::Binary { left, right, .. }
         | Expr::In {
