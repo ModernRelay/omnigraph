@@ -4826,7 +4826,7 @@ fn dst_schema_apply_racing_writers_first_contact() {
         assert!(
             report.era_commits_between_data >= 1,
             "seed {seed}: no schema apply landed between two writer commits — the \
-             applies never contended with the writers"
+             SchemaContention handshake did not hold"
         );
         println!(
             "dst s24 schema [seed={seed}]: committed={} occ_retries={} \

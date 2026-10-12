@@ -359,6 +359,7 @@ fn documents_query() -> Operation {
                 type_name: "Doc".into(),
             },
         }],
+        distinct: false,
         order_by: Vec::new(),
         limit: None,
     }))

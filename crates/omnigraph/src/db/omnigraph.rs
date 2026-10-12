@@ -381,8 +381,12 @@ pub struct Omnigraph {
     /// state; its independent fresh graph-head CAS remains authoritative. A
     /// successful publish returns the updated coordinator, while failure drops
     /// the taken view so the next capture starts fresh.
-    /// The mutex serializes captures — the schema serial queue already
-    /// serializes merges and branch controls at capture time.
+    /// The mutex serializes a capture's selection and read of the entry, but
+    /// a miss opens the branch's coordinator with the mutex released: the
+    /// schema gate is shared by merges and branch captures, so holding it
+    /// across that open would make captures on different branches wait out
+    /// each other's full open. Two captures that miss on the same branch
+    /// open it twice; the entry is a hint either way.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
@@ -1061,6 +1065,12 @@ impl Omnigraph {
     /// caller MUST already hold a schema permit (either side); this helper does
     /// not acquire one because the gate is non-reentrant on one task.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        Ok(self.load_accepted_view_with_schema_gate_held().await?.0)
+    }
+
+    /// The accepted catalog and the live view of the current branch it was
+    /// accepted against.
+    async fn load_accepted_view_with_schema_gate_held(&self) -> Result<(Arc<Catalog>, Snapshot)> {
         let current_branch = self
             .coordinator
             .read()
@@ -1074,7 +1084,7 @@ impl Omnigraph {
             .snapshot;
         let (catalog, _) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
-        Ok(catalog)
+        Ok((catalog, snapshot))
     }
 
     /// Accept the contract bytes in this snapshot before reusing its catalog.
@@ -1912,7 +1922,13 @@ impl Omnigraph {
                 }
             }
         } else {
+            // A miss reopens the branch's coordinator: many storage round
+            // trips. Open it without the lock so captures on other branches
+            // proceed meanwhile, then install it; the entry is a hint, and
+            // the capture reads it under the returned guard.
+            drop(cache);
             let coord = self.open_coordinator_for_branch(branch).await?;
+            cache = self.merge_authority_cache.lock().await;
             *cache = Some((key, coord));
         }
         Ok(cache)
@@ -2301,12 +2317,12 @@ impl Omnigraph {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
             return Ok((resolved, catalog));
         }
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         if bind_historical_aliases {
             let catalog = self
                 .catalog_for_image_vintage(&resolved.snapshot, catalog)
                 .await?;
-            resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            resolved.snapshot.bind_catalog_aliases(&catalog, &live)?;
             return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
@@ -2336,7 +2352,7 @@ impl Omnigraph {
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
             .read()
@@ -2352,7 +2368,7 @@ impl Omnigraph {
             .await?,
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
-        snapshot.bind_catalog_aliases(&catalog)?;
+        snapshot.bind_catalog_aliases(&catalog, &live)?;
         Ok((snapshot, catalog))
     }
 

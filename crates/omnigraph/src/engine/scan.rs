@@ -61,6 +61,7 @@ impl<'n> NodeRead<'n> {
         ds: &Dataset,
         node_type: &omnigraph_compiler::catalog::NodeType,
         table_key: &str,
+        contract_covers: bool,
         filters: &[IRExpr],
         catalog: &Catalog,
         search_mode: &SearchMode,
@@ -70,6 +71,7 @@ impl<'n> NodeRead<'n> {
             ds,
             &node_type.arrow_schema,
             table_key,
+            contract_covers,
             read_columns
                 .stored_columns()
                 .into_iter()
@@ -87,13 +89,20 @@ impl<'n> NodeRead<'n> {
                         .map(|target| target.property.as_str()),
                 ),
         )?;
-        super::typed_value::check_scan_leaves(ds, filters)?;
+        super::typed_value::check_scan_leaves(
+            ds,
+            &node_type.arrow_schema,
+            table_key,
+            contract_covers,
+            filters,
+        )?;
         Ok(())
     }
 
     pub(super) fn for_index_split(
         ds: Dataset,
         type_name: &str,
+        contract_covers: bool,
         filters: &[IRExpr],
         params: &ParamMap,
         catalog: &'n Catalog,
@@ -110,6 +119,7 @@ impl<'n> NodeRead<'n> {
             &ds,
             node_type,
             &format!("node:{type_name}"),
+            contract_covers,
             filters,
             catalog,
             &SearchMode::default(),
@@ -145,6 +155,7 @@ impl<'n> NodeRead<'n> {
             &ds,
             node_type,
             &table_key,
+            snapshot.contract_covers(&table_key),
             filters,
             catalog,
             search_mode,

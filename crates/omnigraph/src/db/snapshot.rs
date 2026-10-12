@@ -274,8 +274,18 @@ impl Snapshot {
             .map(SchemaContractIdentity::from)
     }
 
-    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
-        self.inner.bind_catalog_aliases(catalog)
+    pub(crate) fn bind_catalog_aliases(
+        &mut self,
+        catalog: &Catalog,
+        live: &Snapshot,
+    ) -> Result<()> {
+        self.inner.bind_catalog_aliases(catalog, &live.inner)
+    }
+
+    /// Whether the accepted contract was published with the version this view
+    /// pins for `type_key` (see `omnigraph_catalog::Snapshot::contract_covers`).
+    pub(crate) fn contract_covers(&self, type_key: &str) -> bool {
+        self.inner.contract_covers(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present

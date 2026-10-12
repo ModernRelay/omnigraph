@@ -157,6 +157,7 @@ fn query(two: bool) -> QueryIR {
             column: "a.id".into(),
             ty: prop("a").ty().clone(),
         }],
+        distinct: false,
         order_by: vec![],
         limit: None,
     }
