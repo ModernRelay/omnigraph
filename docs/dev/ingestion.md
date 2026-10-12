@@ -76,5 +76,5 @@ If an application needs durable acceptance before graph visibility, put an exter
 - Parser, batching, branch creation, modes, bounds, and actor attribution: in-source `crates/omnigraph/src/loader/` tests.
 - Atomic table staging and recovery: `crates/omnigraph/tests/writes.rs`, `integration/recovery.rs`, and `failpoints.rs`.
 - Strict and compatibility HTTP routes: `crates/omnigraph-server/tests/integration/data_routes.rs`, auth coverage, and `integration/openapi.rs`.
-- CLI local/remote behavior and deprecation signal: `crates/omnigraph-cli/tests/system_local.rs`, `system_remote.rs`, and `integration/parity_matrix.rs`.
+- CLI local/remote behavior and deprecation signal: `crates/omnigraph-cli/tests/integration/system_local.rs`, `system_remote.rs`, and `parity_matrix.rs`.
 - Absence of retired durable surfaces: `crates/omnigraph/tests/forbidden_apis.rs` and configuration rejection tests.

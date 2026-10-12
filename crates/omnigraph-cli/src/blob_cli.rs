@@ -1,20 +1,20 @@
-//! CLI-only shaping for graph-level Blob reads.
+//! CLI-only shaping for graph-level Blob reads and writes.
 //!
 //! The engine and server own descriptor interpretation, snapshot fencing, and
 //! bounded payload reads. This module keeps the command line's selector,
 //! range, and error vocabulary identical across the embedded and served arms.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::Report;
 use color_eyre::eyre::{Result, eyre};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::{BlobCell, EntityKind, ExternalBlobRef};
-use omnigraph_api_types::{BlobEntityKind, BlobReadQuery};
+use omnigraph::{BlobCell, BlobPrecondition, EntityKind, ExternalBlobRef};
+use omnigraph_api_types::{BlobEntityKind, BlobReadQuery, BlobWriteQuery};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, ETAG, HeaderMap, HeaderName};
 
@@ -162,6 +162,104 @@ pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> 
         params.push(("snapshot", snapshot));
     }
     crate::helpers::remote_url(base_url, &["blob"], &params)
+}
+
+pub(crate) fn blob_write_query(
+    entity: BlobEntityKind,
+    type_name: String,
+    id: String,
+    property: String,
+    branch: Option<String>,
+) -> BlobWriteQuery {
+    BlobWriteQuery {
+        entity,
+        r#type: type_name,
+        id,
+        property,
+        branch,
+    }
+}
+
+pub(crate) fn blob_write_cell(query: &BlobWriteQuery) -> BlobCell {
+    BlobCell {
+        entity: match query.entity {
+            BlobEntityKind::Node => EntityKind::Node,
+            BlobEntityKind::Edge => EntityKind::Edge,
+        },
+        type_name: query.r#type.clone(),
+        id: query.id.clone(),
+        property: query.property.clone(),
+    }
+}
+
+pub(crate) fn blob_write_url(base_url: &str, query: &BlobWriteQuery) -> Result<String> {
+    let entity = match query.entity {
+        BlobEntityKind::Node => "node",
+        BlobEntityKind::Edge => "edge",
+    };
+    let mut params = vec![
+        ("entity", entity),
+        ("type", query.r#type.as_str()),
+        ("id", query.id.as_str()),
+        ("property", query.property.as_str()),
+    ];
+    if let Some(branch) = query.branch.as_deref() {
+        params.push(("branch", branch));
+    }
+    crate::helpers::remote_url(base_url, &["blob"], &params)
+}
+
+/// Parse `--if-match` with the parser the server applies to the `If-Match`
+/// header, so a malformed value is refused before any graph is addressed.
+pub(crate) fn parse_if_match(raw: Option<&str>) -> Result<Option<BlobPrecondition>> {
+    omnigraph_api_types::parse_blob_if_match(raw.map(str::as_bytes)).map_err(|error| eyre!(error))
+}
+
+/// Read `blob put`'s bytes from `--file` or stdin, never both, before any
+/// graph is addressed. Input over the put limit is refused with the resource
+/// the engine and the server report, without reading past one more byte;
+/// an interactive stdin is refused rather than waited on.
+pub(crate) fn read_put_input(file: Option<&Path>) -> Result<bytes::Bytes> {
+    let limit = omnigraph::BLOB_WRITE_MAX_BYTES;
+    let too_large = |actual: u64| -> Report {
+        OmniError::resource_limit(omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE, limit, actual).into()
+    };
+    let mut buffer = Vec::new();
+    match file {
+        Some(path) => {
+            let file = File::open(path)
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?;
+            let length = file
+                .metadata()
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?
+                .len();
+            if length > limit {
+                return Err(too_large(length));
+            }
+            buffer.reserve(usize::try_from(length).unwrap_or(0));
+            file.take(limit + 1)
+                .read_to_end(&mut buffer)
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?;
+        }
+        None => {
+            let stdin = io::stdin();
+            if stdin.is_terminal() {
+                return Err(eyre!(
+                    "blob put reads its bytes from stdin; pipe them in or pass --file PATH"
+                ));
+            }
+            stdin
+                .lock()
+                .take(limit + 1)
+                .read_to_end(&mut buffer)
+                .map_err(|error| eyre!("cannot read stdin: {error}"))?;
+        }
+    }
+    let read = buffer.len() as u64;
+    if read > limit {
+        return Err(too_large(read));
+    }
+    Ok(bytes::Bytes::from(buffer))
 }
 
 pub(crate) fn whole_external_uri(reference: &ExternalBlobRef) -> Result<&str> {

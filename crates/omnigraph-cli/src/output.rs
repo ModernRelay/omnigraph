@@ -711,6 +711,39 @@ pub(crate) fn print_snapshot_human(
     }
 }
 
+/// A Blob write receipt: the cell, the state it was left in and the commit
+/// that published it, or that nothing was published.
+pub(crate) fn print_blob_write_human(output: &omnigraph_api_types::BlobWriteOutput) {
+    let entity = match output.selector.entity {
+        omnigraph_api_types::BlobEntityKind::Node => "node",
+        omnigraph_api_types::BlobEntityKind::Edge => "edge",
+    };
+    println!("entity: {entity}");
+    println!("type: {}", output.selector.r#type);
+    println!("id: {}", output.selector.id);
+    println!("property: {}", output.selector.property);
+    println!("branch: {}", output.branch);
+    match output.kind {
+        omnigraph_api_types::BlobWriteStateOutput::Managed => {
+            println!("kind: managed");
+            if let Some(size) = output.size {
+                println!("size: {size}");
+            }
+            if let Some(etag) = output.etag.as_deref() {
+                println!("etag: {etag}");
+            }
+        }
+        omnigraph_api_types::BlobWriteStateOutput::Null => println!("kind: null"),
+    }
+    if let Some(actor) = output.actor_id.as_deref() {
+        println!("actor: {actor}");
+    }
+    match &output.commit {
+        Some(commit) => println!("commit: {}", commit.graph_commit_id),
+        None => println!("commit: none (the cell was already null)"),
+    }
+}
+
 pub(crate) fn print_blob_stat_human(output: &BlobStatOutput) {
     let entity = match output.selector.entity {
         omnigraph_api_types::BlobEntityKind::Node => "node",

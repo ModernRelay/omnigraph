@@ -133,8 +133,14 @@ instead of skipping them; the v6 format fence in the `test` job keeps its own
 resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
 scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
-cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
-`lance_version_columns` and `forbidden_apis`. All four select the
+cases of `crossversion_upgrade.rs` (a module of the CLI's `integration`
+binary, run by the exact names `--list-cases crossversion --compiled` takes
+from a `-- --list` of the same feature graph, which must contain every
+source-derived name, generated to a file before the run so an empty inventory
+fails the step, and the run's log must equal that file), the
+engine `db::upgrade::tests`, `lance_version_columns` (a module of the
+engine's `integration` binary, selected as `lance_version_columns::`) and
+`forbidden_apis`. All four select the
 `Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
 omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
 graph, the one `Test Workspace` builds, and the engine scopes reuse the
@@ -181,7 +187,7 @@ through an in-process server, its in-process verdict must be green and its
 served verdict must equal it; `gqt_served_count.rs` in the same job totals
 the served and skipped cases and fails when no case is served.
 The same cell builds `omnigraph`, `omnigraph-server` and `omnigraph-gqt`, then
-explicitly runs `omnigraph-cli/tests/gqt_served_smoke.rs`. That test reuses the
+explicitly runs `omnigraph-cli/tests/integration/gqt_served_smoke.rs`. That test reuses the
 CLI's cluster/server process helpers and runs a corpus case through the GQT
 command with a bearer token. It requires one passing served attempt, token
 redaction in the retained report and replay refusal. It is ignored outside this
