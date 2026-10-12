@@ -80,8 +80,10 @@ yourself must embed the source value the same way to be comparable with text
 queries.
 
 When `model` is recorded, a text `nearest` query is rejected unless the active
-provider resolves to exactly that model id. Changing the recorded source or
-model is not an in-place schema migration; rebuild or re-embed the data instead.
+provider resolves to exactly that model id, and so is an
+[`omnigraph embed`](#offline-file-pipeline) run that fills the property.
+Changing the recorded source or model is not an in-place schema migration;
+rebuild or re-embed the data instead.
 
 `@embed` does not populate the property during a load, even with an embedding
 provider configured. Supplied vectors are preserved, omitted nullable vectors
@@ -98,32 +100,58 @@ every vector was supplied. Human CLI output prints the corresponding guidance.
 `omnigraph embed` reads and writes JSONL files; it does not mutate a graph.
 
 ```bash
-omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
+omnigraph embed --schema schema.pg --input raw.jsonl --output embedded.jsonl
 ```
 
-The spec names, for each node type, the vector property to fill and the one
-property whose value it embeds:
+The schema is the only statement of what to embed. Each `@embed` declaration is
+a vector the command fills: a record of the declaring node type gets that
+property set to the embedding of its source property, at the dimension of the
+property's `Vector(N)`. A type may declare several such vectors. Pass the schema
+the graph was initialized or last applied with; `omnigraph schema show` prints a
+graph's accepted schema. A schema without an `@embed` declaration is refused.
 
-```json
-{
-  "dimension": 1536,
-  "types": {
-    "Document": { "target": "embedding", "fields": ["body"] }
-  }
-}
-```
+When an `@embed` records a `model`, the command refuses to run unless the
+embedding provider resolves to exactly that model id, the check a text
+`nearest` query applies to the same property. The refusal comes before the
+input is read or the output is written. Use `--type` to leave out a type whose
+recorded model the provider does not serve.
 
-`fields` must name exactly one property, the source the target's `@embed`
-declares; a spec that lists none or several is refused. The command does not
-read the schema, so keep `target`, `fields`, and `dimension` equal to the
-`@embed` declaration and its `Vector(N)`. The source's string value is embedded
-unchanged, as described under [Schema annotation](#schema-annotation). A
-processed record whose source is absent, null, or blank gets no vector: whatever
-its target held, including a null or an empty list, is removed and counted as
-cleaned. A source value that is not a string is refused.
+The source's string value is embedded unchanged, as described under
+[Schema annotation](#schema-annotation). A processed record whose source is
+absent, null, or blank gets no vector for it: whatever the vector property
+held, including a null or an empty list, is removed and counted as cleaned.
+When that property is a required `Vector(N)` (no `?`), the record is refused
+instead, with its line number, since a load would refuse it without the vector.
+A source value that is not a string is refused.
 
 By default it fills missing vectors. Use `--reembed-all` to replace selected
-vectors or `--clean` to remove them. `--type` and `--select` restrict the
-records processed. A seed manifest can be supplied with `--seed` instead of
-separate input, output, and spec paths; its `embeddings` entry takes the same
-shape as the spec.
+vectors or `--clean` to remove them. `--type` restricts the run to the named
+node types, each of which must declare an `@embed` vector, and `--select`
+restricts the records processed.
+
+`--json` prints a summary: the `input`, `output` and `schema` paths, the
+`records` read, the `selected_records`, and the `mode`. A record counts once in
+`embedded_records` when any of its vectors was embedded and once in
+`cleaned_records` when any was removed. `vectors` lists each processed `@embed`
+vector with its `type`, `property`, `source` and `dimension`, and `model` is the
+model the provider resolved (empty with `--clean`, which calls no provider).
+
+### Seed manifests
+
+A seed manifest names the three files in one place, each path relative to the
+manifest:
+
+```yaml
+schema: ./schema.pg
+sources:
+  raw_seed: ./data/seed.jsonl
+artifacts:
+  embedded_seed: ./build/seed.embedded.jsonl
+```
+
+```bash
+omnigraph embed --seed seed.yaml
+```
+
+`schema` and `sources.raw_seed` are required; `artifacts.embedded_seed` defaults
+to `./build/seed.embedded.jsonl`. A key the command does not read is refused.

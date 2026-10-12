@@ -678,15 +678,26 @@ pub(crate) fn render_annotations(
 }
 
 pub(crate) fn print_embed_human(output: &EmbedOutput) {
+    let vectors = output
+        .vectors
+        .iter()
+        .map(|vector| {
+            format!(
+                "{}.{} {}d",
+                vector.type_name, vector.property, vector.dimension
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
-        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{} {}d]",
+        "embedded {} records (selected {}, cleaned {}) from {} -> {} [{}: {}]",
         output.embedded_records,
         output.selected_records,
         output.cleaned_records,
         output.input,
         output.output,
         output.mode,
-        output.dimension
+        vectors
     );
 }
 

@@ -205,7 +205,7 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 
 **Local** (no graph):
 - `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
-- `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
+- `embed (--seed <embed.yaml> | --schema <schema.pg> --input <raw.jsonl> --output <out.jsonl>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
 - `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `version`
 
 Managed folders can select an Intent API with `login --api` and `use`; implicit

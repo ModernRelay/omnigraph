@@ -312,7 +312,7 @@ pub(super) async fn resolve_nearest_query_vec(
             let client = embedding.resolve().await?;
             if let Some(recorded) = &recorded_model {
                 let resolved = &client.config().model;
-                if resolved != recorded {
+                if !client.config().embeds_with_model(recorded) {
                     return Err(OmniError::manifest(format!(
                         "nearest() on '{property}': its stored vectors were embedded with model \
                          '{recorded}', but the query embedder resolves to '{resolved}'. Set \

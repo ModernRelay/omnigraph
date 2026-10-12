@@ -904,10 +904,22 @@ pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
     let seed = root.join("seed.yaml");
 
     fs::write(
+        root.join("schema.pg"),
+        concat!(
+            "node Decision {\n",
+            "    slug: String @key\n",
+            "    intent: String?\n",
+            "    embedding: Vector(4)? @embed(\"intent\")\n",
+            "}\n"
+        ),
+    )
+    .unwrap();
+
+    fs::write(
         &raw_seed,
         concat!(
             "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
-            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n"
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2,0.3,0.4]}}\n"
         ),
     )
     .unwrap();
@@ -915,19 +927,11 @@ pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
     fs::write(
         &seed,
         concat!(
-            "graph:\n",
-            "  slug: mr-context-graph\n",
+            "schema: ./schema.pg\n",
             "sources:\n",
             "  raw_seed: ./data/seed.jsonl\n",
             "artifacts:\n",
-            "  embedded_seed: ./build/seed.embedded.jsonl\n",
-            "embeddings:\n",
-            "  model: gemini-embedding-2-preview\n",
-            "  dimension: 4\n",
-            "  types:\n",
-            "    Decision:\n",
-            "      target: embedding\n",
-            "      fields: [intent]\n"
+            "  embedded_seed: ./build/seed.embedded.jsonl\n"
         ),
     )
     .unwrap();
@@ -942,7 +946,7 @@ pub fn write_seed_fixture_with_edge(root: &std::path::Path) -> std::path::PathBu
         &raw_seed,
         concat!(
             "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
-            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n",
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2,0.3,0.4]}}\n",
             "{\"edge\":\"Triggered\",\"from\":\"sig-alpha\",\"to\":\"dec-alpha\"}\n"
         ),
     )

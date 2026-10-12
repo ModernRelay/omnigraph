@@ -835,7 +835,10 @@ unchanged: the offline workflow a record's `@embed` source value, the query
 path the query string. Only the provider's retrieval role differs between them,
 so a document whose source equals the query text is the query's own input; a
 template on either side would put stored and query vectors in different text
-spaces. Ordinary Load does not execute `@embed`
+spaces. The offline workflow reads each vector's source, dimension and recorded
+model from the schema's `@embed` declarations, and both sides refuse a recorded
+model the provider does not resolve through one rule,
+`EmbeddingConfig::embeds_with_model`. Ordinary Load does not execute `@embed`
 at ingestion time; callers supply vectors or precompute them. The annotation
 records and validates embedding identity. Any future ingest-time reconciler is
 a separate design, not a hidden loader behavior.

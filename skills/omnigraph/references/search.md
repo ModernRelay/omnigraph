@@ -36,15 +36,15 @@ remain null even when its source text is supplied.
 `omnigraph embed` transforms JSONL files; it does **not** mutate a graph:
 
 ```bash
-omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
+omnigraph embed --schema schema.pg --input raw.jsonl --output embedded.jsonl
 ```
 
-The spec maps each type to its vector and the one source property its
-`@embed` names; `fields` must hold exactly that property:
-
-```json
-{ "dimension": 1536, "types": { "Chunk": { "target": "embedding", "fields": ["text"] } } }
-```
+The schema is the only spec: every `@embed` declaration is a vector to fill,
+from the source property it names, at its `Vector(N)` dimension. Pass the schema
+the graph was initialized or applied with (`omnigraph schema show` prints the
+accepted one). A recorded `@embed(model="…")` must equal the model the provider
+resolves, or the run is refused before it writes anything, as a text `nearest`
+would be.
 
 The source value is embedded exactly as stored, with no type or field-name
 template, which is also how a text `nearest($c.embedding, $q)` embeds `$q`; a
@@ -55,9 +55,10 @@ vector. Vectors from older `omnigraph embed` builds embedded a
 
 By default it fills missing vectors. Load the output explicitly afterward.
 
-Use the same file/spec form with `--reembed-all` to replace selected vectors,
-or `--clean` to remove them. `--type` and `--select` narrow the records. A seed
-manifest is an alternative:
+Use the same form with `--reembed-all` to replace selected vectors, or `--clean`
+to remove them. `--type` (a type that declares an `@embed` vector) and
+`--select` narrow the records. A seed manifest naming `schema`,
+`sources.raw_seed` and `artifacts.embedded_seed` is an alternative:
 
 ```bash
 omnigraph embed --seed embed-config.yaml --reembed-all
