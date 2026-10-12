@@ -157,7 +157,8 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let order_by: Vec<IROrdering> = query
         .orders
         .iter()
-        .map(|order| {
+        .enumerate()
+        .map(|(index, order)| {
             let expr = order
                 .expr
                 .meta_field_result_key()
@@ -172,7 +173,23 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
                         .clone();
                     IRExpr::AliasRef(name, ty)
                 })
-                .map_or_else(|| lower_expr(&order.expr, &ctx), Ok)?;
+                .map_or_else(
+                    || {
+                        if index == 0
+                            && matches!(
+                                &order.expr,
+                                TypedExpr::Nearest { .. }
+                                    | TypedExpr::Bm25 { .. }
+                                    | TypedExpr::Rrf { .. }
+                            )
+                        {
+                            lower_expr(&order.expr, &ctx)
+                        } else {
+                            lower_projection(&order.expr, &ctx)
+                        }
+                    },
+                    Ok,
+                )?;
             Ok(IROrdering {
                 expr,
                 descending: order.descending,
@@ -869,8 +886,8 @@ fn outer_var_in_expr(expr: &TypedExpr, outer_bound: &HashSet<String>) -> Option<
     }
 }
 
-/// A projected rank expression, at the root or inside the Boolean structure
-/// (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
+/// A rank expression in a projection or secondary order key, at the root or
+/// inside Boolean structure (`bm25($p.name, "x") > 0.0 as hit`), lowers to the score column the
 /// retrieval appends (`TypedExpr::score_column`); T33 required `order` to execute it.
 fn lower_projection(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
     let mut lowered = match expr {
