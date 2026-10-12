@@ -131,11 +131,19 @@ Silent filtering can mislead: an average over the view is not the company's
 average. Two mitigations are part of the contract:
 
 1. A query result carries a `view` object whose `restricted` field is `true`
-   when the actor's view excludes anything from a type the plan read. It is
-   computed from the view and the plan, never from data, so it reveals only a
-   policy fact the actor may know.
-2. Answers that must be complete are served by stored queries that run with
-   their definer's rights, reviewed through cluster configuration
+   when the actor's view excludes anything from a type the plan read, or a
+   member of an abstract type the plan bound. It is computed from the view and
+   the plan, never from data, so it reveals only a policy fact the actor may
+   know.
+2. A caller that needs a whole answer asks for one. A stored query annotated
+   `@complete`, or a request with `"complete": true`, is refused with
+   `view_incomplete` whenever `restricted` would be `true`. The refusal carries
+   no type name, count or row, so it discloses exactly what `restricted`
+   discloses. An interface-bound UI component uses this to show "no access"
+   instead of a silently partial calendar.
+3. Answers that must be complete for an actor who cannot see the rows behind
+   them are served by stored queries that run with their definer's rights,
+   reviewed through cluster configuration
    ([Answer capabilities](#answer-capabilities)).
 
 A name the view hides (a type, an edge type or a property) does not exist for
@@ -224,7 +232,7 @@ node Salary @sensitivity("compensation") {
 | `@grant` | edge type | Principal or group → securable, with a `relation` enum property whose values are a subset of `viewer`, `editor`, `owner`. |
 | `@barrier` | edge type | Principal or group → securable. Members never see the securable, whatever they are granted. |
 | `@barrier_exception` | edge type | Principal → securable with a `until: DateTime` property: an audited, time-bound crossing of a barrier. |
-| `@secured_by("T")` | String property | The row belongs to the securable of type `T` whose key equals this value. Non-null, single per type. |
+| `@secured_by("T")` | `String` or `String?` property | The row belongs to the securable of type `T` whose key equals this value. One per type. A null value hides the row from every restricted actor, which lets an existing type be secured by adding a nullable property and backfilling it. `T` is a `@securable` node type, or ([Polymorphic types](#polymorphic-types)) an interface whose members are all `@securable` and which declares interface-scope `@unique` on their key. |
 | `@sensitivity("c")` | property or type | The property, or the whole type, is visible only to actors granted class `c`. |
 | `@restricts("discover" \| "ground")` | Bool property of a securable | When `true`, the securable's rows leave that tier. |
 | `@provenance` | edge type | Derived row → source row ([Derived content](#derived-content)). |
@@ -394,6 +402,7 @@ share reconcilers are unaffected. A later phase serves view-filtered history
 | `explain` | Omits row estimates, statistics, dataset paths, versions and index facts for restricted types unless the actor holds `explain_full`. |
 | `profile` | Requires `explain_full`. |
 | `GET /schema` | The schema view: hidden types and properties are absent. |
+| Structured catalog route and schema hash on reads ([Polymorphic types](#polymorphic-types)) | The schema view, and the view's digest in place of the schema hash. |
 | `GET /queries`, MCP `queries` | Only queries that typecheck against the schema view. |
 | `GET /snapshot` | Omits `entity_count` and dataset paths for restricted types. |
 | `GET /commits`, `/commits/{id}`, `/commits/{id}/changes`, `GET /changes`, `POST /changes/baseline`, `POST /export` | `view_restricted` until Phase 7. |
@@ -749,8 +758,8 @@ is masked:
 Wildcard traversal already expands only over edge types whose declared
 endpoints match (`crates/omnigraph-compiler/src/query/typecheck.rs:1981-1989`),
 so the schema view prunes hidden edge types. Query bindings are concrete node
-types; there are no polymorphic scans to cover
-(`crates/omnigraph-compiler/src/query/typecheck.rs:1785-1790`).
+types today (`crates/omnigraph-compiler/src/query/typecheck.rs:1785-1790`);
+[Polymorphic types](#polymorphic-types) covers abstract bindings.
 
 `Omnigraph::graph_index()` returns the whole topology
 (`crates/omnigraph/src/db/omnigraph.rs:2681`) and becomes crate-private.
@@ -835,6 +844,118 @@ The server refuses to serve it in unauthenticated mode, which today allows every
 graph action (`crates/omnigraph-server/src/handlers.rs:651-668`), and with static
 tokens and no policy, which today allows every read
 (`crates/omnigraph-server/src/handlers.rs:661`).
+
+### Polymorphic types
+
+The draft RFC for polymorphic types
+([ModernRelay/omnigraph#884](https://github.com/ModernRelay/omnigraph/pull/884),
+`2026-10-07-polymorphic-types.md`) makes interfaces and inline unions bindable,
+adds polymorphic edge endpoints with `__src_type` and `__dst_type` tag columns,
+and leaves per-type policy to the `predicate_for` work this RFC defines. The two
+designs compose as follows.
+
+**Member sets come from the schema view.** An abstract binding resolves its
+member set against the actor's view catalog, so a member hidden by
+`@sensitivity` is absent, exactly as it is absent from `materialize(V(a))`.
+Visibility is decided per concrete type; `implements` neither grants nor
+removes it, which keeps that RFC's rule that `implements` never confers a
+permission. `$x is T`, `@type` and `@type_id` comparisons naming a hidden type
+fail with the unknown-name error. Result schemas still never depend on the
+member set: an abstract binding is typed from the interface declaration, and an
+interface property hidden by `@sensitivity` is hidden for every member (below).
+
+This replaces that RFC's `policy_denied_member` refusal and its
+`policy_filtered` marker. Refusing a query because an interface includes a
+hidden member leaks the member's existence, and the refusal's only escape, a
+type test that removes the member, requires the caller to name a type it is not
+allowed to know. A stored query shared by actors with different views could
+never be written that way. Completeness is served instead by `view.restricted`
+and the opt-in `@complete` refusal, which reveal no member.
+
+**Security annotations on interfaces.** Under that RFC, property annotations on
+an interface property apply to every implementor that inherits it.
+`@sensitivity` and `@secured_by` follow that rule with two additions:
+
+- A member that redeclares an inherited property may not drop either
+  annotation. This is a refusal, not the lint warning that RFC gives other
+  dropped annotations, because dropping it would declassify the member.
+- A member may not add `@sensitivity` to an inherited property. Declaring it on
+  the interface keeps the property's visibility uniform across members, so
+  `$x.p` on an abstract binding is either visible for the whole binding or
+  hidden for it.
+
+Type-level `@sensitivity` belongs to concrete types and is not inherited
+through `implements`.
+
+**Declassification by migration.** A schema-apply step that removes
+`@sensitivity` or `@secured_by` from any concrete type or property, by any
+route, is a declassification step. The routes are deleting the annotation,
+removing an interface property, removing `implements`, and narrowing an
+endpoint that changes which annotated property a member inherits. The plan
+lists each such step, and apply requires `declassify` in addition to
+`schema_apply`.
+
+**Polymorphic securables.** A row has one `@secured_by` value, a key string. A
+key must name one securable even when securables come in several types (a Slack
+channel, a Drive folder, a CRM account). `@secured_by` therefore names either
+one concrete `@securable` type or an interface whose members are all
+`@securable` and that declares interface-scope `@unique` on their key, which
+that RFC adds in its phase 3. Interface-scope uniqueness rests on read-set
+validation and the exact graph-head precondition rather than a fence; a
+concurrent duplicate fails publication.
+
+**Authorization edges.** With polymorphic endpoints one edge type covers both
+kinds of subject:
+
+```pg
+interface Securable { slug: String @key  @unique(slug) }
+node Space @securable implements Securable { name: String }
+node Channel @securable implements Securable { topic: String? }
+
+edge MemberOf: Principal | Group -> Group @membership
+edge Grants: Principal | Group -> Securable @grant {
+  relation: enum(viewer, editor, owner)
+}
+```
+
+Membership closure becomes one bounded multi-hop traversal from the principal
+across `MemberOf`, which that RFC's set-based multi-hop rule admits, instead of
+a one-hop step followed by a group-to-group recursion. The readable-set plan
+reads grant rows by tag through that RFC's single endpoint resolver.
+
+**Union scans and polymorphic expansion.** Every arm of a union scan whose
+member is a restricted secured type carries its own view conjunct, placed during
+that RFC's per-arm resolution. The coverage validator inspects arms. A
+`count` over an abstract binding may sum per-member metadata counts only for
+unrestricted members. A polymorphic expansion groups each hop's frontier by tag,
+as that RFC's interner already keys by `(type, id)`, and masks each restricted
+member type as in [Traversal](#traversal).
+
+**Graph index.** That RFC's phase 3 moves the graph index to one global ordinal
+space, with each node type at a fixed offset. Per-view masks
+([Rollout](#rollout), Phase 6) target that space: one bitmap per view and index
+instance, instead of one per node type.
+
+**Search.** That RFC refuses `bm25` on a multi-member binding because each
+table's statistics differ. Uniform statistics are identical across tables, so
+for restricted actors that reason disappears. This RFC does not admit
+multi-member `bm25`; a later change may.
+
+**Catalog route, schema hash, descriptors and feeds.** The structured catalog
+route that RFC adds serves the schema view: member lists, properties and
+annotations of visible types only. Reads by a restricted actor carry the
+digest of the schema view where they would carry `schema_ir_hash`, so clients
+cache type names per view and a change to a hidden type is not observable.
+Operation descriptors list visible members. In Phase 7, interface filters on
+the change feed expand over the view, and a `ChangeScopeMembershipChanged`
+refusal names only visible members.
+
+**History.** Both RFCs refuse abstract bindings on historical targets for now.
+
+**Order of implementation.** Whichever lands second carries the integration: if
+union scans land first, this RFC's Phase 2 extends the coverage validator to
+arms and expansions; if views land first, that RFC's union scan adds the
+per-arm view conjunct when it resolves arms.
 
 ### Shares
 
@@ -1155,6 +1276,11 @@ secured types; they are refused with `view_write_denied`.
   against row visibility.
 - Server: refuse to serve an `actor-views` graph in unauthenticated mode or with
   static tokens and no policy.
+- Completeness: `view.restricted`, the `@complete` stored-query annotation, the
+  `complete` request option and `view_incomplete`.
+- Polymorphic types, if union scans have landed: view conjuncts per arm,
+  validator coverage of arms and polymorphic expansions, member sets from the
+  schema view, the view digest in place of the schema hash.
 - Lance guards: exact String BTREE `IsIn` prefiltering KNN and WAND; supplied
   base-scorer statistics change scores; `CountPushdown` on an exact BTREE count.
 
@@ -1205,7 +1331,9 @@ Exit: the ranking threshold holds on the fixture.
 ### Phase 6: performance
 
 - Per-view ordinal masks over a CSR instance, keyed by the instance and the
-  node-table versions; CSR mode re-enabled for restricted types.
+  node-table versions; CSR mode re-enabled for restricted types. If the
+  polymorphic types RFC's global ordinal index has landed, one bitmap per view
+  covers every node type.
 - An optional per-view row-mask cache, after a guard covers Lance's
   `CountPushdown` with a row mask.
 
@@ -1263,12 +1391,28 @@ write-one queries across graphs.
 5. Whether edge types need their own `@secured_by` in a later RFC.
 6. Whether design partners accept key-existence disclosure to writers, or need
    securable-scoped uniqueness.
+7. Whether stored queries bound by UI components should default to `@complete`.
+   The polymorphic types RFC chose refusal for interface members a reader may
+   not see; this RFC proposes filtering with a signal and opt-in refusal, and
+   that RFC's Policy section needs the matching amendment before either is
+   accepted.
 
 ## Decision log
 
 - 2026-10-11: Drafted. The design was checked against the code at `6e31d0ab`
   and Lance 11.0.0; Appendix A records every assumption with its verdict.
   Prior art is in Appendix B.
+- 2026-10-11: Aligned with the polymorphic types draft
+  (ModernRelay/omnigraph#884). Added
+  [Polymorphic types](#polymorphic-types): abstract member sets come from the
+  schema view; `policy_denied_member` and `policy_filtered` are replaced by
+  `view.restricted` and an opt-in `@complete` refusal; security annotations on
+  interface properties cannot be dropped or added per member; removing one by
+  any migration route is declassification; `@secured_by` may name an interface
+  of securables with interface-scope `@unique`; authorization edges may use
+  polymorphic endpoints; per-view graph-index masks target the global ordinal
+  space. `@secured_by` admits a nullable property, null hiding the row from
+  restricted actors.
 
 ## Appendix A: validated assumptions
 
