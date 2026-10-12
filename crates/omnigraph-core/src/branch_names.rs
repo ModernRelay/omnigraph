@@ -197,6 +197,31 @@ pub fn is_merge_input_tag(name: &str) -> bool {
     matches!(merge_input_owner(name), Ok(Some(_)))
 }
 
+/// The reserved prefix of an unpublished graph commit's tag (RFC
+/// "Unpublished graph commits"); the rest is the full `hb1` id it names.
+pub const UNPUBLISHED_TAG_PREFIX: &str = "unpublished_";
+
+/// The graph commit id a reserved proposal tag names: `None` for a tag of
+/// another kind, an error for a reserved name that is not a commit id.
+pub fn unpublished_tag_commit_id(name: &str) -> Result<Option<String>> {
+    let Some(id) = name.strip_prefix(UNPUBLISHED_TAG_PREFIX) else {
+        return Ok(None);
+    };
+    if !is_valid_graph_commit_id(id) {
+        return Err(OmniError::manifest_internal(format!(
+            "native tag '{name}' carries the reserved unpublished-commit prefix and names no \
+             graph commit id"
+        )));
+    }
+    Ok(Some(id.to_string()))
+}
+
+/// A valid proposal tag exempts logical retirement the way a merge-input
+/// tag does: the proposal expires with the incarnation it targets.
+pub fn is_unpublished_tag(name: &str) -> bool {
+    matches!(unpublished_tag_commit_id(name), Ok(Some(_)))
+}
+
 /// Resolve a logical branch to its single live native ref.
 ///
 /// `Ok(None)` means no incarnation exists. More than one live incarnation is a

@@ -240,14 +240,15 @@ lead the order clause. The score is also a result value: `return { $d.slug,
 nearest($d.vector, $v) as score }` returns the distance the ordering used, and
 `bm25(...) as score` the relevance score, provided the projected expression
 repeats the leading `order` key (`T33`); without an alias the column is
-`d._distance` or `d._score`. A rank expression under an aggregate (`T32`),
-`rrf(...)` in `return` (`T37`, until the fused score becomes a column), and
-the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
-(`T35`, they belong in `match`) are refused at compile time. Aggregated
-queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). A `bm25()`
-ordering reads every matching entity before the final limit, so rows tied on
-score are ordered by entity id.
+`d._distance` or `d._score`, and `rrf(...) as score` the fused score (an
+`F64`, `d._rrf` without an alias). A rank expression under an aggregate
+(`T32`) and the predicates `search(...)`, `fuzzy(...)` and `match_text(...)`
+in `return` (`T35`, they belong in `match`) are refused at compile time.
+Aggregated queries are outside search ranking: the leading search function
+selects the groups' population; subsequent keys order the groups, followed by
+every group key ascending. Without subsequent keys, groups are unordered;
+groups cannot project a score (`T9`). A `bm25()` ordering reads every matching
+entity before the final limit, breaking score ties by entity id.
 
 ## Blobs
 

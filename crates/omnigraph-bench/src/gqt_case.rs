@@ -1,11 +1,15 @@
 //! Authored GQT experiments. Recipe identity is resolved before I/O; point
 //! identity is bound only after the dataset's logical evidence is verified.
 use crate::case::{
-    Backend, CacheCondition, EnginePreparation, PageCacheCondition, ProcessLifecycle, Protocol,
-    ResetMode, Schedule, WarmupProgram,
+    Backend, CacheCondition, EnginePreparation, NetworkPosition, PageCacheCondition,
+    ProcessLifecycle, Protocol, ResetMode, Schedule, WarmupProgram,
 };
+pub use crate::model::{digest, sha256_bytes};
 use crate::model::{read_text_file, typed_sha256, valid_kebab_id};
-use omnigraph_gqt_core::{Case, ExecutionHost, Item, PlainHost, Step, StepDescriptor, StepKind};
+use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_gqt_core::{
+    Case, ExecutionHost, Item, PlainHost, Step, StepDescriptor, StepKind, step_kind,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -52,9 +56,76 @@ pub struct MeasuredStep {
     pub text: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "GqtEnvironmentWire", into = "GqtEnvironmentWire")]
 pub struct GqtEnvironment {
     pub backend: Backend,
+    pub target: Target,
+    pub network_position: NetworkPosition,
+}
+/// Embedded identities omit the implicit target and position; served ones always name the position.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GqtEnvironmentWire {
+    backend: Backend,
+    #[serde(default, skip_serializing_if = "Target::is_engine")]
+    target: Target,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network_position: Option<NetworkPosition>,
+}
+impl TryFrom<GqtEnvironmentWire> for GqtEnvironment {
+    type Error = String;
+    fn try_from(wire: GqtEnvironmentWire) -> Result<Self, String> {
+        let network_position = match (wire.target, wire.network_position) {
+            (_, Some(position)) => position,
+            (Target::Engine, None) => NetworkPosition::SameHost,
+            (Target::Server, None) => {
+                return Err(
+                    "server targets must declare network_position (same-host, same-region or remote)"
+                        .into(),
+                );
+            }
+        };
+        Ok(Self {
+            backend: wire.backend,
+            target: wire.target,
+            network_position,
+        })
+    }
+}
+impl From<GqtEnvironment> for GqtEnvironmentWire {
+    fn from(environment: GqtEnvironment) -> Self {
+        let network_position = match (environment.target, environment.network_position) {
+            (Target::Engine, NetworkPosition::SameHost) => None,
+            (_, position) => Some(position),
+        };
+        Self {
+            backend: environment.backend,
+            target: environment.target,
+            network_position,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Target {
+    #[default]
+    #[serde(rename = "omnigraph-engine")]
+    Engine,
+    #[serde(rename = "omnigraph-server")]
+    Server,
+}
+impl Target {
+    fn is_engine(&self) -> bool {
+        *self == Self::Engine
+    }
+}
+impl GqtEnvironment {
+    pub fn embedded(backend: Backend) -> Self {
+        Self {
+            backend,
+            target: Target::Engine,
+            network_position: NetworkPosition::SameHost,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,11 +166,19 @@ pub struct DatasetBuildPlan {
 }
 impl DatasetBuildPlan {
     pub fn revalidate(&self) -> Result<(), String> {
+        if self.environment.target != Target::Engine
+            || self.environment.network_position != NetworkPosition::SameHost
+        {
+            return Err(
+                "dataset construction requires an independently declared embedded environment"
+                    .into(),
+            );
+        }
         let dataset = validate_recipe(&self.dataset)?;
         let query_indices = match &self.index_queries {
             Some(source) => {
                 let case = source.parse()?;
-                admit_environment(&case)?;
+                PlainHost.admit_case(&case)?;
                 if case.fixture.is_some() {
                     return Err("index-requirement queries must be schema-less".into());
                 }
@@ -172,7 +251,7 @@ pub fn dataset_file(
         recipe_sha256: recipe_hash(&dataset)?,
         dataset,
         index_queries,
-        environment: GqtEnvironment { backend },
+        environment: GqtEnvironment::embedded(backend),
         reset,
         needs_indices,
     };
@@ -214,14 +293,20 @@ pub struct BoundGqt {
     pub point_name: String,
 }
 impl PlannedGqt {
-    pub fn dataset_build_plan(&self) -> DatasetBuildPlan {
-        DatasetBuildPlan {
-            dataset: self.dataset.clone(),
-            index_queries: Some(self.queries.clone()),
-            recipe_sha256: self.recipe_sha256.clone(),
-            environment: self.definition.environment.clone(),
-            reset: self.definition.protocol.reset,
-            needs_indices: self.needs_indices,
+    pub fn dataset_build_plan(&self) -> Result<DatasetBuildPlan, String> {
+        match self.definition.environment.target {
+            Target::Engine => Ok(DatasetBuildPlan {
+                dataset: self.dataset.clone(),
+                index_queries: Some(self.queries.clone()),
+                recipe_sha256: self.recipe_sha256.clone(),
+                environment: self.definition.environment.clone(),
+                reset: self.definition.protocol.reset,
+                needs_indices: self.needs_indices,
+            }),
+            Target::Server => Err(
+                "served scenarios run against a provisioned graph; the dataset cache does not apply"
+                    .into(),
+            ),
         }
     }
     pub fn planned_hash(&self) -> Result<String, String> {
@@ -269,7 +354,19 @@ impl PlannedGqt {
         validate_definition(&self.definition)?;
         let queries = self.queries.parse()?;
         let dataset = validate_recipe(&self.dataset)?;
-        let condition = admit_queries(&queries, &self.definition.workload.measured_step)?;
+        let condition = admit_target_queries(
+            &queries,
+            &self.definition.workload.measured_step,
+            self.definition.environment.target,
+        )?;
+        if self.definition.environment.target == Target::Server {
+            if matches!(self.dataset, DatasetRecipe::Registered { .. }) || self.needs_indices {
+                return Err(
+                    "served benchmarks do not support registered or indexed datasets".into(),
+                );
+            }
+            omnigraph_gqt_core::admit_served(&dataset)?;
+        }
         if condition != self.cache_condition
             || (dataset.needs_indices || queries.needs_indices) != self.needs_indices
         {
@@ -323,6 +420,23 @@ pub fn validate_definition(c: &GqtCaseV1) -> Result<(), String> {
     }
     if !matches!(c.environment.backend, Backend::LocalFs { .. }) {
         return Err("gqt-v1 supports local-filesystem only".into());
+    }
+    match c.environment.target {
+        Target::Engine => {
+            validate_backend_reset(&c.environment.backend, c.protocol.reset)?;
+            if c.environment.network_position != NetworkPosition::SameHost {
+                return Err("embedded execution requires same-host network position".into());
+            }
+        }
+        Target::Server => {
+            if c.protocol.reset != ResetMode::None
+                || c.protocol.attribution != crate::case::Attribution::Off
+            {
+                return Err(
+                    "served read-only execution requires reset:none and attribution:off".into(),
+                );
+            }
+        }
     }
     if c.workload.measured_step.ordinal == 0
         || c.workload.measured_step.text.trim().is_empty()
@@ -396,7 +510,11 @@ pub fn load_with_root(
         planned_sha256: String::new(),
         case_digest: typed_sha256(&definition).map_err(|e| e.to_string())?,
         recipe_sha256: recipe_hash(&dataset)?,
-        cache_condition: admit_queries(&parsed_queries, &definition.workload.measured_step)?,
+        cache_condition: admit_target_queries(
+            &parsed_queries,
+            &definition.workload.measured_step,
+            definition.environment.target,
+        )?,
         needs_indices: parsed_queries.needs_indices || parsed_dataset.needs_indices,
         definition,
         dataset,
@@ -454,7 +572,38 @@ pub fn workload_steps(case: &Case) -> Result<Vec<StepDescriptor>, String> {
     Ok(case.steps())
 }
 pub fn admit_queries(case: &Case, selected: &MeasuredStep) -> Result<CacheCondition, String> {
-    admit_environment(case)?;
+    admit_target_queries(case, selected, Target::Engine)
+}
+pub(crate) fn admit_target_queries(
+    case: &Case,
+    selected: &MeasuredStep,
+    target: Target,
+) -> Result<CacheCondition, String> {
+    admit_target_environment(case, target)?;
+    if target == Target::Server {
+        omnigraph_gqt_core::admit_served(case)?;
+        workload_steps(case)?;
+        for step in case.items.iter().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_ref(step),
+            Item::Loop { steps, .. } => steps.as_slice(),
+        }) {
+            let ordinal = step.ordinal();
+            if !SERVED_READ_KINDS.contains(&step.operation_kind()) {
+                return Err(format!(
+                    "step {ordinal} ({}) is not read-only; reset:none requires every served workload step, including loops and verification, to be read-only",
+                    step_kind(step)
+                ));
+            }
+            if let Step::Query(query) = step {
+                let file = parse_query(&query.source).map_err(|e| e.to_string())?;
+                if !file.settings.is_empty() {
+                    return Err(format!(
+                        "step {ordinal} (query with a settings prefix) is refused for served acquisition until the served door is proven by a conformance case"
+                    ));
+                }
+            }
+        }
+    }
     if case.fixture.is_some() {
         return Err("queries must omit schema and seed".into());
     }
@@ -533,16 +682,14 @@ pub fn admit_queries(case: &Case, selected: &MeasuredStep) -> Result<CacheCondit
             "queries require explicit verification steps after the measured operation".into(),
         );
     }
+    let process = match target {
+        Target::Engine => ProcessLifecycle::FreshPerRepetition,
+        Target::Server => ProcessLifecycle::LongRunningServer,
+    };
     Ok(CacheCondition {
-        process: ProcessLifecycle::FreshPerRepetition,
-        engine: if reopened {
-            EnginePreparation::ReopenedAfterProgram
-        } else if reads > 0 {
-            EnginePreparation::WarmedByProgram
-        } else {
-            EnginePreparation::PreparationOnly
-        },
-        page_cache: if reads > 0 {
+        process,
+        engine: engine_preparation(reopened, reads, process),
+        page_cache: if reads > 0 && target == Target::Engine {
             PageCacheCondition::ProgramConditioned
         } else {
             PageCacheCondition::Uncontrolled
@@ -555,17 +702,6 @@ pub fn admit_queries(case: &Case, selected: &MeasuredStep) -> Result<CacheCondit
         iterations: reads,
     })
 }
-pub fn digest(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-pub fn sha256_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 /// Explicit CLI inputs are frozen by their supplied paths and need not live in a catalog.
 pub fn override_sources(
     mut plan: PlannedGqt,
@@ -589,7 +725,11 @@ pub fn override_sources(
         DatasetRecipe::Gqt { source } => source.parse()?,
         DatasetRecipe::Registered { preparation, .. } => preparation.parse()?,
     };
-    plan.cache_condition = admit_queries(&parsed, &plan.definition.workload.measured_step)?;
+    plan.cache_condition = admit_target_queries(
+        &parsed,
+        &plan.definition.workload.measured_step,
+        plan.definition.environment.target,
+    )?;
     plan.needs_indices = dataset.needs_indices || parsed.needs_indices;
     plan.recipe_sha256 = recipe_hash(&plan.dataset)?;
     plan.case_digest = typed_sha256(&plan.definition).map_err(|e| e.to_string())?;
@@ -601,24 +741,53 @@ pub fn override_sources(
     Ok(plan)
 }
 
+/// The only step kinds a served workload may contain anywhere in its program.
+pub const SERVED_READ_KINDS: [StepKind; 3] =
+    [StepKind::Query, StepKind::BranchList, StepKind::Show];
+
+/// Engine preparation implied by the executed prefix reads, a restart, and the process lifecycle.
+pub(crate) fn engine_preparation(
+    reopened: bool,
+    reads: u32,
+    process: ProcessLifecycle,
+) -> EnginePreparation {
+    match (reopened, reads, process) {
+        (true, _, _) => EnginePreparation::ReopenedAfterProgram,
+        (false, 1.., _) => EnginePreparation::WarmedByProgram,
+        (false, 0, ProcessLifecycle::LongRunningServer) => EnginePreparation::Uncontrolled,
+        (false, 0, ProcessLifecycle::FreshPerRepetition) => EnginePreparation::PreparationOnly,
+    }
+}
+
 pub fn explicit_verification(kind: StepKind) -> bool {
     !matches!(
         kind,
         StepKind::Restart | StepKind::Settings | StepKind::Concurrent
     )
 }
-pub fn admit_environment(case: &Case) -> Result<(), String> {
+pub(crate) fn admit_environment(case: &Case) -> Result<(), String> {
+    admit_target_environment(case, Target::Engine)
+}
+fn admit_target_environment(case: &Case, target: Target) -> Result<(), String> {
     PlainHost.admit_case(case)?;
     if !case.runner.environments.iter().any(|e| {
         matches!(
-            e.execution,
-            omnigraph_gqt_core::Execution::Engine {
-                storage: omnigraph_gqt_core::runner_config::Storage::LocalFilesystem
-            }
+            (&e.execution, target),
+            (
+                omnigraph_gqt_core::Execution::Engine {
+                    storage: omnigraph_gqt_core::runner_config::Storage::LocalFilesystem
+                },
+                Target::Engine
+            ) | (
+                omnigraph_gqt_core::Execution::Server {
+                    storage: omnigraph_gqt_core::runner_config::Storage::LocalFilesystem
+                },
+                Target::Server
+            )
         )
     }) {
         return Err(
-            "benchmark requires an admitted direct-engine/local-filesystem environment".into(),
+            "benchmark target requires a matching admitted local-filesystem environment".into(),
         );
     }
     Ok(())
@@ -639,23 +808,36 @@ pub fn validate_point_spec(spec: &GqtPointIdentityV1) -> Result<(), String> {
         protocol: spec.protocol.clone(),
     };
     validate_definition(&synthetic)?;
-    validate_backend_reset(&spec.environment.backend, spec.protocol.reset)?;
     let c = &spec.cache_condition;
-    let valid = c.process == ProcessLifecycle::FreshPerRepetition
-        && matches!(
-            (c.engine, c.page_cache, c.program, c.iterations),
-            (
-                EnginePreparation::PreparationOnly,
-                PageCacheCondition::Uncontrolled,
-                WarmupProgram::None,
-                0,
-            ) | (
-                EnginePreparation::WarmedByProgram | EnginePreparation::ReopenedAfterProgram,
-                PageCacheCondition::ProgramConditioned,
-                WarmupProgram::GqtReadSetV1,
-                1..=4096,
+    let valid = if spec.environment.target == Target::Server {
+        c.process == ProcessLifecycle::LongRunningServer
+            && c.page_cache == PageCacheCondition::Uncontrolled
+            && matches!(
+                (c.engine, c.program, c.iterations),
+                (EnginePreparation::Uncontrolled, WarmupProgram::None, 0)
+                    | (
+                        EnginePreparation::WarmedByProgram,
+                        WarmupProgram::GqtReadSetV1,
+                        1..=4096
+                    )
             )
-        );
+    } else {
+        c.process == ProcessLifecycle::FreshPerRepetition
+            && matches!(
+                (c.engine, c.page_cache, c.program, c.iterations),
+                (
+                    EnginePreparation::PreparationOnly,
+                    PageCacheCondition::Uncontrolled,
+                    WarmupProgram::None,
+                    0,
+                ) | (
+                    EnginePreparation::WarmedByProgram | EnginePreparation::ReopenedAfterProgram,
+                    PageCacheCondition::ProgramConditioned,
+                    WarmupProgram::GqtReadSetV1,
+                    1..=4096,
+                )
+            )
+    };
     if !valid {
         return Err("invalid GQT cache condition tuple".into());
     }
@@ -697,6 +879,24 @@ pub fn explicit_pair(
     reset: ResetMode,
     deadline_seconds: Option<u64>,
 ) -> Result<PlannedGqt, String> {
+    explicit_pair_in_environment(
+        dataset,
+        queries,
+        selected,
+        GqtEnvironment::embedded(backend),
+        reset,
+        deadline_seconds,
+    )
+}
+
+pub fn explicit_pair_in_environment(
+    dataset: &Path,
+    queries: &Path,
+    selected: MeasuredStep,
+    environment: GqtEnvironment,
+    reset: ResetMode,
+    deadline_seconds: Option<u64>,
+) -> Result<PlannedGqt, String> {
     let dataset_source = read_source(dataset)?;
     let query_source = read_source(queries)?;
     let definition = GqtCaseV1 {
@@ -710,14 +910,18 @@ pub fn explicit_pair(
             queries: queries.to_path_buf(),
             measured_step: selected,
         },
-        environment: GqtEnvironment { backend },
         protocol: Protocol {
             deadline_seconds,
-            attribution: crate::case::Attribution::PerPhase,
+            attribution: if environment.target == Target::Server {
+                crate::case::Attribution::Off
+            } else {
+                crate::case::Attribution::PerPhase
+            },
             schedule: Schedule::Manual,
             reset,
             timer: crate::case::Timer::Monotonic,
         },
+        environment,
     };
     let query_case = query_source.parse()?;
     let dataset_case = dataset_source.parse()?;
@@ -728,7 +932,11 @@ pub fn explicit_pair(
         case_digest: typed_sha256(&definition).map_err(|e| e.to_string())?,
         recipe_sha256: recipe_hash(&recipe)?,
         planned_sha256: String::new(),
-        cache_condition: admit_queries(&query_case, &definition.workload.measured_step)?,
+        cache_condition: admit_target_queries(
+            &query_case,
+            &definition.workload.measured_step,
+            definition.environment.target,
+        )?,
         needs_indices: query_case.needs_indices || dataset_case.needs_indices,
         definition,
         dataset: recipe,

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-09
-updated: 2026-10-08
+updated: 2026-10-11
 discussion: null
 supersedes: []
 superseded_by: []
@@ -27,10 +27,11 @@ and Lance 10.0.0 as the required implementation substrate.
 **Audience:** engine, compiler, server, CLI, security, storage, maintenance,
 and documentation maintainers.
 **Current rollout:** Phases 0, 1, 2A (HTTP read delivery), and 2B (CLI read
-delivery) are implemented on the v0.10 development line. Phase 3 (mutation) is
-planned against current main in §13, with its decisions in the 2026-10-08
-decision-log entry. Phase 4 (measured optimization) and the production delivery
-telemetry named in §11 remain open.
+delivery) are implemented on the v0.10 development line. Phase 3 (mutation:
+put and clear through the engine, HTTP and the CLI) is implemented for v0.13.1,
+with its decisions in the 2026-10-08 and 2026-10-10 decision-log entries.
+Phase 4 (measured optimization) and the production delivery telemetry named in
+§11 remain open.
 
 This RFC is the required successor to an earlier reverted blob-delivery
 experiment. The relevant evidence and decisions are restated here; no untracked
@@ -588,11 +589,12 @@ merge-insert that accepts the external mode and outside-base admission of
 `WriteParams`, plus a surface guard; that belongs to the descriptor-preserving
 item of Phase 4, not to Phase 3.
 
-The raw managed payload limit is 32 MiB inclusive, counted in payload bytes. The
-engine rejects a larger value before it opens the table, so before any staged
+The raw managed payload limit is the session's `write_max_bytes` (32 MiB by
+default, at most 32 MiB), inclusive, counted in payload bytes. The engine
+rejects a larger value before it opens the table, so before any staged
 fragment, transaction, manifest update, or lineage row. The carried siblings'
 payload bytes, by declared logical length, are charged with the target to the
-same operation-wide 32 MiB pre-effect payload budget. Therefore a near-limit
+same operation-wide pre-effect payload budget. Therefore a near-limit
 target can be refused when the row has other large Blob cells. This is an
 explicit V1 limitation, not hidden behavior.
 
@@ -601,7 +603,8 @@ write (load, `.gq` mutation, branch merge and these methods) charges each
 managed Blob value's logical length to the payload budget and every other byte
 of its batches, the Blob columns' offsets, validity and descriptor framing
 included, to the existing keyed-write byte ceilings in Arrow memory. One shared
-accounting function applies both. A single budget cannot keep the inclusive
+accounting function applies both, and both budgets are the operation's
+`write_max_bytes`, captured once from the effective session settings. A single budget cannot keep the inclusive
 promise: a one-row batch holding a 33,554,432-byte value and an `id` measures
 33,555,112 bytes in Arrow memory (arrow 58.3), so the old combined ceiling
 refused every exact-limit value, from `blob put`, an embedded `.gq` parameter, a
@@ -1235,7 +1238,7 @@ Physical row addresses never become public stable identity.
 | URI credential disclosure | Reject user-info/query/fragment credentials at config and input; return URI only to an authorized Blob reader |
 | URI parser amplification | Reject a raw configured or input URI above 64 KiB before trimming, parsing, decoding, or filesystem resolution |
 | External SSRF during read | Descriptor-first classification; redirect only; no proxy or validation on GET/HEAD |
-| Oversize upload | Route and engine 32 MiB inclusive limits in payload bytes, separate from the batch framing budget (§4.3); refusal before effect |
+| Oversize upload | Route and engine `write_max_bytes` (32 MiB by default, at most 32 MiB) inclusive limits in payload bytes, separate from the row-data budget (§4.3); refusal before effect, and before reading past the limit on the route |
 | Rewrite amplification | New logical input and row-writing branch merge pre-size all carried Blob payloads under one 32 MiB operation budget before read; predicate mutation carry applies the same cumulative byte ceiling while materializing bounded scan batches. Schema apply reads no Blob payload: its column changes are metadata-only (§8.4) |
 | Compaction memory | Optimize sets the compaction scanner batch from the planned fragments' largest row, summing that row's Blob columns: as many rows (1 to 8,192) as fit 32 MiB of managed payload at that row's size, so one batch materializes at most 32 MiB of managed payload. A row whose Blob values together exceed 32 MiB is compacted in a batch of its own and materialized whole. This bounds payload per batch, not heap: Lance's writer copies inline payloads into its prepared arrays while it holds the batch (see the operator guide's optimize section). External descriptors are carried unread |
 | External-source planning | Row-writing branch merge admits at most 8,192 external-reference cells and 32 MiB of retained URI metadata before HEAD; probes are bounded and normalized aliases deduplicate within the applicable operation or scan-batch envelope |
@@ -1265,14 +1268,15 @@ They exist for three reasons:
 - a mutation or load holds its batches in memory until its one publication;
 - Lance writes a Blob value from an in-memory Arrow array.
 
-The ceilings are not a setting. The evidence behind the figure is
+A setting cannot raise the ceilings: `write_max_bytes` (§4.3) only lowers them,
+for a session or a process, and 32 MiB is its maximum. The evidence behind the figure is
 [RFC 0023's cost gate](0023-key-conflict-fencing.md#114-cost-gate): paired
 peak-RSS overhead of bounded fenced transactions under the old combined 32 MiB
 accounting, for the workloads that gate names. It is not a workload-independent
 process-memory bound, and it does not qualify the split envelope of §4.3, up to
 32 MiB of payload plus 32 MiB of framing; qualifying that remains open work for
-the same gate. A setting without such a measured multiplier would promise a
-bound it cannot keep. Going beyond the ceilings means keeping large data out of
+the same gate. A setting that raised the ceilings without such a measured
+multiplier would promise a bound it cannot keep. Going beyond the ceilings means keeping large data out of
 the write path's memory. There are three separate limits, each with its own dependency
 and trigger:
 
@@ -1428,13 +1432,13 @@ The implementation extends existing owners before creating new fixtures, per
   reference, proving that target payload is not read while the untouched sibling
   remains byte-identical. Every refusal proves table HEAD, manifest, lineage,
   and accepted state unchanged.
-- `writes.rs` also owns the payload/framing split (§4.3): an exact 32 MiB PUT is
-  accepted and one more byte is refused by the payload limit, not by a framing
-  ceiling; a 32 MiB value carried by an update, one inserted through an
-  embedded `.gq` parameter and one loaded by the compatibility loader are
-  accepted where the combined ceiling refused them, while the strict NDJSON
-  loader still refuses that value's encoded line at its line limit; and a
-  framing refusal still names its keyed-write ceiling. It owns the sibling carry rule
+- The payload/row split (§4.3) is owned by the `write_max_bytes` owners: the
+  `write_max_bytes*.gqt` and `load_write_max_bytes_*.gqt` cases (an exact
+  payload beside its row, one more byte refused, a value carried by an update),
+  `consistency.rs` and `merge_fast_forward.rs`. `writes.rs` owns the put's
+  bound: an exact-limit put is accepted at the default and under a lowered
+  `write_max_bytes`, one more byte is refused as `Blob write payload bytes`, and
+  a carried sibling shares the payload allowance. It owns the sibling carry rule
   too: an external sibling becomes managed under an admitting policy (visible
   through `stat`), fails with `StoredExternalBlobDenied` naming the sibling under
   a denying one, and on a row with two external cells under a denying policy a
@@ -1576,7 +1580,7 @@ transports.
 The object-store cost evidence is explicitly on-demand and is not implied by the
 canonical local test graph. Follow the current
 [deployment guide](../user/deployment.md),
-run `cargo test -p omnigraph-engine --test write_cost_s3` with the documented
+run `cargo test -p omnigraph-engine --test integration write_cost_s3::` with the documented
 bucket, endpoint, and credential environment, and attach the untruncated test log
 plus the non-secret endpoint configuration to the implementation PR.
 
@@ -1671,16 +1675,16 @@ correctness gate.
 
 ### Phase 3 — mutation
 
+Implemented: 3A in #908, 3B in #922 and 3C in #928.
+
 - **Served-read prerequisite:** met. The routed `GraphRequest` lease and the
   read observer are held by the GET/HEAD response through EOF; the bounded
   transport tests of §12.4 that assert it for Blob land with 3B. The schema-token
   check of §5.1 is the runtime's, for every route.
-- **3-pre — accounting:** one shared function charges managed Blob payloads by
-  logical length to the payload budget and every other batch byte by Arrow
-  memory to the keyed-write ceilings (§4.3), for every keyed writer and for the
-  compatibility loader's pre-decode forecast; plus the two §12.3 surface
-  guards. This lands first because it changes load and
-  mutation limits on its own, and the inclusive PUT bound depends on it.
+- **3-pre — accounting:** done, with the `write_max_bytes` setting: row data
+  and logical Blob payloads have independent allowances (§4.3) for every keyed
+  writer and for the compatibility loader's pre-decode forecast. The two §12.3
+  surface guards land with 3A.
 - **3A — engine:** add `Session::put_blob_at_as` and `clear_blob_at_as` through
   the shared Mutation staging/publication tail: a kind-agnostic exact-ID adapter
   generalized from the update path, the publish tail extracted so Mutation keeps
@@ -1698,8 +1702,12 @@ correctness gate.
 
 - Batched reads (`read_blobs`) landed for materializing rewrites, export, the
   change-feed baseline, change images and entity reads (§4), and schema apply
-  stopped rewriting Blob columns (§8.4). Remaining: benchmark. Tuning is
-  optional and may not weaken the batched contract or change logical behavior.
+  stopped rewriting Blob columns (§8.4). Remaining: benchmark. The active
+  benchmark catalog runs GQ operations only, and Blob reads and export are not
+  GQ operations, so that benchmark waits for a harness that can drive them;
+  until then `export.rs::export_reads_each_batch_of_managed_blobs_in_one_read_per_column`
+  pins the read count. Tuning is optional and may not weaken the batched
+  contract or change logical behavior.
 - Retain the exact empty/null/neighbor compaction guard across every future Lance
   dependency bump.
 - Consider descriptor-preserving unchanged-cell updates only with an ownership
@@ -1930,6 +1938,31 @@ publisher architecture.
 
 ## Decision log
 
+- 2026-10-11: Phase 3 is implemented: the engine writes (#908), `PUT` and
+  `DELETE /blob` (#922) and `blob put` / `blob clear` (#928). The Phase 4
+  benchmark waits for a harness that can drive Blob reads and export, which are
+  not GQ operations. Superseded: the header's "Phase 3 (mutation) is planned
+  against current main in §13"; and §10.1's "The ceilings are not a setting."
+  and "A setting without such a measured multiplier would promise a bound it
+  cannot keep.", since `write_max_bytes` now lowers the ceilings but cannot
+  raise them.
+- 2026-10-10: Step 3-pre landed as part of the `write_max_bytes` session
+  setting rather than on its own. Row data and logical Blob payloads get
+  independent allowances of `write_max_bytes` each, 32 MiB by default and at
+  most 32 MiB, captured once per operation, for every keyed writer and the
+  compatibility loader's forecast, which classifies a `base64:` value as payload
+  only for a declared Blob property. The Blob put checks its value against the
+  session's allowance, so a lowered `write_max_bytes` lowers the put's bound too.
+  A PUT carries no settings, so the route refuses a body over the server's
+  process `write_max_bytes` before reading past it and reserves only that much
+  ingress; the CLI keeps its 32 MiB pre-read bound, the setting's maximum,
+  because a served caller cannot see the server's value. The payload/row split
+  is owned by the `write_max_bytes` owners, so §12.2's `writes.rs` split bullet
+  narrows to the put's bound. The two §12.3 surface guards move to 3A. Superseded: §4.3's "The raw
+  managed payload limit is 32 MiB inclusive" and "the same operation-wide 32 MiB
+  pre-effect payload budget"; §10's "Route and engine 32 MiB inclusive limits in
+  payload bytes, separate from the batch framing budget"; and §13's 3-pre
+  bullet, including "plus the two §12.3 surface guards. This lands first".
 - 2026-10-08: Phase 3 is planned against current main, after checking every
   substrate and code assumption it makes.
   - Payload bytes and batch framing get separate budgets for every keyed writer

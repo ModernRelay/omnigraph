@@ -86,10 +86,12 @@ partitions probed per index delta; `null` is no cap) and `scope` (`order`
 for the query's own order, `primary` or `secondary` for an arm of `rrf()`). A
 physical
 `RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` and
-`row_tiebreak`. These downstream row keys follow the arm's score and fused node
-ID; selected edges use `$e.@type` before `$e.@id`. Fusion still scores the
-ranked node by its ID. A
+`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` (the
+query's, which sizes the nearest arm's candidate window; the fused rows are
+cut by the `Limit` above the `Sort`) and `row_tiebreak`. These downstream
+row keys follow the arm's score and fused node ID; selected edges use
+`$e.@type` before `$e.@id`. Fusion still scores the ranked node by its ID and
+appends the fused score as `<binding>._rrf`. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
 planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
@@ -104,7 +106,13 @@ carries no `runtime_filter` key unless a `ContainsJoin` marked it. A physical
 `table` and the `columns` the output alone reads, which the scans below no
 longer project (they read the row address instead) and which are fetched by
 row address for the rows the root `limit` kept. Its `properties` carry
-`retained_limit`, the bytes one hydrated chunk may hold. Then one
+`retained_limit`, hydration's chunk budget: a quarter for what the storage
+layer may read ahead, the rest for one chunk's fetched rows and their copies.
+It is a budget, not a cap on all memory: the row that crosses it, up to eight
+decoded rows waiting to be charged and the storage layer's soft read-ahead,
+which can pass its share by one coalesced read, all come on top, as
+[execution.md](../../dev/execution.md#v2-plan-lowering-one-node-one-operator)
+states. Then one
 `plan` row per optimizer pass that fired (`node` `pass`), and one per
 remaining field of the explain document: `route` (the engine route the plan
 describes), `logical_hash` (the structural hash of the logical plan),

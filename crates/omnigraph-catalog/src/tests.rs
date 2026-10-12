@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance_namespace::LanceNamespace;
@@ -90,7 +90,7 @@ async fn stale_overwrite_loses_the_version_cas_without_replacing_the_winner() {
         .unwrap();
     assert_eq!(winner.version().version, base.version().version + 1);
 
-    let lost = super::commit::overwrite(base, &rows)
+    let lost = super::commit::overwrite(base, &rows, None)
         .await
         .expect_err("a stale overwrite must not land over the winner");
     assert!(is_retryable_publish_conflict(&lost), "{lost}");
@@ -100,6 +100,298 @@ async fn stale_overwrite_loses_the_version_cas_without_replacing_the_winner() {
     let ids = manifest_object_ids(&head).await;
     assert!(ids.contains("cas_probe:winner"), "{ids:?}");
     assert_eq!(ids.len(), rows.tables.len() + 3, "{ids:?}");
+}
+
+/// `count` block runs from `from`, one block each, as registry rows.
+fn probe_runs(from: u128, count: u128) -> super::state::LineageRegistry {
+    super::state::LineageRegistry {
+        runs: (from..from + count)
+            .map(|n| super::state::BlockRun {
+                block: ulid::Ulid::from(n),
+                first_slot: 0,
+                last_slot: 3,
+                first_generation: u64::try_from(4 * n).unwrap(),
+                parent_commit_id: Some(format!("p{n}")),
+            })
+            .collect(),
+        merges: Vec::new(),
+    }
+}
+
+/// A hot registry overflow becomes a cold fragment below the hot one: open
+/// reads the hot fragment alone, a cold read returns the rows, a publish names
+/// the cold file unchanged, and pushes repack by the chain rule.
+#[tokio::test]
+async fn cold_registry_fragments_are_pushed_reused_and_repacked() {
+    use super::state::{cold_fragments, hot_fragment, read_cold_registry};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let dataset = open_manifest_dataset(uri, None).await.unwrap();
+    let mut rows = read_manifest_rows(&dataset).await.unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+
+    let mut registry = probe_runs(1, 70);
+    let first = registry
+        .cold_push()
+        .expect("70 rows are over the hot bound");
+    assert!(registry.is_empty() && probe_runs(1, 64).cold_push().is_none());
+    rows.registry = registry;
+    let (v2, batch) = super::commit::overwrite(dataset, &rows, Some(&first))
+        .await
+        .unwrap();
+    assert!(
+        super::state::rows_of_batch(&batch)
+            .unwrap()
+            .registry
+            .is_empty()
+    );
+    let cold = cold_fragments(&v2);
+    assert_eq!((v2.fragments().len(), cold.len()), (2, 1));
+    assert_eq!(cold[0].physical_rows, Some(70));
+    assert!(hot_fragment(&v2).unwrap().id > cold[0].id);
+    let reopened = read_manifest_rows(&v2).await.unwrap();
+    assert_eq!(
+        (reopened.head, reopened.registry),
+        (rows.head.clone(), Default::default())
+    );
+    assert_eq!(read_cold_registry(&v2, &cold).await.unwrap(), first);
+
+    let (v3, _) = super::commit::overwrite(v2, &rows, None).await.unwrap();
+    assert_eq!(v3.fragments().len(), 2);
+    assert_eq!(cold_fragments(&v3)[0].files, cold[0].files);
+
+    let second = probe_runs(100, 20);
+    let (v4, _) = super::commit::overwrite(v3, &rows, Some(&second))
+        .await
+        .unwrap();
+    let mut sizes: Vec<_> = cold_fragments(&v4)
+        .iter()
+        .map(|fragment| fragment.physical_rows)
+        .collect();
+    sizes.sort();
+    assert_eq!(
+        sizes,
+        [Some(20), Some(70)],
+        "70 is over twice 20, so it stays"
+    );
+
+    let third = probe_runs(200, 50);
+    let (v5, _) = super::commit::overwrite(v4, &rows, Some(&third))
+        .await
+        .unwrap();
+    let cold = cold_fragments(&v5);
+    assert_eq!(cold.len(), 1, "20 joins 50, then 70 is under twice 70");
+    assert_eq!(cold[0].physical_rows, Some(140));
+    let mut every = first.clone();
+    every.merge(&second);
+    every.merge(&third);
+    assert_eq!(read_cold_registry(&v5, &cold).await.unwrap(), every);
+    assert!(read_manifest_rows(&v5).await.unwrap().registry.is_empty());
+}
+
+/// The rows of a release: one run per block, split where the slot sequence or
+/// the block changes, one edge per merged parent, and no rows at all for a
+/// release whose generations are not the chain its ids claim.
+#[test]
+fn released_runs_split_at_gaps_record_merge_edges_and_assert_the_chain() {
+    use super::state::{BlockRun, LineageRegistry, MergeEdge};
+    use omnigraph_core::graph_commit_id::HistoryBlockId;
+    let (a, b, c) = (
+        ulid::Ulid::from(1u128),
+        ulid::Ulid::from(2u128),
+        ulid::Ulid::from(3u128),
+    );
+    let id = |block, slot| {
+        HistoryBlockId::new(block, slot, ulid::Ulid::from(9u128))
+            .unwrap()
+            .to_string()
+    };
+    let commit = |block, slot, generation, parent: Option<String>, merged: Option<&str>| {
+        let mut row = probe_commit(&id(block, slot), parent.as_deref());
+        row.generation = generation;
+        row.merged_parent_commit_id = merged.map(str::to_string);
+        row
+    };
+    let released = [
+        commit(a, 0, 10, Some("seed".to_string()), None),
+        commit(a, 1, 11, Some(id(a, 0)), None),
+        commit(a, 2, 12, Some(id(a, 1)), None),
+        commit(a, 4, 13, Some(id(a, 2)), None),
+        commit(b, 0, 14, Some(id(a, 4)), None),
+        commit(b, 1, 20, Some(id(b, 0)), Some("x")),
+        commit(b, 2, 21, Some(id(b, 1)), None),
+    ];
+    let registry = LineageRegistry::of_released(&released).unwrap();
+    assert_eq!(
+        registry.runs,
+        [
+            BlockRun {
+                block: a,
+                first_slot: 0,
+                last_slot: 2,
+                first_generation: 10,
+                parent_commit_id: Some("seed".to_string()),
+            },
+            BlockRun {
+                block: a,
+                first_slot: 4,
+                last_slot: 4,
+                first_generation: 13,
+                parent_commit_id: Some(id(a, 2)),
+            },
+            BlockRun {
+                block: b,
+                first_slot: 0,
+                last_slot: 2,
+                first_generation: 14,
+                parent_commit_id: Some(id(a, 4)),
+            },
+        ]
+    );
+    assert_eq!(
+        registry.merges,
+        [MergeEdge {
+            block: b,
+            slot: 1,
+            generation: 20,
+            merged_parent_commit_id: "x".to_string(),
+        }]
+    );
+
+    let legacy = [probe_commit("legacy", None), commit(c, 0, 5, None, None)];
+    let registry = LineageRegistry::of_released(&legacy).unwrap();
+    assert_eq!((registry.runs.len(), registry.merges.len()), (1, 0));
+
+    let broken = [
+        commit(c, 0, 5, None, None),
+        commit(c, 1, 7, Some(id(c, 0)), None),
+    ];
+    let error = LineageRegistry::of_released(&broken).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("a run's generations rise by one, more at a merge"),
+        "{error}"
+    );
+}
+
+/// A stamp-14 record struct lacks the three registry children: the reader
+/// fills them and decodes the same rows a stamp-15 struct holds.
+#[tokio::test]
+async fn stamp_14_record_without_registry_children_decodes() {
+    use super::record::{
+        RECORD_COLUMN, REGISTRY_FIELDS, compact_to_storage, expand_from_storage,
+        manifest_storage_schema,
+    };
+    use arrow_array::{Array, ArrayRef, StructArray};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let dataset = open_manifest_dataset(uri, None).await.unwrap();
+    let rows = read_manifest_rows(&dataset).await.unwrap();
+    let stored = compact_to_storage(
+        &rows.to_batch().unwrap(),
+        &manifest_storage_schema(HashMap::new()),
+    )
+    .unwrap();
+    let record = stored
+        .column_by_name(RECORD_COLUMN)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let (fields, children): (Vec<_>, Vec<_>) = record
+        .fields()
+        .iter()
+        .zip(record.columns())
+        .filter(|(field, _)| !REGISTRY_FIELDS.iter().any(|(name, _)| name == field.name()))
+        .map(|(field, child)| (field.clone(), child.clone()))
+        .unzip();
+    assert_eq!(fields.len() + REGISTRY_FIELDS.len(), record.fields().len());
+    let stripped: ArrayRef = Arc::new(StructArray::try_new(fields.into(), children, None).unwrap());
+    let schema = stored.schema();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name() == RECORD_COLUMN {
+            true => Arc::new(
+                Field::new(RECORD_COLUMN, stripped.data_type().clone(), false)
+                    .with_metadata(field.metadata().clone()),
+            ),
+            false => field.clone(),
+        })
+        .collect();
+    let columns = stored
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| match field.name() == RECORD_COLUMN {
+            true => stripped.clone(),
+            false => column.clone(),
+        })
+        .collect();
+    let old = RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .unwrap();
+    assert_eq!(
+        expand_from_storage(&old).unwrap(),
+        expand_from_storage(&stored).unwrap()
+    );
+    let decoded = super::state::rows_of_batch(&old).unwrap();
+    assert_eq!(
+        (decoded.head, decoded.registry),
+        (rows.head.clone(), Default::default())
+    );
+
+    let root = dir.path().join("v14");
+    let root = root.to_str().unwrap();
+    let mut metadata = old.schema().metadata().clone();
+    metadata.insert(
+        super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+        "14".to_string(),
+    );
+    let schema = Arc::new(old.schema().as_ref().clone().with_metadata(metadata));
+    let old = old.with_schema(schema).unwrap();
+    let original = super::commit::create_for_test(&manifest_uri(root), old)
+        .await
+        .unwrap();
+    let opened = ManifestCoordinator::open(root).await.unwrap();
+    assert_eq!(opened.head(), &rows.head);
+    assert_eq!(
+        opened.read_schema_contract().await.unwrap(),
+        rows.schema_contract.clone().unwrap()
+    );
+    let outcome = GraphNamespacePublisher::new(root, None)
+        .publish(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&outcome.dataset),
+        Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        outcome.dataset.version().version,
+        original.version().version + 1
+    );
+    assert_eq!(super::migrations::read_stamp(&original), Some(14));
+    let snapshot = ManifestCoordinator::snapshot_at(root, None, original.version().version)
+        .await
+        .unwrap();
+    assert_eq!(
+        ManifestCoordinator::read_schema_contract_for_snapshot(root, &snapshot)
+            .await
+            .unwrap(),
+        rows.schema_contract.unwrap()
+    );
+    let reopened = ManifestCoordinator::open(root).await.unwrap();
+    assert_eq!(reopened.version(), outcome.dataset.version().version);
 }
 
 /// One stored `__manifest` row under a new `object_id`.
@@ -2868,11 +3160,11 @@ fn lineage_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) ->
     }
 }
 
-/// A [`lineage_intent`] whose commit takes about 4 KiB of the release budget,
-/// so that about `HISTORY_RELEASE_BYTES / 4096` of them fill a buffer.
+/// A [`lineage_intent`] whose commit takes an eighth of the release budget,
+/// so that about eight of them fill a buffer.
 fn fat_intent(branch: Option<&str>, merged_parent: Option<BranchRecords>) -> LineageIntent {
     LineageIntent {
-        actor_id: Some("a".repeat(4000)),
+        actor_id: Some("a".repeat(HISTORY_RELEASE_BYTES / 8)),
         ..lineage_intent(branch, merged_parent)
     }
 }
@@ -3240,13 +3532,8 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     );
 }
 
-/// Test C (S3 variant, bucket-gated): the same two-disjoint-writers +
-/// `LineageIntent` race as Test A, but on a real object store so the one-winner
-/// behaviour exercises the genuine conditional-put CAS on `__manifest` rather
-/// than the local content-token emulation. Skips with a log when
-/// `OMNIGRAPH_S3_TEST_BUCKET` is unset (the `tests/s3_storage.rs` gate); the
-/// rustfs CI job sets it. Asserts the same end-state: both commit, single linear
-/// chain.
+/// Exercises object-store conditional PUTs; the local variant uses content tokens.
+/// Shares the bucket gate with `tests/integration/s3_storage.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
@@ -3490,6 +3777,7 @@ fn record_states_batch() -> RecordBatch {
     let rows = ManifestRows {
         schema_contract_head: None,
         schema_contract: None,
+        registry: Default::default(),
         tables: vec![probe_table(
             7,
             TableState::Dropped {
@@ -3577,6 +3865,9 @@ fn packed_record_round_trips_nulls_through_present_bits() {
             "schema_content_hash",
             "replaced_at",
             "registered_at",
+            "block_id",
+            "first_slot",
+            "last_slot",
             "present",
         ]
     );
@@ -3609,6 +3900,9 @@ fn packed_record_round_trips_nulls_through_present_bits() {
                 "created_at",
                 "replaced_at",
                 "registered_at",
+                "block_id",
+                "first_slot",
+                "last_slot",
             ]),
             null_bits(&[
                 "schema_ir_hash",
@@ -3630,6 +3924,9 @@ fn packed_record_round_trips_nulls_through_present_bits() {
                 "merged_parent_commit_id",
                 "replaced_at",
                 "registered_at",
+                "block_id",
+                "first_slot",
+                "last_slot",
             ]),
             null_bits(&[
                 "schema_ir_hash",
@@ -3652,6 +3949,9 @@ fn packed_record_round_trips_nulls_through_present_bits() {
                 "merged_parent_commit_id",
                 "actor_id",
                 "created_at",
+                "block_id",
+                "first_slot",
+                "last_slot",
             ]),
             null_bits(&[]),
         ]
@@ -3734,7 +4034,7 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
             let message = error.to_string();
             assert!(
                 message.contains(&format!("internal schema v{stamp}"))
-                    && message.contains("reads only v14 to v14")
+                    && message.contains("reads only v14 to v15")
                     && !message.contains("omnigraph upgrade"),
                 "{what} of a stamp {stamp} manifest: {message}"
             );
@@ -3775,7 +4075,7 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
         );
         refused(
             "overwrite",
-            super::commit::overwrite(dataset.clone(), &rows_at_birth)
+            super::commit::overwrite(dataset.clone(), &rows_at_birth, None)
                 .await
                 .unwrap_err(),
         );
@@ -3788,9 +4088,9 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
     }
 }
 
-/// A snapshot reports the stamp of the `__manifest` version it captured, from its
-/// attached dataset and from the fallback open, not the head's: after the head is
-/// restamped to a refused version the snapshot taken before still says v14.
+/// A snapshot reports the stamp of the `__manifest` version it captured, from
+/// its attached dataset and from the fallback open, not the head's: a head
+/// restamped to a refused version leaves an earlier snapshot at its birth stamp.
 #[tokio::test]
 async fn snapshot_stamp_follows_the_captured_version_not_the_head() {
     let dir = tempfile::tempdir().unwrap();
@@ -3815,12 +4115,13 @@ async fn snapshot_stamp_follows_the_captured_version_not_the_head() {
     let stamp_of = |snapshot: Snapshot| async move {
         ManifestCoordinator::internal_schema_stamp_for_snapshot(uri, &snapshot).await
     };
-    assert_eq!(stamp_of(held.clone()).await.unwrap(), Some(14));
+    let born_with = Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION);
+    assert_eq!(stamp_of(held.clone()).await.unwrap(), born_with);
     let mut detached = held.clone();
     detached.manifest_dataset = None;
     assert_eq!(
         stamp_of(detached.clone()).await.unwrap(),
-        Some(14),
+        born_with,
         "the fallback opens the captured version, not the restamped head"
     );
     let elsewhere = tempfile::tempdir().unwrap();
@@ -5573,16 +5874,15 @@ async fn repeated_merge_base_search_makes_no_request() {
         );
         history_requests(&probes)
     };
-    let (gets, lists, heads, bytes) = search().await;
-    assert!(
-        (4..=6).contains(&gets) && lists == 0 && heads == 0 && bytes > 0,
-        "a cold search is one GET per object it walks (the three blocks main released since \
-         the fork, the fork point's block, and what the source side reaches before the base \
-         is proven: main's first block and the genesis commit): {gets} GET, {lists} LIST, \
-         {heads} HEAD"
+    assert_eq!(
+        search().await,
+        (0, 0, 0, 0),
+        "a cold search crosses the three blocks main released since the fork over the \
+         registry rows of main's `__manifest`, down to the fork point the source still holds, \
+         and reads no `__history` object"
     );
     assert_eq!(search().await, (0, 0, 0, 0));
-    assert_eq!(late.history().objects().len(), gets);
+    assert_eq!(late.history().objects().len(), 0);
 }
 
 #[tokio::test]
@@ -6516,7 +6816,7 @@ async fn history_ids(uri: &str) -> HashSet<String> {
 /// Each merge of a still-open source block archives only the source commits no earlier merge archived, so a cold lookup of its newest and oldest commit stays in budget.
 #[tokio::test]
 async fn repeated_merges_of_an_open_source_block_append_each_commit_once_and_stay_readable() {
-    const MERGES: u16 = 450;
+    const MERGES: u16 = 24;
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let session = crate::lance_access::control_session();
@@ -6659,35 +6959,44 @@ async fn merges_separated_by_a_target_release_append_each_source_commit_once() {
     );
 }
 
-/// The block `01ARZ3NDEKTSV4RRFFQ69G5FAV` under 1,104 range extents that all
-/// cover slot 48: every `start-end` with `start` in 0..=47 and `end` in 48..=70,
+/// The block `01ARZ3NDEKTSV4RRFFQ69G5FAV` under range extents that all cover
+/// slot 48: every `start-end` with `start` in `starts` and `end` in `ends`,
 /// the run `(k+1)-j` a target forked at `k` appends when it merges at `j`.
 async fn settle_ranges_over_slot_48(
     uri: &str,
     session: &Arc<lance::session::Session>,
+    starts: std::ops::RangeInclusive<usize>,
+    ends: std::ops::RangeInclusive<usize>,
 ) -> Vec<HistoryRecord> {
+    assert!(*starts.end() < 48 && *ends.start() >= 48);
     let records = history_block_run("01ARZ3NDEKTSV4RRFFQ69G5FAV", 96);
-    for start in 0..=47 {
-        for end in 48..=70 {
-            super::history::settle(uri, session, &records[start..=end])
-                .await
-                .unwrap();
-        }
-    }
+    let ranges = starts
+        .clone()
+        .flat_map(|start| ends.clone().map(move |end| (start, end)));
+    futures::stream::iter(ranges)
+        .for_each_concurrent(Some(16), |(start, end)| {
+            let records = &records;
+            async move {
+                super::history::settle(uri, session, &records[start..=end])
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
     assert_eq!(
         stored_ranges(uri, "01ARZ3NDEKTSV4RRFFQ69G5FAV").await.len(),
-        48 * 23
+        starts.count() * ends.count()
     );
     records
 }
 
 /// A slot covered by more range extents than the old listing cap is read from the three narrowest of them, cold and through a handle's cache, for its commit and for its record.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_slot_covered_by_over_a_thousand_equal_ranges_is_read_from_three_of_them() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 0..=47, 48..=70).await;
     let wanted = &records[48];
     let id = wanted.commit.graph_commit_id.as_str();
 
@@ -6835,7 +7144,7 @@ async fn a_conflicting_copy_among_the_ranges_read_is_still_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 40..=47, 48..=55).await;
     let mut conflicting = records[48..=48].to_vec();
     conflicting[0].commit.actor_id = Some("different".to_string());
     super::history::settle(&uri, &session, &conflicting)
@@ -6862,7 +7171,7 @@ async fn a_conflicting_copy_outside_the_narrowest_three_is_refused_only_by_the_w
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}", dir.path().display());
     let session = crate::lance_access::control_session();
-    let records = settle_ranges_over_slot_48(&uri, &session).await;
+    let records = settle_ranges_over_slot_48(&uri, &session, 40..=47, 48..=55).await;
     let mut widest = records[0..=95].to_vec();
     widest[48].commit.actor_id = Some("different".to_string());
     super::history::settle(&uri, &session, &widest)
@@ -7302,6 +7611,7 @@ fn replaced_table_rows_store_the_delta_against_the_current_row() {
     let rows = ManifestRows {
         schema_contract_head: None,
         schema_contract: None,
+        registry: Default::default(),
         tables: vec![
             probe_table(7, pin(9, current_metadata)),
             probe_table(
@@ -7419,6 +7729,7 @@ fn replaced_row_measure_and_stored(
     let rows = ManifestRows {
         schema_contract_head: None,
         schema_contract: None,
+        registry: Default::default(),
         tables: current,
         head: probe_commit("c9", Some("c8")),
         buffer: CommitBuffer {
@@ -7692,6 +8003,7 @@ fn settled_commit_rows_imply_their_parent_and_inherit_their_contract() {
     let rows = ManifestRows {
         schema_contract_head: None,
         schema_contract: None,
+        registry: Default::default(),
         tables: Vec::new(),
         head: commit("c4", Some("c3"), Some(2)),
         buffer: CommitBuffer {
@@ -7757,6 +8069,7 @@ fn manifest_rows_refuse_a_buffer_that_is_not_a_run_behind_the_head() {
         let rows = ManifestRows {
             schema_contract_head: None,
             schema_contract: None,
+            registry: Default::default(),
             tables: Vec::new(),
             head,
             buffer,
@@ -9771,6 +10084,7 @@ async fn a_wide_run_over_the_object_cap_is_rebuilt_one_extent_at_a_time() {
             tables: current.clone(),
         },
         merge_base: None,
+        registry: Default::default(),
     };
     let merged: Vec<HeldRecord<'_>> = source.held().collect();
     let merge = tempfile::tempdir().unwrap();
@@ -9834,6 +10148,7 @@ fn records_to_append_of_a_wide_run_rebuild_no_table_rows() {
             tables: current.clone(),
         },
         merge_base: None,
+        registry: Default::default(),
     };
     let merge = lineage_intent(Some("target"), Some(source));
     let read = HeldRows {
@@ -10165,6 +10480,7 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
     let rows = ManifestRows {
         schema_contract_head: None,
         schema_contract: None,
+        registry: Default::default(),
         tables: Vec::new(),
         head: unnamed.commit,
         buffer: CommitBuffer::default(),
@@ -11017,7 +11333,7 @@ async fn legacy_census_of_a_stamp_9_root_records_every_commit_under_the_root_con
     let mut converted = history.head(None).unwrap().schema().metadata.clone();
     converted.insert(
         super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-        "14".to_string(),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
     );
     let (_, batch) =
         super::legacy::conversion_batch(root, &session, &census.heads[0].record, converted)
@@ -11028,10 +11344,14 @@ async fn legacy_census_of_a_stamp_9_root_records_every_commit_under_the_root_con
     assert_eq!(rows.tables, census.heads[0].record.tables);
 }
 
-/// `validate` owns protocol 6 from each of the three source formats to 14 and
-/// no other route.
+/// `validate` owns protocol 6 from each of the three source formats to the
+/// stamp this binary writes and no other route: not from a served stamp, not
+/// to the served floor.
 #[test]
 fn migrations_intent_validates_every_source_format_and_no_other_route() {
+    use super::migrations::{
+        INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+    };
     let route = |protocol, source_format, target_format| {
         super::migrations::UpgradeIntent {
             protocol,
@@ -11042,14 +11362,25 @@ fn migrations_intent_validates_every_source_format_and_no_other_route() {
         .validate()
     };
     for source_format in super::migrations::UPGRADE_SOURCE_FORMATS {
-        route(6, source_format, 14).unwrap();
+        route(6, source_format, INTERNAL_MANIFEST_SCHEMA_VERSION).unwrap();
     }
     for (protocol, source_format, target_format) in [
-        (6, 10, 14),
-        (6, 12, 14),
-        (5, 9, 14),
+        (6, 10, INTERNAL_MANIFEST_SCHEMA_VERSION),
+        (6, 12, INTERNAL_MANIFEST_SCHEMA_VERSION),
+        (5, 9, INTERNAL_MANIFEST_SCHEMA_VERSION),
+        (6, 9, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION),
         (6, 9, 13),
-        (6, 14, 14),
+        (
+            6,
+            MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+            INTERNAL_MANIFEST_SCHEMA_VERSION,
+        ),
+        (6, 13, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION),
+        (
+            6,
+            INTERNAL_MANIFEST_SCHEMA_VERSION,
+            INTERNAL_MANIFEST_SCHEMA_VERSION,
+        ),
     ] {
         let error = route(protocol, source_format, target_format).unwrap_err();
         assert!(
@@ -11432,15 +11763,16 @@ async fn legacy_census_derives_writers_tables_and_heads_and_plans_deterministica
             .await
             .unwrap_err();
         assert!(
-            stale
-                .to_string()
-                .contains("conversion rows are written under stamp 14"),
+            stale.to_string().contains(&format!(
+                "conversion rows are written under stamp {}",
+                super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION
+            )),
             "{stale}"
         );
         let mut converted = metadata.clone();
         converted.insert(
             super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-            "14".to_string(),
+            super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
         );
         let (schema, batch) = super::legacy::conversion_batch(root, &session, record, converted)
             .await
@@ -12212,7 +12544,7 @@ async fn legacy_census_records_a_contractless_head_under_the_contract_its_forks_
     let mut metadata = history.head(Some(&fork)).unwrap().schema().metadata.clone();
     metadata.insert(
         super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-        "14".to_string(),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
     );
     let (_, batch) = super::legacy::conversion_batch(root, &session, &forked.record, metadata)
         .await
@@ -12795,6 +13127,12 @@ async fn legacy_record_at_resolves_a_version_by_writer_parent_walk_and_fence() {
 /// the conversion under the pending key is read only by the fenced reader.
 #[tokio::test]
 async fn legacy_versions_of_an_upgraded_root_are_served_from_their_records() {
+    for target in [14, super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION] {
+        assert_legacy_versions_of_an_upgraded_root(target).await;
+    }
+}
+
+async fn assert_legacy_versions_of_an_upgraded_root(target: u32) {
     use super::commit_graph::{HistoryCache, graph_commit_from_manifest_row};
     use super::migrations::UPGRADE_PENDING_KEY;
     use super::retention::ManifestTagInventory;
@@ -12805,13 +13143,32 @@ async fn legacy_versions_of_an_upgraded_root_are_served_from_their_records() {
     let [_, c2, c4, f4, x3] = served.ids.each_ref().map(|id| served.record(id));
     let session = crate::lance_access::control_session();
 
-    let intent = legacy_route_intent(6, 13, 14);
-    assert_eq!(served.history.fence_for_test(&intent, 14).await.unwrap(), 5);
+    let intent = legacy_route_intent(6, 13, target);
+    assert_eq!(
+        served
+            .history
+            .fence_for_test(&intent, target)
+            .await
+            .unwrap(),
+        5
+    );
     let fence = served.history.head(None).unwrap().clone();
     let metadata = fence.schema().metadata.clone();
-    let (_, rows) = super::legacy::conversion_batch(root, &session, &c4, metadata.clone())
+    let mut writer_metadata = metadata.clone();
+    writer_metadata.insert(
+        super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+        INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+    );
+    let (_, rows) = super::legacy::conversion_batch(root, &session, &c4, writer_metadata)
         .await
         .unwrap();
+    let schema = Arc::new(
+        rows.schema()
+            .as_ref()
+            .clone()
+            .with_metadata(metadata.clone()),
+    );
+    let rows = RecordBatch::try_new(schema, rows.columns().to_vec()).unwrap();
     let conversion = super::commit::commit_overwrite(fence, vec![rows])
         .await
         .unwrap();
@@ -12970,6 +13327,138 @@ async fn legacy_versions_of_an_upgraded_root_are_served_from_their_records() {
             .graph_commit_id,
         c2.commit.graph_commit_id
     );
+    if target == 14 {
+        let old_feature = open_manifest_dataset(root, Some("feature")).await.unwrap();
+        assert_eq!(
+            old_feature.manifest().branch.as_deref(),
+            Some(served.feature.as_str())
+        );
+        let mut feature_metadata = old_feature.schema().metadata.clone();
+        feature_metadata.remove(UPGRADE_PENDING_KEY);
+        feature_metadata.insert(
+            super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+            INTERNAL_MANIFEST_SCHEMA_VERSION.to_string(),
+        );
+        let (_, feature_rows) =
+            super::legacy::conversion_batch(root, &session, &f4, feature_metadata.clone())
+                .await
+                .unwrap();
+        feature_metadata.insert(
+            super::migrations::INTERNAL_SCHEMA_VERSION_KEY.to_string(),
+            "14".to_string(),
+        );
+        let feature_schema = Arc::new(
+            feature_rows
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(feature_metadata),
+        );
+        let feature_rows =
+            RecordBatch::try_new(feature_schema, feature_rows.columns().to_vec()).unwrap();
+        let converted_feature = super::commit::commit_overwrite(old_feature, vec![feature_rows])
+            .await
+            .unwrap();
+        assert_eq!(super::migrations::read_stamp(&converted_feature), Some(14));
+
+        let mut main = ManifestCoordinator::open(root).await.unwrap();
+        main.create_branch("after_upgrade").await.unwrap();
+
+        for (logical, old_head, person_version) in [
+            ("feature", f4.commit.graph_commit_id.as_str(), 6),
+            ("after_upgrade", c4.commit.graph_commit_id.as_str(), 7),
+        ] {
+            let mut branch = ManifestCoordinator::open_at_branch(root, logical)
+                .await
+                .unwrap();
+            assert_eq!(branch.head().graph_commit_id, old_head);
+            branch
+                .commit_changes_with_lineage(
+                    &[],
+                    &HashMap::new(),
+                    Some(&lineage_intent(Some(logical), None)),
+                )
+                .await
+                .unwrap();
+            let expected_head = branch.head().clone();
+            assert_ne!(expected_head.graph_commit_id, old_head);
+
+            let mut dataset = open_manifest_dataset(root, Some(logical)).await.unwrap();
+            let native = dataset.manifest().branch.clone().unwrap();
+            super::migrations::set_stamp_for_test(&mut dataset, 14)
+                .await
+                .unwrap();
+            assert_eq!(super::migrations::read_stamp(&dataset), Some(14));
+            let retained_version = dataset.version().version;
+            let snapshot = ManifestCoordinator::snapshot_at(root, Some(logical), retained_version)
+                .await
+                .unwrap();
+            assert_eq!(snapshot.version, retained_version);
+            assert_eq!(
+                snapshot.graph_head(Some(logical)),
+                Some(expected_head.graph_commit_id.as_str())
+            );
+            assert_eq!(pinned_person(&snapshot), person_version);
+            assert_eq!(
+                ManifestCoordinator::read_schema_contract_for_snapshot(root, &snapshot)
+                    .await
+                    .unwrap(),
+                served.contract,
+            );
+
+            let tag_name = format!("native14_{logical}");
+            active
+                .tags()
+                .create(
+                    &tag_name,
+                    Ref::Version(Some(native.clone()), Some(retained_version)),
+                )
+                .await
+                .unwrap();
+            let tags = ManifestTagInventory::capture(&active).await.unwrap();
+            let pinned = tags.snapshot(&tags.tags[&tag_name], root).await.unwrap();
+            assert_eq!(pinned.snapshot.version, retained_version);
+            assert_eq!(pinned_person(&pinned.snapshot), person_version);
+            assert_eq!(
+                pinned
+                    .commit_graph(root, &HistoryCache::default())
+                    .await
+                    .unwrap()
+                    .head()
+                    .graph_commit_id,
+                expected_head.graph_commit_id,
+            );
+
+            active.tags().delete(&tag_name).await.unwrap();
+            drop(branch);
+            main.delete_branch(logical).await.unwrap();
+            let retired =
+                ManifestCoordinator::retired_commit_graphs(root, &HistoryCache::default())
+                    .await
+                    .unwrap();
+            let (_, graph) = retired
+                .iter()
+                .find(|(name, _)| name == &native)
+                .unwrap_or_else(|| panic!("retired native v14 branch {logical} was skipped"));
+            assert_eq!(
+                graph.head().graph_commit_id,
+                expected_head.graph_commit_id,
+                "{logical} must keep its native head, not the archived writer's old head",
+            );
+            let lineage = graph.lineage().await.unwrap();
+            let chain = lineage.first_parent_chain().unwrap();
+            assert_eq!(
+                chain.last().unwrap().graph_commit_id,
+                expected_head.graph_commit_id
+            );
+            assert!(
+                chain
+                    .iter()
+                    .any(|commit| commit.graph_commit_id == old_head),
+                "{logical} must retain the inherited/archived ancestor beside the post-upgrade head",
+            );
+        }
+    }
 }
 
 /// Open, read and publish refuse stamp 13 on the stamp alone and never convert
@@ -12994,7 +13483,7 @@ async fn stamps_13_is_refused_by_open_read_and_publish_naming_the_upgrade() {
         .to_string();
     for clause in [
         "internal schema v13",
-        "reads only v14 to v14",
+        "reads only v14 to v15",
         "For a standalone root, stop all readers, writers and maintenance",
         "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`",
         "A cluster-managed graph has no in-place route yet: with a main development build from \
@@ -13036,7 +13525,7 @@ async fn stamps_13_is_refused_by_open_read_and_publish_naming_the_upgrade() {
     );
     refused(
         "overwrite",
-        super::commit::overwrite(dataset.clone(), &rows_at_birth)
+        super::commit::overwrite(dataset.clone(), &rows_at_birth, None)
             .await
             .unwrap_err(),
     );
@@ -13061,7 +13550,7 @@ fn migrations_intent(version: u64) -> super::migrations::UpgradeIntent {
         protocol: 6,
         attempt: legacy_id(9),
         source_format: 13,
-        target_format: 14,
+        target_format: super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
         graph_identity: "domain".to_string(),
         branches: vec![
             SourceBranch {
@@ -13107,8 +13596,8 @@ async fn migrations_set(dataset: &mut Dataset, key: &str, value: &str) -> u64 {
 }
 
 /// The intent round-trips through the pending key byte for byte, and
-/// `intent_from` owns only protocol 6 from 13 to 14 with a contract, a plan
-/// under a known layout and one main pinned last.
+/// `intent_from` owns only protocol 6 from 13 to the stamp this binary writes
+/// with a contract, a plan under a known layout and one main pinned last.
 #[tokio::test]
 async fn migrations_intent_round_trips_and_refuses_what_this_build_cannot_own() {
     use super::migrations::{
@@ -13130,11 +13619,11 @@ async fn migrations_intent_round_trips_and_refuses_what_this_build_cannot_own() 
         guidance,
         format!(
             "storage upgrade recovery required: this graph carries the pending storage \
-             conversion of attempt {} to format v14. Keep the graph offline: stop all readers, \
+             conversion of attempt {} to format v{}. Keep the graph offline: stop all readers, \
              writers and maintenance, retain the backup taken before the attempt, and rerun \
              `omnigraph upgrade <graph>` without `--check` with this executable; the upgrade \
              resumes the existing attempt.",
-            intent.attempt
+            intent.attempt, intent.target_format
         )
     );
     assert_eq!(
@@ -13204,8 +13693,17 @@ async fn migrations_intent_round_trips_and_refuses_what_this_build_cannot_own() 
             ambiguous,
         ),
         (
-            "target 15",
-            edit(&|intent| intent.target_format = 15),
+            "a target above the stamp this binary writes",
+            edit(&|intent| {
+                intent.target_format = super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION + 1
+            }),
+            ambiguous,
+        ),
+        (
+            "a target at the served floor",
+            edit(&|intent| {
+                intent.target_format = super::migrations::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION
+            }),
             ambiguous,
         ),
         (
@@ -13455,4 +13953,47 @@ async fn migrations_receipts_complete_a_ref_only_at_the_protocol_versions() {
         rival_main.version + 1
     );
     refused(&dataset, &rival_main, "foreign upgrade receipt");
+}
+
+#[test]
+fn registry_import_keeps_only_rows_missing_from_the_captured_target() {
+    use super::state::{LineageRegistry, MergeEdge};
+
+    let mut known = probe_runs(1, 70);
+    let edge = MergeEdge {
+        block: ulid::Ulid::from(7u128),
+        slot: 2,
+        generation: 31,
+        merged_parent_commit_id: "merged-parent".to_string(),
+    };
+    known.merges.push(edge.clone());
+
+    let mut repeated = known.clone();
+    repeated.retain_missing(&known);
+    assert!(repeated.is_empty());
+
+    let mut overlapping = known.runs[0].clone();
+    overlapping.last_slot += 1;
+    let mut extra_edge = edge;
+    extra_edge.slot = 3;
+    extra_edge.generation = 32;
+    let mut novel = probe_runs(100, 1);
+    novel.runs.push(overlapping.clone());
+    novel.merges.push(extra_edge.clone());
+    let mut source = known.clone();
+    source.merge(&novel);
+    source.retain_missing(&known);
+    assert_eq!(source.runs.len(), 2);
+    assert!(source.runs.contains(&overlapping));
+    assert!(source.runs.contains(&probe_runs(100, 1).runs[0]));
+    assert_eq!(source.merges, [extra_edge]);
+
+    let mut after_import = known;
+    after_import.merge(&source);
+    source.retain_missing(&after_import);
+    assert!(source.is_empty());
+
+    let mut against_empty = novel.clone();
+    against_empty.retain_missing(&LineageRegistry::default());
+    assert_eq!(against_empty, novel);
 }

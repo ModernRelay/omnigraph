@@ -66,7 +66,48 @@ ENGINE_CASES = (
     "interrupted::interruption_boundaries_retry_from_stamp_9",
     "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock",
     "interrupted::interruption_boundaries_retry_from_stamp_8",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_legacy",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_before_activation",
+    "interrupted::interruption_boundaries_retry_without_mixed_visibility_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_9_with_a_schema_apply_lock_after_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_between_legacy_files_1_to_3",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_between_legacy_files_4_to_5",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_legacy",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_stage_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_stage_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_branch_1_to_2",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_branch_3_to_4",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_before_activation",
+    "interrupted::interruption_boundaries_retry_from_stamp_8_after_activation",
     "interrupted::a_fenced_stamp_8_or_9_rerun_reads_the_archived_contract_not_the_root_objects",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_widened_pg",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_corrupt_ir",
+    "interrupted::a_fenced_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg",
+    "interrupted::a_fenced_locked_stamp_9_rerun_reads_the_archived_contract_not_a_staged_pg",
+    "interrupted::a_fenced_stamp_8_rerun_reads_the_archived_contract_not_a_respelled_root",
     "interrupted::a_fenced_stamp_9_rerun_without_its_archived_contract_asks_for_the_backup",
     "interrupted::partial_legacy_write_is_completed_on_retry",
     "interrupted::resume_after_directory_skips_census",
@@ -81,10 +122,15 @@ SCOPES = {
     # failpoint features, one graph for the whole job and the same one `Test
     # Workspace` builds; a scope with its own selection resolved a third
     # graph (docs/dev/ci.md, cache rule).
+    # `crossversion_upgrade` and `lance_version_columns` are modules of their
+    # crates' `integration` binaries, so a selector names them with their
+    # module prefix. The crossversion scope runs the exact derived names
+    # (`--list-cases`): the bare prefix would add every other journey of the
+    # module, and two libtest filters select their union, not their intersection.
     "crossversion": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
-        "crates/omnigraph-cli/tests/crossversion_upgrade.rs",
-        "",
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" -- --exact --test-threads=1 "${cases[@]}"',
+        "crates/omnigraph-cli/tests/integration/crossversion_upgrade.rs",
+        "crossversion_upgrade::",
     ),
     "engine": (
         'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --lib --features "$FAILPOINT_FEATURES" db::upgrade::tests -- --test-threads=1',
@@ -92,9 +138,9 @@ SCOPES = {
         "db::upgrade::tests::",
     ),
     "lance": (
-        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1',
-        "crates/omnigraph/tests/lance_version_columns.rs",
-        "",
+        'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" lance_version_columns:: -- --test-threads=1',
+        "crates/omnigraph/tests/integration/lance_version_columns.rs",
+        "lance_version_columns::",
     ),
     "protocol": (
         'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test forbidden_apis --features "$FAILPOINT_FEATURES" -- --test-threads=1',
@@ -102,11 +148,29 @@ SCOPES = {
         "",
     ),
 }
+# The scopes whose selection runs inside a merged `integration` binary. The
+# lance scope's passing set must equal the source-derived inventory, extra
+# tests included, so a filter that widens onto a sibling module is refused.
+# The crossversion scope runs exact names, so its inventory comes from the
+# compiled `--list` of the same feature graph (a source regex cannot see every
+# valid declaration); the source-derived names are the floor that listing must
+# contain, and the log must equal the generated file.
+EXACT_SCOPES = ("lance",)
+CASES_FILE_SCOPES = ("crossversion",)
+COMPILED_CASE = re.compile(r"^(crossversion_upgrade::[\w:]*storage_upgrade[\w:]*): test$", re.MULTILINE)
 OLD_SCOPE_COMMANDS = (
-    'cargo test --workspace --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
+    'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade --features "$FAILPOINT_FEATURES" storage_upgrade -- --test-threads=1',
     "cargo test --locked -p omnigraph-engine --lib --features failpoints db::upgrade::tests -- --test-threads=1",
-    "cargo test --locked -p omnigraph-engine --test lance_version_columns --features failpoints -- --test-threads=1",
+    'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test lance_version_columns --features "$FAILPOINT_FEATURES" -- --test-threads=1',
     "cargo test --locked -p omnigraph-engine --test forbidden_apis --features failpoints -- --test-threads=1",
+)
+CROSSVERSION_INVENTORY_SCRIPT = (
+    'list_log="$RUNNER_TEMP/storage-upgrade-crossversion-list.log"\n'
+    'cases_file="$RUNNER_TEMP/storage-upgrade-crossversion-cases.txt"\n'
+    'cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$FAILPOINT_FEATURES" crossversion_upgrade:: -- --list 2>&1 | tee "$list_log"\n'
+    'python3 scripts/check-storage-upgrade-ci.py --list-cases crossversion --compiled "$list_log" > "$cases_file"\n'
+    'mapfile -t cases < "$cases_file"\n'
+    '[ "${#cases[@]}" -gt 0 ] || { echo "::error::the crossversion storage upgrade inventory is empty"; exit 1; }'
 )
 PREDECESSOR_TOKENS = (
     "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
@@ -172,11 +236,17 @@ echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV\""""
 
 def scope_script(scope: str) -> str:
     command = SCOPES[scope][0]
+    # The crossversion inventory is generated to a file and read back, so a
+    # failed generator fails the step under `set -e` instead of becoming an
+    # empty filter list (process substitution would hide its exit status).
+    inventory = CROSSVERSION_INVENTORY_SCRIPT + "\n" if scope in CASES_FILE_SCOPES else ""
+    cases = ' --cases "$cases_file"' if scope in CASES_FILE_SCOPES else ""
     return (
         "set -euo pipefail\n"
         f'test_log="$RUNNER_TEMP/storage-upgrade-{scope}.log"\n'
+        f"{inventory}"
         f'{command} 2>&1 | tee "$test_log"\n'
-        f'python3 scripts/check-storage-upgrade-ci.py --check-log {scope} "$test_log"'
+        f'python3 scripts/check-storage-upgrade-ci.py --check-log {scope} "$test_log"{cases}'
     )
 
 
@@ -234,29 +304,77 @@ def validate(workflow: str, table: dict | None = None) -> list[str]:
     return failures
 
 
+class InventoryError(Exception):
+    """The scope's source inventory cannot be read or names no test."""
+
+
 def expected_cases(scope: str, root: Path = ROOT) -> set[str]:
     _, source, prefix = SCOPES[scope]
+    try:
+        text = (root / source).read_text()
+    except OSError as error:
+        raise InventoryError(f"cannot read the {scope} inventory source {source}: {error}") from error
     names = set(re.findall(
         r"^#\[(?:tokio::)?test[^\n]*\]\n(?:#\[[^\n]*\]\n)*(?:async )?fn (\w+)\(",
-        (root / source).read_text(), re.MULTILINE,
+        text, re.MULTILINE,
     ))
     if scope == "crossversion":
-        names = {name for name in names if "storage_upgrade" in name} | set(CASES)
+        names = {name for name in names if "storage_upgrade" in name}
+    if not names:
+        raise InventoryError(f"the {scope} inventory source {source} names no test")
+    if scope == "crossversion":
+        names |= set(CASES)
     elif scope == "engine":
         names |= set(ENGINE_CASES)
     return {prefix + name for name in names}
 
 
-def validate_log(log: str, expected: set[str]) -> list[str]:
+def compiled_cases(scope: str, listing: str) -> set[str]:
+    """The crossversion `storage_upgrade` cases a `cargo test … crossversion_upgrade:: -- --list` printed."""
+    if scope not in CASES_FILE_SCOPES:
+        raise InventoryError(f"the {scope} scope takes no compiled listing")
+    names = set(COMPILED_CASE.findall(re.sub(r"\x1b\[[0-9;]*m", "", listing)))
+    if not names:
+        raise InventoryError("the compiled crossversion listing names no storage_upgrade test")
+    return names
+
+
+def list_cases(scope: str, root: Path = ROOT, compiled: str | None = None) -> list[str]:
+    """The scope's qualified case names, sorted, one libtest `--exact` filter each.
+
+    With `compiled`, the names are the compiled listing's, which must contain
+    every source-derived name; without it, the source-derived names alone.
+    """
+    expected = expected_cases(scope, root)
+    if compiled is None:
+        return sorted(expected)
+    names = compiled_cases(scope, compiled)
+    missing = sorted(expected - names)
+    if missing:
+        raise InventoryError(f"the compiled crossversion listing lacks required {missing}")
+    return sorted(names)
+
+
+def validate_log(log: str, expected: set[str], exact: bool = False, cases: set[str] | None = None) -> list[str]:
     failures = []
     log = re.sub(r"\x1b\[[0-9;]*m", "", log)
     if not expected:
         failures.append("required test inventory is empty")
+    if cases is not None and not cases:
+        failures.append("generated case inventory is empty")
     if re.search(r"\b(?:skipping|skipped)\b", log, re.IGNORECASE):
         failures.append("required storage upgrade coverage skipped")
     passed = set(re.findall(r"^test ([\w:]+) \.\.\. ok$", log, re.MULTILINE))
     for name in sorted(expected - passed):
         failures.append(f"required storage upgrade case {name} did not pass")
+    if cases is not None:
+        for name in sorted(cases - passed):
+            failures.append(f"generated storage upgrade case {name} did not pass")
+        for name in sorted(passed - cases):
+            failures.append(f"storage upgrade run selected {name} outside the generated inventory")
+    if exact:
+        for name in sorted(passed - expected):
+            failures.append(f"storage upgrade run selected {name} outside the required inventory")
     summaries = re.findall(
         r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; \d+ filtered out;", log, re.MULTILINE
     )
@@ -308,8 +426,8 @@ class GuardTests(unittest.TestCase):
 
     def test_old_package_feature_selection_fails(self):
         changed = self.workflow.replace(
-            "cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test crossversion_upgrade",
-            "cargo test --locked -p omnigraph-cli --test crossversion_upgrade",
+            "cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration",
+            "cargo test --locked -p omnigraph-cli --test integration",
         )
         self.assertNotEqual(changed, self.workflow)
         self.assertTrue(validate(changed))
@@ -415,17 +533,154 @@ class GuardTests(unittest.TestCase):
     def test_expected_cases_name_the_genuine_journey_and_every_engine_case(self):
         crossversion = expected_cases("crossversion")
         for name in CASES:
-            self.assertIn(name, crossversion)
+            self.assertIn("crossversion_upgrade::" + name, crossversion)
+        self.assertTrue(all(name.startswith("crossversion_upgrade::") for name in crossversion), crossversion)
         engine = expected_cases("engine")
         for name in ENGINE_CASES:
             self.assertIn("db::upgrade::tests::" + name, engine)
+        lance = expected_cases("lance")
+        self.assertTrue(lance)
+        self.assertTrue(all(name.startswith("lance_version_columns::") for name in lance), lance)
+
+    def test_list_cases_emits_the_sorted_qualified_inventory(self):
+        cases = list_cases("crossversion")
+        self.assertEqual(cases, sorted(expected_cases("crossversion")))
+        self.assertLessEqual({"crossversion_upgrade::" + name for name in CASES}, set(cases))
+        self.assertTrue(all("storage_upgrade" in name for name in cases), cases)
+
+    def test_compiled_listing_drives_the_inventory_and_keeps_the_source_floor(self):
+        import tempfile
+        constant = [f"crossversion_upgrade::{name}: test" for name in CASES]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / SCOPES["crossversion"][1]
+            source.parent.mkdir(parents=True)
+            # The second declaration is valid Rust the source regex cannot see.
+            source.write_text(
+                "#[test]\nfn storage_upgrade_seen() {}\n\n"
+                "#[test]\n// a comment between the attribute and the item\nfn storage_upgrade_probe() {}\n"
+            )
+            self.assertEqual(expected_cases("crossversion", root) & {"crossversion_upgrade::storage_upgrade_probe"}, set())
+            listing = "\n".join(
+                constant + [
+                    "crossversion_upgrade::storage_upgrade_seen: test",
+                    "crossversion_upgrade::storage_upgrade_probe: test",
+                    "crossversion_upgrade::nested::storage_upgrade_probe: test",
+                    "crossversion_upgrade::storage_upgrade_nested::probe: test",
+                    "crossversion_upgrade::unrelated_journey: test",
+                    "crossversion_upgrade::nested::unrelated_journey: test",
+                    "other::storage_upgrade_probe: test",
+                    "", "14 tests, 0 benchmarks", "", "0 tests, 0 benchmarks",
+                ]
+            ) + "\n"
+            cases = list_cases("crossversion", root, compiled=listing)
+            self.assertIn("crossversion_upgrade::storage_upgrade_probe", cases)
+            self.assertIn("crossversion_upgrade::storage_upgrade_seen", cases)
+            self.assertIn("crossversion_upgrade::nested::storage_upgrade_probe", cases)
+            self.assertIn("crossversion_upgrade::storage_upgrade_nested::probe", cases)
+            self.assertNotIn("crossversion_upgrade::unrelated_journey", cases)
+            self.assertNotIn("crossversion_upgrade::nested::unrelated_journey", cases)
+            self.assertNotIn("other::storage_upgrade_probe", cases)
+            self.assertEqual(cases, sorted(cases))
+            with self.assertRaises(InventoryError):
+                list_cases("crossversion", root, compiled=listing.replace("crossversion_upgrade::storage_upgrade_seen: test\n", ""))
+            with self.assertRaises(InventoryError):
+                list_cases("crossversion", root, compiled="0 tests, 0 benchmarks\n")
+            with self.assertRaises(InventoryError):
+                compiled_cases("lance", listing)
+            source.write_text("#[test]\nfn unrelated_journey() {}\n")
+            with self.assertRaises(InventoryError):
+                expected_cases("crossversion", root)
+
+    def test_unreadable_or_empty_inventory_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for scope in SCOPES:
+                with self.subTest(scope=scope):
+                    with self.assertRaises(InventoryError):
+                        list_cases(scope, root)
+                    empty = root / SCOPES[scope][1]
+                    empty.parent.mkdir(parents=True, exist_ok=True)
+                    empty.write_text("")
+                    with self.assertRaises(InventoryError):
+                        list_cases(scope, root)
+            empty = root / SCOPES["lance"][1]
+            empty.write_text("#[tokio::test]\nasync fn one() {}\n")
+            self.assertEqual(list_cases("lance", root), ["lance_version_columns::one"])
+
+    def test_log_must_equal_the_generated_cases(self):
+        good = (
+            "test crossversion_upgrade::storage_upgrade_a ... ok\ntest crossversion_upgrade::storage_upgrade_b ... ok\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"
+        )
+        cases = {"crossversion_upgrade::storage_upgrade_a", "crossversion_upgrade::storage_upgrade_b"}
+        floor = {"crossversion_upgrade::storage_upgrade_a"}
+        self.assertEqual(validate_log(good, floor, cases=cases), [])
+        self.assertTrue(validate_log(good, floor, cases=cases | {"crossversion_upgrade::storage_upgrade_c"}))
+        self.assertTrue(validate_log(good, floor, cases={"crossversion_upgrade::storage_upgrade_a"}))
+        self.assertTrue(validate_log(good, floor, cases=set()))
+        self.assertTrue(validate_log(good, floor | {"crossversion_upgrade::storage_upgrade_c"}, cases=cases))
+
+    def test_crossversion_inventory_generation_precedes_cargo(self):
+        script = scope_script("crossversion")
+        run = script.index("-- --exact --test-threads=1")
+        self.assertLess(script.index("-- --list 2>&1"), script.index("--list-cases crossversion --compiled"))
+        self.assertLess(script.index("--list-cases crossversion --compiled"), run)
+        self.assertLess(script.index('"${#cases[@]}" -gt 0'), run)
+        self.assertIn('--check-log crossversion "$test_log" --cases "$cases_file"', script)
+        self.assertNotIn("<(", script)
+        self.assertNotIn("$(", script)
+        block = "".join(f"          {line}\n" for line in CROSSVERSION_INVENTORY_SCRIPT.splitlines())
+        self.assertEqual(self.workflow.count(block), 1)
+        for line in CROSSVERSION_INVENTORY_SCRIPT.splitlines():
+            for replacement in ("", f"true # {line}", f"{line} || true"):
+                with self.subTest(line=line, replacement=replacement):
+                    altered = block.replace(f"          {line}\n", f"          {replacement}\n" if replacement else "")
+                    changed = self.workflow.replace(block, altered)
+                    self.assertNotEqual(changed, self.workflow)
+                    self.assertIn(
+                        "storage compatibility requires the exact fail-closed crossversion command and log check",
+                        validate(changed),
+                    )
+
+    def test_exact_scopes_refuse_extra_and_prefixed_mismatches(self):
+        good = (
+            "test crossversion_upgrade::alpha ... ok\ntest crossversion_upgrade::beta ... ok\n"
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"
+        )
+        expected = {"crossversion_upgrade::alpha", "crossversion_upgrade::beta"}
+        self.assertEqual(validate_log(good, expected, exact=True), [])
+        extra = good.replace(
+            "test crossversion_upgrade::beta ... ok\n",
+            "test crossversion_upgrade::beta ... ok\ntest other::gamma ... ok\n",
+        ).replace("2 passed", "3 passed")
+        self.assertEqual(validate_log(extra, expected), [])
+        self.assertEqual(
+            validate_log(extra, expected, exact=True),
+            ["storage upgrade run selected other::gamma outside the required inventory"],
+        )
+        bare = good.replace("crossversion_upgrade::", "")
+        self.assertTrue(validate_log(bare, expected, exact=True))
+        omitted = good.replace("test crossversion_upgrade::beta ... ok\n", "").replace("2 passed", "1 passed")
+        self.assertEqual(
+            validate_log(omitted, expected, exact=True),
+            ["required storage upgrade case crossversion_upgrade::beta did not pass"],
+        )
+        ignored = good.replace("test crossversion_upgrade::beta ... ok", "test crossversion_upgrade::beta ... ignored")
+        self.assertTrue(validate_log(ignored, expected, exact=True))
+        self.assertTrue(validate_log(good + "skipping genuine stamp-13 storage upgrade\n", expected, exact=True))
+        self.assertIn("crossversion", CASES_FILE_SCOPES)
+        self.assertIn("lance", EXACT_SCOPES)
 
     def test_every_named_case_exists_in_its_source(self):
+        # A case is an `fn` or a `name: …;` row of the `retry_journeys!` macro.
         for scope, cases in (("crossversion", CASES), ("engine", ENGINE_CASES)):
             source = (ROOT / SCOPES[scope][1]).read_text()
             for name in cases:
                 with self.subTest(name=name):
-                    self.assertRegex(source, rf"\bfn {name.rsplit('::', 1)[-1]}\(")
+                    bare = name.rsplit("::", 1)[-1]
+                    self.assertRegex(source, rf"(?m)\bfn {bare}\(|^\s+{bare}: ", msg=name)
 
     def test_log_requires_every_case_and_positive_unskipped_summary(self):
         good = "test alpha ... ok\ntest beta ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 1s\n"
@@ -452,15 +707,38 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--check-log", nargs=2, metavar=("SCOPE", "PATH"))
+    parser.add_argument("--list-cases", metavar="SCOPE", help="print the scope's qualified case names, one per line")
+    parser.add_argument("--compiled", metavar="PATH", help="with --list-cases: a `cargo test … -- --list` log to take the names from")
+    parser.add_argument("--cases", metavar="PATH", help="with --check-log: the generated case file the log must equal")
     args = parser.parse_args()
     if args.self_test:
         result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(GuardTests))
         return 0 if result.wasSuccessful() else 1
+    if args.list_cases:
+        if args.list_cases not in SCOPES:
+            parser.error(f"unknown test scope: {args.list_cases}")
+        try:
+            compiled = Path(args.compiled).read_text() if args.compiled else None
+            cases = list_cases(args.list_cases, compiled=compiled)
+        except (InventoryError, OSError) as error:
+            print(f"Storage upgrade CI: {error}", file=sys.stderr)
+            return 1
+        for name in cases:
+            print(name)
+        return 0
     if args.check_log:
         scope, path = args.check_log
         if scope not in SCOPES:
             parser.error(f"unknown test scope: {scope}")
-        failures = validate_log(Path(path).read_text(), expected_cases(scope))
+        if (scope in CASES_FILE_SCOPES) != bool(args.cases):
+            parser.error(f"--cases is required for {', '.join(CASES_FILE_SCOPES)} and refused for other scopes")
+        try:
+            expected = expected_cases(scope)
+            cases = {line.strip() for line in Path(args.cases).read_text().splitlines() if line.strip()} if args.cases else None
+        except (InventoryError, OSError) as error:
+            print(f"Storage upgrade CI: {error}", file=sys.stderr)
+            return 1
+        failures = validate_log(Path(path).read_text(), expected, exact=scope in EXACT_SCOPES, cases=cases)
     else:
         failures = validate((ROOT / ".github/workflows/ci.yml").read_text())
     if failures:

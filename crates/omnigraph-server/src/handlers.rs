@@ -40,10 +40,11 @@ where
 
 mod dispatch;
 use dispatch::{
-    Door, ReadDispatch, classify, control_write_at_read_door, explain_at_write_door,
+    CommitControlOutcome, Door, ReadDispatch, classify, commit_control_body,
+    commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
     read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, session_with_prefix,
-    show_at_write_door,
+    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
+    session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -975,6 +976,304 @@ pub(crate) async fn server_blob_head(
     blob_transport::serve_blob_head(read, &headers).inspect_err(log_blob_transport_internal)
 }
 
+#[utoipa::path(
+    put,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "putBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. Weak tags never match. The write evaluates it against the branch head it applies to."),
+    ),
+    request_body(
+        content = inline(BlobBinaryBody),
+        content_type = "application/octet-stream",
+        description = "The raw bytes to store: at most 33554432 bytes (32 MiB), inclusive."
+    ),
+    responses(
+        (status = 200, description = "The bytes are published in one graph commit", body = BlobWriteOutput,
+            headers(
+                ("ETag" = String, description = "Strong validator of the stored value; equals `etag` in the body"),
+            )),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 408, description = "The request body did not arrive before the body deadline", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
+        (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Replace one Blob value of an existing node or edge with the request body.
+///
+/// The cell's old value is never read; the entity's other cells are carried
+/// unchanged. Authorization of `change` on the branch runs before the body is
+/// read. Once admitted the write is owned by the server: a disconnect loses
+/// only the response, never cancels or replays the write.
+pub(crate) async fn server_blob_put(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+    request: Request,
+) -> std::result::Result<Response, ApiError> {
+    let ingress = request
+        .extensions()
+        .get::<IngressLease>()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("missing ingress reservation"))?;
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(request.headers())?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+
+    let content_type = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(content_type, Some(value) if value.eq_ignore_ascii_case("application/octet-stream"))
+    {
+        return Err(ApiError::unsupported_media_type(
+            "a Blob put requires Content-Type: application/octet-stream",
+        ));
+    }
+    let declared = match request.headers().get(CONTENT_LENGTH) {
+        None => None,
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| ApiError::bad_request("invalid Content-Length"))?,
+        ),
+    };
+    let limit = state.blob_put_limit();
+    if let Some(declared) = declared.filter(|declared| *declared > limit) {
+        return Err(blob_put_too_large(limit, declared));
+    }
+
+    let deadline = request
+        .extensions()
+        .get::<ingress::BodyDeadline>()
+        .copied()
+        .ok_or_else(|| ApiError::internal("missing request body deadline"))?;
+    let bytes = tokio::time::timeout_at(
+        deadline.0,
+        collect_blob_put_body(request.into_body(), declared, limit),
+    )
+    .await
+    .map_err(|_| ingress::body_timeout())??;
+    ingress
+        .shrink(bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, bytes.len() as u64)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .put_blob_at_as(&branch, cell, bytes, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/blob",
+    tag = "blobs",
+    operation_id = "clearBlob",
+    params(
+        BlobWriteQuery,
+        ("If-Match" = Option<String>, Header, description = "`*` to require a value in the cell, or a list of strong entity tags one of which must equal the cell's current ETag. A null cell satisfies neither form."),
+    ),
+    responses(
+        (status = 200, description = "The cell is null. `commit` is the clear's publication, or `null` when the cell already was null and nothing was published", body = BlobWriteOutput),
+        (status = 400, description = "Invalid selector, query parameter, If-Match field or target, a non-Blob or non-nullable property, or a carried external reference the graph's policy denies", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
+            headers(
+                ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
+            )),
+        (status = 413, description = "The entity's carried Blob payloads exceed the write's payload limit", body = ErrorOutput),
+        (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "Write admission is closed or an overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Set one nullable Blob value of an existing node or edge to null.
+///
+/// Clearing a cell that is already null publishes nothing. Like a put, the
+/// clear is owned by the server once admitted.
+pub(crate) async fn server_blob_delete(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    headers: HeaderMap,
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<Response, ApiError> {
+    let query = parse_blob_write_query(query)?;
+    let precondition = blob_write_precondition(&headers)?;
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let branch = query.branch.clone().unwrap_or_else(|| "main".to_string());
+    authorize_blob_write(&handle, actor, &branch)?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, 0)
+        .map_err(ApiError::from_workload_reject)?;
+
+    let session = state.session(&handle, None)?;
+    let selector = BlobSelectorOutput::from(&query);
+    let cell = blob_write_cell(query);
+    let actor_id = actor.map(|actor| actor.actor_id.to_string());
+    let output = owned_write(&state, admission, ingress, handle.clone(), async move {
+        let outcome = session
+            .clear_blob_at_as(&branch, cell, precondition, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(api::blob_write_output(selector, branch, &outcome, actor_id))
+    })
+    .await?;
+    blob_write_response(output)
+}
+
+fn parse_blob_write_query(
+    query: std::result::Result<Query<BlobWriteQuery>, QueryRejection>,
+) -> std::result::Result<BlobWriteQuery, ApiError> {
+    query.map(|Query(query)| query).map_err(|rejection| {
+        ApiError::bad_request(format!(
+            "invalid Blob write query parameters: {}",
+            rejection.body_text()
+        ))
+    })
+}
+
+fn blob_write_precondition(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<omnigraph::BlobPrecondition>, ApiError> {
+    api::parse_blob_if_match(
+        headers
+            .get_all(axum::http::header::IF_MATCH)
+            .iter()
+            .map(|value| value.as_bytes()),
+    )
+    .map_err(ApiError::bad_request)
+}
+
+/// A Blob write needs `change` on its branch, checked before any body byte
+/// is read.
+fn authorize_blob_write(
+    handle: &GraphHandle,
+    actor: Option<&AuthenticatedActor>,
+    branch: &str,
+) -> std::result::Result<(), ApiError> {
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )
+}
+
+fn blob_write_cell(query: BlobWriteQuery) -> omnigraph::BlobCell {
+    omnigraph::BlobCell {
+        entity: match query.entity {
+            api::BlobEntityKind::Node => omnigraph::EntityKind::Node,
+            api::BlobEntityKind::Edge => omnigraph::EntityKind::Edge,
+        },
+        type_name: query.r#type,
+        id: query.id,
+        property: query.property,
+    }
+}
+
+/// The refusal of a put body over the limit: the same resource, limit and
+/// message the engine reports for an oversized embedded put.
+fn blob_put_too_large(limit: u64, actual: u64) -> ApiError {
+    ApiError::from_omni(OmniError::resource_limit(
+        omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE,
+        limit,
+        actual,
+    ))
+}
+
+/// Collect a put body into one buffer, sized from a declared length that is
+/// already within the limit. The engine adopts the buffer without a copy.
+async fn collect_blob_put_body(
+    body: Body,
+    declared: Option<u64>,
+    limit: u64,
+) -> std::result::Result<Bytes, ApiError> {
+    let capacity = declared.map_or(Ok(0), usize::try_from).map_err(|_| {
+        ApiError::bad_request("Content-Length does not fit in this platform's memory")
+    })?;
+    let mut data = Vec::with_capacity(capacity);
+    let mut body = body.into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::bad_request(format!("failed to read Blob request body: {err}"))
+        })?;
+        let actual = data.len().saturating_add(chunk.len()) as u64;
+        if actual > limit {
+            return Err(blob_put_too_large(limit, actual));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if declared.is_some_and(|declared| declared != data.len() as u64) {
+        return Err(ApiError::bad_request(
+            "Blob request body length does not match its Content-Length",
+        ));
+    }
+    Ok(Bytes::from(data))
+}
+
+/// A write receipt with its `ETag` header when the cell holds a managed value.
+fn blob_write_response(output: BlobWriteOutput) -> std::result::Result<Response, ApiError> {
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = output.etag.as_deref() {
+        headers.insert(
+            axum::http::header::ETAG,
+            axum::http::HeaderValue::from_str(etag)
+                .map_err(|_| ApiError::internal("a managed Blob ETag is not a header value"))?,
+        );
+    }
+    Ok((StatusCode::OK, headers, Json(output)).into_response())
+}
+
 fn parse_blob_read_query(
     query: std::result::Result<Query<BlobReadQuery>, QueryRejection>,
 ) -> std::result::Result<BlobReadQuery, ApiError> {
@@ -1266,6 +1565,18 @@ pub(crate) async fn run_mutate(
                 BranchStmt::List => Err(read_at_write_door()),
             };
         }
+        FileBody::Commit(write) => {
+            if door == Door::Query {
+                return Err(commit_write_at_read_door(&write));
+            }
+            refuse_statement_envelope(
+                branch.is_some(),
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return run_commit_statement(&state, &handle, &session, actor, ingress, write).await;
+        }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
         FileBody::Explain(_) => {
             refuse_explain(door)?;
@@ -1369,6 +1680,14 @@ pub(crate) async fn run_query(
                 )),
                 BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
             };
+        }
+        FileBody::Commit(write) => {
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return Err(commit_write_at_read_door(&write));
         }
         FileBody::Show(id) => {
             refuse_statement_envelope(
@@ -2506,6 +2825,11 @@ pub(crate) async fn server_branch_merge(
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid branch merge request", rejection))?;
+    if request.as_commit && request.delete_branch {
+        return Err(ApiError::bad_request(
+            "a merge `as_commit` keeps its source until the commit is published or dropped; drop `delete_branch`",
+        ));
+    }
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
     let session = state.session(&handle, request.settings.as_ref())?;
@@ -2515,10 +2839,11 @@ pub(crate) async fn server_branch_merge(
         .operations
         .submit((admission, ingress, handle.clone()), async move {
             let result = match session
-                .branch_merge_as(
+                .branch_merge_as_with_options(
                     &request.source,
                     &target,
                     actor.as_ref().map(|actor| actor.actor_id.as_ref()),
+                    request.as_commit,
                 )
                 .await
                 .map_err(ApiError::from_omni)
@@ -2560,6 +2885,7 @@ pub(crate) async fn server_branch_merge(
 /// Body shared by `POST /branches/merge` and the `branch merge` statement:
 /// the `branch_merge` check on (`source`, `target`), admission, the engine
 /// call. A conflict surfaces as `ApiError::merge_conflict` (409).
+#[allow(clippy::too_many_arguments)]
 async fn branch_merge_body(
     state: &AppState,
     handle: &GraphRequest,
@@ -2568,6 +2894,7 @@ async fn branch_merge_body(
     ingress: IngressLease,
     source: &str,
     target: &str,
+    as_commit: bool,
 ) -> std::result::Result<MergeResult, ApiError> {
     let admission = admit_branch_merge(state, handle, actor, source, target)?;
     let session = session.clone();
@@ -2576,7 +2903,7 @@ async fn branch_merge_body(
     let actor_id = actor.map(|actor| actor.actor_id.to_string());
     owned_write(state, admission, ingress, handle.clone(), async move {
         session
-            .branch_merge_as(&source, &target, actor_id.as_deref())
+            .branch_merge_as_with_options(&source, &target, actor_id.as_deref(), as_commit)
             .await
             .map_err(ApiError::from_omni)
     })
@@ -2667,6 +2994,10 @@ async fn delete_merged_source_branch(
 /// contract — newest first by (graph-manifest version, created-at, commit id) — and
 /// a future `cursor`/`limit` pagination will be keyset-based on that same
 /// order. Read-only.
+///
+/// `unpublished=true` lists instead the unpublished commits whose recorded
+/// target is `branch` (writes `as commit` awaiting `commit publish`), newest
+/// first; each carries `published: false`.
 pub(crate) async fn server_commit_list(
     Extension(handle): Extension<GraphRequest>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -2685,12 +3016,13 @@ pub(crate) async fn server_commit_list(
             target_branch: None,
         },
     )?;
-    let commits = {
-        let db = &handle.engine;
-        db.list_commits(Some(branch.as_str()))
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let db = &handle.engine;
+    let commits = if query.unpublished {
+        db.list_unpublished_commits(Some(branch.as_str())).await
+    } else {
+        db.list_commits(Some(branch.as_str())).await
+    }
+    .map_err(ApiError::from_omni)?;
     Ok(Json(CommitListOutput {
         commits: commits.iter().map(api::commit_output).collect(),
     }))
@@ -2745,6 +3077,103 @@ pub(crate) async fn server_commit_show(
             .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::commit_output(&commit)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/commits/{commit_id}/publish",
+    tag = "commits",
+    operation_id = "publishCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 200, description = "The commit as published on its recorded target branch; a published id is answered as it stands", body = api::CommitOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its publication is not permitted", body = ErrorOutput),
+        (status = 409, description = "The target's state moved under the proposal's authority", body = ErrorOutput),
+        (status = 412, description = "The target head moved past the commit's captured parent; the commit can only be dropped", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Publish an unpublished commit onto its recorded target branch.
+///
+/// The target is the branch the commit recorded when it was written `as
+/// commit`, so the request carries no body. Runs under `commit_publish` on
+/// that branch; a denial answers the 404 an unknown id answers. The GQ
+/// statement `commit publish "<id>"` on `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_publish(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    let CommitControlOutcome { commit, .. } = commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Publish {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    commit
+        .map(Json)
+        .ok_or_else(|| ApiError::internal("commit publish answered no commit"))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/commits/{commit_id}",
+    tag = "commits",
+    operation_id = "dropCommit",
+    params(
+        ("commit_id" = String, Path, description = "Unpublished commit identifier"),
+    ),
+    responses(
+        (status = 204, description = "Commit dropped: its id stops resolving and its held merge inputs are released"),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 404, description = "Commit not found, or its drop is not permitted", body = ErrorOutput),
+        (status = 409, description = "The commit is published", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Drop an unpublished commit.
+///
+/// **Irreversible.** Runs under `commit_drop` on the commit's recorded target
+/// branch; a denial answers the 404 an unknown id answers. A published commit
+/// is never dropped (409). The GQ statement `commit drop "<id>"` on
+/// `POST /mutate` runs the same body.
+pub(crate) async fn server_commit_drop(
+    State(state): State<AppState>,
+    Extension(handle): Extension<GraphRequest>,
+    Extension(ingress): Extension<IngressLease>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+    let session = state.session(&handle, None)?;
+    commit_control_body(
+        &state,
+        &handle,
+        &session,
+        actor_ref,
+        ingress,
+        omnigraph_compiler::query::ast::CommitWrite::Drop {
+            graph_commit_id: commit_id,
+        },
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) fn read_target_from_request(

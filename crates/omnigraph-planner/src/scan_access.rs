@@ -6,7 +6,7 @@ use crate::error::PlanError;
 use crate::logical::{RuntimeInput, ScanAccess, ScanSpec};
 use crate::optimizer::{Optimized, gq_conjunct};
 use crate::physical::{PhysicalNode, RankKind, ScanInput};
-use crate::source::{IndexKind, PlanSource};
+use crate::source::{IndexFact, IndexKind, PlanSource};
 
 pub const PASS_SCAN_ACCESS: &str = "scan_access";
 pub const PASS_KEY_TO_ID: &str = "key_to_id";
@@ -55,7 +55,7 @@ pub async fn finalize_scan_access(
             }
         } else if let Some(input) = source.scan_runtime_input(spec) {
             ScanAccess::Runtime { input }
-        } else if spec.filter.is_none() || facts.is_empty() {
+        } else if spec.filter.is_none() || !facts.iter().any(IndexFact::may_narrow) {
             ScanAccess::Sequential
         } else {
             if facts.iter().any(|fact| {

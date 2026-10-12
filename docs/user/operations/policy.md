@@ -18,6 +18,8 @@ Graph-scoped actions:
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
+| `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
+| `commit_drop` | Drop of an unpublished commit |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
@@ -106,7 +108,13 @@ cluster APIs keep their explicit trust boundary.
 Graph rules may use `branch_scope` for a source branch or
 `target_branch_scope` for a destination branch. Values are `any`, `protected`,
 or `unprotected`; a rule may not set both. Server actions and graph-wide
-`invoke_query` rules do not take branch scopes.
+`invoke_query` rules do not take branch scopes. `commit_publish` and
+`commit_drop` take `target_branch_scope`: the scope is the branch the
+unpublished commit recorded as its target. Writing an unpublished commit
+needs no new action: a mutation `as commit` is a `change` on its branch and a
+merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
+can omit `as commit`; this is a voluntary review workflow, not an approval
+boundary (see [Unpublished graph commits](../../rfcs/2026-10-10-unpublished-graph-commits.md)).
 
 ## Validate and test
 

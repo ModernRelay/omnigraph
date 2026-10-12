@@ -1563,6 +1563,78 @@ async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRef
     }
 }
 
+/// A fragment reader reads a data file in the dataset's own base through the
+/// scan scheduler `FragReadConfig` passes, and a file the dataset reaches
+/// through a `base_id` (the files a branch inherits) through a
+/// maximum-bandwidth scheduler Lance 11 opens for it, ignoring the one
+/// passed: the passed scheduler reads that file's rows without a byte.
+/// `HydrateExec` bounds Lance's read-ahead with the scheduler it passes, and
+/// for this reason reads a fragment holding an inherited file (a table fork
+/// created before v11) one row per request (`fragment_rows` in
+/// `engine/operators/hydrate.rs`). When this goes
+/// red, Lance honors the passed scheduler for every base: drop that fallback
+/// and this guard together.
+#[tokio::test]
+async fn fragment_reads_bypass_the_passed_scheduler_for_inherited_files() {
+    use lance::dataset::fragment::FragReadConfig;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("inherited.lance");
+    let mut main = fresh_dataset(uri.to_str().unwrap()).await;
+    let mut branch = main
+        .create_branch("inherits", main.version().version, None)
+        .await
+        .unwrap();
+    append_guard_row(&mut branch, "carol", 3).await;
+    let store = branch.object_store(None).await.unwrap();
+    let schema = branch.schema().project(&["value"]).unwrap();
+    let mut seen = (false, false);
+    for fragment in branch.get_fragments() {
+        let inherited = fragment
+            .metadata()
+            .files
+            .iter()
+            .any(|file| file.base_id.is_some());
+        let scheduler = ScanScheduler::new(Arc::clone(&store), SchedulerConfig::new(1 << 20));
+        let reader = fragment
+            .open(
+                &schema,
+                FragReadConfig::default()
+                    .with_row_address(true)
+                    .with_scan_scheduler(Arc::clone(&scheduler)),
+            )
+            .await
+            .unwrap();
+        let mut rows = 0;
+        let mut tasks = reader.take(&[0], 1, None).await.unwrap();
+        while let Some(task) = futures::StreamExt::next(&mut tasks).await {
+            rows += task.await.unwrap().num_rows();
+        }
+        assert_eq!(rows, 1);
+        let read = scheduler.stats().bytes_read;
+        if inherited {
+            seen.0 = true;
+            assert_eq!(
+                read, 0,
+                "Lance read an inherited file through the passed scheduler: \
+                 drop hydration's one-row fallback for inherited files"
+            );
+        } else {
+            seen.1 = true;
+            assert!(
+                read > 0,
+                "an own-base file must read through the passed scheduler"
+            );
+        }
+    }
+    assert_eq!(
+        seen,
+        (true, true),
+        "the branch must hold an inherited and an own fragment"
+    );
+}
+
 async fn recreate_named_branch_and_assert_token_changes(main: &mut Dataset, require_etag: bool) {
     let base_version = main.version().version;
     let first = main
@@ -5746,6 +5818,9 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 // a silently-wrong batch) in release. Faithful transcription of lance#7444's
 // minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
 // This guard turns red if a future Lance bump regresses the upstream fix.
+// It also pins that the merge-update keeps the updated row's stable row id:
+// a Blob write reads that id back from its own detached commit to form the
+// ETag a later read at the published snapshot returns (RFC 0033 §4.3).
 #[tokio::test]
 async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
     use futures::TryStreamExt;
@@ -5800,11 +5875,29 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         (1..=40).map(|i| format!("r{i}")).collect(),
     );
     let ds = merge(ds, seed, schema.clone()).await;
+    let row_id_of = |ds: Dataset, slug: &'static str| async move {
+        let mut scan = ds.scan();
+        scan.with_row_id();
+        scan.filter(&format!("slug = '{slug}'")).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1, "{slug}");
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0)
+    };
+    let seeded_row_id = row_id_of(ds.clone(), "t3").await;
     let updates = mk_batch(
         (1..=15).map(|i| format!("t{i}")).collect(),
         (1..=15).map(|i| format!("e{i}")).collect(),
     );
     let ds = Arc::new(merge(ds, updates, schema.clone()).await);
+    assert_eq!(
+        row_id_of((*ds).clone(), "t3").await,
+        seeded_row_id,
+        "a whole-row merge-update keeps the updated row's stable row id"
+    );
 
     // The delete's deletion vector makes the overlapping id region sparse.
     let staged = lance::dataset::DeleteBuilder::new(ds.clone(), "slug = 't20'")
@@ -5834,6 +5927,72 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
     }
+}
+
+// --- Guard: merge-insert refuses an external Blob reference outside the bases ---
+//
+// Lance 11's merge-insert writer stages its files with `WriteParams::default()`,
+// whose `allow_external_blob_outside_bases` is false, and a merge-insert takes
+// no other write params. A keyed write therefore cannot carry a stored external
+// reference as a reference: the engine reads it and stores managed bytes, or
+// refuses it under a denying policy (RFC 0033 §4.3). When this goes red,
+// merge-insert stores such a reference, and carrying a sibling's reference
+// without reading it is open again (RFC 0033, Phase 4).
+#[tokio::test]
+async fn merge_insert_refuses_an_external_blob_outside_the_dataset_bases() {
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("outside.bin");
+    std::fs::write(&external_path, b"outside the dataset").unwrap();
+    let external_uri = url::Url::from_file_path(&external_path)
+        .unwrap()
+        .to_string();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let row = |content: arrow_array::ArrayRef| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a"])), content],
+        )
+        .unwrap()
+    };
+    let mut managed = BlobArrayBuilder::new(1);
+    managed.push_bytes(b"managed").unwrap();
+    let ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(row(managed.finish().unwrap()))], schema.clone()),
+        dir.path().join("table.lance").to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut external = BlobArrayBuilder::new(1);
+    external.push_uri(external_uri.as_str()).unwrap();
+    let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let error = job
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(row(external.finish().unwrap()))],
+            schema.clone(),
+        ))
+        .await
+        .expect_err("merge-insert must refuse a reference outside the dataset's bases");
+    assert!(
+        error
+            .to_string()
+            .contains("is outside registered external bases"),
+        "{error}"
+    );
 }
 
 // --- Guard 21: starts_with routes to the BTREE (LikePrefix) and stays literal --

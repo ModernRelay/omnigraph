@@ -61,7 +61,16 @@ pub mod publisher;
 pub mod read_executor;
 pub mod retention;
 pub mod state;
+pub mod unpublished;
 pub use branch_names::is_merge_input_tag;
+pub use migrations::{
+    UNPUBLISHED_COMMITS_STAMP, require_unpublished_commits, supports_unpublished_commits,
+};
+pub use unpublished::{
+    UNPUBLISHED_TAG_PREFIX, UnpublishedCommit, UnpublishedCommitProperty, UnpublishedExpiry,
+    UnpublishedLifetime, UnpublishedMergeInputs, is_unpublished_tag, unpublished_tag_commit_id,
+    unpublished_tag_name,
+};
 
 pub use graph::{GenesisManifestAttempt, ManifestInitError};
 use graph::{
@@ -85,13 +94,15 @@ use metadata::{
 pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
+pub use publisher::{CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
 use state::read_schema_contract_row;
 #[cfg(test)]
 use state::string_column;
-pub use state::{BranchRecords, CommitBuffer, ReplacedRow, ReplacedTable};
+pub use state::{
+    BlockRun, BranchRecords, CommitBuffer, LineageRegistry, MergeEdge, ReplacedRow, ReplacedTable,
+};
 pub use state::{
     GraphLineageRow, SchemaContractHead, SchemaContractRow, TablePin, TableRow, TableState,
 };
@@ -120,6 +131,14 @@ pub const OBJECT_TYPE_SETTLED_COMMIT: &str = "settled_commit";
 /// What a publish read for a table identity it then changed, kept while a
 /// buffered commit is older than that publish.
 pub const OBJECT_TYPE_REPLACED_TABLE: &str = "replaced_table";
+/// One released first-parent run of a history block, as the merge-base walk
+/// reads it: the block, its slot range, the generation of its first slot and
+/// that slot's parent. `object_id` is [`history_block_object_id`].
+pub const OBJECT_TYPE_HISTORY_BLOCK: &str = "history_block";
+/// One merge commit inside a released run: its block and slot, its generation
+/// and its merged parent, the one edge that leaves the run's chain.
+/// `object_id` is [`history_merge_object_id`].
+pub const OBJECT_TYPE_HISTORY_MERGE: &str = "history_merge";
 /// The commit ceiling of the buffer of a `__manifest` version. The buffer is
 /// released on [`HISTORY_RELEASE_BYTES`]; the ceiling only bounds a buffer of
 /// tiny commits. Equal to the slot ceiling of a history block.
@@ -488,6 +507,40 @@ impl SnapshotDataset {
     /// Whether this dataset has a user full-text index on physical `column`.
     pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
         crate::dataset_index::has_fts_index_on(&self.dataset, column).await
+    }
+
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        crate::dataset_index::has_fts_postings_on(&self.dataset, column).await
+    }
+
+    /// The names of this version's built index entries: every entry of the
+    /// raw index-metadata section, read without the current reader's
+    /// supported-version filtering (see [`Self::has_raw_index_section`]),
+    /// except untrained full-text segments, which index no row. System
+    /// entries count as built. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        if !self.has_raw_index_section() {
+            return Ok(Vec::new());
+        }
+        let store = self
+            .dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            &store,
+            self.dataset.manifest_location(),
+            self.dataset.manifest(),
+        )
+        .await
+        .map_err(OmniError::storage)?;
+        Ok(indices
+            .into_iter()
+            .filter(|index| !crate::dataset_index::is_untrained_full_text(index))
+            .map(|index| index.name)
+            .collect())
     }
 
     /// Whether this dataset has a user vector index on physical `column`.
@@ -952,7 +1005,8 @@ impl CollectorBranch {
             rows.head,
             rows.buffer.commits(),
             history.clone(),
-        ))
+        )
+        .with_registry(Arc::new(rows.registry), &self.dataset))
     }
 
     /// The version history up to the opened version; a version published
@@ -1147,6 +1201,8 @@ pub struct ManifestCoordinator {
     head: Arc<HistoryRecord>,
     /// The buffer of that same version.
     buffer: Arc<CommitBuffer>,
+    /// The block registry rows that version's hot fragment holds.
+    registry: Arc<LineageRegistry>,
     history: HistoryCache,
 }
 
@@ -1172,6 +1228,7 @@ impl ManifestCoordinator {
             publisher: Arc::clone(&self.publisher),
             head: Arc::clone(&self.head),
             buffer: Arc::clone(&self.buffer),
+            registry: Arc::clone(&self.registry),
             history: self.history.clone(),
         }
     }
@@ -1205,6 +1262,7 @@ impl ManifestCoordinator {
             head,
             buffer,
             schema_contract,
+            registry,
             ..
         } = rows;
         Self {
@@ -1221,6 +1279,7 @@ impl ManifestCoordinator {
                 tables,
             }),
             buffer: Arc::new(buffer),
+            registry: Arc::new(registry),
             history: HistoryCache::default(),
         }
     }
@@ -1774,9 +1833,11 @@ impl ManifestCoordinator {
             head,
             buffer,
             schema_contract,
+            registry,
             ..
         } = rows;
         self.captured_contract = schema_contract.map(Arc::new);
+        self.registry = Arc::new(registry);
         let head = HistoryRecord {
             commit: head,
             tables,
@@ -1857,7 +1918,13 @@ impl ManifestCoordinator {
             buffer: self.buffer.as_ref().clone(),
             head: self.head.as_ref().clone(),
             merge_base: None,
+            registry: self.registry.as_ref().clone(),
         }
+    }
+
+    /// The block registry rows the held version's hot fragment holds.
+    pub fn registry(&self) -> &LineageRegistry {
+        &self.registry
     }
 
     /// The commit graph of the head and the buffer this coordinator holds.
@@ -1869,6 +1936,7 @@ impl ManifestCoordinator {
             self.buffer.commits(),
             self.history.clone(),
         )
+        .with_registry(Arc::clone(&self.registry), &self.dataset)
     }
 
     pub fn history(&self) -> &HistoryCache {
@@ -1988,6 +2056,7 @@ impl ManifestCoordinator {
             tables,
             buffer,
             schema_contract,
+            registry,
         } = self
             .publisher
             .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
@@ -2008,6 +2077,7 @@ impl ManifestCoordinator {
             head: head.clone(),
             buffer,
             schema_contract,
+            registry,
         };
         self.install_head(rows, merged);
         Ok(CommitOutcome {
@@ -2035,9 +2105,20 @@ impl ManifestCoordinator {
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<(GraphLineageRow, CommitBuffer)> {
+        let (rows, _) = Self::read_rows_at(root_uri, branch, control_session).await?;
+        Ok((rows.head, rows.buffer))
+    }
+
+    /// The rows of the latest version of `branch`'s `__manifest`, beside the
+    /// version they were read from.
+    pub(crate) async fn read_rows_at(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(ManifestRows, Dataset)> {
         let dataset = open_manifest_dataset_with_session(root_uri, branch, control_session).await?;
         let rows = state::read_manifest_rows_projected(&dataset).await?;
-        Ok((rows.head, rows.buffer))
+        Ok((rows, dataset))
     }
 
     /// The record of `graph_commit_id` from the latest `__manifest` version of

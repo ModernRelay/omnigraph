@@ -72,6 +72,107 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     }
 }
 
+/// A `--- params generate` recipe supplies a step's parameters: its values
+/// reach the engine as a literal body's would, a Blob value included. The
+/// header takes `generate: v1` and a seed only, the recipe takes no `${`
+/// substitution, and its JSON bound is checked when the case parses.
+#[tokio::test]
+async fn generated_params_supply_a_step_and_are_refused_outside_their_contract() {
+    const GENERATED: &str =
+        "--- params generate: v1 seed: 7\nparams:\n  n: {kind: key, prefix: gen-, width: 3}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{MUTATE}{GENERATED}--- expect affected: nodes=1 edges=0\n\
+         --- query\nquery named() {{\n    match {{ $p: Person {{ name: \"gen-000\" }} }}\n    return {{ $p.name }}\n}}\n\
+         --- expect unordered\n{{\"p.name\": \"gen-000\"}}\n{SHAPE}"
+    );
+    let case = parse_case("generated_params", &text).unwrap();
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    let blob = format!(
+        "{HDR}--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode Doc {{\n    slug: String @key\n    body: Blob?\n}}\n--- seed\n\
+         --- mutate\nquery put($slug: String, $body: Blob) {{\n    insert Doc {{ slug: $slug, body: $body }}\n}}\n\
+         --- params generate: v1 seed: 0\nparams:\n  slug: {{kind: literal, value: doc}}\n  body: {{kind: blob, byte: 1, length: 3}}\n\
+         --- expect affected: nodes=1 edges=0\n"
+    );
+    let case = parse_case("generated_blob_param", &blob).unwrap();
+    let [Item::Step(Step::Mutate(step))] = case.items.as_slice() else {
+        panic!("expected one mutate step");
+    };
+    let Some(ParamsInput::Generated(generated)) = step.params_raw.as_ref() else {
+        panic!("expected generated params");
+    };
+    assert_eq!(
+        generated.generate().unwrap(),
+        serde_json::json!({"slug": "doc", "body": "base64:AQEB"})
+    );
+    execute_case(&case, Path::new("unused.gqt"), false)
+        .await
+        .unwrap();
+
+    // A Zipf endpoint is prepared as a table's is, under the same total
+    // bound, which is checked before any distribution is built.
+    let zipf = |name: &str, population: u64| {
+        format!(
+            "  {name}: {{kind: endpoint, prefix: s, width: 1, population: {population}, distribution: {{kind: zipf, exponent: 1.25}}}}\n"
+        )
+    };
+    let skewed = GeneratedParams::parse(
+        "generate: v1 seed: 0",
+        &format!("params:\n{}", zipf("s", 1)),
+    )
+    .unwrap();
+    assert_eq!(skewed.generate().unwrap(), serde_json::json!({"s": "s0"}));
+    let wide = (0..9)
+        .map(|i| zipf(&format!("s{i}"), 1_000_000))
+        .collect::<String>();
+    assert!(
+        GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
+            .unwrap_err()
+            .contains("zipf tables exceed 8000000 entries")
+    );
+
+    for (from, to) in [
+        ("generate: v1", "generate: v2"),
+        (" seed: 7", ""),
+        ("seed: 7", "seed: 7 mode: merge"),
+        ("seed: 7", "seed: 7 branch: main"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: key, prefix: gen-, width: 3, extra: 1}",
+        ),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: literal, value: \"${n}\"}",
+        ),
+        ("params:\n  n:", "params: {}\n  n:"),
+        (
+            "{kind: key, prefix: gen-, width: 3}",
+            "{kind: blob, byte: 0, length: 50331648}",
+        ),
+        ("--- expect affected", "--- params\n{}\n--- expect affected"),
+    ] {
+        let changed = text.replacen(from, to, 1);
+        assert_ne!(changed, text, "{from} must occur in the case");
+        assert!(
+            parse_case("generated_params", &changed).is_err(),
+            "{from} -> {to}"
+        );
+    }
+    assert!(
+        parse_case(
+            "generated_params",
+            &format!(
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
+            )
+        )
+        .is_err(),
+        "a generated load takes no params"
+    );
+}
+
 #[test]
 fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
     for recipe in [
@@ -582,6 +683,7 @@ fn outcome_takes_the_three_merge_words() {
         let ControlWrite::Merge {
             source,
             into,
+            as_commit: _,
             expect: MergeExpect::Outcome(got),
         } = &step.write
         else {
@@ -678,6 +780,154 @@ fn refuses_substitution_marker_in_a_statement_body() {
     assert_eq!(
         refusal("x", &text),
         "line 16: `${` may appear only inside a params or expect body"
+    );
+}
+
+const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n";
+const BIND: &str = "--- bind commit $c\n";
+
+/// `--- bind commit $name` attaches to the write before it, a `snapshot:
+/// $name` header and a quoted `"${name}"` commit operand consume it, and
+/// the `${` fence admits exactly that operand.
+#[test]
+fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- query snapshot: $c\n{}{EXPECT}--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- bind commit $m\n--- mutate\ncommit drop \"${{m}}\"\n{EXPECT_OK}",
+        QUERY.trim_start_matches("--- query\n")
+    );
+    let case = parse_case("x", &text).unwrap();
+    let [
+        Item::Step(Step::Mutate(propose)),
+        Item::Step(Step::Query(read)),
+        Item::Step(Step::Control(publish)),
+        Item::Step(Step::Control(merge)),
+        Item::Step(Step::Control(drop)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected five steps, got {:?}", case.items);
+    };
+    assert_eq!(propose.bind.as_deref(), Some("c"));
+    assert_eq!(read.snapshot.as_deref(), Some("c"));
+    assert_eq!(read.branch, "main");
+    assert!(matches!(
+        &publish.write,
+        ControlWrite::Publish { graph_commit_id, .. } if graph_commit_id == "${c}"
+    ));
+    assert_eq!(publish.bind, None);
+    assert_eq!(merge.bind.as_deref(), Some("m"));
+    assert!(matches!(
+        &drop.write,
+        ControlWrite::Drop { graph_commit_id, .. } if graph_commit_id == "${m}"
+    ));
+    let mut bindings = Bindings::new();
+    bindings.insert("c".into(), "hb1-c".into());
+    assert_eq!(resolve_operand("${c}", &bindings).unwrap(), "hb1-c");
+    assert_eq!(resolve_operand("literal", &bindings).unwrap(), "literal");
+    assert_eq!(
+        resolve_operand("${m}", &bindings).unwrap_err(),
+        "`${m}` is not bound at this step"
+    );
+    assert_eq!(
+        bound_snapshot(read, &bindings).unwrap().as_deref(),
+        Some("hb1-c")
+    );
+}
+
+/// Every misplacement of a binding is refused with the rule it broke.
+#[test]
+fn bind_commit_refusals() {
+    for (steps, want) in [
+        (
+            format!("{QUERY}{EXPECT}{BIND}"),
+            "`--- bind commit` follows a query step; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{MUTATE}{PARAMS}--- expect error: nope\n{BIND}"),
+            "`--- bind commit` follows a write expected to fail; a refused write binds nothing",
+        ),
+        (
+            format!("{CREATE}{BIND}"),
+            "`--- bind commit` follows `branch create`, which publishes no commit; bind a mutation, a `branch merge`, or a `commit publish`",
+        ),
+        (
+            format!("{PROPOSE}{BIND}{BIND}"),
+            "`--- bind commit $c` is declared twice; one binding per name",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- bind commit $d\n"),
+            "one write step binds one name",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit c\n"),
+            "`--- bind commit c`: a name is $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("{PROPOSE}--- bind $c\n"),
+            "`--- bind` must be `bind commit $name`",
+        ),
+        (
+            format!("{PROPOSE}--- bind commit $c\nbody\n"),
+            "line 20: `--- bind` carries no body",
+        ),
+        (
+            format!("--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}"),
+            "`${c}` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!(
+                "--- query snapshot: $c\n{}{EXPECT}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`snapshot: $c` is not bound; `--- bind commit $c` must precede this step",
+        ),
+        (
+            format!("{PROPOSE}{BIND}--- query snapshot: $c\nbranch list\n{EXPECT}"),
+            "`snapshot:` selects a query declaration's read target; a statement takes no target",
+        ),
+        (
+            format!(
+                "--- mutate snapshot: $c\n{}",
+                MUTATE.trim_start_matches("--- mutate\n")
+            ),
+            "`--- mutate` takes no arguments but `branch: <name>`, got `snapshot: $c`",
+        ),
+        (
+            format!(
+                "--- query snapshot:\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot:` needs a bound name, `$name`",
+        ),
+        (
+            format!(
+                "--- query snapshot: c\n{}",
+                QUERY.trim_start_matches("--- query\n")
+            ),
+            "`--- query snapshot: c` must name a binding, $[a-z][a-z0-9_]*",
+        ),
+        (
+            format!("--- foreach $i a b\n{PROPOSE}{BIND}--- endloop\n"),
+            "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case",
+        ),
+        (
+            BIND.to_string(),
+            "`--- bind commit` has no write step to follow",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{steps}");
+        assert_eq!(refusal("x", &text), want, "{steps}");
+    }
+}
+
+/// The fence still refuses `${` outside a whole quoted commit operand.
+#[test]
+fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\nbranch create \"${{c}}\"\n{EXPECT_OK}"
+    );
+    assert_eq!(
+        refusal("x", &text),
+        "line 21: `${` may appear only inside a params or expect body"
     );
 }
 
@@ -2377,13 +2627,10 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 }
 
 #[test]
-fn refuses_ordered_expect_on_an_rrf_led_order() {
+fn admits_ordered_expect_on_an_rrf_led_order() {
     let query = "--- query\nquery q($v: Vector(4), $t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
-    let message = refusal("x", &text);
-    assert!(message.contains("led by `rrf()`"), "{message}");
-    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n{SHAPE}");
+                 return { $p.name }\n    order { rrf(nearest($p.vec, $v), bm25($p.name, $t)) }\n    limit 3\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
     parse_case("x", &text).unwrap();
 }
 
@@ -2395,6 +2642,12 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
     assert!(refusal("x", &text).contains("aggregate in its `return` list"));
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
+    parse_case("x", &text).unwrap();
+    let query = "--- query\nquery q($t: String) {\n    match { $p: Person }\n    \
+                 return { $p.name, count($p) as total }\n    order { bm25($p.name, $t), total desc }\n    limit 3\n}\n";
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
+    );
     parse_case("x", &text).unwrap();
 }
 

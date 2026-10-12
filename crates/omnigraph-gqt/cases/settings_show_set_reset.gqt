@@ -31,6 +31,7 @@ show all;
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
 {"name": "traversal_work_limit", "value": "1000000", "default": "1000000", "source": "default", "scope": "request"}
+{"name": "write_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}
 {"name": "history_release_bytes", "value": "262144", "default": "262144", "source": "default", "scope": "request"}
 
 --- query
@@ -119,3 +120,25 @@ show history_release_bytes;
 
 --- expect unordered
 {"name": "history_release_bytes", "value": "262144", "default": "262144", "source": "default", "scope": "request"}
+
+--- mutate
+set write_max_bytes = 4093;
+
+--- expect ok
+
+--- query
+show write_max_bytes;
+
+--- expect unordered
+{"name": "write_max_bytes", "value": "4093", "default": "33554432", "source": "file", "scope": "request"}
+
+--- mutate
+reset write_max_bytes;
+
+--- expect ok
+
+--- query
+show write_max_bytes;
+
+--- expect unordered
+{"name": "write_max_bytes", "value": "33554432", "default": "33554432", "source": "default", "scope": "request"}

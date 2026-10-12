@@ -87,18 +87,14 @@ impl ExecutionHost for GqtHost {
         &'a self,
         session: &'a Session,
         step: &'a QueryStep,
+        target: ReadTarget,
         params: &'a ParamMap,
     ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
         async move {
             session
                 .clone()
                 .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(
-                    ReadTarget::branch(&step.branch),
-                    &step.source,
-                    &step.name,
-                    params,
-                )
+                .query(target, &step.source, &step.name, params)
                 .await
                 .map_err(|error| error.to_string())
         }

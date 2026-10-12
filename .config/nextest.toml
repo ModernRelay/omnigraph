@@ -5,6 +5,10 @@
 # journeys, in place of grepping a `--nocapture` log.
 [profile.ci]
 fail-fast = true
+# A hung test fails as a named test after ten minutes instead of holding the
+# job to its 60-minute limit. The longest test either `ci` run selects
+# (`Test Workspace`, `tests-slow-nightly.yml`) takes about a minute locally.
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 [profile.ci.junit]
 path = "junit.xml"

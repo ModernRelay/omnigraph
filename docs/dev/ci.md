@@ -133,8 +133,14 @@ instead of skipping them; the v6 format fence in the `test` job keeps its own
 resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
 scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
-cases of `crossversion_upgrade.rs`, the engine `db::upgrade::tests`,
-`lance_version_columns` and `forbidden_apis`. All four select the
+cases of `crossversion_upgrade.rs` (a module of the CLI's `integration`
+binary, run by the exact names `--list-cases crossversion --compiled` takes
+from a `-- --list` of the same feature graph, which must contain every
+source-derived name, generated to a file before the run so an empty inventory
+fails the step, and the run's log must equal that file), the
+engine `db::upgrade::tests`, `lance_version_columns` (a module of the
+engine's `integration` binary, selected as `lance_version_columns::`) and
+`forbidden_apis`. All four select the
 `Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
 omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
 graph, the one `Test Workspace` builds, and the engine scopes reuse the
@@ -151,7 +157,8 @@ features are reused.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
-Current-version live schema and policy deployment remains required by `Test Workspace`.
+The complete current-version live-apply CLI journey runs in `Tests slow nightly`.
+`Test Workspace` retains the focused deployment and delivery-loss tests.
 
 `GQ Logic Tests` (`gq-logic-tests.yml`) owns the complete `.gqt` corpus as a
 required context aggregating four qualification jobs. `GQT (ordinary)` checks
@@ -179,9 +186,18 @@ every corpus case that declares the `omnigraph-server` target runs again
 through an in-process server, its in-process verdict must be green and its
 served verdict must equal it; `gqt_served_count.rs` in the same job totals
 the served and skipped cases and fails when no case is served.
-It selects the tests-only crate `omnigraph-gqt-served` under an empty
-`RUSTFLAGS`, the one job that builds that crate, so `Test Workspace` excludes
-it beside `omnigraph-gqt` and shares no engine build with it. All
+The same cell builds `omnigraph`, `omnigraph-server` and `omnigraph-gqt`, then
+explicitly runs `omnigraph-cli/tests/integration/gqt_served_smoke.rs`. That test reuses the
+CLI's cluster/server process helpers and runs a corpus case through the GQT
+command with a bearer token. It requires one passing served attempt, token
+redaction in the retained report and replay refusal. It is ignored outside this
+cell because the GQT binary must be built first.
+All three steps select the same four packages under an empty `RUSTFLAGS`, and
+the binaries are built with `cargo test --no-run` so every step resolves the
+same dev-dependency feature world (`cargo build --bins` would compile
+`omnigraph-cluster` again without `failpoints` and `test-util`).
+This is the one job that builds the tests-only `omnigraph-gqt-served` crate,
+so `Test Workspace` excludes it beside `omnigraph-gqt`. All
 four run from the repository root under
 the workspace Cargo configuration, which enables the seeded Tokio runtime.
 Each job has its own 60-minute budget and cache key. The budget is at least
@@ -208,9 +224,12 @@ workflow carries the `Classify Changes` copy under the name
 (`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
 regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
 `issue_N` function, added or strengthened, in a top-level test target
-(`tests/<name>.rs`) or `src/` module under `crates/*` or `tools/*` (an owner
+(`tests/<name>.rs`), `tests/integration/main.rs` or its direct modules, or a
+`src/` module under `crates/*` or `tools/*` (an owner
 test not yet named for the issue is renamed to carry `issue_N` when
-extended). A PR whose diff changes no path under `crates/` or `tools/`
+extended). An integration module requires a bare, top-level `mod <name>;`
+declaration in that root at the range's head commit. Attributed declarations,
+path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/` or `tools/`
 (Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
 passes unexamined, with a notice annotation saying so: a fix in a workflow, a
 script, a document, or a deployment file has no logic or Rust test that could
@@ -237,8 +256,42 @@ characters with no whitespace but the plain space; `docs(rfc):` is refused in fa
 `Revert "…"` title in favour of `revert: …` (the rule and its examples:
 [CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests).
 `scripts/check-pr-title.py` is the check; it runs its `--self-test` first and
-prints one actionable failure line with the accepted shape and two examples,
-as a log line and as a GitHub error annotation. It is a policy check on
+prints each independently detectable problem with a stable diagnostic code
+and a repair instruction, both in the log and in a GitHub error annotation.
+Length failures include the actual length, the limit and how many characters
+must be removed. Text output uses red failures, yellow repairs and green
+successes on a terminal or in Actions. Use `--color never` or set `NO_COLOR`
+to a nonempty value to disable automatic color; `--color always` forces it.
+Agents can use `--format json` with either input option for one JSON object.
+Version 1 carries `schema_version`, `offset_unit`, `input_kind`, `valid`,
+`title`, `length`, `max_length`, `excess` and `errors`. Each error has a closed
+`code`, its `field`, a `span` with `start` and `end`, the exact `found` text,
+`expected`, `message` and `fix`. Ranges are zero-based, end-exclusive Unicode
+code-point offsets in the checked `title`; for a squash message, that means
+the extracted title. A zero-width range marks a missing token; an unclosed
+scope marks its unmatched opening parenthesis. The human report names the
+same range using one-based character positions, or an insertion offset.
+`--schema` prints the JSON Schema with the allowed codes, fields and record
+shapes. Enum types close the code, field, input, format and color sets;
+immutable records validate ranges and their original-title slices at runtime.
+Numeric facts and the validity flag are derived from the report.
+JSON contains no color or Actions annotations.
+Both formats exit 0 for an accepted title and 1 for a refused title;
+invalid command-line arguments exit 2. For example:
+
+```bash
+python3 scripts/check-pr-title.py --title "fix(merge): find the merge base over contracted lineage" --format json
+python3 scripts/check-pr-title.py --schema
+```
+
+The check uses Python 3.11 or later and the standard library. Its `--self-test`
+entry point runs `scripts/test_check_pr_title.py`, including an exact range
+and field fixture for every error code, Unicode/length boundaries, parser
+refusals, runtime type invariants and each output/CLI mode. When editing the
+checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
+development environment with mypy installed. The enum dispatches are exhaustive.
+
+It is a policy check on
 `pull_request_target` like the regression gate, re-run on every title edit,
 and the pull request head is never fetched. On the merge queue's branch it
 checks the first line of the group commit's message, minus the ` (#N)`
@@ -374,6 +427,14 @@ journeys listed in the step) and for the upgrade journeys' captured notices,
 in place of grepping a `--nocapture` log. The local command in
 [testing.md](testing.md) stays `cargo test`; the two run the same binaries.
 
+Every run, red or green, uploads that report as `test-workspace-junit` and
+the compile step's `--timings` page as `test-workspace-build-timings`, both
+kept 14 days: per-test durations and per-crate compile and link times on the
+hosted runner, which any change to this job's scheduling is sized from. The
+`ci` profile terminates a test that runs ten minutes (`slow-timeout`), so a
+hang fails as a named test instead of holding the job to its 60-minute limit,
+and a test still running after one minute is reported as `SLOW` in the log.
+
 The `main` run also seeds the dependency cache that pull requests restore.
 Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
 `dst.yml` saves only from `main` (`save-if`): a save from any other ref, a
@@ -499,6 +560,13 @@ unavailable-runtime refusal test does not replace executing the DST cases.
 `crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
 a time; it is not a required context, and it is its own workflow because the
 GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
+`tests-slow-nightly.yml` (cron 04:15 UTC + manual dispatch) runs the
+`#[ignore]`d Rust tests enrolled by exact name in its list, the `nightly:`
+deadline and journey tests and the `heavy-repro:` scale repros (`AGENTS.md`,
+ignore species), through `cargo nextest run --run-ignored only` on the
+workspace graph with `--no-fail-fast`, then `check-workspace-test-owners.py`
+over its JUnit report, so an enrolled test that was renamed, filtered out or
+red fails the run; it is not a required context.
 
 ## Local pre-push checks
 

@@ -470,7 +470,9 @@ async fn observe_engine_index(
     }
     for (present, kind) in [
         (
-            dataset.has_fts_index(column).await.map_err(|error| {
+            // An untrained segment only declares the analyzer; the observed
+            // physical state counts full-text postings.
+            dataset.has_fts_postings(column).await.map_err(|error| {
                 RealGraphError::new(format!("inspect FTS {table_key}.{column}: {error}"))
             })?,
             RealGraphIndexKindV1::Fts,

@@ -247,7 +247,7 @@ pub(crate) enum Command {
         #[arg(long = "type")]
         type_names: Vec<String>,
     },
-    /// Read one logical node or edge Blob cell.
+    /// Read, replace or clear one logical node or edge Blob cell.
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
@@ -290,7 +290,7 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the format this binary serves (v14); other formats are rebuilt by export and load
+    /// the current format this binary serves (v15); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
@@ -513,6 +513,61 @@ pub(crate) enum BlobCommand {
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
         /// Emit stable JSON metadata.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace one Blob value of an existing node or edge with raw bytes from
+    /// a file or stdin, as one graph commit.
+    Put {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Read the bytes from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set one nullable Blob value of an existing node or edge to null, as one
+    /// graph commit; a cell that is already null publishes nothing.
+    Clear {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -812,6 +867,11 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Merge into an unpublished commit (`branch merge … as commit`): the
+        /// target head is unchanged until `omnigraph commit publish <id>`.
+        /// Exclusive with --delete-branch, whose source the commit still holds.
+        #[arg(long, conflicts_with = "delete_branch")]
+        as_commit: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
         /// `settings` field (the Session settings RFC).
@@ -857,7 +917,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store
@@ -879,6 +939,29 @@ pub(crate) enum CommitCommand {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// List the unpublished commits whose recorded target is the branch
+        /// (`as commit` writes awaiting `commit publish`) instead of its history
+        #[arg(long)]
+        unpublished: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish an unpublished commit onto its recorded target branch
+    Publish {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop an unpublished commit: its id stops resolving and its held merge
+    /// inputs are released
+    Drop {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
         #[arg(long)]
         json: bool,
     },

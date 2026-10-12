@@ -668,7 +668,7 @@ query people() { match { $p: Person } return { count($p) as n } }
     fn compile(catalog: &Catalog, name: &str) -> QueryIR {
         let statement = omnigraph_compiler::find_read_statement(QUERIES, name).unwrap();
         let checked = typecheck_query(catalog, statement.decl()).unwrap();
-        omnigraph_compiler::lower_query(catalog, statement.decl(), &checked).unwrap()
+        omnigraph_compiler::lower_query(catalog, &checked).unwrap()
     }
 
     /// GQT cannot inspect gathered facts or the catalog's version origin.

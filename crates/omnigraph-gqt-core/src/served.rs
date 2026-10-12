@@ -18,10 +18,11 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep, MAIN_BRANCH,
-    MergeExpect, MutateExpect, MutateStep, QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail,
-    WriteExpect, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
-    operation, step_kind, step_label, substitute,
+    Bindings, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep,
+    MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput, QueryExpect, QueryStep, Seed,
+    ShowStep, Step, StepFail, WriteExpect, bound_snapshot, check_error_expect, check_rows_json,
+    expectation_evidence, merge_outcome_word, operation, record_binding, resolve_operand,
+    step_kind, step_label, substitute,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -127,6 +128,7 @@ async fn execute_served_inner<H: ExecutionHost>(
         check_schema(&client, &fixture.schema).await?;
         seed(&client, fixture).await?;
     }
+    let mut bindings = Bindings::new();
     for item in &case.items {
         let (values, var, steps): (Vec<Option<&str>>, Option<&str>, Vec<&Step>) = match item {
             Item::Step(step) => (vec![None], None, vec![step]),
@@ -156,10 +158,26 @@ async fn execute_served_inner<H: ExecutionHost>(
                     step_kind(step),
                 );
                 let outcome = match step {
-                    Step::Query(q) => query(host, &client, q, binding).await,
-                    Step::Mutate(m) => mutate(host, &client, m, binding).await,
+                    Step::Query(q) => query(host, &client, q, binding, &bindings).await,
+                    Step::Mutate(m) => mutate(host, &client, m, binding).await.and_then(|commit| {
+                        record_binding(
+                            &mut bindings,
+                            m.bind.as_deref(),
+                            commit,
+                            &step_label(ordinal, "mutate", binding),
+                        )
+                    }),
                     Step::Load(l) => load(host, &client, l, binding).await,
-                    Step::Control(c) => control(host, &client, c, binding).await,
+                    Step::Control(c) => control(host, &client, c, binding, &bindings)
+                        .await
+                        .and_then(|commit| {
+                            record_binding(
+                                &mut bindings,
+                                c.bind.as_deref(),
+                                commit,
+                                &step_label(ordinal, c.name, binding),
+                            )
+                        }),
                     Step::List(l) => list(host, &client, l, binding).await,
                     Step::Show(s) => show(host, &client, s, binding).await,
                     Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
@@ -195,6 +213,9 @@ async fn execute_served_inner<H: ExecutionHost>(
 /// a bounded read, so a large row set or a runaway server fails the step
 /// instead of the process.
 const RESPONSE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes of an undecodable response body a diagnostic repeats.
+const ECHO_LIMIT_BYTES: usize = 4 * 1024;
 
 /// The requests one served run sends: every one under `/graphs/{id}`, with
 /// the contract header and, when given, the bearer token.
@@ -272,17 +293,37 @@ impl ServerClient {
             return serde_json::from_slice(&body).map(Ok).map_err(|e| {
                 format!(
                     "server answered {status} with a body this runner cannot decode: {e}: {}",
-                    String::from_utf8_lossy(&body)
+                    self.echo(&body)
                 )
             });
         }
         let error: ErrorText = serde_json::from_slice(&body).map_err(|e| {
             format!(
                 "server answered {status} without an error body: {e}: {}",
-                String::from_utf8_lossy(&body)
+                self.echo(&body)
             )
         })?;
         Ok(Err(error.error))
+    }
+
+    /// An undecodable body as diagnostic text: the bearer token's raw and
+    /// JSON-escaped spellings redacted first, then the text cut to its bound.
+    fn echo(&self, body: &[u8]) -> String {
+        let mut text = String::from_utf8_lossy(body).into_owned();
+        if let Some(token) = self.token.as_deref().filter(|t| !t.is_empty()) {
+            let json = serde_json::to_string(token).expect("string encoding is infallible");
+            for spelling in [&json[1..json.len() - 1], token] {
+                text = text.replace(spelling, "<redacted>");
+            }
+        }
+        if text.len() <= ECHO_LIMIT_BYTES {
+            return text;
+        }
+        let mut end = ECHO_LIMIT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}… ({} bytes, truncated)", &text[..end], body.len())
     }
 
     async fn post<Req: Serialize, Res: DeserializeOwned>(
@@ -296,6 +337,14 @@ impl ServerClient {
                 .json(body),
         )
         .await
+    }
+
+    /// Resolve after row materialization so the operation timer includes decoding.
+    async fn read(&self, request: &QueryRequest) -> Result<Result<Vec<Value>, String>, String> {
+        match self.post::<_, ReadOutput>("/query", request).await? {
+            Ok(output) => rows_of(&output).map(Ok),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     async fn get<Res: DeserializeOwned>(&self, route: &str) -> Result<Result<Res, String>, String> {
@@ -375,17 +424,20 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     }
 }
 
-/// The `--- params` body as it goes on the wire: the JSON the case spells,
-/// bindings substituted; the server holds it against the declaration, so a
-/// parameter error is the server's answer, never a local verdict.
+/// The `--- params` as they go on the wire: the JSON the case spells,
+/// bindings substituted, or a recipe's generated values; the server holds them
+/// against the declaration, so a parameter error is the server's answer, never
+/// a local verdict. A generated value travels in the request body, under the
+/// server's request limits.
 fn wire_params(
-    params_raw: Option<&String>,
+    params: Option<&ParamsInput>,
     binding: Option<(&str, &str)>,
 ) -> Result<Option<Value>, String> {
-    params_raw
-        .map(|raw| {
-            serde_json::from_str::<Value>(&substitute(raw, binding))
-                .map_err(|e| format!("params are not valid JSON: {e}"))
+    params
+        .map(|params| match params {
+            ParamsInput::Literal(raw) => serde_json::from_str::<Value>(&substitute(raw, binding))
+                .map_err(|e| format!("params are not valid JSON: {e}")),
+            ParamsInput::Generated(generated) => generated.generate(),
         })
         .transpose()
 }
@@ -405,7 +457,7 @@ fn check_read_expect(
     host: &impl ExecutionHost,
     label: &str,
     expect: &QueryExpect,
-    outcome: Result<ReadOutput, String>,
+    outcome: Result<Vec<Value>, String>,
     failed: &str,
     succeeded: &str,
     binding: Option<(&str, &str)>,
@@ -418,8 +470,7 @@ fn check_read_expect(
             span,
             shape,
         } => {
-            let output = outcome.map_err(|e| fail(format!("{failed}: {e}")))?;
-            let actual = rows_of(&output).map_err(&fail)?;
+            let actual = outcome.map_err(|e| fail(format!("{failed}: {e}")))?;
             host.observe(|| {
                 format!(
                     "shape: {} line(s) not judged under a server target",
@@ -439,6 +490,7 @@ async fn query(
     client: &ServerClient,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
+    bindings: &Bindings,
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "query", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
@@ -457,22 +509,19 @@ async fn query(
             };
         }
     };
+    let snapshot = bound_snapshot(step, bindings).map_err(&fail)?;
     let request = QueryRequest {
         query: step.source.clone(),
         name: Some(step.name.clone()),
         params,
-        branch: Some(step.branch.clone()),
-        snapshot: None,
+        branch: snapshot.is_none().then(|| step.branch.clone()),
+        snapshot,
         settings: None,
     };
-    let outcome = operation(
-        host,
-        step.ordinal,
-        client.post::<_, ReadOutput>("/query", &request),
-    )
-    .await
-    .map_err(&fail)?
-    .map_err(&fail)?;
+    let outcome = operation(host, step.ordinal, client.read(&request))
+        .await
+        .map_err(&fail)?
+        .map_err(&fail)?;
     check_read_expect(
         host,
         &label,
@@ -489,7 +538,7 @@ async fn mutate(
     client: &ServerClient,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
-) -> Result<(), StepFail> {
+) -> Result<Option<String>, StepFail> {
     let label = step_label(step.ordinal, "mutate", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let params = match wire_params(step.params_raw.as_ref(), binding) {
@@ -498,7 +547,7 @@ async fn mutate(
             return match &step.expect {
                 MutateExpect::Error { needle } if e.contains(needle) => {
                     host.record("parameter_error", || serde_json::json!({"message": e}));
-                    Ok(())
+                    Ok(None)
                 }
                 MutateExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
@@ -535,14 +584,16 @@ async fn mutate(
         ),
         Err(error) => format!("actual mutation error: {error}"),
     });
+    let commit_id =
+        |output: &ChangeOutput| output.commit.as_ref().map(|c| c.graph_commit_id.clone());
     match &step.expect {
         MutateExpect::Ok => outcome
-            .map(|_| ())
+            .map(|output| commit_id(&output))
             .map_err(|e| fail(format!("mutation failed: {e}"))),
         MutateExpect::Affected { nodes, edges } => {
             let result = outcome.map_err(|e| fail(format!("mutation failed: {e}")))?;
             if result.affected_nodes == *nodes && result.affected_edges == *edges {
-                Ok(())
+                Ok(commit_id(&result))
             } else {
                 Err(fail(format!(
                     "affected counts mismatch: expected nodes={nodes} edges={edges}, got nodes={} edges={}",
@@ -551,7 +602,9 @@ async fn mutate(
             }
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded").map_err(fail)
+            check_error_expect(host, needle, outcome, "the mutation succeeded")
+                .map(|()| None)
+                .map_err(fail)
         }
     }
 }
@@ -615,14 +668,20 @@ fn branch_name(name: &str) -> String {
     if ident {
         name.to_string()
     } else {
-        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+        string_literal(name)
     }
 }
 
-/// The control write as the corpus spells it, so the served path exercises
-/// the statement parser a user's text meets at `/mutate`.
-fn control_statement(write: &ControlWrite) -> String {
-    match write {
+/// `text` as the grammar's `string_lit`.
+fn string_literal(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The control write as the corpus spells it, a bound commit id resolved, so
+/// the served path exercises the statement parser a user's text meets at
+/// `/mutate`.
+fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String, String> {
+    Ok(match write {
         ControlWrite::Create {
             name,
             from: Some(parent),
@@ -636,15 +695,32 @@ fn control_statement(write: &ControlWrite) -> String {
         ControlWrite::Delete { name, .. } => format!("branch delete {}", branch_name(name)),
         ControlWrite::Merge {
             source,
-            into: Some(target),
+            into,
+            as_commit,
             ..
+        } => {
+            let mut statement = format!("branch merge {}", branch_name(source));
+            if let Some(target) = into {
+                statement.push_str(&format!(" into {}", branch_name(target)));
+            }
+            if *as_commit {
+                statement.push_str(" as commit");
+            }
+            statement
+        }
+        ControlWrite::Publish {
+            graph_commit_id, ..
         } => format!(
-            "branch merge {} into {}",
-            branch_name(source),
-            branch_name(target)
+            "commit publish {}",
+            string_literal(&resolve_operand(graph_commit_id, bindings)?)
         ),
-        ControlWrite::Merge { source, .. } => format!("branch merge {}", branch_name(source)),
-    }
+        ControlWrite::Drop {
+            graph_commit_id, ..
+        } => format!(
+            "commit drop {}",
+            string_literal(&resolve_operand(graph_commit_id, bindings)?)
+        ),
+    })
 }
 
 async fn control(
@@ -652,12 +728,13 @@ async fn control(
     client: &ServerClient,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
-) -> Result<(), StepFail> {
+    bindings: &Bindings,
+) -> Result<Option<String>, StepFail> {
     let name = step.name;
     let label = step_label(step.ordinal, name, binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let request = ChangeRequest {
-        query: control_statement(&step.write),
+        query: control_statement(&step.write, bindings).map_err(&fail)?,
         name: None,
         params: None,
         branch: None,
@@ -672,8 +749,15 @@ async fn control(
     .map_err(&fail)?
     .map_err(&fail)?;
     host.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
+    let commit = outcome
+        .as_ref()
+        .ok()
+        .and_then(|output| output.commit.as_ref().map(|c| c.graph_commit_id.clone()));
     match &step.write {
-        ControlWrite::Create { expect, .. } | ControlWrite::Delete { expect, .. } => {
+        ControlWrite::Create { expect, .. }
+        | ControlWrite::Delete { expect, .. }
+        | ControlWrite::Publish { expect, .. }
+        | ControlWrite::Drop { expect, .. } => {
             if let (WriteExpect::Ok, Ok(output)) = (expect, &outcome) {
                 let answered = matches!(
                     (&step.write, &output.outcome),
@@ -683,6 +767,12 @@ async fn control(
                     ) | (
                         ControlWrite::Delete { .. },
                         Some(BranchOutcomeOutput::Deleted { .. })
+                    ) | (
+                        ControlWrite::Publish { .. },
+                        Some(BranchOutcomeOutput::Published)
+                    ) | (
+                        ControlWrite::Drop { .. },
+                        Some(BranchOutcomeOutput::Dropped { .. })
                     )
                 );
                 if !answered {
@@ -692,12 +782,16 @@ async fn control(
                     )));
                 }
             }
-            check_write_expect(host, name, expect, outcome).map_err(fail)
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| commit)
+                .map_err(fail)
         }
         ControlWrite::Merge {
             expect: MergeExpect::Write(expect),
             ..
-        } => check_write_expect(host, name, expect, outcome).map_err(fail),
+        } => check_write_expect(host, name, expect, outcome)
+            .map(|()| commit)
+            .map_err(fail),
         ControlWrite::Merge {
             expect: MergeExpect::Outcome(want),
             ..
@@ -707,7 +801,7 @@ async fn control(
                 Some(BranchOutcomeOutput::Merged { merge, .. })
                     if merge_outcome(merge) == *want =>
                 {
-                    Ok(())
+                    Ok(commit)
                 }
                 Some(BranchOutcomeOutput::Merged { merge, .. }) => Err(fail(format!(
                     "merge outcome mismatch: expected `{}`, got `{}`",
@@ -774,7 +868,7 @@ async fn show(
 async fn statement(
     client: &ServerClient,
     text: &str,
-) -> Result<Result<ReadOutput, String>, String> {
+) -> Result<Result<Vec<Value>, String>, String> {
     let request = QueryRequest {
         query: text.to_string(),
         name: None,
@@ -783,5 +877,5 @@ async fn statement(
         snapshot: None,
         settings: None,
     };
-    client.post("/query", &request).await
+    client.read(&request).await
 }

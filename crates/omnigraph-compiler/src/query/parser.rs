@@ -99,6 +99,9 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                     Rule::branch_stmt => {
                         statement = Some(FileBody::Branch(parse_branch_stmt(inner)?));
                     }
+                    Rule::commit_stmt => {
+                        statement = Some(FileBody::Commit(parse_commit_stmt(inner)?));
+                    }
                     Rule::show_stmt => {
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
@@ -109,6 +112,7 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                         let subject = match statement {
                             Some(FileBody::Show(_)) => "a show statement",
                             Some(FileBody::Explain(_)) => "an `explain` statement",
+                            Some(FileBody::Commit(_)) => "a commit statement",
                             _ => "a branch statement",
                         };
                         return Err(diagnostic_at(
@@ -294,6 +298,10 @@ fn parse_branch_stmt(
         .find(|inner| inner.as_rule() != Rule::kw_branch)
         .expect("grammar: branch_stmt holds one form after kw_branch");
     let rule = form.as_rule();
+    let as_commit = form
+        .clone()
+        .into_inner()
+        .any(|inner| inner.as_rule() == Rule::as_commit_clause);
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
@@ -307,13 +315,47 @@ fn parse_branch_stmt(
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }
-        (Rule::branch_merge, Some(source), into) => {
-            Ok(BranchStmt::Write(BranchWrite::Merge { source, into }))
-        }
+        (Rule::branch_merge, Some(source), into) => Ok(BranchStmt::Write(BranchWrite::Merge {
+            source,
+            into,
+            as_commit,
+        })),
         (Rule::branch_list, None, None) => Ok(BranchStmt::List),
         (other, _, _) => {
             unreachable!("grammar: every branch form fixes its name arity, got {other:?}")
         }
+    }
+}
+
+fn parse_commit_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<CommitWrite, QueryDiagnostic> {
+    let form = pair
+        .into_inner()
+        .find(|inner| inner.as_rule() != Rule::kw_commit)
+        .expect("grammar: commit_stmt holds one form after kw_commit");
+    let rule = form.as_rule();
+    let literal = form
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::string_lit)
+        .expect("grammar: every commit form names one string literal");
+    let position = position_of(&literal);
+    let graph_commit_id = decode_string_literal(literal.as_str())
+        .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &literal))?;
+    if graph_commit_id.is_empty()
+        || graph_commit_id.trim() != graph_commit_id
+        || graph_commit_id.chars().any(char::is_control)
+    {
+        return Err(QueryDiagnostic::parse(
+            Q004,
+            format!("graph commit id {graph_commit_id:?} is not a commit id"),
+            Some(position),
+        ));
+    }
+    match rule {
+        Rule::commit_publish => Ok(CommitWrite::Publish { graph_commit_id }),
+        Rule::commit_drop => Ok(CommitWrite::Drop { graph_commit_id }),
+        other => unreachable!("grammar: commit_stmt admits no {other:?}"),
     }
 }
 
@@ -415,9 +457,11 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
+    let mut as_commit_clause = None;
 
     for item in inner {
         match item.as_rule() {
+            Rule::as_commit_clause => as_commit_clause = Some(item),
             Rule::param_list => {
                 for p in item.into_inner() {
                     if let Rule::param = p.as_rule() {
@@ -520,6 +564,14 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
             _ => {}
         }
     }
+    if let Some(clause) = &as_commit_clause
+        && mutations.is_empty()
+    {
+        return Err(query_error_at(
+            format!("`as commit` applies to a mutation; query `{name}` is read-only"),
+            clause,
+        ));
+    }
 
     Ok(QueryDecl {
         name,
@@ -531,6 +583,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         order_clause,
         limit,
         mutations,
+        as_commit: as_commit_clause.is_some(),
     })
 }
 
@@ -1293,8 +1346,12 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let first = inner
         .next()
         .ok_or_else(|| CompilerError::Parse("ordering cannot be empty".to_string()))?;
-    let (expr, descending) = match first.as_rule() {
-        Rule::nearest_ordering => (parse_nearest_ordering(first, NameScope::Alias)?, false),
+    let (expr, descending, explicit) = match first.as_rule() {
+        Rule::nearest_ordering => (
+            parse_nearest_ordering(first, NameScope::Alias)?,
+            false,
+            false,
+        ),
         Rule::expr => {
             let expr = parse_expr(first, NameScope::Alias)?;
             let direction = inner.next();
@@ -1306,8 +1363,9 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
                     direction,
                 ));
             }
+            let explicit = direction.is_some();
             let descending = direction.is_some_and(|p| p.as_str() == "desc");
-            (expr, descending)
+            (expr, descending, explicit)
         }
         other => {
             return Err(CompilerError::Parse(format!(
@@ -1317,7 +1375,11 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         }
     };
 
-    Ok(Ordering { expr, descending })
+    Ok(Ordering {
+        expr,
+        descending,
+        explicit,
+    })
 }
 
 fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Result<Expr> {
