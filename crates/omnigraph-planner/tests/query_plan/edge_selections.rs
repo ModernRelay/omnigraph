@@ -510,6 +510,7 @@ fn fused_row_identity_declared_under_the_fused_score_sort() {
         (
             vec![IRExpr::Aggregate {
                 func: AggFunc::Count,
+                distinct: false,
                 arg: Box::new(IRExpr::Variable(
                     "b".into(),
                     omnigraph_compiler::ExprType::Node {

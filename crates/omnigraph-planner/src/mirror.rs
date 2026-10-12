@@ -1374,6 +1374,7 @@ pub enum ExprMirror {
     },
     Aggregate {
         func: AggFuncMirror,
+        distinct: bool,
         arg: Box<ExprMirror>,
         signature: AggSignature,
     },
@@ -1483,10 +1484,12 @@ impl From<&IRExpr> for ExprMirror {
             },
             IRExpr::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFuncMirror::from(*func),
+                distinct: *distinct,
                 arg: boxed(arg),
                 signature: signature.clone(),
             },
@@ -1587,10 +1590,12 @@ impl From<ExprMirror> for IRExpr {
             ExprMirror::Literal { value, ty } => Self::Literal(Literal::from(value), ty),
             ExprMirror::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFunc::from(func),
+                distinct,
                 arg: unboxed(*arg),
                 signature,
             },

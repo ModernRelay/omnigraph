@@ -122,17 +122,35 @@ fn round_trip(bound: &BoundPlan) -> BoundPlan {
 
 #[test]
 fn saved_plan_version_refuses_both_legacy_and_future_readers() {
+    let mut counted = query(prop("d", "slug"));
+    counted.order_by.clear();
+    counted.limit = None;
+    counted.return_exprs = vec![IRProjection {
+        expr: IRExpr::Aggregate {
+            func: omnigraph_compiler::query::ast::AggFunc::Count,
+            distinct: true,
+            arg: Box::new(prop("d", "slug")),
+            signature: omnigraph_compiler::AggSignature {
+                arg: value_type(ScalarType::String, true),
+                result: value_type(ScalarType::I64, true),
+            },
+        },
+        alias: Some("names".into()),
+        column: "names".into(),
+        ty: value_type(ScalarType::I64, true),
+    }];
     let bound = BoundPlan {
-        plan: plan(prop("d", "slug")),
+        plan: futures::executor::block_on(plan_query(&counted, &source(), &fixture_bounds::BOUNDS))
+            .unwrap(),
         values: Default::default(),
     };
     let encoded = serde_json::to_value(&bound).unwrap();
-    assert_eq!(encoded["bound_plan_version"], 6);
+    assert_eq!(encoded["bound_plan_version"], 7);
     assert!(encoded.get("plan").is_none());
     assert!(encoded["body"]["plan"].is_object());
     assert_eq!(round_trip(&bound), bound);
 
-    for version in [1, 2, 3, 4, 5] {
+    for version in [1, 2, 3, 4, 5, 6] {
         let mut older = encoded.clone();
         older["bound_plan_version"] = serde_json::json!(version);
         assert!(
@@ -146,12 +164,32 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
     assert!(error.to_string().contains("regenerate"), "{error}");
     let mut future = encoded.clone();
-    future["bound_plan_version"] = serde_json::json!(7);
+    future["bound_plan_version"] = serde_json::json!(8);
     let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("unsupported bound plan version 7"),
+            .contains("unsupported bound plan version 8"),
+        "{error}"
+    );
+
+    let mut missing_distinct = encoded.clone();
+    let aggregate = missing_distinct["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "Aggregate")
+        .unwrap();
+    assert_eq!(
+        aggregate["return_exprs"][0]["expr"]
+            .as_object_mut()
+            .unwrap()
+            .remove("distinct"),
+        Some(serde_json::json!(true))
+    );
+    let error = serde_json::from_value::<BoundPlan>(missing_distinct).unwrap_err();
+    assert!(
+        error.to_string().contains("missing field `distinct`"),
         "{error}"
     );
 
