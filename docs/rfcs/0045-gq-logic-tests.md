@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-09-28
+updated: 2026-10-13
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -655,10 +655,21 @@ counts exist). `branch list` is a rows step: it takes `unordered`,
 `ordered`, or `error: <substring>` over rows `{"name": "…"}`, its rows are
 sorted by `name` in byte order (a total order, so `ordered` is accepted and
 the `order`-clause refusal for declarations does not apply), and it
-carries the mandatory shape section, one line, `name: String`. A statement
-step has no params, so an iterating value never reaches its body; `${` in a
-quoted statement name parses and is refused by the runner's `${` fence, and
-`${` anywhere else in a statement body does not parse.
+carries the mandatory shape section, one line, `name: String`. A
+`--- query` step may also hold a ***branch control read*** of RFC 0030 §8.5
+(`branch diff`, `branch merge-base`, `branch merge … dry run`), refused under
+`--- mutate` as `branch list` is. It is a rows step over the statement's own
+answer: `unordered`, `ordered`, or `error: <substring>`, the rows compared
+as JSON whatever their key order. Its columns are the statement's, so it
+carries no shape section, and one is refused (`` `branch diff` answers its
+own columns; drop the `--- expect shape` section ``). A side spelled as a
+quoted bound name (`branch diff "${c}" to main`) runs with the commit
+`--- bind commit $c` captured, and a bound `${c}` in an expected row stands
+for the same id, as in a params body; an unbound name is refused. A
+statement step has no params, so an iterating value never reaches its body;
+`${` in a quoted statement name parses and is refused by the runner's `${`
+fence unless it is a bound commit, and `${` anywhere else in a statement body
+does not parse.
 
 The read/mutation classification is the compiler's own
 (`query_body = { read_query_body | mutation_body }` in `query.pest`); the
@@ -2662,3 +2673,11 @@ historical command and configuration descriptions are not migration aliases.
   `order_key_aggregate_or_node_binds_to_return_item.gqt` (§Evidence and
   tests) and `engine_v1_refuses_compound_predicates.gqt` to
   `compound_and_bare_boolean_filters.gqt`.
+- 2026-10-13, branch control reads: a `--- query` step holds the branch
+  control reads of RFC 0030 §8.5 (`branch diff`, `branch merge-base`,
+  `branch merge … dry run`) as rows steps without a shape section, their
+  columns being the statement's own, with a bound commit name in a quoted
+  side and in the expected rows. This supersedes "a `--- query` step may hold
+  `branch list`" as the only branch statement a query step holds, and "`${`
+  in a quoted statement name parses and is refused by the runner's `${`
+  fence" for a bound commit name in a branch control read.

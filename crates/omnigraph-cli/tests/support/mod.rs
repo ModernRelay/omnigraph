@@ -1420,14 +1420,15 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
-    // The read commands (blob get/stat, query, changes, commit) reject `--as`:
-    // a served read resolves the actor from its bearer token and a direct read
-    // attributes none, so passing `--as` there is an error. Only the write
-    // verbs, `blob put` and `blob clear` among them, carry the parity actor on
-    // the direct arm.
+    // The read commands (blob get/stat, branch diff/merge-base, query,
+    // changes, commit, diff) reject `--as`: a served read resolves the actor
+    // from its bearer token and a direct read attributes none, so passing
+    // `--as` there is an error. Only the write verbs, `blob put` and
+    // `blob clear` among them, carry the parity actor on the direct arm.
     let read = match args {
         ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
-        [verb, ..] => matches!(*verb, "query" | "changes" | "commit"),
+        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
+        [verb, ..] => matches!(*verb, "query" | "changes" | "commit" | "diff"),
         [] => false,
     };
     if !read {

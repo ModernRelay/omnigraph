@@ -101,7 +101,7 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
+    /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
     /// Run a read query.
     Query {
@@ -110,13 +110,15 @@ pub(crate) enum Command {
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
         /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// `branch list` statement, or one `explain query …` statement, which
-        /// answers the plan the query would run under as results.
+        /// branch read statement (`branch list`, `branch diff`,
+        /// `branch merge-base`, `branch merge … dry run`), or one
+        /// `explain query …` statement, which answers the plan the query
+        /// would run under as results.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// the `branch list` statement, which takes no name, params, --branch
-        /// or --snapshot, or an `explain query …` statement.
+        /// a branch read statement, which takes no name, params, --branch or
+        /// --snapshot, or an `explain query …` statement.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -251,6 +253,38 @@ pub(crate) enum Command {
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
+    },
+    /// Net entity changes between two read targets: a branch (its head now)
+    /// or a graph commit id. Auto-paginates; `branch diff` reviews a branch
+    /// against its merge base, `commit changes` reports one commit with its
+    /// cause.
+    Diff {
+        /// Graph URI
+        uri: Option<String>,
+        /// Read target the diff starts from
+        #[arg(long)]
+        from: String,
+        /// Read target the diff ends at
+        #[arg(long)]
+        to: String,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fetch exactly one page starting at this opaque token
+        /// (auto-paginates when omitted)
+        #[arg(long)]
+        page_token: Option<String>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
     },
     /// Commit history operations
     Commit {
@@ -906,11 +940,58 @@ pub(crate) enum BranchCommand {
         /// Exclusive with --delete-branch, whose source the commit still holds.
         #[arg(long, conflicts_with = "delete_branch")]
         as_commit: bool,
+        /// Run the merge through classification and validation and stop:
+        /// report the outcome, or fail with the conflicts, and write nothing.
+        /// A read of both branches.
+        #[arg(long, conflicts_with_all = ["delete_branch", "as_commit"])]
+        dry_run: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
         /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What a branch changed since its merge base with a target branch: the
+    /// net entity changes from the base to the branch head. Auto-paginates.
+    Diff {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        source: String,
+        /// Branch the source is compared against (default main)
+        #[arg(long)]
+        into: Option<String>,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fetch exactly one page starting at this opaque token
+        /// (auto-paginates when omitted)
+        #[arg(long)]
+        page_token: Option<String>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The commit a merge of a source branch into a target branch would
+    /// classify against
+    MergeBase {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        source: String,
+        /// Branch the source would merge into (default main)
+        #[arg(long)]
+        into: Option<String>,
         #[arg(long)]
         json: bool,
     },
