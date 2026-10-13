@@ -176,6 +176,21 @@ impl Failure {
                 && is_plain_refusal(&remote.output)
                 && single
         });
+        // The server authenticates, checks the contract header and applies
+        // policy before it admits a write; each code under its own status
+        // proves the request was refused there.
+        let refused = remote.is_some_and(|remote| {
+            matches!(
+                (remote.status, &remote.output.code),
+                (StatusCode::UNAUTHORIZED, Some(ErrorCode::Unauthorized))
+                    | (StatusCode::FORBIDDEN, Some(ErrorCode::Forbidden))
+                    | (
+                        StatusCode::BAD_REQUEST,
+                        Some(ErrorCode::ApiContractMismatch)
+                    )
+            ) && is_plain_refusal(&remote.output)
+                && single
+        });
         let contract = error.downcast_ref::<ApiContractError>();
         let request_dispatched = contract.map(|value| value.request_dispatched);
         let http_status = remote
@@ -205,8 +220,10 @@ impl Failure {
                     .unwrap_or_else(|| ErrorOutput::message(error.to_string())),
             }
         };
-        let not_started =
-            retry || conditional || (evidence.dispatched == 0 && !evidence.writable_open);
+        let not_started = retry
+            || conditional
+            || refused
+            || (evidence.dispatched == 0 && !evidence.writable_open);
         let action = if retry {
             Action::Retry
         } else if output.recovery_required.is_some()

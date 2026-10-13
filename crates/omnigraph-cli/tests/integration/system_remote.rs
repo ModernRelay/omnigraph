@@ -1656,17 +1656,34 @@ query insert_person($name: String, $age: I32) {
     .unwrap();
 
     // Reads are granted to the team group (bruno).
-    let snapshot = parse_stdout_json(&output_success(
-        cli()
-            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
-            .arg("snapshot")
-            .arg("--server")
-            .arg(&server.base_url)
-            .arg("--graph")
-            .arg(GRAPH_ID)
-            .arg("--json"),
-    ));
+    let main_snapshot = || {
+        parse_stdout_json(&output_success(
+            cli()
+                .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+                .arg("snapshot")
+                .arg("--server")
+                .arg(&server.base_url)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--json"),
+        ))
+    };
+    let snapshot = main_snapshot();
     assert_eq!(snapshot["graph_branch"], "main");
+
+    // Authentication and policy refuse before admission or staging, so the CLI
+    // reports a write that never started and leaves no reconciliation to do.
+    let refused_before_effects = |output: &std::process::Output, status: u16| {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let body = parse_stdout_json(output);
+        assert_eq!(body["http_status"], status, "{body}");
+        assert_eq!(
+            body["command_outcome"],
+            serde_json::json!({"execution":"not_started","effects":"none","action":"refresh"}),
+            "{body}"
+        );
+        body
+    };
 
     // bruno cannot change protected main (team-write-unprotected only).
     let denied_main_change = output_failure(
@@ -1683,7 +1700,7 @@ query insert_person($name: String, $age: I32) {
             .arg(r#"{"name":"PolicyRemote","age":41}"#)
             .arg("--json"),
     );
-    let denied_main = parse_stdout_json(&denied_main_change);
+    let denied_main = refused_before_effects(&denied_main_change, 403);
     assert_eq!(denied_main["code"], "forbidden");
     let denied_main_message = denied_main["error"].as_str().unwrap();
     assert!(
@@ -1692,6 +1709,53 @@ query insert_person($name: String, $age: I32) {
             && denied_main_message.contains("main"),
         "expected change-on-main denial, got: {denied_main}"
     );
+
+    // Nor load into it.
+    let batch = temp.path().join("system-remote-policy-load.ndjson");
+    fs::write(
+        &batch,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"PolicyLoad\",\"age\":7}}\n",
+    )
+    .unwrap();
+    let denied_load = output_failure(
+        cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .arg("load")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("--data")
+            .arg(&batch)
+            .arg("--mode")
+            .arg("append")
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&denied_load, 403)["code"],
+        "forbidden"
+    );
+
+    // An unrecognized bearer never reaches graph resolution.
+    let unauthenticated = output_failure(
+        cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "unknown-token")
+            .arg("mutate")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"PolicyRemote","age":41}"#)
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&unauthenticated, 401)["code"],
+        "unauthorized"
+    );
+    assert_eq!(main_snapshot(), snapshot, "a refused write moved main");
 
     // bruno can create an unprotected branch.
     let created = parse_stdout_json(&output_success(
@@ -1731,7 +1795,27 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(changed["affected_nodes"], 1);
     assert_eq!(changed["actor_id"], "act-bruno");
 
+    // No rule grants branch_delete; the admin merge below still finds `feature`.
+    let denied_delete = output_failure(
+        cli()
+            .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
+            .arg("branch")
+            .arg("delete")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("feature")
+            .arg("--yes")
+            .arg("--json"),
+    );
+    assert_eq!(
+        refused_before_effects(&denied_delete, 403)["code"],
+        "forbidden"
+    );
+
     // bruno cannot merge into protected main (admins-promote only).
+    let before_merge = main_snapshot();
     let denied_merge = output_failure(
         cli()
             .env("OMNIGRAPH_BEARER_TOKEN", "team-token")
@@ -1746,13 +1830,14 @@ query insert_person($name: String, $age: I32) {
             .arg("main")
             .arg("--json"),
     );
-    let denied_merge = parse_stdout_json(&denied_merge);
+    let denied_merge = refused_before_effects(&denied_merge, 403);
     assert_eq!(denied_merge["code"], "forbidden");
     let denied_merge_message = denied_merge["error"].as_str().unwrap();
     assert!(
         denied_merge_message.contains("denied") && denied_merge_message.contains("branch_merge"),
         "expected branch_merge denial, got: {denied_merge}"
     );
+    assert_eq!(main_snapshot(), before_merge, "a refused merge moved main");
 
     // ragnor can promote into protected main, but has no branch_delete grant.
     // The compound request still exits 0 and preserves the merge's receipt.
