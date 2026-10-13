@@ -247,3 +247,4 @@ then dated RFCs by date.
 | [2026-10-10](2026-10-10-unpublished-graph-commits.md) | Unpublished graph commits | maintainer | accepted | partial |
 | [2026-10-10](2026-10-10-merge-base-block-registry.md) | Block registry for merge base lookup | maintainer | draft | in-progress |
 | [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
+| [2026-10-11](2026-10-11-actor-views-and-subgraph-sharing.md) | Actor views and subgraph sharing | maintainer | draft | not-started |
