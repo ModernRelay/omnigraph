@@ -263,13 +263,15 @@ for origin validation, separate organization sessions, identity pins and renewal
 
 | Managed command | Behavior |
 |---|---|
+| `cluster list --managed --api ORIGIN [--organization ORG]` | List clusters visible to the selected organization |
+| `cluster pull --managed --out NEW_DIR [--rev REVISION]` | Download the bound cluster's exact configuration and context into a new directory |
 | `cluster plan --managed [--rev REVISION]` | Prepare a preview of the full pushed commit ID, or resolve the bound head when omitted |
 | `cluster apply --managed --plan PREVIEW_ID` | Deliver that exact preview under current permissions |
 | `cluster status --managed [DEPLOYMENT_ID] [--wait]` | Read labeled cluster observations, or an exact delivery; `--wait` requires its ID |
 | `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
 | `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
-See [managed lifecycle](managed-lifecycle.md) for creation, upload, deletion, undo and operation status.
+See [managed lifecycle](managed-lifecycle.md) for discovery, source checkout and lifecycle operations.
 
 All accept `--config DIR` and `--json`. Plan and apply also accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
@@ -290,7 +292,8 @@ seconds. Reaching the deadline stops only the local wait; continue with
 `cluster status --managed DEPLOYMENT_ID --wait`. Apply `--no-wait` prints the
 durable delivery reservation and both product/native IDs, then exits 0;
 it does not establish native acceptance or activation. Every HTTP request has a
-10-second deadline and an 8 MiB response limit; redirects are refused.
+10-second deadline and an 8 MiB response limit; configuration download allows
+120 seconds and 64 MiB encoded (8 MiB of file contents). Redirects are refused.
 `--json` prints one API envelope to stdout with its native fields and separate
 source, delivery, archive and runtime observations intact. Progress and idempotency keys use
 stderr; refusals use a JSON problem object with a `type` field.
@@ -322,10 +325,9 @@ The canonical `OMNIGRAPH_CONTROL_API` must match the selected context. A
 missing or mismatched pair refuses before any request. These credentials are
 separate from `OMNIGRAPH_BEARER_TOKEN`, named servers, and operator profiles.
 
-`--managed` requires its own context, except creation and explicit-origin
-operation lookup; `--direct` is rejected. Managed API failures never trigger
-local deployment. Service-only `create`, `push`, `delete`, `undo-delete`, `token`,
-`operation`, `history`, and `cancel` require `--managed`. Local `validate`,
+`--managed` requires context except `create`, `list` and explicit-origin operation
+lookup; `--direct` is rejected. Managed API failures never trigger local deployment.
+Service-only `create`, `list`, `pull`, `push`, `delete`, `undo-delete`, `token`, `operation`, `history` and `cancel` require `--managed`. Local `validate`,
 `observe`, `force-unlock`, and `upgrade-ledger` reject it. Managed `plan` takes
 `--rev` and managed `apply` requires `--plan`; self-hosted deployment flags cannot
 be combined with them.

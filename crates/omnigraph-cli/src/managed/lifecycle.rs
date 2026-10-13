@@ -3,6 +3,7 @@ use super::*;
 
 mod capture;
 mod pending;
+mod source;
 
 pub(super) fn outcome_exit(state: &str) -> Result<Option<i32>> {
     Ok(match state {
@@ -30,6 +31,8 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
     matches!(
         command,
         ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
             | ClusterCommand::Push { .. }
@@ -53,6 +56,12 @@ fn context_required(config: &Path) -> Result<Context> {
 pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
+        ClusterCommand::List {
+            api, organization, ..
+        } => source::list(config, api, organization.as_deref()).await,
+        ClusterCommand::Pull { out, revision, .. } => {
+            source::pull(config, out, revision.as_deref()).await
+        }
         ClusterCommand::Create {
             name,
             api,

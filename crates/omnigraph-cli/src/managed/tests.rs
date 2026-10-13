@@ -201,6 +201,8 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         assert_eq!(output.body["type"], kind);
     }
     for args in [
+        vec!["cluster", "list", "--api", "https://control.example"],
+        vec!["cluster", "pull", "--out", "checkout"],
         vec![
             "cluster",
             "create",
@@ -261,6 +263,22 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         assert!(parse_cluster(&args).is_err(), "accepted {args:?}");
     }
     for args in [
+        vec![
+            "omnigraph",
+            "cluster",
+            "list",
+            "--managed",
+            "--api",
+            "https://control.example",
+        ],
+        vec![
+            "omnigraph",
+            "cluster",
+            "pull",
+            "--managed",
+            "--out",
+            "checkout",
+        ],
         vec!["omnigraph", "cluster", "operation", "op-id", "--managed"],
         vec![
             "omnigraph",

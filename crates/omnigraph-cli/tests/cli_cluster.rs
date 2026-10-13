@@ -918,6 +918,209 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
 }
 
 #[test]
+fn managed_cluster_list_uses_selected_organization_and_refuses_context_conflicts() {
+    let temp = tempdir().unwrap();
+    let response = serde_json::json!({"data":{"clusters":[{"cluster_id":"managed-test","incarnation":"inc-one","name":"Example","state":"ready"}]},"meta":{"provenance":"service_db"}});
+    let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+    let output = output_success(managed_cli(temp.path(), &api.origin).args([
+        "list",
+        "--api",
+        &api.origin,
+        "--organization",
+        "account-one",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output), response);
+    assert_control_request(
+        &api.workflow_requests()[0],
+        "GET",
+        "/v1/clusters",
+        Value::Null,
+        None,
+    );
+    api.assert_complete();
+    assert!(!temp.path().join(".omnigraph").exists());
+
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = managed_cli(temp.path(), &api.origin)
+        .args([
+            "list",
+            "--api",
+            &api.origin,
+            "--organization",
+            "another-account",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert!(api.requests().is_empty());
+    api.assert_complete();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_export(files: Value) -> Value {
+    serde_json::json!({"data":{"cluster_id":"managed-test","revision":MANAGED_REVISION,"files":files},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_downloads_exact_source_and_context_without_printing_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    for explicit_revision in [false, true] {
+        let temp = tempdir().unwrap();
+        let files = serde_json::json!({
+            "cluster.yaml":"version: 1\nstorage: s3://tenant/root\ngraphs: {}\npolicies:\n  access:\n    file: policies/access.yaml\n",
+            "policies/access.yaml":"# og_fixture_control must survive byte-exact download\npolicies: []\n",
+        });
+        let api = lifecycle_fixture(vec![IntentReply::json(200, source_export(files.clone()))]);
+        write_managed_context(temp.path(), &api.origin);
+        let mut command = managed_cli(temp.path(), &api.origin);
+        command.args(["pull", "--out", "checkout", "--json"]);
+        if explicit_revision {
+            command.args(["--rev", MANAGED_REVISION]);
+        }
+        let output = output_success(&mut command);
+        let body = parse_stdout_json(&output);
+        assert_eq!(body["data"]["revision"], MANAGED_REVISION);
+        assert_eq!(body["data"]["file_count"], 2);
+        assert!(body["data"].get("files").is_none());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("og_fixture_control"));
+        for (path, content) in files.as_object().unwrap() {
+            let file = temp.path().join("checkout").join(path);
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                content.as_str().unwrap()
+            );
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(temp.path().join("checkout/.omnigraph/context")).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(temp.path().join("checkout"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let expected = format!(
+            "/v1/clusters/managed-test/config/export{}",
+            if explicit_revision {
+                format!("?revision={MANAGED_REVISION}")
+            } else {
+                String::new()
+            }
+        );
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            &expected,
+            Value::Null,
+            None,
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_refuses_foreign_invalid_and_unsafe_exports_without_partial_output() {
+    let normal = serde_json::json!({"cluster.yaml":"version: 1\ngraphs: {}\n"});
+    let mut foreign = source_export(normal.clone());
+    foreign["meta"]["cluster_id"] = serde_json::json!("another-cluster");
+    let mut wrong_revision = source_export(normal.clone());
+    wrong_revision["data"]["revision"] = serde_json::json!("b".repeat(40));
+    let mut cases = vec![foreign, wrong_revision];
+    for bad_path in [
+        "../outside",
+        "/absolute",
+        "a/../../outside",
+        "a//b",
+        "./schema.pg",
+        "a\\b",
+        "c:drive",
+        ".omnigraph/context",
+        "a/.git/config",
+        "__cluster/state.json",
+    ] {
+        let mut files = normal.clone();
+        files[bad_path] = serde_json::json!("never write");
+        cases.push(source_export(files));
+    }
+    for files in [
+        serde_json::json!({}),
+        serde_json::json!({"only.pg":"node Test {}"}),
+        serde_json::json!({"cluster.yaml":""}),
+        serde_json::json!({"cluster.yaml":17}),
+        serde_json::json!({"cluster.yaml":"version: 1", "a":"file", "a/b":"collision"}),
+        serde_json::json!({"cluster.yaml":"version: 1", "Schema.pg":"a", "schema.pg":"b"}),
+        serde_json::json!({"cluster.yaml":"version: 1", "large.pg":"x".repeat(1024 * 1024 + 1)}),
+    ] {
+        cases.push(source_export(files));
+    }
+    for response in cases {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args([
+                "pull",
+                "--out",
+                "checkout",
+                "--rev",
+                MANAGED_REVISION,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{:?}", output);
+        assert!(!temp.path().join("checkout").exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        api.assert_complete();
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_preserves_existing_destinations_before_http() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::create_dir(temp.path().join("empty")).unwrap();
+    fs::write(temp.path().join("edited"), "keep my work").unwrap();
+    symlink("missing", temp.path().join("link")).unwrap();
+    for out in ["empty", "empty/.", "edited", "link", ".", "missing/child"] {
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(["pull", "--out", out, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join("edited")).unwrap(),
+        "keep my work"
+    );
+    assert_eq!(fs::read_dir(temp.path().join("empty")).unwrap().count(), 0);
+    assert!(
+        fs::symlink_metadata(temp.path().join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(api.requests().is_empty());
+    api.assert_complete();
+}
+
+#[test]
 #[cfg(unix)]
 fn managed_lifecycle_push_sends_only_complete_referenced_files() {
     let temp = tempdir().unwrap();

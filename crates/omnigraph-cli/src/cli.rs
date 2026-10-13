@@ -646,6 +646,32 @@ pub(crate) enum ClusterCommand {
         #[command(flatten)]
         run: ClusterRunArgs,
     },
+    /// With --managed, list the clusters visible in the selected organization.
+    List {
+        #[arg(long)]
+        api: String,
+        #[arg(long)]
+        organization: Option<String>,
+        /// Configuration folder supplying an optional managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// With --managed, download an exact configuration revision into a new directory.
+    Pull {
+        /// New destination; existing files, directories and symlinks are never replaced.
+        #[arg(long)]
+        out: PathBuf,
+        /// Full lowercase Git commit ID; omission captures the current source head.
+        #[arg(long = "rev")]
+        revision: Option<String>,
+        /// Configuration folder containing the managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// With --managed, upload only referenced configuration files to the managed repository.
     Push {
         #[arg(long)]

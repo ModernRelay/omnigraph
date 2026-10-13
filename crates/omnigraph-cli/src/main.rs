@@ -304,6 +304,8 @@ fn validate_cluster_arguments(
     }
     match command {
         ClusterCommand::Create { .. }
+        | ClusterCommand::List { .. }
+        | ClusterCommand::Pull { .. }
         | ClusterCommand::Push { .. }
         | ClusterCommand::Delete { .. }
         | ClusterCommand::UndoDelete { .. }
@@ -2066,6 +2068,8 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }

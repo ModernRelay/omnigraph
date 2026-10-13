@@ -1,10 +1,44 @@
-# Create and retire a managed cluster
+# Discover, configure and retire a managed cluster
 
 These commands use your managed service identity and permissions. They do not
 open graph storage or require cloud credentials. The service must support
 cluster creation and lifecycle operations; an older service returns a refusal.
 Every command below requires explicit `--managed`; folder context alone never
 selects the service for a cluster command.
+
+## Find a cluster and recover its configuration
+
+After signing in, list the clusters visible to your selected organization:
+
+```sh
+omnigraph cluster list --managed --api https://control.example \
+  --organization org_customer --json
+omnigraph use CLUSTER_ID --api https://control.example \
+  --organization org_customer --config binding
+omnigraph cluster pull --managed --config binding --out customer-config --json
+```
+
+`use` creates only the folder binding. `pull` downloads the managed repository's
+current configuration and copies that binding into a **new** directory. This
+works on a new laptop or for another authorized team member; cloud credentials
+and access to a Git server are unnecessary. Keep the returned `data.revision`
+for the next `push --expected-revision`. To retrieve a historical source commit,
+add `--rev FULL_COMMIT_ID` to `pull`.
+
+The destination's parent must exist. An existing directory, even empty, a file
+or a symlink refuses. Download into another new directory to compare remote
+changes with local edits; the CLI never merges or overwrites a working tree.
+All files and the context appear together after validation. A failed download
+leaves no partial destination. Source contents are not printed in the result.
+
+Download is currently supported on Linux and macOS. The export is bounded to
+4096 UTF-8 files, 1 MiB per file, 8 MiB total file contents, 512-byte relative
+paths and a 64 MiB JSON response (allowing JSON escaping). Its HTTP deadline is
+120 seconds. Traversal, symlinks, conflicting paths and reserved directories
+are refused. `.git`, credentials and server-side control records are not
+downloaded; `.omnigraph/context` is created locally from the verified binding.
+The service requires cluster admission and `source_read`; an external repository
+binding must be checked out through its own Git provider instead.
 
 ## Create an empty cluster
 
@@ -45,29 +79,33 @@ explicit port forward; `ready` does not imply a public endpoint.
 ## Prepare and apply configuration
 
 Creation binds the folder; it does not create local configuration files. After
-the operation reaches `ready`, create `customer-demo/cluster.yaml`, replacing
-`CANONICAL_ROOT` with the exact root from the accepted create response:
+the operation reaches `ready`, download its initial configuration, including
+the policy that grants its creator management access:
+
+```sh
+omnigraph cluster pull --managed --config customer-demo --out customer-config --json
+# Keep data.revision as COMMIT below.
+```
+
+Edit `customer-config/cluster.yaml` to add a graph under `graphs`, keeping its
+existing storage root and policy declarations:
 
 ```yaml
-version: 1
-storage: CANONICAL_ROOT
 graphs:
   catalog:
     schema: ./catalog.pg
 ```
 
-Create `customer-demo/catalog.pg` with your graph schema, then read the current
-managed revision before submitting the edit:
+Create `customer-config/catalog.pg` with your graph schema, then submit the edit
+against the exact revision downloaded:
 
 ```sh
-omnigraph cluster status --managed --config customer-demo --json
-# Use data.source.revision from that response.
-omnigraph cluster push --managed --config customer-demo --expected-revision COMMIT \
+omnigraph cluster push --managed --config customer-config --expected-revision COMMIT \
   --message "Add the knowledge graph" --json
 # Use data.revision returned by push.
-omnigraph cluster plan --managed --config customer-demo --rev NEW_COMMIT --json
+omnigraph cluster plan --managed --config customer-config --rev NEW_COMMIT --json
 # Use data.preview_id from the ready preview.
-omnigraph cluster apply --managed --config customer-demo --plan PREVIEW_ID --json
+omnigraph cluster apply --managed --config customer-config --plan PREVIEW_ID --json
 ```
 
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
@@ -80,9 +118,9 @@ and a 32 MiB request. Path length is limited to 512 bytes and capture to
 descriptor-relative file traversal; other platforms refuse before submission.
 
 The expected revision is a full 40-character lowercase Git commit ID. A stale
-head is refused; read the current revision and reconcile your edit before
-retrying. The storage root cannot change. `push` requires `source_write` and
-changes only the managed repository. Source-head observation requires
+head is refused; pull into another new directory and reconcile your edit before
+retrying against that revision. The storage root cannot change. `push` requires
+`source_write` and changes only the managed repository. Source-head observation requires
 `source_read`; it grants no native management permission. The applied cluster
 policy decides whether the caller may plan and deploy configuration. A preview
 does not hold a change lease or prevent another source edit.

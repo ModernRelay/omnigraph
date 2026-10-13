@@ -311,6 +311,12 @@ struct Response {
     body: Value,
 }
 
+struct ResponseLimits {
+    timeout: Duration,
+    max_body: usize,
+    preserve_contents: bool,
+}
+
 impl Api {
     fn new(origin: String, token: Option<String>) -> Result<Self> {
         let client = Client::builder()
@@ -381,6 +387,33 @@ impl Api {
         key: Option<&str>,
         timeout: Duration,
     ) -> Result<Response> {
+        self.raw_bounded(
+            method,
+            path,
+            body,
+            key,
+            ResponseLimits {
+                timeout,
+                max_body: MAX_BODY,
+                preserve_contents: false,
+            },
+        )
+        .await
+    }
+
+    async fn raw_bounded(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        limits: ResponseLimits,
+    ) -> Result<Response> {
+        let ResponseLimits {
+            timeout,
+            max_body,
+            preserve_contents,
+        } = limits;
         let token = if let Some(selection) = &self.selection {
             Some(Box::pin(selection.credential(&self.origin)).await?)
         } else {
@@ -407,7 +440,10 @@ impl Api {
         let transport = || {
             Failure::new(
                 "transport_failed",
-                "managed API request failed or exceeded its 10-second deadline; a submitted operation may still exist; retain the original request and inspect its exact ID",
+                &format!(
+                    "managed API request failed or exceeded its {}-second deadline; a submitted operation may still exist; retain the original request and inspect its exact ID",
+                    timeout.as_secs()
+                ),
                 1,
             )
         };
@@ -422,20 +458,26 @@ impl Api {
         }
         if response
             .content_length()
-            .is_some_and(|n| n > MAX_BODY as u64)
+            .is_some_and(|n| n > max_body as u64)
         {
             return Err(Failure::new(
                 "api_response_too_large",
-                "Intent API response exceeds 8 MiB",
+                &format!(
+                    "Intent API response exceeds {} MiB",
+                    max_body / (1024 * 1024)
+                ),
                 1,
             ));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| transport())? {
-            if chunk.len() > MAX_BODY.saturating_sub(bytes.len()) {
+            if chunk.len() > max_body.saturating_sub(bytes.len()) {
                 return Err(Failure::new(
                     "api_response_too_large",
-                    "Intent API response exceeds 8 MiB",
+                    &format!(
+                        "Intent API response exceeds {} MiB",
+                        max_body / (1024 * 1024)
+                    ),
                     1,
                 ));
             }
@@ -443,7 +485,19 @@ impl Api {
         }
         let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
         if let Some(token) = &token {
+            // Source export is byte-exact, but reflected credentials in its
+            // remaining metadata and in every error must still be redacted.
+            let files = (status.is_success() && preserve_contents)
+                .then(|| {
+                    body.get_mut("data")
+                        .and_then(Value::as_object_mut)?
+                        .remove("files")
+                })
+                .flatten();
             auth::scrub_value(&mut body, token);
+            if let Some(files) = files {
+                body["data"]["files"] = files;
+            }
         }
         if status.is_success() {
             if !body.get("data").is_some_and(Value::is_object)
@@ -512,6 +566,8 @@ fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
         | ClusterCommand::Cancel { config, json, .. }
         | ClusterCommand::Token { config, json, .. }
         | ClusterCommand::Create { config, json, .. }
+        | ClusterCommand::List { config, json, .. }
+        | ClusterCommand::Pull { config, json, .. }
         | ClusterCommand::Delete { config, json, .. }
         | ClusterCommand::UndoDelete { config, json, .. }
         | ClusterCommand::Push { config, json, .. } => (config, *json),
