@@ -709,12 +709,17 @@ branch name), both resolved endpoints, the filter digest and the position; it
 is never accepted as a feed cursor or a commit page token. Filters are the §3.3 kind, type and operation filters. An
 unreadable endpoint maps to the §6 typed outcomes.
 
-Authorization is `read` on the branch each endpoint resolves to. A commit
-endpoint authorizes against its authored branch, or against the recorded
-target of a proposal or snapshot. The two-point route resolves a side before
-it authorizes it, so a forbidden side is reported exactly as a side that names
-nothing (`404`), as the commit diff does. The branch form and the merge base
-name their branches outright and answer a read denial with `403`.
+Authorization of the two-point form is `read` on the branch each endpoint
+resolves to. A commit endpoint authorizes against its authored branch, or
+against the recorded target of a proposal or snapshot. The two-point route
+resolves a side before it authorizes it, so a forbidden side is reported
+exactly as a side that names nothing (`404`), as the commit diff does. The
+branch form and the merge base require `read` on both named branches, source
+and target, on every request, a continuation included, before they read
+lineage. Their endpoints are the base and the source head, which can both be
+readable while the target is not, and the base and the result would then
+reveal whether the target has incorporated the source. They name their
+branches outright, so a denial is a `403`.
 
 Cost: a type lifetime whose `to` pin is one proving transaction past its `from`
 pin may use the §14 candidate pruning. Every other changed lifetime takes the
@@ -742,9 +747,19 @@ or delete.
 
 `branch merge-base` reports the commit a merge of the source into the target
 would classify against, by the rule the
-[merge guide](../user/branching/merge.md) documents. It reads lineage only. It
-also lets a caller replay a branch's own commits through the feed with
-`--start after:<base>`.
+[merge guide](../user/branching/merge.md) documents. It reads lineage only, and
+like the branch diff it requires `read` on both branches (§8.2).
+
+When the base lies on the source's first-parent chain, as it does for a source
+that has never merged the target in, a caller can replay the source's commits
+since the base through the feed with `--start after:<base>`. A merge commit in
+that range still carries the changes it imported in its block (§3.2), so the
+replay is the source's history, not only its own edits. Once the target has
+been merged into the source, the base is the target commit that merge imported,
+which the source's first-parent chain does not hold, and the feed refuses it as
+a start (§5.3). The feed does not walk second parents, because that would
+change its replay contract; `branch diff` reports the net change from any
+base.
 
 `branch merge --dry-run` runs the merge's base resolution, three-way
 classification and constraint validation and stops. It reports the outcome
@@ -777,8 +792,11 @@ answers whether the merge would succeed, without a write.
 The diff commands take the existing `--kind`, `--type`, `--op`, `--limit`,
 `--page-token` and `--json` options and paginate automatically, as
 `commit changes` does. `--into`, `source` and `target` follow `branch merge`.
-These commands are not GQ statements, because their results are paged change
-records rather than query rows.
+Exposing them as GQ statements is deferred, not rejected.
+[RFC 0056](https://github.com/ModernRelay/omnigraph/pull/670) proposes carrying
+`commit changes` and `changes poll` as entity-change rows with an optional page
+object, and the graph diff should take whatever envelope that RFC settles
+rather than decide a second one here. D1–D3 ship through the CLI and HTTP.
 
 ### 8.6 Retiring the table-shaped diff
 
@@ -891,6 +909,11 @@ server `integration/data_routes.rs` and `integration/openapi.rs`; CLI
   reported base is the one branch merge classifies against, because one
   function computes both; after the target was merged into the source, only
   the source's own net changes since the newest base appear.
+- Merge base and the feed: after the target was merged into the source, the
+  base is off the source's first-parent chain and the source's feed refuses
+  `after:<base>` with `ChangeCursorRejected`, while the branch diff still
+  reports the source's net change. Owner: the existing merge-and-feed test in
+  `integration/changes.rs`.
 - Endpoints: a branch, a published commit, a proposal and an unattached
   snapshot all resolve; a string naming both a branch and a commit is refused;
   pages after a concurrent commit on either branch still answer for the pinned
@@ -903,6 +926,9 @@ server `integration/data_routes.rs` and `integration/openapi.rs`; CLI
   is written; an actor with `read` alone can run it and still cannot merge.
 - Authorization and not-found parity with the commit diff; the vocabulary
   gates cover the new DTOs; the parity matrix covers local and remote runs.
+- Branch-form authorization: an actor who can read the base and the source but
+  not the target is refused the branch diff, on its first page and on a
+  continuation, and the merge base.
 
 ### Cost evidence
 
@@ -1368,6 +1394,29 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
       `query --snapshot` on the proposal refuse with "expired and awaits
       cleanup", `commit publish` fails its head precondition, and
       `commit drop` succeeds.
+- **2026-10-12: review of the graph diff amendment.** Three corrections from
+  the review of ModernRelay/omnigraph#964:
+  - The merge base is not always a valid feed start. Once the target has been
+    merged into the source, the base is the target commit that merge
+    imported, off the source's first-parent chain, and the feed refuses it.
+    The review reproduced the refusal with `CommitGraph::merge_base` and the
+    feed in the existing merge-and-feed test. §8.4 now limits the recipe to a
+    base on that chain and points at `branch diff` for the net change, and D0
+    gains the shape.
+  - The branch form's endpoints are the base and the source head, so
+    authorizing them alone lets an actor who cannot read the target learn
+    whether it has incorporated the source. §8.2 now requires `read` on both
+    named branches, continuations included, and D0 gains the gate.
+  - GQ exposure of the diff surfaces is deferred to RFC 0056
+    (ModernRelay/omnigraph#670), not rejected (§8.5).
+
+  This entry supersedes these sentences:
+  - §8.2: "Authorization is `read` on the branch each endpoint resolves to."
+    It now covers the two-point form only.
+  - §8.4: "It also lets a caller replay a branch's own commits through the
+    feed with `--start after:<base>`."
+  - §8.5: "These commands are not GQ statements, because their results are
+    paged change records rather than query rows."
 - **2026-10-12: D1–D3 implemented.** `Omnigraph::diff_page` (two-point and
   branch forms, the `diff-page` token, typed `AmbiguousReadTarget` and
   `ReadTargetNotFound`), `Omnigraph::merge_base`,
@@ -1379,9 +1428,13 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
   "reports the outcome …, the structured conflict list and change counts per
   type and operation, and stops" it supersedes), and the `diff-page` token also
   binds a digest of the request's sides. Evidence: engine `changes.rs`
-  graph-diff tests and the dry run inside every `merge_truth_table` cell (zero
-  object-store writes, the merge's own outcome); server `data_routes.rs` and
-  `auth_policy.rs` route and policy tests; CLI `parity_matrix.rs`
+  graph-diff tests, with the merge-base feed refusal in
+  `change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on_cause`,
+  and the dry run inside every `merge_truth_table` cell (zero object-store
+  writes, the merge's own outcome); server `data_routes.rs` and
+  `auth_policy.rs` route and policy tests, with the target-denied branch
+  review in `policy_branch_review_needs_read_on_the_target`; CLI
+  `parity_matrix.rs`
   `parity_diff_over_shared_history` and `parity_branch_review`; GQT cases
   `graph_diff_branch_review.gqt`, `graph_diff_merge_proposal.gqt`,
   `graph_diff_net_range.gqt` and `graph_diff_refusals.gqt` on the engine, DST
