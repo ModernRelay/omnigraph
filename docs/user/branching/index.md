@@ -143,6 +143,59 @@ Served, the same control writes are `POST /commits/{commit_id}/publish`
 the `commit_publish` and `commit_drop` policy actions on the recorded target
 branch ([Policy](../operations/policy.md)).
 
+### Unattached branches
+
+A mutation written `as unattached branch` records its result as an unattached
+snapshot: the branch head is unchanged, the result is readable at the
+snapshot's id (`--snapshot <id>`), and the snapshot never publishes. A second
+write `on "<id>"` (or `on $base` with a `String` parameter) builds on that
+snapshot and returns a new id; the caller keeps the latest id as its tip. The
+snapshot's branch is the one the first write ran on (`main` when the request
+names none); a write `on` a snapshot runs on that recorded branch, and a
+request that names another branch is refused. Two writes on one base each get
+their own snapshot and see nothing of each other's.
+
+```gq
+query add_person($name: String) as unattached branch {
+    insert Person { name: $name }
+}
+
+query add_address($id: String, $base: String) as unattached branch on $base {
+    insert Address { owner: $id, city: "Delft" }
+}
+```
+
+A write that changes nothing returns `commit: null` and creates no snapshot;
+the caller keeps its previous tip. The receipt's `commit` carries
+`kind: "unattached"`, `published: false` and `root_commit_id`, the first
+snapshot of the chain (its own id on that first snapshot); `parent_commit_id`
+is the base snapshot, or the branch head the first write ran on. A base must
+be a live unattached snapshot: a published commit or an unpublished commit is
+refused.
+
+```bash
+omnigraph commit list graph.omni --branch main --unattached
+omnigraph query people --query queries.gq --snapshot <snapshot-id> --store graph.omni
+omnigraph commit drop <snapshot-id> --uri graph.omni
+```
+
+`commit list --unattached` shows the branch's live snapshots, newest first,
+flat; `parent_commit_id` tells the chains apart. `commit drop` of a snapshot
+also drops every snapshot built on it; dropping the first one discards the
+whole chain, and a snapshot built on another chain is untouched. `commit
+publish` of an unattached snapshot is refused with HTTP 409 and the error
+code `unattached_cannot_publish`; nothing is written. Every snapshot of a
+chain expires when an ordinary write moves the branch head past the head the
+first write captured, or when the branch is deleted or recreated: expired
+snapshots answer `not found` to reads and writes and leave the listing. Dropping or expiring
+a snapshot promises no storage reclamation; `cleanup` reports what it retains.
+
+Served, the listing is `GET /commits?unattached=true&branch=<name>`
+(`unattached` and `unpublished` together are refused) and the drop is the same
+`DELETE /commits/{commit_id}` (204). Writing needs `change` on the recorded
+branch; listing and reading a snapshot need `read` on it
+([Policy](../operations/policy.md)).
+
 ## Historical reads
 
 Every read targets either a live branch or an immutable graph commit. Take a
@@ -157,9 +210,21 @@ omnigraph query sources_for_claim --query queries.gq \
 A query stays on one snapshot for its entire lifetime. Wildcard traversal is
 refused on an explicit historical target because historical schema membership
 is not reconstructed. Explicit edge alternatives retain named-edge historical
-read rules. Historical reads can
-eventually fail after destructive cleanup removes the versions that commit
-needs. Branch deletion can likewise end access to branch-only history.
+read rules.
+
+A historical query is written against the current schema. A type renamed since
+the commit still reads under its current name, but a property reads only where
+the commit stores that same property under its current name. A property added
+since the commit, renamed since, or dropped and re-added with the same name is
+refused at that commit, naming the property, rather than answering with null or
+with the dropped property's values. A whole-node `return { $p }` reads every
+current property, so it is refused at commits made before a property was added.
+Table data written before v0.10 records no property identity, so a commit that
+reads such data refuses its properties too, unless that data is still the
+table's current version.
+
+Historical reads can eventually fail after destructive cleanup removes the
+versions that commit needs. Branch deletion can likewise end access to branch-only history.
 
 ## Changes and feeds
 

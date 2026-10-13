@@ -320,7 +320,7 @@ impl PolicyConfig {
     /// `load` for callers whose policies don't live on the local filesystem
     /// (e.g. a cluster catalog on object storage).
     pub fn from_source(source: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(source)?;
+        let config: Self = yaml_serde::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
@@ -443,7 +443,7 @@ impl PolicyConfig {
 
 impl PolicyTestConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        let config: Self = yaml_serde::from_str(&fs::read_to_string(path)?)?;
         if config.version != 1 {
             bail!("policy test version must be 1");
         }
@@ -1176,7 +1176,7 @@ rules:
 
     #[test]
     fn rejects_duplicate_rule_ids() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1202,7 +1202,7 @@ rules:
 
     #[test]
     fn rejects_unknown_group_references() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1223,7 +1223,7 @@ rules:
 
     #[test]
     fn rejects_invalid_scope_action_combinations() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1244,7 +1244,7 @@ rules:
 
     #[test]
     fn compiles_and_authorizes_branch_and_target_rules() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1313,7 +1313,7 @@ rules:
 
     #[test]
     fn policy_tests_enforce_expected_outcomes() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1356,7 +1356,7 @@ rules:
 
     #[test]
     fn schema_apply_uses_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1400,7 +1400,7 @@ rules:
 
     #[test]
     fn commit_publish_and_drop_use_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1443,7 +1443,7 @@ rules:
             assert!(!deny.allowed, "{action:?} onto feature");
         }
 
-        let branch_scoped: PolicyConfig = serde_yaml::from_str(
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1465,7 +1465,7 @@ rules:
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1515,7 +1515,7 @@ rules:
 
     #[test]
     fn invoke_query_authorizes_per_graph() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1566,7 +1566,7 @@ rules:
         // invoke_query is graph-scoped (like admin) — per-branch access is
         // enforced by the inner read/change gate — so a rule that puts a
         // `branch_scope` qualifier on it is rejected at validate().
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1589,7 +1589,7 @@ rules:
 
     #[test]
     fn server_scoped_rule_cannot_use_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1616,7 +1616,7 @@ rules:
         // A single rule must reference exactly one resource kind.
         // `graph_list` (Server) + `read` (Graph) in one allow block
         // is invalid — operators must split the rule.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1644,7 +1644,7 @@ rules:
         // as before, even when the compiled-in schema now declares
         // `Server` + `graph_*` actions. This pins the "Cedar refactor
         // is operator-invisible" promise.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:

@@ -339,24 +339,32 @@ fn parse_commit_stmt(
         .into_inner()
         .find(|inner| inner.as_rule() == Rule::string_lit)
         .expect("grammar: every commit form names one string literal");
-    let position = position_of(&literal);
-    let graph_commit_id = decode_string_literal(literal.as_str())
-        .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &literal))?;
-    if graph_commit_id.is_empty()
-        || graph_commit_id.trim() != graph_commit_id
-        || graph_commit_id.chars().any(char::is_control)
-    {
-        return Err(QueryDiagnostic::parse(
-            Q004,
-            format!("graph commit id {graph_commit_id:?} is not a commit id"),
-            Some(position),
-        ));
-    }
+    let graph_commit_id = decode_graph_commit_id(&literal)?;
     match rule {
         Rule::commit_publish => Ok(CommitWrite::Publish { graph_commit_id }),
         Rule::commit_drop => Ok(CommitWrite::Drop { graph_commit_id }),
         other => unreachable!("grammar: commit_stmt admits no {other:?}"),
     }
+}
+
+/// A quoted graph commit id operand: decoded, non-empty, untrimmed-equal
+/// and free of control characters (`Q004` otherwise).
+fn decode_graph_commit_id(
+    literal: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<String, QueryDiagnostic> {
+    let graph_commit_id = decode_string_literal(literal.as_str())
+        .map_err(|error| diagnostic_at(Q004, parse_error_message(error), literal))?;
+    if graph_commit_id.is_empty()
+        || graph_commit_id.trim() != graph_commit_id
+        || graph_commit_id.chars().any(char::is_control)
+    {
+        return Err(diagnostic_at(
+            Q004,
+            format!("graph commit id {graph_commit_id:?} is not a commit id"),
+            literal,
+        ));
+    }
+    Ok(graph_commit_id)
 }
 
 fn parse_branch_name(
@@ -454,14 +462,15 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
+    let mut distinct = false;
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
-    let mut as_commit_clause = None;
+    let mut write_clause = None;
 
     for item in inner {
         match item.as_rule() {
-            Rule::as_commit_clause => as_commit_clause = Some(item),
+            Rule::as_commit_clause | Rule::as_unattached_clause => write_clause = Some(item),
             Rule::param_list => {
                 for p in item.into_inner() {
                     if let Rule::param = p.as_rule() {
@@ -520,8 +529,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                 }
                                 Rule::return_clause => {
                                     for proj in section.into_inner() {
-                                        if let Rule::projection = proj.as_rule() {
-                                            return_clause.push(parse_projection(proj)?);
+                                        match proj.as_rule() {
+                                            Rule::kw_distinct => distinct = true,
+                                            Rule::projection => {
+                                                return_clause.push(parse_projection(proj)?);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -564,14 +577,28 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
             _ => {}
         }
     }
-    if let Some(clause) = &as_commit_clause
-        && mutations.is_empty()
-    {
-        return Err(query_error_at(
-            format!("`as commit` applies to a mutation; query `{name}` is read-only"),
-            clause,
-        ));
-    }
+    let write_mode = match write_clause {
+        None => MutationWriteMode::Publish,
+        Some(clause) => {
+            if mutations.is_empty() {
+                let spelled = match clause.as_rule() {
+                    Rule::as_commit_clause => "as commit",
+                    _ => "as unattached branch",
+                };
+                return Err(query_error_at(
+                    format!("`{spelled}` applies to a mutation; query `{name}` is read-only"),
+                    &clause,
+                ));
+            }
+            match clause.as_rule() {
+                Rule::as_commit_clause => MutationWriteMode::AsCommit,
+                Rule::as_unattached_clause => MutationWriteMode::Unattached {
+                    base: parse_unattached_base(clause).map_err(CompilerError::query)?,
+                },
+                other => unreachable!("grammar: query_decl admits no write clause {other:?}"),
+            }
+        }
+    };
 
     Ok(QueryDecl {
         name,
@@ -580,11 +607,35 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         params,
         match_clause,
         return_clause,
+        distinct,
         order_clause,
         limit,
         mutations,
-        as_commit: as_commit_clause.is_some(),
+        write_mode,
     })
+}
+
+/// The `on` operand of an `as_unattached_clause`, `None` when unspelled. A
+/// literal passes the commit-id checks of a commit statement; a variable
+/// records its name for the typechecker to resolve against the parameters.
+fn parse_unattached_base(
+    clause: pest::iterators::Pair<Rule>,
+) -> std::result::Result<Option<UnattachedBase>, QueryDiagnostic> {
+    let Some(operand) = clause
+        .into_inner()
+        .find(|inner| matches!(inner.as_rule(), Rule::string_lit | Rule::variable))
+    else {
+        return Ok(None);
+    };
+    match operand.as_rule() {
+        Rule::variable => Ok(Some(UnattachedBase::Param(
+            operand.as_str()[1..].to_string(),
+        ))),
+        Rule::string_lit => Ok(Some(UnattachedBase::Literal(decode_graph_commit_id(
+            &operand,
+        )?))),
+        other => unreachable!("grammar: as_unattached_clause admits no operand {other:?}"),
+    }
 }
 
 fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static str, String)> {
@@ -1089,9 +1140,19 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::agg_call => {
             let mut parts = inner.into_inner();
             let func = parse_agg_func(parts.next().unwrap().as_str())?;
-            let arg = parse_expr(parts.next().unwrap(), scope)?;
+            let mut distinct = false;
+            let mut arg = None;
+            for part in parts {
+                match part.as_rule() {
+                    Rule::kw_distinct => distinct = true,
+                    _ => arg = Some(parse_expr(part, scope)?),
+                }
+            }
+            let arg =
+                arg.ok_or_else(|| CompilerError::Parse(format!("{func} needs an argument")))?;
             Ok(Expr::Aggregate {
                 func,
+                distinct,
                 arg: Box::new(arg),
             })
         }

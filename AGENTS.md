@@ -134,7 +134,8 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
 # Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
-# binary (one link per crate, not one per file); the binaries CI selects by name stay separate files.
+# binary (one link per crate, not one per file); a file stays a separate binary only when its tests
+# need their own process. CI selects a module's test as `--test integration <module>::<name>`.
 cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
@@ -191,7 +192,7 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   assertions; when the reported symptom additionally needs scale to
   manifest, a second test guards it, a `.gqt` case under
   `crates/omnigraph-gqt/cases_slow/` when the format can express the symptom
-  and an `#[ignore]`d test in a `tests/repro_issue_*.rs` target otherwise,
+  and an `#[ignore]`d test in a `tests/integration/repro_issue_*.rs` module otherwise,
   and the two cross-reference each other in comments.
 - Every `#[ignore]`d test opens its ignore message with its species
   (`instrument:`, `hunt:`, `heavy-repro:`, `nightly:`, or the environment it

@@ -392,7 +392,8 @@ async fn measure(
     )];
     let params = ParamMap::new();
     let read =
-        NodeRead::for_index_split(ds.clone(), "Person", &filters, &params, catalog, None).unwrap();
+        NodeRead::for_index_split(ds.clone(), "Person", true, &filters, &params, catalog, None)
+            .unwrap();
     let (plan, filter) = read.plan_with_filter().await.unwrap();
     if finalized {
         assert!(matches!(

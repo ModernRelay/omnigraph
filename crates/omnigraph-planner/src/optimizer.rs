@@ -187,6 +187,7 @@ fn resolve_query(
         params: _,
         pipeline,
         return_exprs,
+        distinct,
         order_by,
         limit,
     } = ir;
@@ -198,6 +199,7 @@ fn resolve_query(
     let has_aggregates = return_exprs
         .iter()
         .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+    let grouped = has_aggregates || *distinct;
     if let Some(leading) = orderings.first() {
         if let Some(mut node) = search_node(current, &leading.expr, *limit) {
             if let LogicalNode::RankFuse {
@@ -220,7 +222,7 @@ fn resolve_query(
         reads_of_expr(expr, &mut reads);
     }
     let schema = return_schema(return_exprs, &node_object_types(return_exprs, source)?)?;
-    current = if has_aggregates {
+    current = if grouped {
         plan.add(
             LogicalNode::Aggregate {
                 input: current,
@@ -242,11 +244,11 @@ fn resolve_query(
     if ranked || !orderings.is_empty() {
         let bound: Vec<IROrdering> = orderings
             .iter()
-            .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_, _)))
             .map(|ordering| IROrdering {
-                expr: bind_order_key(&ordering.expr, return_exprs),
+                expr: bind_order_key(&ordering.expr, return_exprs, grouped),
                 descending: ordering.descending,
             })
+            .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_, _)))
             .collect();
         let mut keys = Vec::new();
         for ordering in &bound {
@@ -256,7 +258,7 @@ fn resolve_query(
             &scope_tiebreaks(plan, current, source)?,
             order_by,
             return_exprs,
-            has_aggregates,
+            grouped,
         );
         current = plan.add(
             LogicalNode::Sort {
@@ -623,11 +625,39 @@ fn fused_score(binding: &str) -> IRExpr {
     }
 }
 
+/// The user's keys, then every group key the user did not write, ascending.
+fn with_group_keys(
+    order_by: &[IROrdering],
+    return_exprs: &[IRProjection],
+    aggregates: &[Option<crate::aggregate::AggregateSpec>],
+) -> Vec<IROrdering> {
+    let mut keys = order_by.to_vec();
+    for (projection, aggregate) in return_exprs.iter().zip(aggregates) {
+        if aggregate.is_some() {
+            continue;
+        }
+        let column = result_column(projection);
+        let written = keys.iter().any(|key| match &key.expr {
+            IRExpr::AliasRef(alias, _) => *alias == column,
+            expr => *expr == projection.expr,
+        });
+        if !written {
+            keys.push(IROrdering {
+                expr: IRExpr::AliasRef(column, projection.ty.clone()),
+                descending: false,
+            });
+        }
+    }
+    keys
+}
+
 /// A key the type checker bound to a `return` item (T42, RFC
 /// 2026-09-24-shared-expression-model, "Order key binding") as the `AliasRef`
-/// of that item's column; a property or alias key as written.
-fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection]) -> IRExpr {
-    if matches!(key, IRExpr::PropAccess { .. } | IRExpr::AliasRef(_, _)) {
+/// of that item's column; ungrouped property keys keep their source column.
+fn bind_order_key(key: &IRExpr, return_exprs: &[IRProjection], grouped: bool) -> IRExpr {
+    if matches!(key, IRExpr::AliasRef(_, _))
+        || (!grouped && matches!(key, IRExpr::PropAccess { .. } | IRExpr::Literal(_, _)))
+    {
         return key.clone();
     }
     return_exprs
@@ -2510,40 +2540,31 @@ impl Lowering<'_> {
             })
     }
 
-    /// The `Sort` a query's return runs under (RFC 0047 §One total order):
-    /// the ranking's score keys then the user's; over an aggregate the user's
-    /// keys then every group key ascending, or none when the user wrote none.
+    /// The `Sort` a query's return runs under (RFC 0047 §One total order): the
+    /// ranking's score keys then the user's; over an aggregate, or a `distinct`
+    /// return with or without a ranking, the user's keys then every group key.
     fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
-        let Some(ranking) = &self.ranking else {
-            return Some(order_by.to_vec());
+        let grouped = match self.physical.node(input) {
+            Some(PhysicalNode::Aggregate {
+                return_exprs,
+                aggregates,
+                ..
+            }) => Some((return_exprs, aggregates)),
+            _ => None,
         };
-        if let Some(PhysicalNode::Aggregate {
-            return_exprs,
-            aggregates,
-            ..
-        }) = self.physical.node(input)
-        {
+        let Some(ranking) = &self.ranking else {
+            return Some(match grouped {
+                Some((return_exprs, aggregates)) if aggregates.iter().all(Option::is_none) => {
+                    with_group_keys(order_by, return_exprs, aggregates)
+                }
+                _ => order_by.to_vec(),
+            });
+        };
+        if let Some((return_exprs, aggregates)) = grouped {
             if order_by.is_empty() {
                 return None;
             }
-            let mut keys = order_by.to_vec();
-            for (projection, aggregate) in return_exprs.iter().zip(aggregates) {
-                if aggregate.is_some() {
-                    continue;
-                }
-                let column = result_column(projection);
-                let written = keys.iter().any(|key| match &key.expr {
-                    IRExpr::AliasRef(alias, _) => *alias == column,
-                    expr => *expr == projection.expr,
-                });
-                if !written {
-                    keys.push(IROrdering {
-                        expr: IRExpr::AliasRef(column, projection.ty.clone()),
-                        descending: false,
-                    });
-                }
-            }
-            return Some(keys);
+            return Some(with_group_keys(order_by, return_exprs, aggregates));
         }
         let mut keys = match ranking {
             Ranking::Scores(scores) => scores.clone(),

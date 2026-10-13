@@ -780,7 +780,7 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
 
 /// Emulated-S3 graph, bucket-gated. Returns `None` **only** when
 /// `OMNIGRAPH_S3_TEST_BUCKET` is unset, so the caller logs + skips — the
-/// `tests/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
+/// `tests/integration/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
 /// (the rustfs CI job), any `init`/seed failure is a real failure and panics
 /// rather than silently skipping — otherwise a down/misconfigured store would let
 /// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.

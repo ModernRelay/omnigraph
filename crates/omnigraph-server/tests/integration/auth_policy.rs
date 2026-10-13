@@ -1400,6 +1400,212 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
     );
 }
 
+const UNATTACHED_WRITERS_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-ragnor, act-bruno, act-andrew]
+  admins: [act-ragnor]
+  writers: [act-bruno]
+  main_readers: [act-carla]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: main-readers-read
+    allow:
+      actors: { group: main_readers }
+      actions: [read]
+      branch_scope: protected
+  - id: admins-change
+    allow:
+      actors: { group: admins }
+      actions: [change]
+      branch_scope: any
+  - id: writers-change-unprotected
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: unprotected
+"#;
+
+/// A child unattached write is authorized (`change`) on its base's recorded
+/// target, never on the request `branch`: a denial is the unknown-base 404,
+/// a mismatching `branch` is 400 only after it, and reads take the target.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_unattached_child_writes_authorize_on_the_recorded_target() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, UNATTACHED_WRITERS_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![
+            ("act-ragnor".to_string(), "admin-token".to_string()),
+            ("act-bruno".to_string(), "writer-token".to_string()),
+            ("act-andrew".to_string(), "reader-token".to_string()),
+            ("act-carla".to_string(), "main-reader-token".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let sprout = |token: &str, name: &str, base: Option<&str>, branch: Option<&str>| {
+        let on = base.map(|id| format!(" on \"{id}\"")).unwrap_or_default();
+        let mut body = json!({"query": format!(
+            "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+        )});
+        if let Some(branch) = branch {
+            body["branch"] = json!(branch);
+        }
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(&app, sprout("admin-token", "Root", None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "main");
+    let main_root = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) =
+        json_response(&app, sprout("writer-token", "Root", None, Some("main"))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a root is a change on its branch: {body}"
+    );
+
+    let unknown_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let (status, body) = json_response(
+        &app,
+        sprout("writer-token", "Child", Some(unknown_id), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let unknown: ErrorOutput = serde_json::from_value(body).unwrap();
+    for (what, token, branch) in [
+        ("writer without change on main", "writer-token", None),
+        (
+            "writer naming its own branch",
+            "writer-token",
+            Some("feature"),
+        ),
+        ("reader without change", "reader-token", None),
+    ] {
+        let (status, body) =
+            json_response(&app, sprout(token, "Child", Some(&main_root), branch)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{what}: {body}");
+        let denied: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(denied.code, unknown.code, "{what}");
+        assert_eq!(
+            denied.error.replace(&main_root, unknown_id),
+            unknown.error,
+            "{what}: a denial names the id exactly as an unknown id is named"
+        );
+    }
+
+    let (status, body) =
+        json_response(&app, sprout("writer-token", "Root", None, Some("feature"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "feature");
+    assert_eq!(body["commit"]["graph_branch"], "feature");
+    let feature_root = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (what, token) in [("writer", "writer-token"), ("admin", "admin-token")] {
+        let (status, body) = json_response(
+            &app,
+            sprout(token, "Astray", Some(&feature_root), Some("main")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{what}: an authorized request naming another branch is refused: {body}"
+        );
+        let refused: ErrorOutput = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            refused.code,
+            Some(omnigraph_server::api::ErrorCode::BadRequest)
+        );
+    }
+    let (status, body) = json_response(
+        &app,
+        sprout(
+            "writer-token",
+            "Named",
+            Some(&feature_root),
+            Some("feature"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["branch"], "feature");
+    let (status, body) = json_response(
+        &app,
+        sprout("writer-token", "Omitted", Some(&feature_root), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["branch"], "feature",
+        "an omitted branch takes the target"
+    );
+    assert_eq!(body["commit"]["graph_branch"], "feature");
+    assert_eq!(body["commit"]["root_commit_id"], feature_root);
+    let feature_child = body["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let read_snapshot = |token: &str, snapshot: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": "query people() { match { $p: Person } return { $p.name } }",
+                    "snapshot": snapshot,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let (status, body) = json_response(&app, read_snapshot("reader-token", &feature_child)).await;
+    assert_eq!(status, StatusCode::OK, "a read grant on the target: {body}");
+    assert_eq!(body["target"]["snapshot"], feature_child);
+    let (status, body) = json_response(&app, read_snapshot("main-reader-token", &main_root)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) =
+        json_response(&app, read_snapshot("main-reader-token", &feature_child)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a snapshot read takes the read decision on the recorded target: {body}"
+    );
+}
+
 /// A direct commit diff resolves the commit across ALL branches before it
 /// authorizes the commit's branch, so a 403-vs-404 split would be a graph-wide
 /// commit-existence oracle: an actor without read on a branch could confirm a

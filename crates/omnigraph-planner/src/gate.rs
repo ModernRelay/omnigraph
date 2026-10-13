@@ -655,6 +655,7 @@ mod tests {
                     type_name: "Doc".into(),
                 },
             }],
+            distinct: false,
             order_by: vec![],
             limit: None,
         };

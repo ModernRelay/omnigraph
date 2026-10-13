@@ -959,8 +959,12 @@ impl StagedMutation {
         // append/merge may then reprepare at their outer bounded retry loop;
         // strict read-modify-write operations return the typed conflict.
         let snapshot = db.revalidate_write_txn(txn).await?;
+        let pins = txn
+            .unattached_base
+            .as_ref()
+            .map_or(&snapshot, |_| &txn.base);
         for entry in &staged {
-            let current = snapshot
+            let current = pins
                 .dataset(&entry.table_key)
                 .map(|e| e.published_dataset_version)
                 .ok_or_else(|| {

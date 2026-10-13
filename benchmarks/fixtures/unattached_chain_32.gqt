@@ -1,0 +1,194 @@
+# issue: none
+# notes: The 32 paired updates of very_long_history_32 as one retained unattached chain (a root and
+# notes: 31 children, each on the previous snapshot); main stays at the seed. The chain is unrolled
+# notes: because a commit binding may not sit in a loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node HistoryRow { key: String @key value: I64 payload: String }
+
+--- seed
+{"type":"HistoryRow","data":{"key":"hot","value":0,"payload":"fixed"}}
+
+--- mutate
+query set_one() as unattached branch { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c00
+
+--- mutate
+query restore_zero() as unattached branch on "${c00}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c01
+
+--- mutate
+query set_one() as unattached branch on "${c01}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c02
+
+--- mutate
+query restore_zero() as unattached branch on "${c02}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c03
+
+--- mutate
+query set_one() as unattached branch on "${c03}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c04
+
+--- mutate
+query restore_zero() as unattached branch on "${c04}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c05
+
+--- mutate
+query set_one() as unattached branch on "${c05}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c06
+
+--- mutate
+query restore_zero() as unattached branch on "${c06}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c07
+
+--- mutate
+query set_one() as unattached branch on "${c07}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c08
+
+--- mutate
+query restore_zero() as unattached branch on "${c08}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c09
+
+--- mutate
+query set_one() as unattached branch on "${c09}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c10
+
+--- mutate
+query restore_zero() as unattached branch on "${c10}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c11
+
+--- mutate
+query set_one() as unattached branch on "${c11}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c12
+
+--- mutate
+query restore_zero() as unattached branch on "${c12}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c13
+
+--- mutate
+query set_one() as unattached branch on "${c13}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c14
+
+--- mutate
+query restore_zero() as unattached branch on "${c14}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c15
+
+--- mutate
+query set_one() as unattached branch on "${c15}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c16
+
+--- mutate
+query restore_zero() as unattached branch on "${c16}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c17
+
+--- mutate
+query set_one() as unattached branch on "${c17}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c18
+
+--- mutate
+query restore_zero() as unattached branch on "${c18}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c19
+
+--- mutate
+query set_one() as unattached branch on "${c19}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c20
+
+--- mutate
+query restore_zero() as unattached branch on "${c20}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c21
+
+--- mutate
+query set_one() as unattached branch on "${c21}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c22
+
+--- mutate
+query restore_zero() as unattached branch on "${c22}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c23
+
+--- mutate
+query set_one() as unattached branch on "${c23}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c24
+
+--- mutate
+query restore_zero() as unattached branch on "${c24}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c25
+
+--- mutate
+query set_one() as unattached branch on "${c25}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c26
+
+--- mutate
+query restore_zero() as unattached branch on "${c26}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c27
+
+--- mutate
+query set_one() as unattached branch on "${c27}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c28
+
+--- mutate
+query restore_zero() as unattached branch on "${c28}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c29
+
+--- mutate
+query set_one() as unattached branch on "${c29}" { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c30
+
+--- mutate
+query restore_zero() as unattached branch on "${c30}" { update HistoryRow set { value: 0 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $c31
+
+--- query snapshot: $c31
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String

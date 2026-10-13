@@ -1,5 +1,3 @@
-mod support;
-
 use std::env;
 use std::fs;
 
@@ -7,7 +5,7 @@ use omnigraph::db::Omnigraph;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
-use support::*;
+use crate::support::*;
 
 const POLICY_E2E_YAML: &str = r#"
 version: 1

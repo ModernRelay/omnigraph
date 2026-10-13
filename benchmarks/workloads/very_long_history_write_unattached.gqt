@@ -1,0 +1,48 @@
+# issue: none
+# notes: The history checkpoint's next write as an unattached branch root: the updated row is read at
+# notes: the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot
+# notes: is dropped. The selected write is separate from verification.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query next_write() as unattached branch { update HistoryRow set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+--- bind commit $m
+
+--- query snapshot: $m
+query snapshot_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":1,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":0,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- restart
+
+--- query snapshot: $m
+query snapshot_rows_after_restart() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"hot","value":1,"payload":"fixed"}
+--- expect shape
+key: String
+value: I64
+payload: String
+
+--- mutate
+commit drop "${m}"
+--- expect ok

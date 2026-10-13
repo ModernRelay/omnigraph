@@ -1517,16 +1517,19 @@ fn as_commit_marks_a_mutation_declaration_or_a_merge() {
         parse_query("query add($n: String) as commit {\n    insert Person { name: $n }\n}\n")
             .unwrap();
     let decl = decl.single_decl();
-    assert!(decl.as_commit);
+    assert_eq!(decl.write_mode, MutationWriteMode::AsCommit);
     assert_eq!(decl.mutations.len(), 1);
     let plain =
         parse_query("query add($n: String) {\n    insert Person { name: $n }\n}\n").unwrap();
-    assert!(!plain.single_decl().as_commit);
+    assert_eq!(plain.single_decl().write_mode, MutationWriteMode::Publish);
     let annotated = parse_query(
         "query add($n: String) @description(\"adds\") as commit {\n    insert Person { name: $n }\n}\n",
     )
     .unwrap();
-    assert!(annotated.single_decl().as_commit);
+    assert_eq!(
+        annotated.single_decl().write_mode,
+        MutationWriteMode::AsCommit
+    );
 
     let err =
         parse_query("query q() as commit {\n    match { $p: Person }\n    return { $p.name }\n}\n")
@@ -1573,6 +1576,84 @@ fn as_commit_marks_a_mutation_declaration_or_a_merge() {
         "branch merge b0 as",
         "branch create b0 as commit",
         "query q() ascommit {\n    insert Person { name: \"a\" }\n}\n",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn as_unattached_branch_marks_a_mutation_declaration_with_an_optional_base() {
+    let root = parse_query(
+        "query add($n: String) as unattached branch {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        root.single_decl().write_mode,
+        MutationWriteMode::Unattached { base: None }
+    );
+    assert_eq!(root.single_decl().mutations.len(), 1);
+
+    let literal = parse_query(
+        "query add($n: String) as unattached branch on \"01ARZ3NDEKTSV4RRFFQ69G5FAV\" {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        literal.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Literal(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()
+            )),
+        }
+    );
+
+    let param = parse_query(
+        "query add($n: String, $base: String) @description(\"adds\") as unattached branch on $base {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        param.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param("base".to_string())),
+        }
+    );
+
+    let read_only =
+        "query q() as unattached branch {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let err = parse_query(read_only).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`as unattached branch` applies to a mutation; query `q` is read-only"),
+        "{err}"
+    );
+    let diagnostic = parse_query_diagnostic(read_only).unwrap_err();
+    assert_eq!(diagnostic.code, Q005);
+    assert_eq!(
+        diagnostic.position,
+        Some(Position::at("query q() as unattached branch {", 10))
+    );
+
+    for operand in ["\"\"", "\" 01ARZ\"", "\"01ARZ \"", "\"01\\tARZ\""] {
+        let input = format!(
+            "query add($n: String) as unattached branch on {operand} {{\n    insert Person {{ name: $n }}\n}}\n"
+        );
+        let diagnostic = parse_query_diagnostic(&input).unwrap_err();
+        assert_eq!(diagnostic.code, Q004, "{input}");
+        assert!(
+            diagnostic.message.contains("is not a commit id"),
+            "{input}: {}",
+            diagnostic.message
+        );
+    }
+
+    for input in [
+        "branch merge b0 as unattached branch",
+        "branch merge b0 into main as unattached branch",
+        "query q() as unattached {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattachedbranch {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on b0 {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch onx \"01ARZ\" {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as commit as unattached branch {\n    insert Person { name: \"a\" }\n}\n",
     ] {
         assert!(parse_query(input).is_err(), "{input}");
     }

@@ -238,6 +238,7 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
         params: vec![],
         pipeline: vec![scan("c")],
         return_exprs: vec![projection(prop("c", "slug"), &[scan("c")])],
+        distinct: false,
         order_by: vec![
             IROrdering {
                 expr: IRExpr::Nearest {

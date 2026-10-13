@@ -268,12 +268,33 @@ pub struct QueryDecl {
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,
+    /// `return distinct { … }`: one row per distinct projected tuple.
+    pub distinct: bool,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
     pub mutations: Vec<Mutation>,
-    /// `as commit` before the body: the mutation's result is an unpublished
-    /// commit. Never set on a read declaration (the parser refuses it).
-    pub as_commit: bool,
+    /// The clause before the body. Only `Publish` on a read declaration (the
+    /// parser refuses the other two there).
+    pub write_mode: MutationWriteMode,
+}
+
+/// Where a mutation's result goes: the branch head (`Publish`), an
+/// unpublished commit (`as commit`), or an unattached snapshot
+/// (`as unattached branch [on <base>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationWriteMode {
+    Publish,
+    AsCommit,
+    Unattached { base: Option<UnattachedBase> },
+}
+
+/// The `on` operand of `as unattached branch`: the base snapshot's id as a
+/// quoted literal, or the name (without `$`) of a `String` parameter that
+/// carries it per invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnattachedBase {
+    Literal(String),
+    Param(String),
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +503,9 @@ pub enum Expr {
     Literal(Literal),
     Aggregate {
         func: AggFunc,
+        /// `count(distinct …)`: distinct nodes by identity, or distinct
+        /// non-null values; only `count` takes it (T57).
+        distinct: bool,
         arg: Box<Expr>,
     },
     AliasRef(String),
@@ -691,7 +715,16 @@ impl std::fmt::Display for Expr {
             } => write!(f, "rrf({primary}, {secondary}, {k})"),
             Expr::Variable(name) => write!(f, "${name}"),
             Expr::Literal(literal) => write!(f, "{literal}"),
-            Expr::Aggregate { func, arg } => write!(f, "{func}({arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: true,
+                arg,
+            } => write!(f, "{func}(distinct {arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: false,
+                arg,
+            } => write!(f, "{func}({arg})"),
             Expr::AliasRef(alias) => f.write_str(alias),
         }
     }

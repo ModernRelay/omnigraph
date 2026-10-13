@@ -34,6 +34,18 @@ The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
 branch reads may reuse version-keyed derived state.
 
+A historical read plans against the current accepted catalog. Its tables bind
+by table identity (`Snapshot::bind_catalog_aliases`) and its properties by the
+stable property id each physical column persists as
+`omnigraph.stable_property_id` (`stored_field` in `engine/typed_value.rs`,
+behind every scan, hydration and edge read). The binding records each table
+whose pinned version differs from the live one (`Snapshot::contract_covers`);
+only there can the column of a property's name hold another lifetime. On such
+a table a property refuses when that column carries another id (a same-name
+re-add), when the id sits under an earlier name (a rename since) or nowhere
+(an addition since), and when the column carries no id (written before 0.10),
+as Blob reads do. Crossing a rename is not supported.
+
 Stable code owners:
 
 | Concern | Owner |
@@ -128,6 +140,8 @@ before execution. Historical wildcard refusal checks both captured provenance an
 wildcard expansions. A selected dataset absent from the captured snapshot fails
 when opened; empty input need not open it. Bound plans use a versioned envelope
 and require regeneration when the stored version is unsupported.
+Envelope version 7 requires aggregate expressions to carry their `distinct`
+flag. Plans saved with earlier binaries must be regenerated before replay.
 
 ### Expand path selection
 
@@ -830,7 +844,12 @@ admission complete before durable graph movement. See [blob.md](blob.md).
 ## Embeddings
 
 The provider-independent engine client handles query-string embedding and the
-offline `omnigraph embed` workflow. Ordinary Load does not execute `@embed`
+offline `omnigraph embed` workflow. Both pass their text to the provider
+unchanged: the offline workflow a record's `@embed` source value, the query
+path the query string. Only the provider's retrieval role differs between them,
+so a document whose source equals the query text is the query's own input; a
+template on either side would put stored and query vectors in different text
+spaces. Ordinary Load does not execute `@embed`
 at ingestion time; callers supply vectors or precompute them. The annotation
 records and validates embedding identity. Any future ingest-time reconciler is
 a separate design, not a hidden loader behavior.

@@ -61,10 +61,17 @@ pub mod publisher;
 pub mod read_executor;
 pub mod retention;
 pub mod state;
+pub mod unattached;
 pub mod unpublished;
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
-    UNPUBLISHED_COMMITS_STAMP, require_unpublished_commits, supports_unpublished_commits,
+    UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
+    require_unpublished_commits, supports_unattached_branches, supports_unpublished_commits,
+};
+pub use unattached::{
+    CandidateProperty, UNATTACHED_PROPERTY_VERSION, UNATTACHED_TAG_PREFIX, UnattachedCommit,
+    UnattachedCommitProperty, UnattachedExpiry, UnattachedInventoryReader, UnattachedLifetime,
+    is_unattached_tag, unattached_tag_name, unattached_tag_parts, unattached_tag_root_prefix,
 };
 pub use unpublished::{
     UNPUBLISHED_TAG_PREFIX, UnpublishedCommit, UnpublishedCommitProperty, UnpublishedExpiry,
@@ -94,7 +101,10 @@ use metadata::{
 pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub use publisher::{CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition};
+pub use publisher::{
+    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, UnattachedIntent,
+    UnattachedOutcome, UnattachedWriteBase,
+};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
 use state::read_schema_contract_row;
@@ -264,6 +274,10 @@ pub struct Snapshot {
     /// snapshots, time-travel / Snapshot-id reads, and directly-built test
     /// snapshots, which fall back to a plain open.
     read_caches: Option<SnapshotReadCaches>,
+    /// Table keys this view pins at a version the accepted contract it plans
+    /// against was not published with: set by `bind_catalog_aliases` on a
+    /// historical query view, empty on every other view.
+    uncovered_tables: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -605,7 +619,13 @@ impl Snapshot {
     /// table lifetime under its current name. Conversely, a reused name whose
     /// current identity is absent from the historical snapshot is removed from
     /// the execution view, preventing cross-incarnation adoption.
-    pub fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
+    ///
+    /// `live` is the live view `catalog` was accepted against. A bound table
+    /// whose pinned version is not exactly the one `live` pins is recorded as
+    /// uncovered (`contract_covers`): the catalog's property names were not
+    /// published with that version, so a read there resolves each property by
+    /// its persisted stable property id instead.
+    pub fn bind_catalog_aliases(&mut self, catalog: &Catalog, live: &Snapshot) -> Result<()> {
         // Freeze the historical identity map before changing any aliases. A
         // renamed-away alias may later be reused by a new live type; resolving
         // that replacement first must not remove the only entry needed to bind
@@ -640,6 +660,7 @@ impl Snapshot {
             }))
             .collect::<Vec<_>>();
 
+        self.uncovered_tables.clear();
         for (table_key, stable_table_id, incarnation_id) in table_aliases {
             let identity = TableIdentity::new(stable_table_id, incarnation_id)?;
 
@@ -648,10 +669,25 @@ impl Snapshot {
             // historical name.
             self.entries.remove(&table_key);
             if let Some(entry) = historical_by_identity.get(&identity) {
+                let covered = live
+                    .entries
+                    .get(&table_key)
+                    .is_some_and(|live_entry| live_entry.same_physical_version(entry));
+                if !covered {
+                    self.uncovered_tables.insert(table_key.clone());
+                }
                 self.entries.insert(table_key, entry.clone());
             }
         }
         Ok(())
+    }
+
+    /// Whether the accepted contract this view plans against was published
+    /// with the version it pins for `type_key`, so its property names name
+    /// that version's columns. False only on a historical query view, for a
+    /// table pinned at a version other than the live one.
+    pub fn contract_covers(&self, type_key: &str) -> bool {
+        !self.uncovered_tables.contains(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present
@@ -1301,6 +1337,7 @@ impl ManifestCoordinator {
             graph_branch: None,
             native_branch: None,
             read_caches: None,
+            uncovered_tables: HashSet::new(),
         }
     }
 
