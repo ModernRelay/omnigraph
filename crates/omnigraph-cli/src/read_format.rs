@@ -42,8 +42,8 @@ pub fn render_read(
         ReadOutputFormat::Json => Ok(serde_json::to_string_pretty(output)?),
         ReadOutputFormat::Jsonl => render_jsonl(output),
         ReadOutputFormat::Csv => render_csv(output),
-        ReadOutputFormat::Kv => render_kv(output),
-        ReadOutputFormat::Table => render_table(output, options),
+        ReadOutputFormat::Kv => Ok(render_kv(output)? + &page_footer(output)),
+        ReadOutputFormat::Table => Ok(render_table(output, options)? + &page_footer(output)),
         ReadOutputFormat::Arrow => color_eyre::eyre::bail!(
             "`--format arrow` writes an Arrow IPC byte stream to stdout and has no text rendering"
         ),
@@ -57,6 +57,7 @@ fn render_jsonl(output: &ReadOutput) -> Result<String> {
         "query_name": output.query_name,
         "target": output.target,
         "row_count": output.row_count,
+        "page": output.page,
     }))?);
     for row in rows(output)? {
         lines.push(serde_json::to_string(&row)?);
@@ -200,10 +201,32 @@ fn header_line(output: &ReadOutput) -> String {
                 .map(|branch| format!(" from branch {}", branch))
         })
         .unwrap_or_default();
+    let compared = output
+        .page
+        .as_ref()
+        .and_then(|page| {
+            Some((
+                page.from_commit_id.as_deref()?,
+                page.to_commit_id.as_deref()?,
+            ))
+        })
+        .map(|(from, to)| format!(" comparing {from} to {to}"))
+        .unwrap_or_default();
     format!(
-        "{} rows{} via {}",
-        output.row_count, from, output.query_name
+        "{} rows{}{} via {}",
+        output.row_count, from, compared, output.query_name
     )
+}
+
+/// The line a paged answer ends with when a further page exists: the clause
+/// that continues it.
+fn page_footer(output: &ReadOutput) -> String {
+    output
+        .page
+        .as_ref()
+        .and_then(|page| page.next_page_token.as_deref())
+        .map(|token| format!("\nmore: continue with `after page \"{token}\"`"))
+        .unwrap_or_default()
 }
 
 fn rows(output: &ReadOutput) -> Result<Vec<Map<String, Value>>> {
@@ -319,6 +342,7 @@ mod tests {
             )
             .unwrap(),
             graph_commit_id: None,
+            page: None,
         }
     }
 

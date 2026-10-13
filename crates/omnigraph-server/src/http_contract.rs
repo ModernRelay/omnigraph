@@ -125,7 +125,10 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
                             response.content.insert(
                                 "application/json".into(),
                                 Content::new(Some(Ref::from_schema_name(
-                                    if path.contains("/changes") {
+                                    if path.contains("/changes")
+                                        || path.ends_with("/diff")
+                                        || path.ends_with("/merge-base")
+                                    {
                                         "ChangeErrorOutput"
                                     } else {
                                         "ErrorOutput"

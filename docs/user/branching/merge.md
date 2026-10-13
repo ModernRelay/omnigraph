@@ -91,6 +91,27 @@ string. Inspect and retry deletion separately; do not replay a successful merge.
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.
 
+## Preview a merge
+
+```bash
+omnigraph branch merge feature --into main --dry-run --store graph.omni --json
+```
+
+A dry run runs the merge through classification and constraint validation,
+then stops. It reports the outcome the merge would have now, or fails with the
+same structured conflict list, and writes nothing: `commit` is `null` and
+`dry_run` is `true`. It is a read of both branches, so it needs `read` on each
+and no `branch_merge` grant. It refuses `--as-commit` and `--delete-branch`.
+Over HTTP, send `dry_run: true` to `POST /graphs/{graph_id}/branches/merge`.
+The GQ statement `branch merge feature into main dry run` is the same read at
+`POST /query`: it answers one row with `source`, `target` and `outcome`, and a
+conflict is the 409 a merge answers.
+
+A dry run answers whether the merge would succeed. To see what it would change,
+use [`branch diff`](changes.md#review-a-branch). To review the exact result
+before it lands, merge `--as-commit` and inspect the proposal with
+`commit changes`; the proposal expires once the target branch moves.
+
 ## Conflicts
 
 When both sides changed the same logical data incompatibly, the merge returns a

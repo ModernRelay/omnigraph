@@ -59,6 +59,15 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
+A dry run (`Session::branch_merge_dry_run`, RFC 0030 §8.4) takes the same
+path through base resolution, classification and constraint validation, then
+returns before the queue guards and the first detached commit. It is a read:
+it takes neither the schema permit nor the branch gates, pins no merge-input
+tag (a reclaimed input surfaces as a typed gap), and stages only to the
+process-local scratch directory. The merge truth table runs it before every
+cell's merge and holds it to the merge's outcome and to zero object-store
+writes.
+
 On the adopt route, every target, main included, selects the source's exact
 table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or

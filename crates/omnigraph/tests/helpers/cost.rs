@@ -244,6 +244,9 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// `__manifest` object-store writes: published versions, transaction files
+    /// and tags (merge-input holds and proposals among them).
+    pub manifest_writes: u64,
     /// Bytes returned by those real object-store reads. This distinguishes a
     /// physical-address take from scanning a compacted history-sized fragment
     /// even when both use a similar number of requests.
@@ -639,6 +642,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_writes: manifest.write_iops,
             manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
