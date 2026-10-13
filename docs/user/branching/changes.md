@@ -92,10 +92,11 @@ that commit alone, the one a merge of `feature` into `main` would classify
 against. While `feature` has never merged `main` in, the base is on its
 first-parent history, and `changes poll --branch feature --start
 after:<merge-base>` replays its commits since then; a merge commit in that
-range still carries the changes it brought in. Once `main` has been merged into
-`feature`, the base is the `main` commit that merge brought in, which
-`feature`'s feed refuses as a start; `branch diff` gives the net change from
-any base.
+range still carries the changes it brought in. A base off `feature`'s
+first-parent history is refused as a start: for example, after `main` is
+merged into a `feature` that had diverged from it, the base is the `main`
+commit that merge brought in. `branch diff` gives the net change from any
+base.
 
 The HTTP routes are `GET /graphs/{graph_id}/branches/diff?source=&target=` and
 `GET /graphs/{graph_id}/branches/merge-base?source=&target=`. To see whether
