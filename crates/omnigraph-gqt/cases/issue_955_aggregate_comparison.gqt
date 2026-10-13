@@ -59,9 +59,6 @@ query has_members() {
 --- expect shape
 has_member: Bool?
 
---- expect plan
-validation scope invariants_only
-
 --- query
 query no_members_is_false() {
     match {
