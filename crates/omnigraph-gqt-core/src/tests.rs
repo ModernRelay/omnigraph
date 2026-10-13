@@ -1858,6 +1858,7 @@ mod result_contract {
             },
             IRExpr::Aggregate {
                 func: AggFunc::Count,
+                distinct: false,
                 arg: Box::new(node()),
                 signature: AggSignature {
                     arg: ExprType::Node {

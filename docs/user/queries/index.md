@@ -196,25 +196,28 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, and
-`count`, `sum`, `avg`, `min`, and `max`. Each produces one column named by its
-alias or expression: `$p.name` gives `p.name` and `$p.@id` gives `p.@id`.
-Duplicate column names are refused (`T25`).
+Return expressions include variables, properties, literals, `now()`, and the
+aggregates `count`, `sum`, `avg`, `min`, and `max`. Each gives one column named by
+its alias or expression (`$p.name` gives `p.name`); duplicates are refused (`T25`).
 
 Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
 uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
-`Bool`, `Date`, or `DateTime` columns and preserve their type. Booleans order
-false before true; dates and datetimes order chronologically. With no matches,
-an aggregate-only return gives one row: `count` is 0 and other aggregates are
-null. A return that also projects a group value gives no rows.
+`Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
+dates chronologically). With no matches, an aggregate-only return gives one row
+(`count` 0, the rest null); a return that also projects a group value gives no rows.
 
-A bare node returns one object containing `@id` and every property except
-`Blob` and `Vector`: `$p` produces column `p`. Project a property for one field.
-`count($p)` counts rows; other aggregates require a property (`T8`).
+A bare node returns one object with `@id` and every property except `Blob` and
+`Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
+counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
+counts distinct non-null values, so a node reached by several paths counts once.
+Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as
-`$p.age > 30 as adult`. Its result is `Bool`, or `Bool?` with a nullable operand;
-`is null` and `is not null` always return `Bool`. Aggregates refuse these projections (`T9`).
+`$p.age > 30 as adult`; its result is `Bool`, or `Bool?` with a nullable operand,
+and `is null` is always `Bool`. In an aggregated return its operands are
+aggregates, literals, `now()` and parameters, evaluated per group after
+aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. A group
+value beside an aggregate is refused (`T58`), any other Boolean item too (`T9`).
 
 `return distinct { $p.name }` keeps one row per complete projected tuple.
 Repeated traversal matches and equal values on different entities collapse;
@@ -225,15 +228,12 @@ ordering and limiting, so the limit counts distinct rows. Aggregates with
 order keys must be projected values or aliases, including property keys
 (`T42`). Remaining projected columns break ties ascending; no identity tiebreak is added.
 
-For ordinary returns, explicit order is total: entity ids break ties only
-when they can change the visible order. When every projection is an order key,
-equal rows are indistinguishable and no id is read. Ascending order puts nulls
-first; descending puts them last. `nearest(...)` requires a limit.
-
-Outside DISTINCT, property and system-field order keys need not be projected.
-Other keys, except the leading search function, must be return aliases or
-expressions written in return (`T42`), such as `count($d)` after
-`return { count($d) as deals }`.
+For ordinary returns, explicit order is total: entity ids break ties only when
+they can change the visible order, and no id is read when every projection is a
+key. Ascending puts nulls first, descending last. `nearest(...)` requires a limit.
+On ungrouped, non-DISTINCT rows, property and system-field order keys need not be projected;
+other keys, except the leading search function, must be return aliases or
+expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
 
 For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
 and `rrf` by descending score, including through traversals. The search

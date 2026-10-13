@@ -1151,7 +1151,16 @@ fn walk_expr(
         | Expr::Variable(_)
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
-        Expr::Aggregate { func: _, arg } => {
+        Expr::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => {
+            if reject_edge_type && *distinct {
+                return Err(format!(
+                    "expect same as v1: the reference engine does not support `{func}(distinct …)`"
+                ));
+            }
             walk_expr(arg, params, needs_indices, reject_edge_type)?
         }
         Expr::Binary { left, op: _, right }
@@ -1259,6 +1268,19 @@ fn walk_clauses(
     Ok(())
 }
 
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_aggregate(inner),
+        _ => false,
+    }
+}
+
 /// Why `expect ordered` is refused: search-led aggregates and DISTINCT
 /// need a key after the search function to order their output rows.
 /// Ordinary ordered queries retain their total-order contract.
@@ -1280,7 +1302,7 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     if decl
         .return_clause
         .iter()
-        .any(|p| matches!(p.expr, Expr::Aggregate { .. }))
+        .any(|p| contains_aggregate(&p.expr))
     {
         if !search_led || decl.order_clause.len() < 2 {
             return Some(
