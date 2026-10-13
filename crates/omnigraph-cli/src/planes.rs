@@ -14,7 +14,7 @@ use color_eyre::eyre::bail;
 
 use crate::cli::{
     BlobCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand,
+    SchemaCommand, SkillCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +301,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Logout { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
+        | Command::Skill { .. }
         | Command::Version => Plane::Session,
     }
 }
@@ -314,6 +315,10 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
         Command::Profile { .. } => "profile",
+        Command::Skill { command } => match command {
+            SkillCommand::Export { .. } => "skill export",
+            SkillCommand::Show { .. } => "skill show",
+        },
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
@@ -604,6 +609,10 @@ mod tests {
                 parse(&["omnigraph", "version"]),
                 [false, false, false, false, false, false],
             ),
+            (
+                parse(&["omnigraph", "skill", "export", "skills/omnigraph"]),
+                [false, false, false, false, false, false],
+            ),
         ];
         for (cmd, expected) in &rows {
             let capability = command_capability(cmd);
@@ -692,6 +701,7 @@ mod tests {
             Capability::Control
         );
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
+        assert_eq!(cap(&["omnigraph", "skill", "show"]), Capability::Local);
         // `queries`/`policy` tooling reads cluster state now (control plane).
         assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
         assert_eq!(

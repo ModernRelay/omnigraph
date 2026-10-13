@@ -1,6 +1,8 @@
 # Reference Commands
 
 ## Contents
+- Command index
+- Version-matched skill (skill export, skill show)
 - Inspect state (snapshot, export)
 - Branches · commits · changes · graphs
 - Blob reads
@@ -15,6 +17,62 @@
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
+
+## Command Index
+
+Every public command of this CLI. `omnigraph <command> [<subcommand>] --help`
+prints the exact flags of the installed binary.
+
+| Command | Subcommands | Use |
+|---|---|---|
+| `query` | — | Run a read query: a served stored query by name, or ad-hoc `--query`/`-e` source; also the `branch list` and `explain` statements |
+| `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
+| `alias` | — | Invoke an operator alias's stored read query |
+| `load` | — | Bulk-load JSONL; `--mode` is required |
+| `branch` | `create` `list` `delete` `merge` | Manage graph branches |
+| `snapshot` | — | Show one branch's types, entity counts and dataset versions |
+| `export` | — | Stream a branch as JSONL |
+| `blob` | `get` `stat` `put` `clear` | Read, inspect, replace or clear one Blob cell |
+| `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
+| `changes` | `poll` `baseline` | Follow a branch's change feed |
+| `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
+| `graphs` | `list` | List the graphs a multi-graph server serves |
+| `init` | — | Create a graph from a `.pg` schema |
+| `upgrade` | — | Convert a standalone graph's storage offline |
+| `optimize` | — | Compact data and reconcile declared indexes |
+| `rebuild-full-text-indexes` | — | Replace one branch's full-text indexes |
+| `repair` | — | Report foreign Lance history without adopting it |
+| `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
+| `lint` | — | Validate `.gq` source against a schema or a graph |
+| `queries` | `validate` `list` | Check or list a cluster's stored queries |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
+| `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
+| `embed` | — | Generate, clean or refresh seed embeddings |
+| `login` | — | Store a server's bearer token, or open a managed session |
+| `logout` | — | Remove a stored token or a managed session |
+| `use` | — | Select a managed cluster for a config folder |
+| `profile` | `list` `show` | Inspect operator profiles |
+| `skill` | `export` `show` | Export or print this skill as built into the CLI |
+| `version` | — | Print the CLI version and the storage formats it serves |
+
+## Version-Matched Skill
+
+The `omnigraph` binary carries this skill, written for its own commands and
+HTTP contract. Export it where your agent loads skills:
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show                          # SKILL.md on stdout
+omnigraph skill show references/queries.md    # any other skill file
+```
+
+The export refuses to replace existing files unless `--force`. It also writes
+`.omnigraph-skill.json`, a record of each file it wrote; a later `--force`
+export uses it to remove files this skill no longer has, but only while their
+bytes are unchanged, and reports them under `removed` and `kept`. No other file
+in the directory is touched. `--json` reports the `files` written,
+`skill_version`, `cli_version` and `http_contract`. The command reads no
+configuration and needs no graph, server or network.
 
 ## Inspect State
 
