@@ -1,5 +1,5 @@
 # issue: 955
-# red_on: 9556daa2
+# red_on: 9556daa2fb55f96d17f921071867ac1dd9d2efd6
 # notes: A Boolean expression over aggregates, literals and parameters in an
 # notes: aggregated `return` is evaluated per group after aggregation and
 # notes: projects a Bool column under its alias (`Bool?` when an operand can be
