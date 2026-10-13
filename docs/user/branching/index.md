@@ -124,10 +124,14 @@ commit publish "<commit-id>"
 commit drop "<commit-id>"
 ```
 
-`commit publish` installs the commit on the branch it recorded as its target;
-once an ordinary write moved that head past the commit's parent, the publish
-fails its precondition and the commit can only be dropped. A published commit
-is answered as it stands by a repeat publish and is never dropped.
+`commit publish` installs the commit on the branch it recorded as its target.
+A published commit is answered as it stands by a repeat publish and is never
+dropped. An unpublished commit expires once an ordinary write moves its target
+branch's head past the commit's parent, or when that branch is deleted or
+recreated, and can then only be dropped: a publish is refused (a moved head
+fails its precondition), reads at its id (`--snapshot`, `commit show`,
+`commit changes`) answer `not found`, and it leaves the `--unpublished`
+listing.
 
 ```bash
 omnigraph branch merge feature --into main --as-commit --uri graph.omni
