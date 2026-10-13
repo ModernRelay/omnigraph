@@ -83,6 +83,19 @@ pub struct CheckedReadQuery {
     pub(crate) limit: Option<u64>,
 }
 
+impl CheckedReadQuery {
+    /// The bindings visible at the end of the top-level match scope.
+    pub fn bindings(&self) -> &HashMap<String, BoundVariable> {
+        &self.scope.bindings
+    }
+
+    /// The traversals of the top-level match scope, in source order;
+    /// a correlated block's traversals belong to its own scope.
+    pub fn traversals(&self) -> impl Iterator<Item = &ResolvedTraversal> {
+        self.scope.traversals()
+    }
+}
+
 /// A declared parameter and the type selected for its name (the last
 /// declaration of a repeated name wins, as the checker's lookup does).
 #[derive(Debug, Clone)]

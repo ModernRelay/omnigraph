@@ -9,6 +9,7 @@ use crate::operation::{Operation, PageBudgetSpec, ScopeSpec};
 use crate::physical::StatisticSource;
 use crate::registry::{Entry, Route};
 use crate::route::RouteOverride;
+use crate::validate::ValidationSummary;
 
 /// Incremented when a field's meaning changes, or when a node kind is added
 /// or removed; additive keys do not bump it. Version 2: the logical `Filter`
@@ -119,6 +120,9 @@ pub struct Explain {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statistics: Option<Vec<StatisticSource>>,
     pub passes: Vec<&'static str>,
+    /// What acceptance checked, on a read query's accepted plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationSummary>,
 }
 
 impl Explain {
@@ -136,6 +140,7 @@ impl Explain {
             pipelines: None,
             statistics: None,
             passes: Vec::new(),
+            validation: None,
         }
     }
 
