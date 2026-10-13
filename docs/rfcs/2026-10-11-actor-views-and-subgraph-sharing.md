@@ -1055,10 +1055,13 @@ static tokens and no policy, which today allows every read
 
 The draft RFC for polymorphic types
 ([ModernRelay/omnigraph#884](https://github.com/ModernRelay/omnigraph/pull/884),
-`2026-10-07-polymorphic-types.md`) makes interfaces and inline unions bindable,
-adds polymorphic edge endpoints with `__src_type` and `__dst_type` tag columns,
-and leaves per-type policy to the `predicate_for` work this RFC defines. The two
-designs compose as follows.
+`2026-10-07-polymorphic-types.md`) makes interfaces and inline unions bindable
+and lets an edge endpoint be an interface or a union. It builds on the integer
+node identity draft stacked with it (`2026-10-12-integer-node-identity.md`),
+under which every edge endpoint is a ***packed node reference***: the endpoint
+type's `StableTypeId` in the high 16 bits and the node's `__id` in the low 48.
+That RFC defers per-type visibility to this one; its Policy section adopts the
+rules below. The two designs compose as follows.
 
 **Member sets come from the schema view.** An abstract binding resolves its
 member set against the actor's view catalog, so a member type placed in a
@@ -1101,15 +1104,23 @@ edge Access: Person | Team -> Team | Channel | Folder | Class @grant {
 ```
 
 The membership closure is then one bounded multi-hop traversal, which that
-RFC's set-based multi-hop rule admits. The global securable-key namespace means a
-placement value never needs a type tag.
+RFC's set-based multi-hop rule admits.
+
+**Placement values under integer identity.** A placement stores a securable's
+key, so securable keys share one namespace across securable types. Under
+integer node identity a placement could instead store the securable's packed
+reference, resolved from the key the writer supplies, as an edge endpoint is.
+The type half would identify the securable type, removing the shared key
+namespace, and the view conjunct would become an `IN` over integers. Whether to
+switch is open ([Unresolved questions](#unresolved-questions)).
 
 **Union scans and polymorphic expansion.** Every arm of a union scan whose member
 is a restricted placed type carries its own view conjunct, placed during that
 RFC's per-arm resolution. The coverage validator inspects arms. A `count` over
 an abstract binding may sum per-member metadata counts only for members the
-actor's view does not restrict. A polymorphic expansion groups each hop's frontier by tag, as that
-RFC's interner already keys by `(type, id)`, and masks each restricted member.
+actor's view does not restrict. A polymorphic expansion groups each hop's
+frontier by the type half of its packed references, as that RFC's interner
+already keys by packed reference, and masks each restricted member type.
 
 **Graph index.** That RFC's phase 3 moves the graph index to one global ordinal
 space. Per-view masks ([Rollout](#rollout), Phase 7) target that space: one
@@ -1345,8 +1356,10 @@ fences anything new.
   membership, and two mechanisms for one idea.
 - **Placement as an edge.** A join on every read and, alongside a property, a
   second source of truth (D3).
-- **Typed securable references through polymorphic endpoints.** Needs type tags
-  on every placement; a global key namespace needs none.
+- **Typed securable references.** Before integer node identity, a typed
+  reference would need a type tag beside every placement; a shared key
+  namespace needs none. Packed references remove that cost, which is why the
+  switch is an open question rather than rejected.
 - **An external Zanzibar service** (SpiceDB with Materialize, OpenFGA). A second
   store with its own consistency tokens and a dual-write problem; list APIs are
   bounded (OpenFGA ListObjects defaults to 1,000 results in 3 s).
@@ -1626,8 +1639,8 @@ write-one queries across graphs.
    uniqueness scoped to a placement.
 7. At what audience size the item-side reader encoding replaces `IN` for a type,
    and whether that choice is declared or measured.
-8. The matching amendment to the polymorphic types RFC's Policy section, which
-   still refuses hidden members.
+8. Whether placements store packed securable references once integer node
+   identity lands, replacing the shared securable-key namespace.
 
 ## Decision log
 
@@ -1657,6 +1670,12 @@ write-one queries across graphs.
   placement, incremental maintenance of readable sets (Phase 4), the item-side
   encoding boundary for per-item audiences, D8 and
   [Appendix C](#appendix-c-query-based-access-compared).
+- 2026-10-12: The polymorphic types draft (ModernRelay/omnigraph#884) adopted
+  this RFC's rules for abstract types and withdrew `policy_denied_member` and
+  `policy_filtered`, closing the cross-RFC question. [Polymorphic types](#polymorphic-types)
+  now follows that draft's current design: packed node references from integer
+  node identity instead of tag columns, which reopens typed placement values as
+  a question.
 
 ## Appendix A: validated assumptions
 
