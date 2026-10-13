@@ -61,6 +61,9 @@ mod output;
 mod planes;
 mod schema_upgrade;
 mod scope;
+#[cfg(all(test, unix))]
+#[path = "../tests/support/unix_gateway.rs"]
+mod unix_gateway_fixture;
 mod upgrade;
 use cli::*;
 use helpers::*;

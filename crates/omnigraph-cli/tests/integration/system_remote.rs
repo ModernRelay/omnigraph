@@ -2009,3 +2009,104 @@ fn mutate_if_commit_lost_cas_exits_4_issue_365() {
 
     drop(server);
 }
+
+/// A Unix-domain socket in front of the server carries every CLI data path:
+/// a JSON read, a mutation, the raw NDJSON load body, the streamed export
+/// response and Blob delivery. Each command reaches the server through the
+/// socket, and reads over it match the same reads over TCP.
+#[cfg(unix)]
+#[test]
+fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
+    use crate::support::unix_gateway::UnixGateway;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (cluster_dir, _) = blob_parity_config(temp.path(), &temp.path().join("twin.omni"));
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-parity":"parity-tok"}"#,
+        )],
+    );
+    let gateway = UnixGateway::new(&server.base_url);
+    let socket = gateway.url();
+    let served = |server_url: &str, args: &[&str]| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+            .args(args)
+            .args(["--server", server_url, "--graph", PARITY_GRAPH_ID]);
+        command
+    };
+    let mut connections = 0;
+    let mut over_socket = |args: &[&str]| {
+        let output = output_success(&mut served(&socket, args));
+        assert!(
+            gateway.connections() > connections,
+            "{args:?} did not reach the server through the socket"
+        );
+        connections = gateway.connections();
+        output
+    };
+
+    let read = [
+        "query",
+        "-e",
+        "query docs() { match { $d: Document } return { $d.title, $d.note } order { $d.title asc } }",
+        "--json",
+    ];
+    assert_eq!(
+        scrubbed_json(&over_socket(&read)),
+        scrubbed_json(&output_success(&mut served(&server.base_url, &read)))
+    );
+
+    let blob = ["blob", "get", "node", "Document", "readme", "content"];
+    assert_eq!(over_socket(&blob).stdout, BLOB_NODE_BYTES);
+
+    let mutation = parse_stdout_json(&over_socket(&[
+        "mutate",
+        "-e",
+        r#"query add($title: String) { insert Document { title: $title, note: "over a socket" } }"#,
+        "--params",
+        r#"{"title":"socket-mutate"}"#,
+        "--json",
+    ]));
+    assert_eq!(mutation["affected_nodes"], 1, "{mutation}");
+
+    let rows = temp.path().join("socket-load.jsonl");
+    fs::write(
+        &rows,
+        r#"{"type":"Document","data":{"title":"socket-load","note":"loaded over a socket"}}"#,
+    )
+    .unwrap();
+    let load = parse_stdout_json(&over_socket(&[
+        "load",
+        "--mode",
+        "merge",
+        "--data",
+        rows.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(load["total_entities"], 1, "{load}");
+
+    let lines = |output: &std::process::Output| {
+        let mut lines: Vec<String> = String::from_utf8(output.stdout.clone())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort_unstable();
+        lines
+    };
+    let exported = lines(&over_socket(&["export"]));
+    assert_eq!(
+        exported,
+        lines(&output_success(&mut served(&server.base_url, &["export"])))
+    );
+    for title in ["socket-mutate", "socket-load"] {
+        assert!(
+            exported.iter().any(|line| line.contains(title)),
+            "{title} missing from the export"
+        );
+    }
+}

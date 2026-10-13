@@ -157,7 +157,7 @@ impl RemoteCluster {
     ) -> Result<T> {
         let url = remote_url(&self.root, segments, &[])?;
         let request = apply_bearer_token(
-            self.client.request(method.clone(), url),
+            self.client.request(method.clone(), url)?,
             self.token.as_deref(),
         );
         // GETs are individually bounded. POST acceptance can wait for drain

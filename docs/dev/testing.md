@@ -142,7 +142,11 @@ timeout without replaying a committed merge. Its deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit.
+PID; neither apply nor recovery polling may resubmit. The `unix://` server
+transport goes through `tests/support/unix_gateway.rs`, a byte-for-byte
+Unix-socket relay to the server's TCP address: `system_remote` runs the CLI's
+data verbs through it, and the in-source `client.rs` tests own the request
+target, discovery and refusals over the socket.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 

@@ -69,7 +69,7 @@ means unknown effects, never permission to replay. Proxies must preserve it both
 
 Server URLs name the service root, including its proxy prefix. Select a graph
 with `--graph`, `default_graph` or `alias.graph`. Migrate graph-qualified server
-URLs to that root plus graph selection; the CLI never guesses a root from a path.
+URLs to that root plus graph selection; the CLI never guesses a root from a path. A `unix:///absolute/path.sock` URL names a Unix-domain socket instead: its whole path is the socket, so it has no proxy prefix, and requests carry `Host: localhost`; see [Unix-socket access](../deployment.md#unix-socket-access).
 
 Public `/healthz`, `/readyz` and `/openapi.json` need no header and identify the
 contract in their responses. Before every graph, registry or deployment request, the CLI sends
