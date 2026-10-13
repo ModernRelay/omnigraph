@@ -106,11 +106,17 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
-A merge classifies both sides against their merge base, the nearest commit
-both branches descend from, counting a merged branch as an ancestor. Two
-branches that each merged the same third branch therefore share that
-branch's commit as their base, and an entity only one of them changed after
-that import merges cleanly. The record of such a commit lives in the branch
+A merge classifies both sides against their merge base, the newest commit
+both branches descend from, counting a merged branch as an ancestor: a
+commit both branches descend from that no other such commit descends from.
+When two such commits are each not an ancestor of the other, the base is the
+one nearest the two heads (the fewest commits between it and the heads,
+summed), then the one with the higher generation (its distance from the
+first commit along the longest path), then the one with the smaller commit
+id. Two branches that
+each merged the same third branch therefore share that branch's commit as
+their base, and an entity only one of them changed after that import merges
+cleanly. The record of such a commit lives in the branch
 it was merged from, and the merge can read it from a live branch or retained
 retired history. Cleanup preserves the exact selected base and the retired
 histories needed to resolve it. Recreating the logical branch name cannot

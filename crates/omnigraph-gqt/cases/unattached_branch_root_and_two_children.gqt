@@ -1,0 +1,132 @@
+# issue: none
+# notes: A root `as unattached branch` and two successive children on the earlier id each read their
+# notes: ancestors' rows and their own, the ids survive a restart, and the recorded target never sees a write.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- query snapshot: $r
+query names_at_root() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query child_carol() as unattached branch on "${r}" {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c1
+
+--- query snapshot: $c1
+query names_at_child() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query grandchild_dave() as unattached branch on "${c1}" {
+    insert Person { name: "dave", age: 63 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c2
+
+--- query snapshot: $c2
+query names_at_grandchild() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $r
+query names_at_root_after_children() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- restart
+
+--- query snapshot: $c2
+query names_at_grandchild_after_restart() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

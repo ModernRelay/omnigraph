@@ -3,10 +3,10 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array, new_null_array};
+use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
-use lance::blob::{BlobArrayBuilder, blob_field};
+use lance::blob::blob_field;
 use lance::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -18,7 +18,7 @@ use omnigraph_compiler::{
 };
 
 use crate::db::graph_coordinator::{
-    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange,
+    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange, commit_not_found,
 };
 use crate::error::{OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
@@ -42,12 +42,13 @@ pub(crate) mod table_ops;
 
 pub use collector::{
     CollectorCost, CollectorPathSnapshot, CollectorReport, CollectorRowSummary,
-    RetainedManifestVersions, StagingVerdict, TableCollectionPlan, UnpublishedManifest,
+    RetainedManifestVersions, StagingVerdict, TableCollectionPlan, UnattachedTagRecord,
+    UnpublishedManifest, unattached_release_order,
 };
 #[doc(hidden)]
 pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
-    LogicalBlobValue, RangedExternalBlobs, export_blob_values, logical_row_image,
+    LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
 use prepared_create::initial_schema_ir;
@@ -64,6 +65,7 @@ pub use system_column_upgrade::{
     SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
 };
 pub(crate) use table_ops::OpenedForMutation;
+pub(crate) use table_ops::Publication;
 pub use table_ops::{FullTextIndexRebuildResult, PendingIndex, RebuiltFullTextIndex};
 
 use super::commit_graph::GraphCommit;
@@ -83,6 +85,26 @@ pub enum MergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
+}
+
+/// What a graph commit id addresses for a control write: a proposal that is
+/// not published, an unattached snapshot while its candidate tag stands
+/// (whatever its lifetime), or the published commit a repeat answers.
+pub(crate) enum AddressedCommit {
+    Proposal(Box<super::manifest::UnpublishedCommit>),
+    Unattached(Box<super::manifest::UnattachedCommit>),
+    Published(GraphCommit),
+}
+
+impl AddressedCommit {
+    /// The branch a control write on the commit addresses (`None` = main).
+    pub(crate) fn target_branch(&self) -> Option<&str> {
+        match self {
+            Self::Proposal(candidate) => candidate.property.graph_branch.as_deref(),
+            Self::Unattached(candidate) => candidate.property.graph_branch.as_deref(),
+            Self::Published(published) => published.graph_branch.as_deref(),
+        }
+    }
 }
 
 /// A merge's disposition and the graph commit published by that invocation.
@@ -210,6 +232,46 @@ pub(crate) struct WriteTxn {
     /// current and fall back to a full coherent capture on mismatch. The
     /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
+    /// Set on a child unattached write: `base` is then the base snapshot's
+    /// view at its detached version, not the live head, while `authority`
+    /// stays the live head the chain's root captured.
+    pub(crate) unattached_base: Option<UnattachedTxnBase>,
+}
+
+/// The base snapshot a child unattached write extends, as resolved before
+/// the write was prepared; revalidated under the effect gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnattachedTxnBase {
+    pub(crate) root_commit_id: String,
+    pub(crate) base_commit_id: String,
+    /// `D`, the detached `__manifest` version the base's candidate tag names.
+    pub(crate) detached_version: u64,
+    /// The root's captured effective head, which the live head must still be.
+    pub(crate) captured_head_commit_id: String,
+    pub(crate) tag_name: String,
+}
+
+impl UnattachedTxnBase {
+    fn of(base: &super::manifest::UnattachedCommit) -> Self {
+        Self {
+            root_commit_id: base.property.root_commit_id.clone(),
+            base_commit_id: base.property.graph_commit_id.clone(),
+            detached_version: base.detached_version,
+            captured_head_commit_id: base.property.captured_head_commit_id.clone(),
+            tag_name: base.tag_name(),
+        }
+    }
+
+    /// The publisher's description of the base: the chain and the
+    /// coordinates the child's rows come from.
+    pub(crate) fn write_base(&self) -> super::manifest::UnattachedWriteBase {
+        super::manifest::UnattachedWriteBase::Snapshot {
+            root_commit_id: self.root_commit_id.clone(),
+            base_commit_id: self.base_commit_id.clone(),
+            detached_version: self.detached_version,
+            captured_head_commit_id: self.captured_head_commit_id.clone(),
+        }
+    }
 }
 
 /// One coherent handle-local projection of the durable schema contract.
@@ -319,8 +381,12 @@ pub struct Omnigraph {
     /// state; its independent fresh graph-head CAS remains authoritative. A
     /// successful publish returns the updated coordinator, while failure drops
     /// the taken view so the next capture starts fresh.
-    /// The mutex serializes captures — the schema serial queue already
-    /// serializes merges and branch controls at capture time.
+    /// The mutex serializes a capture's selection and read of the entry, but
+    /// a miss opens the branch's coordinator with the mutex released: the
+    /// schema gate is shared by merges and branch captures, so holding it
+    /// across that open would make captures on different branches wait out
+    /// each other's full open. Two captures that miss on the same branch
+    /// open it twice; the entry is a hint either way.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
@@ -999,6 +1065,12 @@ impl Omnigraph {
     /// caller MUST already hold a schema permit (either side); this helper does
     /// not acquire one because the gate is non-reentrant on one task.
     pub(crate) async fn load_accepted_catalog_with_schema_gate_held(&self) -> Result<Arc<Catalog>> {
+        Ok(self.load_accepted_view_with_schema_gate_held().await?.0)
+    }
+
+    /// The accepted catalog and the live view of the current branch it was
+    /// accepted against.
+    async fn load_accepted_view_with_schema_gate_held(&self) -> Result<(Arc<Catalog>, Snapshot)> {
         let current_branch = self
             .coordinator
             .read()
@@ -1012,7 +1084,7 @@ impl Omnigraph {
             .snapshot;
         let (catalog, _) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
-        Ok(catalog)
+        Ok((catalog, snapshot))
     }
 
     /// Accept the contract bytes in this snapshot before reusing its catalog.
@@ -1233,8 +1305,8 @@ impl Omnigraph {
             .await
     }
 
-    /// Respell this graph's system columns in place; the storage format stays
-    /// v14. The operation and its preflight live in `system_column_upgrade`
+    /// Respell this graph's system columns in place; the storage layout is
+    /// unchanged. The operation and its preflight live in `system_column_upgrade`
     /// (RFC 0040 step 3).
     pub async fn upgrade_system_columns(
         &self,
@@ -1420,6 +1492,69 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            unattached_base: None,
+        })
+    }
+
+    /// The write transaction of a child unattached snapshot (RFC "Unattached
+    /// graph branches"): the live authority of `target`, the recorded target
+    /// the chain's root captured, beside the base snapshot `base` pins, which
+    /// the per-table opens, the validation and the expected versions read.
+    /// Refused once the live incarnation or effective head differs from what
+    /// the root captured, or the live schema identity from the base's: the
+    /// base has expired, or is about to.
+    pub(crate) async fn open_write_txn_on_unattached(
+        &self,
+        target: Option<&str>,
+        base: &super::manifest::UnattachedCommit,
+    ) -> Result<WriteTxn> {
+        let target = normalize_branch_name(target.unwrap_or("main"))?;
+        if target != base.property.graph_branch {
+            return Err(OmniError::manifest_internal(format!(
+                "a child of unattached branch '{}' opens on branch '{}' but its recorded \
+                 target is '{}'",
+                base.property.graph_commit_id,
+                target.as_deref().unwrap_or("main"),
+                base.property.graph_branch.as_deref().unwrap_or("main"),
+            )));
+        }
+        base.require_extendable()?;
+        let (branch_identifier, graph_head, effective_graph_head, live, manifest_probe) = self
+            .write_authority_for_known_branch(target.as_deref(), true)
+            .await?;
+        if branch_identifier != base.property.branch_identifier
+            || effective_graph_head.as_deref()
+                != Some(base.property.captured_head_commit_id.as_str())
+        {
+            return Err(OmniError::manifest_not_found(format!(
+                "unattached branch '{}' not found: it expired (branch '{}' moved past the \
+                 captured head '{}' to '{}') and awaits cleanup",
+                base.property.graph_commit_id,
+                target.as_deref().unwrap_or("main"),
+                base.property.captured_head_commit_id,
+                effective_graph_head.as_deref().unwrap_or("<absent>"),
+            )));
+        }
+        let snapshot = Snapshot::wrap(base.snapshot(self.uri())?);
+        let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
+        let (_, live_identity) = self.accepted_catalog_for_snapshot(&live).await?;
+        if live_identity != identity {
+            return Err(OmniError::manifest_read_set_changed(
+                "schema_ir_hash".to_string(),
+                Some(identity.schema_ir_hash),
+                Some(live_identity.schema_ir_hash),
+            ));
+        }
+        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
+        Ok(WriteTxn {
+            branch: target,
+            base: snapshot,
+            authority: identity.write_authority(branch_identifier, graph_head),
+            effective_graph_head,
+            caller_expected_graph_head: None,
+            catalog,
+            manifest_probe,
+            unattached_base: Some(UnattachedTxnBase::of(base)),
         })
     }
 
@@ -1492,6 +1627,7 @@ impl Omnigraph {
                 caller_expected_graph_head: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
+                unattached_base: None,
             };
         Ok((
             make_txn(
@@ -1786,7 +1922,13 @@ impl Omnigraph {
                 }
             }
         } else {
+            // A miss reopens the branch's coordinator: many storage round
+            // trips. Open it without the lock so captures on other branches
+            // proceed meanwhile, then install it; the entry is a hint, and
+            // the capture reads it under the returned guard.
+            drop(cache);
             let coord = self.open_coordinator_for_branch(branch).await?;
+            cache = self.merge_authority_cache.lock().await;
             *cache = Some((key, coord));
         }
         Ok(cache)
@@ -1906,8 +2048,37 @@ impl Omnigraph {
                 Some(live.schema_identity_version.to_string()),
             ));
         }
+        if let Some(pinned) = &txn.unattached_base {
+            self.revalidate_unattached_base(pinned).await?;
+        }
         validate_bound_catalog_against_snapshot(&txn.catalog, &snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Re-read a child write's base under the effect gates: a base dropped,
+    /// retagged or expired since its resolution refuses the write before any
+    /// detached table commit.
+    async fn revalidate_unattached_base(&self, pinned: &UnattachedTxnBase) -> Result<()> {
+        let base = self
+            .unattached_commit(&pinned.base_commit_id)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_not_found(format!(
+                    "unattached branch '{}' not found: it was dropped before the write on \
+                     it was committed",
+                    pinned.base_commit_id
+                ))
+            })?;
+        base.require_extendable()?;
+        let live = UnattachedTxnBase::of(&base);
+        if live != *pinned {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("unattached_base:{}", pinned.base_commit_id),
+                Some(format!("{}@{}", pinned.tag_name, pinned.detached_version)),
+                Some(format!("{}@{}", live.tag_name, live.detached_version)),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
@@ -2146,12 +2317,12 @@ impl Omnigraph {
             validate_bound_catalog_against_snapshot(&catalog, &resolved.snapshot)?;
             return Ok((resolved, catalog));
         }
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         if bind_historical_aliases {
             let catalog = self
                 .catalog_for_image_vintage(&resolved.snapshot, catalog)
                 .await?;
-            resolved.snapshot.bind_catalog_aliases(&catalog)?;
+            resolved.snapshot.bind_catalog_aliases(&catalog, &live)?;
             return Ok((resolved, catalog));
         }
         Ok((resolved, catalog))
@@ -2181,7 +2352,7 @@ impl Omnigraph {
         version: u64,
     ) -> Result<(Snapshot, Arc<Catalog>)> {
         let _schema_permit = self.write_queue().acquire_schema_shared().await;
-        let catalog = self.load_accepted_catalog_with_schema_gate_held().await?;
+        let (catalog, live) = self.load_accepted_view_with_schema_gate_held().await?;
         let branch = self
             .coordinator
             .read()
@@ -2197,7 +2368,7 @@ impl Omnigraph {
             .await?,
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
-        snapshot.bind_catalog_aliases(&catalog)?;
+        snapshot.bind_catalog_aliases(&catalog, &live)?;
         Ok((snapshot, catalog))
     }
 
@@ -3148,6 +3319,15 @@ impl Omnigraph {
             .await
     }
 
+    /// The branch a control write on `commit_id` addresses: a proposal's or
+    /// an unattached snapshot's recorded target while its tag stands,
+    /// whatever its lifetime, else the branch of the published commit; an
+    /// unknown id is not found.
+    pub async fn commit_target_branch(&self, commit_id: &str) -> Result<String> {
+        let addressed = self.addressed_commit(commit_id).await?;
+        Ok(addressed.target_branch().unwrap_or("main").to_string())
+    }
+
     /// List the branch's reachable graph lineage, **most recent first** (by
     /// [`GraphCommit::lineage_key`] — the same total order head selection and
     /// any future keyset pagination cursor derive from).
@@ -3171,6 +3351,282 @@ impl Omnigraph {
         let mut commits = coordinator.list_commits().await?;
         commits.reverse();
         Ok(commits)
+    }
+
+    /// The unpublished commits whose target is `branch` (`None` = main) and
+    /// whose publication is still possible, newest first. One tag listing
+    /// and one read per retained proposal.
+    pub async fn list_unpublished_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let proposals = crate::db::manifest::ManifestCoordinator::list_unpublished(
+            self.uri(),
+            &self.control_session(),
+            branch.as_deref(),
+        )
+        .await?;
+        Ok(proposals
+            .iter()
+            .map(crate::db::manifest::UnpublishedCommit::graph_commit)
+            .collect())
+    }
+
+    /// The live unattached snapshots whose recorded target is `branch`
+    /// (`None` = main), newest first (RFC "Unattached graph branches"). One
+    /// tag listing, one read per candidate tag and one target scan per
+    /// distinct chain.
+    pub async fn list_unattached_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let snapshots = crate::db::manifest::ManifestCoordinator::list_unattached(
+            self.uri(),
+            &self.control_session(),
+            branch.as_deref(),
+        )
+        .await?;
+        Ok(snapshots
+            .iter()
+            .map(crate::db::manifest::UnattachedCommit::graph_commit)
+            .collect())
+    }
+
+    /// The unpublished commit `commit_id` names, judged against its target.
+    async fn unpublished_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<crate::db::manifest::UnpublishedCommit>> {
+        crate::db::manifest::ManifestCoordinator::unpublished_commit(
+            self.uri(),
+            &self.control_session(),
+            commit_id,
+        )
+        .await
+    }
+
+    /// The unattached snapshot `commit_id` names, judged against its target.
+    async fn unattached_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<crate::db::manifest::UnattachedCommit>> {
+        crate::db::manifest::ManifestCoordinator::unattached_commit(
+            self.uri(),
+            &self.control_session(),
+            commit_id,
+        )
+        .await
+    }
+
+    /// What `commit_id` addresses: the proposal its tag names while that is
+    /// not published, else the unattached snapshot a candidate tag names,
+    /// else the published commit; an unknown id is not found. The candidate
+    /// tag listing costs nothing for an id that is not a canonical ULID.
+    pub(crate) async fn addressed_commit(&self, commit_id: &str) -> Result<AddressedCommit> {
+        use crate::db::manifest::{UnpublishedExpiry, UnpublishedLifetime};
+        if let Some(candidate) = self.unpublished_commit(commit_id).await?
+            && candidate.lifetime != UnpublishedLifetime::Expired(UnpublishedExpiry::Published)
+        {
+            return Ok(AddressedCommit::Proposal(Box::new(candidate)));
+        }
+        if let Some(candidate) = self.unattached_commit(commit_id).await? {
+            return Ok(AddressedCommit::Unattached(Box::new(candidate)));
+        }
+        self.coordinator
+            .read()
+            .await
+            .resolve_commit(&SnapshotId::new(commit_id))
+            .await
+            .map(AddressedCommit::Published)
+    }
+
+    /// `enforce` for an id-addressed control write on `target_branch`: a
+    /// denial answers the not-found error an unknown id answers, so the id
+    /// discloses neither existence nor publication state.
+    fn enforce_commit_control(
+        &self,
+        action: omnigraph_policy::PolicyAction,
+        target_branch: Option<&str>,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let scope = omnigraph_policy::ResourceScope::TargetBranch(
+            target_branch.unwrap_or("main").to_string(),
+        );
+        match self.enforce(action, &scope, actor) {
+            Err(OmniError::Policy(_)) if actor.is_some() => {
+                Err(commit_not_found(&SnapshotId::new(commit_id)))
+            }
+            decision => decision,
+        }
+    }
+
+    /// Publish the unpublished commit `commit_id` onto its recorded target
+    /// branch, under `commit_publish` on that branch. The publication is the
+    /// ordinary publish of the proposal's recorded changes under the
+    /// captured authority, so it is refused once the target moved. A commit
+    /// already published is answered as it stands: a repeat never publishes
+    /// twice.
+    pub async fn publish_commit_as(
+        &self,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<GraphCommit> {
+        self.ensure_schema_state_valid().await?;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(candidate) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitPublish,
+                    candidate.property.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Err(OmniError::unattached_cannot_publish(commit_id));
+            }
+            AddressedCommit::Published(published) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitPublish,
+                    published.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Ok(published);
+            }
+        };
+        let target = candidate.property.graph_branch.clone();
+        let target_name = target.clone().unwrap_or_else(|| "main".to_string());
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitPublish,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_publishable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
+            AddressedCommit::Published(published) => return Ok(published),
+        };
+        candidate.require_publishable()?;
+        self.ensure_schema_state_valid().await?;
+        let mut active = self.coordinator.write().await;
+        let published = if target.as_deref() == active.current_branch() {
+            *active = self.open_coordinator_for_branch(target.as_deref()).await?;
+            active.publish_unpublished(&candidate).await?
+        } else {
+            drop(active);
+            let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
+            let published = coordinator.publish_unpublished(&candidate).await?;
+            *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
+            published
+        };
+        if candidate
+            .record
+            .tables
+            .iter()
+            .any(|table| table.registration.table_key.starts_with("edge:"))
+        {
+            self.invalidate_graph_index().await;
+        }
+        Ok(published.commit)
+    }
+
+    /// Drop the unpublished commit `commit_id`, under `commit_drop` on its
+    /// recorded target branch and that branch's write gate, which it shares
+    /// with the publication: its tag is removed and its held merge inputs
+    /// released. An unattached snapshot is dropped with every descendant,
+    /// deepest first ([`Self::drop_unattached_as`]). A published commit is
+    /// refused.
+    pub async fn drop_commit_as(&self, commit_id: &str, actor: Option<&str>) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        let published_conflict =
+            || OmniError::manifest_conflict(format!("commit '{commit_id}' is published"));
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(candidate) => {
+                return self.drop_unattached_as(*candidate, commit_id, actor).await;
+            }
+            AddressedCommit::Published(published) => {
+                self.enforce_commit_control(
+                    omnigraph_policy::PolicyAction::CommitDrop,
+                    published.graph_branch.as_deref(),
+                    commit_id,
+                    actor,
+                )?;
+                return Err(published_conflict());
+            }
+        };
+        let target = candidate.property.graph_branch.clone();
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitDrop,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_droppable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Proposal(candidate) => *candidate,
+            AddressedCommit::Unattached(_) => return Err(changed_kind_under_gate(commit_id)),
+            AddressedCommit::Published(_) => return Err(published_conflict()),
+        };
+        candidate.require_droppable()?;
+        crate::db::manifest::ManifestCoordinator::drop_unpublished(
+            self.uri(),
+            &self.control_session(),
+            &candidate,
+        )
+        .await
+    }
+
+    /// Drop `candidate` and every snapshot descending from it, deepest first,
+    /// under `commit_drop` on its recorded target and that branch's write
+    /// gate, under which the descendant set is captured.
+    async fn drop_unattached_as(
+        &self,
+        candidate: crate::db::manifest::UnattachedCommit,
+        commit_id: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let target = candidate.property.graph_branch.clone();
+        self.enforce_commit_control(
+            omnigraph_policy::PolicyAction::CommitDrop,
+            target.as_deref(),
+            commit_id,
+            actor,
+        )?;
+        candidate.require_droppable()?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let candidate = match self.addressed_commit(commit_id).await? {
+            AddressedCommit::Unattached(candidate) => *candidate,
+            AddressedCommit::Proposal(_) | AddressedCommit::Published(_) => {
+                return Err(changed_kind_under_gate(commit_id));
+            }
+        };
+        candidate.require_droppable()?;
+        let descendants = crate::db::manifest::ManifestCoordinator::unattached_descendants(
+            self.uri(),
+            &self.control_session(),
+            &candidate.property.root_commit_id,
+            commit_id,
+        )
+        .await?;
+        crate::db::manifest::ManifestCoordinator::drop_unattached(
+            self.uri(),
+            &self.control_session(),
+            &candidate,
+            &descendants,
+        )
+        .await
     }
 
     /// Legacy no-transaction opener retained only by the raw-write unit fixtures.
@@ -3223,6 +3679,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         txn: &crate::db::WriteTxn,
         lineage_intent: crate::db::manifest::LineageIntent,
+        publication: Publication,
     ) -> Result<crate::db::GraphCommit> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
@@ -3232,6 +3689,7 @@ impl Omnigraph {
             actor_id,
             txn,
             lineage_intent,
+            publication,
         )
         .await
     }
@@ -3293,17 +3751,6 @@ async fn warm_resolved_target(
         graph_commit_id: coord.effective_graph_head().await?,
         snapshot: coord.snapshot(),
     })
-}
-
-fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
-    if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
-    }
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next().unwrap());
-    }
-    let batch_schema = batches[0].schema();
-    arrow_select::concat::concat_batches(&batch_schema, &batches).map_err(OmniError::arrow_internal)
 }
 
 fn blob_properties_for_table_key<'a>(
@@ -3492,6 +3939,15 @@ fn physical_table_schema(
         fields,
         schema.metadata.clone(),
     )))
+}
+
+/// A proposal id and an unattached id are distinct spellings, so a commit
+/// that resolves to one kind before a branch gate and another under it is
+/// an integrity failure, never a lifetime outcome.
+fn changed_kind_under_gate(commit_id: &str) -> OmniError {
+    OmniError::manifest_internal(format!(
+        "commit '{commit_id}' resolved to a different kind under the branch gate"
+    ))
 }
 
 fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {
@@ -3729,7 +4185,7 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, new_null_array};
 
     use super::*;
     use crate::db::manifest::ManifestCoordinator;

@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::error::{OmniError, Result};
 use crate::metadata::TableVersionMetadata;
-use crate::record::{COMMIT_FIELDS, REPLACED_FIELDS, TABLE_FIELDS};
-use crate::state::{GraphLineageRow, TablePin, TableRow, TableState};
+use crate::record::{COMMIT_FIELDS, REGISTRY_FIELDS, REPLACED_FIELDS, TABLE_FIELDS};
+use crate::state::{BlockRun, GraphLineageRow, MergeEdge, TablePin, TableRow, TableState};
 use crate::{TableIdentity, TableRegistration, table_path_for_identity};
 
 fn typed<'a, T: Array + 'static>(
@@ -516,11 +516,18 @@ impl<'a> CommitColumns<'a> {
 
     /// Whether `row` holds no commit column, which a `table` row requires.
     pub(crate) fn is_null(&self, row: usize) -> bool {
+        self.holds_only_lineage_edges(row)
+            && self.generations.is_null(row)
+            && self.parent_commit_ids.is_null(row)
+            && self.merged_parent_commit_ids.is_null(row)
+    }
+
+    /// Whether `row` fills none of the commit columns beyond `generation` and
+    /// the two parent ids, the three a registry row reuses.
+    pub(crate) fn holds_only_lineage_edges(&self, row: usize) -> bool {
         let strings = [
             self.graph_branches,
             self.native_branches,
-            self.parent_commit_ids,
-            self.merged_parent_commit_ids,
             self.actor_ids,
             self.schema_ir_hash,
             self.schema_identity_domain,
@@ -528,9 +535,21 @@ impl<'a> CommitColumns<'a> {
         ];
         strings.iter().all(|column| column.is_null(row))
             && self.graph_manifest_versions.is_null(row)
-            && self.generations.is_null(row)
             && self.created_at.is_null(row)
             && self.schema_identity_version.is_null(row)
+    }
+
+    /// The `generation`, `parent_commit_id` and `merged_parent_commit_id` of
+    /// a registry row, the generation required.
+    pub(crate) fn lineage_edges(
+        &self,
+        row: usize,
+    ) -> Result<(u64, Option<String>, Option<String>)> {
+        Ok((
+            required(number(self.generations, row), "generation", row)?,
+            string(self.parent_commit_ids, row),
+            string(self.merged_parent_commit_ids, row),
+        ))
     }
 
     /// The commit at `row`, and whether the row inherits its schema contract
@@ -708,6 +727,21 @@ impl CommitColumnsBuilder {
         self.schema_content_hash.push(None);
     }
 
+    /// A registry row: its generation and the parent ids it carries, every
+    /// other commit column null.
+    pub(crate) fn push_lineage_edges(
+        &mut self,
+        generation: u64,
+        parent_commit_id: Option<&str>,
+        merged_parent_commit_id: Option<&str>,
+    ) {
+        self.push_null();
+        let last = self.generations.len() - 1;
+        self.generations[last] = Some(generation);
+        self.parent_commit_ids[last] = parent_commit_id.map(str::to_string);
+        self.merged_parent_commit_ids[last] = merged_parent_commit_id.map(str::to_string);
+    }
+
     /// The columns in the order of [`COMMIT_FIELDS`].
     pub(crate) fn finish(self) -> [ArrayRef; COMMIT_FIELDS.len()] {
         [
@@ -795,6 +829,90 @@ impl ReplacedColumnsBuilder {
         [
             Arc::new(UInt64Array::from(self.replaced_at)),
             Arc::new(UInt64Array::from(self.registered_at)),
+        ]
+    }
+}
+
+/// The columns only a `history_block` or `history_merge` row fills, borrowed
+/// for decoding; the row's generation and parent ids are commit columns.
+pub(crate) struct RegistryColumns<'a> {
+    block_ids: &'a StringArray,
+    first_slots: &'a UInt64Array,
+    last_slots: &'a UInt64Array,
+}
+
+impl<'a> RegistryColumns<'a> {
+    pub(crate) fn new(lookup: &dyn Fn(&str) -> Option<&'a ArrayRef>) -> Result<Self> {
+        Ok(Self {
+            block_ids: typed(lookup, "block_id")?,
+            first_slots: typed(lookup, "first_slot")?,
+            last_slots: typed(lookup, "last_slot")?,
+        })
+    }
+
+    pub(crate) fn is_null(&self, row: usize) -> bool {
+        self.block_ids.is_null(row) && self.first_slots.is_null(row) && self.last_slots.is_null(row)
+    }
+
+    /// The block and the slot run of a registry row.
+    pub(crate) fn decode(&self, row: usize) -> Result<(ulid::Ulid, u16, u16)> {
+        let block = required(string(self.block_ids, row), "block_id", row)?;
+        let block = omnigraph_core::graph_commit_id::canonical_ulid(&block).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "registry row {row} names block '{block}', not a canonical ULID"
+            ))
+        })?;
+        let slot = |column: &UInt64Array, name: &str| -> Result<u16> {
+            u16::try_from(required(number(column, row), name, row)?)
+                .ok()
+                .filter(|slot| *slot < omnigraph_core::graph_commit_id::HISTORY_BLOCK_SLOTS)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "registry row {row} names a `{name}` beyond the slot ceiling"
+                    ))
+                })
+        };
+        Ok((
+            block,
+            slot(self.first_slots, "first_slot")?,
+            slot(self.last_slots, "last_slot")?,
+        ))
+    }
+}
+
+/// The registry columns of rows being written, one entry per row.
+#[derive(Default)]
+pub(crate) struct RegistryColumnsBuilder {
+    block_ids: Vec<Option<String>>,
+    first_slots: Vec<Option<u64>>,
+    last_slots: Vec<Option<u64>>,
+}
+
+impl RegistryColumnsBuilder {
+    pub(crate) fn push_run(&mut self, run: &BlockRun) {
+        self.block_ids.push(Some(run.block.to_string()));
+        self.first_slots.push(Some(u64::from(run.first_slot)));
+        self.last_slots.push(Some(u64::from(run.last_slot)));
+    }
+
+    pub(crate) fn push_merge(&mut self, edge: &MergeEdge) {
+        self.block_ids.push(Some(edge.block.to_string()));
+        self.first_slots.push(Some(u64::from(edge.slot)));
+        self.last_slots.push(Some(u64::from(edge.slot)));
+    }
+
+    pub(crate) fn push_null(&mut self) {
+        self.block_ids.push(None);
+        self.first_slots.push(None);
+        self.last_slots.push(None);
+    }
+
+    /// The columns in the order of [`REGISTRY_FIELDS`].
+    pub(crate) fn finish(self) -> [ArrayRef; REGISTRY_FIELDS.len()] {
+        [
+            Arc::new(StringArray::from(self.block_ids)),
+            Arc::new(UInt64Array::from(self.first_slots)),
+            Arc::new(UInt64Array::from(self.last_slots)),
         ]
     }
 }

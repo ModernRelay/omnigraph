@@ -47,7 +47,8 @@ impl CacheKey for VerifiedCertificateKey {
     }
 }
 
-/// Certify a newly completed, unpublished full FTS build from source rows.
+/// Certify a newly completed, unpublished FTS segment the engine's builder
+/// wrote from source rows: all of them, or none (an untrained declaration).
 ///
 /// The caller must own this fresh index UUID and publish the updated metadata
 /// through the existing staged CreateIndex transaction. Do not use this to

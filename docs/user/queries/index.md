@@ -196,58 +196,59 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, earlier
-projection aliases, and the aggregates `count`, `sum`, `avg`, `min`, and `max`.
-In the return clause, integer `sum` accumulates exactly in 128 bits and rounds
-the total once to `F64`; `avg` uses a floating-point accumulator.
-`min` and `max` accept a numeric, `String`, `Bool`, `Date`, or `DateTime`
-column and return the column's own type; `Bool` orders `false` before `true`,
-dates and datetimes chronologically. When no row matches, a query whose
-projections are all aggregates returns one row: `count` is 0 and every other
-aggregate is null; a query that also projects a group value returns no rows.
-A bare node variable returns the node as one object: its `@id` and every
-property except `Blob` and `Vector` ones, so `return { $p }` gives a column
-`p` holding `{"@id": "alice", "name": "alice", "age": 30}`; project a property
-(`$p.name`, `$p.embedding`) for a single field. `count($p)` counts rows; the
-other aggregates take a property, not a bare node binding (`T8`). Each
-projection produces one result column, named by its alias or, without one,
-by its expression (`$p.name` gives `p.name`, `$p.@id` gives `p.@id`). Two projections that would
-produce the same column name are refused at compile time (`T25`); give each
-its own alias. A comparison or Boolean expression gives a `Bool` column and
-needs an alias (`T43`), `$p.age > 30 as adult`; it is `Bool?` when an operand is
-nullable (`is null` and `is not null` are always `Bool`), and refused in an aggregated `return` (`T9`).
-Search expressions are documented in [Search](../search/index.md).
+Return expressions include variables, properties, literals, `now()`, and the
+aggregates `count`, `sum`, `avg`, `min`, and `max`. Each gives one column named by
+its alias or expression (`$p.name` gives `p.name`); duplicates are refused (`T25`).
 
-An explicit order is total and deterministic: OmniGraph adds entity ids as a
-final tie-breaker when user keys are equal, only where the ids can change the
-visible order (when every returned expression is an order key, equal rows are
-indistinguishable and no id is read). Ascending order places nulls first;
-descending order places them last. `nearest(...)` ordering requires a `limit`.
+Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
+uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
+`Bool`, `Date`, or `DateTime` columns and keep their type (false before true,
+dates chronologically). With no matches, an aggregate-only return gives one row
+(`count` 0, the rest null); a return that also projects a group value gives no rows.
 
-An order key that is a property access or a system field sorts as before,
-returned or not. Any other key except the leading search key (an aggregate,
-a comparison, a call) must be a return alias or an expression written in
-`return`, as in `return { count($d) as deals } order { count($d) desc }`;
-otherwise it is ``T42: order key `max($d.amount)` does not appear in return;
-add it to return or order by its alias``, with the key as written.
+A bare node returns one object with `@id` and every property except `Blob` and
+`Vector`: `$p` produces column `p`; project a property for one field. `count($p)`
+counts rows and `count(distinct $p)` distinct nodes; `count(distinct $p.city)`
+counts distinct non-null values, so a node reached by several paths counts once.
+Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
-Search orderings share that contract: `nearest(...)` ranks by ascending vector
-distance and `bm25(...)` by descending relevance score, so the score (never
-any internal scan or traversal order) is what the row order means, including
-through multi-hop traversals. Keys after the search function apply as
-secondary sorts before the id tie-breaker; the search function itself must
-lead the order clause. The score is also a result value: `return { $d.slug,
-nearest($d.vector, $v) as score }` returns the distance the ordering used, and
-`bm25(...) as score` the relevance score, provided the projected expression
-repeats the leading `order` key (`T33`); without an alias the column is
-`d._distance` or `d._score`. A rank expression under an aggregate (`T32`),
-`rrf(...)` in `return` (`T37`, until the fused score becomes a column), and
-the predicates `search(...)`, `fuzzy(...)` and `match_text(...)` in `return`
-(`T35`, they belong in `match`) are refused at compile time. Aggregated
-queries are outside search ordering: group
-results are not score-ranked and cannot project a score (`T9`). A `bm25()`
-ordering reads every matching entity before the final limit, so rows tied on
-score are ordered by entity id.
+A comparison or Boolean expression requires an alias (`T43`), such as
+`$p.age > 30 as adult`. Its result is `Bool`, or `Bool?` with a nullable operand;
+`is null` and `is not null` always return `Bool`. Aggregates refuse these projections (`T9`).
+
+`return distinct { $p.name }` keeps one row per complete projected tuple.
+Repeated traversal matches and equal values on different entities collapse;
+nulls compare equal. Every projection is a key, including comparisons, and
+bare nodes deduplicate by identity. Deduplication follows `match` and precedes
+ordering and limiting, so the limit counts distinct rows. Aggregates with
+`distinct` are refused (`T56`). Except for a leading search function, DISTINCT
+order keys must be projected values or aliases, including property keys
+(`T42`). Remaining projected columns break ties ascending; no identity tiebreak is added.
+
+For ordinary returns, explicit order is total: entity ids break ties only
+when they can change the visible order. When every projection is an order key,
+equal rows are indistinguishable and no id is read. Ascending order puts nulls
+first; descending puts them last. `nearest(...)` requires a limit.
+
+Outside DISTINCT, property and system-field order keys need not be projected.
+Other keys, except the leading search function, must be return aliases or
+expressions written in return (`T42`), such as `count($d)` after
+`return { count($d) as deals }`.
+
+For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
+and `rrf` by descending score, including through traversals. The search
+function must lead; subsequent keys precede the identity tiebreak. Projected
+scores must repeat that leading function (`T33`); the [Search guide](../search/index.md)
+defines their names and types. Rank expressions under aggregates (`T32`) and
+search predicates in return (`T35`) are refused.
+
+For aggregate or DISTINCT returns, the leading search function selects the
+input population; it does not order the output. Subsequent keys order output
+rows, followed by every group or DISTINCT key ascending. Without subsequent
+keys, output is unordered. Aggregates cannot project scores (`T9`). DISTINCT
+uses the selected nearest population without retry overfetch, so duplicates
+can leave fewer rows than the limit. BM25 reads every matching entity before
+the final limit.
 
 ## Blobs
 

@@ -20,8 +20,43 @@ pub struct QueryFile {
 pub enum FileBody {
     Queries(Vec<QueryDecl>),
     Branch(BranchStmt),
+    Commit(CommitWrite),
     Show(Option<SettingId>),
     Explain(QueryDecl),
+}
+
+/// A top-level control write on an unpublished commit:
+/// `commit publish "<id>"` or `commit drop "<id>"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitWrite {
+    Publish { graph_commit_id: String },
+    Drop { graph_commit_id: String },
+}
+
+impl CommitWrite {
+    /// The write's two keywords, `commit publish` or `commit drop`.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            CommitWrite::Publish { .. } => "commit publish",
+            CommitWrite::Drop { .. } => "commit drop",
+        }
+    }
+
+    pub fn graph_commit_id(&self) -> &str {
+        match self {
+            CommitWrite::Publish { graph_commit_id } | CommitWrite::Drop { graph_commit_id } => {
+                graph_commit_id
+            }
+        }
+    }
+
+    /// Refusal text for a consumer that expected `query` declarations.
+    pub fn not_a_declaration_message(&self) -> String {
+        format!(
+            "`{}` is a commit statement, not a query declaration",
+            self.statement_name()
+        )
+    }
 }
 
 /// Which empty a source is: no statement at all, or a settings prefix with
@@ -82,6 +117,7 @@ impl FileBody {
         match self {
             FileBody::Queries(queries) => Ok(queries),
             FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
+            FileBody::Commit(write) => Err(write.not_a_declaration_message()),
             FileBody::Show(id) => Err(format!(
                 "`{}` is a settings statement, not a query declaration",
                 show_statement_name(id)
@@ -155,6 +191,7 @@ impl QueryFile {
                 ),
             },
             FileBody::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
+            FileBody::Commit(write) => panic!("{}", write.not_a_declaration_message()),
             FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
             FileBody::Explain(_) => panic!("{EXPLAIN_NOT_A_DECLARATION}"),
         }
@@ -170,7 +207,7 @@ pub enum BranchStmt {
 }
 
 /// A control write: `branch create <name> [from <parent>]`,
-/// `branch delete <name>`, or `branch merge <source> [into <target>]`.
+/// `branch delete <name>`, or `branch merge <source> [into <target>] [as commit]`.
 /// `from` and `into` are `None` when unspelled; no default is filled here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchWrite {
@@ -184,6 +221,8 @@ pub enum BranchWrite {
     Merge {
         source: String,
         into: Option<String>,
+        /// `as commit`: the merge result is an unpublished commit.
+        as_commit: bool,
     },
 }
 
@@ -229,9 +268,33 @@ pub struct QueryDecl {
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,
+    /// `return distinct { … }`: one row per distinct projected tuple.
+    pub distinct: bool,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
     pub mutations: Vec<Mutation>,
+    /// The clause before the body. Only `Publish` on a read declaration (the
+    /// parser refuses the other two there).
+    pub write_mode: MutationWriteMode,
+}
+
+/// Where a mutation's result goes: the branch head (`Publish`), an
+/// unpublished commit (`as commit`), or an unattached snapshot
+/// (`as unattached branch [on <base>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationWriteMode {
+    Publish,
+    AsCommit,
+    Unattached { base: Option<UnattachedBase> },
+}
+
+/// The `on` operand of `as unattached branch`: the base snapshot's id as a
+/// quoted literal, or the name (without `$`) of a `String` parameter that
+/// carries it per invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnattachedBase {
+    Literal(String),
+    Param(String),
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +503,9 @@ pub enum Expr {
     Literal(Literal),
     Aggregate {
         func: AggFunc,
+        /// `count(distinct …)`: distinct nodes by identity, or distinct
+        /// non-null values; only `count` takes it (T57).
+        distinct: bool,
         arg: Box<Expr>,
     },
     AliasRef(String),
@@ -649,7 +715,16 @@ impl std::fmt::Display for Expr {
             } => write!(f, "rrf({primary}, {secondary}, {k})"),
             Expr::Variable(name) => write!(f, "${name}"),
             Expr::Literal(literal) => write!(f, "{literal}"),
-            Expr::Aggregate { func, arg } => write!(f, "{func}({arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: true,
+                arg,
+            } => write!(f, "{func}(distinct {arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: false,
+                arg,
+            } => write!(f, "{func}({arg})"),
             Expr::AliasRef(alias) => f.write_str(alias),
         }
     }
@@ -661,12 +736,16 @@ impl std::fmt::Display for Expr {
 pub const DISTANCE_COLUMN: &str = "_distance";
 /// See [`DISTANCE_COLUMN`].
 pub const SCORE_COLUMN: &str = "_score";
+/// The fused score `RankFuse` appends under the primary arm's binding
+/// (`{var}._rrf`, RFC 0047 §One total order), reserved like the two above.
+pub const RRF_COLUMN: &str = "_rrf";
 
 impl Expr {
     /// The `(binding, column)` a projected rank expression reads: the score
     /// the executed retrieval wrote for that binding (RFC 0047 §Metric
-    /// projection). `None` for every expression that is not a single-source
-    /// rank expression over a property.
+    /// projection); an `rrf()` reads the fused score under its primary arm's
+    /// binding. `None` for every expression that is not a rank expression
+    /// over a property.
     pub fn score_column(&self) -> Option<(&str, &'static str)> {
         match self {
             Expr::Nearest { variable, .. } => Some((variable, DISTANCE_COLUMN)),
@@ -674,6 +753,9 @@ impl Expr {
                 Expr::PropAccess { variable, .. } => Some((variable, SCORE_COLUMN)),
                 _ => None,
             },
+            Expr::Rrf { primary, .. } => primary
+                .score_column()
+                .map(|(variable, _)| (variable, RRF_COLUMN)),
             _ => None,
         }
     }
@@ -859,6 +941,9 @@ pub struct Projection {
 pub struct Ordering {
     pub expr: Expr,
     pub descending: bool,
+    /// Whether the query wrote `asc` or `desc` after the key; a bare key
+    /// reads as ascending, a bare rank key as the rank's own direction.
+    pub explicit: bool,
 }
 
 #[derive(Debug, Clone)]

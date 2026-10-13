@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::array::ArrayData;
 use datafusion::arrow::buffer::Buffer;
@@ -692,19 +692,6 @@ impl WorkMemory {
         self.take_admitted(batch, indices, name, 1)
     }
 
-    /// The bytes `take_once` admits for the rows of `batch` at `indices`
-    /// before Arrow allocates them: one copy per index, a row repeated by
-    /// the indices once per repetition, and Arrow's scratch. A caller sizes
-    /// a window by it before it takes.
-    pub(in crate::engine) fn take_bytes(
-        &self,
-        batch: &RecordBatch,
-        indices: &UInt32Array,
-    ) -> DfResult<usize> {
-        let (picked, scratch) = self.take_estimate(batch, indices)?;
-        Ok(picked.saturating_add(scratch))
-    }
-
     /// The picked bytes of a take and its scratch bytes. A null index copies
     /// no row: it costs what a null row of the column costs.
     fn take_estimate(
@@ -763,6 +750,85 @@ impl WorkMemory {
             .map(|column| arrow_select::take::take(column.as_ref(), indices, None))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let result = RecordBatch::try_new(batch.schema(), columns)?;
+        drop(admitted);
+        self.hold(&result)?;
+        Ok(result)
+    }
+
+    /// The bytes `interleave_once` admits for the rows of `batches` at
+    /// `picks` (`(batch, row)`) before Arrow builds them: each pick copies its
+    /// row once, a row picked twice is copied twice, plus Arrow's scratch. A
+    /// caller sizes a window by it before it interleaves.
+    pub(in crate::engine) fn interleave_bytes(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<usize> {
+        let (picked, scratch) = self.interleave_estimate(batches, picks)?;
+        Ok(picked.saturating_add(scratch))
+    }
+
+    /// The picked bytes of an interleave and its scratch bytes, column by
+    /// column as `take_estimate` counts a take.
+    fn interleave_estimate(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<(usize, usize)> {
+        let Some(first) = batches.first() else {
+            return Ok((0, 0));
+        };
+        let mut bytes = 0usize;
+        let mut scratch_bytes = 0usize;
+        for column in 0..first.num_columns() {
+            let data: Vec<ArrayData> = batches
+                .iter()
+                .map(|batch| batch.column(column).to_data())
+                .collect();
+            scratch_bytes = scratch_bytes.saturating_add(take_scratch_size(&data[0], picks.len()));
+            let mut picked = 0usize;
+            for &(batch, row) in picks {
+                self.check()?;
+                let data = data.get(batch).ok_or_else(|| {
+                    DataFusionError::Internal(format!("interleave pick of absent batch {batch}"))
+                })?;
+                picked = picked
+                    .saturating_add(slice_memory_size(data, row, 1)?)
+                    .saturating_add(16);
+            }
+            bytes = bytes.saturating_add(picked).saturating_add(128);
+        }
+        Ok((bytes, scratch_bytes))
+    }
+
+    /// The rows of `batches` at `picks`, in pick order, under `schema`: the
+    /// copy is admitted once at `interleave_bytes` while Arrow builds it, then
+    /// only the result is held.
+    pub(in crate::engine) fn interleave_once(
+        &self,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+        name: &str,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.interleave_estimate(batches, picks)?;
+        let admitted = self
+            .resources
+            .reservation(name, bytes.saturating_add(scratch_bytes))?;
+        let columns = (0..schema.fields().len())
+            .map(|column| {
+                let arrays: Vec<&dyn Array> = batches
+                    .iter()
+                    .map(|batch| batch.column(column).as_ref())
+                    .collect();
+                arrow_select::interleave::interleave(&arrays, picks)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let result = RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(picks.len())),
+        )?;
         drop(admitted);
         self.hold(&result)?;
         Ok(result)
@@ -1199,7 +1265,8 @@ mod tests {
     /// flat path (a text column) and the per-row path (a struct over it): 64
     /// null slots whose raw value names a 512 KiB row admit a few KiB, and
     /// four repetitions of that row admit four copies per column, which a
-    /// 4 MiB pool holding the batch refuses before Arrow builds them. A case
+    /// 4 MiB pool holding the batch refuses before Arrow builds them; an
+    /// interleave over one-row batches admits each pick the same way. A case
     /// cannot write null indices.
     #[test]
     fn a_take_admits_a_copy_per_index_and_a_null_row_per_null_index() {
@@ -1221,7 +1288,8 @@ mod tests {
         let (pool, memory) = test_memory(4 * 1_048_576);
         memory.hold(&batch).unwrap();
         let nulls = UInt32Array::new(vec![0u32; 64].into(), Some(NullBuffer::new_null(64)));
-        let admitted = memory.take_bytes(&batch, &nulls).unwrap();
+        let (picked, scratch) = memory.take_estimate(&batch, &nulls).unwrap();
+        let admitted = picked + scratch;
         assert!(
             admitted < 16 * 1024,
             "null indices admitted {admitted} bytes"
@@ -1235,11 +1303,27 @@ mod tests {
                 .all(|column| column.null_count() == 64)
         );
         let repeated = UInt32Array::from(vec![0u32; 4]);
-        assert!(memory.take_bytes(&batch, &repeated).unwrap() >= 8 * 512 * 1024);
+        assert!(memory.take_estimate(&batch, &repeated).unwrap().0 >= 8 * 512 * 1024);
         assert!(
             memory.take_once(&batch, &repeated, "test take").is_err(),
             "four copies of the row in two columns exceed the pool"
         );
+        // An interleave over one-row batches counts each pick the same way.
+        let rows = [batch.slice(0, 1), batch.slice(1, 1)];
+        let picks = [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
+        assert!(memory.interleave_bytes(&rows, &picks[..2]).unwrap() < 2 * 1_048_576);
+        assert!(memory.interleave_bytes(&rows, &picks).unwrap() >= 8 * 512 * 1024);
+        let two = memory
+            .interleave_once(&batch.schema(), &rows, &picks[..2], "test interleave")
+            .unwrap();
+        assert_eq!(two, batch);
+        assert!(
+            memory
+                .interleave_once(&batch.schema(), &rows, &picks, "test interleave")
+                .is_err(),
+            "four copies of the wide row in two columns exceed the pool"
+        );
+        drop(two);
         drop(taken);
         drop(memory);
         assert_eq!(pool.reserved(), 0);

@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use crate::gqt_case::BoundGqt as ValidatedCase;
 use crate::gqt_protocol::{
-    ChildFrameV1, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerRequestV1, WorkerStageV1,
+    ChildFrameV2, ParentFrameV2, WORKER_PROTOCOL_VERSION, WorkerRequestV2, WorkerStageV1,
     digest_worker_executable, read_frame, validate_protocol_version, write_frame,
 };
 use crate::gqt_runner::execute_gqt_rep_signaled;
@@ -17,7 +17,7 @@ use crate::runner::{MeasurementSignals, RunnerError, RunnerResult};
 /// This is public only so the package binary can host the hidden worker
 /// command. It is not a stable embedding API.
 #[doc(hidden)]
-pub async fn run_worker_stdio_v1() -> ExitCode {
+pub async fn run_worker_stdio_v2() -> ExitCode {
     let input = std::io::stdin();
     let output = std::io::stdout();
     let mut input = BufReader::new(input);
@@ -72,7 +72,7 @@ pub async fn run_worker_stdio_v1() -> ExitCode {
     let result = execute_request(&request, &mut signals).await;
     match result {
         Ok(sample) => {
-            let frame = ChildFrameV1::Complete {
+            let frame = ChildFrameV2::Complete {
                 protocol_version: WORKER_PROTOCOL_VERSION,
                 point_id: request.expected_point_id.clone(),
                 case_digest: request.expected_case_digest.clone(),
@@ -111,14 +111,14 @@ pub async fn run_worker_stdio_v1() -> ExitCode {
     }
 }
 
-fn read_request(input: &mut BufReader<std::io::Stdin>) -> RunnerResult<WorkerRequestV1> {
-    let frame = read_frame::<_, ParentFrameV1>(input).map_err(|error| {
+fn read_request(input: &mut BufReader<std::io::Stdin>) -> RunnerResult<WorkerRequestV2> {
+    let frame = read_frame::<_, ParentFrameV2>(input).map_err(|error| {
         RunnerError::new(
             "worker_protocol_error",
             format!("could not read worker request: {error}"),
         )
     })?;
-    let Some(ParentFrameV1::Request {
+    let Some(ParentFrameV2::Request {
         protocol_version,
         request,
     }) = frame
@@ -134,33 +134,46 @@ fn read_request(input: &mut BufReader<std::io::Stdin>) -> RunnerResult<WorkerReq
 }
 
 async fn execute_request(
-    request: &WorkerRequestV1,
+    request: &WorkerRequestV2,
     signals: &mut ProtocolSignals,
 ) -> RunnerResult<crate::gqt_runner::GqtRepObservation> {
     crate::runner::enforce_release_build()?;
     crate::runner::validate_benchmark_child_runtime_overrides(&request.worker_scratch_root)?;
     let validated = validate_worker_case(request)?;
-    execute_gqt_rep_signaled(
-        request.repetition,
-        &request.repetition_root,
-        &request.expected_physical_digest,
-        &request.expected_metadata_digest,
-        &validated,
-        signals,
-    )
-    .await
+    match &request.execution {
+        crate::gqt_protocol::RepetitionInputV2::Embedded {
+            repetition_root,
+            physical_digest,
+            metadata_digest,
+            ..
+        } => {
+            execute_gqt_rep_signaled(
+                request.repetition,
+                repetition_root,
+                physical_digest,
+                metadata_digest,
+                &validated,
+                signals,
+            )
+            .await
+        }
+        crate::gqt_protocol::RepetitionInputV2::Served { input } => {
+            crate::gqt_runner::execute_served_rep_signaled(
+                request.repetition,
+                &validated,
+                input,
+                signals,
+            )
+            .await
+        }
+    }
 }
 
-fn validate_worker_case(request: &WorkerRequestV1) -> RunnerResult<ValidatedCase> {
-    if !request.repetition_root.is_absolute() {
-        return Err(RunnerError::new(
-            "worker_identity_mismatch",
-            format!(
-                "repetition root must be absolute: {}",
-                request.repetition_root.display()
-            ),
-        ));
-    }
+fn validate_worker_case(request: &WorkerRequestV2) -> RunnerResult<ValidatedCase> {
+    request
+        .execution
+        .validate(&request.case)
+        .map_err(|e| RunnerError::new("worker_case_invalid", e))?;
     if !request.worker_scratch_root.is_absolute() {
         return Err(RunnerError::new(
             "worker_protocol_error",
@@ -192,12 +205,6 @@ fn validate_worker_case(request: &WorkerRequestV1) -> RunnerResult<ValidatedCase
             "worker scratch root must be a real directory",
         ));
     }
-    let repetition_root = std::fs::canonicalize(&request.repetition_root).map_err(|error| {
-        RunnerError::new(
-            "worker_protocol_error",
-            format!("could not resolve worker repetition root: {error}"),
-        )
-    })?;
     let worker_scratch_root =
         std::fs::canonicalize(&request.worker_scratch_root).map_err(|error| {
             RunnerError::new(
@@ -205,11 +212,18 @@ fn validate_worker_case(request: &WorkerRequestV1) -> RunnerResult<ValidatedCase
                 format!("could not resolve worker scratch root: {error}"),
             )
         })?;
-    if repetition_root.parent() != worker_scratch_root.parent() {
-        return Err(RunnerError::new(
-            "worker_protocol_error",
-            "worker scratch root must be a sibling of the repetition store on the same verified scratch backend",
-        ));
+    if let crate::gqt_protocol::RepetitionInputV2::Embedded {
+        repetition_root, ..
+    } = &request.execution
+    {
+        let root = std::fs::canonicalize(repetition_root)
+            .map_err(|e| RunnerError::new("worker_protocol_error", e.to_string()))?;
+        if root.parent() != worker_scratch_root.parent() {
+            return Err(RunnerError::new(
+                "worker_protocol_error",
+                "worker scratch root must be a sibling of the repetition store",
+            ));
+        }
     }
     let mut entries = std::fs::read_dir(&worker_scratch_root).map_err(|error| {
         RunnerError::new(
@@ -256,9 +270,9 @@ fn validate_worker_case(request: &WorkerRequestV1) -> RunnerResult<ValidatedCase
 }
 
 struct ProtocolSignals {
-    parent_frames: Receiver<Result<ParentFrameV1, String>>,
+    parent_frames: Receiver<Result<ParentFrameV2, String>>,
     output: BufWriter<std::io::Stdout>,
-    request: WorkerRequestV1,
+    request: WorkerRequestV2,
     worker_build: crate::gqt_protocol::WorkerBuildV1,
 }
 
@@ -272,15 +286,18 @@ impl MeasurementSignals for ProtocolSignals {
         })?;
         write_frame(
             &mut self.output,
-            &ChildFrameV1::Ready {
+            &ChildFrameV2::Ready {
                 protocol_version: WORKER_PROTOCOL_VERSION,
                 repetition: self.request.repetition,
                 point_id: self.request.expected_point_id.clone(),
                 case_digest: self.request.expected_case_digest.clone(),
                 worker_build: Box::new(self.worker_build.clone()),
                 machine: Box::new(machine),
-                physical_digest: self.request.expected_physical_digest.clone(),
-                metadata_digest: self.request.expected_metadata_digest.clone(),
+                proof: self
+                    .request
+                    .execution
+                    .proof()
+                    .map_err(|e| RunnerError::new("worker_identity_mismatch", e))?,
             },
         )
         .map_err(|error| RunnerError::new("worker_protocol_error", error.to_string()))?;
@@ -296,7 +313,7 @@ impl MeasurementSignals for ProtocolSignals {
             })?
             .map_err(|error| RunnerError::new("worker_protocol_error", error))?;
         match begin {
-            ParentFrameV1::Begin {
+            ParentFrameV2::Begin {
                 protocol_version,
                 repetition,
             } if protocol_version == WORKER_PROTOCOL_VERSION
@@ -317,7 +334,7 @@ impl MeasurementSignals for ProtocolSignals {
     fn settled(&mut self, elapsed_us: u64) -> RunnerResult<()> {
         write_frame(
             &mut self.output,
-            &ChildFrameV1::Settled {
+            &ChildFrameV2::Settled {
                 protocol_version: WORKER_PROTOCOL_VERSION,
                 repetition: self.request.repetition,
                 elapsed_us,
@@ -330,12 +347,12 @@ impl MeasurementSignals for ProtocolSignals {
 /// Parent EOF terminates the worker during preparation, measurement, or verification.
 fn spawn_parent_watch(
     mut input: BufReader<std::io::Stdin>,
-) -> std::io::Result<Receiver<Result<ParentFrameV1, String>>> {
+) -> std::io::Result<Receiver<Result<ParentFrameV2, String>>> {
     let (send, receive) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("omnigraph-bench-parent-watch".to_string())
         .spawn(move || {
-            match read_frame::<_, ParentFrameV1>(&mut input) {
+            match read_frame::<_, ParentFrameV2>(&mut input) {
                 Ok(Some(frame)) => {
                     if send.send(Ok(frame)).is_err() {
                         return;
@@ -348,7 +365,7 @@ fn spawn_parent_watch(
                 }
             }
 
-            match read_frame::<_, ParentFrameV1>(&mut input) {
+            match read_frame::<_, ParentFrameV2>(&mut input) {
                 Ok(None) => std::process::exit(125),
                 Ok(Some(_)) | Err(_) => std::process::exit(126),
             }
@@ -405,7 +422,7 @@ fn send_failure(
 ) -> Result<(), crate::gqt_protocol::WorkerProtocolError> {
     write_frame(
         output,
-        &ChildFrameV1::Failed {
+        &ChildFrameV2::Failed {
             protocol_version: WORKER_PROTOCOL_VERSION,
             stage,
             code: error.code.clone(),

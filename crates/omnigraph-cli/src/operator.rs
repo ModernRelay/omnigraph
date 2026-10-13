@@ -55,7 +55,7 @@ pub(crate) struct OperatorConfig {
     /// Everything this CLI version doesn't know. Warned once at load,
     /// otherwise ignored (forward compatibility within the operator layer).
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 /// A personal alias: a pure BINDING to a stored query on a named server —
@@ -75,17 +75,17 @@ pub(crate) struct OperatorAlias {
     pub(crate) args: Vec<String>,
     /// Fixed default params; positionals and `--params` override per key.
     #[serde(default)]
-    pub(crate) params: serde_yaml::Mapping,
+    pub(crate) params: yaml_serde::Mapping,
     pub(crate) format: Option<ReadOutputFormat>,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct OperatorServer {
     pub(crate) url: String,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -94,7 +94,7 @@ pub(crate) struct OperatorIdentity {
     /// cluster commands alike): `--as` > this > none.
     pub(crate) actor: Option<String>,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,7 +118,7 @@ pub(crate) struct OperatorDefaults {
     /// `--graph` is passed (RFC-011).
     pub(crate) default_graph: Option<String>,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 /// A named scope bundle (RFC-011): exactly one of {server, cluster, store}
@@ -136,7 +136,7 @@ pub(crate) struct OperatorProfile {
     /// which is already one graph).
     pub(crate) default_graph: Option<String>,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 /// A managed-cluster storage root (RFC-011).
@@ -145,7 +145,7 @@ pub(crate) struct OperatorCluster {
     /// The cluster's storage-root URI (`file://` / `s3://` / `az://`).
     pub(crate) root: String,
     #[serde(flatten)]
-    unknown: serde_yaml::Mapping,
+    unknown: yaml_serde::Mapping,
 }
 
 /// The one entity a profile (or flat default) binds. Exactly one variant —
@@ -303,7 +303,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
             ));
         }
     };
-    let config: OperatorConfig = serde_yaml::from_str(&text).map_err(|err| {
+    let config: OperatorConfig = yaml_serde::from_str(&text).map_err(|err| {
         eyre!(
             "could not parse operator config '{}': {err}",
             path.display()
@@ -319,7 +319,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
 impl OperatorConfig {
     fn unknown_key_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        let mut collect = |mapping: &serde_yaml::Mapping, prefix: &str| {
+        let mut collect = |mapping: &yaml_serde::Mapping, prefix: &str| {
             for key in mapping.keys() {
                 if let Some(name) = key.as_str() {
                     warnings.push(format!(

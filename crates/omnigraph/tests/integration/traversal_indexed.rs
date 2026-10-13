@@ -1,0 +1,484 @@
+//! BTREE-indexed Expand path (`execute_expand_indexed`) coverage.
+//!
+//! These tests force the Expand execution mode with a session's `traversal`
+//! setting and assert the indexed path matches the CSR path (both are
+//! semantically identical: the indexed path serves neighbor lookups from the
+//! persisted src/dst BTREE instead of an in-memory CSR). A setting belongs to
+//! one session, so these tests need no `#[serial]` and no dedicated binary.
+
+use omnigraph::db::Omnigraph;
+use omnigraph::loader::LoadMode;
+use omnigraph::{IndexCoverage, Session};
+use omnigraph_compiler::ir::ParamMap;
+
+use crate::helpers::*;
+
+/// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
+async fn sorted_names(db: &Session, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+    first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
+}
+
+/// Run the same query under `csr`, `indexed` and `auto`, assert the three agree
+/// and return the rows: the chooser changes which path runs, never the result.
+async fn both_modes(db: &Session, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+    let csr_db = with_traversal(db, Traversal::Csr);
+    let indexed_db = with_traversal(db, Traversal::Indexed);
+    let csr = first_column_sorted(&query_main(&csr_db, queries, name, params).await.unwrap());
+    let indexed = first_column_sorted(
+        &query_main(&indexed_db, queries, name, params)
+            .await
+            .unwrap(),
+    );
+    let auto = sorted_names(db, queries, name, params).await;
+    assert_eq!(
+        indexed, csr,
+        "indexed Expand must produce identical results to CSR for query '{name}'"
+    );
+    assert_eq!(
+        auto, csr,
+        "auto (cost-chooser) Expand must produce identical results to the forced paths for query '{name}'"
+    );
+    indexed
+}
+
+// The C6 index-coverage guard: `key_column_index_coverage` must report whether
+// a `key_col IN (...)` scan will use the persisted BTREE or silently full-scan.
+#[tokio::test]
+async fn key_column_index_coverage_detects_btree_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snap = snapshot_main(&db).await.unwrap();
+
+    // The shared fixture explicitly reconciles indexes after loading, so the
+    // edge `src` BTREE is present and fully covered here.
+    let edge_ds = snap.open_dataset("edge:Knows").await.unwrap();
+    let src_cov = edge_ds.index_coverage("__src").await.unwrap();
+    assert_eq!(src_cov, IndexCoverage::Indexed, "edge src is BTREE-indexed");
+
+    // A node property column with no scalar index → Degraded (the warn path).
+    let node_ds = snap.open_dataset("node:Person").await.unwrap();
+    let age_cov = node_ds.index_coverage("age").await.unwrap();
+    assert!(
+        matches!(age_cov, IndexCoverage::Degraded { .. }),
+        "non-indexed column should be Degraded, got {age_cov:?}"
+    );
+}
+
+// An edge appended after the BTREE was built lands in a new fragment that the
+// index does not cover (edge-index creation is skipped once a BTREE exists). The
+// scan is then partly a full scan, so coverage must report `Degraded` — otherwise
+// the cost chooser would price an unindexed-in-part scan as fully indexed.
+// (Results stay correct regardless — `indexed_finds_unindexed_appended_edge`.)
+#[tokio::test]
+async fn coverage_degrades_for_appended_unindexed_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // The fixture's explicit post-load `ensure_indices` covers every current
+    // Knows fragment → Indexed.
+    let snap = snapshot_main(&db).await.unwrap();
+    let edge_ds = snap.open_dataset("edge:Knows").await.unwrap();
+    assert_eq!(
+        edge_ds.index_coverage("__src").await.unwrap(),
+        IndexCoverage::Indexed,
+        "freshly-loaded edge BTREE covers all fragments"
+    );
+
+    // Append an edge → a new, unindexed fragment outside the index fragment_bitmap.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+
+    let snap2 = snapshot_main(&db).await.unwrap();
+    let edge_ds2 = snap2.open_dataset("edge:Knows").await.unwrap();
+    let cov = edge_ds2.index_coverage("__src").await.unwrap();
+    assert!(
+        matches!(cov, IndexCoverage::Degraded { .. }),
+        "appended unindexed fragment must degrade coverage, got {cov:?}"
+    );
+}
+
+#[tokio::test]
+async fn indexed_matches_csr_one_hop_same_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    // friends_of: `$p knows $f` (Person -> Person, single hop).
+    let got = both_modes(
+        &db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await;
+    assert_eq!(got, vec!["Bob", "Charlie"], "Alice knows Bob and Charlie");
+}
+
+#[tokio::test]
+async fn indexed_matches_csr_undirected_one_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+"#;
+    // Bob: outgoing Bob->Diana, incoming Alice->Bob — undirected sees both.
+    let got = both_modes(&db, queries, "connected", &params(&[("$name", "Bob")])).await;
+    assert_eq!(got, vec!["Alice", "Diana"], "out ∪ in neighbors of Bob");
+}
+
+/// The undirected cost fix (review follow-up): coverage is priced by the
+/// WORST of the two probed columns. This test degrades coverage via a
+/// mutation-appended unindexed fragment and asserts undirected results stay
+/// correct and mode-equivalent regardless of which path the cost model picks.
+#[tokio::test]
+async fn indexed_matches_csr_undirected_under_degraded_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // Append an edge through the mutation path — an unindexed fragment that
+    // degrades BTREE coverage on the Knows table (pinned by the coverage test
+    // above). Diana->Alice also gives Alice a NEW incoming edge that only the
+    // undirected form can see from Alice's side.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Diana"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+"#;
+    // Alice: outgoing Bob, Charlie; incoming Diana (the fresh unindexed edge).
+    let got = both_modes(&db, queries, "connected", &params(&[("$name", "Alice")])).await;
+    assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
+}
+
+#[tokio::test]
+async fn indexed_matches_csr_multi_hop_same_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let queries = r#"
+query reach($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{1,2} $f
+    }
+    return { $f.name }
+}
+"#;
+    // Alice -> Bob, Charlie (1 hop); Bob -> Diana (2 hops).
+    let got = both_modes(&db, queries, "reach", &params(&[("$name", "Alice")])).await;
+    assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
+}
+
+#[tokio::test]
+async fn indexed_matches_csr_cross_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let queries = r#"
+query employer($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt $c
+    }
+    return { $c.name }
+}
+"#;
+    let got = both_modes(&db, queries, "employer", &params(&[("$name", "Alice")])).await;
+    assert_eq!(got, vec!["Acme"], "Alice works at Acme");
+}
+
+#[tokio::test]
+async fn indexed_matches_csr_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    // Diana has no outgoing Knows edges → empty in both modes.
+    let got = both_modes(
+        &db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Diana")]),
+    )
+    .await;
+    assert!(got.is_empty(), "Diana knows no one");
+}
+
+#[tokio::test]
+async fn indexed_finds_unindexed_appended_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // Append Alice -> Diana AFTER the initial load. `ensure_indices`' existence
+    // guard means the src/dst BTREE built on the first load does NOT cover this
+    // new fragment. The indexed path must still find it via Lance's
+    // unindexed-fragment scan (fast_search=false default), so partial index
+    // coverage never silently drops rows.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+
+    let indexed_db = with_traversal(&db, Traversal::Indexed);
+    let got = first_column_sorted(
+        &query_main(
+            &indexed_db,
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(
+        got,
+        vec!["Bob", "Charlie", "Diana"],
+        "indexed traversal must see the freshly-appended, unindexed edge"
+    );
+}
+
+// Regression: a node `id` is unique only WITHIN a type, so a `Person` and a
+// `Company` can share an id string. A path over a cross-type edge (`worksAt`,
+// Person -> Company) stops after one hop — a Company is not a `worksAt`
+// source — so `worksAt{1,2}` is refused at type check (T5) instead of running.
+// Before that refusal the engine capped such a range at one hop, and before
+// the cap the indexed path's single string interner de-interned the hop-1
+// Company id back to the colliding Person id and ran a hop-2
+// `worksAt src IN (...)` scan that matched that same-string Person's edges,
+// emitting a spurious second-hop company the CSR path never produces. The
+// one-hop form still runs over the colliding ids: `both_modes`
+// (csr == indexed == auto) plus the golden assert catch both a divergence and
+// an over-emitting shared bug.
+#[tokio::test]
+async fn cross_type_id_collision_does_not_bleed_into_second_hop() {
+    const SCHEMA: &str = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company
+"#;
+    // `shared` is BOTH a Person id and a Company id. alice worksAt the Company
+    // `shared`; the Person `shared` worksAt the Company `other`.
+    const DATA: &str = r#"{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"shared"}}
+{"type":"Company","data":{"name":"shared"}}
+{"type":"Company","data":{"name":"other"}}
+{"edge":"WorksAt","from":"alice","to":"shared"}
+{"edge":"WorksAt","from":"shared","to":"other"}"#;
+    const QUERY: &str = r#"
+query reach($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt $c
+    }
+    return { $c.name }
+}
+
+query reach_two($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt{1,2} $c
+    }
+    return { $c.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    db.load_jsonl(DATA, LoadMode::Overwrite).await.unwrap();
+
+    let got = both_modes(&db, QUERY, "reach", &params(&[("$name", "alice")])).await;
+    assert_eq!(
+        got,
+        vec!["shared"],
+        "cross-type worksAt must return only the one-hop company; another \
+         result means the id-string collision bled across types"
+    );
+    let error = query_main(&db, QUERY, "reach_two", &params(&[("$name", "alice")]))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "T5: multi-hop traversal `worksAt{1,2}` requires the same node type at both endpoints"
+        ),
+        "{error}"
+    );
+}
+
+const REACH_5: &str = r#"
+query reach($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{1,5} $f
+    }
+    return { $f.name }
+}
+"#;
+
+// A directed 3-cycle a->b->c->a, traversed with a hop ceiling (5) ABOVE the cycle
+// length. Variable-length traversal must terminate and dedup (the source is
+// seeded into `visited`, so the c->a back-edge does not re-emit a). Uses a
+// bounded range deliberately: an unbounded `{1,}` is a typecheck error, not a
+// runtime path. `both_modes` also confirms indexed == csr on the cycle.
+#[tokio::test]
+async fn variable_hops_terminate_and_dedup_on_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"c"}
+{"edge":"Knows","from":"c","to":"a"}"#;
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
+
+    let got = both_modes(&db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
+    // and is not re-emitted. No infinite loop, each node at most once.
+    assert_eq!(got, vec!["b", "c"]);
+}
+
+// Self-loop a->a plus a->b: the start node's own self-edge is a hop-1
+// destination, so the reach set is {a, b} (distance semantics; the start node
+// is never re-reached through a cycle); traversal must terminate. Cycle
+// pruning: see variable_hops_terminate_and_dedup_on_cycle.
+#[tokio::test]
+async fn variable_hops_handle_self_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"a"}
+{"edge":"Knows","from":"a","to":"b"}"#;
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
+
+    let got = both_modes(&db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    // a via its own self-edge (1 hop), b (1 hop). No infinite loop.
+    assert_eq!(got, vec!["a", "b"]);
+}
+
+// Self-loop on a LATER node (b->b) under a range starting above 1: b is one
+// hop from a, so `{2,2}` returns only c. Before the fix the self-edge emitted
+// b again at hop 2. `{1,5}` is the control: a range starting at 1 already
+// deduped the re-emission through `seen_dst`, so its answer is unchanged.
+#[tokio::test]
+async fn pinned_range_does_not_re_reach_a_self_looped_node() {
+    const EXACTLY_2: &str = r#"
+query reach2($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{2,2} $f
+    }
+    return { $f.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"b"}
+{"edge":"Knows","from":"b","to":"c"}"#;
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
+
+    let p = params(&[("$name", "a")]);
+    let exactly_two = both_modes(&db, EXACTLY_2, "reach2", &p).await;
+    assert_eq!(
+        exactly_two,
+        vec!["c"],
+        "b is one hop away; its self-loop must not re-reach it at hop 2"
+    );
+    let ranged = both_modes(&db, REACH_5, "reach", &p).await;
+    assert_eq!(ranged, vec!["b", "c"], "a range starting at 1 is unchanged");
+}
+
+// A stored self-loop must appear in every single-hop spelling — directed,
+// undirected (docs/user/queries/index.md: set semantics for endpoint pairs,
+// so the loop appears once), and bound-edge — and all three must agree.
+#[tokio::test]
+async fn single_hop_self_loop_is_emitted_by_all_spellings() {
+    const QUERIES: &str = r#"
+query friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+query friends_undirected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+query friends_bound($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"a"}
+{"edge":"Knows","from":"a","to":"b"}"#;
+    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    db.load_jsonl(data, LoadMode::Overwrite).await.unwrap();
+
+    let p = params(&[("$name", "a")]);
+    let directed = both_modes(&db, QUERIES, "friends", &p).await;
+    assert_eq!(
+        directed,
+        vec!["a", "b"],
+        "directed single hop emits the self-loop"
+    );
+
+    let undirected = both_modes(&db, QUERIES, "friends_undirected", &p).await;
+    // The self-loop row is reachable through both the out and in probes; set
+    // semantics emit it once.
+    assert_eq!(
+        undirected,
+        vec!["a", "b"],
+        "undirected emits the self-loop once"
+    );
+
+    // Auto mode only: an edge binding dispatches to execute_expand_bound
+    // before any mode logic, so forcing csr/indexed does not apply.
+    let bound = sorted_names(&db, QUERIES, "friends_bound", &p).await;
+    assert_eq!(
+        bound,
+        vec!["a", "b"],
+        "bound-edge agrees with the other spellings"
+    );
+}

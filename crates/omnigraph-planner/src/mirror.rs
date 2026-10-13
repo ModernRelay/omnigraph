@@ -4,8 +4,8 @@
 //! of it. The mirror is the serialized form and the comparable form of a
 //! plan; nothing executes from it directly.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::ir::{
@@ -23,7 +23,9 @@ use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
-use crate::logical::{ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanSpec};
+use crate::logical::{
+    ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanAccess, ScanSpec,
+};
 use crate::operation::TableRef;
 use crate::physical::{
     Assumptions, Estimate, Hop, HydratedBinding, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
@@ -874,6 +876,8 @@ impl From<PrefilterMirror> for Prefilter {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanSpecMirror {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<ScanAccess>,
     pub side: SideId,
     pub table: TableRef,
     pub version: Option<u64>,
@@ -889,6 +893,7 @@ pub struct ScanSpecMirror {
 impl From<&ScanSpec> for ScanSpecMirror {
     fn from(spec: &ScanSpec) -> Self {
         Self {
+            access: spec.access.clone(),
             side: spec.side,
             table: spec.table.clone(),
             version: spec.version,
@@ -907,6 +912,7 @@ impl TryFrom<ScanSpecMirror> for ScanSpec {
 
     fn try_from(mirror: ScanSpecMirror) -> Result<Self, PlanError> {
         Ok(Self {
+            access: mirror.access,
             side: mirror.side,
             table: mirror.table,
             version: mirror.version,
@@ -1368,6 +1374,7 @@ pub enum ExprMirror {
     },
     Aggregate {
         func: AggFuncMirror,
+        distinct: bool,
         arg: Box<ExprMirror>,
         signature: AggSignature,
     },
@@ -1477,10 +1484,12 @@ impl From<&IRExpr> for ExprMirror {
             },
             IRExpr::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFuncMirror::from(*func),
+                distinct: *distinct,
                 arg: boxed(arg),
                 signature: signature.clone(),
             },
@@ -1581,10 +1590,12 @@ impl From<ExprMirror> for IRExpr {
             ExprMirror::Literal { value, ty } => Self::Literal(Literal::from(value), ty),
             ExprMirror::Aggregate {
                 func,
+                distinct,
                 arg,
                 signature,
             } => Self::Aggregate {
                 func: AggFunc::from(func),
+                distinct,
                 arg: unboxed(*arg),
                 signature,
             },
@@ -1779,7 +1790,7 @@ impl From<&StatisticSource> for StatisticSourceMirror {
         Self {
             statistic: source.statistic.clone(),
             value: source.value.clone(),
-            origin: source.origin.to_string(),
+            origin: source.origin.clone(),
         }
     }
 }
@@ -1789,25 +1800,9 @@ impl From<StatisticSourceMirror> for StatisticSource {
         Self {
             statistic: mirror.statistic,
             value: mirror.value,
-            origin: intern_origin(mirror.origin),
+            origin: mirror.origin,
         }
     }
-}
-
-/// A statistic's origin is a `&'static str` in the plan and one of a few
-/// planner words; the process keeps each distinct one it reads back once.
-fn intern_origin(origin: String) -> &'static str {
-    static ORIGINS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut origins = ORIGINS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(known) = origins.get(origin.as_str()) {
-        return known;
-    }
-    let leaked: &'static str = Box::leak(origin.into_boxed_str());
-    origins.insert(leaked);
-    leaked
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

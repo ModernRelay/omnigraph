@@ -204,7 +204,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    fn scan(&self, source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+    fn scan(&self, mut source: ScanSource, spec: &ScanSpec) -> Result<ScanExec> {
+        if let ScanSource::Table { mode, .. } = &mut source {
+            mode.scalar_index = spec
+                .access
+                .as_ref()
+                .and_then(|access| access.use_scalar_index());
+        }
         let lookup = self.lookup(spec)?;
         ScanExec::try_new(
             source,
@@ -770,16 +776,18 @@ impl Lower for Walk<'_, '_> {
         let RankFuseFields {
             arms,
             k,
-            limit,
+            limit: _,
             row_tiebreak,
         } = fields;
-        let limit = limit.ok_or_else(|| {
-            OmniError::manifest("rrf() ordering requires a limit clause".to_string())
-        })?;
         let k = resolve_rrf_k(k, self.lowering.params())?;
         let id_column = format!(
             "{}.{}",
             arms[0].binding, self.lowering.catalog.system_columns.id
+        );
+        let fused_score = format!(
+            "{}.{}",
+            arms[0].binding,
+            omnigraph_compiler::query::ast::RRF_COLUMN
         );
         let order = |arm: &RankArm| {
             let (property, descending) = arm.kind.score();
@@ -791,8 +799,9 @@ impl Lower for Walk<'_, '_> {
         let fuse = RankFuseExec::new(
             primary,
             secondary,
-            RrfMode { k, limit },
+            RrfMode { k },
             id_column,
+            fused_score,
             [order(&arms[0]), order(&arms[1])],
             row_tiebreak
                 .iter()
@@ -887,6 +896,7 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::Aggregate {
                         func,
+                        distinct,
                         arg,
                         signature,
                     },
@@ -950,6 +960,7 @@ impl Lower for Walk<'_, '_> {
                     let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
                         .schema(Arc::clone(&input_schema))
                         .alias(name)
+                        .with_distinct(*distinct)
                         .build()
                         .map(Arc::new)
                         .map_err(OmniError::datafusion)?;

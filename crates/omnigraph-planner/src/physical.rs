@@ -343,7 +343,7 @@ impl Estimate {
 pub struct StatisticSource {
     pub statistic: String,
     pub value: String,
-    pub origin: &'static str,
+    pub origin: String,
 }
 
 /// The properties a physical node declares: derived after selection,
@@ -538,8 +538,8 @@ pub enum PhysicalNode {
         outer_var: String,
     },
     /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
-    /// ranked scan, fused by reciprocal rank; `k` as the query wrote it (`None`
-    /// the default), `limit` the fused rows, `prefilter` feeds the `bm25` arms.
+    /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
+    /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
     RankFuse {
         arms: [RankArm; 2],
         k: Option<IRExpr>,
@@ -889,6 +889,9 @@ impl PhysicalPlan {
                 ranked,
             } => {
                 let mut value = scan_json("Scan", spec);
+                if let Some(access) = &spec.access {
+                    access.explain(&mut value);
+                }
                 if let ScanInput::Dependent { .. } = source {
                     value["id_restriction"] = json!("input");
                     value["access"] = json!(AccessPath::IdLookup);
@@ -1032,9 +1035,10 @@ impl PhysicalPlan {
                 "typed_exprs": crate::typed::returns(return_exprs),
                 "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
                     match (&projection.expr, spec) {
-                        (IRExpr::Aggregate { func, signature, .. }, Some(spec)) => json!({
+                        (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
                             "column": crate::optimizer::result_column(projection),
                             "func": func.to_string(),
+                            "distinct": distinct,
                             "input": signature.arg.spelling(),
                             "accumulator": spec.accumulator,
                             "overflow": spec.overflow,

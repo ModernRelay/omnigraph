@@ -1237,17 +1237,20 @@ pub struct MergeWriteProbes {
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
     /// Blob payload values a rewrite consumed while rebuilding descriptor rows
-    /// into a logical source (a keyed write or a schema rewrite): one per
-    /// managed value, counted after the batched managed read returned it and
-    /// its length matched, and one per external object read. Zero does not
-    /// prove that no payload I/O ran: `blob_managed_batch_read_calls` counts
-    /// the managed reads issued, before any byte arrives.
+    /// into a logical source (a keyed write or a branch merge), or that
+    /// export, a change image or an entity read rendered: one per managed
+    /// value, counted after the batched managed read returned it and its
+    /// length matched, and one per external object read (rewrites only).
+    /// Zero does not prove that no payload I/O ran:
+    /// `blob_managed_batch_read_calls` counts the managed reads issued, before
+    /// any byte arrives.
     pub blob_payload_read_calls: Arc<AtomicU64>,
-    /// Batched managed Blob reads (`Dataset::read_blobs`) a materializing
-    /// rewrite issued: one per rewritten batch column holding a managed cell,
-    /// however many managed values it carries, recorded before the read is
-    /// issued. Distinguishes the batched read from one read per value, which
-    /// `blob_payload_read_calls` cannot.
+    /// Batched managed Blob reads (`Dataset::read_blobs`) issued: one per
+    /// batch column holding a managed cell, however many managed values it
+    /// carries, recorded before the read is issued. A materializing rewrite,
+    /// export and the change-feed baseline read per batch; a change image and
+    /// an entity read per row. Distinguishes the batched read from one read
+    /// per value, which `blob_payload_read_calls` cannot.
     pub blob_managed_batch_read_calls: Arc<AtomicU64>,
     /// Compaction tasks executed over a table with a Blob field.
     pub compaction_blob_batch_calls: Arc<AtomicU64>,
@@ -1590,7 +1593,7 @@ pub fn record_mutation_table_open() {
     });
 }
 
-/// Record one Blob payload value a rewrite consumed: a managed value after the
+/// Record one Blob payload value a reader consumed: a managed value after the
 /// batched managed read returned it, or an external object read. It trails the
 /// managed I/O, which `record_blob_managed_batch_read` marks. No-op in
 /// production (no probes installed).
@@ -1600,8 +1603,8 @@ pub fn record_blob_payload_read() {
     });
 }
 
-/// Record one batched managed Blob read issued by a materializing rewrite.
-/// No-op in production (no probes installed).
+/// Record one batched managed Blob read issued. No-op in production (no
+/// probes installed).
 pub fn record_blob_managed_batch_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_managed_batch_read_calls
