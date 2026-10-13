@@ -242,9 +242,11 @@ recurses across Person and Organization with one shortest-distance search.
 
 Refusals:
 
-- `bm25` on a binding whose set has more than one member is refused. Lance
-  computes BM25 statistics per index, so scores are not comparable across
-  tables.
+- `bm25` on a binding whose set has more than one member is refused in
+  phases 1 and 2. By default Lance builds BM25 statistics from one dataset's
+  inverted index, so scores from two member tables are not comparable. Phase 3
+  admits it with a shared corpus scorer (see Search under Planning and
+  execution).
 - `search`, `fuzzy` and `match_text` produce no score; they are membership
   filters. They run per arm when every member has an inverted index on the
   property, and are refused, naming the member, otherwise.
@@ -314,7 +316,11 @@ query touch($slug: String) {
   resource bounds. The table-handle cache holds at least every table in the
   accepted catalog. Today it holds 64, so a 75-member interface evicts its own
   handles: in the prototype a warm repeat of a 75-member keyed lookup reopened
-  55 to 61 tables, against none at 60 members.
+  55 to 61 tables, against none at 60 members. Each reopen costs at least one
+  object-store HEAD on S3: OmniGraph opens a pinned version without passing
+  the manifest size, so Lance resolves it before consulting its manifest
+  cache (`lance` `dataset/builder.rs` `resolve_version_location`). Passing
+  the size recorded in `__manifest` would make a warm reopen free as well.
 - Every schema migration in this RFC is a schema apply, and schema apply
   refuses while any branch other than `main` exists. A graph that keeps
   long-lived branches lands them before widening an endpoint.
@@ -373,7 +379,12 @@ identity-derived path. Edge tables already store each endpoint as one packed
 polymorphic edge table has the same columns, the same indexes and the same
 row shape as a concrete one. The scalar index on each endpoint column serves
 `=`, `IN` and the range predicate that selects one endpoint type,
-`packed BETWEEN type << 48 AND ((type << 48) | (2^48 - 1))`.
+`packed BETWEEN type << 48 AND ((type << 48) | (2^48 - 1))`. That index is a
+BTREE. A bitmap index also answers these predicates, but it loads every
+distinct key when opened (`lance-index` `scalar/bitmap.rs`), and packed
+endpoints are nearly unique. Packed filters are built from `u64` literals: a
+value that passes through `i64` loses the index silently, because Lance then
+compares through a cast instead of probing.
 
 The identity upgrade publishes new table versions for the current snapshot.
 Retained pre-upgrade versions still carry string endpoints; their decoding,
@@ -507,6 +518,17 @@ upgraded current format, and historical abstract bindings remain refused.
 - **Hydration.** `id_lookup` groups each slice's references by type and probes
   each member table. `hash_join` builds per member type, or on the packed
   key.
+- **Search across members (phase 3).** `bm25` over an abstract binding builds
+  one corpus scorer from every member's inverted index with Lance's
+  `build_global_bm25_scorer`, which sums document counts, token totals and
+  per-term document frequencies over any list of index handles. Each arm's
+  full-text plan takes that scorer through `with_base_scorer`, so every arm
+  scores against the same statistics and scores merge like distances. The
+  full-text index is declared on the interface property, so every member
+  shares its analyzer. The scorer must cover every query token, including
+  fuzzy expansions. Lance's scanner does not expose the hook, so the engine
+  builds those plans itself. This replaces a derived projection for
+  cross-type full-text ranking; the API is verified in source, not yet run.
 - **Search.** `nearest` runs per arm with `k` and merges by `_distance`. The
   merge preserves each arm's accuracy, because the global top k is a subset
   of the union of per-arm top-k results. The overfetch ladder runs per arm.
@@ -755,7 +777,8 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 | Join a union's property types over its concrete closure | Matches the alternation rule literally, but adding an implementor to an interface inside a union could change a stored query's result schema. Joining declared member types keeps result schemas independent of membership. |
 | Refuse a type set that includes a member hidden from the actor (`policy_denied_member`) | Keeps results whole, but discloses that the hidden member exists, and the only escape names the hidden type. Filtering over the actor's schema view with `view.restricted` gives the same completeness signal without disclosure. |
 | Expand an interface feed filter once, when the cursor is created | Needs no new refusal, but freezes membership: a live view misses every member added later. |
-| Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion over N arms keyed by packed reference is plausible later; today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. |
+| Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion ignores absolute relevance, and today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. A shared corpus scorer gives comparable scores directly. |
+| A derived interface projection for cross-type full-text search | True global BM25, but a maintained copy of every member's text. Lance 11 already accepts injected corpus statistics, so the same scores come from the members' own indexes. |
 
 Prior art. Gel (EdgeDB) keeps a table per concrete type and compiles abstract
 reads to a per-query `UNION ALL`, with `__type__` as a per-table constant.
@@ -792,6 +815,26 @@ The first draft's probes of a detached `Operation::Merge` adding a nullable
 column, and of an Overwrite changing row ids and dropping indexes, supported a
 storage design this revision no longer carries and are not evidence for the
 integer-identity upgrade.
+
+Lance 11.0.0 behavior this revision relies on was rechecked on 2026-10-12,
+by a probe on the prototype branch (`tests/lance_identity_probes.rs`) and in
+the pinned source:
+
+- On a packed `UInt64` column, BTREE and bitmap indexes both serve a type
+  range (`>=`/`<=` and `BETWEEN`), `=` and `IN`, with correct rows, including
+  packed values above 2^63 (type id 40000). The parser turns a bounded pair
+  into `SargableQuery::Range` (`lance-index` `scalar/expression.rs`,
+  `maybe_range`).
+- Row addresses are `(fragment << 32) | offset` per dataset, and stable row
+  ids also start at 0 in every dataset; two tables produced the same first
+  addresses. Neither is a key across member tables.
+- Each dataset plans index use from its own index metadata, and a table
+  without the index falls back to a filtered scan.
+- Metadata-only column addition: a staged `Operation::Merge` must keep every
+  original fragment and row count, existing field ids keep their paths, new
+  ids exceed `max_field_id`, and fragments without the field read null.
+- `merge_insert` probes a key-column index with `IsIn` when one exists, which
+  matches the one data read measured for a keyed insert today.
 
 ### Prototype
 
@@ -999,11 +1042,11 @@ graph.
    - Interface-scope `@unique` behind `interface-unique`, including full
      prospective-universe validation on schema changes. Earlier phases refuse
      its declarations and feature rather than accept unenforced constraints.
+   - `bm25` across members with a shared corpus scorer.
 5. **Phase 4, extensions.**
    - Covariant interface properties (enum refining String, non-null refining
      nullable; physically identical).
    - A top type (`$x: *`, `-> *`) that requires an anchor.
-   - Derived interface projections for cross-type full-text search.
    - Downcast access `$x[Person].email`.
 
 `implementation` moves to `in-progress` with phase 0 and to `partial` when
