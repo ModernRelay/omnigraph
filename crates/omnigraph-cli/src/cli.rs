@@ -424,8 +424,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
-    /// Print the CLI version
-    Version,
+    /// Print the CLI version, the HTTP contract it speaks, and the storage
+    /// formats it writes and serves.
+    Version {
+        /// Emit the same facts as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

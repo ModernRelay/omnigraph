@@ -301,7 +301,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Logout { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
-        | Command::Version => Plane::Session,
+        | Command::Version { .. } => Plane::Session,
     }
 }
 
@@ -309,7 +309,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
 /// families so messages read `schema plan`, `queries validate`, etc.).
 pub(crate) fn command_label(cmd: &Command) -> &'static str {
     match cmd {
-        Command::Version => "version",
+        Command::Version { .. } => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
