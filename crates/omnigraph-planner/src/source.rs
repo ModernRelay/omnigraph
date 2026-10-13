@@ -265,6 +265,56 @@ pub trait PlanSource {
     fn gate_policy(&self) -> GatePolicy {
         GatePolicy::default()
     }
+
+    /// How far the full-text index of `property` covers the pinned table
+    /// `type_key` names. The default claims no coverage, the answer under
+    /// which every plan stays correct.
+    fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
+        FullTextCoverage::Absent
+    }
+}
+
+/// How far a property's full-text index covers the pinned dataset's
+/// fragments. Only full coverage makes a BM25 score independent of a filter
+/// applied before scoring: Lance scores the unindexed fragments flat, from
+/// statistics over the rows the filter admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullTextCoverage {
+    /// Every fragment of the pinned version is in a full-text segment.
+    Full,
+    /// A full-text index exists; some fragment is not in it.
+    Partial,
+    /// The property has no full-text index.
+    Absent,
+}
+
+impl FullTextCoverage {
+    /// The coverage the index facts of one table establish for `column`:
+    /// `Absent` with no index on it, `Full` only when it has a full-text
+    /// index and every full-text index on it has known coverage of every
+    /// current fragment, `Partial` otherwise. An index of unknown kind or
+    /// unknown coverage on the column never counts as full.
+    pub fn of_facts(facts: &[IndexFact], column: &str) -> Self {
+        let on_column: Vec<&IndexFact> =
+            facts.iter().filter(|fact| fact.column == column).collect();
+        let full_text = on_column
+            .iter()
+            .any(|fact| fact.kind == IndexKind::Inverted);
+        let unknown = on_column.iter().any(|fact| fact.kind == IndexKind::Unknown);
+        if !full_text {
+            return if unknown { Self::Partial } else { Self::Absent };
+        }
+        let full = !unknown
+            && on_column
+                .iter()
+                .filter(|fact| fact.kind == IndexKind::Inverted)
+                .all(|fact| {
+                    fact.coverage
+                        .is_some_and(|coverage| coverage.covered == coverage.total)
+                });
+        if full { Self::Full } else { Self::Partial }
+    }
 }
 
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
@@ -283,9 +333,29 @@ pub struct MemorySource {
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
+    full_text: HashMap<(String, String), FullTextCoverage>,
+    /// When set, a key's canonical id renders as `id:<value>`, a parameter
+    /// resolved from these values.
+    canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
 }
 
 impl MemorySource {
+    pub fn with_full_text_coverage(
+        mut self,
+        type_key: &str,
+        property: &str,
+        coverage: FullTextCoverage,
+    ) -> Self {
+        self.full_text
+            .insert((type_key.to_string(), property.to_string()), coverage);
+        self
+    }
+
+    pub fn with_canonical_key_ids(mut self, params: omnigraph_compiler::ir::ParamMap) -> Self {
+        self.canonical_keys = Some(params);
+        self
+    }
+
     pub fn with_index_facts(mut self, dataset_key: &str, facts: Vec<IndexFact>) -> Self {
         self.index_facts.insert(dataset_key.to_string(), facts);
         self
@@ -369,6 +439,25 @@ impl MemorySource {
 }
 
 impl PlanSource for MemorySource {
+    fn canonical_key_id(
+        &self,
+        _type_key: &str,
+        value: &IRExpr,
+    ) -> Result<Option<String>, PlanError> {
+        let Some(params) = &self.canonical_keys else {
+            return Ok(None);
+        };
+        let literal = match value {
+            IRExpr::Literal(literal, _) => Some(literal),
+            IRExpr::Param(name, _) => params.get(name),
+            _ => None,
+        };
+        Ok(match literal {
+            Some(omnigraph_compiler::query::ast::Literal::String(key)) => Some(format!("id:{key}")),
+            _ => None,
+        })
+    }
+
     fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
         self.index_facts
             .get(dataset_key)
@@ -435,5 +524,12 @@ impl PlanSource for MemorySource {
 
     fn query_memory_pool_bytes(&self) -> u64 {
         self.query_memory_pool_bytes
+    }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        self.full_text
+            .get(&(type_key.to_string(), property.to_string()))
+            .copied()
+            .unwrap_or(FullTextCoverage::Absent)
     }
 }

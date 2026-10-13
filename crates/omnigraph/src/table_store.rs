@@ -70,8 +70,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, is_untrained_full_text, user_indices_for_column, validate_full_text_demand,
-    validate_full_text_scan,
+    is_full_text_index, is_untrained_full_text, validate_full_text_demand, validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -5287,44 +5286,6 @@ impl TableStore {
 
     pub async fn has_fts_postings(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_fts_postings_on(ds, column).await
-    }
-
-    /// Metadata-only check (no data IO) of whether the FTS (inverted) index
-    /// entries on `column` together cover EVERY current fragment of `ds`.
-    /// The FTS twin of `dataset_index::key_column_index_coverage`, consumed as a
-    /// correctness fence by the rrf prefilter gate: rows in fragments no
-    /// entry covers are scored by a filter-dependent batch-derived scorer
-    /// instead of the index-global BM25 statistics (lance
-    /// `inverted/index.rs`), so a prefilter mask would change their scores
-    /// and the gate's two plans would stop being answer-identical.
-    /// Coverage is the UNION across same-column entries: index optimization
-    /// creates delta entries each covering a disjoint fragment subset, and
-    /// demanding one all-covering entry would permanently disable the
-    /// prefilter plan on exactly the append + optimize maintenance schedule
-    /// production tables follow. `false` is always safe — the gate then
-    /// runs the postfilter plan — so every unprovable case (no FTS index,
-    /// an entry without a fragment bitmap) contributes nothing.
-    pub(crate) async fn fts_covers_all_fragments(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = user_indices_for_column(ds, column).await?;
-        let fts_bitmaps: Vec<_> = indices
-            .iter()
-            .filter(|index| {
-                index
-                    .index_details
-                    .as_ref()
-                    .map(|details| IndexDetails(details.clone()).supports_fts())
-                    .unwrap_or(false)
-            })
-            .filter_map(|index| index.fragment_bitmap.as_ref())
-            .collect();
-        if fts_bitmaps.is_empty() {
-            return Ok(false);
-        }
-        Ok(ds.fragments().iter().all(|f| {
-            fts_bitmaps
-                .iter()
-                .any(|bitmap| bitmap.contains(f.id as u32))
-        }))
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {

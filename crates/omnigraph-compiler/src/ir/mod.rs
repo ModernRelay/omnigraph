@@ -5,6 +5,8 @@ pub(crate) mod lower;
 pub mod untyped;
 pub(crate) mod validate;
 
+pub use lower::is_fresh_variable;
+
 use std::collections::HashMap;
 
 use crate::error::{CompilerError, Result};
@@ -496,6 +498,7 @@ impl IRExpr {
             match expr {
                 Self::Aggregate {
                     func,
+                    distinct: _,
                     arg,
                     signature,
                 } => {
@@ -825,7 +828,18 @@ impl std::fmt::Display for IRExpr {
             IRExpr::Param(name, _) if name == NOW_PARAM_NAME => f.write_str("now()"),
             IRExpr::Param(name, _) => write!(f, "${name}"),
             IRExpr::Literal(literal, _) => write!(f, "{literal}"),
-            IRExpr::Aggregate { func, arg, .. } => write!(f, "{func}({arg})"),
+            IRExpr::Aggregate {
+                func,
+                distinct: true,
+                arg,
+                ..
+            } => write!(f, "{func}(distinct {arg})"),
+            IRExpr::Aggregate {
+                func,
+                distinct: false,
+                arg,
+                ..
+            } => write!(f, "{func}({arg})"),
             IRExpr::AliasRef(alias, _) => f.write_str(alias),
         }
     }
@@ -880,6 +894,7 @@ mod render_tests {
         let arg_type = ExprType::from_prop(&PropType::scalar(crate::types::ScalarType::I32, true));
         let mut expression = IRExpr::Aggregate {
             func: AggFunc::Sum,
+            distinct: false,
             arg: Box::new(IRExpr::Param("amount".into(), arg_type.clone())),
             signature: AggSignature {
                 arg: arg_type,
@@ -904,6 +919,7 @@ mod render_tests {
 
         let expression = IRExpr::Aggregate {
             func: AggFunc::Count,
+            distinct: false,
             arg: Box::new(IRExpr::Variable(
                 "p".into(),
                 ExprType::Node {
@@ -1068,6 +1084,7 @@ mod render_tests {
         );
         let count = IRExpr::Aggregate {
             func: AggFunc::Count,
+            distinct: false,
             arg: Box::new(IRExpr::Variable(
                 "f".to_string(),
                 ExprType::Node {
@@ -1418,6 +1435,7 @@ pub enum IRExpr {
     Literal(Literal, ExprType),
     Aggregate {
         func: AggFunc,
+        distinct: bool,
         arg: Box<IRExpr>,
         signature: AggSignature,
     },

@@ -4,8 +4,9 @@ use super::{
 
 impl QueryIR {
     /// The read representation accepted by the frozen reference executor.
-    /// `distinct` is not carried: the frozen format predates it, and GQT
-    /// refuses `--- expect same as v1` on a `return distinct` step.
+    /// Neither `distinct` is carried: the frozen format predates both, and GQT
+    /// refuses `--- expect same as v1` on a `return distinct` or a
+    /// `count(distinct …)` step.
     pub fn erase(&self) -> untyped::QueryIR {
         let Self {
             name,
@@ -199,6 +200,7 @@ impl IRExpr {
             Self::Literal(literal, _) => untyped::IRExpr::Literal(literal.clone()),
             Self::Aggregate {
                 func,
+                distinct: _,
                 arg,
                 signature: _,
             } => untyped::IRExpr::Aggregate {
@@ -411,6 +413,7 @@ mod tests {
             cases.push((
                 IRExpr::Aggregate {
                     func,
+                    distinct: false,
                     arg: Box::new(IRExpr::PropAccess {
                         variable: "document".into(),
                         property: "amount".into(),

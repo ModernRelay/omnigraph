@@ -10,8 +10,8 @@ use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 use omnigraph_planner::{
-    BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan, RankKind, RankScope,
-    TableRef, ValueTable, plan_query,
+    BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
+    RankKind, RankScope, TableRef, ValueTable, plan_query,
 };
 
 use crate::fixture_bounds;
@@ -122,17 +122,35 @@ fn round_trip(bound: &BoundPlan) -> BoundPlan {
 
 #[test]
 fn saved_plan_version_refuses_both_legacy_and_future_readers() {
+    let mut counted = query(prop("d", "slug"));
+    counted.order_by.clear();
+    counted.limit = None;
+    counted.return_exprs = vec![IRProjection {
+        expr: IRExpr::Aggregate {
+            func: omnigraph_compiler::query::ast::AggFunc::Count,
+            distinct: true,
+            arg: Box::new(prop("d", "slug")),
+            signature: omnigraph_compiler::AggSignature {
+                arg: value_type(ScalarType::String, true),
+                result: value_type(ScalarType::I64, true),
+            },
+        },
+        alias: Some("names".into()),
+        column: "names".into(),
+        ty: value_type(ScalarType::I64, true),
+    }];
     let bound = BoundPlan {
-        plan: plan(prop("d", "slug")),
+        plan: futures::executor::block_on(plan_query(&counted, &source(), &fixture_bounds::BOUNDS))
+            .unwrap(),
         values: Default::default(),
     };
     let encoded = serde_json::to_value(&bound).unwrap();
-    assert_eq!(encoded["bound_plan_version"], 6);
+    assert_eq!(encoded["bound_plan_version"], BOUND_PLAN_VERSION);
     assert!(encoded.get("plan").is_none());
     assert!(encoded["body"]["plan"].is_object());
     assert_eq!(round_trip(&bound), bound);
 
-    for version in [1, 2, 3, 4, 5] {
+    for version in [1, 2, 3, 4, 5, 6] {
         let mut older = encoded.clone();
         older["bound_plan_version"] = serde_json::json!(version);
         assert!(
@@ -145,13 +163,34 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     let legacy = encoded["body"].clone();
     let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
     assert!(error.to_string().contains("regenerate"), "{error}");
-    let mut future = encoded.clone();
-    future["bound_plan_version"] = serde_json::json!(7);
-    let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
+    for version in [BOUND_PLAN_VERSION - 1, BOUND_PLAN_VERSION + 1] {
+        let mut other = encoded.clone();
+        other["bound_plan_version"] = serde_json::json!(version);
+        let error = serde_json::from_value::<BoundPlan>(other).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("unsupported bound plan version {version}")),
+            "{error}"
+        );
+    }
+    let mut missing_distinct = encoded.clone();
+    let aggregate = missing_distinct["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "Aggregate")
+        .unwrap();
+    assert_eq!(
+        aggregate["return_exprs"][0]["expr"]
+            .as_object_mut()
+            .unwrap()
+            .remove("distinct"),
+        Some(serde_json::json!(true))
+    );
+    let error = serde_json::from_value::<BoundPlan>(missing_distinct).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("unsupported bound plan version 7"),
+        error.to_string().contains("missing field `distinct`"),
         "{error}"
     );
 
