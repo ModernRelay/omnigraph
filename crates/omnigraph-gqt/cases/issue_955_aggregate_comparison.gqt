@@ -59,6 +59,9 @@ query has_members() {
 --- expect shape
 has_member: Bool?
 
+--- expect plan
+validation scope invariants_only
+
 --- query
 query no_members_is_false() {
     match {
@@ -260,3 +263,118 @@ query comparison_order_key_not_returned() {
 }
 
 --- expect error: T42:
+
+--- query
+query composed_distinct_counts() {
+    match {
+        $f: Forum { slug: "f1" }
+        $f hasMember $p
+        $copy: Person
+    }
+    return {
+        count(distinct $p) > 0 as has_member,
+        count(distinct $p) = 2 as two_members,
+        count($p) = 6 as repeated_rows,
+        count(distinct $p.age) = 1 as one_known_age,
+        count($p.age) = 3 as repeated_ages
+    }
+}
+--- expect unordered
+{"has_member":true,"two_members":true,"repeated_rows":true,"one_known_age":true,"repeated_ages":true}
+--- expect shape
+has_member: Bool?
+two_members: Bool?
+repeated_rows: Bool?
+one_known_age: Bool?
+repeated_ages: Bool?
+
+--- query
+query distinct_comparison_order_expression() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        $copy: Person
+    }
+    return {
+        $f.title as title,
+        count(distinct $p) > 1 as popular,
+        count(distinct $p) as members,
+        count($p) as visits
+    }
+    order { count(distinct $p) > 1 desc, title asc }
+    limit 1
+}
+--- expect unordered
+{"title":"graph club","popular":true,"members":2,"visits":6}
+--- expect shape
+title: String
+popular: Bool?
+members: I64?
+visits: I64?
+
+--- query
+query unprojected_group_property() {
+    match { $p: Person }
+    return { count($p) > 0 as present, $p as person }
+    order { $p.name }
+}
+--- expect error: T42:
+
+--- query
+query unprojected_plain_aggregate_property() {
+    match { $p: Person }
+    return { count($p) as total, $p as person }
+    order { $p.name }
+}
+--- expect error: T42:
+
+--- query
+query projected_group_property() {
+    match { $p: Person }
+    return { count($p) > 0 as present, $p as person, $p.name as name }
+    order { $p.name desc }
+    limit 1
+}
+--- expect unordered
+{"present":true,"person":{"@id":"cyd","slug":"cyd","name":"Cyd Vox","age":50},"name":"Cyd Vox"}
+--- expect shape
+present: Bool?
+person: Person
+name: String
+
+--- query
+query ordinary_hidden_property_still_orders() {
+    match { $p: Person }
+    return { $p.slug }
+    order { $p.name }
+    limit 1
+}
+--- expect ordered
+{"p.slug":"ann"}
+--- expect shape
+p.slug: String
+
+--- query
+query aggregate_metadata_name_still_orders() {
+    match { $p: Person }
+    return { count($p.@id), count($p) > 0 as present }
+    order { $p.@id }
+}
+--- expect unordered
+{"p.@id":3,"present":true}
+--- expect shape
+p.@id: I64
+present: Bool?
+
+--- query
+query constant_edge_type_still_orders_groups() {
+    match { $f: Forum $f $e:hasMember $p }
+    return { $f.title as title, count($p) > 0 as present }
+    order { $e.@type }
+}
+--- expect unordered
+{"title":"graph club","present":true}
+{"title":"chess","present":true}
+--- expect shape
+title: String
+present: Bool?

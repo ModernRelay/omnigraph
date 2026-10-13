@@ -866,12 +866,34 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         });
     }
 
+    let has_agg = query
+        .return_clause
+        .iter()
+        .any(|p| expr_contains_aggregate(&p.expr));
+
     // Typecheck order expressions
     let mut orders = Vec::with_capacity(query.order_clause.len());
     for (index, ord) in query.order_clause.iter().enumerate() {
         let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Return)?;
         reject_blob_read_value(&typed.ty(), &ord.expr)?;
-        bind_order_key(index, &ord.expr, &query.return_clause, &ctx, query.distinct)?;
+        let carried_meta = has_agg
+            && matches!(typed, TypedExpr::PropAccess { .. })
+            && typed.meta_field_result_key().is_some_and(|name| {
+                returns.iter().any(|item| {
+                    item.alias.is_none()
+                        && item.expr.meta_field_result_key().as_deref() == Some(name.as_str())
+                })
+            });
+        if !carried_meta {
+            bind_order_key(
+                index,
+                &ord.expr,
+                &query.return_clause,
+                &ctx,
+                query.distinct,
+                has_agg,
+            )?;
+        }
         if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
             && ord.explicit
             && !ord.descending
@@ -913,10 +935,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
 
     // T9: If any return expression is an aggregate, non-aggregate expressions
     // must be valid group-by keys (PropAccess or Variable).
-    let has_agg = query
-        .return_clause
-        .iter()
-        .any(|p| expr_contains_aggregate(&p.expr));
     if query.distinct && has_agg {
         return Err(CompilerError::typed(
             T56,
@@ -961,17 +979,24 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
-/// return list"): a property key sorts through its hidden column (none under
-/// `distinct`), the leading rank key is the search node's; others bind to return.
+/// return list"): a property key has a hidden column only on ungrouped rows;
+/// the leading rank key is the search node's; others bind to return.
 fn bind_order_key(
     index: usize,
     key: &Expr,
     return_clause: &[Projection],
     ctx: &TypeContext,
     distinct: bool,
+    aggregate: bool,
 ) -> Result<()> {
     let exempt = match key {
-        Expr::PropAccess { .. } => !distinct,
+        Expr::PropAccess { variable, property } => {
+            !distinct
+                && (!aggregate
+                    || (property == EDGE_TYPE_META
+                        && matches!(ctx.bindings.get(variable),
+                            Some(BoundVariable::Edge { type_names }) if type_names.len() == 1)))
+        }
         Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => index == 0,
         _ => false,
     };

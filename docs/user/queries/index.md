@@ -231,7 +231,7 @@ order keys must be projected values or aliases, including property keys
 For ordinary returns, explicit order is total: entity ids break ties only when
 they can change the visible order, and no id is read when every projection is a
 key. Ascending puts nulls first, descending last. `nearest(...)` requires a limit.
-Outside DISTINCT, property and system-field order keys need not be projected;
+On ungrouped, non-DISTINCT rows, property and system-field order keys need not be projected;
 other keys, except the leading search function, must be return aliases or
 expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
 

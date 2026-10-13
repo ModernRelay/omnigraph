@@ -16,6 +16,7 @@ mod budget;
 mod invariants;
 mod replay;
 mod requirements;
+mod returns;
 pub(crate) mod subset;
 
 pub use budget::{Budget, ValidationLimits};

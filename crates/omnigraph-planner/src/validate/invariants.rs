@@ -25,7 +25,7 @@ use super::budget::Budget;
 use super::requirements::{Requirements, Retrieval, Search, constant_true};
 use super::{AcceptInput, ValidationError};
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
-use crate::optimizer::{RRF_NEAREST_ARM_K, derived_order};
+use crate::optimizer::{RRF_NEAREST_ARM_K, contains_aggregate, derived_order};
 use crate::physical::{
     Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
     RankKind, RankScope, RankedAccess,
@@ -211,7 +211,7 @@ impl Requirements {
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
-        self.check_returns(plan, &top)?;
+        self.check_returns(plan, &top, budget)?;
         self.check_hydration(plan, &top)?;
         self.check_order_and_cut(plan, &top, input, budget)?;
         check_policies(plan, budget)?;
@@ -692,14 +692,31 @@ impl Requirements {
 
     /// The plan's projection is the query's `return`, item for item, and
     /// every projected score is the score of the retrieval it names.
-    fn check_returns(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+    fn check_returns(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        budget.visit(u64::try_from(self.returns.len()).unwrap_or(u64::MAX))?;
+        let split = self.returns.iter().any(|item| {
+            contains_aggregate(&item.expr) && !matches!(item.expr, IRExpr::Aggregate { .. })
+        });
         let projections = projections_of(plan, top);
-        let [returns] = projections.as_slice() else {
+        let returns = if split && projections.len() == 2 {
+            super::returns::check_split_returns(&self.returns, plan, top, budget)?;
+            &self.returns
+        } else if let [returns] = projections.as_slice()
+            && !split
+        {
+            returns
+        } else {
             return Err(ValidationError::violated(
                 "projection",
                 format!(
-                    "the plan has {} projections of the query's `return`; it needs one",
-                    projections.len()
+                    "the plan has {} projections of the query's `return`; it needs {}",
+                    projections.len(),
+                    if split { 2 } else { 1 }
                 ),
             ));
         };
@@ -835,11 +852,11 @@ impl Requirements {
             let distinct = !self
                 .returns
                 .iter()
-                .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+                .any(|projection| contains_aggregate(&projection.expr));
             let mut keys = self.order.clone();
             if self.search.is_some() || distinct {
                 for projection in &self.returns {
-                    if matches!(projection.expr, IRExpr::Aggregate { .. }) {
+                    if contains_aggregate(&projection.expr) {
                         continue;
                     }
                     let written = keys.iter().any(|key| match &key.expr {

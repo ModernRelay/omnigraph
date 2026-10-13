@@ -5,9 +5,9 @@
 //! which rank call a projected score names. The compiler's typed lowering of
 //! that declaration (`AcceptInput::ir`, its filter constants folded under the
 //! bound values) states each expression in the form a plan carries it: every
-//! conjunct, traversal, block predicate, return item and order key a plan
-//! places is a verbatim copy of an IR expression, so plan and requirement
-//! compare as typed IR, explicit casts and exact-integer carriers included.
+//! conjunct, traversal, block predicate and order key is copied from IR.
+//! A split return reads aggregate leaves by alias after grouping; acceptance
+//! checks their operands against this IR, with explicit casts and types intact.
 //! The declaration is consulted only where the lowering erases meaning: a
 //! projected rank call becomes its score column.
 
@@ -288,7 +288,7 @@ impl Requirements {
             || ir
                 .return_exprs
                 .iter()
-                .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+                .any(|projection| crate::optimizer::contains_aggregate(&projection.expr));
         let order = keys
             .iter()
             .map(|key| IROrdering {

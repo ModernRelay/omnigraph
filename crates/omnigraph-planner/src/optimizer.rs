@@ -651,7 +651,7 @@ fn fused_score(binding: &str) -> IRExpr {
     }
 }
 
-fn contains_aggregate(expr: &IRExpr) -> bool {
+pub(crate) fn contains_aggregate(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Aggregate { .. } => true,
         IRExpr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
