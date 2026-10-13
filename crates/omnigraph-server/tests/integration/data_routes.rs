@@ -6864,6 +6864,112 @@ async fn diff_routes_review_a_branch_against_its_merge_base() {
         change_ids(&since_fork),
         vec![("MainOnly".to_string(), "insert".to_string())]
     );
+
+    // The branch control reads answer the same through `POST /query`, as
+    // rows; a diff's commits and its continuation token travel in `page`.
+    let (_, base) = get_json(&app, g("/branches/merge-base?source=feature")).await;
+    let (status, base_rows) = query_statement(&app, "branch merge-base feature").await;
+    assert_eq!(status, StatusCode::OK, "{base_rows}");
+    assert_eq!(base_rows["query_name"], "branch merge-base");
+    assert_eq!(
+        base_rows["rows"],
+        json!([{
+            "source": "feature",
+            "target": "main",
+            "source_commit_id": base["source_commit_id"],
+            "target_commit_id": base["target_commit_id"],
+            "merge_base_commit_id": fork,
+        }])
+    );
+    let row_ids = |answer: &Value| {
+        answer["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].as_str().unwrap().to_string(),
+                    row["op"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (_, review) = get_json(&app, g("/branches/diff?source=feature")).await;
+    let (status, first_rows) = query_statement(&app, "branch diff feature limit 1").await;
+    assert_eq!(status, StatusCode::OK, "{first_rows}");
+    assert_eq!(
+        first_rows["columns"],
+        json!(["kind", "type", "id", "op", "before", "after"])
+    );
+    assert_eq!(first_rows["page"]["base_commit_id"], fork.as_str());
+    assert_eq!(first_rows["page"]["to_commit_id"], review["to_commit_id"]);
+    assert_eq!(first_rows["rows"][0]["type"], "Person");
+    let mut statement_review = row_ids(&first_rows);
+    let mut token = first_rows["page"]["next_page_token"]
+        .as_str()
+        .expect("several changes, pages of one")
+        .to_string();
+    loop {
+        let (status, page) = query_statement(
+            &app,
+            &format!(r#"branch diff feature into main after page "{token}" limit 1"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["page"]["to_commit_id"], review["to_commit_id"]);
+        statement_review.extend(row_ids(&page));
+        match page["page"]["next_page_token"].as_str() {
+            Some(next) => token = next.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(statement_review, change_ids(&review));
+    let (status, head_rows) = query_statement(&app, "branch diff main to feature").await;
+    assert_eq!(status, StatusCode::OK, "{head_rows}");
+    assert_eq!(row_ids(&head_rows), change_ids(&heads));
+    let (status, dry) = query_statement(&app, "branch merge feature dry run").await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(
+        dry["rows"],
+        json!([{"source": "feature", "target": "main", "outcome": "merged"}])
+    );
+    assert_eq!(main_head_commit_id(&app).await, since_fork["to_commit_id"]);
+
+    // A control read is refused at the write door, under its own name.
+    for statement in [
+        "branch diff feature",
+        "branch merge-base feature",
+        "branch merge feature dry run",
+    ] {
+        let (status, body) =
+            json_response(&app, json_post("/mutate", &json!({"query": statement}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{statement}: {body}");
+        let name = statement.split(" feature").next().unwrap();
+        let name = if statement.ends_with("dry run") {
+            "branch merge dry run"
+        } else {
+            name
+        };
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("'{name}' is a read")),
+            "{statement}: {body}"
+        );
+    }
+}
+
+/// One statement at the read door, sent bare.
+async fn query_statement(app: &axum::Router, statement: &str) -> (StatusCode, Value) {
+    json_response(
+        app,
+        json_post(
+            "/query",
+            &json!({"query": statement, "name": null, "params": null, "branch": null, "snapshot": null}),
+        ),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]

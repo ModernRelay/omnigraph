@@ -1654,7 +1654,7 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => {
                         refuse_process_prefix_when_remote(&client, &prefix)?;
-                        run_branch_list_statement_cli(
+                        run_branch_read_statement_cli(
                             &client,
                             &query_source,
                             stmt,
@@ -2412,7 +2412,7 @@ fn refuse_process_prefix_when_remote(
 /// The `query` door's branch-statement path: the door check, then the
 /// envelope refusals, then the round trip. The door rule itself is documented
 /// on `refuse_wrong_door` in `crates/omnigraph-server/src/handlers/dispatch.rs`.
-async fn run_branch_list_statement_cli(
+async fn run_branch_read_statement_cli(
     client: &client::GraphClient,
     query_source: &str,
     stmt: BranchStmt,
@@ -2424,7 +2424,14 @@ async fn run_branch_list_statement_cli(
         bail!("{}", control_write_at_read_door(write));
     }
     refuse_statement_envelope(has_target, has_name_or_params, false)?;
-    client.branch_list_statement(query_source, settings).await
+    match stmt {
+        BranchStmt::Read(read) => {
+            client
+                .branch_read_statement(query_source, read, settings)
+                .await
+        }
+        _ => client.branch_list_statement(query_source, settings).await,
+    }
 }
 
 /// The `query` door's `show` path: the envelope refusals `branch list`
@@ -2457,8 +2464,9 @@ async fn run_branch_statement_cli(
     json: bool,
     settings: &[(SettingId, SettingValue)],
 ) -> Result<ChangeOutput> {
+    let statement_name = stmt.statement_name();
     let BranchStmt::Write(write) = stmt else {
-        bail!("{}", read_at_write_door());
+        bail!("{}", read_at_write_door(statement_name));
     };
     refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
     if let BranchWrite::Delete { .. } = &write {

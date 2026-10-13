@@ -46,11 +46,9 @@ pub enum GqtOperationKind {
     CommitDrop,
     Settings,
     Show,
+    BranchRead,
     Restart,
     Concurrent,
-    Diff,
-    MergeBase,
-    MergeDryRun,
 }
 impl From<StepKind> for GqtOperationKind {
     fn from(kind: StepKind) -> Self {
@@ -66,11 +64,9 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::CommitDrop => Self::CommitDrop,
             StepKind::Settings => Self::Settings,
             StepKind::Show => Self::Show,
+            StepKind::BranchRead => Self::BranchRead,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
-            StepKind::Diff => Self::Diff,
-            StepKind::MergeBase => Self::MergeBase,
-            StepKind::MergeDryRun => Self::MergeDryRun,
         }
     }
 }

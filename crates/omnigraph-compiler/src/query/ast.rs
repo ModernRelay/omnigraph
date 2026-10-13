@@ -198,12 +198,67 @@ impl QueryFile {
     }
 }
 
-/// A top-level branch statement: a control write, or `branch list`, the
-/// one statement that changes no branch.
+/// A top-level branch statement: a control write, `branch list`, or a
+/// control read that compares or previews branches (RFC 0030 §8). Only a
+/// control write changes a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchStmt {
     Write(BranchWrite),
     List,
+    Read(BranchRead),
+}
+
+/// A branch control read: it changes no branch and publishes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchRead {
+    /// `branch diff <source> [into <target>]` or `branch diff <from> to <to>`,
+    /// one page of net entity changes.
+    Diff {
+        sides: BranchDiffSides,
+        page: DiffPageClause,
+    },
+    /// `branch merge-base <source> [into <target>]`.
+    MergeBase {
+        source: String,
+        into: Option<String>,
+    },
+    /// `branch merge <source> [into <target>] dry run`: the merge decided,
+    /// nothing written.
+    MergeDryRun {
+        source: String,
+        into: Option<String>,
+    },
+}
+
+/// The two sides of `branch diff`. `into` is `None` when unspelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchDiffSides {
+    /// What `source` changed since its merge base with `into`.
+    Branch {
+        source: String,
+        into: Option<String>,
+    },
+    /// The net change from `from` to `to`, each a branch or a commit id.
+    Between { from: String, to: String },
+}
+
+/// The paging clauses of `branch diff`: `after page "<token>"` continues a
+/// previous answer, `limit <n>` bounds the page's changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffPageClause {
+    pub after_page: Option<String>,
+    pub limit: Option<usize>,
+}
+
+impl BranchRead {
+    /// The read's leading words.
+    pub fn statement_name(&self) -> &'static str {
+        match self {
+            BranchRead::Diff { .. } => "branch diff",
+            BranchRead::MergeBase { .. } => "branch merge-base",
+            BranchRead::MergeDryRun { .. } => "branch merge dry run",
+        }
+    }
 }
 
 /// A control write: `branch create <name> [from <parent>]`,
@@ -238,16 +293,17 @@ impl BranchWrite {
 }
 
 impl BranchStmt {
-    /// `false` only for `branch list`.
+    /// `true` only for a control write.
     pub fn is_write(&self) -> bool {
         matches!(self, BranchStmt::Write(_))
     }
 
-    /// The statement's two keywords, `branch create` through `branch list`.
+    /// The statement's leading words, `branch create` through `branch diff`.
     pub fn statement_name(&self) -> &'static str {
         match self {
             BranchStmt::Write(write) => write.statement_name(),
             BranchStmt::List => "branch list",
+            BranchStmt::Read(read) => read.statement_name(),
         }
     }
 

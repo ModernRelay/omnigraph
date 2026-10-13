@@ -298,10 +298,15 @@ fn parse_branch_stmt(
         .find(|inner| inner.as_rule() != Rule::kw_branch)
         .expect("grammar: branch_stmt holds one form after kw_branch");
     let rule = form.as_rule();
-    let as_commit = form
-        .clone()
-        .into_inner()
-        .any(|inner| inner.as_rule() == Rule::as_commit_clause);
+    let has = |wanted: Rule| {
+        form.clone()
+            .into_inner()
+            .any(|inner| inner.as_rule() == wanted)
+    };
+    let as_commit = has(Rule::as_commit_clause);
+    let dry_run = has(Rule::dry_run_clause);
+    let between = has(Rule::kw_to);
+    let page = parse_diff_page_clause(&form)?;
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
@@ -315,16 +320,74 @@ fn parse_branch_stmt(
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }
+        (Rule::branch_merge, Some(source), into) if dry_run => {
+            Ok(BranchStmt::Read(BranchRead::MergeDryRun { source, into }))
+        }
         (Rule::branch_merge, Some(source), into) => Ok(BranchStmt::Write(BranchWrite::Merge {
             source,
             into,
             as_commit,
         })),
         (Rule::branch_list, None, None) => Ok(BranchStmt::List),
+        (Rule::branch_merge_base, Some(source), into) => {
+            Ok(BranchStmt::Read(BranchRead::MergeBase { source, into }))
+        }
+        (Rule::branch_diff, Some(from), Some(to)) if between => {
+            Ok(BranchStmt::Read(BranchRead::Diff {
+                sides: BranchDiffSides::Between { from, to },
+                page,
+            }))
+        }
+        (Rule::branch_diff, Some(source), into) => Ok(BranchStmt::Read(BranchRead::Diff {
+            sides: BranchDiffSides::Branch { source, into },
+            page,
+        })),
         (other, _, _) => {
             unreachable!("grammar: every branch form fixes its name arity, got {other:?}")
         }
     }
+}
+
+/// The `after page "<token>"` and `limit <n>` clauses of `branch diff`; both
+/// absent on every other form. A limit is at least one (`Q004` otherwise).
+fn parse_diff_page_clause(
+    form: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<DiffPageClause, QueryDiagnostic> {
+    let mut page = DiffPageClause::default();
+    for clause in form.clone().into_inner() {
+        match clause.as_rule() {
+            Rule::diff_after_page => {
+                let literal = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::string_lit)
+                    .expect("grammar: `after page` names one string literal");
+                let token = decode_string_literal(literal.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &literal))?;
+                page.after_page = Some(token);
+            }
+            Rule::diff_limit => {
+                let integer = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::integer)
+                    .expect("grammar: `limit` names one integer");
+                let limit = integer
+                    .as_str()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        diagnostic_at(
+                            Q004,
+                            format!("diff limit {} must be a positive integer", integer.as_str()),
+                            &integer,
+                        )
+                    })?;
+                page.limit = Some(limit);
+            }
+            _ => {}
+        }
+    }
+    Ok(page)
 }
 
 fn parse_commit_stmt(

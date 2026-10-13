@@ -1,6 +1,6 @@
 # issue: none
-# notes: Reviewing a branch (RFC 0030 §8): the merge base, the branch diff from it to the source head,
-# notes: the two-point diff of the heads, and a dry run that writes nothing.
+# notes: Reviewing a branch with the branch control reads (RFC 0030 §8): the merge base, the branch diff
+# notes: from it to the source head, the two-point diff of the heads, and a dry run that writes nothing.
 
 --- runner
 timeout_ms: 10000
@@ -51,6 +51,8 @@ query insert_carol() {
 
 --- expect affected: nodes=1 edges=0
 
+--- bind commit $carol
+
 --- mutate
 query insert_dave() {
     insert Person { name: "dave", age: 50 }
@@ -58,31 +60,40 @@ query insert_dave() {
 
 --- expect affected: nodes=1 edges=0
 
---- merge-base source: feature
+--- bind commit $dave
 
---- expect commit $fork
+--- query
+branch merge-base feature
 
---- diff source: feature target: main
+--- expect ordered
+{"source": "feature", "target": "main", "source_commit_id": "${carol}", "target_commit_id": "${dave}", "merge_base_commit_id": "${fork}"}
+
+--- query
+branch diff feature into main
 
 --- expect ordered
 {"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
 {"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
 
---- diff from: main to: feature
+--- query
+branch diff main to feature
 
 --- expect ordered
 {"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
 {"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
 {"kind":"node","type":"Person","id":"dave","op":"delete","before":{"properties":{"name":"dave","age":50}}}
 
---- diff from: $fork to: main
+--- query
+branch diff "${fork}" to main
 
 --- expect ordered
 {"kind":"node","type":"Person","id":"dave","op":"insert","after":{"properties":{"name":"dave","age":50}}}
 
---- merge-dry-run source: feature
+--- query
+branch merge feature dry run
 
---- expect outcome: merged
+--- expect ordered
+{"source": "feature", "target": "main", "outcome": "merged"}
 
 --- query
 query names_on_main() {

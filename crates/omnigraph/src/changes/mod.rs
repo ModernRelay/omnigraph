@@ -6,7 +6,7 @@ pub(crate) mod row_compare;
 pub(crate) mod token;
 
 pub use model::{
-    CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
+    BranchReadAnswer, CHANGE_FEED_DEFAULT_COMMITS_PER_POLL, CHANGE_FEED_MAX_COMMITS_PER_POLL,
     COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_CHANGES, COMMIT_CHANGES_MAX_BYTES,
     COMMIT_CHANGES_MAX_CHANGES, ChangeBaseline, ChangeCause, ChangeEntityKind,
     ChangeFeedContinuation, ChangeFeedPage, ChangeFeedPosition, ChangeFeedRequest, ChangeFeedScope,

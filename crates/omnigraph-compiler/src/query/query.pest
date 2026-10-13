@@ -28,7 +28,7 @@ setting_value = { integer | ident | string_lit }
 // Statements: one per file, never beside a query declaration. Each keyword
 // is atomic and closed by a word boundary: an identifier character may not
 // follow it (`branch createb0` is a parse error), a quoted name may.
-branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge | branch_list) }
+branch_stmt   = { kw_branch ~ (branch_create | branch_delete | branch_merge_base | branch_merge | branch_list | branch_diff) }
 // The two control writes on an unpublished commit, named by its full id.
 commit_stmt   = { kw_commit ~ (commit_publish | commit_drop) }
 // `explain` wraps the one read declaration whose plan is answered as rows.
@@ -38,11 +38,21 @@ explain_stmt  = { kw_explain ~ query_decl }
 statement_trailer = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | explain_stmt | query_decl)+ }
 branch_create = { kw_create ~ branch_name ~ (kw_from ~ branch_name)? }
 branch_delete = { kw_delete ~ branch_name }
-branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? ~ as_commit_clause? }
+branch_merge  = { kw_merge ~ branch_name ~ (kw_into ~ branch_name)? ~ (as_commit_clause | dry_run_clause)? }
 branch_list   = { kw_list }
-// A bare `as` followed by `commit` is the clause, never a branch named `as`;
-// quote the name for that.
-branch_name   = { !(kw_as ~ kw_commit) ~ (ident | string_lit) }
+// Control reads (RFC 0030 §8): the merge base of a merge, a branch's net
+// change since that base (`into`), or the net change between two points,
+// each a branch or a quoted commit id (`to`). `merge-base` is tried before
+// `merge`, which would otherwise take `merge` and fail on `-base`.
+branch_merge_base = { kw_merge_base ~ branch_name ~ (kw_into ~ branch_name)? }
+branch_diff   = { kw_diff ~ branch_name ~ ((kw_into | kw_to) ~ branch_name)? ~ diff_after_page? ~ diff_limit? }
+diff_after_page = { kw_after ~ kw_page ~ string_lit }
+diff_limit    = { kw_limit ~ integer }
+// `dry run`: the merge is decided and nothing is written.
+dry_run_clause = { kw_dry ~ kw_run }
+// A bare `as` followed by `commit`, or `dry` followed by `run`, is the
+// clause, never a branch named `as` or `dry`; quote the name for that.
+branch_name   = { !(kw_as ~ kw_commit) ~ !(kw_dry ~ kw_run) ~ (ident | string_lit) }
 commit_publish = { kw_publish ~ string_lit }
 commit_drop    = { kw_drop ~ string_lit }
 // `as commit`: the write's result is an unpublished commit.
@@ -57,6 +67,14 @@ kw_explain = @{ "explain" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_create = @{ "create" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete = @{ "delete" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_merge  = @{ "merge" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_merge_base = @{ "merge-base" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_diff   = @{ "diff" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_to     = @{ "to" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_after  = @{ "after" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_page   = @{ "page" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_limit  = @{ "limit" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_dry    = @{ "dry" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_run    = @{ "run" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_list   = @{ "list" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_from   = @{ "from" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_into   = @{ "into" ~ !(ASCII_ALPHANUMERIC | "_") }

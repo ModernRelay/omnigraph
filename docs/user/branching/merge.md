@@ -103,6 +103,9 @@ same structured conflict list, and writes nothing: `commit` is `null` and
 `dry_run` is `true`. It is a read of both branches, so it needs `read` on each
 and no `branch_merge` grant. It refuses `--as-commit` and `--delete-branch`.
 Over HTTP, send `dry_run: true` to `POST /graphs/{graph_id}/branches/merge`.
+The GQ statement `branch merge feature into main dry run` is the same read at
+`POST /query`: it answers one row with `source`, `target` and `outcome`, and a
+conflict is the 409 a merge answers.
 
 A dry run answers whether the merge would succeed. To see what it would change,
 use [`branch diff`](changes.md#review-a-branch). To review the exact result

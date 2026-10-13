@@ -8,9 +8,8 @@ use futures::FutureExt as _;
 use omnigraph::db::MergeOutcome;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, DiffOutput, HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER,
-    IngestRequest, MergeBaseOutput, QueryRequest, ReadOutput, SchemaOutput,
+    BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
+    HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
 use omnigraph_compiler::query::ast::show_statement_name;
 use serde::de::DeserializeOwned;
@@ -19,13 +18,12 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::{
-    Bindings, Case, ControlStep, ControlWrite, DiffSides, DiffStep, ExecutionHost, Fixture, Item,
-    ListStep, LoadStep, MAIN_BRANCH, MergeBaseStep, MergeDryRunStep, MergeExpect, MutateExpect,
-    MutateStep, ParamsInput, QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail, WriteExpect,
-    bound_snapshot, bound_source, check_diff_expect, check_dry_run_expect, check_error_expect,
-    check_merge_base_expect, check_rows_json, diff_row, expectation_evidence, merge_outcome_word,
-    operation, record_binding, resolve_operand, resolve_side, step_kind, step_label,
-    substitute_all,
+    Bindings, BranchReadStep, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item,
+    ListStep, LoadStep, MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput,
+    QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail, WriteExpect, bound_snapshot,
+    bound_source, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
+    operation, record_binding, resolve_operand, step_kind, step_label, substitute_all,
+    substitute_bound,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -100,9 +98,7 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
             | Step::Control(_)
             | Step::List(_)
             | Step::Show(_)
-            | Step::Diff(_)
-            | Step::MergeBase(_)
-            | Step::MergeDryRun(_) => {}
+            | Step::BranchRead(_) => {}
         }
     }
     if refused.is_empty() {
@@ -194,9 +190,7 @@ async fn execute_served_inner<H: ExecutionHost>(
                         }),
                     Step::List(l) => list(host, &client, l, binding).await,
                     Step::Show(s) => show(host, &client, s, binding).await,
-                    Step::Diff(d) => diff(host, &client, d, binding, &bindings).await,
-                    Step::MergeBase(m) => merge_base(host, &client, m, binding, &bindings).await,
-                    Step::MergeDryRun(m) => merge_dry_run(host, &client, m, binding).await,
+                    Step::BranchRead(r) => branch_read(host, &client, r, binding, &bindings).await,
                     Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
                         Err(StepFail::new(
                             step_label(ordinal, step_kind(step), binding),
@@ -367,20 +361,6 @@ impl ServerClient {
     async fn get<Res: DeserializeOwned>(&self, route: &str) -> Result<Result<Res, String>, String> {
         self.send(self.http.get(format!("{}{route}", self.graph_base)))
             .await
-    }
-
-    /// A GET whose query parameters the client encodes.
-    async fn get_query<Res: DeserializeOwned>(
-        &self,
-        route: &str,
-        query: &[(&str, &str)],
-    ) -> Result<Result<Res, String>, String> {
-        self.send(
-            self.http
-                .get(format!("{}{route}", self.graph_base))
-                .query(query),
-        )
-        .await
     }
 
     async fn load(&self, branch: &str, mode: LoadMode, data: String) -> Result<(), String> {
@@ -899,6 +879,48 @@ async fn show(
     )
 }
 
+/// A branch control read at the `/query` door: the statement sent with its
+/// bound names replaced, its rows held against the expect with the same
+/// names replaced in the expected rows.
+async fn branch_read(
+    host: &impl ExecutionHost,
+    client: &ServerClient,
+    step: &BranchReadStep,
+    binding: Option<(&str, &str)>,
+    bindings: &Bindings,
+) -> Result<(), StepFail> {
+    let name = step.read.statement_name();
+    let label = step_label(step.ordinal, name, binding);
+    let fail = |message: String| StepFail::new(label.clone(), message);
+    let text = substitute_bound(&step.source, bindings);
+    let outcome = operation(host, step.ordinal, statement(client, &text))
+        .await
+        .map_err(&fail)?
+        .map_err(&fail)?;
+    match &step.expect {
+        QueryExpect::Rows {
+            ordered,
+            body_raw,
+            span,
+            ..
+        } => {
+            let actual = outcome.map_err(|e| fail(format!("`{name}` failed: {e}")))?;
+            check_rows_json(
+                host,
+                &label,
+                &actual,
+                *ordered,
+                &substitute_bound(body_raw, bindings),
+                *span,
+                binding,
+            )
+        }
+        QueryExpect::Error { needle } => {
+            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded")).map_err(fail)
+        }
+    }
+}
+
 /// A read statement (`branch list`, `show …`) at the `/query` door, sent
 /// bare: no name, params, branch or snapshot, as the route documents.
 async fn statement(
@@ -914,153 +936,4 @@ async fn statement(
         settings: None,
     };
     client.read(&request).await
-}
-
-/// Every change a diff step names, page by page through its route:
-/// `GET /diff`, `GET /branches/diff` or `GET /commits/{id}/changes`.
-async fn served_diff_rows(
-    client: &ServerClient,
-    sides: &DiffSides,
-    bindings: &Bindings,
-) -> Result<Result<Vec<Value>, String>, String> {
-    let mut rows = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let from: String;
-        let to: String;
-        let mut query: Vec<(&str, &str)> = Vec::new();
-        let page_changes = match sides {
-            DiffSides::Commit { commit } => {
-                let id = resolve_side(commit, bindings)?;
-                if let Some(token) = token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                let route = format!("/commits/{id}/changes");
-                match client
-                    .get_query::<CommitChangesOutput>(&route, &query)
-                    .await?
-                {
-                    Ok(page) => Ok((page.changes, page.next_page_token)),
-                    Err(error) => Err(error),
-                }
-            }
-            DiffSides::Between { from: f, to: t } => {
-                from = resolve_side(f, bindings)?;
-                to = resolve_side(t, bindings)?;
-                query.extend([("from", from.as_str()), ("to", to.as_str())]);
-                if let Some(token) = token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                match client.get_query::<DiffOutput>("/diff", &query).await? {
-                    Ok(page) => Ok((page.changes, page.next_page_token)),
-                    Err(error) => Err(error),
-                }
-            }
-            DiffSides::Branch { source, target } => {
-                query.extend([("source", source.as_str()), ("target", target.as_str())]);
-                if let Some(token) = token.as_deref() {
-                    query.push(("page_token", token));
-                }
-                match client
-                    .get_query::<DiffOutput>("/branches/diff", &query)
-                    .await?
-                {
-                    Ok(page) => Ok((page.changes, page.next_page_token)),
-                    Err(error) => Err(error),
-                }
-            }
-        };
-        let (changes, next) = match page_changes {
-            Ok(page) => page,
-            Err(error) => return Ok(Err(error)),
-        };
-        rows.extend(changes.iter().map(diff_row));
-        match next {
-            Some(next) => token = Some(next),
-            None => return Ok(Ok(rows)),
-        }
-    }
-}
-
-async fn diff(
-    host: &impl ExecutionHost,
-    client: &ServerClient,
-    step: &DiffStep,
-    binding: Option<(&str, &str)>,
-    bindings: &Bindings,
-) -> Result<(), StepFail> {
-    let label = step_label(step.ordinal(), "diff", binding);
-    let fail = |message: String| StepFail::new(label.clone(), message);
-    let outcome = operation(
-        host,
-        step.ordinal(),
-        served_diff_rows(client, &step.sides, bindings),
-    )
-    .await
-    .map_err(&fail)?
-    .map_err(&fail)?;
-    host.observe(|| format!("actual diff: {outcome:?}"));
-    check_diff_expect(host, step.expect(), outcome).map_err(fail)
-}
-
-async fn merge_base(
-    host: &impl ExecutionHost,
-    client: &ServerClient,
-    step: &MergeBaseStep,
-    binding: Option<(&str, &str)>,
-    bindings: &Bindings,
-) -> Result<(), StepFail> {
-    let label = step_label(step.ordinal(), "merge-base", binding);
-    let fail = |message: String| StepFail::new(label.clone(), message);
-    let query = [
-        ("source", step.source.as_str()),
-        ("target", step.target.as_str()),
-    ];
-    let outcome = operation(
-        host,
-        step.ordinal(),
-        client.get_query::<MergeBaseOutput>("/branches/merge-base", &query),
-    )
-    .await
-    .map_err(&fail)?
-    .map_err(&fail)?
-    .map(|output| output.merge_base.graph_commit_id);
-    host.observe(|| format!("actual merge base: {outcome:?}"));
-    check_merge_base_expect(host, step.expect(), outcome, bindings).map_err(fail)
-}
-
-async fn merge_dry_run(
-    host: &impl ExecutionHost,
-    client: &ServerClient,
-    step: &MergeDryRunStep,
-    binding: Option<(&str, &str)>,
-) -> Result<(), StepFail> {
-    let label = step_label(step.ordinal(), "merge-dry-run", binding);
-    let fail = |message: String| StepFail::new(label.clone(), message);
-    let request = BranchMergeRequest {
-        source: step.source.clone(),
-        target: Some(step.target.clone()),
-        delete_branch: false,
-        as_commit: false,
-        dry_run: true,
-        settings: None,
-    };
-    let outcome = operation(
-        host,
-        step.ordinal(),
-        client.post::<_, BranchMergeOutput>("/branches/merge", &request),
-    )
-    .await
-    .map_err(&fail)?
-    .map_err(&fail)?
-    .map(|output| {
-        let outcome = match output.outcome {
-            BranchMergeOutcome::AlreadyUpToDate => MergeOutcome::AlreadyUpToDate,
-            BranchMergeOutcome::FastForward => MergeOutcome::FastForward,
-            BranchMergeOutcome::Merged => MergeOutcome::Merged,
-        };
-        (outcome, output.commit.is_some() || !output.dry_run)
-    });
-    host.observe(|| format!("actual dry run: {outcome:?}"));
-    check_dry_run_expect(host, step.expect(), outcome).map_err(fail)
 }

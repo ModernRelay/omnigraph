@@ -23,11 +23,13 @@ node Person {
 --- seed
 {"type":"Person","data":{"name":"bob","age":40}}
 
---- diff from: main to: nowhere
+--- query
+branch diff main to nowhere
 
 --- expect error: 'nowhere' names no branch and no commit
 
---- merge-base source: nowhere
+--- query
+branch merge-base nowhere
 
 --- expect error: not found
 
@@ -50,7 +52,8 @@ query main_bob() {
 
 --- expect affected: nodes=1 edges=0
 
---- merge-dry-run source: feature
+--- query
+branch merge feature dry run
 
 --- expect error: merge conflicts
 

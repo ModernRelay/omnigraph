@@ -40,7 +40,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query, or the `branch list`, `show`, or `explain` statement | direct or served |
+| `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |

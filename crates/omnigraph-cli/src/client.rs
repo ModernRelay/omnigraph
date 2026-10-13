@@ -38,12 +38,12 @@ use omnigraph_api_types::{
     EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
     GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
     SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    change_baseline_output, change_feed_output, change_scope, commit_changes_output, commit_output,
-    diff_output, merge_base_output, read_output, schema_apply_output, show_read_output,
-    snapshot_payload,
+    branch_read_output, change_baseline_output, change_feed_output, change_scope,
+    commit_changes_output, commit_output, diff_output, merge_base_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite};
+use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -1523,6 +1523,43 @@ impl GraphClient {
             GraphClient::Embedded { .. } => Ok(branch_list_read_output(
                 &self.branch_list().await?.branches,
             )?),
+        }
+    }
+
+    /// A branch control read from `-e`/`--query` (`branch diff`,
+    /// `branch merge-base`, `branch merge … dry run`): `POST /query` with the
+    /// source and the `--set` values, or the embedded engine's answer in the
+    /// one `ReadOutput` shape the server renders.
+    pub(crate) async fn branch_read_statement(
+        &self,
+        query_source: &str,
+        read: BranchRead,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_query_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let session = Self::open_read_session(uri, settings).await?;
+                Ok(branch_read_output(&session.branch_read(&read).await?)?)
+            }
         }
     }
 

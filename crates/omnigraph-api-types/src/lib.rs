@@ -487,6 +487,26 @@ pub struct ReadOutput {
     /// come from one pinned version, so no separate id fetch is needed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_commit_id: Option<String>,
+    /// Page state of a paged control read (`branch diff`); absent for every
+    /// other answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<ReadPageOutput>,
+}
+
+/// The page state a `branch diff` answer carries: the exact commits it
+/// compares, and the token `after page "<token>"` continues it with, absent
+/// on its last page.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReadPageOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_commit_id: Option<String>,
+    /// The merge base, for a branch's diff since it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
 }
 
 /// The effect of a branch statement sent to `POST /mutate`, tagged by `kind`.
@@ -1087,8 +1107,9 @@ pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch
-    /// statement `branch list`, sent with no `name`, `params`, `branch`, or
-    /// `snapshot`; or one `explain` statement (`explain query …`), which
+    /// statement `branch list` or a branch control read (`branch diff …`,
+    /// `branch merge-base …`, `branch merge … dry run`), sent with no `name`,
+    /// `params`, `branch`, or `snapshot`; or one `explain` statement (`explain query …`), which
     /// answers the v2 plan instead of
     /// running it, as one result per plan node (fields `tree`, `depth`, `node`,
     /// `detail`: the logical, physical and available DataFusion trees, then `plan` entries for
@@ -2346,6 +2367,7 @@ pub fn read_output(
         columns,
         rows,
         graph_commit_id,
+        page: None,
     })
 }
 
@@ -2368,7 +2390,126 @@ pub fn branch_list_read_output(branches: &[String]) -> Result<ReadOutput, serde_
         columns: vec!["name".to_string()],
         rows: serde_json::value::to_raw_value(&rows)?,
         graph_commit_id: None,
+        page: None,
     })
+}
+
+/// The answer of a branch control read: rows in the order given, no target
+/// (the statement names its own branches) and no graph commit.
+fn branch_read_rows_output(
+    query_name: &str,
+    columns: &[&str],
+    rows: Vec<serde_json::Value>,
+    page: Option<ReadPageOutput>,
+) -> Result<ReadOutput, serde_json::Error> {
+    Ok(ReadOutput {
+        query_name: query_name.to_string(),
+        target: ReadTargetOutput {
+            branch: None,
+            snapshot: None,
+        },
+        row_count: rows.len(),
+        columns: columns.iter().map(|column| column.to_string()).collect(),
+        rows: serde_json::value::to_raw_value(&rows)?,
+        graph_commit_id: None,
+        page,
+    })
+}
+
+/// The answer of any branch control read, rendered by its family.
+pub fn branch_read_output(
+    answer: &omnigraph::changes::BranchReadAnswer,
+) -> Result<ReadOutput, serde_json::Error> {
+    use omnigraph::changes::BranchReadAnswer;
+    match answer {
+        BranchReadAnswer::Diff(page) => branch_diff_read_output(page),
+        BranchReadAnswer::MergeBase {
+            source,
+            target,
+            base,
+        } => branch_merge_base_read_output(source, target, base),
+        BranchReadAnswer::MergeDryRun {
+            source,
+            target,
+            outcome,
+        } => branch_merge_dry_run_read_output(source, target, (*outcome).into()),
+    }
+}
+
+/// The `branch diff` answer: one row per entity change in the diff's order,
+/// columns `kind`, `type`, `id`, `op`, `before`, `after`, the HTTP change
+/// shape with the type named by its name (`GET /diff` also carries its
+/// per-graph opaque id); the compared commits and the continuation token
+/// travel in `page`.
+pub fn branch_diff_read_output(
+    page: &omnigraph::changes::GraphDiffPage,
+) -> Result<ReadOutput, serde_json::Error> {
+    let rows = page
+        .changes
+        .iter()
+        .map(|change| {
+            let mut row = serde_json::to_value(entity_change_output(change))?;
+            row["type"] = serde_json::Value::String(change.entity_type.name.clone());
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    branch_read_rows_output(
+        "branch diff",
+        &["kind", "type", "id", "op", "before", "after"],
+        rows,
+        Some(ReadPageOutput {
+            from_commit_id: Some(page.from_commit_id.clone()),
+            to_commit_id: Some(page.to_commit_id.clone()),
+            base_commit_id: page.base_commit_id.clone(),
+            next_page_token: page.next_page_token.clone(),
+        }),
+    )
+}
+
+/// The `branch merge-base` answer: one row naming the two branches, their
+/// heads and the merge base commit.
+pub fn branch_merge_base_read_output(
+    source: &str,
+    target: &str,
+    base: &omnigraph::changes::MergeBase,
+) -> Result<ReadOutput, serde_json::Error> {
+    branch_read_rows_output(
+        "branch merge-base",
+        &[
+            "source",
+            "target",
+            "source_commit_id",
+            "target_commit_id",
+            "merge_base_commit_id",
+        ],
+        vec![serde_json::json!({
+            "source": source,
+            "target": target,
+            "source_commit_id": base.source_commit_id,
+            "target_commit_id": base.target_commit_id,
+            "merge_base_commit_id": base.merge_base.graph_commit_id,
+        })],
+        None,
+    )
+}
+
+/// The `branch merge … dry run` answer: one row naming the two branches and
+/// the outcome the merge would have.
+pub fn branch_merge_dry_run_read_output(
+    source: &str,
+    target: &str,
+    outcome: BranchMergeOutcome,
+) -> Result<ReadOutput, serde_json::Error> {
+    branch_read_rows_output(
+        "branch merge dry run",
+        &["source", "target", "outcome"],
+        vec![serde_json::json!({
+            "source": source,
+            "target": target,
+            "outcome": outcome,
+        })],
+        None,
+    )
 }
 
 /// The `show` answer: one row per setting in the order given, the five
@@ -2406,6 +2547,7 @@ pub fn show_read_output(rows: &[SettingRow]) -> Result<ReadOutput, serde_json::E
             .collect(),
         rows: serde_json::value::to_raw_value(&rendered)?,
         graph_commit_id: None,
+        page: None,
     })
 }
 

@@ -243,6 +243,23 @@ pub struct MergeBase {
     pub merge_base: GraphCommit,
 }
 
+/// What a branch control read answers (RFC 0030 §8), before a transport
+/// renders it: one page of a diff, a merge base, or a merge's outcome.
+#[derive(Debug, Clone)]
+pub enum BranchReadAnswer {
+    Diff(GraphDiffPage),
+    MergeBase {
+        source: String,
+        target: String,
+        base: MergeBase,
+    },
+    MergeDryRun {
+        source: String,
+        target: String,
+        outcome: crate::db::MergeOutcome,
+    },
+}
+
 /// Graph-vocabulary feed filter. Empty dimensions match everything; the
 /// canonical digest of this scope binds page tokens and feed cursors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
