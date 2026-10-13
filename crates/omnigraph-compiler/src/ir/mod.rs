@@ -5,6 +5,8 @@ pub(crate) mod lower;
 pub mod untyped;
 pub(crate) mod validate;
 
+pub use lower::is_fresh_variable;
+
 use std::collections::HashMap;
 
 use crate::error::{CompilerError, Result};

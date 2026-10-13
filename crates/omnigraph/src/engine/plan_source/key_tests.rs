@@ -59,12 +59,14 @@ async fn run_with_access(
     let stores = probes.table_stores.clone();
     with_query_io_probes(probes, async {
         let statement = omnigraph_compiler::find_read_statement(text, "lookup").unwrap();
-        let checked =
-            omnigraph_compiler::query::typecheck::typecheck_query(catalog, statement.decl())
-                .unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, &checked).unwrap();
+        let checked = CheckedRead::check(catalog, statement.decl()).unwrap();
+        let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
+        let query = CompiledQuery {
+            ir: Arc::new(ir),
+            checked,
+        };
         let settings = SessionSettings::default();
-        let source = QuerySource::gather(&ir, catalog, &snapshot, params, &settings)
+        let source = QuerySource::gather(&query, catalog, &snapshot, params, &settings)
             .await
             .unwrap();
         assert!(
@@ -76,10 +78,13 @@ async fn run_with_access(
                     omnigraph_planner::IndexKind::Btree { usable: true }
                 ) && fact.column == "__id")
         );
-        let ExplainedQuery { explain, physical } = explain_query(&source).await.unwrap();
-        let mut bound = crate::engine::bind::bind(physical, &source, &EmbeddingResolver::explain())
-            .await
-            .unwrap();
+        let ExplainedQuery { explain, accepted } = explain_query(&source).await.unwrap();
+        let evidence = accepted.evidence().clone();
+        let (mut bound, _) =
+            crate::engine::bind::bind(accepted, &source, &EmbeddingResolver::explain())
+                .await
+                .unwrap()
+                .into_parts();
         if sequential {
             let scans: Vec<_> = bound
                 .plan
@@ -106,7 +111,17 @@ async fn run_with_access(
             catalog,
             graph_index: Arc::new(GraphIndexHandle::none()),
         };
-        let run = crate::engine::execute(bound, &context).await.unwrap();
+        // The edited access is a cost choice acceptance admits: the plan
+        // reaches execution through the replay door, like any saved plan.
+        let envelope = omnigraph_planner::ReplayEnvelope::new(
+            text,
+            "lookup",
+            bound,
+            &evidence,
+            omnigraph_planner::catalog_digest(catalog),
+        );
+        let accepted = accept_replay(&query, envelope, catalog).unwrap();
+        let run = crate::engine::execute(accepted, &context).await.unwrap();
         let execution = drain(&stores);
         Observed {
             planning,

@@ -1132,6 +1132,19 @@ fn walk_clauses(
     Ok(())
 }
 
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_aggregate(inner),
+        _ => false,
+    }
+}
+
 /// Why `expect ordered` is refused: search-led aggregates and DISTINCT
 /// need a key after the search function to order their output rows.
 /// Ordinary ordered queries retain their total-order contract.
@@ -1153,7 +1166,7 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
     if decl
         .return_clause
         .iter()
-        .any(|p| matches!(p.expr, Expr::Aggregate { .. }))
+        .any(|p| contains_aggregate(&p.expr))
     {
         if !search_led || decl.order_clause.len() < 2 {
             return Some(

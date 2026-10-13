@@ -11,16 +11,18 @@ use crate::source::{IndexFact, IndexKind, PlanSource};
 pub const PASS_SCAN_ACCESS: &str = "scan_access";
 pub const PASS_KEY_TO_ID: &str = "key_to_id";
 
+/// Record every fresh scan's access, and return the identity conjuncts the
+/// key narrowing added (one per narrowed scan), which acceptance re-derives.
 pub async fn finalize_scan_access(
     optimized: &mut Optimized,
     source: &(dyn PlanSource + Sync),
-) -> Result<(), PlanError> {
+) -> Result<Vec<IRExpr>, PlanError> {
     let scans: Vec<_> = optimized
         .physical
         .live()
         .filter_map(|(id, node)| matches!(node, PhysicalNode::Scan { .. }).then_some(id))
         .collect();
-    let mut rewrote_key = false;
+    let mut narrowed = Vec::new();
     for id in &scans {
         let Some(PhysicalNode::Scan {
             source: input,
@@ -62,34 +64,34 @@ pub async fn finalize_scan_access(
                 fact.column == spec.columns.id
                     && matches!(fact.kind, IndexKind::Btree { usable: true })
             }) {
-                rewrote_key |= narrow_key(spec, source)?;
+                narrowed.extend(narrow_key(spec, source)?);
             }
             source.index_split(spec).await?
         };
         spec.access = Some(access);
     }
-    if rewrote_key {
+    if !narrowed.is_empty() {
         optimized.fired.push(PASS_KEY_TO_ID);
     }
     if !scans.is_empty() {
         optimized.fired.push(PASS_SCAN_ACCESS);
     }
-    Ok(())
+    Ok(narrowed)
 }
 
-fn narrow_key(spec: &mut ScanSpec, source: &dyn PlanSource) -> Result<bool, PlanError> {
+fn narrow_key(spec: &mut ScanSpec, source: &dyn PlanSource) -> Result<Option<IRExpr>, PlanError> {
     let Some(type_name) = spec.table.type_key.strip_prefix("node:") else {
-        return Ok(false);
+        return Ok(None);
     };
     let node = source.node_type(type_name)?;
     let [key] = node.key.as_slice() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(binding) = spec.binding.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(original) = spec.filter.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     for conjunct in original
         .gq_filters()
@@ -134,10 +136,10 @@ fn narrow_key(spec: &mut ScanSpec, source: &dyn PlanSource) -> Result<bool, Plan
                 IRExpr::Literal(Literal::String(id), ty),
             );
             spec.filter = Some(original.clone().and(gq_conjunct(&derived)));
-            return Ok(true);
+            return Ok(Some(derived));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn string_type(ty: &ExprType) -> bool {
