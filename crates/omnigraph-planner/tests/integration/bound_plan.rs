@@ -145,12 +145,12 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
         values: Default::default(),
     };
     let encoded = serde_json::to_value(&bound).unwrap();
-    assert_eq!(encoded["bound_plan_version"], 7);
+    assert_eq!(encoded["bound_plan_version"], 8);
     assert!(encoded.get("plan").is_none());
     assert!(encoded["body"]["plan"].is_object());
     assert_eq!(round_trip(&bound), bound);
 
-    for version in [1, 2, 3, 4, 5, 6] {
+    for version in [1, 2, 3, 4, 5, 6, 7] {
         let mut older = encoded.clone();
         older["bound_plan_version"] = serde_json::json!(version);
         assert!(
@@ -164,12 +164,12 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     let error = serde_json::from_value::<BoundPlan>(legacy).unwrap_err();
     assert!(error.to_string().contains("regenerate"), "{error}");
     let mut future = encoded.clone();
-    future["bound_plan_version"] = serde_json::json!(8);
+    future["bound_plan_version"] = serde_json::json!(9);
     let error = serde_json::from_value::<BoundPlan>(future).unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("unsupported bound plan version 8"),
+            .contains("unsupported bound plan version 9"),
         "{error}"
     );
 
@@ -796,6 +796,7 @@ fn block_bound(left: omnigraph_compiler::ir::BlockAggregateExpr, right: IRExpr) 
             op: CompOp::Gt,
             right,
         },
+        strategy: omnigraph_planner::AntiJoinStrategy::KeySet,
     });
     plan.set_root(root);
     BoundPlan {
@@ -1060,7 +1061,12 @@ fn block_mirrors_and_explain_preserve_every_nested_cast_in_order() {
         panic!("block");
     };
     assert_eq!(predicate, back);
+    assert_eq!(
+        restored, bound,
+        "the block's strategy survives the saved plan"
+    );
     let explain = restored.plan.to_json();
+    assert_eq!(explain["strategy"], "key_set");
     assert_eq!(explain["predicate"], "count > $bound");
     assert_eq!(explain["typed_left"]["type"], "F64");
     assert_eq!(explain["typed_left"]["args"][0]["type"], "exact_integer");

@@ -128,11 +128,11 @@ skips null values.
 
 The block narrows the rows before `order` and `limit`, so a paged listing
 filtered by a relationship count is exact. A binding the block's traversal
-connects to the outer row is reached through that traversal, never scanned as
-a whole table, however many rows the outer pattern has; a binding correlated
-only through a filter, or read by a text search, is scanned. A
-single-hop, filter-free `count { ... }` over a directed, unbound edge is
-answered from the graph index's degree. A bare aggregate in `match`,
+connects to the outer row is reached through it, or the block runs once from a
+node it binds by key if that is cheaper (`strategy` in [explain](explain.md));
+a binding correlated only through a filter, or read by a text search, is
+scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
+edge is answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
 
 ```

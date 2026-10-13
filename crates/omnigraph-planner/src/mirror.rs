@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::aggregate::AggregateSpec;
 use crate::bound::{BoundPlan, ValueTable};
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, GqFilter, KeyJoinKind, Predicate, RuntimeFilterSpec, ScanAccess, ScanSpec,
@@ -314,6 +314,7 @@ pub enum NodeMirror {
         outer_var: String,
         predicate: SubqueryPredicateMirror,
         aggregate: Option<AggregateSpec>,
+        strategy: AntiJoinStrategy,
     },
     OuterReference {
         outer_var: String,
@@ -497,12 +498,14 @@ impl From<&PhysicalNode> for NodeMirror {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input: *input,
                 inner: *inner,
                 outer_var: outer_var.clone(),
                 predicate: SubqueryPredicateMirror::from(predicate),
                 aggregate: *aggregate,
+                strategy: *strategy,
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -695,12 +698,14 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
             } => Self::AntiJoin {
                 input,
                 inner,
                 outer_var,
                 predicate: SubqueryPredicate::from(predicate),
                 aggregate,
+                strategy,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {

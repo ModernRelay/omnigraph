@@ -1904,6 +1904,7 @@ mod result_contract {
                     op: CompOp::Gt,
                     right,
                 },
+                strategy: omnigraph_planner::AntiJoinStrategy::Correlated,
             });
             bound.plan.set_root(id);
             assert_eq!(check_bound_plan_round_trip(&bound), Ok(()));

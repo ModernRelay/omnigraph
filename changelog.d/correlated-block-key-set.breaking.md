@@ -1,0 +1,1 @@
+- Saved query plans now use envelope version 8, which records each correlated block's strategy. Regenerate plans saved with earlier binaries; older binaries reject version 8 plans.

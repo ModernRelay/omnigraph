@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::aggregate::AggregateSpec;
-use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
+use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy};
 use crate::error::PlanError;
 use crate::logical::{
     ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
@@ -526,14 +526,19 @@ pub enum PhysicalNode {
         policy: ExpandPolicy,
         versions: BTreeMap<String, Option<u64>>,
     },
+    /// A correlated block over `input`. Under `Correlated` the `inner` tree's
+    /// leaf is an `OuterReference` to the input rows; under `KeySet` the inner
+    /// tree reads no outer rows and ends on `outer_var`'s identity, the key
+    /// the input rows are kept by.
     AntiJoin {
         input: NodeId,
         inner: NodeId,
         outer_var: String,
         predicate: SubqueryPredicate,
         aggregate: Option<AggregateSpec>,
+        strategy: AntiJoinStrategy,
     },
-    /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
+    /// The enclosing rows, the leaf of a correlated `AntiJoin` inner tree.
     OuterReference {
         outer_var: String,
     },
@@ -994,10 +999,12 @@ impl PhysicalPlan {
                 outer_var,
                 predicate,
                 aggregate,
+                strategy,
                 ..
             } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
+                "strategy": strategy,
                 "predicate": predicate.to_string(),
                 "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
                 "typed_left": crate::typed::block(&predicate.left),

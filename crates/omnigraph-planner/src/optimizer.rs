@@ -13,12 +13,13 @@ use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
-    AccessPath, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
-    choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
-    scan_row_estimate,
+    AccessPath, AntiJoinStrategy, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
+    HASH_JOIN_POOL_DIVISOR, HYDRATE_ROW_RATIO, IndexCoverage, chain_rows, choose_access_path,
+    choose_anti_join_strategy, choose_expand_mode, direction_probe_factor, estimate_rows,
+    executed_hops, hydrate_chunk_bytes, scan_row_estimate,
 };
 use crate::error::PlanError;
+use crate::key_set::{KeySetTree, key_set_tree};
 use crate::logical::{
     ColumnRef, EDGE_TYPE_MEMBER, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId,
     LogicalNode, LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm,
@@ -68,6 +69,7 @@ pub const PASS_LATE_MATERIALIZATION: &str = "late_materialization";
 pub const PASS_JOIN_ALGORITHM: &str = "join_algorithm";
 pub const PASS_EXPAND_MODE: &str = "expand_mode";
 pub const PASS_ACCESS_PATH: &str = "access_path";
+pub const PASS_ANTI_JOIN_STRATEGY: &str = "anti_join_strategy";
 
 /// The optimizer's output: the physical plan with every property declared,
 /// the passes that fired, and every statistic a pass read.
@@ -1135,15 +1137,18 @@ pub fn physical_plan(
     if address_short_circuit(plan, source) {
         fired.push(PASS_ADDRESS_SHORT_CIRCUIT);
     }
+    let key_sets = key_set_trees(plan, source)?;
     let mut lowering = Lowering {
         logical: plan,
         source,
         bounds,
+        key_sets: &key_sets,
         physical: PhysicalPlan::new(),
         late_materialization: false,
         join_algorithm: false,
         expand_mode: false,
         access_path: false,
+        anti_join_strategy: false,
         csr_cached: false,
         decisions: Vec::new(),
         ranking: None,
@@ -1156,6 +1161,7 @@ pub fn physical_plan(
         join_algorithm,
         expand_mode,
         access_path,
+        anti_join_strategy,
         mut decisions,
         ..
     } = lowering;
@@ -1177,6 +1183,9 @@ pub fn physical_plan(
     if access_path {
         fired.push(PASS_ACCESS_PATH);
     }
+    if anti_join_strategy {
+        fired.push(PASS_ANTI_JOIN_STRATEGY);
+    }
     let mut statistics = decisions;
     statistics.extend(derive_properties(&mut physical, source, bounds)?);
     let after = physical
@@ -1191,6 +1200,29 @@ pub fn physical_plan(
         fired,
         statistics,
     })
+}
+
+/// The key-set tree of every `AntiJoin` whose block qualifies (`key_set.rs`),
+/// built before physical selection, which lowers it in place of the
+/// correlated tree when pass 10 prices it lower.
+fn key_set_trees(
+    plan: &LogicalPlan,
+    source: &dyn PlanSource,
+) -> Result<HashMap<LogicalId, KeySetTree>, PlanError> {
+    let mut trees = HashMap::new();
+    for (id, node) in plan.live() {
+        if let LogicalNode::AntiJoin {
+            inner,
+            outer_var,
+            predicate,
+            ..
+        } = node
+            && let Some(tree) = key_set_tree(plan, *inner, outer_var, predicate, source)?
+        {
+            trees.insert(id, tree);
+        }
+    }
+    Ok(trees)
 }
 
 /// The nodes of the pipeline under `root` that constrain its rows: every
@@ -2229,9 +2261,13 @@ fn address_short_circuit(plan: &mut LogicalPlan, source: &dyn PlanSource) -> boo
 /// materialization (pass 6) at every `Join` and the join algorithm rule
 /// (pass 7): a fragment-scoped right input builds, everything else streams.
 struct Lowering<'a> {
+    /// The arena `lower` reads: the plan's, or a key-set tree's while one is
+    /// lowered in place of its block's correlated tree.
     logical: &'a LogicalPlan,
     source: &'a dyn PlanSource,
     bounds: &'a Bounds,
+    /// The key-set tree of each qualifying `AntiJoin`, by its logical id.
+    key_sets: &'a HashMap<LogicalId, KeySetTree>,
     physical: PhysicalPlan,
     late_materialization: bool,
     join_algorithm: bool,
@@ -2239,6 +2275,8 @@ struct Lowering<'a> {
     expand_mode: bool,
     /// Pass 9 fired: a dependent scan's access path came from the cost model.
     access_path: bool,
+    /// Pass 10 fired: a correlated block's strategy came from the cost model.
+    anti_join_strategy: bool,
     /// An earlier lowered node of this plan realizes the query's CSR (an
     /// `Expand` in `Csr` mode or an `AntiJoin`), so a later `Expand` reuses
     /// it for free. Lowering order is execution order (inputs first).
@@ -2744,14 +2782,31 @@ impl Lowering<'_> {
                 predicate,
             } => {
                 let lowered = self.lower(*input)?;
-                let inner_lowered = self.lower(*inner)?;
-                self.csr_cached = true;
+                let key_set = self.key_sets.get(&id);
+                let strategy = match key_set {
+                    Some(tree) => self.anti_join_strategy(*input, *inner, outer_var, tree),
+                    None => AntiJoinStrategy::Correlated,
+                };
+                let inner_lowered = match (strategy, key_set) {
+                    (AntiJoinStrategy::KeySet, Some(tree)) => {
+                        let logical = std::mem::replace(&mut self.logical, &tree.plan);
+                        let lowered = self.lower(tree.root);
+                        self.logical = logical;
+                        lowered?
+                    }
+                    _ => {
+                        let lowered = self.lower(*inner)?;
+                        self.csr_cached = true;
+                        lowered
+                    }
+                };
                 Ok(self.physical.add(PhysicalNode::AntiJoin {
                     input: lowered,
                     inner: inner_lowered,
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                     aggregate: crate::plan_block_aggregate(&predicate.left)?,
+                    strategy,
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {
@@ -3145,6 +3200,33 @@ impl Lowering<'_> {
             origin: "projected widths and storage statistics".to_string(),
         });
         Ok(access)
+    }
+
+    /// Pass 10, the strategy of a correlated block with a key-set tree: the
+    /// cost model over the rows each inner tree produces, the correlated one
+    /// from the outer input's row-count estimate (`chain_rows`); `Correlated`
+    /// when an estimate is unknown.
+    fn anti_join_strategy(
+        &mut self,
+        input: LogicalId,
+        inner: LogicalId,
+        outer_var: &str,
+        tree: &KeySetTree,
+    ) -> AntiJoinStrategy {
+        let outer_rows = estimate_rows(self.logical, input, self.source);
+        let (Some(correlated), Some(key_set)) = (
+            chain_rows(self.logical, inner, self.source, outer_rows),
+            chain_rows(&tree.plan, tree.root, self.source, None),
+        ) else {
+            return AntiJoinStrategy::Correlated;
+        };
+        self.anti_join_strategy = true;
+        self.decisions.push(StatisticSource {
+            statistic: format!("anti_join_rows(${outer_var})"),
+            value: format!("correlated {correlated} estimated, key_set {key_set} estimated"),
+            origin: "row-count estimates of the block's two inner trees".to_string(),
+        });
+        choose_anti_join_strategy(correlated, key_set)
     }
 
     fn set_ordered(&mut self, id: NodeId, value: bool) {

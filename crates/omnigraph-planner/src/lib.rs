@@ -29,6 +29,7 @@ pub mod cost;
 pub mod error;
 pub mod explain;
 pub mod gate;
+mod key_set;
 pub mod logical;
 pub mod lower;
 pub mod mirror;
@@ -48,10 +49,11 @@ pub use aggregate::{
 };
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
-    AccessPath, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs, ExpandMode, ExpandPolicy,
-    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage, choose_access_path,
-    choose_expand_mode, direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes,
-    scan_row_estimate, should_switch_to_csr,
+    AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, ExpandCostInputs,
+    ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO,
+    IndexCoverage, chain_rows, choose_access_path, choose_anti_join_strategy, choose_expand_mode,
+    direction_probe_factor, estimate_rows, executed_hops, hydrate_chunk_bytes, scan_row_estimate,
+    should_switch_to_csr,
 };
 pub use error::PlanError;
 pub use explain::Explain;

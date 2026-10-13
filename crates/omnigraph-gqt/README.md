@@ -439,6 +439,7 @@ scan Doc: not columns [embedding]
 scan Doc as $d: filter reads [d.state]
 scan Doc as $e: no filter
 hash join $e
+anti join $p: key_set
 expand $d Knows $e: mode indexed_scan
 filter reads [d.rank, e.rank]
 sort tiebreak [$d, $e]
@@ -531,7 +532,12 @@ has another access path or is the build side of a hash join. A `hash
 join $var` line claims that a physical `HashJoin` reaches `$var`'s rows by
 reading its table once as the build side the traversal probes (pass
 `access_path` when the cost model decided); it fails when the plan holds no
-hash join over that binding. The `hash join` and `expand` lines take a
+hash join over that binding. An `anti join $var: <correlated|key_set>` line
+claims the strategy of every physical `AntiJoin` correlated on `$var` (a `not`,
+`exists`, `count` or aggregate block): `correlated` starts its inner tree from
+the outer rows, `key_set` runs it once from the block's own bounded binding
+(pass `anti_join_strategy`); it fails when no such block is in the physical
+plan or one took the other strategy. The `hash join` and `expand` lines take a
 trailing `ran <side>` (`hash join $e ran id_lookup`, `mode indexed_scan ran
 csr`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined

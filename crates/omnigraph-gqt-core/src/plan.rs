@@ -11,6 +11,7 @@
 //! scan Doc as $d: access id_lookup
 //! hash join $d
 //! hash join $d ran id_lookup
+//! anti join $x: key_set
 //! scan Doc as $d: ranked bm25
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
@@ -32,20 +33,21 @@
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_planner::optimizer::{
-    PASS_ACCESS_PATH, PASS_ADDRESS_SHORT_CIRCUIT, PASS_AGGREGATE_PUSHDOWN, PASS_EXPAND_MODE,
-    PASS_FRAGMENT_SCOPE, PASS_JOIN_ALGORITHM, PASS_LATE_MATERIALIZATION, PASS_PREDICATE_PUSHDOWN,
-    PASS_PROJECTION_PUSHDOWN, PASS_RESOLVE,
+    PASS_ACCESS_PATH, PASS_ADDRESS_SHORT_CIRCUIT, PASS_AGGREGATE_PUSHDOWN, PASS_ANTI_JOIN_STRATEGY,
+    PASS_EXPAND_MODE, PASS_FRAGMENT_SCOPE, PASS_JOIN_ALGORITHM, PASS_LATE_MATERIALIZATION,
+    PASS_PREDICATE_PUSHDOWN, PASS_PROJECTION_PUSHDOWN, PASS_RESOLVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::report::Row;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `rank fuse row tiebreak [$e.@type, $e.@id]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
 const EXPAND_MODES: [&str; 2] = ["csr", "indexed_scan"];
+const ANTI_JOIN_STRATEGIES: [&str; 2] = ["correlated", "key_set"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AggregateClaim {
@@ -119,6 +121,12 @@ pub(crate) enum PlanLine {
     HashJoin {
         binding: String,
         ran: Option<String>,
+    },
+    /// Every physical `AntiJoin` correlated on `$outer_var` reaches its
+    /// block's matches by `strategy` (`correlated` or `key_set`).
+    AntiJoin {
+        outer_var: String,
+        strategy: String,
     },
     /// Every selected physical scan is ranked, and one of them by the named
     /// index, asking it for `fetch` candidates and under the probe cap
@@ -228,6 +236,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 PASS_JOIN_ALGORITHM,
                 PASS_EXPAND_MODE,
                 PASS_ACCESS_PATH,
+                PASS_ANTI_JOIN_STRATEGY,
                 omnigraph_planner::scan_access::PASS_SCAN_ACCESS,
                 omnigraph_planner::scan_access::PASS_KEY_TO_ID,
             ]
@@ -434,6 +443,26 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         }
+        if let Some(rest) = line.strip_prefix("anti join ") {
+            let claim = rest.split_once(':').and_then(|(outer_var, strategy)| {
+                let outer_var = outer_var
+                    .trim()
+                    .strip_prefix('$')
+                    .filter(|v| identifier(v))?;
+                let strategy = strategy.trim();
+                ANTI_JOIN_STRATEGIES
+                    .contains(&strategy)
+                    .then(|| (outer_var.to_string(), strategy.to_string()))
+            });
+            let Some((outer_var, strategy)) = claim else {
+                return Err(refused("claims `anti join $var: <correlated|key_set>`"));
+            };
+            lines.push(PlanLine::AntiJoin {
+                outer_var,
+                strategy,
+            });
+            continue;
+        }
         let join = if let Some(rest) = line.strip_prefix("contains join ") {
             Some((rest, "contains join"))
         } else {
@@ -464,7 +493,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             (rest, true)
         } else {
             return Err(refused(
-                "knows fourteen line heads: `scan`, `hash join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
+                "knows fifteen line heads: `scan`, `hash join`, `anti join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -918,6 +947,8 @@ struct PlannedNodes {
     modes: Vec<PlannedExpandMode>,
     accesses: Vec<PlannedAccess>,
     joins: Vec<PlannedJoin>,
+    /// `(outer_var, strategy)` of every physical `AntiJoin`.
+    anti_joins: Vec<(String, String)>,
     contains_joins: Vec<PlannedContainsJoin>,
     cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
@@ -1192,24 +1223,27 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 "expect plan: Aggregate has no aggregates list".to_string()
             )),
         },
-        Some("AntiJoin") => match node.get("aggregate") {
-            Some(Value::Null) => {}
-            Some(entry) => {
-                let mut entry = entry.clone();
-                if let Some(fields) = entry.as_object_mut()
-                    && let Some(gq) = fields.remove("gq")
-                {
-                    fields.insert("column".into(), gq);
+        Some("AntiJoin") => {
+            out.anti_joins.push((text("outer_var"), text("strategy")));
+            match node.get("aggregate") {
+                Some(Value::Null) => {}
+                Some(entry) => {
+                    let mut entry = entry.clone();
+                    if let Some(fields) = entry.as_object_mut()
+                        && let Some(gq) = fields.remove("gq")
+                    {
+                        fields.insert("column".into(), gq);
+                    }
+                    out.block_aggregates
+                        .push(serde_json::from_value(entry).map_err(|error| {
+                            format!("expect plan: malformed block aggregate entry: {error}")
+                        }));
                 }
-                out.block_aggregates
-                    .push(serde_json::from_value(entry).map_err(|error| {
-                        format!("expect plan: malformed block aggregate entry: {error}")
-                    }));
+                None => out.block_aggregates.push(Err(
+                    "expect plan: AntiJoin has no aggregate declaration".into(),
+                )),
             }
-            None => out.block_aggregates.push(Err(
-                "expect plan: AntiJoin has no aggregate declaration".into(),
-            )),
-        },
+        }
         Some("Expand") => {
             out.selections.push((
                 text("src"),
@@ -1851,6 +1885,32 @@ pub(crate) fn plan_mismatch(
                         }
                         Ok(_) => {}
                     }
+                }
+            }
+            PlanLine::AntiJoin {
+                outer_var,
+                strategy,
+            } => {
+                let selected: Vec<&str> = nodes
+                    .anti_joins
+                    .iter()
+                    .filter(|(var, _)| var == outer_var)
+                    .map(|(_, planned)| planned.as_str())
+                    .collect();
+                if selected.is_empty() {
+                    let known: Vec<String> = nodes
+                        .anti_joins
+                        .iter()
+                        .map(|(var, _)| format!("${var}"))
+                        .collect();
+                    return Some(format!(
+                        "expect plan: no anti join correlated on `${outer_var}` in the physical plan; it correlates {known:?}"
+                    ));
+                }
+                if let Some(planned) = selected.iter().find(|planned| **planned != strategy) {
+                    return Some(format!(
+                        "expect plan: the anti join on `${outer_var}` is `{planned}`, expected `{strategy}`"
+                    ));
                 }
             }
             PlanLine::Scan {
@@ -2730,6 +2790,55 @@ mod tests {
             "hash join $d ran",
             "hash join $d ran csr",
             "hash join $d took hash_join",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn anti_join_claims_read_each_blocks_strategy() {
+        let explain = json!({
+            "physical_plan": {"node": "Projection", "inputs": [
+                {"node": "AntiJoin", "outer_var": "x", "strategy": "key_set", "aggregate": null, "inputs": [
+                    {"node": "AntiJoin", "outer_var": "p", "strategy": "correlated", "aggregate": null, "inputs": [
+                        {"node": "Scan", "table": "node:Person", "binding": "p"},
+                        {"node": "OuterReference", "outer_var": "p"}
+                    ]},
+                    {"node": "Scan", "table": "node:Source", "binding": "s0"}
+                ]}
+            ]},
+            "passes": ["resolve", "anti_join_strategy"],
+        });
+        let lines = parse_plan_body(&[
+            (0, "anti join $x: key_set"),
+            (1, "anti join $p: correlated"),
+            (2, "pass anti_join_strategy"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::AntiJoin {
+                outer_var: "x".to_string(),
+                strategy: "key_set".to_string(),
+            }
+        );
+        assert_eq!(check(&lines, &explain), None);
+        for (claim, message) in [
+            (
+                "anti join $x: correlated",
+                "the anti join on `$x` is `key_set`, expected `correlated`",
+            ),
+            ("anti join $q: key_set", "no anti join correlated on `$q`"),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = check(&lines, &explain).unwrap();
+            assert!(mismatch.contains(message), "{mismatch}");
+        }
+        for refused in [
+            "anti join x: key_set",
+            "anti join $x key_set",
+            "anti join $x: hash_join",
+            "anti join $x:",
         ] {
             assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
         }
