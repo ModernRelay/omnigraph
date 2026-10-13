@@ -1,0 +1,262 @@
+# issue: 955
+# red_on: 9556daa2
+# notes: A Boolean expression over aggregates, literals and parameters in an
+# notes: aggregated `return` is evaluated per group after aggregation and
+# notes: projects a Bool column under its alias (`Bool?` when an operand can be
+# notes: null): `count($p) > 0 as has_member` gives one `false` row on an empty
+# notes: match, grouped flags follow their group, `and` joins two comparisons,
+# notes: and the alias or returned expression is an `order` key. Node group
+# notes: keys retain their complete fields. A comparison over an aggregate in
+# notes: `match`, a property leaf beside the aggregate, and a missing alias
+# notes: stay refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Forum {
+    slug: String @key
+    title: String
+    min_members: I64
+}
+
+node Person {
+    slug: String @key
+    name: String
+    age: I64?
+}
+
+edge HasMember: Forum -> Person
+
+--- seed
+{"type":"Forum","data":{"slug":"f1","title":"graph club","min_members":2}}
+{"type":"Forum","data":{"slug":"f2","title":"chess","min_members":1}}
+{"type":"Forum","data":{"slug":"f3","title":"empty","min_members":1}}
+{"type":"Person","data":{"slug":"ann","name":"Ann Lee","age":30}}
+{"type":"Person","data":{"slug":"bob","name":"Bob Ray"}}
+{"type":"Person","data":{"slug":"cyd","name":"Cyd Vox","age":50}}
+{"edge":"HasMember","from":"f1","to":"ann"}
+{"edge":"HasMember","from":"f1","to":"bob"}
+{"edge":"HasMember","from":"f2","to":"cyd"}
+
+--- query
+query has_members() {
+    match {
+        $f: Forum { slug: "f1" }
+        $f hasMember $p
+    }
+    return { count($p) > 0 as has_member }
+}
+
+--- expect unordered
+{"has_member": true}
+
+--- expect shape
+has_member: Bool?
+
+--- query
+query no_members_is_false() {
+    match {
+        $f: Forum { slug: "f3" }
+        $f hasMember $p
+    }
+    return { count($p) > 0 as has_member }
+}
+
+--- expect unordered
+{"has_member": false}
+
+--- expect shape
+has_member: Bool?
+
+--- query
+query literal_on_the_left() {
+    match {
+        $f: Forum { slug: "f1" }
+        $f hasMember $p
+    }
+    return { 1 < count($p) as several }
+}
+
+--- expect unordered
+{"several": true}
+
+--- expect shape
+several: Bool?
+
+--- query
+query popular_per_forum() {
+    match {
+        $f: Forum
+        $f hasMember $p
+    }
+    return { $f.title as title, count($p) > 1 as popular, count($p) as members }
+    order { popular desc, title asc }
+}
+
+--- expect unordered
+{"title": "graph club", "popular": true, "members": 2}
+{"title": "chess", "popular": false, "members": 1}
+
+--- expect shape
+title: String
+popular: Bool?
+members: I64
+
+--- query
+query senior_per_forum() {
+    match {
+        $f: Forum
+        $f hasMember $p
+    }
+    return { $f.title as title, max($p.age) > 40 as senior }
+}
+
+--- expect unordered
+{"title": "graph club", "senior": false}
+{"title": "chess", "senior": true}
+
+--- expect shape
+title: String
+senior: Bool?
+
+--- query
+query node_group_keys() {
+    match { $p: Person }
+    return { count($p) > 0 as present, $p as person }
+}
+
+--- expect unordered
+{"present":true,"person":{"@id":"ann","slug":"ann","name":"Ann Lee","age":30}}
+{"present":true,"person":{"@id":"bob","slug":"bob","name":"Bob Ray"}}
+{"present":true,"person":{"@id":"cyd","slug":"cyd","name":"Cyd Vox","age":50}}
+
+--- expect shape
+present: Bool?
+person: Person
+
+--- query
+query popular_ordered_by_expression() {
+    match {
+        $f: Forum
+        $f hasMember $p
+    }
+    return { $f.title as title, count($p) > 1 as popular }
+    order { count($p) > 1 desc }
+    limit 1
+}
+
+--- expect unordered
+{"title":"graph club","popular":true}
+
+--- expect shape
+title: String
+popular: Bool?
+
+--- query
+query nobody_has_an_age() {
+    match {
+        $f: Forum { slug: "f3" }
+        $f hasMember $p
+    }
+    return { max($p.age) is null as nobody }
+}
+
+--- expect unordered
+{"nobody": true}
+
+--- expect shape
+nobody: Bool
+
+--- query
+query senior_club() {
+    match {
+        $f: Forum { slug: "f2" }
+        $f hasMember $p
+    }
+    return { count($p) > 0 and max($p.age) > 40 as senior_club }
+}
+
+--- expect unordered
+{"senior_club": true}
+
+--- expect shape
+senior_club: Bool?
+
+--- query
+query enough_members($min: I64) {
+    match {
+        $f: Forum { slug: "f1" }
+        $f hasMember $p
+    }
+    return { count($p) >= $min as enough }
+}
+
+--- params
+{"min": 3}
+
+--- expect unordered
+{"enough": false}
+
+--- expect shape
+enough: Bool?
+
+--- query
+query any_person() {
+    match { $p: Person }
+    return { count($p) > 0 as any_person }
+}
+
+--- expect unordered
+{"any_person": true}
+
+--- expect shape
+any_person: Bool?
+
+--- query
+query comparison_in_match() {
+    match {
+        $f: Forum
+        $f hasMember $p
+        count($p) > 0
+    }
+    return { $f.title }
+}
+
+--- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+
+--- query
+query property_beside_aggregate() {
+    match {
+        $f: Forum
+        $f hasMember $p
+    }
+    return { $f.title, count($p) >= $f.min_members as big }
+}
+
+--- expect error: compares aggregates with constants only
+
+--- query
+query missing_alias() {
+    match {
+        $f: Forum
+        $f hasMember $p
+    }
+    return { count($p) > 0 }
+}
+
+--- expect error: T43: a comparison in return needs an alias; write `… as <name>`
+
+--- query
+query comparison_order_key_not_returned() {
+    match { $p: Person }
+    return { count($p) > 0 as present }
+    order { count($p) > 1 }
+}
+
+--- expect error: T42:
