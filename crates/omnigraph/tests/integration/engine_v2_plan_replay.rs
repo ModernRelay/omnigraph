@@ -1308,8 +1308,12 @@ async fn a_fusion_replays() {
     });
     forged.plan.set_properties(never, properties);
     match forged.plan.node_mut(parent) {
-        Some(PhysicalNode::Sort { input, .. }) => *input = never,
-        other => panic!("the fusion's parent is a sort: {other:?}"),
+        Some(
+            PhysicalNode::Projection { input, .. }
+            | PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Limit { input, .. },
+        ) => *input = never,
+        other => panic!("the fusion feeds a single-input node: {other:?}"),
     }
     let error = match db
         .replay_bound_plan(
