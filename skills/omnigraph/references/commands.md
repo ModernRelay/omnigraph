@@ -29,9 +29,10 @@ prints the exact flags of the installed binary.
 | `mutate` | — | Run a mutation, or a `branch create`/`delete`/`merge` or `commit publish`/`drop` statement |
 | `alias` | — | Invoke an operator alias's stored read query |
 | `load` | — | Bulk-load JSONL; `--mode` is required |
-| `branch` | `create` `list` `delete` `merge` | Manage graph branches |
+| `branch` | `create` `list` `delete` `merge` `diff` `merge-base` | Manage graph branches; `diff` reviews what a branch changed since its merge base, `merge-base` prints that base |
 | `snapshot` | — | Show one branch's types, entity counts and dataset versions |
 | `export` | — | Stream a branch as JSONL |
+| `diff` | — | Net entity changes between two read targets (branch heads or graph commit ids) |
 | `blob` | `get` `stat` `put` `clear` | Read, inspect, replace or clear one Blob cell |
 | `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
 | `changes` | `poll` `baseline` | Follow a branch's change feed |

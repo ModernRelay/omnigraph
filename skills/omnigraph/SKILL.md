@@ -177,6 +177,7 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `export [--branch <b>] [--type <T>…]` (streams JSONL)
 - `branch <create <name> [--from <base>] | list | delete <name> | merge <source> [--into <target>] [--delete-branch]> [--json]` (`--from`/`--into` default to `main`; also available as GQ statements via `mutate -e`/`query -e`)
 - `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
+- `diff --from <branch|commit_id> --to <branch|commit_id> [filters…] [--json]` — net entity changes between two read targets; `branch diff <source> [--into <target>]` reviews a branch against its merge base, and `branch merge-base <source> [--into <target>]` prints that base
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
 - `schema show` (alias `get`)
 
