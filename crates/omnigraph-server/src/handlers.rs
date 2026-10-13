@@ -43,7 +43,7 @@ where
 
 mod dispatch;
 use dispatch::{
-    CommitControlOutcome, Door, ReadDispatch, classify, commit_control_body,
+    CommitControlOutcome, Door, ReadDispatch, branch_read_body, classify, commit_control_body,
     commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
     read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
     refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
@@ -791,7 +791,14 @@ pub(crate) async fn server_snapshot(
 ///
 /// The GQ statement `branch list` is also served here, with no `branch`,
 /// `snapshot`, `name`, or `params`: it answers one result per branch (field
-/// `name`, byte order) under the same `read` check as `GET /branches`.
+/// `name`, byte order) under the same `read` check as `GET /branches`. So are
+/// the branch control reads, each under its route's checks and errors:
+/// `branch diff <source> [into <target>]` and `branch diff <from> to <to>`
+/// (one result per entity change, fields `kind`, `type`, `id`, `op`,
+/// `before`, `after`; the compared commits and the continuation token in
+/// `page`; `after page "<token>"` and `limit <n>` continue and bound it),
+/// `branch merge-base <source> [into <target>]` and
+/// `branch merge <source> [into <target>] dry run` (one result each).
 /// `branch create`, `branch delete`, and `branch merge` are rejected with
 /// 400; send them to `POST /mutate`.
 ///
@@ -1567,7 +1574,9 @@ pub(crate) async fn run_mutate(
                     let session = session_with_prefix(&session, &file.settings)?;
                     run_branch_statement(&state, &handle, &session, actor, ingress, write).await
                 }
-                BranchStmt::List => Err(read_at_write_door()),
+                BranchStmt::List | BranchStmt::Read(_) => {
+                    Err(read_at_write_door(stmt.statement_name()))
+                }
             };
         }
         FileBody::Commit(write) => {
@@ -1753,6 +1762,9 @@ pub(crate) async fn run_query(
                 BranchStmt::List => Ok(ReadDispatch::BranchList(
                     branch_list_body(&handle, actor).await?,
                 )),
+                BranchStmt::Read(read) => Ok(ReadDispatch::BranchRead(
+                    branch_read_body(&handle, &session, actor, read).await?,
+                )),
                 BranchStmt::Write(write) => Err(control_write_at_read_door(&write)),
             };
         }
@@ -1873,7 +1885,7 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>
     request_body = ChangeRequest,
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
-        (status = 400, description = "Bad request - also returned when `branch list` arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when `branch list` or a branch control read (`branch diff`, `branch merge-base`, `branch merge … dry run`) arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "`branch delete` of a branch that does not exist, as DELETE /branches/{branch} answers", body = ErrorOutput),
@@ -1903,8 +1915,9 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>
 /// here, with no `branch`, `name`, or `params`: each runs the handler body
 /// of its `/branches` route (same Cedar action, admission check, and errors,
 /// including the 409 of a conflicting merge) and answers a `ChangeOutput`
-/// whose `outcome` names the effect. `branch list` is rejected with 400;
-/// send it to `POST /query`.
+/// whose `outcome` names the effect. `branch list` and the branch control
+/// reads (`branch diff`, `branch merge-base`, `branch merge … dry run`) are
+/// rejected with 400; send them to `POST /query`.
 pub(crate) async fn server_mutate(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
@@ -4069,9 +4082,33 @@ pub(crate) async fn server_diff(
     validate_change_http_limit(params.limit)?;
     let from = required_diff_param(params.from, "from")?;
     let to = required_diff_param(params.to, "to")?;
+    let page = two_point_diff_page(
+        &handle,
+        actor.as_ref().map(|Extension(actor)| actor),
+        from,
+        to,
+        api::change_scope(&params.kinds, &params.types, &params.ops),
+        params.page_token,
+        params.limit,
+    )
+    .await?;
+    Ok(Json(api::diff_output(&page)))
+}
+
+/// One page of the net change between two read targets, for `GET /diff` and
+/// the `branch diff <from> to <to>` statement: each side is authorized on the
+/// branch it resolves to, and a side the actor cannot read answers the 404 a
+/// side naming nothing does.
+pub(crate) async fn two_point_diff_page(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    from: String,
+    to: String,
+    scope: omnigraph::changes::ChangeFeedScope,
+    page_token: Option<String>,
+    max_changes: Option<usize>,
+) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
     let db = &handle.engine;
-    let actor = actor.as_ref().map(|Extension(actor)| actor);
-    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
     // One resolution serves authorization and the read: each side is
     // authorized on the branch it resolved to, before any of its data is read.
     let prepared = db
@@ -4081,8 +4118,8 @@ pub(crate) async fn server_diff(
                 to: to.clone(),
             },
             scope,
-            page_token: params.page_token,
-            max_changes: params.limit,
+            page_token,
+            max_changes,
             max_bytes: None,
         })
         .await
@@ -4097,15 +4134,11 @@ pub(crate) async fn server_diff(
     for (side, branch) in prepared.side_branches() {
         authorize_diff_side(actor, handle.policy.as_deref(), side, branch)?;
     }
-    let page = db
-        .run_diff_page(prepared)
-        .await
-        .map_err(change_route_error)?;
-    Ok(Json(api::diff_output(&page)))
+    db.run_diff_page(prepared).await.map_err(change_route_error)
 }
 
 /// Authorize `read` on each named branch of a branch diff or merge base.
-fn authorize_branch_reads(
+pub(crate) fn authorize_branch_reads(
     actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     branches: [&str; 2],
@@ -4156,26 +4189,46 @@ pub(crate) async fn server_branch_diff(
 ) -> std::result::Result<Json<api::DiffOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), BRANCH_DIFF_PARAMS)?;
     validate_change_http_limit(params.limit)?;
-    let source = normalize_change_branch(Some(&required_diff_param(params.source, "source")?))?;
-    let target = normalize_change_branch(params.target.as_deref())?;
-    authorize_branch_reads(
+    let source = required_diff_param(params.source, "source")?;
+    let page = branch_diff_page(
+        &handle,
         actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        [&source, &target],
-    )?;
-    let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
-    let page = handle
+        &source,
+        params.target.as_deref(),
+        api::change_scope(&params.kinds, &params.types, &params.ops),
+        params.page_token,
+        params.limit,
+    )
+    .await?;
+    Ok(Json(api::diff_output(&page)))
+}
+
+/// One page of what `source` changed since its merge base with `target`
+/// (`main` when absent), for `GET /branches/diff` and the `branch diff`
+/// statement: `read` on both named branches before any lineage is read.
+pub(crate) async fn branch_diff_page(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    source: &str,
+    target: Option<&str>,
+    scope: omnigraph::changes::ChangeFeedScope,
+    page_token: Option<String>,
+    max_changes: Option<usize>,
+) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
+    let source = normalize_change_branch(Some(source))?;
+    let target = normalize_change_branch(target)?;
+    authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
+    handle
         .engine
         .diff_page(&omnigraph::changes::GraphDiffRequest {
             sides: omnigraph::changes::GraphDiffSides::Branch { source, target },
             scope,
-            page_token: params.page_token,
-            max_changes: params.limit,
+            page_token,
+            max_changes,
             max_bytes: None,
         })
         .await
-        .map_err(change_route_error)?;
-    Ok(Json(api::diff_output(&page)))
+        .map_err(change_route_error)
 }
 
 #[utoipa::path(
@@ -4204,19 +4257,35 @@ pub(crate) async fn server_merge_base(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> std::result::Result<Json<api::MergeBaseOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), MERGE_BASE_PARAMS)?;
-    let source = normalize_change_branch(Some(&required_diff_param(params.source, "source")?))?;
-    let target = normalize_change_branch(params.target.as_deref())?;
-    authorize_branch_reads(
+    let source = required_diff_param(params.source, "source")?;
+    let (source, target, base) = merge_base_body(
+        &handle,
         actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        [&source, &target],
-    )?;
+        &source,
+        params.target.as_deref(),
+    )
+    .await?;
+    Ok(Json(api::merge_base_output(&source, &target, &base)))
+}
+
+/// The merge base of `source` into `target` (`main` when absent), for
+/// `GET /branches/merge-base` and the `branch merge-base` statement: `read`
+/// on both named branches first. Answers the normalized names with the base.
+pub(crate) async fn merge_base_body(
+    handle: &GraphRequest,
+    actor: Option<&AuthenticatedActor>,
+    source: &str,
+    target: Option<&str>,
+) -> std::result::Result<(String, String, omnigraph::changes::MergeBase), ApiError> {
+    let source = normalize_change_branch(Some(source))?;
+    let target = normalize_change_branch(target)?;
+    authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
     let base = handle
         .engine
         .merge_base(&source, &target)
         .await
         .map_err(change_route_error)?;
-    Ok(Json(api::merge_base_output(&source, &target, &base)))
+    Ok((source, target, base))
 }
 
 /// Contextual 404 projection. `Manifest::NotFound` is a broad internal

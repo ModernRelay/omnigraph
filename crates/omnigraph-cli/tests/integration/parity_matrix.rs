@@ -1494,6 +1494,16 @@ fn parity_branch_review() {
         ][..],
         &["diff", "--from", "main", "--to", "feature", "--json"][..],
         &["branch", "merge", "feature", "--dry-run", "--json"][..],
+        // The same reads as GQ statements at the query door.
+        &["query", "-e", "branch merge-base feature", "--json"][..],
+        &[
+            "query",
+            "-e",
+            "branch diff feature into main limit 1",
+            "--json",
+        ][..],
+        &["query", "-e", "branch diff main to feature", "--json"][..],
+        &["query", "-e", "branch merge feature dry run", "--json"][..],
     ] {
         let (l, r) = p.run(args);
         assert!(
@@ -1516,6 +1526,29 @@ fn parity_branch_review() {
     assert_eq!(dry["outcome"], "fast_forward");
     assert_eq!(dry["dry_run"], true);
     assert!(dry["commit"].is_null());
+    let (l, _r) = p.run(&["query", "-e", "branch diff feature", "--json"]);
+    let rows = parse_stdout_json(&l);
+    assert_eq!(rows["query_name"], "branch diff");
+    assert_eq!(rows["rows"][0]["id"], "Reviewed");
+    assert_eq!(rows["rows"][0]["type"], "Person");
+    assert_eq!(rows["page"]["base_commit_id"], review["base_commit_id"]);
+    let (l, r) = p.run(&["query", "-e", "branch merge feature dry run", "--json"]);
+    for output in [&l, &r] {
+        assert_eq!(
+            parse_stdout_json(output)["rows"][0]["outcome"],
+            "fast_forward"
+        );
+    }
+    // A branch read sent through `mutate` is refused as a read on both arms.
+    let (l, r) = p.run(&["mutate", "-e", "branch diff feature"]);
+    for output in [&l, &r] {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("statement 'branch diff' is a read; use POST /query"),
+            "{output:?}"
+        );
+    }
     // The dry run wrote nothing: the real merge still has work to do.
     let (l, r) = p.run(&["branch", "merge", "feature", "--json"]);
     assert_write_parity("merge after the dry run", &l, &r);

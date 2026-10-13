@@ -1745,6 +1745,94 @@ fn branch_statements_parse_with_and_without_their_defaults() {
 }
 
 #[test]
+fn branch_control_reads_parse_as_reads() {
+    let read = |stmt: BranchStmt| match stmt {
+        BranchStmt::Read(read) => read,
+        other => panic!("expected a branch control read, got {other:?}"),
+    };
+    let names = |source: &str, into: Option<&str>| (source.to_string(), into.map(str::to_string));
+
+    let diff = parse_branch("branch diff feature");
+    assert!(!diff.is_write());
+    assert_eq!(diff.statement_name(), "branch diff");
+    assert_eq!(
+        read(diff),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: None,
+            },
+            page: DiffPageClause::default(),
+        }
+    );
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff feature into main after page "tok" limit 50"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: Some("main".to_string()),
+            },
+            page: DiffPageClause {
+                after_page: Some("tok".to_string()),
+                limit: Some(50),
+            },
+        }
+    );
+    // A commit id is quoted: it is not an identifier.
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV" to main limit 1"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Between {
+                from: "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                to: "main".to_string(),
+            },
+            page: DiffPageClause {
+                after_page: None,
+                limit: Some(1),
+            },
+        }
+    );
+
+    let base = parse_branch("branch merge-base feature into main");
+    assert!(!base.is_write());
+    assert_eq!(base.statement_name(), "branch merge-base");
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(read(base), BranchRead::MergeBase { source, into });
+
+    let dry = parse_branch("branch merge feature dry run");
+    assert!(!dry.is_write());
+    assert_eq!(dry.statement_name(), "branch merge dry run");
+    let (source, into) = names("feature", None);
+    assert_eq!(read(dry), BranchRead::MergeDryRun { source, into });
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(
+        read(parse_branch("branch merge feature into main dry run")),
+        BranchRead::MergeDryRun { source, into }
+    );
+
+    // `dry run` is the clause, never a branch named `dry`; quoted, it is one.
+    assert_eq!(parse_branch(r#"branch merge "dry""#), merge("dry", None));
+    assert!(parse_query("branch merge dry run").is_err());
+    for input in [
+        "branch merge feature dry run as commit",
+        "branch merge feature as commit dry run",
+        "branch merge-base feature dry run",
+        "branch diff feature to",
+        "branch diff feature into main to other",
+        "branch diff feature limit 0",
+        "branch diff feature limit 5 after page \"tok\"",
+        "branch diffx feature",
+        "branch merge-basefeature",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
 fn branch_names_outside_the_identifier_alphabet_are_quoted() {
     assert_eq!(
         parse_branch(r#"branch create "review/add-benchmark""#),

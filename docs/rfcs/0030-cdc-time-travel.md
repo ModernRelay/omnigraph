@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-08-05
-updated: 2026-10-12
+updated: 2026-10-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -782,22 +782,41 @@ answers whether the merge would succeed, without a write.
 
 ### 8.5 Surfaces
 
-| CLI | HTTP | Answers |
-|---|---|---|
-| `diff --from <REV> --to <REV>` | `GET /graphs/{id}/diff?from=&to=` | Net changes between two read targets |
-| `branch diff <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/diff?source=&target=` | What the source changed since its merge base with the target |
-| `branch merge-base <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/merge-base?source=&target=` | The merge base commit |
-| `branch merge <SOURCE> --dry-run` | `POST /graphs/{id}/branches/merge` with `dry_run: true` | Merge outcome or conflicts, without a write |
-| `commit changes <ID>`, unchanged | `GET /graphs/{id}/commits/{commit_id}/changes`, unchanged | One commit's changes with its cause |
+Each surface is a GQ branch statement, a control read in the sense of
+[RFC 0055](0055-gq-branch-statements.md): it enters through `POST /query` and
+`omnigraph query`, standing alone in its file, and `POST /mutate` refuses it
+as a read. The CLI verbs and HTTP routes wrap the same engine call, under the
+same authorization and errors.
 
-The diff commands take the existing `--kind`, `--type`, `--op`, `--limit`,
-`--page-token` and `--json` options and paginate automatically, as
-`commit changes` does. `--into`, `source` and `target` follow `branch merge`.
-Exposing them as GQ statements is deferred, not rejected.
-[RFC 0056](https://github.com/ModernRelay/omnigraph/pull/670) proposes carrying
-`commit changes` and `changes poll` as entity-change rows with an optional page
-object, and the graph diff should take whatever envelope that RFC settles
-rather than decide a second one here. D1–D3 ship through the CLI and HTTP.
+| GQ statement | CLI | HTTP | Answers |
+|---|---|---|---|
+| `branch diff <from> to <to>` | `diff --from <REV> --to <REV>` | `GET /graphs/{id}/diff?from=&to=` | Net changes between two read targets |
+| `branch diff <source> [into <target>]` | `branch diff <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/diff?source=&target=` | What the source changed since its merge base with the target |
+| `branch merge-base <source> [into <target>]` | `branch merge-base <SOURCE> [--into <TARGET>]` | `GET /graphs/{id}/branches/merge-base?source=&target=` | The merge base commit |
+| `branch merge <source> [into <target>] dry run` | `branch merge <SOURCE> --dry-run` | `POST /graphs/{id}/branches/merge` with `dry_run: true` | Merge outcome or conflicts, without a write |
+| none | `commit changes <ID>`, unchanged | `GET /graphs/{id}/commits/{commit_id}/changes`, unchanged | One commit's changes with its cause |
+
+A side is a branch name or a quoted commit id. A `branch diff` statement takes
+`after page "<token>"` and `limit <n>`, in that order. `dry run` is a clause
+like `as commit`: a bare `dry run` after the names is the clause, so a branch
+named `dry` is quoted. The CLI and HTTP diff surfaces also take the `--kind`,
+`--type` and `--op` filters; the statements take none yet.
+
+A statement answers a `ReadOutput` with no target and no graph commit:
+
+- `branch diff`: one row per change in the §4.4 order, columns `kind`, `type`,
+  `id`, `op`, `before` and `after`, the HTTP change shape with the type named
+  by its name. The opaque type id, unique per graph, stays on the HTTP routes,
+  where it lets a consumer follow a type across a rename. The compared commits
+  (`from_commit_id`, `to_commit_id`, `base_commit_id` for the branch form) and
+  the continuation token (`next_page_token`) travel in an optional `page`
+  object on `ReadOutput`, the shape RFC 0056
+  ([#670](https://github.com/ModernRelay/omnigraph/pull/670)) proposes for
+  paged change reads.
+- `branch merge-base`: one row, `source`, `target`, `source_commit_id`,
+  `target_commit_id` and `merge_base_commit_id`.
+- `branch merge … dry run`: one row, `source`, `target` and `outcome`; a
+  conflict is the 409 a merge answers.
 
 ### 8.6 Retiring the table-shaped diff
 
@@ -1440,5 +1459,20 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
   `parity_diff_over_shared_history` and `parity_branch_review`; GQT cases
   `graph_diff_branch_review.gqt`, `graph_diff_merge_proposal.gqt`,
   `graph_diff_net_range.gqt` and `graph_diff_refusals.gqt` on the engine, DST
-  and served targets (RFC 0045's new `--- diff`, `--- merge-base` and
-  `--- merge-dry-run` steps).
+  and served targets (as GQT steps at first, then, per the 2026-10-13 entry,
+  as the branch statements under `--- query`).
+- **2026-10-13: the graph diff surfaces are GQ statements.** Review of
+  ModernRelay/omnigraph#966 asked that the diff, merge base and dry run be GQ
+  statements beside `branch merge … as commit` rather than GQT step kinds.
+  §8.5 now defines `branch diff`, `branch merge-base` and
+  `branch merge … dry run` as RFC 0055 control reads at `POST /query`, with the
+  CLI verbs and HTTP routes as wrappers of the same engine call. The
+  `branch diff` answer carries its compared commits and continuation token in
+  an optional `page` object on `ReadOutput`, the shape RFC 0056 proposes, and
+  names its rows' type by name. GQT runs the statements as ordinary
+  `--- query` steps; the three step kinds RFC 0045 had gained are withdrawn.
+  This entry supersedes these sentences:
+  - §8.5: "Exposing them as GQ statements is deferred, not rejected." and the
+    rest of that paragraph through "D1–D3 ship through the CLI and HTTP."
+  - The 2026-10-12 review entry's "GQ exposure of the diff surfaces is
+    deferred to RFC 0056 (ModernRelay/omnigraph#670), not rejected (§8.5)."

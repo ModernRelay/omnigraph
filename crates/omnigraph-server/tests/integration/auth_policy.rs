@@ -1716,6 +1716,23 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
             format!("'{forbidden_side}' names no branch and no commit")
         );
         assert_eq!(forbidden["code"], unknown["code"]);
+        // The `branch diff <from> to <to>` statement answers the same 404.
+        let statement = |side: &str| {
+            statement_request(
+                "/query",
+                "team-token",
+                &format!(r#"branch diff main to "{side}""#),
+            )
+        };
+        let (forbidden_status, forbidden) = json_response(&app, statement(forbidden_side)).await;
+        let (unknown_status, unknown) = json_response(&app, statement(unknown_side)).await;
+        assert_eq!(forbidden_status, StatusCode::NOT_FOUND, "{forbidden}");
+        assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown}");
+        assert_eq!(
+            forbidden["error"],
+            format!("'{forbidden_side}' names no branch and no commit")
+        );
+        assert_eq!(forbidden["code"], unknown["code"]);
     }
     // The branch routes name their branches outright: a read denial is a 403,
     // and a dry run is a read of both branches.
@@ -1793,6 +1810,20 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     assert_eq!(body["outcome"], "fast_forward");
     assert_eq!(body["dry_run"], true);
     let (status, body) = json_response(&app, merge(false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // The statement form is the same read.
+    let (status, body) = json_response(
+        &app,
+        statement_request("/query", "team-token", "branch merge feature dry run"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0]["outcome"], "fast_forward");
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "team-token", "branch merge feature"),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
@@ -1884,6 +1915,23 @@ async fn policy_branch_review_needs_read_on_the_target() {
     ] {
         let (status, body) = json_response(&app, get(&uri, "team-token")).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    // The statement forms take the same decision.
+    let (status, body) = json_response(
+        &app,
+        statement_request("/query", "team-token", "branch diff feature into main"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for source in [
+        "branch diff feature into private".to_string(),
+        format!(r#"branch diff feature into private after page "{token}" limit 1"#),
+        "branch merge-base feature into private".to_string(),
+        "branch merge feature into private dry run".to_string(),
+    ] {
+        let (status, body) =
+            json_response(&app, statement_request("/query", "team-token", &source)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{source}: {body}");
     }
 }
 

@@ -235,7 +235,7 @@ keep their existing routes and do not expose MCP.
 | `/graphs/{id}/schema` | Show the accepted schema |
 | `/graphs/{id}/export` | Stream a branch snapshot as JSONL |
 
-`/query` also serves `branch list`, `show`, and [explain](../queries/explain.md).
+`/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
 `/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,
 and `commit drop`. See [Branching](../branching/index.md).
 Each of `/query`, `/mutate`, `/mutate/if-graph-commit` and `/branches/merge`

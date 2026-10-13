@@ -568,6 +568,55 @@ fn refuses_mutation_declaration_under_query() {
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
 
+/// A branch control read is a `--- query` rows step whose shape is its own:
+/// it carries no shape section, takes `${name}` for a bound commit in its
+/// sides and its expected rows, and is refused under `--- mutate`, with an
+/// unbound name, or with a shape section.
+#[test]
+fn branch_read_steps_parse_and_refuse() {
+    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    let accepted = format!(
+        "{HDR}{SCHEMA}{SEED}{BIND}\
+         --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
+         --- query\nbranch merge-base main\n--- expect ordered\n\
+         {{\"source\": \"main\", \"target\": \"main\", \"source_commit_id\": \"${{c}}\", \"target_commit_id\": \"${{c}}\", \"merge_base_commit_id\": \"${{c}}\"}}\n\
+         --- query\nbranch merge main dry run\n--- expect error: nothing\n"
+    );
+    let case = parse_case("x", &accepted).unwrap();
+    let reads = case
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Step(Step::BranchRead(_))))
+        .count();
+    assert_eq!(reads, 3);
+
+    for (step, want) in [
+        (
+            "--- mutate\nbranch diff feature\n--- expect ok\n".to_string(),
+            "`branch diff` under `--- mutate` is refused; use `--- query`",
+        ),
+        (
+            "--- query\nbranch diff \"${x}\" to main\n--- expect ordered\n".to_string(),
+            "`${x}` is not bound; `--- bind commit $x` must precede this step",
+        ),
+        (
+            "--- query\nbranch merge-base feature\n--- expect ok\n".to_string(),
+            "`branch merge-base` takes `unordered`, `ordered`, or `error:`",
+        ),
+    ] {
+        let text = format!("{HDR}{SCHEMA}{SEED}{step}");
+        assert_eq!(refusal("x", &text), want, "{step}");
+    }
+    let shaped = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nbranch merge feature dry run\n--- expect ordered\n--- expect shape\noutcome: String\n"
+    );
+    assert!(
+        refusal("x", &shaped)
+            .contains("answers its own columns; drop the `--- expect shape` section"),
+        "{shaped}"
+    );
+}
+
 const CREATE: &str = "--- mutate\nbranch create b0\n--- expect ok\n";
 const LIST: &str = "--- query\nbranch list\n--- expect unordered\n{\"name\": \"b0\"}\n{\"name\": \"main\"}\n--- expect shape\nname: String\n";
 
@@ -663,131 +712,6 @@ fn refuses_outcome_on_any_step_but_a_merge() {
     ] {
         let text = format!("{HDR}{SCHEMA}{SEED}{step}{outcome}");
         assert_eq!(refusal("x", &text), want, "{step}");
-    }
-}
-
-#[test]
-fn diff_steps_parse_their_sides_and_expects() {
-    let bind = "--- mutate\nquery add() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
-    let text = format!(
-        "{HDR}{SCHEMA}{SEED}{bind}\
-         --- diff from: $c to: main\n--- expect ordered\n{{\"id\": \"bob\"}}\n\
-         --- diff source: feature\n--- expect unordered\n\
-         --- diff commit: $c\n--- expect error: nope\n\
-         --- merge-base source: feature target: main\n--- expect commit $c\n\
-         --- merge-dry-run source: feature\n--- expect outcome: merged\n"
-    );
-    let case = parse_case("x", &text).unwrap();
-    let steps: Vec<&Step> = case
-        .items
-        .iter()
-        .map(|item| match item {
-            Item::Step(step) => step,
-            Item::Loop { .. } => panic!("no loops here"),
-        })
-        .collect();
-    let [
-        _,
-        Step::Diff(between),
-        Step::Diff(branch),
-        Step::Diff(commit),
-        Step::MergeBase(base),
-        Step::MergeDryRun(dry),
-    ] = steps.as_slice()
-    else {
-        panic!("unexpected steps: {steps:?}");
-    };
-    assert_eq!(
-        between.sides,
-        DiffSides::Between {
-            from: "$c".into(),
-            to: "main".into()
-        }
-    );
-    assert!(matches!(
-        between.expect(),
-        DiffExpect::Rows { ordered: true, rows } if rows.len() == 1
-    ));
-    assert_eq!(
-        branch.sides,
-        DiffSides::Branch {
-            source: "feature".into(),
-            target: "main".into()
-        }
-    );
-    assert!(matches!(
-        branch.expect(),
-        DiffExpect::Rows { ordered: false, rows } if rows.is_empty()
-    ));
-    assert_eq!(
-        commit.sides,
-        DiffSides::Commit {
-            commit: "$c".into()
-        }
-    );
-    assert!(matches!(commit.expect(), DiffExpect::Error { needle } if needle == "nope"));
-    assert_eq!(
-        (base.source.as_str(), base.target.as_str()),
-        ("feature", "main")
-    );
-    assert!(matches!(base.expect(), MergeBaseExpect::Commit { name } if name == "c"));
-    assert_eq!(
-        (dry.source.as_str(), dry.target.as_str()),
-        ("feature", "main")
-    );
-    assert!(matches!(
-        dry.expect(),
-        MergeExpect::Outcome(MergeOutcome::Merged)
-    ));
-}
-
-#[test]
-fn diff_steps_refuse_bad_arguments_and_expects() {
-    for (steps, want) in [
-        (
-            "--- diff from: $c to: main\n--- expect ordered\n",
-            "`--- diff` side `$c` is not bound",
-        ),
-        (
-            "--- diff from: main source: feature\n--- expect ordered\n",
-            "`--- diff` takes `from:` and `to:`, `source:` with an optional `target:`, or `commit:`",
-        ),
-        (
-            "--- diff branch: main\n--- expect ordered\n",
-            "`--- diff` takes `from:`, `to:`, `source:`, `target:`, `commit:` as `key: value`, got `branch:`",
-        ),
-        (
-            "--- diff from: main to: main\n--- expect ok\n",
-            "a `--- diff` step takes `ordered` or `unordered` rows, or `error:`",
-        ),
-        (
-            "--- diff from: main to: main\n--- expect ordered\n[1]\n",
-            "a diff row is one JSON object",
-        ),
-        (
-            "--- merge-base target: main\n--- expect error: x\n",
-            "`--- merge-base` needs `source:`",
-        ),
-        (
-            "--- merge-base source: feature\n--- expect commit $c\n",
-            "`expect commit $c`: `$c` is not bound",
-        ),
-        (
-            "--- merge-dry-run source: feature\n--- expect ordered\n",
-            "rows",
-        ),
-        (
-            "--- mutate\nbranch create b0\n--- expect commit $c\n",
-            "`expect commit $name` is accepted on a `--- merge-base` step only",
-        ),
-        (
-            "--- diff from: main to: main\nbody\n--- expect ordered\n",
-            "`--- diff`",
-        ),
-    ] {
-        let text = format!("{HDR}{SCHEMA}{SEED}{steps}");
-        let error = refusal("x", &text);
-        assert!(error.contains(want), "{steps}: {error}");
     }
 }
 

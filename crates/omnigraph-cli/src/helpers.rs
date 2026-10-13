@@ -8,7 +8,7 @@ use omnigraph_api_types::{
     ChangeRequest, QueryRequest, branch_statement_refusals, query_file_refusals,
 };
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
+    BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, QueryFile, show_statement_name,
 };
 use omnigraph_compiler::settings::SettingId;
 
@@ -978,11 +978,12 @@ pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
     )
 }
 
-/// The server's refusal for `branch list` sent through `mutate`.
-pub(crate) fn read_at_write_door() -> String {
+/// The server's refusal for a branch read (`branch list`, `branch diff`, …)
+/// sent through `mutate`.
+pub(crate) fn read_at_write_door(statement_name: &str) -> String {
     branch_statement_refusals::with_statement(
         branch_statement_refusals::READ_AT_WRITE_DOOR,
-        BranchStmt::List.statement_name(),
+        statement_name,
     )
 }
 

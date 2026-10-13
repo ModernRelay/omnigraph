@@ -1,7 +1,7 @@
 # issue: none
 # notes: A graph diff compares its endpoints and never folds history (RFC 0030 §8.2): a reverted update,
 # notes: an insert later deleted and an equal reinsert produce nothing; a changed reinsert is one update;
-# notes: an insert later updated is one insert with the final image. A commit's own diff is its change.
+# notes: an insert later updated is one insert with the final image. A diff from a commit's parent is its change.
 
 --- runner
 timeout_ms: 10000
@@ -97,6 +97,8 @@ query jill_arrives() {
 
 --- expect affected: nodes=1 edges=0
 
+--- bind commit $jill
+
 --- mutate
 query jill_ages() {
     update Person set { age: 19 } where name = "jill"
@@ -106,23 +108,27 @@ query jill_ages() {
 
 --- bind commit $last
 
---- diff from: $start to: main
+--- query
+branch diff "${start}" to main
 
 --- expect ordered
 {"kind":"node","type":"Person","id":"ivan","op":"update","before":{"properties":{"name":"ivan","age":20}},"after":{"properties":{"name":"ivan","age":21}}}
 {"kind":"node","type":"Person","id":"jill","op":"insert","after":{"properties":{"name":"jill","age":19}}}
 
---- diff commit: $last
+--- query
+branch diff "${jill}" to "${last}"
 
 --- expect ordered
 {"kind":"node","type":"Person","id":"jill","op":"update","before":{"properties":{"name":"jill","age":18}},"after":{"properties":{"name":"jill","age":19}}}
 
---- diff from: main to: $start
+--- query
+branch diff main to "${start}"
 
 --- expect unordered
 {"kind":"node","type":"Person","id":"jill","op":"delete","before":{"properties":{"name":"jill","age":19}}}
 {"kind":"node","type":"Person","id":"ivan","op":"update","before":{"properties":{"name":"ivan","age":21}},"after":{"properties":{"name":"ivan","age":20}}}
 
---- diff from: main to: main
+--- query
+branch diff main to main
 
 --- expect ordered

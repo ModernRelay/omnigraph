@@ -54,7 +54,9 @@ Each side is a branch name, meaning its head when the diff starts, or a commit
 id: a published commit, an unpublished proposal, or an unattached snapshot. A
 string that names both a branch and a commit is refused; name the branch's
 head by its commit id instead. The equivalent HTTP route is
-`GET /graphs/{graph_id}/diff?from=<side>&to=<side>`.
+`GET /graphs/{graph_id}/diff?from=<side>&to=<side>`, and the GQ statement
+`branch diff <from> to <to>` answers the same comparison at `POST /query`,
+a commit id quoted (`branch diff "<commit-id>" to main`).
 
 The result is the net change from the `from` state to the `to` state, in the
 `commit changes` change shape and order, with `from_commit_id` and
@@ -99,7 +101,16 @@ commit that merge brought in. `branch diff` gives the net change from any
 base.
 
 The HTTP routes are `GET /graphs/{graph_id}/branches/diff?source=&target=` and
-`GET /graphs/{graph_id}/branches/merge-base?source=&target=`. To see whether
+`GET /graphs/{graph_id}/branches/merge-base?source=&target=`; the GQ statements
+are `branch diff feature into main` and `branch merge-base feature into main`.
+
+A statement answers rows through `POST /query` or `omnigraph query -e`. A
+`branch diff` row has `kind`, `type` (the type's name), `id`, `op`, `before`
+and `after`; the compared commits and the token for the next page travel in
+the answer's `page` object, and `after page "<token>"` (then `limit <n>`)
+continues it. A `branch merge-base` row names `source`, `target`, both heads
+and `merge_base_commit_id`. Statements take no kind, type or operation filter
+yet; use the routes or CLI commands for those. To see whether
 the merge would succeed, run it as a [dry run](merge.md#preview-a-merge).
 
 ## Follow a branch
