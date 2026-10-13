@@ -137,7 +137,11 @@ edge RelatedTo: Subject -> Subject
   or `@unique`. Today a redeclared `slug: String` silently loses the
   interface's `@key`: in the prototype the same slug then loaded as two rows.
   With keys as the public address, that silently breaks addressing, so it
-  becomes a refusal. Dropping any other inherited annotation is a lint warning.
+  becomes a refusal. A redeclaration that drops an inherited placement (`@in`,
+  from [Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951)) is refused for the same reason, since it would expose the
+  column; a member also may not add a fixed placement to an inherited
+  property, so the property's visibility is the same for every member.
+  Dropping any other inherited annotation is a lint warning.
 - An edge endpoint is a node type, an interface, or an inline union
   `A | B | …` whose members are node types or interfaces. Its member set is
   the union of each member's concrete closure.
@@ -637,30 +641,52 @@ widen an old `$e: Event` view.
   the new member's existing rows as changes. Expanding once at cursor creation
   would freeze membership, and a live view would miss a member added later.
 - The operation descriptor lists every member type in `reads` and `writes`.
+- Under an actor view (see [Policy](#policy)) each of these surfaces describes
+  the actor's schema view: the catalog route lists only visible types,
+  properties and members; reads carry the schema view's digest in place of
+  `schema_ir_hash`, so a change to a hidden type is not observable;
+  operation descriptors list visible members; and a
+  `ChangeScopeMembershipChanged` refusal names only visible members.
 
 ### Policy
 
 Cedar has no type dimension today: its resources are graph, server and
 cluster, and a request is action, branch and actor. An abstract binding is a
 read of the same graph on the same branch, and an interface-wide mutation is a
-`change`, so nothing changes. When per-type rules arrive (the planned
-`predicate_for`), the planner expands each abstract binding to concrete types
-before evaluating policy. `implements` never confers a permission, because a
-`schema_apply` holder could otherwise widen read access.
+`change`, so nothing changes at that gate.
 
-A denied member never silently thins a result:
-- A read whose binding or traversal destination includes a member the actor
-  may not read is refused with a typed `policy_denied_member` error, unless the
-  query removes that member (a type test, a rebinding, or type pruning).
-- An interface-wide mutation with a denied arm is refused before staging,
-  never partly applied.
-- Row-level predicates inside an allowed type may filter. The response then
-  carries `policy_filtered: true`, with no counts, so a view can say its
-  results are partial.
+Per-type and per-row visibility is defined by
+[Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951), and abstract types follow it:
 
-Filtering a denied arm instead would make `count` and a view's completeness
-wrong with no signal. A denied endpoint is never rendered as a dangling
-reference.
+- An abstract binding resolves its type set against the actor's schema view.
+  A member type the actor cannot see is absent from the set, exactly as it
+  would be absent from a graph holding only the actor's view. Visibility is
+  decided per concrete type; `implements` neither grants nor removes it, so a
+  `schema_apply` holder cannot widen read access by adding `implements`.
+- A type test, or a `@type` or `@type_id` comparison, naming a type hidden
+  from the actor fails with the unknown-name error a misspelling produces.
+- Each union arm whose member the view restricts carries that member's row
+  predicate, placed during per-arm resolution. A traversal never reaches a
+  node the actor cannot see, so a hidden endpoint is never rendered as a
+  dangling reference.
+- An interface-wide mutation checks every arm against the actor's view before
+  staging and is never partly applied.
+- When the view removed a member or filtered rows of any type the plan read,
+  the response's `view.restricted` is `true`. It is computed from the view and
+  the plan, never from data, and carries no counts. A view that must be
+  complete refuses on it.
+
+Result schemas still never depend on the member set, because they come from
+declared types.
+
+An earlier draft refused a read whose type set included a denied member
+(`policy_denied_member`) unless the query removed that member, and marked
+row-level filtering with `policy_filtered`. Both are withdrawn. The refusal
+disclosed that a hidden member exists, and its only escape, a type test that
+removes the member, required the caller to name a type it is not allowed to
+know. A stored query shared by actors with different views could never be
+written that way. `view.restricted` gives a view the same completeness signal
+without naming a member.
 
 ## Invariants
 
@@ -680,8 +706,9 @@ reference.
 - **8, loud integrity failures.** Ambiguous direction, an unknown or
   non-member endpoint type, an untyped polymorphic endpoint, cross-member
   cardinality violations, an untyped expansion over a polymorphic edge, a
-  non-member type in an interface-wide mutation, a policy-denied member and a
-  feed membership change are typed refusals. No result is silently partial.
+  non-member type in an interface-wide mutation and a feed membership change
+  are typed refusals. A result filtered by an actor view says so in
+  `view.restricted`; no result is silently partial.
 - **9, typed semantics.** Type sets, selections, type tests and pruning live
   in AST, IR and plan structures. Type filters are structured predicates.
 - **11, bounded resources.** Union arms run within the query's memory and
@@ -726,7 +753,7 @@ sub-pipelines), no cost-blind plan choice, and no maintained parallel truth.
 | Named unions as a declaration kind | Marker interfaces cover reuse. Inline unions cover closed endpoint sets. Deferred. |
 | Resolve untyped polymorphic endpoints by probing every member table | Hides an N-table cost in every write, and turns colliding keys into errors at write time. Typed endpoints are the default, and probing is an unresolved question. |
 | Join a union's property types over its concrete closure | Matches the alternation rule literally, but adding an implementor to an interface inside a union could change a stored query's result schema. Joining declared member types keeps result schemas independent of membership. |
-| Filter a policy-denied member's rows | Simple, but makes `count` and a view's completeness silently wrong. Refusing unless the query removes the member keeps results whole. |
+| Refuse a type set that includes a member hidden from the actor (`policy_denied_member`) | Keeps results whole, but discloses that the hidden member exists, and the only escape names the hidden type. Filtering over the actor's schema view with `view.restricted` gives the same completeness signal without disclosure. |
 | Expand an interface feed filter once, when the cursor is created | Needs no new refusal, but freezes membership: a live view misses every member added later. |
 | Normalize BM25 scores across arms, or fuse arms with `rrf` | Normalization is unstable across `k`, filters and pages. Rank fusion over N arms keyed by packed reference is plausible later; today's `rrf` takes exactly two arms and fuses by bare id, which would merge colliding keys. |
 
@@ -838,7 +865,7 @@ code were spot-checked on `origin/main`.
 | 10 | Catalog route | Too thin for a create form; no schema version. | Field list and `ETag`. |
 | 11 | Live views | Expanding at cursor creation freezes membership. | Per-commit expansion and membership refusal. |
 | 12 | Remove-`implements` dependency | "Depends" was undefined. | Typecheck-based rule and registry pinning. |
-| 13 | Per-type policy | A denied member was silently filtered. | Refusal unless narrowed. |
+| 13 | Per-type policy | A denied member was silently filtered. | Member sets from the actor's schema view, with `view.restricted` as the completeness signal. |
 | 14 | Shared core name collision | `interface Event` and `node Event` coexist on main; reusing a renamed name changes stored queries silently. | One namespace; same-apply reuse refused; registry pinning. |
 
 Packed references dissolve none of these: they concern typing, planning,
@@ -899,8 +926,9 @@ extended:
 - **DST:** concurrent writes to a polymorphic edge with cascades.
 - **Reference engine:** refuses the new IR.
 - **Server:** catalog-route fields and `ETag`; schema hash on reads; feed
-  `ChangeScopeMembershipChanged`; `policy_denied_member` once per-type rules
-  exist.
+  `ChangeScopeMembershipChanged`; once actor views exist, member sets from the
+  schema view, identical errors for hidden and undeclared type names, and
+  `view.restricted`.
 - **Tower:** catalog-route parity and grammar capability gating.
 
 Acceptance thresholds:
@@ -997,9 +1025,6 @@ required to admit phases 1 and 2.
 - **Historical abstract bindings.** When can they be admitted? That needs
   historical membership, which the captured contract does not reconstruct
   today.
-- **Interface-named policy rules.** Should they exist under per-type
-  authorization, compiled to the current member set and re-checked on every
-  schema apply?
 - **Paging surface.** An opaque cursor on stored-query invocation, carrying the
   snapshot and the last row's order tuple, or GQ syntax such as
   `after $cursor`? Either needs the total order and a `limit` that can be a
@@ -1039,3 +1064,11 @@ expansion with a membership refusal, refusal of policy-denied members,
 interface-property migration rows, the inherited-key refusal, one namespace
 with stored-query pinning, and concurrent arms with a handle cache sized to the
 catalog.
+
+2026-10-12: adopted
+[Actor views and subgraph sharing](https://github.com/ModernRelay/omnigraph/pull/951)
+for per-type visibility. Abstract type sets resolve against the actor's schema view, and `view.restricted` replaces the
+`policy_denied_member` refusal and the `policy_filtered` marker, which
+disclosed hidden members. An inherited placement cannot be dropped or added
+per member. This resolves the question of interface-named policy rules: access
+is defined by facts on securables, never by rules naming types.
