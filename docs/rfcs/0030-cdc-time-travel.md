@@ -753,12 +753,13 @@ When the base lies on the source's first-parent chain, as it does for a source
 that has never merged the target in, a caller can replay the source's commits
 since the base through the feed with `--start after:<base>`. A merge commit in
 that range still carries the changes it imported in its block (§3.2), so the
-replay is the source's history, not only its own edits. Once the target has
-been merged into the source, the base is the target commit that merge imported,
-which the source's first-parent chain does not hold, and the feed refuses it as
-a start (§5.3). The feed does not walk second parents, because that would
-change its replay contract; `branch diff` reports the net change from any
-base.
+replay is the source's history, not only its own edits. A base off that chain
+is refused as a start (§5.3). For example, after the target is merged into a
+source that had diverged from it, the base is the target commit that merge
+imported, which the source's first-parent chain does not hold; a later merge
+of the source into the target and back can bring the base onto the chain
+again. The feed does not walk second parents, because that would change its
+replay contract; `branch diff` reports the net change from any base.
 
 `branch merge --dry-run` runs the merge's base resolution, three-way
 classification and constraint validation, reports the outcome
@@ -905,11 +906,11 @@ server `integration/data_routes.rs` and `integration/openapi.rs`; CLI
   reported base equals branch merge's base on the merge truth-table fixtures,
   ties included; after the target was merged into the source, only the
   source's own net changes since the newest base appear.
-- Merge base and the feed: after the target was merged into the source, the
-  base is off the source's first-parent chain and the source's feed refuses
-  `after:<base>` with `ChangeCursorRejected`, while the branch diff still
-  reports the source's net change. Owner: the existing merge-and-feed test in
-  `integration/changes.rs`.
+- Merge base and the feed: when the target was merged into a diverged source,
+  the base is off the source's first-parent chain and the source's feed
+  refuses `after:<base>` with `ChangeCursorRejected`, while the branch diff
+  still reports the source's net change. Owner: the existing merge-and-feed
+  test in `integration/changes.rs`.
 - Endpoints: a branch, a published commit, a proposal and an unattached
   snapshot all resolve; a string naming both a branch and a commit is refused;
   pages after a concurrent commit on either branch still answer for the pinned
@@ -1392,9 +1393,10 @@ Amendments before 2026-10-12 are recorded in §14 and in the dispositions above.
       `commit drop` succeeds.
 - **2026-10-12: review of the graph diff amendment.** Three corrections from
   the review of ModernRelay/omnigraph#964:
-  - The merge base is not always a valid feed start. Once the target has been
-    merged into the source, the base is the target commit that merge
-    imported, off the source's first-parent chain, and the feed refuses it.
+  - The merge base is not always a valid feed start: a base off the source's
+    first-parent chain is refused. One way it gets there is a merge of the
+    target into a diverged source, which makes the base the target commit
+    that merge imported.
     The review reproduced the refusal with `CommitGraph::merge_base` and the
     feed in the existing merge-and-feed test. §8.4 now limits the recipe to a
     base on that chain and points at `branch diff` for the net change, and D0
