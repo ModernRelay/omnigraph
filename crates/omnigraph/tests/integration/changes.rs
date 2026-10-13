@@ -3248,6 +3248,57 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
         merge_block.changes.iter().all(|change| change.id != "Bob"),
         "main's own divergence is not re-attributed to the merge commit"
     );
+
+    // Main merged side in, so the merge base of main into side is the side
+    // head that merge imported, which main's first-parent chain does not
+    // hold: main's feed refuses it as a start, and the branch diff still
+    // reports main's net change since it.
+    let base = main.merge_base("main", "side").await.unwrap();
+    assert_eq!(
+        merge_block.cause.merged_parent_commit_id.as_deref(),
+        Some(base.merge_base.graph_commit_id.as_str()),
+        "the base is the merged parent"
+    );
+    let refused = main
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                base.merge_base.graph_commit_id.clone(),
+            )),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            omnigraph::error::OmniError::ChangeCursorRejected { reason }
+                if reason.contains("first-parent chain")
+        ),
+        "{refused:?}"
+    );
+    let review = graph_diff_all(
+        &main,
+        omnigraph::changes::GraphDiffSides::Branch {
+            source: "main".to_string(),
+            target: "side".to_string(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        review.base_commit_id.as_deref(),
+        Some(base.merge_base.graph_commit_id.as_str())
+    );
+    assert_eq!(
+        diff_ops(&review.changes),
+        vec![(
+            "Person".to_string(),
+            "Bob".to_string(),
+            omnigraph::changes::ChangeOpKind::Update
+        )],
+        "only main's own divergence is main's change since the base"
+    );
 }
 
 #[tokio::test]

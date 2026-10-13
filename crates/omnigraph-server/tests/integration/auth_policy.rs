@@ -1796,6 +1796,97 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
+/// A branch review's endpoints are the merge base and the source head, which
+/// can both be readable while the target is not; the base and the result
+/// would then reveal whether the target has incorporated the source. So the
+/// branch diff, on every page, and the merge base need `read` on the target
+/// as well as on the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_branch_review_needs_read_on_the_target() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap());
+    for branch in ["feature", "private"] {
+        db.branch_create_from(ReadTarget::branch("main"), branch)
+            .await
+            .unwrap();
+    }
+    db.load_with_receipt(
+        "feature",
+        concat!(
+            r#"{"type":"Person","data":{"name":"feature-one","age":40}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"feature-two","age":41}}"#,
+        ),
+        omnigraph::loader::LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+    // act-bruno reads main and feature but not private; act-ada reads all.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  team: [act-bruno]\n  admins: [act-ada]\nprotected_branches: [main, feature]\nrules:\n  - id: team-read\n    allow: {actors: {group: team}, actions: [read], branch_scope: protected}\n  - id: admin-read\n    allow: {actors: {group: admins}, actions: [read], branch_scope: any}\n",
+    )
+    .unwrap();
+    let app = build_app(
+        AppState::open_with_bearer_tokens_and_policy(
+            graph.to_string_lossy().to_string(),
+            vec![
+                ("act-bruno".to_string(), "team-token".to_string()),
+                ("act-ada".to_string(), "admin-token".to_string()),
+            ],
+            Some(&policy_path),
+        )
+        .await
+        .unwrap(),
+    );
+    let get = |uri: &str, token: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(uri))
+            .method(Method::GET)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // Against main the base and feature's head are readable, and so is the
+    // target.
+    let (status, body) = json_response(
+        &app,
+        get("/branches/diff?source=feature&target=main", "team-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Against private the endpoints are the same base on main and the same
+    // feature head; only the target is unreadable.
+    let (status, first) = json_response(
+        &app,
+        get(
+            "/branches/diff?source=feature&target=private&limit=1",
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["from_commit_id"], body["from_commit_id"]);
+    assert_eq!(first["to_commit_id"], body["to_commit_id"]);
+    let token = first["next_page_token"]
+        .as_str()
+        .expect("two changes page at one")
+        .to_string();
+    for uri in [
+        "/branches/diff?source=feature&target=private".to_string(),
+        format!("/branches/diff?source=feature&target=private&limit=1&page_token={token}"),
+        "/branches/merge-base?source=feature&target=private".to_string(),
+    ] {
+        let (status, body) = json_response(&app, get(&uri, "team-token")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
     let temp = init_graph_with_schema_and_data(
