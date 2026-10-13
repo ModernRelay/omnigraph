@@ -2726,7 +2726,8 @@ mod tests {
                     "graph_commit_id": "head-after", "graph_branch": "main",
                     "graph_manifest_version": 7, "parent_commit_id": "head-before",
                     "merged_parent_commit_id": "head-source",
-                    "actor_id": "principal:alice", "created_at": 12345
+                    "actor_id": "principal:alice", "created_at": 12345,
+                    "published": true, "kind": "published", "root_commit_id": null
                 });
                 let mut reply = json!({
                     "branch": "main", "query_name": "m", "affected_nodes": 1,
@@ -2856,7 +2857,8 @@ mod tests {
                         "graph_commit_id": "commit-a", "graph_branch": "main",
                         "graph_manifest_version": 7, "parent_commit_id": "prior",
                         "merged_parent_commit_id": null, "actor_id": "principal:alice",
-                        "created_at": 12345
+                        "created_at": 12345, "published": true, "kind": "published",
+                        "root_commit_id": null
                     });
                     let reply = match operation {
                         "commit-list" => json!({"commits": [commit]}),
