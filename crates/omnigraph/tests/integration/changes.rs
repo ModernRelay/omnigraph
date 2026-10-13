@@ -4535,18 +4535,37 @@ async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
         OmniError::AmbiguousReadTarget { target } => assert_eq!(target, genesis),
         other => panic!("expected AmbiguousReadTarget, got {other:?}"),
     }
-    assert!(matches!(
-        db.diff_read_target_branch(&genesis).await.unwrap_err(),
-        OmniError::AmbiguousReadTarget { .. }
-    ));
 
-    match graph_diff_all(&db, between("main", "no-such-side"), None)
-        .await
-        .unwrap_err()
-    {
-        OmniError::ReadTargetNotFound { target } => assert_eq!(target, "no-such-side"),
-        other => panic!("expected ReadTargetNotFound, got {other:?}"),
+    // A spelling no commit id has skips the commit lookup: an unknown name,
+    // and a malformed `hb1` address, are the same typed not-found.
+    for side in ["no-such-side", "hb1.not.a.commit"] {
+        match graph_diff_all(&db, between("main", side), None)
+            .await
+            .unwrap_err()
+        {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, side),
+            other => panic!("expected ReadTargetNotFound for {side}, got {other:?}"),
+        }
     }
+
+    // One resolution names the branch each side reads: a branch itself, and
+    // a commit's authored branch.
+    db.branch_create("feature").await.unwrap();
+    let on_feature = write_on(&db, "feature", "insert_person", &person("Fay", 30)).await;
+    let prepared = db
+        .prepare_diff_page(&diff_request(
+            between("main", &on_feature.graph_commit_id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.side_branches(),
+        [
+            ("main".to_string(), "main".to_string()),
+            (on_feature.graph_commit_id.clone(), "feature".to_string()),
+        ]
+    );
 }
 
 /// Continuations answer for the commits the first page resolved, even after

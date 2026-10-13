@@ -4010,30 +4010,25 @@ fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result
 /// of a commit. The side is resolved before the policy check, so a denial is
 /// reported exactly as a side that names nothing: the route is not an
 /// existence oracle for branches or commits the actor cannot read.
-async fn authorize_diff_side(
-    db: &Omnigraph,
+fn authorize_diff_side(
     actor: Option<&AuthenticatedActor>,
     policy: Option<&PolicyEngine>,
     side: &str,
+    branch: &str,
 ) -> std::result::Result<(), ApiError> {
-    let not_found = || ApiError::not_found(format!("'{side}' names no branch and no commit"));
-    let branch = match db.diff_read_target_branch(side).await {
-        Ok(branch) => branch,
-        // A branch deleted between resolution steps is the same fixed 404.
-        Err(OmniError::BranchNotFound { .. }) => return Err(not_found()),
-        Err(error) => return Err(change_route_error(error)),
-    };
     match authorize(
         actor,
         policy,
         PolicyRequest {
             action: PolicyAction::Read,
-            branch: Some(branch),
+            branch: Some(branch.to_string()),
             target_branch: None,
         },
     )? {
         Authz::Allowed => Ok(()),
-        Authz::Denied(_) => Err(not_found()),
+        Authz::Denied(_) => Err(ApiError::not_found(format!(
+            "'{side}' names no branch and no commit"
+        ))),
     }
 }
 
@@ -4076,18 +4071,34 @@ pub(crate) async fn server_diff(
     let to = required_diff_param(params.to, "to")?;
     let db = &handle.engine;
     let actor = actor.as_ref().map(|Extension(actor)| actor);
-    for side in [&from, &to] {
-        authorize_diff_side(db, actor, handle.policy.as_deref(), side).await?;
-    }
     let scope = api::change_scope(&params.kinds, &params.types, &params.ops);
-    let page = db
-        .diff_page(&omnigraph::changes::GraphDiffRequest {
-            sides: omnigraph::changes::GraphDiffSides::Between { from, to },
+    // One resolution serves authorization and the read: each side is
+    // authorized on the branch it resolved to, before any of its data is read.
+    let prepared = db
+        .prepare_diff_page(&omnigraph::changes::GraphDiffRequest {
+            sides: omnigraph::changes::GraphDiffSides::Between {
+                from: from.clone(),
+                to: to.clone(),
+            },
             scope,
             page_token: params.page_token,
             max_changes: params.limit,
             max_bytes: None,
         })
+        .await
+        .map_err(|error| match error {
+            // A branch deleted between resolution steps is that side's 404.
+            OmniError::BranchNotFound { branch } => {
+                let side = if branch == from.trim() { &from } else { &to };
+                ApiError::not_found(format!("'{side}' names no branch and no commit"))
+            }
+            error => change_route_error(error),
+        })?;
+    for (side, branch) in prepared.side_branches() {
+        authorize_diff_side(actor, handle.policy.as_deref(), side, branch)?;
+    }
+    let page = db
+        .run_diff_page(prepared)
         .await
         .map_err(change_route_error)?;
     Ok(Json(api::diff_output(&page)))

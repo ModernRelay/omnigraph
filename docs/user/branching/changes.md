@@ -29,13 +29,15 @@ with its first parent. Each response includes:
   [Blobs](../blobs.md)).
 
 Filter with repeatable `--kind node|edge`, `--type <name>`, and
-`--op insert|update|delete` options. `--limit` defaults to 1,000 and may be
-at most 8,192. Results are deterministic by entity kind, type identity, logical
-id, and operation.
+`--op insert|update|delete` options. A page holds at most 8,192 changes; the
+HTTP routes default to 1,000. Results are deterministic by entity kind, type
+identity, logical id, and operation.
 
 Large results are paginated. The CLI normally follows every
-`next_page_token`; passing `--page-token` fetches exactly one page. A page
-token continues that one commit result and is not a change-feed cursor.
+`next_page_token` and asks for 8,192 changes per page, because every page
+resumes its comparison where the last one stopped; passing `--page-token`
+fetches exactly one page, of 1,000 changes unless `--limit` sets the size. A
+page token continues that one commit result and is not a change-feed cursor.
 
 A parentless commit returns `409` with reason `parentless_commit`. A diff
 that crosses a schema boundary returns `409` with reason

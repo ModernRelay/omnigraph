@@ -265,7 +265,8 @@ pub(crate) enum Command {
         /// Read target the diff ends at
         #[arg(long)]
         to: String,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -927,7 +928,8 @@ pub(crate) enum BranchCommand {
         /// Branch the source is compared against (default main)
         #[arg(long)]
         into: Option<String>,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -1063,7 +1065,8 @@ pub(crate) enum CommitCommand {
         #[arg(long)]
         uri: Option<String>,
         commit_id: String,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -1137,7 +1140,8 @@ pub(crate) enum ChangesCommand {
         /// Start mode: now | beginning | after:<commit_id> (default now)
         #[arg(long, conflicts_with = "cursor")]
         start: Option<String>,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192 (default 8192; the CLI follows
+        /// every page)
         #[arg(long)]
         limit: Option<usize>,
         /// Filter by entity kind (repeatable): node | edge
