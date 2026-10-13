@@ -462,6 +462,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
+    let mut distinct = false;
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
@@ -528,8 +529,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                 }
                                 Rule::return_clause => {
                                     for proj in section.into_inner() {
-                                        if let Rule::projection = proj.as_rule() {
-                                            return_clause.push(parse_projection(proj)?);
+                                        match proj.as_rule() {
+                                            Rule::kw_distinct => distinct = true,
+                                            Rule::projection => {
+                                                return_clause.push(parse_projection(proj)?);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -602,6 +607,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         params,
         match_clause,
         return_clause,
+        distinct,
         order_clause,
         limit,
         mutations,
@@ -1134,9 +1140,19 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::agg_call => {
             let mut parts = inner.into_inner();
             let func = parse_agg_func(parts.next().unwrap().as_str())?;
-            let arg = parse_expr(parts.next().unwrap(), scope)?;
+            let mut distinct = false;
+            let mut arg = None;
+            for part in parts {
+                match part.as_rule() {
+                    Rule::kw_distinct => distinct = true,
+                    _ => arg = Some(parse_expr(part, scope)?),
+                }
+            }
+            let arg =
+                arg.ok_or_else(|| CompilerError::Parse(format!("{func} needs an argument")))?;
             Ok(Expr::Aggregate {
                 func,
+                distinct,
                 arg: Box::new(arg),
             })
         }

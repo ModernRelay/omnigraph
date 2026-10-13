@@ -2,6 +2,7 @@
 use crate::gqt_case::*;
 use crate::gqt_runner::{execute_gqt_rep_signaled, validate_sample};
 use crate::runner::{MeasurementSignals, RunnerResult};
+use omnigraph::db::{GraphCommit, GraphCommitKind, Omnigraph};
 use omnigraph_gqt_core::StepKind;
 use std::path::{Path, PathBuf};
 
@@ -125,6 +126,11 @@ async fn run_sample_with_logical(
     )
     .await
     .unwrap();
+    let retained_chain = if plan.definition.id == "unattached-chain-32-write" {
+        Some(retained_unattached_chain(&root).await)
+    } else {
+        None
+    };
     let physical =
         crate::reset::digest_physical_tree(&root, crate::reset::TraversalLimits::default())
             .unwrap();
@@ -151,7 +157,40 @@ async fn run_sample_with_logical(
     .unwrap();
     assert_eq!(signals.events, vec!["ready", "settled"]);
     assert_eq!(signals.elapsed, Some(sample.elapsed_us));
+    if let Some(before) = retained_chain {
+        assert_eq!(
+            retained_unattached_chain(&root).await,
+            before,
+            "the workload must preserve the retained chain and published history"
+        );
+    }
     Ok((sample, signals, logical))
+}
+
+async fn retained_unattached_chain(root: &Path) -> (Vec<GraphCommit>, Vec<GraphCommit>) {
+    let db = Omnigraph::open_read_only(root.to_str().unwrap())
+        .await
+        .unwrap();
+    let published = db.list_commits(None).await.unwrap();
+    let mut chain = db.list_unattached_commits(None).await.unwrap();
+    assert_eq!(chain.len(), 32, "the fixture must retain all 32 snapshots");
+    chain.sort_by_key(|commit| commit.generation);
+    let root_id = &chain[0].graph_commit_id;
+    let mut parent = published.first().unwrap();
+    for commit in &chain {
+        assert_eq!(commit.kind, GraphCommitKind::Unattached);
+        assert!(!commit.published);
+        assert_eq!(commit.root_commit_id.as_ref(), Some(root_id));
+        assert_eq!(
+            commit.parent_commit_id.as_ref(),
+            Some(&parent.graph_commit_id),
+            "the retained snapshots must form one chain starting at main"
+        );
+        assert!(commit.merged_parent_commit_id.is_none());
+        assert_eq!(commit.generation, parent.generation + 1);
+        parent = commit;
+    }
+    (chain, published)
 }
 #[test]
 fn original_pairs_and_groups_preserve_pre_migration_identity() {
@@ -568,6 +607,7 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         "tiny-restart",
         "tiny-post-reopen",
         "tiny-mutate",
+        "tiny-mutate-unattached",
         "tiny-branch",
         "tiny-load",
     ] {
@@ -597,6 +637,12 @@ async fn bounded_scenario(name: &str) -> crate::dataset_identity::DatasetLogical
     if name.starts_with("very-long-history-32-") {
         assert_eq!(main.history_commits, 34, "{name}");
     }
+    if name == "unattached-chain-32-write" {
+        assert_eq!(
+            main.history_commits, 2,
+            "{name}: the chain never publishes on main"
+        );
+    }
     logical
 }
 
@@ -621,6 +667,8 @@ scenario_tests!(
         bounded_threshold_crossings_at => "threshold-crossings-at",
         bounded_threshold_crossings_after => "threshold-crossings-after",
         bounded_threshold_crossings_production_control => "threshold-crossings-production-control",
+        bounded_very_long_history_32_write_unattached => "very-long-history-32-write-unattached",
+        bounded_unattached_chain_32_write => "unattached-chain-32-write",
     ]
 );
 

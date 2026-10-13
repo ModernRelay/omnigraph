@@ -69,6 +69,8 @@ codes! {
     T53 = "list literal elements must share one scalar type";
     T54 = "a relevance ranking does not accept the asc modifier";
     T55 = "an unattached base parameter is undeclared or not a String";
+    T56 = "distinct does not apply to an aggregated return";
+    T57 = "distinct applies only to count";
 }
 
 #[cfg(test)]

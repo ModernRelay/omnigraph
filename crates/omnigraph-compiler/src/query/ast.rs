@@ -268,6 +268,8 @@ pub struct QueryDecl {
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,
+    /// `return distinct { … }`: one row per distinct projected tuple.
+    pub distinct: bool,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
     pub mutations: Vec<Mutation>,
@@ -501,6 +503,9 @@ pub enum Expr {
     Literal(Literal),
     Aggregate {
         func: AggFunc,
+        /// `count(distinct …)`: distinct nodes by identity, or distinct
+        /// non-null values; only `count` takes it (T57).
+        distinct: bool,
         arg: Box<Expr>,
     },
     AliasRef(String),
@@ -710,7 +715,16 @@ impl std::fmt::Display for Expr {
             } => write!(f, "rrf({primary}, {secondary}, {k})"),
             Expr::Variable(name) => write!(f, "${name}"),
             Expr::Literal(literal) => write!(f, "{literal}"),
-            Expr::Aggregate { func, arg } => write!(f, "{func}({arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: true,
+                arg,
+            } => write!(f, "{func}(distinct {arg})"),
+            Expr::Aggregate {
+                func,
+                distinct: false,
+                arg,
+            } => write!(f, "{func}({arg})"),
             Expr::AliasRef(alias) => f.write_str(alias),
         }
     }

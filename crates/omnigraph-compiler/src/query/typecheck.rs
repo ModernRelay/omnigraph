@@ -77,6 +77,8 @@ pub struct CheckedReadQuery {
     pub(crate) params: Vec<CheckedParam>,
     pub(crate) scope: CheckedScope,
     pub(crate) returns: Vec<CheckedReturn>,
+    /// `return distinct`: one row per distinct projected tuple.
+    pub(crate) distinct: bool,
     pub(crate) orders: Vec<CheckedOrder>,
     pub(crate) limit: Option<u64>,
 }
@@ -283,6 +285,7 @@ pub(crate) enum TypedExpr {
     },
     Aggregate {
         func: AggFunc,
+        distinct: bool,
         arg: Box<TypedExpr>,
         signature: AggSignature,
     },
@@ -847,7 +850,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
     for (index, ord) in query.order_clause.iter().enumerate() {
         let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
         reject_blob_read_value(&typed.ty(), &ord.expr)?;
-        bind_order_key(index, &ord.expr, &query.return_clause, &ctx)?;
+        bind_order_key(index, &ord.expr, &query.return_clause, &ctx, query.distinct)?;
         if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
             && ord.explicit
             && !ord.descending
@@ -893,6 +896,14 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         .return_clause
         .iter()
         .any(|p| matches!(p.expr, Expr::Aggregate { .. }));
+    if query.distinct && has_agg {
+        return Err(CompilerError::typed(
+            T56,
+            "`distinct` on an aggregated return: the group values are already one row each; \
+             drop `distinct` or the aggregate"
+                .to_string(),
+        ));
+    }
     if has_agg {
         for proj in &query.return_clause {
             if !matches!(proj.expr, Expr::Aggregate { .. }) {
@@ -919,22 +930,24 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
             clauses,
         },
         returns,
+        distinct: query.distinct,
         orders,
         limit: query.limit,
     })
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
-/// return list"): a property key sorts through the hidden column, the leading
-/// rank key is the search node's; every other key is a return alias or item.
+/// return list"): a property key sorts through its hidden column (none under
+/// `distinct`), the leading rank key is the search node's; others bind to return.
 fn bind_order_key(
     index: usize,
     key: &Expr,
     return_clause: &[Projection],
     ctx: &TypeContext,
+    distinct: bool,
 ) -> Result<()> {
     let exempt = match key {
-        Expr::PropAccess { .. } => true,
+        Expr::PropAccess { .. } => !distinct,
         Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => index == 0,
         _ => false,
     };
@@ -948,11 +961,14 @@ fn bind_order_key(
     if bound {
         return Ok(());
     }
+    let fix = if distinct {
+        "under `distinct` an order key is a projected value or its alias; add it to return"
+    } else {
+        "add it to return or order by its alias"
+    };
     Err(CompilerError::typed(
         T42,
-        format!(
-            "order key `{key}` does not appear in return; add it to return or order by its alias"
-        ),
+        format!("order key `{key}` does not appear in return; {fix}"),
     ))
 }
 
@@ -3292,10 +3308,23 @@ fn resolve_expr(
             literal: lit.clone(),
             ty: ResolvedType::Scalar(literal_type(lit)?),
         }),
-        Expr::Aggregate { func, arg } => {
+        Expr::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => {
+            if *distinct && *func != AggFunc::Count {
+                return Err(CompilerError::typed(
+                    T57,
+                    format!(
+                        "`distinct` applies only to `count`; `{func}(distinct …)` is not supported"
+                    ),
+                ));
+            }
             let (arg, signature) = resolve_aggregate(catalog, *func, arg, ctx, params, true)?;
             Ok(TypedExpr::Aggregate {
                 func: *func,
+                distinct: *distinct,
                 arg: Box::new(arg),
                 signature,
             })
@@ -3484,7 +3513,7 @@ fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
 fn check_projection(expr: &Expr, alias: Option<&str>, order_clause: &[Ordering]) -> Result<()> {
     match expr {
         Expr::Now | Expr::PropAccess { .. } | Expr::Variable(_) | Expr::Literal(_) => Ok(()),
-        Expr::Aggregate { func, arg } => match arg.as_ref() {
+        Expr::Aggregate { func, arg, .. } => match arg.as_ref() {
             Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => {
                 Err(CompilerError::typed(
                     T32,

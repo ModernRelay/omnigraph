@@ -169,6 +169,15 @@ These inputs establish correctness conditions, not performance results.
 | Repeated deletion/recreation | `repeated-deletion-recreation-{rows,branches}` | Four bounded cycles followed by the next insertion or branch creation. Every cycle verifies exact rows; the final branch inventory and reopened views are checked. Row churn and branch churn are separate treatments. |
 | Threshold crossings | `threshold-crossings-{before,at,after,production-control}` | A configured history-release boundary: two, three, or four updates at `history_release_bytes = 2048`, plus a three-update control at the production budget 262144, followed by an insert. Exact main/child contents are checked. |
 | Equal current state, different history | `equal-current-{narrow-one-batch,wide-one-batch,wide-four-batches}` | Four identical final rows after eight past/restore cycles. Prior payload width varies from 8 to 4096 bytes; a separate treatment publishes each load in four batches. Build witnesses check equal current contents and 18/18/66 reachable commits. |
+| Unattached branch root write (group `unattached-writes`, with `tiny-mutate-unattached`) | `very-long-history-32-write-unattached`, `unattached-chain-32-write` | The history checkpoint's next update written `as unattached branch` instead of on `main`: the row is checked at the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot is dropped. The chain case keeps the same 32 updates as one retained unattached chain (a root and 31 children) with `main` at the seed. Each twin pairs with the ordinary write on the same fixture (`very-long-history-32-write`, `tiny-mutate`). |
+
+An unattached record costs the root write only. A child `on` an earlier
+snapshot cannot be the selected step: its base id is bound by a write earlier
+in the same program, and writes before the selected step are refused. The
+engine's per-phase attribution covers `branch merge` only, so these mutation
+records carry elapsed time and logical store calls, not a publication or
+history-settlement phase split. Neither path's number stands in for a chained
+stream or for end-to-end published-write latency.
 
 The threshold fixtures preserve the configured shapes from the engine's
 history-release correctness cases. Their row assertions do not prove that a
@@ -182,7 +191,7 @@ Dataset and query basenames use the same scenario names with underscores.
 The history operations share `workloads/very_long_history_{read,write,reopen}.gqt`
 across depths, and equal-current cases share
 `workloads/equal_current_different_history.gqt`. The owning benchmark catalog
-test executes all 20 bounded pairs through dataset construction and the
+test executes all 20 bounded pairs, plus the two unattached twins, through dataset construction and the
 measured adapter, including their explicit restart verification. Parsing and
 suite admission also cover the larger recipes without executing them.
 
