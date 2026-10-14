@@ -1446,38 +1446,13 @@ mod tests {
         );
     }
 
-    // A literal `--server` is a server address: `unix:///…` names a socket
-    // and composes graph URLs like any root; every other scheme is refused as
-    // an address here, before storage resolution could try it.
+    // A literal `--server` is a server address: every other scheme is refused
+    // as an address here, before storage resolution could try it. `unix:///…`
+    // names a socket and composes graph URLs like any root on a Unix
+    // platform, and is refused as an address elsewhere.
     #[test]
     fn server_flag_resolves_unix_sockets_and_refuses_other_schemes_issue_979() {
-        assert_eq!(
-            resolve_server_flag(Some("unix:///tmp/og.sock/"), Some("knowledge")).unwrap(),
-            Some("unix:///tmp/og.sock/graphs/knowledge".to_string())
-        );
-        for root in [
-            "unix:///tmp/og.sock",
-            "UNIX:///tmp/og.sock",
-            "unix:///tmp/gate way/og.sock",
-            "unix:///tmp/gate%20way/og.sock",
-        ] {
-            assert!(resolve_server_flag(Some(root), None).is_ok(), "{root}");
-            assert!(is_remote_uri(root), "{root}");
-        }
-        for root in ["HTTP://h:8080", "https://h/prefix"] {
-            assert!(is_remote_uri(root), "{root}");
-        }
-        for (root, refusal) in [
-            ("ftp://h/x", "`ftp://` is not a server scheme"),
-            ("s3://bucket/graph.omni", "`s3://` is not a server scheme"),
-            ("file:///tmp/graph.omni", "`file://` is not a server scheme"),
-            ("unix://host/tmp/og.sock", "unix:///ABSOLUTE/PATH.sock"),
-            ("unix:///", "unix:///ABSOLUTE/PATH.sock"),
-            ("unix:///tmp/og/..", "unix:///ABSOLUTE/PATH.sock"),
-            ("unix:///tmp/og.sock?x=1", "unix:///ABSOLUTE/PATH.sock"),
-            ("unix:///tmp/og.sock#f", "unix:///ABSOLUTE/PATH.sock"),
-            ("unix:///tmp/og%00.sock", "NUL byte"),
-        ] {
+        let refusal = |root: &str| {
             let error = resolve_server_flag(Some(root), Some("knowledge"))
                 .unwrap_err()
                 .to_string();
@@ -1485,11 +1460,59 @@ mod tests {
                 error.starts_with("invalid server address: "),
                 "{root}: {error}"
             );
-            assert!(error.contains(refusal), "{root}: {error}");
             assert!(!error.contains("storage"), "{root}: {error}");
+            error
+        };
+        for root in [
+            "HTTP://h:8080",
+            "https://h/prefix",
+            "unix:///tmp/og.sock",
+            "UNIX:///tmp/og.sock",
+        ] {
+            assert!(is_remote_uri(root), "{root}");
         }
         assert!(!is_remote_uri("s3://bucket/graph.omni"));
         assert!(!is_remote_uri("/tmp/a://b"));
+        for (root, expected) in [
+            ("ftp://h/x", "`ftp://` is not a server scheme"),
+            ("s3://bucket/graph.omni", "`s3://` is not a server scheme"),
+            ("file:///tmp/graph.omni", "`file://` is not a server scheme"),
+        ] {
+            let error = refusal(root);
+            assert!(error.contains(expected), "{root}: {error}");
+        }
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                resolve_server_flag(Some("unix:///tmp/og.sock/"), Some("knowledge")).unwrap(),
+                Some("unix:///tmp/og.sock/graphs/knowledge".to_string())
+            );
+            for root in [
+                "unix:///tmp/og.sock",
+                "UNIX:///tmp/og.sock",
+                "unix:///tmp/gate way/og.sock",
+                "unix:///tmp/gate%20way/og.sock",
+            ] {
+                assert!(resolve_server_flag(Some(root), None).is_ok(), "{root}");
+            }
+            for (root, expected) in [
+                ("unix://host/tmp/og.sock", "unix:///ABSOLUTE/PATH.sock"),
+                ("unix:///", "unix:///ABSOLUTE/PATH.sock"),
+                ("unix:///tmp/og/..", "unix:///ABSOLUTE/PATH.sock"),
+                ("unix:///tmp/og.sock?x=1", "unix:///ABSOLUTE/PATH.sock"),
+                ("unix:///tmp/og.sock#f", "unix:///ABSOLUTE/PATH.sock"),
+                ("unix:///tmp/og%00.sock", "NUL byte"),
+            ] {
+                let error = refusal(root);
+                assert!(error.contains(expected), "{root}: {error}");
+            }
+        }
+        #[cfg(not(unix))]
+        for root in ["unix:///tmp/og.sock", "UNIX:///tmp/og.sock"] {
+            let error = refusal(root);
+            assert!(error.contains("needs a Unix platform"), "{root}: {error}");
+        }
     }
 
     // `branch delete` interpolates the branch into the URL path. The composed
