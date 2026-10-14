@@ -66,12 +66,14 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+#[cfg(unix)]
+pub mod unix_gateway;
 
 pub fn write_managed_context(config: &Path, origin: &str) {
     fs::create_dir_all(config.join(".omnigraph")).unwrap();
     fs::write(
         config.join(".omnigraph/context"),
-        format!("version: 1\ncluster: managed-test\napi: {origin}\n"),
+        format!("version: 2\ncluster: managed-test\napi: {origin}\norganization_id: account-one\n"),
     )
     .unwrap();
 }

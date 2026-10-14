@@ -8,19 +8,22 @@ use tempfile::tempdir;
 use crate::support::managed_http::{IntentApiFixture, IntentReply, IntentRequest};
 use crate::support::*;
 
-fn managed_envelope(kind: &str, state: &str) -> serde_json::Value {
-    let outcome = if ["proposed", "offered", "running"].contains(&state) {
-        serde_json::Value::Null
-    } else {
-        serde_json::json!(state)
-    };
-    serde_json::json!({
-        "data": {"cluster_id":"managed-test", "run_id":"run-one", "kind":kind,
-            "state":state, "outcome":outcome, "proposer":"authenticated-actor",
-            "plan":{"plan_digest":"exact-plan", "bundle_digest":"exact-bytes"}},
-        "meta":{"cluster_id":"managed-test", "incarnation":"inc-one",
-            "provenance":"service_db", "assurance":"verified_workload", "stale":false}
-    })
+const MANAGED_REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn managed_preview(state: &str) -> Value {
+    serde_json::json!({"data":{"preview_id":"saved-plan","state":state,"revision":MANAGED_REVISION,"input_digest":"exact-input","generation":{"state_revision":3}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+fn managed_delivery(delivery: &str) -> Value {
+    serde_json::json!({"data":{"deployment_id":"delivery-one","native_deployment_id":"ledger:1:nonce","preview_id":"saved-plan","delivery":delivery,"archive":"pending","native_result_status":null,"attempted_at":null,"observation":{"state":"not_observed"}},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+fn managed_complete(converged: bool, active: bool, archive: &str) -> Value {
+    let mut body = managed_delivery("dispatched");
+    body["data"]["archive"] = serde_json::json!(archive);
+    body["data"]["native_result_status"] = serde_json::json!("complete");
+    body["data"]["observation"] = serde_json::json!({"state":"observed","historical":false,"native":{"deployment":{"status":"complete","result":{"id":"ledger:1:nonce","converged":converged,"graphs":{}}},"active":active,"in_progress":false}});
+    body
 }
 
 fn assert_control_request(
@@ -916,6 +919,209 @@ fn managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity() {
 }
 
 #[test]
+fn managed_cluster_list_uses_selected_organization_and_refuses_context_conflicts() {
+    let temp = tempdir().unwrap();
+    let response = serde_json::json!({"data":{"clusters":[{"cluster_id":"managed-test","incarnation":"inc-one","name":"Example","state":"ready"}]},"meta":{"provenance":"service_db"}});
+    let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+    let output = output_success(managed_cli(temp.path(), &api.origin).args([
+        "list",
+        "--api",
+        &api.origin,
+        "--organization",
+        "account-one",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output), response);
+    assert_control_request(
+        &api.workflow_requests()[0],
+        "GET",
+        "/v1/clusters",
+        Value::Null,
+        None,
+    );
+    api.assert_complete();
+    assert!(!temp.path().join(".omnigraph").exists());
+
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = managed_cli(temp.path(), &api.origin)
+        .args([
+            "list",
+            "--api",
+            &api.origin,
+            "--organization",
+            "another-account",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert!(api.requests().is_empty());
+    api.assert_complete();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn source_export(files: Value) -> Value {
+    serde_json::json!({"data":{"cluster_id":"managed-test","revision":MANAGED_REVISION,"files":files},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_downloads_exact_source_and_context_without_printing_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    for explicit_revision in [false, true] {
+        let temp = tempdir().unwrap();
+        let files = serde_json::json!({
+            "cluster.yaml":"version: 1\nstorage: s3://tenant/root\ngraphs: {}\npolicies:\n  access:\n    file: policies/access.yaml\n",
+            "policies/access.yaml":"# og_fixture_control must survive byte-exact download\npolicies: []\n",
+        });
+        let api = lifecycle_fixture(vec![IntentReply::json(200, source_export(files.clone()))]);
+        write_managed_context(temp.path(), &api.origin);
+        let mut command = managed_cli(temp.path(), &api.origin);
+        command.args(["pull", "--out", "checkout", "--json"]);
+        if explicit_revision {
+            command.args(["--rev", MANAGED_REVISION]);
+        }
+        let output = output_success(&mut command);
+        let body = parse_stdout_json(&output);
+        assert_eq!(body["data"]["revision"], MANAGED_REVISION);
+        assert_eq!(body["data"]["file_count"], 2);
+        assert!(body["data"].get("files").is_none());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("og_fixture_control"));
+        for (path, content) in files.as_object().unwrap() {
+            let file = temp.path().join("checkout").join(path);
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                content.as_str().unwrap()
+            );
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            fs::read(temp.path().join("checkout/.omnigraph/context")).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(temp.path().join("checkout"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let expected = format!(
+            "/v1/clusters/managed-test/config/export{}",
+            if explicit_revision {
+                format!("?revision={MANAGED_REVISION}")
+            } else {
+                String::new()
+            }
+        );
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            &expected,
+            Value::Null,
+            None,
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_refuses_foreign_invalid_and_unsafe_exports_without_partial_output() {
+    let normal = serde_json::json!({"cluster.yaml":"version: 1\ngraphs: {}\n"});
+    let mut foreign = source_export(normal.clone());
+    foreign["meta"]["cluster_id"] = serde_json::json!("another-cluster");
+    let mut wrong_revision = source_export(normal.clone());
+    wrong_revision["data"]["revision"] = serde_json::json!("b".repeat(40));
+    let mut cases = vec![foreign, wrong_revision];
+    for bad_path in [
+        "../outside",
+        "/absolute",
+        "a/../../outside",
+        "a//b",
+        "./schema.pg",
+        "a\\b",
+        "c:drive",
+        ".omnigraph/context",
+        "a/.git/config",
+        "__cluster/state.json",
+    ] {
+        let mut files = normal.clone();
+        files[bad_path] = serde_json::json!("never write");
+        cases.push(source_export(files));
+    }
+    for files in [
+        serde_json::json!({}),
+        serde_json::json!({"only.pg":"node Test {}"}),
+        serde_json::json!({"cluster.yaml":""}),
+        serde_json::json!({"cluster.yaml":17}),
+        serde_json::json!({"cluster.yaml":"version: 1", "a":"file", "a/b":"collision"}),
+        serde_json::json!({"cluster.yaml":"version: 1", "Schema.pg":"a", "schema.pg":"b"}),
+        serde_json::json!({"cluster.yaml":"version: 1", "large.pg":"x".repeat(1024 * 1024 + 1)}),
+    ] {
+        cases.push(source_export(files));
+    }
+    for response in cases {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response)]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args([
+                "pull",
+                "--out",
+                "checkout",
+                "--rev",
+                MANAGED_REVISION,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{:?}", output);
+        assert!(!temp.path().join("checkout").exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        api.assert_complete();
+    }
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn managed_cluster_pull_preserves_existing_destinations_before_http() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(temp.path(), &api.origin);
+    fs::create_dir(temp.path().join("empty")).unwrap();
+    fs::write(temp.path().join("edited"), "keep my work").unwrap();
+    symlink("missing", temp.path().join("link")).unwrap();
+    for out in ["empty", "empty/.", "edited", "link", ".", "missing/child"] {
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(["pull", "--out", out, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join("edited")).unwrap(),
+        "keep my work"
+    );
+    assert_eq!(fs::read_dir(temp.path().join("empty")).unwrap().count(), 0);
+    assert!(
+        fs::symlink_metadata(temp.path().join("link"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(api.requests().is_empty());
+    api.assert_complete();
+}
+
+#[test]
 #[cfg(unix)]
 fn managed_lifecycle_push_sends_only_complete_referenced_files() {
     let temp = tempdir().unwrap();
@@ -1651,21 +1857,18 @@ fn managed_data_issue_633_direct_preserves_ambient_legacy_resolution() {
 #[test]
 fn managed_use_verifies_access_before_writing_context() {
     let temp = tempdir().unwrap();
-    let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},
-        "meta":{"cluster_id":"managed-test","assurance":"verified_workload"}});
-    let status = serde_json::json!({
-        "data":{"requested":{"revision":"revision-one"},"effective":{"revision":"revision-one"}},
-        "meta":{"cluster_id":"managed-test","provenance":"service_db"}
-    });
-    let run = managed_envelope("apply", "failed");
-    let history = serde_json::json!({
-        "data":{"runs":[run.clone()]},
-        "meta":{"cluster_id":"managed-test","provenance":"service_db"}
-    });
+    let body = serde_json::json!({"data":{"cluster_id":"managed-test","name":"prod"},"meta":{"cluster_id":"managed-test","assurance":"verified_workload"}});
+    let status = serde_json::json!({"data":{"source":{"revision":MANAGED_REVISION},"requested":null,"observed":{"state":"observation_blocked"}},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
+    let delivery = managed_complete(false, false, "archived");
+    let history = serde_json::json!({"data":{"deployments":[delivery["data"].clone()]},"meta":{"cluster_id":"managed-test","provenance":"service_db"}});
     let mut reads = Vec::new();
     for (args, path, response) in [
         (vec!["status"], "/v1/clusters/managed-test/status", status),
-        (vec!["status", "run-one"], "/v1/runs/run-one", run),
+        (
+            vec!["status", "delivery-one"],
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            delivery,
+        ),
         (
             vec!["history"],
             "/v1/clusters/managed-test/history?limit=100",
@@ -1687,22 +1890,20 @@ fn managed_use_verifies_access_before_writing_context() {
         let mut foreign = response.clone();
         foreign["meta"]["cluster_id"] = "another-cluster".into();
         reads.push((args.clone(), path, foreign, true));
-        if args == ["status", "run-one"] {
-            for field in ["cluster_id", "run_id"] {
-                let mut foreign = response.clone();
-                foreign["data"][field] = "another-identity".into();
-                reads.push((args.clone(), path, foreign, true));
-            }
+        if args == ["status", "delivery-one"] {
+            let mut foreign = response;
+            foreign["data"]["deployment_id"] = "another-delivery".into();
+            reads.push((args, path, foreign, true));
         }
     }
     let replies = std::iter::once(IntentReply::json(200, body.clone()))
         .chain(
             reads
                 .iter()
-                .map(|(_, _, response, _)| IntentReply::json(200, response.clone())),
+                .map(|(_, _, body, _)| IntentReply::json(200, body.clone())),
         )
         .collect();
-    let api = IntentApiFixture::new(replies);
+    let api = lifecycle_fixture(replies);
     let output = output_success(
         cli()
             .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
@@ -1716,19 +1917,17 @@ fn managed_use_verifies_access_before_writing_context() {
     assert_eq!(parse_stdout_json(&output), body);
     let context: yaml_serde::Value =
         yaml_serde::from_slice(&fs::read(temp.path().join(".omnigraph/context")).unwrap()).unwrap();
-    assert_eq!(context["version"], 1);
+    assert_eq!(context["version"], 2);
+    assert_eq!(context["organization_id"], "account-one");
     assert_eq!(context["cluster"], "managed-test");
     assert_eq!(context["api"].as_str(), Some(api.origin.as_str()));
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1);
     assert_control_request(
-        &requests[0],
+        &api.workflow_requests()[0],
         "GET",
         "/v1/clusters/managed-test",
-        serde_json::Value::Null,
+        Value::Null,
         None,
     );
-    assert_no_core_effects(temp.path());
     for (index, (args, path, response, refused)) in reads.into_iter().enumerate() {
         let output = managed_cli(temp.path(), &api.origin)
             .args(args)
@@ -1740,58 +1939,49 @@ fn managed_use_verifies_access_before_writing_context() {
             Some(if refused { 2 } else { 0 }),
             "{output:?}"
         );
-        let received = parse_stdout_json(&output);
         if refused {
-            assert_eq!(received["type"], "context_mismatch");
+            assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
         } else {
-            // Observation succeeds even when the inspected run itself failed.
-            assert_eq!(received, response);
+            assert_eq!(parse_stdout_json(&output), response);
         }
-        let requests = api.requests();
-        assert_eq!(
-            requests.len(),
-            index + 2,
-            "no extra requests or submissions"
+        assert_eq!(api.workflow_requests().len(), index + 2);
+        assert_control_request(
+            &api.workflow_requests()[index + 1],
+            "GET",
+            path,
+            Value::Null,
+            None,
         );
-        assert_control_request(&requests[index + 1], "GET", path, Value::Null, None);
         assert_no_core_effects(temp.path());
     }
-    let count = api.requests().len();
     let invalid = managed_cli(temp.path(), &api.origin)
         .args(["history", "--since", "not-a-time", "--json"])
         .output()
         .unwrap();
     assert_eq!(invalid.status.code(), Some(2));
     assert_eq!(parse_stdout_json(&invalid)["type"], "since_invalid");
-    assert_eq!(api.requests().len(), count);
     api.assert_complete();
 }
 
 #[test]
-fn managed_plan_and_apply_submit_exact_intent_without_waiting() {
-    for (kind, arguments, expected) in [
+fn managed_plan_and_apply_submit_exact_native_intent_without_waiting() {
+    for (arguments, path, expected, body) in [
         (
-            "plan",
-            vec!["plan", "--rev", "pushed-revision"],
-            serde_json::json!({"kind":"plan","revision":"pushed-revision"}),
+            vec!["plan", "--rev", MANAGED_REVISION],
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            managed_preview("ready"),
         ),
         (
-            "apply",
             vec!["apply", "--plan", "saved-plan"],
-            serde_json::json!({"kind":"apply","plan_run":"saved-plan"}),
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
+            managed_delivery("queued"),
         ),
     ] {
         let temp = tempdir().unwrap();
         write_cluster_config_fixture(temp.path());
-        let body = managed_envelope(
-            kind,
-            if kind == "plan" {
-                "proposed"
-            } else {
-                "offered"
-            },
-        );
-        let api = IntentApiFixture::new(vec![IntentReply::json(202, body.clone())]);
+        let api = lifecycle_fixture(vec![IntentReply::json(202, body.clone())]);
         write_managed_context(temp.path(), &api.origin);
         let output = output_success(managed_cli(temp.path(), &api.origin).args(arguments).args([
             "--no-wait",
@@ -1802,34 +1992,83 @@ fn managed_plan_and_apply_submit_exact_intent_without_waiting() {
         assert_eq!(parse_stdout_json(&output), body);
         assert!(String::from_utf8_lossy(&output.stderr).contains("exact-key"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("og_fixture_control"));
-        let requests = api.requests();
-        assert_eq!(requests.len(), 1);
         assert_control_request(
-            &requests[0],
+            &api.workflow_requests()[0],
             "POST",
-            "/v1/clusters/managed-test/runs",
+            path,
             expected,
             Some("exact-key"),
         );
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
 }
 
 #[test]
-#[ignore = "nightly: a real 2 s managed poll and a 1 s --timeout"]
-fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
-    for timeout in [false, true] {
+fn managed_plan_omitted_revision_captures_public_source_head_once() {
+    for state in ["ready", "capturing", "failed", "expired"] {
         let temp = tempdir().unwrap();
-        let proposed = managed_envelope("plan", "proposed");
-        let converged = managed_envelope("plan", "converged");
-        let api = IntentApiFixture::new(vec![
-            IntentReply::json(202, proposed.clone()),
-            IntentReply::json(200, converged.clone()),
+        let source = serde_json::json!({"data":{"revision":MANAGED_REVISION},"meta":{"cluster_id":"managed-test"}});
+        let expected = managed_preview(state);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, source),
+            IntentReply::json(200, expected.clone()),
         ]);
         write_managed_context(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
+            .args(["plan", "--idempotency-key", "snapshot", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(match state {
+                "ready" => 0,
+                "capturing" => 5,
+                _ => 1,
+            })
+        );
+        assert_eq!(parse_stdout_json(&output), expected);
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            "/v1/clusters/managed-test/config",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &api.workflow_requests()[1],
+            "POST",
+            "/v1/clusters/managed-test/plans",
+            serde_json::json!({"revision":MANAGED_REVISION}),
+            Some("snapshot"),
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[ignore = "nightly: real 2 s delivery polling and a 1 s wait deadline"]
+fn managed_apply_polls_original_delivery_without_resubmission_or_cancellation() {
+    for timeout in [false, true] {
+        let temp = tempdir().unwrap();
+        let queued = managed_delivery("queued");
+        let complete = managed_complete(true, true, "archived");
+        let replies = if timeout {
+            vec![IntentReply::json(202, queued.clone())]
+        } else {
+            vec![
+                IntentReply::json(202, queued.clone()),
+                IntentReply::json(200, complete.clone()),
+            ]
+        };
+        let api = lifecycle_fixture(replies);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
             .args([
-                "plan",
+                "apply",
+                "--plan",
+                "saved-plan",
                 "--timeout",
                 if timeout { "1" } else { "10" },
                 "--idempotency-key",
@@ -1841,85 +2080,216 @@ fn managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it() {
         assert_eq!(
             output.status.code(),
             Some(if timeout { 5 } else { 0 }),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "{output:?}"
         );
         assert_eq!(
             parse_stdout_json(&output),
-            if timeout { proposed } else { converged }
+            if timeout { queued } else { complete }
         );
         if timeout {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                stderr.contains("inspect `cluster status --managed run-one`"),
-                "{stderr}"
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cluster status --managed delivery-one")
             );
-            assert!(!stderr.contains("inspect `managed status"), "{stderr}");
         }
-        let requests = api.requests();
-        assert_eq!(requests.len(), if timeout { 1 } else { 2 });
         assert_control_request(
-            &requests[0],
+            &api.workflow_requests()[0],
             "POST",
-            "/v1/clusters/managed-test/runs",
-            serde_json::json!({"kind":"plan"}),
+            "/v1/clusters/managed-test/deployments",
+            serde_json::json!({"preview_id":"saved-plan"}),
             Some("poll-key"),
         );
         if !timeout {
             assert_control_request(
-                &requests[1],
+                &api.workflow_requests()[1],
                 "GET",
-                "/v1/runs/run-one",
-                serde_json::Value::Null,
+                "/v1/clusters/managed-test/deployments/delivery-one",
+                Value::Null,
                 None,
             );
         }
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
 }
 
 #[test]
-fn managed_terminal_outcomes_and_http_refusals_preserve_json_and_exit_codes() {
-    for (state, code) in [
-        ("converged", 0),
-        ("failed", 1),
-        ("refused", 2),
-        ("blocked", 2),
-        ("partially_converged", 3),
-        ("recovery_required", 4),
-        ("stalled", 5),
-        ("cancelled", 6),
+#[ignore = "nightly: real 1 s native-outcome wait deadlines"]
+fn managed_native_outcomes_preserve_activation_archive_and_uncertainty() {
+    let mut refused = managed_delivery("dispatched");
+    refused["data"]["native_result_status"] = serde_json::json!("refused");
+    let mut blocked = managed_delivery("dispatch_unknown");
+    blocked["data"]["observation"] =
+        serde_json::json!({"state":"observation_blocked","reason":"native_authorization_denied"});
+    let mut unavailable = managed_delivery("dispatch_unknown");
+    unavailable["data"]["observation"] = serde_json::json!({"state":"observation_blocked","reason":"native_observation_unavailable"});
+    let mut historical = managed_complete(true, false, "archived");
+    historical["data"]["observation"] = serde_json::json!({"state":"archived","historical":true,"native_result":{"id":"ledger:1:nonce","converged":true}});
+    let mut outstanding = managed_delivery("dispatched");
+    outstanding["data"]["observation"] = serde_json::json!({"state":"observed","native":{"deployment":{"status":"outstanding","id":"ledger:1:nonce","input_digest":"digest","graphs":{}},"active":false,"in_progress":false}});
+    let unknowns = ["not_recorded", "result_expired", "identity_mismatch", "different_ledger"].map(|status| {
+        let mut body = managed_delivery("dispatch_unknown");
+        body["data"]["observation"] = serde_json::json!({"state":"unknown","lookup":{"status":status},"active":false,"in_progress":false,"historical":false});
+        (body, 5)
+    });
+    for (body, code) in [
+        (managed_complete(true, true, "archived"), 0),
+        (managed_complete(false, false, "archived"), 1),
+        (managed_complete(true, false, "archived"), 5),
+        (managed_complete(true, true, "archive_blocked"), 5),
+        (managed_complete(true, true, "pending"), 5),
+        (managed_delivery("dispatch_unknown"), 5),
+        (managed_delivery("expired"), 1),
+        (managed_delivery("cancelled"), 1),
+        (unavailable, 5),
+        (historical, 5),
+        (blocked, 2),
+        (outstanding, 5),
+        (refused, 2),
+    ]
+    .into_iter()
+    .chain(unknowns)
+    {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, body.clone())]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args([
+                "status",
+                "delivery-one",
+                "--wait",
+                "--timeout",
+                "1",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{body}: {output:?}");
+        assert_eq!(parse_stdout_json(&output), body);
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            "/v1/clusters/managed-test/deployments/delivery-one",
+            Value::Null,
+            None,
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+fn managed_current_policy_and_stale_preview_refusals_never_submit_again() {
+    for (status, kind, args) in [
+        (
+            403,
+            "native_authorization_denied",
+            vec!["plan", "--rev", MANAGED_REVISION],
+        ),
+        (
+            409,
+            "native_busy_or_stale",
+            vec!["apply", "--plan", "saved-plan"],
+        ),
+        (
+            403,
+            "native_authorization_denied",
+            vec!["apply", "--plan", "saved-plan"],
+        ),
     ] {
         let temp = tempdir().unwrap();
-        let body = managed_envelope("apply", state);
-        let api = IntentApiFixture::new(vec![IntentReply::json(202, body.clone())]);
+        let problem = serde_json::json!({"type":kind,"status":status,"detail":"current native authority refused"});
+        let api = lifecycle_fixture(vec![IntentReply::json(status, problem.clone())]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(args)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(parse_stdout_json(&output), problem);
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
+}
+
+#[test]
+#[ignore = "nightly: four real 2 s delivery polling intervals"]
+fn managed_poll_identity_mismatch_retains_original_delivery_and_native_ids() {
+    for pointer in [
+        "/data/deployment_id",
+        "/data/native_deployment_id",
+        "/data/preview_id",
+        "/data/observation/native/deployment/result/id",
+    ] {
+        let temp = tempdir().unwrap();
+        let queued = managed_delivery("queued");
+        let mut changed = managed_complete(true, true, "archived");
+        *changed.pointer_mut(pointer).unwrap() = serde_json::json!("foreign");
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(202, queued),
+            IntentReply::json(200, changed),
+        ]);
         write_managed_context(temp.path(), &api.origin);
         let output = managed_cli(temp.path(), &api.origin)
             .args(["apply", "--plan", "saved-plan", "--json"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(code), "state {state}");
-        assert_eq!(parse_stdout_json(&output), body);
-        assert_eq!(api.requests().len(), 1);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let problem = parse_stdout_json(&output);
+        assert_eq!(problem["type"], "context_mismatch");
+        assert_eq!(
+            problem["accepted_deployment"]["deployment_id"],
+            "delivery-one"
+        );
+        assert_eq!(
+            problem["accepted_deployment"]["native_deployment_id"],
+            "ledger:1:nonce"
+        );
+        assert_eq!(
+            api.workflow_requests()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .count(),
+            1
+        );
+        api.assert_complete();
         assert_no_core_effects(temp.path());
     }
+}
+
+#[test]
+fn managed_lost_submission_retains_key_without_effect_retry() {
     let temp = tempdir().unwrap();
-    let problem = serde_json::json!({"type":"scope_missing","status":403,"detail":"apply denied"});
-    let api = IntentApiFixture::new(vec![IntentReply::json(403, problem.clone())]);
+    let api = lifecycle_fixture(vec![IntentReply {
+        status: 202,
+        headers: vec![],
+        body: b"{".to_vec(),
+    }]);
     write_managed_context(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
-        .args(["apply", "--plan", "saved-plan", "--json"])
+        .args([
+            "apply",
+            "--plan",
+            "saved-plan",
+            "--idempotency-key",
+            "original-key",
+            "--json",
+        ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(parse_stdout_json(&output), problem);
-    assert_eq!(api.requests().len(), 1);
+    assert_eq!(output.status.code(), Some(1));
+    let result = parse_stdout_json(&output);
+    assert_eq!(result["submission"]["idempotency_key"], "original-key");
+    assert_eq!(result["submission"]["request"]["preview_id"], "saved-plan");
+    assert_eq!(result["submission"]["acceptance"], "unknown");
+    api.assert_complete();
     assert_no_core_effects(temp.path());
 }
 
 #[test]
 fn managed_invalid_context_refuses_without_network_or_core_effects() {
-    let api = IntentApiFixture::new(vec![]);
+    let api = lifecycle_fixture(vec![]);
     for context in [
         "{\n".to_string(),
         format!("version: 2\ncluster: managed-test\napi: {}\n", api.origin),
@@ -1947,7 +2317,7 @@ fn managed_invalid_context_refuses_without_network_or_core_effects() {
 #[test]
 #[cfg(unix)]
 fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
-    let api = IntentApiFixture::new(vec![]);
+    let api = lifecycle_fixture(vec![]);
     for variant in ["file-link", "dangling-link", "directory-link", "fifo"] {
         let temp = tempdir().unwrap();
         write_cluster_config_fixture(temp.path());
@@ -1998,7 +2368,7 @@ fn managed_context_links_and_fifo_refuse_without_blocking_or_core_effects() {
 #[test]
 fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
     let temp = tempdir().unwrap();
-    let api = IntentApiFixture::new(vec![]);
+    let api = lifecycle_fixture(vec![]);
     write_managed_context(temp.path(), &api.origin);
     for context in ["valid", "malformed"] {
         let root = temp.path().join(context);
@@ -2113,7 +2483,6 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
             "--writers-stopped",
         ],
         vec!["cluster", "status", "--managed", "--deployment-id", "id"],
-        vec!["cluster", "status", "--managed", "run", "--wait"],
         vec!["cluster", "status", "--managed", "run", "--timeout", "10"],
         vec!["cluster", "validate", "--managed"],
         vec!["cluster", "observe", "--managed"],
@@ -2184,75 +2553,68 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
 }
 
 #[test]
-fn managed_cancel_checks_selected_cluster_before_any_post() {
+fn managed_cancel_uses_exact_cluster_scope_and_refuses_foreign_response() {
     let temp = tempdir().unwrap();
-    let mut foreign = managed_envelope("plan", "proposed");
-    foreign["data"]["cluster_id"] = serde_json::json!("another-cluster");
-    let api = IntentApiFixture::new(vec![IntentReply::json(200, foreign)]);
+    let mut foreign = managed_delivery("cancelled");
+    foreign["meta"]["cluster_id"] = serde_json::json!("another-cluster");
+    let api = lifecycle_fixture(vec![IntentReply::json(200, foreign)]);
     write_managed_context(temp.path(), &api.origin);
     let output = managed_cli(temp.path(), &api.origin)
-        .args(["cancel", "run-one", "--json"])
+        .args(["cancel", "delivery-one", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
-    let requests = api.requests();
-    assert_eq!(requests.len(), 1);
     assert_control_request(
-        &requests[0],
-        "GET",
-        "/v1/runs/run-one",
-        serde_json::Value::Null,
+        &api.workflow_requests()[0],
+        "POST",
+        "/v1/clusters/managed-test/deployments/delivery-one:cancel",
+        Value::Null,
         None,
     );
+    api.assert_complete();
     assert_no_core_effects(temp.path());
 }
 
 #[test]
-fn managed_cancel_selects_pending_cancel_or_completed_plan_abandon() {
-    for (before, after, verb, code) in [
-        ("proposed", "cancelled", "cancel", 6),
-        ("converged", "converged", "abandon", 0),
-    ] {
-        let temp = tempdir().unwrap();
-        let mut result = managed_envelope("plan", after);
-        if verb == "abandon" {
-            result["data"]["abandoned_at"] = serde_json::json!("2026-09-05T00:00:00Z");
-        }
-        let api = IntentApiFixture::new(vec![
-            IntentReply::json(200, managed_envelope("plan", before)),
-            IntentReply::json(200, result.clone()),
-        ]);
-        write_managed_context(temp.path(), &api.origin);
+fn managed_cancel_is_idempotent_and_cannot_cancel_attempted_native_work() {
+    let temp = tempdir().unwrap();
+    let cancelled = managed_delivery("cancelled");
+    let problem = serde_json::json!({"type":"native_cancellation_too_late","status":409,"detail":"an attempt may have reached the native server"});
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, cancelled.clone()),
+        IntentReply::json(200, cancelled.clone()),
+        IntentReply::json(409, problem.clone()),
+    ]);
+    write_managed_context(temp.path(), &api.origin);
+    for (expected, code) in [(cancelled.clone(), 0), (cancelled, 0), (problem, 2)] {
         let output = managed_cli(temp.path(), &api.origin)
-            .args(["cancel", "run-one", "--json"])
+            .args(["cancel", "delivery-one", "--json"])
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(code));
-        assert_eq!(parse_stdout_json(&output), result);
-        let requests = api.requests();
-        assert_eq!(requests.len(), 2);
-        assert_control_request(
-            &requests[0],
-            "GET",
-            "/v1/runs/run-one",
-            serde_json::Value::Null,
-            None,
-        );
-        assert_control_request(
-            &requests[1],
-            "POST",
-            &format!("/v1/runs/run-one:{verb}"),
-            serde_json::Value::Null,
-            None,
-        );
-        assert_no_core_effects(temp.path());
+        let mut expected = expected;
+        if code == 2 {
+            expected["requested_deployment_id"] = serde_json::json!("delivery-one");
+        }
+        assert_eq!(parse_stdout_json(&output), expected);
     }
+    for request in api.workflow_requests() {
+        assert_control_request(
+            &request,
+            "POST",
+            "/v1/clusters/managed-test/deployments/delivery-one:cancel",
+            Value::Null,
+            None,
+        );
+    }
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
 }
 
 #[test]
 fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects() {
-    let redirect_target = IntentApiFixture::new(vec![]);
+    let redirect_target = lifecycle_fixture(vec![]);
     for (headers, status, expected) in [
         (
             vec![(
@@ -2273,7 +2635,7 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
     ] {
         let temp = tempdir().unwrap();
         write_cluster_config_fixture(temp.path());
-        let api = IntentApiFixture::new(vec![IntentReply {
+        let api = lifecycle_fixture(vec![IntentReply {
             status,
             headers,
             body: vec![],
@@ -2285,7 +2647,7 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(parse_stdout_json(&output)["type"], expected);
-        assert_eq!(api.requests().len(), 1);
+        assert_eq!(api.workflow_requests().len(), 1);
         assert_no_core_effects(temp.path());
     }
     assert!(redirect_target.requests().is_empty());
@@ -2295,7 +2657,7 @@ fn managed_redirect_and_oversized_reply_fail_without_following_or_core_effects()
 fn managed_origin_mismatch_and_api_down_never_open_core() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    let api = IntentApiFixture::new(vec![]);
+    let api = lifecycle_fixture(vec![]);
     write_managed_context(temp.path(), &api.origin);
     let mismatch = managed_cli(temp.path(), &api.origin)
         .env("OMNIGRAPH_CONTROL_API", "https://other.example")
@@ -3398,4 +3760,195 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
         parse_stdout_json(&out)["datasets"].as_array().is_some(),
         "optimize should resolve via the ledger despite degraded catalog payloads"
     );
+}
+
+#[test]
+fn managed_invalid_acknowledgements_keep_request_identity_in_json_and_human_output() {
+    for (command, mut body, field) in [
+        ("apply", managed_delivery("queued"), "/data/preview_id"),
+        ("apply", managed_delivery("queued"), "/meta/cluster_id"),
+        ("plan", managed_preview("ready"), "/data/revision"),
+    ] {
+        *body.pointer_mut(field).unwrap() = serde_json::json!("foreign");
+        for json in [false, true] {
+            let temp = tempdir().unwrap();
+            let api = lifecycle_fixture(vec![IntentReply::json(200, body.clone())]);
+            write_managed_context(temp.path(), &api.origin);
+            let mut cli = managed_cli(temp.path(), &api.origin);
+            cli.args(if command == "apply" {
+                vec!["apply", "--plan", "saved-plan"]
+            } else {
+                vec!["plan", "--rev", MANAGED_REVISION]
+            })
+            .args(["--idempotency-key", "original-key"]);
+            if json {
+                cli.arg("--json");
+            }
+            let output = cli.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            if json {
+                let body = parse_stdout_json(&output);
+                assert_eq!(body["submission"]["idempotency_key"], "original-key");
+                assert_eq!(body["submission"]["acceptance"], "unknown");
+                assert!(body.get("accepted_deployment").is_none());
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("submission:") && stderr.contains("original-key"));
+            }
+            api.assert_complete();
+            assert_no_core_effects(temp.path());
+        }
+    }
+}
+
+#[test]
+fn managed_cancellation_never_claims_an_attempted_delivery_was_cancelled() {
+    let temp = tempdir().unwrap();
+    let mut body = managed_delivery("cancelled");
+    body["data"]["attempted_at"] = serde_json::json!("2026-10-08T00:00:00Z");
+    let api = lifecycle_fixture(vec![IntentReply::json(200, body)]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = managed_cli(temp.path(), &api.origin)
+        .args(["cancel", "delivery-one", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        parse_stdout_json(&output)["requested_deployment_id"],
+        "delivery-one"
+    );
+    api.assert_complete();
+    assert_no_core_effects(temp.path());
+}
+
+#[test]
+fn managed_explicit_use_rebinds_regular_context_only_after_access_verification() {
+    for previous in [
+        "version: 1\ncluster: old\napi: https://old.example\n",
+        "version: 2\ncluster: old\napi: https://old.example\norganization_id: account-other\n",
+        "not: [valid yaml",
+    ] {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".omnigraph")).unwrap();
+        let path = dir.path().join(".omnigraph/context");
+        fs::write(&path, previous).unwrap();
+        let body = serde_json::json!({"data":{"cluster_id":"managed-test"},"meta":{"cluster_id":"managed-test"}});
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(403, serde_json::json!({"type":"scope_missing"})),
+            IntentReply::json(200, body.clone()),
+        ]);
+        let invoke = || {
+            cli()
+                .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+                .env("OMNIGRAPH_CONTROL_API", &api.origin)
+                .args([
+                    "use",
+                    "managed-test",
+                    "--api",
+                    &api.origin,
+                    "--organization",
+                    "account-one",
+                    "--json",
+                    "--config",
+                ])
+                .arg(dir.path())
+                .output()
+                .unwrap()
+        };
+        assert_eq!(invoke().status.code(), Some(2));
+        assert_eq!(fs::read_to_string(&path).unwrap(), previous);
+        assert!(invoke().status.success());
+        let bound: yaml_serde::Value = yaml_serde::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(bound["version"], 2);
+        assert_eq!(bound["cluster"], "managed-test");
+        assert_eq!(bound["api"].as_str(), Some(api.origin.as_str()));
+        assert_eq!(bound["organization_id"], "account-one");
+        api.assert_complete();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".omnigraph")).unwrap();
+        let victim = dir.path().join("untouched");
+        fs::write(&victim, "preserve").unwrap();
+        symlink(&victim, dir.path().join(".omnigraph/context")).unwrap();
+        let api = lifecycle_fixture(vec![]);
+        let output = cli()
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args([
+                "use",
+                "managed-test",
+                "--api",
+                &api.origin,
+                "--organization",
+                "account-one",
+                "--json",
+                "--config",
+            ])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(parse_stdout_json(&output)["type"], "context_invalid");
+        assert_eq!(fs::read_to_string(victim).unwrap(), "preserve");
+        assert!(api.requests().is_empty());
+    }
+}
+
+#[test]
+fn managed_bound_operation_rejects_cross_organization_before_authentication() {
+    let dir = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_context(dir.path(), &api.origin);
+    let output = managed_cli(dir.path(), &api.origin)
+        .args([
+            "operation",
+            "operation-one",
+            "--organization",
+            "account-other",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(parse_stdout_json(&output)["type"], "context_mismatch");
+    assert!(api.requests().is_empty());
+}
+
+#[test]
+fn managed_native_deployment_commands_refuse_a_foreign_organization_before_work() {
+    for arguments in [
+        vec!["plan", "--rev", MANAGED_REVISION],
+        vec!["apply", "--plan", "saved-plan"],
+        vec!["status", "delivery-one"],
+        vec!["history"],
+        vec!["cancel", "delivery-one"],
+    ] {
+        let temp = tempdir().unwrap();
+        let api = IntentApiFixture::with_session(
+            vec![],
+            lifecycle_session("principal-one", "account-other"),
+        );
+        write_managed_context(temp.path(), &api.origin);
+        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(arguments)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(parse_stdout_json(&output)["type"], "organization_mismatch");
+        let requests = api.requests();
+        assert_eq!(requests.len(), 1);
+        assert_control_request(&requests[0], "GET", "/v1/auth/session", Value::Null, None);
+        assert!(api.workflow_requests().is_empty());
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            before
+        );
+        api.assert_complete();
+        assert_no_core_effects(temp.path());
+    }
 }

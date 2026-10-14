@@ -37,7 +37,7 @@ pub(crate) async fn require_contract(request: Request, next: Next) -> Result<Res
 
 pub(crate) async fn identify_response(request: Request, next: Next) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/mcp" | "/.well-known/oauth-protected-resource") {
+    if path == "/mcp" || crate::mcp::is_resource_metadata_path(path) {
         return next.run(request).await;
     }
     let discovery = path == "/healthz";
@@ -60,7 +60,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
     schema.enum_values = Some(vec![HTTP_API_CONTRACT.into()]);
     for (path, item) in &mut doc.paths.paths {
         // OAuth resource metadata follows its standard protocol, as does MCP.
-        if path == "/.well-known/oauth-protected-resource" {
+        if crate::mcp::is_resource_metadata_path(path) {
             continue;
         }
         let protected =

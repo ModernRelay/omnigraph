@@ -2035,7 +2035,7 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     .await
     .unwrap();
     let before = snapshot_main(&db).await.unwrap();
-    let result = db.rebuild_full_text_indices_on(" main ").await.unwrap();
+    let result = db.rebuild_full_text_indices_on("main").await.unwrap();
     assert_eq!(result.branch, "main");
     assert_eq!(result.graph_commit_id, None);
     assert!(result.rebuilt_indexes.is_empty());
