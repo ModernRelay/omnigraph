@@ -2306,6 +2306,7 @@ mod external_blob_startup_tests {
                 policy: None,
             }),
             expected: None,
+            io_scope: None,
         };
         let error = match open_prepared_graph(prepared).await {
             Ok(_) => panic!("a missing root must not open"),
