@@ -1,6 +1,6 @@
 use super::*;
 use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use workos::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
@@ -18,6 +18,29 @@ impl Store for MemoryStore {
     fn remove(&self, key: &str) -> Result<()> {
         self.0.borrow_mut().remove(key);
         Ok(())
+    }
+}
+
+struct PromptingStore<'a> {
+    inner: &'a MemoryStore,
+    prompted: Cell<bool>,
+}
+
+impl Store for PromptingStore<'_> {
+    fn get(&self, key: &str) -> Result<Option<String>> {
+        if key.starts_with("credential:") && !self.prompted.replace(true) {
+            // Model synchronous OS consent taking longer than the network budget.
+            std::thread::sleep(Duration::from_secs(40));
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, value: &str) -> Result<()> {
+        self.inner.put(key, value)
+    }
+
+    fn remove(&self, key: &str) -> Result<()> {
+        self.inner.remove(key)
     }
 }
 
@@ -66,13 +89,14 @@ fn metadata_for(seconds: i64, principal: &str, organization: &str) -> IntentRepl
 pub(super) struct MockTransport {
     pub requests: Mutex<Vec<HttpRequest>>,
     pub responses: Mutex<VecDeque<(u16, Value)>>,
+    pending: bool,
 }
 
 impl MockTransport {
     pub fn with(responses: Vec<(u16, Value)>) -> Arc<Self> {
         Arc::new(Self {
-            requests: Mutex::new(vec![]),
             responses: Mutex::new(responses.into()),
+            ..Self::default()
         })
     }
     pub fn provider(self: &Arc<Self>) -> provider::Provider {
@@ -87,6 +111,9 @@ impl HttpTransport for MockTransport {
         request: HttpRequest,
     ) -> std::result::Result<HttpResponse, TransportError> {
         self.requests.lock().unwrap().push(request);
+        if self.pending {
+            return std::future::pending().await;
+        }
         let (status, value) = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
             TransportError::other(std::io::Error::other("unexpected provider call"))
         })?;
@@ -539,10 +566,21 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
         let store = MemoryStore::default();
         cache_original_session(&store, &api.origin).await;
         let before = store.0.borrow().clone();
+        let prompting_store = PromptingStore {
+            inner: &store,
+            prompted: Cell::new(false),
+        };
+        // Only one case waits for consent; both fresh organization profiles
+        // retain their existing custody and provider-request assertions.
+        let device_store: &dyn Store = if initial_org.is_none() {
+            &prompting_store
+        } else {
+            &store
+        };
         let selected = device_tokens(Some("org_other"), "fresh_session", "selected-refresh");
         let transport = MockTransport::with(vec![(200, selected.clone())]);
         let result = accept_device(
-            &store,
+            device_store,
             &api.origin,
             config(),
             &transport.provider(),
@@ -552,6 +590,7 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
         )
         .await
         .unwrap();
+        assert_eq!(prompting_store.prompted.get(), initial_org.is_none());
         assert_eq!(result["data"]["account_id"], "org_other");
         assert_eq!(result["data"]["principal_id"], "principal_one");
         for (key, value) in before.iter().filter(|(key, _)| *key != &api.origin) {
@@ -584,6 +623,37 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
         assert!(!result.to_string().contains("fresh-refresh"));
         api.assert_complete();
     }
+}
+
+#[tokio::test]
+async fn fresh_device_selection_network_timeout_preserves_cached_custody_without_replay() {
+    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    let store = MemoryStore::default();
+    cache_original_session(&store, &api.origin).await;
+    let before = store.0.borrow().clone();
+    let transport = Arc::new(MockTransport {
+        pending: true,
+        ..MockTransport::default()
+    });
+    let error = tokio::time::timeout(
+        Duration::from_secs(40),
+        accept_device(
+            &store,
+            &api.origin,
+            config(),
+            &transport.provider(),
+            serde_json::from_value(device_tokens(None, "fresh_session", "fresh-refresh")).unwrap(),
+            Some("org_other"),
+        ),
+    )
+    .await
+    .expect("network selection remains bounded")
+    .unwrap_err();
+    assert_eq!(error.body["type"], "refresh_outcome_unknown");
+    assert_eq!(*store.0.borrow(), before);
+    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(api.requests().len(), 1, "no acceptance or revocation");
+    api.assert_complete();
 }
 
 #[tokio::test]

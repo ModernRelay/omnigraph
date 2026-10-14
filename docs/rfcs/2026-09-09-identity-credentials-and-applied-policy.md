@@ -299,8 +299,10 @@ and return the requested organization, whose bearer the API verifies before
 custody. The initial organization need not be enrolled at the API. Indexed
 credentials are inspected read-only to refuse a provider-session collision
 before selection or revocation; their token pairs are never used or changed.
-Selection and resource-server verification share one 35-second budget. An
-uncertain selection requires a new explicit device login, without replay.
+The serialized, read-only keychain checks, including interactive OS consent,
+finish before the network budget starts. Selection and resource-server
+verification share one 35-second network budget. An uncertain selection requires
+a new explicit device login, without replay.
 Device initiation/exchange use only the official SDK parameters. Ordinary
 renewal names only the already selected organization and retains the complete
 identity; it cannot switch or clone an existing organization's session.

@@ -248,10 +248,10 @@ api: https://control.example
 organization_id: org_customer
 ```
 
-The folder pins the organization. Without a folder or `--organization`, exactly
-one cached organization may be selected; ambiguity refuses. Explicit fresh login
-selects the requested organization using only its new device session. Failed or
-uncertain selection leaves cached sessions unchanged and requires fresh login.
+Without a folder or `--organization`, exactly one cached organization is required.
+Fresh login selects its organization using only its new session; failure or
+uncertainty preserves cached sessions and requires fresh login. OS-keychain
+consent is outside the 35-second selection and verification network budget.
 
 Fully explicit `login`/`logout` select independently of the folder; ordinary
 commands refuse conflicts. To replace an old or invalid regular context, sign in

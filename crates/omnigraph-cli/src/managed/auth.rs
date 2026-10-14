@@ -439,16 +439,13 @@ async fn accept_device(
     tokens: workos::AuthenticateResponse,
     organization: Option<&str>,
 ) -> Result<Value> {
+    // Keychain reads can require interactive OS consent. Complete the cached
+    // session collision check under the origin lock before timing network work.
+    let initial = renewal::check_device_session(store, origin, &config, &tokens)?;
     let (saved, body) = tokio::time::timeout(Duration::from_secs(35), async {
-        let tokens = renewal::select_device_organization(
-            store,
-            origin,
-            &config,
-            provider,
-            tokens,
-            organization,
-        )
-        .await?;
+        let tokens =
+            renewal::select_device_organization(&config, provider, tokens, initial, organization)
+                .await?;
         renewal::accept(origin, config, tokens, None).await
     })
     .await

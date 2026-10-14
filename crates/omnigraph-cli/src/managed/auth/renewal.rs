@@ -43,7 +43,7 @@ impl Session {
 }
 
 #[derive(Deserialize)]
-struct Claims {
+pub(super) struct Claims {
     iss: String,
     sub: String,
     sid: String,
@@ -249,14 +249,12 @@ pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn select_device_organization(
+pub(super) fn check_device_session(
     store: &dyn Store,
     origin: &str,
     config: &provider::Config,
-    provider: &provider::Provider,
-    tokens: workos::AuthenticateResponse,
-    organization: Option<&str>,
-) -> Result<workos::AuthenticateResponse> {
+    tokens: &workos::AuthenticateResponse,
+) -> Result<Claims> {
     let initial = provider_claims(tokens.access_token.as_ref(), config, false)?;
     validate_token(tokens.refresh_token.as_ref())?;
     if tokens.user.id != initial.sub || tokens.organization_id != initial.org_id {
@@ -280,6 +278,16 @@ pub(super) async fn select_device_organization(
             ));
         }
     }
+    Ok(initial)
+}
+
+pub(super) async fn select_device_organization(
+    config: &provider::Config,
+    provider: &provider::Provider,
+    tokens: workos::AuthenticateResponse,
+    initial: Claims,
+    organization: Option<&str>,
+) -> Result<workos::AuthenticateResponse> {
     let Some(organization) = organization else {
         return Ok(tokens);
     };
