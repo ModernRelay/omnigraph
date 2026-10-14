@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-skill"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "The omnigraph agent skill, embedded byte for byte for the OmniGraph CLI."
 license = "MIT"
@@ -11,6 +11,9 @@ documentation = "https://docs.rs/omnigraph-skill"
 # The package root is `skills/` so that `skills/omnigraph`, the one copy of
 # the skill, lies inside it: a packaged crate carries the skill tree, and
 # `build.rs` embeds it from there in the workspace and in a package alike.
+# `skills/` is also the collection `npx skills` reads, so the package names
+# exactly what the crate builds and embeds, not every skill beside it.
+include = ["/build.rs", "/src/**", "/omnigraph/**"]
 
 [lints]
 workspace = true
