@@ -621,15 +621,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             SkillCommand::Show { path } => skill::show(&path)?,
         },
-        Command::Version => {
-            println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "internal-schema {} (serves v{} to v{})",
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-                omnigraph::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-            );
-        }
+        Command::Version { json } => print_version(&VersionOutput::current(), json)?,
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;
             if args.json {

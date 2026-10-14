@@ -285,8 +285,10 @@ pub struct SnapshotOutput {
     pub graph_branch: String,
     pub graph_manifest_version: u64,
     /// The on-disk internal-schema (storage-format) version this graph's branch
-    /// is stamped at. This binary serves only its own storage-format version; a
-    /// graph at any other version is refused until it is upgraded offline or rebuilt.
+    /// is stamped at. It may be below the version the binary writes (the
+    /// `internal_schema_version` of `GET /healthz`): normal open serves a range
+    /// of versions, and a branch in that range takes the current one at its
+    /// first publish.
     pub internal_schema_version: u32,
     pub datasets: Vec<SnapshotDatasetOutput>,
 }
@@ -1727,9 +1729,11 @@ pub struct CommitListQuery {
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
-    /// The internal-schema (storage-format) version this binary writes and
-    /// the only one it serves; a graph at any other version is refused until
-    /// it is upgraded offline or rebuilt.
+    /// The internal-schema (storage-format) version this binary writes, the
+    /// highest it serves. Normal open serves every version from the binary's
+    /// lowest supported one up to this one; a graph below that range is
+    /// refused until it is upgraded offline or rebuilt, and a graph above it
+    /// needs a newer binary.
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
