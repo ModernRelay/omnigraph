@@ -723,6 +723,37 @@ fn server_target_admission_refuses_before_workers() {
             "{expected}: a worker ran"
         );
     }
+    let csv_case = dir.path().join("served_csv.gqt");
+    let served_text = std::fs::read_to_string(&served).unwrap();
+    for (fixture, expected) in [
+        (
+            "--- csv people.csv\nid\n1\n",
+            "`--- csv` fixtures (engine execution only)",
+        ),
+        ("", "load csv source without an absolute URI"),
+    ] {
+        std::fs::write(
+            &csv_case,
+            format!(
+                "{served_text}\n{fixture}\n--- mutate\nload csv \"people.csv\" into node:Person mode append header\n--- expect ok\n"
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&csv_case)
+            .args(["--server", "http://127.0.0.1:1", "--graph", "default"])
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+        assert!(
+            report(&output).1["attempts"].as_array().unwrap().is_empty(),
+            "{expected}: a worker ran"
+        );
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&served)
         .args(["--target", "omnigraph-engine"])

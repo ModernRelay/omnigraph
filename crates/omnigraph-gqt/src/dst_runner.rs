@@ -1942,7 +1942,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     if executable_digest(&executable)? != input.executable_digest {
         return Err("environment_changed: worker executable digest differs".into());
     }
-    let case = parse_case(&input.stem, &input.text)?;
+    let mut case = parse_case(&input.stem, &input.text)?;
     if !case.runner.environments.contains(&input.environment)
         || !input.environment.seeds().contains(&input.seed)
     {
@@ -1969,6 +1969,9 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     input
         .environment
         .admit_store(case.needs_dst(), input.store.as_deref())?;
+    let csv_dir = tempfile::tempdir().map_err(|e| format!("worker_failed: tempdir: {e}"))?;
+    case.materialize_csv_fixtures(csv_dir.path())
+        .map_err(|e| format!("invalid_case: {e}"))?;
     match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {

@@ -1480,6 +1480,7 @@ fn parse_branch(input: &str) -> BranchStmt {
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
         FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
         FileBody::Commit(write) => panic!("expected a branch statement, got {write:?}"),
+        FileBody::Load(stmt) => panic!("expected a branch statement, got {stmt:?}"),
     }
 }
 
@@ -1509,6 +1510,98 @@ fn parse_commit(input: &str) -> CommitWrite {
         FileBody::Commit(write) => write,
         other => panic!("expected a commit statement, got {other:?}"),
     }
+}
+
+fn parse_load(input: &str) -> LoadStmt {
+    match parse_query(input).unwrap().body {
+        FileBody::Load(stmt) => stmt,
+        other => panic!("expected a load statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_statement_parses_every_option() {
+    let stmt = parse_load(
+        "load csv \"s3://bucket/imports/knows.csv\" into edge:Knows mode append delimiter \"|\" header columns (from, to, creationDate);",
+    );
+    assert_eq!(
+        stmt,
+        LoadStmt {
+            source: "s3://bucket/imports/knows.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadStmtMode::Append,
+            delimiter: b'|',
+            header: true,
+            columns: Some(vec![
+                "from".to_string(),
+                "to".to_string(),
+                "creationDate".to_string()
+            ]),
+        }
+    );
+    assert_eq!(stmt.statement_name(), "load csv");
+    assert_eq!(stmt.target.table_key(), "edge:Knows");
+}
+
+#[test]
+fn load_statement_defaults_to_comma_and_header_names() {
+    let stmt =
+        parse_load("load csv \"file:///tmp/person.csv\" into node:Person mode overwrite header");
+    assert_eq!(stmt.target, LoadTarget::Node("Person".to_string()));
+    assert_eq!(stmt.mode, LoadStmtMode::Overwrite);
+    assert_eq!(stmt.delimiter, b',');
+    assert!(stmt.header);
+    assert_eq!(stmt.columns, None);
+}
+
+#[test]
+fn load_statement_refusals_name_the_missing_or_repeated_part() {
+    let cases = [
+        (
+            "load csv \"s3://b/p.csv\" into node:Person header",
+            "names its mode",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append",
+            "names its columns",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append mode merge header",
+            "`mode` is given twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append columns (a, a)",
+            "column `a` is named twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header delimiter \"||\"",
+            "one printable ASCII character",
+        ),
+        (
+            "load csv \"\" into node:Person mode append header",
+            "non-empty URI",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header\nquery q() { match { $p: Person } return { $p.id } }",
+            "a load statement stands alone in its file",
+        ),
+    ];
+    for (input, expected) in cases {
+        let error = parse_query(input).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{input}: expected {expected:?} in {error:?}"
+        );
+    }
+}
+
+#[test]
+fn load_statement_is_not_a_declaration() {
+    let file = parse_query("load csv \"s3://b/p.csv\" into node:Person mode append header");
+    assert_eq!(
+        file.unwrap().into_declarations().unwrap_err(),
+        "`load csv` is a load statement, not a query declaration"
+    );
 }
 
 #[test]

@@ -1,0 +1,161 @@
+# issue: none
+# notes: A CSV load keeps the `write_max_bytes` input admission in every mode: the typed batch
+# notes: is charged before it is retained, so an overwrite over the cap refuses with the same
+# notes: `strict_input_arrow_bytes` resource a JSONL load names, and the type keeps its rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+}
+
+node Counter {
+    id: I64 @key
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice"}}
+{"type":"Counter","data":{"id":1}}
+
+--- csv people.csv
+id,name
+2,bob
+3,carol
+4,dave
+5,erin
+6,frank
+7,grace
+8,heidi
+9,ivan
+
+--- mutate
+set write_max_bytes = 64;
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect error: strict_input_arrow_bytes
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id, $p.name }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice"}
+
+--- expect shape
+p.id: I64
+p.name: String
+
+--- mutate
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- query
+query replaced() {
+    match { $p: Person }
+    return { $p.id }
+}
+
+--- expect unordered
+{"p.id": 2}
+{"p.id": 3}
+{"p.id": 4}
+{"p.id": 5}
+{"p.id": 6}
+{"p.id": 7}
+{"p.id": 8}
+{"p.id": 9}
+
+--- expect shape
+p.id: I64
+
+--- csv counters.csv
+id
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+
+--- mutate
+set write_max_bytes = 1500;
+load csv "counters.csv" into node:Counter mode overwrite header
+
+--- expect error: strict_input_arrow_bytes
+
+--- mutate
+set write_max_bytes = 1500;
+load csv "counters.csv" into node:Counter mode append header
+
+--- expect error: strict_input_arrow_bytes
+
+--- mutate
+set write_max_bytes = 1500;
+load csv "counters.csv" into node:Counter mode merge header
+
+--- expect error: strict_input_arrow_bytes
+
+--- query
+query projection_refusals_keep_rows() {
+    match { $c: Counter }
+    return { $c.id }
+}
+
+--- expect unordered
+{"c.id": 1}
+
+--- expect shape
+c.id: I64

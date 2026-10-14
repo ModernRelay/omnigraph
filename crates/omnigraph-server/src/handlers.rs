@@ -45,9 +45,9 @@ mod dispatch;
 use dispatch::{
     CommitControlOutcome, Door, ReadDispatch, branch_read_body, classify, commit_control_body,
     commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
-    read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
-    session_with_prefix, show_at_write_door,
+    load_at_read_door, read_at_write_door, refuse_empty_file, refuse_explain,
+    refuse_process_settings, refuse_statement_envelope, refuse_wrong_door, run_branch_statement,
+    run_commit_statement, run_load_statement, session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -1592,6 +1592,28 @@ pub(crate) async fn run_mutate(
             let session = session_with_prefix(&session, &file.settings)?;
             return run_commit_statement(&state, &handle, &session, actor, ingress, write).await;
         }
+        FileBody::Load(stmt) => {
+            if door == Door::Query {
+                return Err(load_at_read_door(&stmt));
+            }
+            refuse_statement_envelope(
+                false,
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return run_load_statement(
+                &state,
+                &handle,
+                &session,
+                actor,
+                ingress,
+                stmt,
+                branch,
+                query.len(),
+            )
+            .await;
+        }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
         FileBody::Explain(_) => {
             refuse_explain(door)?;
@@ -1776,6 +1798,14 @@ pub(crate) async fn run_query(
                 false,
             )?;
             return Err(commit_write_at_read_door(&write));
+        }
+        FileBody::Load(stmt) => {
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return Err(load_at_read_door(&stmt));
         }
         FileBody::Show(id) => {
             refuse_statement_envelope(

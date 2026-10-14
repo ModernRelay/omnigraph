@@ -1,0 +1,69 @@
+# issue: none
+# notes: The source URI is authorized by the graph's external Blob policy before any byte is
+# notes: read: a `file://` path outside the case's base and an `s3://` object outside every base
+# notes: are refused, an unsupported scheme is refused, and a source inside the base loads.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice"}}
+
+--- csv inside.csv
+id,name
+2,bob
+
+--- mutate
+load csv "file:///etc/hosts" into node:Person mode append header
+
+--- expect error: outside every configured external Blob base
+
+--- mutate
+load csv "s3://bucket/imports/people.csv" into node:Person mode append header
+
+--- expect error: outside every configured external Blob base
+
+--- mutate
+load csv "https://example.invalid/people.csv" into node:Person mode append header
+
+--- expect error: is not supported
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id }
+}
+
+--- expect unordered
+{"p.id": 1}
+
+--- expect shape
+p.id: I64
+
+--- mutate
+load csv "inside.csv" into node:Person mode append header
+
+--- expect ok
+
+--- query
+query loaded() {
+    match { $p: Person }
+    return { $p.id, $p.name }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice"}
+{"p.id": 2, "p.name": "bob"}
+
+--- expect shape
+p.id: I64
+p.name: String

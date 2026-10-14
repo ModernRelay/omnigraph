@@ -1664,6 +1664,10 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => bail!("{}", commit_write_at_read_door(&write)),
                     Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        ..
+                    }) => bail!("{}", helpers::load_at_read_door(&stmt)),
+                    Ok(QueryFile {
                         body: FileBody::Show(id),
                         settings: prefix,
                         ..
@@ -1780,6 +1784,25 @@ async fn run(cli: Cli) -> Result<()> {
                             &query_source,
                             write,
                             has_target,
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                            &settings,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_load_statement_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            branch.as_deref(),
                             name.is_some() || params_json.is_some(),
                             if_commit.is_some(),
                             cli.yes,
@@ -2494,6 +2517,53 @@ async fn run_commit_statement_cli(
     client
         .commit_write_statement(query_source, write, settings)
         .await
+}
+
+/// The `mutate` door's load-statement path: envelope refusals as for a
+/// branch statement, `--branch` as the target, overwrite consent, then the
+/// round trip under the base `embedded_file_source_policy` installs.
+#[allow(clippy::too_many_arguments)]
+async fn run_load_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: omnigraph_compiler::query::ast::LoadStmt,
+    branch: Option<&str>,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ChangeOutput> {
+    refuse_statement_envelope(false, has_name_or_params, has_expected_head)?;
+    if stmt.mode == omnigraph_compiler::query::ast::LoadStmtMode::Overwrite {
+        confirm_destructive("load csv (mode overwrite)", client.uri(), yes, json)?;
+    }
+    let policy = if client.is_remote() {
+        None
+    } else {
+        embedded_file_source_policy(&stmt.source)?
+    };
+    client
+        .load_statement(branch, query_source, stmt, policy, settings)
+        .await
+}
+
+/// One embedded-only base over a `file://` source's directory, so a direct
+/// run authorizes the statement by the policy's own rule (base outside the
+/// graph root included); any other scheme installs nothing.
+fn embedded_file_source_policy(source: &str) -> Result<Option<omnigraph::ExternalBlobPolicy>> {
+    let Some(path) = source.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        bail!("`load csv \"{source}\"`: a `file://` source is an absolute path to a file");
+    };
+    let base = omnigraph::ExternalBlobBase::new(
+        format!("file://{parent}/"),
+        omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+    )
+    .map_err(|error| color_eyre::eyre::eyre!("`load csv \"{source}\"`: {error}"))?;
+    Ok(Some(omnigraph::ExternalBlobPolicy::allow(vec![base])?))
 }
 
 #[cfg(test)]

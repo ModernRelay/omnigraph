@@ -987,6 +987,15 @@ pub(crate) fn commit_write_at_read_door(write: &CommitWrite) -> String {
     )
 }
 
+/// The server's refusal for `load csv` sent through `query`: a control
+/// write, under the statement's own name.
+pub(crate) fn load_at_read_door(stmt: &omnigraph_compiler::query::ast::LoadStmt) -> String {
+    branch_statement_refusals::with_statement(
+        branch_statement_refusals::CONTROL_WRITE_AT_READ_DOOR,
+        stmt.statement_name(),
+    )
+}
+
 /// The server's refusal for a branch read (`branch list`, `branch diff`, …)
 /// sent through `mutate`.
 pub(crate) fn read_at_write_door(statement_name: &str) -> String {

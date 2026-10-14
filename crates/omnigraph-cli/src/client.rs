@@ -512,10 +512,26 @@ impl GraphClient {
         uri: &str,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<Session> {
+        Self::open_write_session_with_external_blob_policy(uri, settings, None).await
+    }
+
+    /// An embedded write session, with `external_blob_policy` installed on
+    /// its fresh handle when given: the one way a CLI run admits a source
+    /// outside the graph (a `load csv "file://…"` statement run directly).
+    async fn open_write_session_with_external_blob_policy(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
         crate::admission::ensure_graph(uri).await?;
         crate::command_outcome::writable_open();
-        let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
+        let db = Omnigraph::open(uri).await?;
+        let db = match external_blob_policy {
+            Some(policy) => db.with_external_blob_policy(policy)?,
+            None => db,
+        };
+        let mut session = Arc::new(db).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
         }
@@ -1415,6 +1431,66 @@ impl GraphClient {
                     actor_id: actor.clone(),
                     commit,
                     outcome: Some(outcome),
+                })
+            }
+        }
+    }
+
+    /// A `load csv` statement from `-e`/`--query`: `POST /mutate` with the
+    /// source and the request `branch`, or the engine call on the branch
+    /// (`main` when unspelled), answered as the server answers it: the
+    /// branch that received the load, `load csv` as the name, the loaded
+    /// node and edge counts, and the load's own publication.
+    pub(crate) async fn load_statement(
+        &self,
+        branch: Option<&str>,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ChangeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_change_request(query_source);
+                request.branch = branch.map(str::to_string);
+                request.settings = Self::remote_settings(settings)?;
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["mutate"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let query_name = stmt.statement_name().to_string();
+                let request = omnigraph::loader::CsvLoadRequest::from_statement(&stmt);
+                let mut session = Self::open_write_session_with_external_blob_policy(
+                    uri,
+                    settings,
+                    external_blob_policy,
+                )
+                .await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                let receipt = session
+                    .load_csv_as_with_receipt(branch.unwrap_or("main"), &request, actor.as_deref())
+                    .await?;
+                Ok(ChangeOutput {
+                    branch: receipt.result.branch,
+                    query_name,
+                    affected_nodes: receipt.result.nodes_loaded.values().sum(),
+                    affected_edges: receipt.result.edges_loaded.values().sum(),
+                    actor_id: actor.clone(),
+                    commit: Some(commit_output(&receipt.commit)),
+                    outcome: None,
                 })
             }
         }

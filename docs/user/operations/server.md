@@ -300,7 +300,7 @@ is an error unless the request supplies `from`. This differs from the CLI,
 where `--mode` is always required.
 
 See [Mutations and loading](../mutations/index.md) for the record shape and load
-modes.
+modes, including [CSV statements on `/mutate`](../mutations/index.md#csv-loading).
 
 ## Deliver Blob values
 

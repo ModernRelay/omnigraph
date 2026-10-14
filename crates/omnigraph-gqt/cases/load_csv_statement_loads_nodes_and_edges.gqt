@@ -1,0 +1,83 @@
+# issue: none
+# notes: `load csv` reads a pipe-separated file with a header into a keyed node type, then an
+# notes: edge file whose first two columns are the endpoints; cells arrive typed by the schema,
+# notes: an empty field is null, and the loaded rows read back beside the seeded one.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    firstName: String
+    birthday: Date
+    creationDate: DateTime
+    score: F64
+    active: Bool?
+}
+edge Knows: Person -> Person {
+    creationDate: DateTime
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"firstName":"alice","birthday":"1990-01-02","creationDate":"2010-02-14T15:32:10.447Z","score":1.5,"active":false}}
+
+--- csv person.csv
+id|firstName|birthday|creationDate|score|active
+2|bob|1985-12-31|2011-03-01T00:00:00.000Z|2.25|true
+3|carol|2000-06-15|2012-07-04T12:00:00.100Z|0|
+
+--- mutate
+load csv "person.csv" into node:Person mode append delimiter "|" header
+
+--- expect ok
+
+--- csv knows.csv
+Person.id|Person.id|creationDate
+1|2|2012-01-01T00:00:00.000Z
+2|3|2012-01-02T00:00:00.000Z
+
+--- mutate
+load csv "knows.csv" into edge:Knows mode append delimiter "|" header
+
+--- expect ok
+
+--- query
+query people() {
+    match { $p: Person }
+    return { $p.id, $p.firstName, $p.birthday, $p.creationDate, $p.score, $p.active }
+}
+
+--- expect unordered
+{"p.id": 1, "p.firstName": "alice", "p.birthday": "1990-01-02", "p.creationDate": "2010-02-14T15:32:10.447", "p.score": 1.5, "p.active": false}
+{"p.id": 2, "p.firstName": "bob", "p.birthday": "1985-12-31", "p.creationDate": "2011-03-01T00:00:00", "p.score": 2.25, "p.active": true}
+{"p.id": 3, "p.firstName": "carol", "p.birthday": "2000-06-15", "p.creationDate": "2012-07-04T12:00:00.100", "p.score": 0.0}
+
+--- expect shape
+p.id: I64
+p.firstName: String
+p.birthday: Date
+p.creationDate: DateTime
+p.score: F64
+p.active: Bool?
+
+--- query
+query knows() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.firstName, $b.id }
+}
+
+--- expect unordered
+{"a.firstName": "alice", "b.id": 2}
+{"a.firstName": "bob", "b.id": 3}
+
+--- expect shape
+a.firstName: String
+b.id: I64

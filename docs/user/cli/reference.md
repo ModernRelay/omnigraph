@@ -41,7 +41,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
-| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, or `commit drop` statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
