@@ -2469,7 +2469,9 @@ struct Lowering<'a> {
     logical: &'a LogicalPlan,
     source: &'a dyn PlanSource,
     bounds: &'a Bounds,
-    /// The key-set tree of each qualifying `AntiJoin`, by its logical id.
+    /// The key-set tree of each qualifying `AntiJoin`, by its id in the
+    /// plan's arena. A tree's own ids overlap these, so a tree must hold no
+    /// `AntiJoin` to look up while it is lowered (checked at the swap).
     key_sets: &'a HashMap<LogicalId, KeySetTree>,
     physical: PhysicalPlan,
     late_materialization: bool,
@@ -3047,6 +3049,15 @@ impl Lowering<'_> {
                 };
                 let inner_lowered = match (strategy, key_set) {
                     (AntiJoinStrategy::KeySet, Some(tree)) => {
+                        if tree
+                            .plan
+                            .live()
+                            .any(|(_, node)| matches!(node, LogicalNode::AntiJoin { .. }))
+                        {
+                            return Err(PlanError::Internal(format!(
+                                "the key-set tree of block `${outer_var}` holds a correlated block, whose id would name another arena's tree"
+                            )));
+                        }
                         let logical = std::mem::replace(&mut self.logical, &tree.plan);
                         let lowered = self.lower(tree.root);
                         self.logical = logical;

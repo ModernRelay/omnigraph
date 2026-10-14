@@ -222,11 +222,16 @@ binding's identity column with no scan of it. An unbound `Expand` emits one row
 per distinct endpoint pair and a bound one one row per edge row, in either
 direction, so every key meets the same matches. Pass `anti_join_strategy`
 prices both from the summed row estimates of each chain (`chain_rows`, the
-correlated one from the outer input's estimate), records
-`anti_join_rows($x)`, and lowers the `key_set` tree only when it produces fewer
-rows; an unknown estimate keeps `correlated`. The logical plan keeps the
-correlated tree as the block's meaning; the strategy is the physical
-`AntiJoin`'s `strategy` and the GQT line `anti join $x: key_set`.
+correlated one from the outer input's estimate), records `anti_join_rows($x)`,
+and lowers the `key_set` tree only when it produces fewer rows; an unknown
+estimate keeps `correlated`. Each hop is priced at its edge type's average
+degree, so a hub root is under-priced: with a tiny outer side, `key_set` can
+read every edge of the hub, bounded by that root's neighbourhood and never by
+the outer rows. The recorded estimates make such a choice visible. The logical
+plan keeps the correlated tree as the block's meaning; the strategy is the
+physical `AntiJoin`'s `strategy` and the GQT line `anti join $x: key_set`. Plan
+acceptance refuses a strategy its inner tree does not have (check `block
+strategy`), so an edited saved plan fails before it runs.
 
 A block stays `correlated` when its inner tree holds anything but `Expand`,
 dependent `TableScan` and `Filter` nodes (a nested block, a second
