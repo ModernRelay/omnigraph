@@ -1,7 +1,9 @@
 //! Embeds the skill tree beside this manifest: every file below `omnigraph/`
 //! becomes one row of the generated `FILES` table, so adding or removing a
-//! skill file needs no code change. Names starting with `.` are skipped; any
-//! entry that is neither a file nor a directory fails the build.
+//! skill file needs no code change. Names starting with `.` are skipped; a
+//! name that is not ASCII, or an entry that is neither a file nor a directory,
+//! fails the build. ASCII names keep case-insensitive and normalizing file
+//! systems from aliasing two skill paths that an export compares.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -43,6 +45,7 @@ fn collect(dir: &Path, prefix: Option<&str>, files: &mut Vec<(String, String)>) 
         if name.starts_with('.') {
             continue;
         }
+        assert!(name.is_ascii(), "skill path name {name:?} is not ASCII");
         let path = match prefix {
             Some(prefix) => format!("{prefix}/{name}"),
             None => name,

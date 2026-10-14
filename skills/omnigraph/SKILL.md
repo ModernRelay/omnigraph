@@ -2,7 +2,7 @@
 name: omnigraph
 description: Operate OmniGraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, OmniGraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
-compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; storage formats 14 through 16 are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
+compatibility: Covers the current OmniGraph CLI and server, using HTTP contract 0.13. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
   version: "0.14.0"
@@ -16,8 +16,8 @@ This skill captures the operational rules for working with a locally or remotely
 Check `omnigraph version` and the command's `--help` before using these
 instructions. This skill tracks the current CLI/server contract, including
 `Omnigraph-Http-Api: 0.13`; the released 0.12 contract is unsupported. The engine
-reports `internal-schema 16 (serves v14 to v16)` and serves storage
-formats 14 through 16. New graphs use `__id`/`__src`/`__dst` system columns; a graph
+reports `internal-schema 16 (serves v14 to v16)`: the storage format it
+writes, then the range it serves. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
 standalone v8 or v9 graph (written by 0.11.x) or a v13 graph is converted in
 place by the offline `omnigraph upgrade`; a v0.10 graph uses v6 and is first
@@ -193,11 +193,13 @@ executing the query. It uses the ordinary query target and parameter flags.
 accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 - `init --schema <f.pg> <uri> [--force]`
 - `schema <plan|apply> --schema <f.pg> [--json]` — `apply` refuses a cluster-managed graph; evolve those via `cluster apply`
-- `upgrade <uri> [--check] [--to-format 14] [--json]` — offline standalone
-  conversion of a v8, v9 or v13 graph to format 14, the only target.
-  `schema upgrade-system-columns <uri> [--check] [--json]` respells a
-  format-14 graph's legacy `id`/`src`/`dst` columns without changing the
-  format. Read [migration preconditions](references/migrations.md) first;
+- `upgrade <uri> [--check] [--to-format <N>] [--json]` — offline standalone
+  conversion of a v8, v9 or v13 graph to the format `omnigraph version`
+  reports as written, the only `--to-format` target; a graph at an older
+  served format is only stamped to it.
+  `schema upgrade-system-columns <uri> [--check] [--json]` respells a served
+  graph's legacy `id`/`src`/`dst` columns without changing its format.
+  Read [migration preconditions](references/migrations.md) first;
   cluster-managed roots refuse. The 0.11 binary's `upgrade` took
   `--to-format <7|8|9>` and defaulted to v9.
 - `lint --query <f.gq> [--schema <f.pg>] [<uri>] [--json]` — offline with `--schema`, graph-backed with a URI

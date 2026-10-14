@@ -46,7 +46,7 @@ prints the exact flags of the installed binary.
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check or list a cluster's stored queries |
-| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
+| `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; `--managed` selects the managed service |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Store a server's bearer token, or open a managed session |
@@ -189,9 +189,12 @@ omnigraph schema upgrade-system-columns "$REPO" --check --json
 ```
 
 `omnigraph upgrade` converts a standalone v8 or v9 graph (written by 0.11) or
-a v13 graph to storage format 14 in place, keeping branches, commit ids and
-commit history; `--to-format` accepts 14 only. `schema upgrade-system-columns`
-is a separate step on a graph already at 14: it respells the legacy
+a v13 graph in place to the storage format this binary writes, the first
+number `omnigraph version` reports, keeping branches, commit ids and commit
+history. A graph at an older format this binary serves is only stamped to it,
+with one metadata-only commit per live branch. `--to-format` accepts only the
+written format. `schema upgrade-system-columns` is a separate step on a graph
+this binary serves: it respells the legacy
 `id`/`src`/`dst` system columns and requires only `main` and no user property
 starting with `_`. Both are standalone, offline operations: stop every process
 using the graph and keep a verified whole-root backup; cluster-managed roots

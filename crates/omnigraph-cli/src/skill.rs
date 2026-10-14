@@ -166,7 +166,7 @@ pub(crate) fn export(dir: &Path, force: bool) -> Result<SkillExportOutput> {
     let mut removed = Vec::new();
     let mut kept = Vec::new();
     for (path, digest) in previous.iter().flat_map(|record| &record.files) {
-        if current.contains(path.as_str()) {
+        if names_current_file(path, &current) {
             continue;
         }
         match inspect(dir, path)? {
@@ -307,11 +307,21 @@ fn read_record(dir: &Path) -> Result<Option<ExportRecord>> {
     Ok(Some(record))
 }
 
-/// A `/`-separated relative path of plain names, none starting with `.`:
+/// Whether a recorded path names a file this export just wrote. On a
+/// case-insensitive file system a path differing only in ASCII case opens the
+/// same file, so removing it as stale would delete a current file. Skill paths
+/// are ASCII (the build script and [`is_skill_path`] refuse others), so ASCII
+/// case is the only folding that can alias two of them.
+fn names_current_file(path: &str, current: &BTreeSet<&str>) -> bool {
+    current.iter().any(|file| file.eq_ignore_ascii_case(path))
+}
+
+/// A `/`-separated relative path of ASCII names, none starting with `.`:
 /// every path the embedded skill can hold, and nothing that reaches outside
 /// the export directory or onto the record itself.
 fn is_skill_path(path: &str) -> bool {
-    !path.contains(['\\', ':'])
+    path.is_ascii()
+        && !path.contains(['\\', ':'])
         && path
             .split('/')
             .all(|part| !part.is_empty() && !part.starts_with('.'))
@@ -376,7 +386,7 @@ mod tests {
 
     use clap::CommandFactory;
 
-    use super::is_skill_path;
+    use super::{is_skill_path, names_current_file};
 
     /// Every public command path of the CLI, from the clap tree: a command
     /// without subcommands is one path, and a command with subcommands
@@ -495,6 +505,29 @@ mod tests {
         }
     }
 
+    /// SKILL.md states the storage formats this binary reports, so a stamp
+    /// change fails here until the skill says what `omnigraph version` says.
+    #[test]
+    fn skill_states_the_storage_formats_this_binary_reports() {
+        let line = crate::output::VersionOutput::current()
+            .internal_schema
+            .line();
+        assert!(
+            embedded_text("SKILL.md").contains(&format!("`{line}`")),
+            "SKILL.md must state `{line}`, as `omnigraph version` prints it"
+        );
+    }
+
+    #[test]
+    fn a_recorded_path_differing_only_in_case_is_a_current_file() {
+        let current = BTreeSet::from(["SKILL.md", "references/commands.md"]);
+        assert!(names_current_file("references/commands.md", &current));
+        assert!(names_current_file("references/Commands.md", &current));
+        assert!(names_current_file("REFERENCES/COMMANDS.MD", &current));
+        assert!(!names_current_file("references/retired.md", &current));
+        assert!(!names_current_file("references/commands.md.bak", &current));
+    }
+
     #[test]
     fn record_paths_stay_below_the_export_directory() {
         for path in ["SKILL.md", "references/queries.md", "a/b/c.md"] {
@@ -511,6 +544,7 @@ mod tests {
             "references/.hidden",
             "references\\x.md",
             "C:/x.md",
+            "references/caf\u{e9}.md",
         ] {
             assert!(!is_skill_path(path), "{path}");
         }
