@@ -47,7 +47,10 @@ fn parse_identity_claims(
 }
 
 fn key(context: &Context) -> String {
-    format!("{}/clusters/{}", context.api, context.cluster)
+    format!(
+        "{}/organizations/{}/clusters/{}",
+        context.api, context.organization_id, context.cluster
+    )
 }
 
 fn invalid() -> Failure {
@@ -113,6 +116,7 @@ impl Credential {
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).map_err(|_| invalid())?)
                 .map_err(|_| invalid())?;
         if claims.iss != self.api
+            || claims.account_id != context.organization_id
             || claims.cluster_id != self.cluster_id
             || self.cluster_incarnation.as_deref() != Some(claims.cluster_incarnation.as_str())
             || claims.aud != format!("urn:omnigraph:data:{}", self.cluster_id)
@@ -287,7 +291,7 @@ pub(super) async fn token(
     if clear {
         return self::clear(&auth::DATA_STORE, context);
     }
-    let api = Api::authenticated(context.api.clone())?;
+    let api = Api::authenticated(context.api.clone(), Some(&context.organization_id)).await?;
     mint(&auth::DATA_STORE, context, &api, ttl.unwrap_or(3600)).await
 }
 
@@ -355,6 +359,7 @@ fn has_ambient_target() -> Result<bool> {
     Ok(operator.default_server().is_some() || operator.default_store().is_some())
 }
 
+#[cfg(test)]
 fn resolve(
     cli: &Cli,
     config: &std::path::Path,
@@ -367,6 +372,15 @@ fn resolve(
     let Some(context) = super::read_context(config)? else {
         return Ok(None);
     };
+    resolve_context(cli, &context, store, ambient_target)
+}
+
+fn resolve_context(
+    cli: &Cli,
+    context: &Context,
+    store: &impl Store,
+    ambient_target: impl FnOnce() -> Result<bool>,
+) -> Result<Option<GraphClient>> {
     if ambient_target()? {
         return Err(Failure::refused(
             "managed_target_ambiguous",
@@ -381,7 +395,7 @@ fn resolve(
                 "graphs list enumerates a cluster; omit --graph",
             ));
         }
-        let credential = load_credential(store, &context)?;
+        let credential = load_credential(store, context)?;
         return GraphClient::managed_registry(&credential.endpoint, credential.token)
             .map(Some)
             .map_err(|_| {
@@ -398,7 +412,7 @@ fn resolve(
         .as_deref()
         .ok_or_else(|| Failure::refused("graph_required", "managed data requires --graph"))?;
     graph_id(graph)?;
-    load(store, &context, graph).map(Some)
+    load(store, context, graph).map(Some)
 }
 
 /// Acquire authority before constructing the operation request. Unsupported
@@ -411,9 +425,15 @@ async fn resolve_with_acquisition(
     identity: impl AsyncFn(&Context) -> Result<Option<String>>,
     api: impl AsyncFn(&Context) -> Result<Api>,
 ) -> Result<Option<GraphClient>> {
-    let mut resolved = resolve(cli, cwd, store, &ambient);
+    if skips_context(cli) {
+        return Ok(None);
+    }
+    let Some(context) = super::read_context(cwd)? else {
+        return Ok(None);
+    };
+    // One folder/account binding owns the whole invocation, including renewal.
+    let mut resolved = resolve_context(cli, &context, store, &ambient);
     let expected = if matches!(&resolved, Ok(Some(_))) {
-        let context = super::read_context(cwd)?.ok_or_else(Failure::protocol)?;
         let expected = identity(&context).await?;
         if expected.as_ref().is_some_and(|id| {
             load_credential(store, &context)
@@ -440,7 +460,6 @@ async fn resolve_with_acquisition(
                 )
             ) =>
         {
-            let context = super::read_context(cwd)?.ok_or_else(Failure::protocol)?;
             let expected = match expected {
                 Some(id) => Some(id),
                 None => identity(&context).await?,
@@ -459,7 +478,7 @@ async fn resolve_with_acquisition(
                             .as_ref()
                             .is_none_or(|id| saved.actor == format!("principal:{id}"))
                         {
-                            return resolve(cli, cwd, store, ambient);
+                            return resolve_context(cli, &context, store, ambient);
                         }
                     }
                     Err(error) if error.body["type"] == "data_credential_expired" => {}
@@ -467,8 +486,14 @@ async fn resolve_with_acquisition(
                 }
             }
             let api = api(&context).await?;
+            if let (Some(selected), Some(expected)) = (&api.selection, &expected) {
+                api.matches_principal(expected, &context.organization_id)?;
+                if selected.account_id != context.organization_id {
+                    return Err(Failure::protocol());
+                }
+            }
             mint_for_principal(store, &context, &api, 3600, expected.as_deref()).await?;
-            resolve(cli, cwd, store, ambient)
+            resolve_context(cli, &context, store, ambient)
         }
         Err(failure) => Err(failure),
     }
@@ -500,12 +525,9 @@ pub(crate) async fn client(cli: &Cli) -> std::result::Result<Option<GraphClient>
             &cwd,
             &auth::DATA_STORE,
             has_ambient_target,
-            async |context| auth::selected_principal(&context.api).await,
+            async |context| auth::selected_principal(&context.api, &context.organization_id).await,
             async |context| {
-                Api::new(
-                    context.api.clone(),
-                    Some(auth::credential(&context.api).await?),
-                )
+                Api::authenticated(context.api.clone(), Some(&context.organization_id)).await
             },
         )
         .await
