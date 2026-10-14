@@ -822,6 +822,18 @@ mod tests {
 
     #[test]
     fn disconnected_owned_operation_keeps_its_request_span() {
+        fn request_parent() -> Option<tracing::Id> {
+            use tracing_subscriber::registry::LookupSpan;
+            tracing::Span::current()
+                .with_subscriber(|(id, dispatch)| {
+                    let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+                    let operation = registry.span(id)?;
+                    assert_eq!(operation.name(), "native.operation");
+                    operation.parent().map(|parent| parent.id())
+                })
+                .flatten()
+        }
+
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::DEBUG);
         use tracing_subscriber::prelude::*;
@@ -838,7 +850,7 @@ mod tests {
                         let _entered = span.enter();
                         runtime
                             .submit((), async move {
-                                sent.send(tracing::Span::current().id()).unwrap();
+                                sent.send(request_parent()).unwrap();
                                 Ok::<_, ApiError>(()).into()
                             })
                             .unwrap()
@@ -849,7 +861,7 @@ mod tests {
                     let response = {
                         let _entered = span.enter();
                         runtime.try_observe().unwrap().spawn_read((), async move {
-                            sent.send(tracing::Span::current().id()).unwrap();
+                            sent.send(request_parent()).unwrap();
                             Ok::<_, ApiError>(())
                         })
                     };
