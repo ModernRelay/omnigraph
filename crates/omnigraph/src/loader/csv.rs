@@ -27,7 +27,7 @@ use super::{
 };
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
-use crate::storage_layer::WriteBudget;
+use crate::storage_layer::{KEYED_WRITE_MAX_ROWS, WriteBudget};
 
 /// The largest CSV object a load statement reads: the served `/load/ndjson`
 /// body limit, so a CSV source is bounded by the same number as a JSONL
@@ -483,16 +483,32 @@ fn parse_records(
     table_key: &str,
 ) -> Result<RecordBatch> {
     let parse_error = |error| csv_parse_error(&request.source, table_key, error);
+    let row_limit = match request.mode {
+        LoadMode::Append | LoadMode::Merge => Some(KEYED_WRITE_MAX_ROWS),
+        LoadMode::Overwrite => None,
+    };
+    let batch_rows = row_limit.map_or(CSV_READ_BATCH_ROWS, |limit| limit + 1);
     let reader = ReaderBuilder::new(Arc::clone(&schema))
         .with_header(request.header)
         .with_delimiter(request.delimiter)
-        .with_batch_size(CSV_READ_BATCH_ROWS)
+        .with_batch_size(batch_rows)
         .build(Cursor::new(bytes))
         .map_err(parse_error)?;
     let mut batches = Vec::new();
     let mut projected = 0_u64;
+    let mut rows = 0_usize;
     for batch in reader {
         let batch = batch.map_err(parse_error)?;
+        rows = rows.saturating_add(batch.num_rows());
+        if let Some(limit) = row_limit
+            && rows > limit
+        {
+            return Err(OmniError::resource_limit(
+                format!("keyed entities for {table_key}"),
+                limit as u64,
+                rows as u64,
+            ));
+        }
         for row in 0..batch.num_rows() {
             for projection in projections {
                 let text_bytes = projection.text_column.map_or(0, |index| {

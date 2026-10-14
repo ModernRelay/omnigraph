@@ -8,6 +8,9 @@ timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
 
 --- schema
 node Person {

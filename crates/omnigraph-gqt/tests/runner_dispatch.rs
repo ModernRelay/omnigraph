@@ -1,6 +1,39 @@
 use std::path::Path;
 use std::process::Command;
 
+/// A case cannot assert its own file-admission failure.
+#[test]
+fn csv_missing_fixture_is_refused_before_execution() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/csv_missing_fixture.gqt");
+    let text = std::fs::read_to_string(fixture).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("csv_missing_fixture.gqt");
+    for extra in ["", "--- csv unrelated.csv\nname\nalice\n"] {
+        std::fs::write(
+            &path,
+            text.replace("--- mutate", &format!("{extra}--- mutate")),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted a missing CSV fixture");
+        let summary = report(&output).1;
+        assert_eq!(summary["code"], "invalid_case", "{summary}");
+        assert!(
+            summary["result"]["Err"]
+                .as_str()
+                .unwrap()
+                .contains("names no `--- csv people.csv` section"),
+            "{summary}"
+        );
+    }
+}
+
 #[test]
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {

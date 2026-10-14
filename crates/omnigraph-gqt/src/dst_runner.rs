@@ -1972,7 +1972,7 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
     let csv_dir = tempfile::tempdir().map_err(|e| format!("worker_failed: tempdir: {e}"))?;
     case.materialize_csv_fixtures(csv_dir.path())
         .map_err(|e| format!("invalid_case: {e}"))?;
-    match input.seed {
+    let mut report = match input.seed {
         None => {
             let settings::TokioRuntime::MultiThread {
                 worker_threads,
@@ -2002,6 +2002,43 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
             ))
         }
         Some(seed) => dst_report(input, &case, seed, input_digest),
+    }?;
+    if !case.csv_sections.is_empty() {
+        let dir = csv_dir
+            .path()
+            .canonicalize()
+            .map_err(|e| format!("worker_failed: csv fixture directory: {e}"))?;
+        let base = format!("file://{}/", dir.display());
+        if let Err(error) = &mut report.result {
+            *error = error.replace(&base, "gqt-csv-fixture:///");
+        }
+        for observation in &mut report.observations {
+            *observation = observation.replace(&base, "gqt-csv-fixture:///");
+        }
+        for evidence in &mut report.evidence {
+            normalize_csv_fixture_evidence(evidence, &base);
+        }
+    }
+    Ok(report)
+}
+
+/// Keep fixture names and errors in replay evidence without the worker's
+/// temporary directory; user-provided absolute sources retain their URIs.
+fn normalize_csv_fixture_evidence(value: &mut serde_json::Value, base: &str) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => *text = text.replace(base, "gqt-csv-fixture:///"),
+        Value::Array(values) => {
+            for value in values {
+                normalize_csv_fixture_evidence(value, base);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                normalize_csv_fixture_evidence(value, base);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 

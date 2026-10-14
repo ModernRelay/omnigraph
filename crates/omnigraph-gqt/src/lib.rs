@@ -235,6 +235,7 @@ async fn execute_case_with_storage(
         Omnigraph::init_with_storage(uri, &fixture.schema, storage.clone(), Default::default())
             .await
             .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
     let session = case_session(db, case, engine)?;
     seed_case(&session, &fixture.seed, case.needs_indices).await?;
     omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &GqtHost)

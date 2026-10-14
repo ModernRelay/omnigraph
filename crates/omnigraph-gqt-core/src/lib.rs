@@ -2777,6 +2777,26 @@ impl Case {
     /// on the case's handles. A source that names no section is an absolute
     /// URI and is left as written; a bare name without a section is refused.
     pub fn materialize_csv_fixtures(&mut self, dir: &std::path::Path) -> Result<(), String> {
+        let steps = self.items.iter().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_ref(step).iter(),
+            Item::Loop { steps, .. } => steps.iter(),
+        });
+        for step in steps {
+            if let Step::Control(ControlStep {
+                write: ControlWrite::Load { stmt, .. },
+                ..
+            }) = step
+                && !stmt.source.contains("://")
+                && !self.csv_sections.contains_key(&stmt.source)
+            {
+                return Err(format!(
+                    "step {}: `load csv \"{}\"` names no `--- csv {}` section and is not a URI",
+                    step.ordinal(),
+                    stmt.source,
+                    stmt.source
+                ));
+            }
+        }
         if self.csv_sections.is_empty() {
             return Ok(());
         }
@@ -2798,7 +2818,6 @@ impl Case {
             Item::Loop { steps, .. } => steps.iter_mut(),
         });
         for step in steps {
-            let ordinal = step.ordinal();
             let Step::Control(ControlStep {
                 write: ControlWrite::Load { stmt, .. },
                 ..
@@ -2808,12 +2827,6 @@ impl Case {
             };
             if stmt.source.contains("://") {
                 continue;
-            }
-            if !self.csv_sections.contains_key(&stmt.source) {
-                return Err(format!(
-                    "step {ordinal}: `load csv \"{}\"` names no `--- csv {}` section and is not a URI",
-                    stmt.source, stmt.source
-                ));
             }
             stmt.source = format!("{base_url}{}", stmt.source);
         }
