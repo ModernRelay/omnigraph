@@ -38,8 +38,13 @@ const RESULT_BYTES: usize = 1024 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
 /// How long a caller waits for a write. The write itself is owned by the
 /// server and continues past this; the caller then learns its outcome is
-/// unknown.
-const WRITE_DEADLINE: Duration = Duration::from_secs(60);
+/// unknown. It stays below common client request timeouts (the MCP
+/// TypeScript SDK defaults to 60 seconds), so a client on such a default
+/// receives that answer instead of giving up first.
+const WRITE_DEADLINE: Duration = READ_DEADLINE;
+/// The MCP TypeScript SDK's default request timeout.
+#[cfg(test)]
+const COMMON_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 const RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
 /// Environment equivalent of `--mcp-allow-adhoc`.
@@ -328,7 +333,7 @@ impl Refusal {
     /// the write completed: the outcome is unknown and must be reconciled, never
     /// replayed blindly.
     async fn tool_result(self, write: bool) -> CallToolResult {
-        let unknown = "The write keeps running and its outcome is unknown. Read the target and reconcile before replaying it.";
+        let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`read` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
         match self {
             Refusal::Unauthenticated => failure(
                 "unauthenticated",
@@ -1398,7 +1403,7 @@ fn spec(settings: &McpSettings, name: &str) -> Option<&'static ToolSpec> {
 fn instructions(settings: &McpSettings) -> String {
     let mut text = String::from(
         "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n\
-         1. Call `graphs` for graph ids.\n\
+         1. Call `graphs` for graph ids. With a credential that is not an identity, it needs a `graph_list` permit, which a server without a cluster policy refuses; then ask the user for the graph id.\n\
          2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n\
          3. Prefer a stored read: `queries` lists them with typed parameters, and `query` runs one.\n",
     );
@@ -1409,7 +1414,7 @@ fn instructions(settings: &McpSettings) -> String {
     }
     if settings.allow_writes {
         text.push_str(
-            "Writes: `mutate`, `load` and the `branches_*` tools each publish at most one commit. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown` means the write may or may not have happened: read the target and reconcile before replaying. Schema and deployment changes are operator-owned and not available here.\n",
+            "Writes: `mutate`, `load` and the `branches_*` tools each publish at most one commit. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
         );
     }
     text.push_str(
@@ -1889,6 +1894,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
+        // The server's answer must arrive before a client on a common default
+        // timeout gives up and never sees `outcome_unknown`.
+        assert!(WRITE_DEADLINE < COMMON_CLIENT_TIMEOUT);
         for refusal in [Refusal::Cancelled, Refusal::Deadline] {
             let result = refusal.tool_result(true).await;
             assert_eq!(result.is_error, Some(true));
