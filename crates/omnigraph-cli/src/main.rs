@@ -612,15 +612,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Version => {
-            println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
-            println!(
-                "internal-schema {} (serves v{} to v{})",
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-                omnigraph::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-                omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-            );
-        }
+        Command::Version { json } => print_version(&VersionOutput::current(), json)?,
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;
             if args.json {
@@ -774,6 +766,7 @@ async fn run(cli: Cli) -> Result<()> {
                 into,
                 delete_branch,
                 as_commit,
+                dry_run,
                 settings,
                 json,
             } => {
@@ -789,9 +782,11 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
                 let into = resolve_branch(into, None, "main");
-                echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                if !dry_run {
+                    echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
+                }
                 let payload = client
-                    .branch_merge(&source, &into, delete_branch, as_commit, &settings)
+                    .branch_merge(&source, &into, delete_branch, as_commit, dry_run, &settings)
                     .await?;
                 // Keep the successful merge receipt on stdout; optional
                 // deletion has its own structured result and human warning.
@@ -803,6 +798,13 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 if json {
                     print_json(&payload)?;
+                } else if payload.dry_run {
+                    println!(
+                        "dry run: merging {} into {} would be: {} (nothing was written)",
+                        payload.source,
+                        payload.target,
+                        payload.outcome.as_str()
+                    );
                 } else {
                     match payload.commit.as_ref().filter(|commit| !commit.published) {
                         Some(commit) => println!(
@@ -824,7 +826,83 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            BranchCommand::Diff {
+                uri,
+                source,
+                into,
+                limit,
+                page_token,
+                kinds,
+                types,
+                ops,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let sides = client::DiffSidesArg::Branch {
+                    source: &source,
+                    target: &into,
+                };
+                run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+            }
+            BranchCommand::MergeBase {
+                uri,
+                source,
+                into,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let into = resolve_branch(into, None, "main");
+                let output = client.merge_base(&source, &into).await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_merge_base_human(&output);
+                }
+            }
         },
+        Command::Diff {
+            uri,
+            from,
+            to,
+            limit,
+            page_token,
+            kinds,
+            types,
+            ops,
+            json,
+        } => {
+            let client = client::GraphClient::resolve(
+                capability,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+            )
+            .await?;
+            let sides = client::DiffSidesArg::Between {
+                from: &from,
+                to: &to,
+            };
+            run_diff(&client, sides, page_token, limit, kinds, types, ops, json).await?;
+        }
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,
@@ -1571,7 +1649,7 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => {
                         refuse_process_prefix_when_remote(&client, &prefix)?;
-                        run_branch_list_statement_cli(
+                        run_branch_read_statement_cli(
                             &client,
                             &query_source,
                             stmt,
@@ -2329,7 +2407,7 @@ fn refuse_process_prefix_when_remote(
 /// The `query` door's branch-statement path: the door check, then the
 /// envelope refusals, then the round trip. The door rule itself is documented
 /// on `refuse_wrong_door` in `crates/omnigraph-server/src/handlers/dispatch.rs`.
-async fn run_branch_list_statement_cli(
+async fn run_branch_read_statement_cli(
     client: &client::GraphClient,
     query_source: &str,
     stmt: BranchStmt,
@@ -2341,7 +2419,14 @@ async fn run_branch_list_statement_cli(
         bail!("{}", control_write_at_read_door(write));
     }
     refuse_statement_envelope(has_target, has_name_or_params, false)?;
-    client.branch_list_statement(query_source, settings).await
+    match stmt {
+        BranchStmt::Read(read) => {
+            client
+                .branch_read_statement(query_source, read, settings)
+                .await
+        }
+        _ => client.branch_list_statement(query_source, settings).await,
+    }
 }
 
 /// The `query` door's `show` path: the envelope refusals `branch list`
@@ -2374,8 +2459,9 @@ async fn run_branch_statement_cli(
     json: bool,
     settings: &[(SettingId, SettingValue)],
 ) -> Result<ChangeOutput> {
+    let statement_name = stmt.statement_name();
     let BranchStmt::Write(write) = stmt else {
-        bail!("{}", read_at_write_door());
+        bail!("{}", read_at_write_door(statement_name));
     };
     refuse_statement_envelope(has_target, has_name_or_params, has_expected_head)?;
     if let BranchWrite::Delete { .. } = &write {
@@ -2453,4 +2539,67 @@ fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
             omnigraph::storage::redacted_storage_uri(&status.canonical_root)
         );
     }
+}
+
+/// Print a graph diff: one page when `page_token` is given (the raw escape
+/// hatch), otherwise every page in turn, each emitted before the next is
+/// fetched.
+#[allow(clippy::too_many_arguments)]
+async fn run_diff(
+    client: &client::GraphClient,
+    sides: client::DiffSidesArg<'_>,
+    page_token: Option<String>,
+    limit: Option<usize>,
+    kinds: Vec<cli::ChangeKindArg>,
+    types: Vec<String>,
+    ops: Vec<cli::ChangeOpArg>,
+    json: bool,
+) -> Result<()> {
+    let kinds: Vec<omnigraph_api_types::EntityKindOutput> =
+        kinds.into_iter().map(Into::into).collect();
+    let ops: Vec<omnigraph_api_types::ChangeOpOutput> = ops.into_iter().map(Into::into).collect();
+    let filter = client::ChangeFilterArgs {
+        kinds: &kinds,
+        types: &types,
+        ops: &ops,
+    };
+    if let Some(page_token) = page_token.as_deref() {
+        let page = client
+            .diff_page(sides, Some(page_token), limit, &filter)
+            .await?;
+        if json {
+            print_json(&page)?;
+        } else {
+            print_diff_human(&page);
+        }
+        return Ok(());
+    }
+    let mut next_page_token: Option<String> = None;
+    if json {
+        let mut output = DiffJsonStream::new(io::BufWriter::new(io::stdout()));
+        loop {
+            let page = client
+                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+        let _ = output.finish()?;
+    } else {
+        let mut output = DiffHumanStream::new();
+        loop {
+            let page = client
+                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .await?;
+            next_page_token = page.next_page_token.clone();
+            output.write_page(&page)?;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }

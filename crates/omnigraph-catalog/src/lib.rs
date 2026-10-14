@@ -855,14 +855,55 @@ impl CapturedManifestProbe {
     }
 }
 
+/// The latest attached version of `dataset`'s location (main or the branch
+/// tree it is checked out on), asked for by name from the version it holds.
+///
+/// `latest_version_id` lists `_versions/`. On a store whose listing is
+/// ordered (S3, GCS, Azure) that is one request returning up to a thousand
+/// keys however few of them are new, and a warm read pays it on every query.
+/// Attached versions are contiguous: Lance writes version `v + 1` only with a
+/// put-if-absent over a read of `v`, and nothing deletes a version of a live
+/// branch's `__manifest`, so while the held version `v` exists the first
+/// absent name above it ends the history. (`cleanup` collects a retired
+/// branch's whole tree; the named-branch probe's identifier read catches
+/// that.) A reclamation of old `__manifest` versions must keep every version
+/// above one a live handle holds.
+///
+/// The probe HEADs `v` and `v + 1` together, then `v + 2` when `v + 1`
+/// exists. `v` must answer: a removed or unreadable `__manifest` answers "not
+/// found" for every name, and only the listing reports it as the failure it
+/// is. A gap of more than two versions, a detached handle, an absent `v` or
+/// any error falls back to the listing, which stays the authority. Like the
+/// listing, the probe relies on the store showing a completed write to a
+/// later request.
+async fn latest_attached_version(dataset: &Dataset) -> lance::Result<u64> {
+    let held = dataset.version().version;
+    if !lance_table::format::is_detached_version(held) {
+        let scheme = dataset.manifest_location().naming_scheme;
+        let base = dataset.branch_location().path;
+        let store = dataset.object_store(None).await?;
+        let [at, next, after] = [held, held + 1, held + 2].map(|v| scheme.manifest_path(&base, v));
+        let (held_present, next_present) = futures::join!(store.exists(&at), store.exists(&next));
+        match (held_present, next_present) {
+            (Ok(true), Ok(false)) => return Ok(held),
+            (Ok(true), Ok(true)) => {
+                if let Ok(false) = store.exists(&after).await {
+                    return Ok(held + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    dataset.latest_version_id().await
+}
+
 async fn probe_dataset_latest_incarnation(
     dataset: &Dataset,
     active_branch: Option<&str>,
 ) -> Result<ManifestIncarnation> {
     if active_branch.is_none() {
         return Ok(ManifestIncarnation {
-            version: dataset
-                .latest_version_id()
+            version: latest_attached_version(dataset)
                 .await
                 .map_err(OmniError::storage)?,
             e_tag: dataset.manifest_location().e_tag.clone(),
@@ -879,8 +920,7 @@ async fn probe_dataset_latest_incarnation(
     // yields the replacement identifier rather than a false match to the held
     // lifetime.
     let held = async {
-        let version = dataset
-            .latest_version_id()
+        let version = latest_attached_version(dataset)
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         let native = dataset.manifest().branch.as_deref().ok_or_else(|| {

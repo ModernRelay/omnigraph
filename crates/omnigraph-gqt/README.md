@@ -130,6 +130,17 @@ inherits its base's recorded target. A name is bound once, before every use,
 outside a loop, and survives `--- restart`; the served path binds from the
 `ChangeOutput.commit` the route answered and sends `snapshot` on the read.
 
+A `--- query` step may hold a branch control read (RFC 0030 §8.5):
+`branch diff <source> [into <target>]`, `branch diff <from> to <to>`,
+`branch merge-base <source> [into <target>]` or
+`branch merge <source> [into <target>] dry run`. It takes `unordered`,
+`ordered` or `error:`; its rows are the statement's answer, compared as JSON
+whatever their key order, and it carries no shape section, since its columns
+are the statement's. A side spelled `"${name}"` runs with the commit
+`--- bind commit $name` captured, and `${name}` in an expected row stands for
+the same id. The engine and DST paths call `Session::branch_read`; the served
+path sends the statement to `POST /query`.
+
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;

@@ -8377,14 +8377,14 @@ async fn rfc_0067_detached_pin_diff_keeps_the_acknowledged_insert() {
             .contains(&"detached-diff".to_string())
     );
     let after = helpers::snapshot_id(&db, "main").await.unwrap();
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         changes.stats.inserts, 1,
         "acknowledged insert absent from public diff: {changes:?}"
@@ -8415,14 +8415,14 @@ async fn rfc_0067_foreign_linear_commit_diff_keeps_the_acknowledged_insert() {
         collect_column_strings(&read_table(&db, "node:Person").await, "name")
             .contains(&"blocked-diff-second".to_string())
     );
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         changes.stats.inserts, 1,
         "acknowledged chain insert absent from public diff: {changes:?}"
@@ -9260,16 +9260,16 @@ async fn rfc_0067_merge_diff_keeps_every_chunk() {
     }
     let after = helpers::snapshot_id(&db, "main").await.unwrap();
     let after_rows = count_rows(&db, "node:Person").await;
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        changes.stats.inserts as usize,
+        changes.stats.inserts,
         after_rows - before_rows,
         "diff omitted acknowledged merge chunks: {} inserts for {} added rows",
         changes.stats.inserts,

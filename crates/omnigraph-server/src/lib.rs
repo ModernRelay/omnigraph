@@ -144,6 +144,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_commit_publish,
         handlers::server_commit_drop,
         handlers::server_commit_changes,
+        handlers::server_diff,
+        handlers::server_branch_diff,
+        handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
@@ -1474,6 +1477,8 @@ impl ApiError {
             OmniError::BranchNotFound { branch } => {
                 Self::not_found(format!("branch '{branch}' not found"))
             }
+            error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
+            error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -2652,6 +2657,8 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
+        .route("/branches/diff", get(server_branch_diff))
+        .route("/branches/merge-base", get(server_merge_base))
         .route("/commits", get(server_commit_list))
         .route(
             "/commits/{commit_id}",
@@ -2659,6 +2666,7 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/commits/{commit_id}/publish", post(server_commit_publish))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
+        .route("/diff", get(server_diff))
         .route("/changes", get(server_changes_feed))
         .route("/changes/baseline", post(server_changes_baseline))
         .route_layer(middleware::from_fn_with_state(

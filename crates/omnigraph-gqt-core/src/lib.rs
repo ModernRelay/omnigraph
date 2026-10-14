@@ -16,8 +16,9 @@ use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_qu
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
 use omnigraph_compiler::query::ast::{
-    BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr, FileBody, Literal,
-    MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase, show_statement_name,
+    BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite, EmptyFile, Expr,
+    FileBody, Literal, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
+    show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::{
@@ -121,6 +122,7 @@ pub fn step_kind(step: &Step) -> &'static str {
         Step::List(_) => "list",
         Step::Settings(_) => "settings",
         Step::Show(_) => "show",
+        Step::BranchRead(_) => "branch read",
         Step::Restart { .. } => "restart",
         Step::Concurrent(_) => "concurrent",
     }
@@ -145,6 +147,7 @@ pub enum Step {
     List(ListStep),
     Settings(SettingsStep),
     Show(ShowStep),
+    BranchRead(BranchReadStep),
     Restart { ordinal: usize },
     Concurrent(ConcurrentStep),
 }
@@ -159,6 +162,7 @@ impl Step {
             Self::List(s) => s.ordinal,
             Self::Settings(s) => s.ordinal,
             Self::Show(s) => s.ordinal,
+            Self::BranchRead(s) => s.ordinal,
             Self::Restart { ordinal } => *ordinal,
             Self::Concurrent(s) => s.ordinal,
         }
@@ -171,6 +175,7 @@ impl Step {
             Step::Query(step) => Some(&step.expect),
             Step::List(step) => Some(&step.expect),
             Step::Show(step) => Some(&step.expect),
+            Step::BranchRead(step) => Some(&step.expect),
             Step::Mutate(_)
             | Step::Load(_)
             | Step::Control(_)
@@ -185,6 +190,7 @@ impl Step {
             Step::Query(step) => Some(&mut step.expect),
             Step::List(step) => Some(&mut step.expect),
             Step::Show(step) => Some(&mut step.expect),
+            Step::BranchRead(step) => Some(&mut step.expect),
             Step::Mutate(_)
             | Step::Load(_)
             | Step::Control(_)
@@ -346,6 +352,136 @@ pub struct ShowStep {
     id: Option<SettingId>,
     prefix: Vec<SettingStmt>,
     expect: QueryExpect,
+}
+
+/// A `--- query` step holding a branch control read (`branch diff`,
+/// `branch merge-base`, `branch merge … dry run`, RFC 0030 §8). Its rows are
+/// the statement's answer, compared as JSON; a side spelled `"${name}"`, and
+/// a `"${name}"` in an expected row, stand for the commit `--- bind commit
+/// $name` captured. Its shape is the statement's own, so the step carries no
+/// shape section.
+#[derive(Debug)]
+pub struct BranchReadStep {
+    ordinal: usize,
+    read: BranchRead,
+    /// The statement text, for the served path, which sends it with its
+    /// bound names replaced.
+    source: String,
+    expect: QueryExpect,
+}
+
+/// The operands of a branch control read that may name a bound commit: its
+/// branch or commit sides.
+fn branch_read_operands(read: &BranchRead) -> Vec<&str> {
+    match read {
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch { source, into },
+            ..
+        }
+        | BranchRead::MergeBase { source, into }
+        | BranchRead::MergeDryRun { source, into } => std::iter::once(source.as_str())
+            .chain(into.as_deref())
+            .collect(),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Between { from, to },
+            ..
+        } => vec![from.as_str(), to.as_str()],
+    }
+}
+
+/// `read` with every operand spelled `${name}` replaced by the bound id.
+fn resolve_branch_read(read: &BranchRead, bindings: &Bindings) -> Result<BranchRead, String> {
+    let resolve = |operand: &str| resolve_operand(operand, bindings);
+    let resolve_into = |into: &Option<String>| into.as_deref().map(resolve).transpose();
+    Ok(match read {
+        BranchRead::Diff { sides, page } => BranchRead::Diff {
+            sides: match sides {
+                BranchDiffSides::Branch { source, into } => BranchDiffSides::Branch {
+                    source: resolve(source)?,
+                    into: resolve_into(into)?,
+                },
+                BranchDiffSides::Between { from, to } => BranchDiffSides::Between {
+                    from: resolve(from)?,
+                    to: resolve(to)?,
+                },
+            },
+            page: page.clone(),
+        },
+        BranchRead::MergeBase { source, into } => BranchRead::MergeBase {
+            source: resolve(source)?,
+            into: resolve_into(into)?,
+        },
+        BranchRead::MergeDryRun { source, into } => BranchRead::MergeDryRun {
+            source: resolve(source)?,
+            into: resolve_into(into)?,
+        },
+    })
+}
+
+/// `text` with every bound commit name replaced by its id.
+fn substitute_bound(text: &str, bindings: &Bindings) -> String {
+    bindings.iter().fold(text.to_string(), |text, (name, id)| {
+        text.replace(&format!("${{{name}}}"), id)
+    })
+}
+
+/// The step a branch control read becomes under `mode`: rows in the
+/// statement's own order or as a multiset, or an error. A bound `${name}`
+/// may appear in the expected rows.
+fn complete_branch_read_step(
+    ordinal: usize,
+    read: BranchRead,
+    source: String,
+    mode: &ExpectHeader,
+    section: &Section<'_>,
+    loop_var: Option<&str>,
+    bound_names: &HashSet<String>,
+) -> Result<BranchReadStep, String> {
+    let expect = match mode {
+        ExpectHeader::Unordered | ExpectHeader::Ordered => {
+            refuse_comment_lines(&section.body, "expect")?;
+            let body: String = section
+                .body
+                .iter()
+                .map(|(_, l)| *l)
+                .collect::<Vec<_>>()
+                .join("\n");
+            validate_subst_tokens(&body, loop_var, bound_names)?;
+            QueryExpect::Rows {
+                ordered: matches!(mode, ExpectHeader::Ordered),
+                body_raw: body,
+                span: BodySpan {
+                    start_line: section.header_line + 1,
+                    len: section.body.len(),
+                },
+                shape: ShapeExpect {
+                    lines: Vec::new(),
+                    span: BodySpan {
+                        start_line: 0,
+                        len: 0,
+                    },
+                },
+            }
+        }
+        ExpectHeader::Error(needle) => {
+            refuse_nonempty_body(&section.body, "an `expect error:` section")?;
+            QueryExpect::Error {
+                needle: needle.clone(),
+            }
+        }
+        ExpectHeader::Ok | ExpectHeader::Affected { .. } | ExpectHeader::Outcome(_) => {
+            return Err(format!(
+                "`{}` takes `unordered`, `ordered`, or `error:`",
+                read.statement_name()
+            ));
+        }
+    };
+    Ok(BranchReadStep {
+        ordinal,
+        read,
+        source,
+        expect,
+    })
 }
 
 /// `main`, the default wherever a branch is unspelled.
@@ -1271,6 +1407,11 @@ enum Pending {
         id: Option<SettingId>,
         prefix: Vec<SettingStmt>,
     },
+    BranchRead {
+        ordinal: usize,
+        read: BranchRead,
+        source: String,
+    },
     /// A `--- concurrent` block awaiting the bare `--- expect` that names
     /// each session's outcome.
     Concurrent(ConcurrentStep),
@@ -1812,7 +1953,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         awaiting: Option<Step>,
     ) -> Result<(), String> {
         match awaiting {
-            Some(step) if matches!(step, Step::Show(_)) => {
+            Some(step) if matches!(step, Step::Show(_) | Step::BranchRead(_)) => {
                 push_step(items, open_loop, step);
                 Ok(())
             }
@@ -1987,10 +2128,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                             );
                         }
                         if kind == "mutate" && !stmt.is_write() {
-                            return Err(
-                                "`branch list` under `--- mutate` is refused; use `--- query`"
-                                    .into(),
-                            );
+                            return Err(format!(
+                                "`{}` under `--- mutate` is refused; use `--- query`",
+                                stmt.statement_name()
+                            ));
                         }
                         if branch.is_some() {
                             return Err(
@@ -2001,6 +2142,30 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ordinal += 1;
                         pending = Some(match stmt {
                             BranchStmt::List => Pending::List { ordinal },
+                            BranchStmt::Read(read) => {
+                                for operand in branch_read_operands(&read) {
+                                    if let Some(name) = bound_operand(operand)
+                                        && !bound_names.contains(name)
+                                    {
+                                        return Err(format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        ));
+                                    }
+                                }
+                                let bound = branch_read_operands(&read)
+                                    .into_iter()
+                                    .filter(|operand| bound_operand(operand).is_some())
+                                    .count();
+                                if bound > 0 && source.matches("${").count() == bound {
+                                    substitutable_lines
+                                        .extend(section.body.iter().map(|(i, _)| *i));
+                                }
+                                Pending::BranchRead {
+                                    ordinal,
+                                    read,
+                                    source: source.clone(),
+                                }
+                            }
                             BranchStmt::Write(write) => Pending::Control {
                                 ordinal,
                                 prefix: file.settings,
@@ -2187,7 +2352,9 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 }
                 let step = match pending.as_mut() {
                     Some(Pending::Decl(step)) => step,
-                    Some(Pending::List { .. } | Pending::Control { .. }) => {
+                    Some(
+                        Pending::List { .. } | Pending::Control { .. } | Pending::BranchRead { .. },
+                    ) => {
                         return Err("a branch statement takes no params".into());
                     }
                     Some(Pending::Settings { .. } | Pending::Show { .. }) => {
@@ -2274,6 +2441,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         refuse_unequal_show_shape(&lines, section.header_line + 1)?;
                         push_step(&mut items, &mut open_loop, step);
                         continue;
+                    }
+                    if let Step::BranchRead(read) = &step {
+                        return Err(format!(
+                            "line {}: `{}` answers its own columns; drop the `--- expect shape` section",
+                            section.header_line + 1,
+                            read.read.statement_name()
+                        ));
                     }
                     let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
                         return Err(format!(
@@ -2376,6 +2550,19 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     Some(Pending::Concurrent(_)) => {
                         unreachable!("a pending concurrent block is completed above")
                     }
+                    Some(Pending::BranchRead {
+                        ordinal,
+                        read,
+                        source,
+                    }) => Step::BranchRead(complete_branch_read_step(
+                        ordinal,
+                        read,
+                        source,
+                        &mode,
+                        section,
+                        loop_var,
+                        &bound_names,
+                    )?),
                     None => {
                         return Err(format!(
                             "line {}: `--- expect` has no query or mutate step to bind to",
@@ -3303,6 +3490,56 @@ async fn run_list_step(
     )
 }
 
+/// Runs a branch control read through `Session::branch_read`, its bound
+/// operands replaced, and holds its rows (rendered as the read door renders
+/// them) or its error against the expect.
+async fn run_branch_read_step(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &BranchReadStep,
+    binding: Option<(&str, &str)>,
+    bindings: &Bindings,
+) -> Result<(), StepFail> {
+    let statement = step.read.statement_name();
+    let label = step_label(step.ordinal, statement, binding);
+    let fail = |message: String| StepFail {
+        label: label.clone(),
+        message,
+        bless_lines: None,
+    };
+    let read = resolve_branch_read(&step.read, bindings).map_err(&fail)?;
+    let outcome = operation(host, step.ordinal, session.branch_read(&read))
+        .await
+        .map_err(&fail)?;
+    match &step.expect {
+        QueryExpect::Rows {
+            ordered,
+            body_raw,
+            span,
+            ..
+        } => {
+            let answer = outcome.map_err(|e| fail(format!("`{statement}` failed: {e}")))?;
+            let output = omnigraph_api_types::branch_read_output(&answer)
+                .map_err(|e| fail(format!("`{statement}` rows failed to render: {e}")))?;
+            let rows: Vec<Value> = serde_json::from_str(output.rows.get())
+                .map_err(|e| fail(format!("`{statement}` rows are not a JSON array: {e}")))?;
+            check_rows_json(
+                host,
+                &label,
+                &rows,
+                *ordered,
+                &substitute_bound(body_raw, bindings),
+                *span,
+                binding,
+            )
+        }
+        QueryExpect::Error { needle } => {
+            check_error_expect(host, needle, outcome, &format!("`{statement}` succeeded"))
+                .map_err(fail)
+        }
+    }
+}
+
 /// Holds a read expect against a result the runner built itself (`branch
 /// list`, `show`): the result's own schema is the inferred one, so the
 /// shape check has no compiler to disagree with.
@@ -3853,6 +4090,9 @@ async fn execute_steps_inner<H: ExecutionHost>(
                     Step::List(l) => run_list_step(host, &session, l, binding).await,
                     Step::Settings(s) => run_settings_step(host, &mut session, s, binding),
                     Step::Show(s) => run_show_step(host, &session, s, binding),
+                    Step::BranchRead(r) => {
+                        run_branch_read_step(host, &session, r, binding, &bindings).await
+                    }
                     Step::Concurrent(c) => host.concurrent_step(&session, case, c).await,
                     Step::Restart { ordinal } => {
                         generation += 1;
@@ -4001,6 +4241,7 @@ fn expectation_evidence(step: &Step) -> Value {
             serde_json::json!({"kind": "settings", "statements": format!("{:?}", s.statements)})
         }
         Step::Show(s) => read_expect_evidence(&s.expect),
+        Step::BranchRead(r) => read_expect_evidence(&r.expect),
         Step::Restart { .. } => serde_json::json!({"kind": "restart", "storage": "preserved"}),
         Step::Concurrent(c) => serde_json::json!({
             "kind": "concurrent",
@@ -4107,6 +4348,7 @@ pub enum StepKind {
     CommitDrop,
     Settings,
     Show,
+    BranchRead,
     Restart,
     Concurrent,
 }
@@ -4177,6 +4419,7 @@ impl Step {
             Self::List(_) => StepKind::BranchList,
             Self::Settings(_) => StepKind::Settings,
             Self::Show(_) => StepKind::Show,
+            Self::BranchRead(_) => StepKind::BranchRead,
             Self::Restart { .. } => StepKind::Restart,
             Self::Concurrent(_) => StepKind::Concurrent,
         }

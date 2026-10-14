@@ -46,6 +46,7 @@ pub enum GqtOperationKind {
     CommitDrop,
     Settings,
     Show,
+    BranchRead,
     Restart,
     Concurrent,
 }
@@ -63,6 +64,7 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::CommitDrop => Self::CommitDrop,
             StepKind::Settings => Self::Settings,
             StepKind::Show => Self::Show,
+            StepKind::BranchRead => Self::BranchRead,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
         }
