@@ -26,6 +26,13 @@ taken to v9 with the 0.11 binary, or rebuilt. See
 Read [migration guidance](references/migrations.md) before replacing a
 deployed binary.
 
+An `omnigraph` binary that has the `skill` command carries the copy of this
+skill written for it: `omnigraph skill export <dir> --force` writes it where
+your agent loads skills, and `omnigraph skill show [<path>]` prints one file.
+Prefer that copy when the installed CLI differs from the one this copy was
+written for (see
+[version-matched skill](references/commands.md#version-matched-skill)).
+
 ## GQ 2.1 traversal support
 
 0.12.0 compiles GQ 2.1, which adds typed edge selections to traversal. A v0.11
@@ -170,6 +177,7 @@ Notation: `<x>` required · `[x]` optional · `<a|b>` choice · `…` repeatable
 - `export [--branch <b>] [--type <T>…]` (streams JSONL)
 - `branch <create <name> [--from <base>] | list | delete <name> | merge <source> [--into <target>] [--delete-branch]> [--json]` (`--from`/`--into` default to `main`; also available as GQ statements via `mutate -e`/`query -e`)
 - `commit <list [--branch <b>] | show <commit_id> | changes <commit_id> [filters…]> [--json]`
+- `diff --from <branch|commit_id> --to <branch|commit_id> [filters…] [--json]` — net entity changes between two read targets; `branch diff <source> [--into <target>]` reviews a branch against its merge base, and `branch merge-base <source> [--into <target>]` prints that base
 - `changes <poll [--start now|beginning|after:<id> | --cursor <c>] | baseline --out <snapshot.jsonl>> [filters…] [--json]`
 - `schema show` (alias `get`)
 
@@ -206,7 +214,7 @@ accept `--cluster <dir|file://|s3://|az://> --graph <id>`:
 **Local** (no graph):
 - `alias <name> [args…]` — invoke an operator alias's bound stored read query; `[--params … | --params-file <p>] [--format <fmt> | --json]` (server/graph/query come from the binding)
 - `embed (--seed <embed.yaml> | --input <raw.jsonl> --output <out.jsonl> --spec <spec.json>) [--reembed-all | --clean] [--type <T>…] [--select "<Type>:<field>=<value>"]`
-- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `version`
+- `login <server> [--token <t>]` (prefer piping the token on stdin) · `logout <server>` · `login --api <origin>` / `logout --api <origin>` (managed session) · `profile <list | show [<name>]>` · `skill <export <dir> [--force] [--json] | show [<path>]>` · `version`
 
 Managed folders can select an Intent API with `login --api` and `use`; implicit
 `query`, `mutate`, `load`, `commit list`/`show` and `graphs list` then acquire

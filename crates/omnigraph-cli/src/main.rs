@@ -61,6 +61,7 @@ mod output;
 mod planes;
 mod schema_upgrade;
 mod scope;
+mod skill;
 mod upgrade;
 use cli::*;
 use helpers::*;
@@ -609,6 +610,17 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Skill { command } => match command {
+            SkillCommand::Export { dir, force, json } => {
+                let output = skill::export(&dir, force)?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    skill::print_export_human(&output);
+                }
+            }
+            SkillCommand::Show { path } => skill::show(&path)?,
+        },
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
             println!(

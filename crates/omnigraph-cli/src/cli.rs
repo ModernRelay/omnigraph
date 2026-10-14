@@ -21,7 +21,7 @@ direct — direct storage access; reject --server (init, upgrade, optimize, rebu
 repair, cleanup, schema plan/apply, lint).\n  \
 control — manage or inspect a cluster (--config for bundles; explicit --cluster roots for \
 self-hosted deployment/recovery; --managed for the managed service; policy & queries via --cluster).\n  \
-local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
+local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, skill, version.\n\
 MANAGED FOLDERS: cluster --managed uses .omnigraph/context; data commands acquire identity credentials automatically.\n\
 Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
 Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
@@ -458,8 +458,42 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Export or print the agent skill built into this binary, which matches
+    /// this CLI's commands and HTTP contract.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Print the CLI version
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SkillCommand {
+    /// Write the agent skill into a directory, creating it when missing.
+    ///
+    /// Refuses when any file the export writes already exists, unless
+    /// --force. A record of the written files (`.omnigraph-skill.json`) lets a
+    /// later --force export remove files this skill no longer has, but only
+    /// while their bytes are unchanged. Other files are never touched.
+    Export {
+        /// Skill directory, e.g. ~/.claude/skills/omnigraph.
+        dir: PathBuf,
+        /// Replace the skill's files and remove unchanged files that an
+        /// earlier export recorded and this skill no longer has.
+        #[arg(long)]
+        force: bool,
+        /// Emit JSON: the files written, the skill version, the CLI version
+        /// and the HTTP contract.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one file of the agent skill to stdout.
+    Show {
+        /// Path below the skill root.
+        #[arg(default_value = "SKILL.md", value_name = "PATH")]
+        path: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

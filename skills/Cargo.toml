@@ -1,0 +1,16 @@
+[package]
+name = "omnigraph-skill"
+version = "0.13.0"
+edition = "2024"
+description = "The omnigraph agent skill, embedded byte for byte for the OmniGraph CLI."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-skill"
+
+# The package root is `skills/` so that `skills/omnigraph`, the one copy of
+# the skill, lies inside it: a packaged crate carries the skill tree, and
+# `build.rs` embeds it from there in the workspace and in a package alike.
+
+[lints]
+workspace = true

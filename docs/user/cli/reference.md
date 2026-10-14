@@ -70,6 +70,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
+| `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print build and storage-format information | local |
 
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
@@ -185,8 +186,7 @@ reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
 
 ## Operator configuration
 
-The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a
-different directory.
+The default path is `~/.omnigraph/config.yaml`. Set `OMNIGRAPH_HOME` to use a different directory.
 
 ```yaml
 operator:
