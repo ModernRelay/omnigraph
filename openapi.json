@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.13.0"
+    "version": "0.14.0"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
