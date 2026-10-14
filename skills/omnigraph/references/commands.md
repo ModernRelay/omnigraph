@@ -54,7 +54,7 @@ prints the exact flags of the installed binary.
 | `use` | — | Select a managed cluster for a config folder |
 | `profile` | `list` `show` | Inspect operator profiles |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
-| `version` | — | Print the CLI version and the storage formats it serves |
+| `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
 ## Version-Matched Skill
 
