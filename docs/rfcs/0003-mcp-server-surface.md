@@ -165,7 +165,7 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|
-| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) | identity required | read-only |
+| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) for an identity credential; otherwise `server_graphs_list` (`GET /graphs`) narrowed to ids and names | identity, or `graph_list` | read-only |
 | `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`), mutations filtered out | `read` | read-only |
 | `query` | shipped | `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false` | `invoke_query`, then `read` | read-only |
 | `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
@@ -185,8 +185,10 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 
 Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
 `query` is `read`, because the shipped `query` already names the stored read; its
-`graphs_list` is the shipped `graphs`, which answers discovery rather than the
-`graph_list`-gated management catalog. `read` also serves what `POST /query`
+`graphs_list` is the shipped `graphs`. Discovery admits only identity
+credentials (OIDC or signed identity tokens), so for any other credential, such
+as a static token, `graphs` calls `GET /graphs` under `graph_list`, as the
+package did, and returns only ids and names. `read` also serves what `POST /query`
 serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
 and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
 serves. Stored mutations stay unavailable through `query`; they arrive with
@@ -219,7 +221,7 @@ write contract below.
 
 | URI | Content | Gate |
 |---|---|---|
-| `omnigraph://graphs` | `GET /graphs/discovery` JSON | identity required |
+| `omnigraph://graphs` | the `graphs` result, JSON | as `graphs` |
 | `omnigraph://graphs/{graph}/schema` (template) | the `.pg` source, `text/plain` | `read` |
 | `omnigraph://graphs/{graph}/branches` (template) | `GET /branches` JSON | `read` |
 | `omnigraph://best-practices/index` | index of the references below, `text/markdown` | identity required |
