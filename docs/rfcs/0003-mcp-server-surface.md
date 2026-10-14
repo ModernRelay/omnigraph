@@ -3,301 +3,400 @@ rfc: "0003"
 title: "MCP server surface"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-02
-discussion: null
+updated: 2026-10-13
+discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
 blocked_on: []
 ---
 
 # RFC 0003: MCP server surface
-**Tickets:** MR-969 (stored queries + MCP exposure — the surface this completes), MR-956 (federated auth / WorkOS OAuth — the auth substrate this consumes), MR-971 (per-server credential resolver), MR-974 (agent setup surface — the installer that wires this), MR-668 (multi-graph server — shipped, the routing this builds on)
-**Builds on:** [RFC 0041](0041-inline-stored-queries.md) and the shipped
-stored-query registry, `GET /queries`, `POST /queries/{name}`, and coarse
-`invoke_query` gate.
-**Replaces:** the obsolete MCP-transport sketch removed from
-[RFC 0041](0041-inline-stored-queries.md). See
+**Tickets:** MR-969 (stored queries + MCP exposure), MR-956 (federated auth /
+WorkOS OAuth), MR-974 (agent setup surface), MR-668 (multi-graph server)
+**Builds on:** [RFC 0041](0041-inline-stored-queries.md) (stored-query registry,
+`GET /queries`, `POST /queries/{name}`, coarse `invoke_query`) and
+[Identity, credentials and applied policy](2026-09-09-identity-credentials-and-applied-policy.md),
+which shipped the `/mcp` transport and its initial tools.
+**Replaces:** the obsolete MCP-transport sketch removed from RFC 0041. See
 [Relationship to RFC 0041](#relationship-to-rfc-0041).
-**Target release:** Unscheduled (phased — see Rollout)
 
 ## Summary
 
-Add a first-class **MCP (Model Context Protocol) server surface to `omnigraph-server`**, exposed over **Streamable HTTP**, that projects the server's operations as MCP tools and resources for LLM clients (Claude Code/Desktop/web, Cursor, etc.). Two populations of tools share one projection path:
+`omnigraph-server` is the only MCP implementation for OmniGraph. Its `/mcp`
+endpoint speaks stateless Streamable HTTP through the official Rust SDK and
+projects existing HTTP handlers as MCP tools and resources. Every tool calls the
+handler its HTTP route calls, under the same actor and the same Cedar action; the
+MCP layer adds no authorization path of its own. Tool visibility is never
+permission.
 
-1. **Built-in operational tools** — parity with the existing `@modernrelay/omnigraph-mcp` stdio package's **13 tools** (`health`, `snapshot`, `read`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply`) and its **2 resources** (`omnigraph://schema`, `omnigraph://branches`), plus a new server-scoped `graphs_list` tool and an `omnigraph://graphs` resource (multi-graph mode).
-2. **Dynamic stored-query tools** — one MCP tool per entry in the applied
-   cluster's `queries:` registry, with parameters typed from the `.gq`
-   declaration through the shipped `query_catalog_entry` / `param_descriptor`
-   projection.
+This RFC decides the surface in two shippable phases on top of the shipped
+transport:
 
-Every tool is **authorized by the server's existing Cedar policy engine**. The MCP layer never implements its own authentication: it consumes an **already-resolved `ResolvedActor`** from the server's bearer middleware (`require_bearer_auth` today; the `TokenVerifier` seam when MR-956 lands), so the **same MCP endpoint serves on-prem (static or customer-OIDC tokens) and our cloud (WorkOS OAuth) by configuration only**. Cloud OAuth is an additive layer (RFC 9728 protected-resource metadata) that slots in with zero MCP changes.
+1. **Self-contained discovery and useful read tools.** Protected-resource
+   metadata is served at the path the OAuth challenge advertises; a refused
+   bearer gets `error="invalid_token"`; a `schema` tool and an opt-in ad-hoc
+   `read` tool let a model answer questions about a graph.
+2. **MCP for every authenticated deployment.** `/mcp` is mounted whenever the
+   server has a bearer credential source (static tokens, signed data tokens or
+   OIDC); read parity with the `@modernrelay/omnigraph-mcp` npm package; opt-in
+   write tools that keep the package's write contract.
 
-The end-state collapses two diverging tool implementations into one: the in-server MCP is the canonical, Cedar-gated, remotely-reachable surface; the stdio package becomes a thin stdio↔HTTP proxy (local on-ramp) over it.
-
-> **Key caveat, stated up front (see §5.9 below):** the headline "a token scoped via Cedar to a *specific set* of stored queries" requires **per-query `invoke_query` scope**, which is designed in [RFC 0041](0041-inline-stored-queries.md) but **not yet implemented** — the shipped action is coarse (any stored query on the graph, or none). Per-actor Cedar curation works today for *built-in vs ad-hoc vs admin* tools and for *stored-vs-ad-hoc*; sub-selecting individual stored queries per actor is gated on a prerequisite (PR 0b). Until then, stored-query curation is graph-level through registry membership.
+After a release ships both phases, the npm package is deprecated in favour of the
+server's `/mcp`. It is retired, not kept as a stdio proxy.
 
 ## Relationship to RFC 0041
 
-[RFC 0041](0041-inline-stored-queries.md) (MR-656 / MR-976 / MR-969) is the
-parent decision for inline and stored queries. This RFC owns MCP transport and
-revises that earlier sketch where shipped query behavior or the MCP wire
+RFC 0041 is the parent decision for inline and stored queries. This RFC owns MCP
+transport and revises that earlier sketch where shipped behavior or the MCP wire
 protocol diverged.
 
-1. **Transport shape.** RFC 0041 sketched `GET /mcp/tools` + `POST /mcp/invoke` (a bespoke REST pair). **That is not the MCP wire protocol — real MCP clients cannot connect to it.** This RFC implements actual MCP JSON-RPC over Streamable HTTP and reuses `query_catalog_entry` as a *projection source*, not a parallel surface. (RFC 0041's own Open Question already leaned toward Streamable HTTP.)
-2. **Exposure config.** RFC 0041 specified inline `.gq` exposure pragmas. The current control plane instead owns an applied `queries:` registry and cluster-mode serving catalogs every registered query. This RFC adopts that shipped registry as the source of dynamic tools; per-actor selection remains a Cedar concern once per-query scope exists.
-3. **Schema introspection.** RFC 0041 lists "Schema introspection through MCP" as a **non-goal** ("agents see types through declared return shapes"). This RFC **revises that**: the operational-parity tools include `schema_get` and `omnigraph://schema` — *because the shipped stdio package already exposes both*. The non-goal is achieved by *policy*, not omission: `schema_get`/`omnigraph://schema` are Cedar-gated by `Read`, and the recommended locked-down agent policy denies `Read`, so a curated agent still never sees the schema. (RFC 0041's intent is preserved; the mechanism moves from "don't build it" to "build it, gate it.")
+1. **Transport.** RFC 0041 sketched a bespoke `GET /mcp/tools` + `POST /mcp/invoke`
+   pair. That is not the MCP wire protocol. This RFC uses MCP JSON-RPC over
+   Streamable HTTP and reuses the stored-query catalog as a projection source.
+2. **Exposure.** Cluster serving catalogs every registered query; this RFC adopts
+   that registry. Per-actor selection of stored queries is a Cedar concern once
+   per-query scope exists (deferred, see [Rollout](#rollout)).
+3. **Schema introspection.** RFC 0041 lists schema introspection through MCP as a
+   non-goal. This RFC revises that: the `schema` tool and schema resource exist
+   and are gated by `read`. A curated agent denied `read` never sees the schema,
+   so the intent is kept by policy rather than by omission.
 
-Everything else in RFC 0041 (two-paths-one-engine, per-query `invoke_query` *as the intended scope*, the response envelope, multi-graph per-graph endpoints) this RFC consumes unchanged.
+## What shipped before this amendment
 
-> **Numbering note:** the `TokenVerifier`/WorkOS auth design is referred to in
-> code (`crates/omnigraph-server/src/identity.rs`) as "RFC 0001," which is not
-> the canonical [RFC 0001](0001-fragment-adopt-branch-merge.md). To avoid the
-> collision this RFC cites the auth substrate as **MR-956** throughout.
+The identity RFC shipped, behind `--oidc-identity-trust` only:
 
-## Reconciliation with shipped code
+- `GET /.well-known/oauth-protected-resource` (root path only) and a 401 from
+  `/mcp` whose challenge names `<resource origin>/.well-known/oauth-protected-resource<resource path>`;
+- `/mcp` on `rmcp` (pinned exactly), stateless (`legacy_session_mode = false`),
+  JSON responses, no `Mcp-Session-Id`;
+- three read-only tools: `graphs` (discovery), `queries` (the stored-read catalog
+  with mutations filtered out) and `query` (a named stored read invoked with
+  `expect_mutation: false`);
+- limits of 64 KiB per request, 1 MiB per complete tool result, a 30 second wait
+  per read and 16 concurrent tool executions; cancellation and the deadline stop
+  the caller's wait while the execution keeps its ingress reservation, observer,
+  graph capture and slot until it finishes.
 
-Verified against `crates/omnigraph-server/src/{lib.rs,api.rs,settings.rs}` and
-`crates/omnigraph-policy/src/lib.rs` in the current tree:
-
-- ✅ `GET /queries` returns the applied cluster query registry as `QueriesCatalogOutput { queries: [QueryCatalogEntry] }`, each with typed `ParamDescriptor`s, `tool_name`, `description`, `instruction`, and a `mutation` flag. **MCP-ready projection, but exposed as bespoke REST/JSON — not the MCP wire protocol.**
-- ✅ `POST /queries/{name}` route exists (`server_invoke_query`, `lib.rs`).
-- ✅ `query_catalog_entry()` / `param_descriptor()` with an exhaustive `ScalarType → ParamKind` map (a new scalar is a compile error).
-- ✅ `InvokeQuery` Cedar action defined in `omnigraph-policy`.
-- ✅ **`InvokeQuery` IS enforced** at `POST /queries/{name}`: `server_invoke_query` calls `authorize(PolicyAction::InvokeQuery)` and **masks a denial to a 404 identical to "unknown query"** so the catalog isn't probeable (the denial-masking the previous draft of this RFC reported as missing is shipped — it lives in `lib.rs`, not `api.rs`). The stored-mutation path is already double-gated: `InvokeQuery` outer, then `Change` inside `run_mutate`.
-- ✅ **Reuse path exists:** `run_query` / `run_mutate` are already decoupled from their HTTP request bodies and take registry-supplied `(source, name, params, branch/snapshot)`. MCP `tools/call` for both stored and ad-hoc tools delegates to these — no new business logic.
-- ❌ **Per-query (`invoke_query[name]`) scope is NOT implemented.** `PolicyRequest` carries only `{action, branch, target_branch}` — **no query-name dimension** — and the action is documented coarse ("permits *any* stored query on the graph"). RFC 0041 *designed* per-name scope; it is unbuilt. This RFC's per-query Cedar filtering (§5.4) and recommended agent policy (§5.9) depend on it → tracked as **PR 0b**.
-- ❌ No MCP protocol surface (`initialize`/`tools/list`/`tools/call`, JSON-RPC, transport).
-- ❌ No `TokenVerifier` trait yet — `require_bearer_auth` resolves a `ResolvedActor` inline (static-hash). The trait/`OidcJwtVerifier` are MR-956 (draft). The MCP layer's only requirement — *consume `ResolvedActor`* — is satisfiable today.
-
-Stack (verified `Cargo.toml`): Axum + utoipa (OpenAPI) + `omnigraph-policy` (Cedar) + `futures` + `tokio`. **No MCP crate present.** `edition = "2024"`.
+Requests are admitted by the server's ordinary ingress (`/mcp` is a read-class
+route with its own 64 KiB body bound) and authenticated per HTTP request by
+`require_bearer_auth`; no MCP session retains an actor.
 
 ## Motivation
 
-- **One curated, safe, remotely-reachable tool surface.** MR-969's thesis: hand an LLM a token Cedar-scoped to a set of tools and it sees exactly those typed tools — cannot construct ad-hoc queries it isn't permitted, cannot read the schema it isn't permitted, cannot reach other graphs. Today the only MCP is the stdio package: local-only, full surface, ungated.
-- **Parity, so the in-server MCP can be the single implementation.** Operators/agents already depend on the operational tools. Supporting them server-side behind one Cedar gate lets the stdio package degrade to a proxy and removes two diverging tool sets.
-- **On-prem and cloud from one endpoint.** A managed cloud (WorkOS OAuth) and an on-prem/air-gapped deploy (static or customer-OIDC tokens) must serve the same MCP without forks or MCP-specific auth.
-- **Foundation for the agent on-ramp (MR-974).** `omnigraph mcp install --agent <tool>` needs a decided transport + a stable endpoint.
+- **The tools cannot answer questions.** Only pre-written stored reads run. There
+  is no schema and no ad-hoc read, although the server already has both as
+  Cedar-gated handlers (`GET /schema`, `POST /query`).
+- **Discovery is not self-contained.** A resource with a path (`https://host/mcp`)
+  advertises a metadata URL the server does not serve; every deployment needs a
+  proxy rewrite before Claude can connect.
+- **A refused token is indistinguishable from no token.** RFC 6750 §3.1 defines
+  `error="invalid_token"` for that case; clients use it to refresh.
+- **MCP exists only with OIDC.** Servers on static or signed data tokens, which
+  covers most self-hosted deployments, have no MCP and fall back to the npm
+  package.
+- **Two implementations drift.** The npm package has 15 tools including writes,
+  the server has three. Fixes and policy semantics diverge, and the package is
+  stdio-only, so Claude on the web cannot use it.
 
-## Goals
+## User and operational behavior
 
-- Project built-in tools + stored queries as MCP tools through **one** registry abstraction.
-- `tools/list` and the callable set are **identical for argument-independent authorization**, both driven by Cedar (see §5.4 for the branch-scoped caveat).
-- The MCP layer is **auth-method-agnostic**: it consumes `ResolvedActor`, never a raw token, never branches on how auth happened.
-- The same endpoint works on-prem (static/OIDC) and cloud (WorkOS OAuth), switched by config; cloud OAuth is additive (RFC 9728).
-- No new business logic: MCP tools delegate to the same `run_query`/`run_mutate`/branch/schema functions the HTTP routes call.
-- Behaviour-neutral when unused: no MCP traffic = no change.
+### Endpoint and mounting
 
-## Non-Goals
+One endpoint, `POST /mcp`, server-scoped. Graph-scoped tools take a `graph`
+argument; there are no per-graph MCP endpoints.
 
-- **Building/hosting an OAuth authorization server.** The server is a Resource Server; WorkOS AuthKit+Connect is the AS (MR-956). The MCP endpoint validates tokens, never issues them, never holds client secrets.
-- **OAuth/WorkOS implementation itself** — MR-956's work. This RFC leaves a clean RFC 9728 hook and consumes `ResolvedActor`.
-- **MCP prompts, elicitation, `tools/list_changed`, resource subscriptions, server-initiated messages.** None needed → enables a stateless POST-only transport (§5.6).
-- **stdio transport inside the server.** stdio stays in the TS package (now a proxy).
-- **Cross-graph tool listing.** Per-graph catalogs only (MR-969 + RFC 0002 non-goal).
-- **Hot reload of the query registry.** Restart-only (MR-969).
+| Server credential sources | `/mcp` | Protected-resource metadata and OAuth challenge |
+|---|---|---|
+| none (`--unauthenticated` or policy-only) | not mounted | not served |
+| static bearer tokens and/or signed data tokens | mounted (phase 2) | not served; 401 carries no challenge |
+| OIDC identity trust (alone or with the above) | mounted | served; 401 carries the challenge |
 
-## Background
+Authentication is the server's existing middleware: static tokens, then signed
+data tokens, then OIDC. A 401 happens before the request body is collected.
 
-`omnigraph-server` (Axum) already implements every operation this RFC exposes as an authenticated HTTP route; each authorizes via a `PolicyAction` against the Cedar policy for a server-resolved actor and calls into the engine. The existing stdio MCP package is a *client* of these routes (it owns no business logic). MR-956 will introduce a `TokenVerifier` trait (`StaticHashTokenVerifier` today inline, `OidcJwtVerifier` for OIDC/WorkOS) producing the `ResolvedActor { actor_id, tenant_id: Option, scopes: Vec<Scope>, source }` that already exists in `identity.rs` and is consumed by Cedar — token *validation* is offline (cached JWKS), so on-prem/air-gapped has no request-path dependency on the cloud.
+### Discovery (OIDC only)
+
+- `GET /.well-known/oauth-protected-resource` keeps answering the metadata.
+- `GET /.well-known/oauth-protected-resource{resource path}`, where the resource
+  path is the configured resource URL's path without a trailing `/`, answers the
+  same body. The path is computed once from the fixed boot binding and compared
+  with the request path byte for byte; any other suffix is 404. This is the URL
+  the challenge advertises and the first URL MCP clients probe.
+- A 401 from `/mcp` with no credential carries
+  `WWW-Authenticate: Bearer resource_metadata="<url>"`. A 401 after a presented
+  bearer credential was refused carries
+  `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<url>"`.
+
+### Host and Origin
+
+`rmcp` refuses a disallowed `Host` with 403. Allowed hosts are the SDK's loopback
+defaults, the OIDC resource authority when configured, and every host named by the
+new allowed-host setting. With OIDC, the resource origin is the allowed browser
+origin, as today. Without OIDC there is no resource origin, so a request carrying
+any `Origin` header is refused with 403; native clients (Claude Code, Cursor) send
+none.
+
+### Settings
+
+MCP settings are process boot settings, spelled like the server's other boot
+settings: a flag and an equivalent environment variable, read once at boot.
+
+| Flag | Environment | Default | Effect |
+|---|---|---|---|
+| `--mcp-allow-adhoc` | `OMNIGRAPH_MCP_ALLOW_ADHOC=1` | off | lists and admits the ad-hoc `read` tool |
+| `--mcp-allow-writes` | `OMNIGRAPH_MCP_ALLOW_WRITES=1` | off | lists and admits the write tools |
+| `--mcp-allowed-host <host[:port]>` (repeatable) | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | adds allowed `Host` values |
+
+Both opt-ins default off even when an applied Cedar policy would deny the actions:
+they are defence in depth that an operator turns on deliberately, independent of
+policy. A tool that is off is absent from `tools/list` and a call to it is refused
+as an unknown tool. These settings never grant anything: an enabled tool still
+runs only what Cedar allows the actor.
+
+### Tool catalog
+
+Every graph-scoped tool resolves its graph through the registry exactly as an HTTP
+request does (unknown and denied graphs are 404, an authorized unavailable graph is
+503) and then calls the named handler.
+
+| Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
+|---|---|---|---|---|
+| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) | identity required | read-only |
+| `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`), mutations filtered out | `read` | read-only |
+| `query` | shipped | `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false` | `invoke_query`, then `read` | read-only |
+| `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
+| `read` | 1, opt-in | `server_query` (`POST /graphs/{id}/query`) | `read` | read-only |
+| `health` | 2 | `server_health` (`GET /healthz`) | none | read-only |
+| `snapshot` | 2 | `server_snapshot` (`GET /graphs/{id}/snapshot`) | `read` | read-only |
+| `branches_list` | 2 | `server_branch_list` (`GET /graphs/{id}/branches`) | `read` | read-only |
+| `commits_list` | 2 | `server_commit_list` (`GET /graphs/{id}/commits`) | `read` | read-only |
+| `commits_get` | 2 | `server_commit_show` (`GET /graphs/{id}/commits/{commit_id}`) | `read` | read-only |
+| `commits_changes` | 2 | `server_commit_changes` (`GET /graphs/{id}/commits/{commit_id}/changes`) | `read` | read-only |
+| `changes_poll` | 2 | `server_changes_feed` (`GET /graphs/{id}/changes`) | `read` | read-only |
+| `mutate` | 2, opt-in | `server_mutate` / `server_mutate_if_graph_commit` | `change` (branch statements: their branch action) | destructive |
+| `load` | 2, opt-in | `server_load` (`POST /graphs/{id}/load`) | `change` (+ `branch_create` with `from`) | destructive |
+| `branches_create` | 2, opt-in | `server_branch_create` (`POST /graphs/{id}/branches`) | `branch_create` | not destructive |
+| `branches_delete` | 2, opt-in | `server_branch_delete` (`DELETE /graphs/{id}/branches/{name}`) | `branch_delete` | destructive, idempotent |
+| `branches_merge` | 2, opt-in | `server_branch_merge` (`POST /graphs/{id}/branches/merge`) | `branch_merge` | destructive |
+
+Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
+`query` is `read`, because the shipped `query` already names the stored read; its
+`graphs_list` is the shipped `graphs`, which answers discovery rather than the
+`graph_list`-gated management catalog. `read` also serves what `POST /query`
+serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
+and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
+serves. Stored mutations stay unavailable through `query`; they arrive with
+per-query tools (deferred).
+
+Schema application, deployment and cluster configuration are never MCP tools;
+they are operator-owned through `omnigraph cluster plan/apply`.
+
+### Tool results
+
+- Success: `structuredContent` is the handler's JSON response body, byte-equal in
+  value to the HTTP route's body, plus the SDK's text duplicate for older clients.
+- Failure: `isError: true` with `structuredContent` either
+  `{"status": <http status>, "error": <the route's ErrorOutput>}` for a handler
+  refusal, or `{"code": "...", "message": "..."}` for an MCP-side refusal
+  (`invalid_arguments`, `capacity_exceeded`, `cancelled`, `deadline_exceeded`,
+  `result_too_large`). A write whose wait ended before its result adds
+  `"outcome_unknown": true`.
+- Tools whose success shape is fixed declare an `outputSchema`; it admits both the
+  success shape and the error envelope, because clients validate any
+  `structuredContent` they receive against it.
+- `queries` returns each stored read's typed parameter descriptors, so a model can
+  call `query` correctly.
+
+Server `instructions` and tool descriptions tell a model to call `schema` (or read
+the schema resource) first, then `read` or a stored `query`, and summarize the
+write contract below.
+
+### Resources (phase 2)
+
+| URI | Content | Gate |
+|---|---|---|
+| `omnigraph://graphs` | `GET /graphs/discovery` JSON | identity required |
+| `omnigraph://graphs/{graph}/schema` (template) | the `.pg` source, `text/plain` | `read` |
+| `omnigraph://graphs/{graph}/branches` (template) | `GET /branches` JSON | `read` |
+| `omnigraph://best-practices/index` | index of the references below, `text/markdown` | identity required |
+| `omnigraph://best-practices/{topic}` for `queries`, `data`, `schema`, `search`, `changes` | `skills/omnigraph/references/{topic}.md` | identity required |
+
+The package's `omnigraph://schema` and `omnigraph://branches` were single-graph:
+the package was configured with one graph id. The server is multi-graph, so these
+are resource templates naming the graph. The best-practices bodies are the skill
+references already maintained in this repository and embedded at build time
+through the `omnigraph-skill` crate, so the server ships exactly the references
+written beside its source.
+
+### Write contract (phase 2)
+
+The write tools keep the npm package's contract:
+
+- **Conditional writes.** `mutate` takes `if_graph_commit`; when present it calls
+  the conditional route (`/mutate/if-graph-commit`), so a stale head fails with 412
+  before effects. A read's `graph_commit_id` is the value to pass.
+- **No automatic retry.** The server never replays a tool call.
+- **Outcome unknown is reported, not replayed.** Writes register through the
+  server's owned-write boundary, so dropping the caller's wait never cancels them.
+  When the wait ends first (cancellation or the 60 second write wait), the result
+  is `isError: true` with `outcome_unknown: true` and an instruction to reconcile
+  before replaying. A handler error that the server reports as completion-uncertain
+  keeps that report.
+- **Bounds.** A write's arguments, including `load` data, fit in the 64 KiB MCP
+  request; larger loads use `POST /load/ndjson`. Each write also reserves write
+  ingress and per-actor write admission exactly as its HTTP route does.
 
 ## Design
 
-### 5.1 One tool model: a `McpTool` trait, two populators
+### One handler, many tools
 
-Both built-in and stored-query tools implement one trait so `tools/list` / `tools/call` never special-case:
+`GraphTools` implements the SDK's `ServerHandler`. Each tool is a static
+definition (name, description, input schema, optional output schema, annotations,
+the setting that enables it) and one dispatch arm that deserializes its arguments
+(`deny_unknown_fields`) and calls the HTTP handler function with the request's
+`AuthenticatedActor`. No business logic or authorization is duplicated.
 
-```rust
-trait McpTool: Send + Sync {
-    fn name(&self) -> &str;                       // MCP tool id (stable)
-    fn title(&self) -> Option<&str>;
-    fn description(&self) -> &str;
-    fn input_schema(&self) -> serde_json::Value;  // JSON Schema (draft 2020-12)
-    fn annotations(&self) -> ToolAnnotations;     // readOnlyHint / destructiveHint / idempotentHint
-    /// The Cedar request(s) this call requires, given parsed args. Used BOTH at
-    /// list-time (dry-run filter, default args) and call-time (enforce, real args).
-    fn authorization(&self, args: &ToolArgs) -> Vec<PolicyRequest>;
-    async fn call(&self, ctx: &GraphCtx, args: ToolArgs) -> Result<ToolOutput, ToolError>;
-}
-```
+### Admission and lifetimes
 
-- **Built-ins**: ~14 static impls, each delegating to the *same* function its HTTP route calls (`run_query`, `run_mutate`, branch ops, `apply_schema_as`, …). `input_schema` authored once (or derived from each route's existing `utoipa`/`ToSchema` DTO).
-- **Stored queries**: generated `McpTool` instances, one per applied registry entry; `input_schema` from `param_descriptor` (§5.3); `authorization` → `InvokeQuery` (coarse today; `InvokeQuery{name}` after PR 0b) then the inner `Read`/`Change`.
+`/mcp` stays a read-class ingress route: the body is collected under a 64 KiB read
+reservation and the response is observed in the read lane. A tool call or resource
+read runs through the shipped `run_read`: it takes one of 16 slots, spawns the
+execution on the request's observer with its ingress lease, slot and graph capture,
+and races the caller's cancellation and deadline. The execution keeps those
+reservations until it finishes. A write tool additionally reserves write ingress
+for its argument bytes and hands it to the handler, whose per-actor admission and
+owned-write registration are unchanged. The graph is selected at most once per
+HTTP request through the existing `McpGraphRequest` slot, so a selected graph's
+capture follows the response and its yielded bytes.
 
-`ToolRegistry` for a graph = the static built-ins + the dynamic stored-query tools resolved from that graph's `GraphHandle` registry.
+### Discovery routes
 
-### 5.2 Tool catalog (parity) and Cedar mapping
+The metadata handler is shared by the root route and a wildcard route under
+`/.well-known/oauth-protected-resource/`. The wildcard handler compares the raw
+request path with the advertised path computed once at router construction; it
+never echoes or decodes the request path. Using a wildcard instead of registering
+the configured path as a literal route keeps an unusual resource path from
+reaching the router's path syntax.
 
-Each built-in **reuses the exact `PolicyAction` its HTTP route already enforces** — verified against the handlers in `lib.rs`, not invented:
+### Challenge
 
-| MCP tool | Scope | Read/Mutate | Cedar action (verified from route) |
-|---|---|---|---|
-| `health` | server | read | none (liveness/version) |
-| `graphs_list` *(new)* | server | read | `GraphList` |
-| `snapshot` | graph | read | `Read` |
-| `schema_get` | graph | read | `Read` |
-| `branches_list` | graph | read | `Read` |
-| `commits_list`, `commits_get` | graph | read | `Read` |
-| `read` (ad-hoc `.gq`) / `query` *(alias)* | graph | read | `Read` |
-| `change` (ad-hoc `.gq`) / `mutate` *(alias)* | graph | mutate | `Change` |
-| `ingest` (NDJSON) | graph | mutate | `Change` (+ `BranchCreate` when forking a new branch) |
-| `branches_create` | graph | mutate | `BranchCreate` |
-| `branches_delete` | graph | mutate | `BranchDelete` |
-| `branches_merge` | graph | mutate | `BranchMerge` |
-| `schema_apply` | graph | mutate | `SchemaApply` |
-| **stored query** (`find_user`, …) | graph | inferred | `InvokeQuery` (coarse; `InvokeQuery{name}` after PR 0b) + inner `Read`/`Change` |
+The challenge layer records whether the request carried a `Bearer` credential
+before authentication runs, and adds `error="invalid_token"` only to a 401 for a
+request that did. It never reflects the credential or a refusal reason.
 
-There is **no `Ingest` and no separate `snapshot`/`Export` action** — `ingest` enforces `Change`, `snapshot` enforces `Read`. (`Export` exists but maps to the `/export` route, which this RFC does not expose as a tool.)
+## Invariants
 
-**Tool id parity vs. canonicalization.** The shipped stdio package uses tool ids **`read`/`change`** (and calls the deprecated `/read`,`/change` routes). The server HTTP surface canonicalized to `/query`,`/mutate` with `/read`,`/change` deprecated (MR-656). To keep existing package clients working *and* align with the server, the MCP exposes **`query`/`mutate` as canonical with `read`/`change` retained as deprecated-but-live aliases** (both dispatch to the same handler). Open Q7 asks whether to drop the aliases later.
+- **Trust at the boundary, enforcement at the engine (invariant 10).** Actors come
+  only from `require_bearer_auth`; embedder-supplied extensions are discarded as
+  today. Every tool reaches the engine through a handler that applies its Cedar
+  gate; write tools reach the same `_as` entry points as HTTP writes.
+- **Bounded and observable (invariant 11).** Request, result, wait, concurrency and
+  ingress bounds are explicit; refusals are typed. Writes report an unknown outcome
+  instead of acknowledging or retrying.
+- **No acknowledgement before durable visibility.** A write tool returns success
+  only with the handler's success body.
+- **Query semantics stay typed (invariant 9).** Tools pass GQ source and typed
+  parameters to the existing compiler path; no string-built semantics.
+- No deny-list shape is introduced: no queue, no shadow state, no process-local
+  lock presented as fencing.
 
-Resources (§5.5): `omnigraph://schema`, `omnigraph://branches` (parity), plus `omnigraph://graphs` *(new)* — each gated by the same action as its list/get route (`Read`, `Read`, `GraphList`).
+## Compatibility and reversibility
 
-### 5.3 `ParamDescriptor → JSON Schema` (stored-query tools)
+- Additive. Without credential sources nothing changes. Existing tool names,
+  arguments and result shapes are unchanged; `graphs` gains an output schema.
+- OpenAPI gains one documented route,
+  `/.well-known/oauth-protected-resource/{resource_path}`. `/mcp` stays out of the
+  REST document.
+- Turning the opt-ins off removes tools without affecting HTTP.
+- The npm package's users move by pointing their client at `https://<server>/mcp`
+  with the same token. Tool names differ where noted above. Reverting this RFC means
+  keeping the package; nothing durable depends on the server surface.
 
-| `ParamKind` | JSON Schema | Notes |
-|---|---|---|
-| String | `{"type":"string"}` | |
-| Bool | `{"type":"boolean"}` | |
-| Int (i32/u32) | `{"type":"integer"}` | |
-| BigInt (i64/u64) | `{"type":"string","pattern":"^-?\\d+$"}` | JSON numbers lose precision >2⁵³ → string (matches the shipped `api.rs` rationale). (Open Q1) |
-| Float (f32/f64) | `{"type":"number"}` | |
-| Date | `{"type":"string","format":"date"}` | |
-| DateTime | `{"type":"string","format":"date-time"}` | |
-| Blob | `{"type":"string","contentEncoding":"base64"}` | |
-| Vector | `{"type":"array","items":{"type":"number"},"minItems":dim,"maxItems":dim}` | uses `vector_dim` |
-| List | `{"type":"array","items":<item_kind schema>}` | scalar items only (grammar guarantees) |
+## Alternatives
 
-`nullable == false` → param is in `required`. Annotations: `mutation` → `{readOnlyHint:false, destructiveHint:true}`; else `{readOnlyHint:true}`. `description` → tool description; `instruction` → appended to description (or `_meta`). (The shipped registry checker already warns when a catalogued query declares a `Vector` param an LLM can't supply.)
+- **Keep the npm package as a stdio↔HTTP proxy** (this RFC's previous text). It
+  keeps a second package to version and release for no capability the server
+  lacks: Claude Code and Cursor speak Streamable HTTP with an `Authorization`
+  header, and Claude on the web cannot use stdio. If local Claude Desktop use
+  needs stdio, an `omnigraph mcp --server <url>` bridge belongs in the Rust CLI.
+- **Per-graph endpoints** (`/graphs/{id}/mcp`, this RFC's previous §5.7). One
+  endpoint with a `graph` argument already shipped, lets a client discover graphs
+  without reconfiguration, and keeps one OAuth resource per server.
+- **Dynamic per-stored-query tools now.** Without per-query `invoke_query` scope
+  every actor would see every stored query as a tool; deferred until that scope
+  exists.
+- **Default the opt-ins on when a policy is applied.** Rejected for now: a policy
+  written for HTTP clients was not reviewed for an LLM caller, and an explicit
+  switch costs one flag.
+- **A hand-rolled JSON-RPC layer.** The SDK already shipped and owns framing,
+  negotiation and cancellation.
 
-For built-in tools the schema is hand-authored from the route DTO; e.g. `query` → `{source: string, branch?: string, params?: object}`; `schema_apply` → `{schema: string}`; `ingest` → `{ndjson: string, mode?: "merge"|"append"|"overwrite", branch?: string}`.
+## Evidence and tests
 
-### 5.4 `tools/list` (Cedar-filtered) and `tools/call` (dispatch + masking)
+The owner is `crates/omnigraph-server/tests/integration/mcp.rs`, extended rather
+than duplicated:
 
-- **`tools/list`**: build the `ToolRegistry`; for each tool evaluate `authorization(default_args)` against the actor's Cedar policy; **emit only tools that authorize**. Authz decisions are memoized per request. Stored-query tools must exist in the applied registry.
-  - **Exactness caveat (R7 is conditional):** the listed set equals the callable set **only for tools whose authorization is argument-independent** (`health`, `graphs_list`, `snapshot`, `schema_get`, `branches_list`, `commits_*`, ad-hoc `query`/`mutate`, and stored queries under the *coarse* action). For **branch-scoped tools** (`branches_create`/`merge` with `target_branch_scope`, and any branch-scoped `Read`/`Change` rule), list-time uses `default_args` (e.g. branch `main`) and cannot know the real target, so the listed set is a *best-effort approximation* of callability — a call may still be denied (or, rarely, a hidden tool would have been allowed). `tools/call` is always the authoritative gate. The contract is: **list never shows a tool the actor can't ever call; for branch-scoped tools it may show one the actor can call only on some branches.**
-- **`tools/call`**: resolve `name` → `McpTool` (masked-404 if unknown); parse+validate args against `input_schema`; enforce `authorization(args)` (mutations stay double-gated: `InvokeQuery` then `Change`); on success `call`. **Denial masking** lives in one place (the dispatcher): an authz denial is returned identically to "unknown tool" (§5.10), reusing the same deny≡missing principle already shipped at `POST /queries/{name}`.
+- discovery at both metadata paths, 404 for other suffixes, both challenge forms;
+- `tools/list` snapshot per setting combination (names, annotations, presence of
+  `outputSchema`, absence of disabled tools) and `initialize` instructions;
+- `schema` and `read` results equal to the HTTP routes' bodies for an allowed actor;
+  denied actors get the same refusal envelope as other tools; `read` refuses
+  `insert`/`update`/`delete` and `branch create` with the manifest version
+  unchanged; the 64 KiB, 1 MiB and deadline bounds hold;
+- phase 2: a static-token server answers with the token and 401 without it, refuses
+  a foreign `Host` and any `Origin`; each parity tool equals its route; resources
+  list and read; write tools are absent by default, honour `if_graph_commit` (412
+  with no effect), and report `outcome_unknown` when the wait ends first.
 
-### 5.5 Resources
+`openapi.json` and its drift test cover the new route. In-source `mcp.rs` tests keep
+owning `run_read` ownership through cancellation and the result bound.
 
-Advertise `resources` capability (`subscribe:false, listChanged:false`). `resources/list` → the URIs the actor may read; `resources/read` → schema `.pg` text / branches JSON / (multi-graph) graphs JSON, each gated by the corresponding action (`Read`, `Read`, `GraphList`). A locked-down agent denied `Read` simply never sees `omnigraph://schema` or `omnigraph://branches` — this is how RFC 0041's "agents don't introspect schema" intent is met *by policy* (§Relationship-to-RFC 0041).
+## Rollout
 
-### 5.6 Transport: Streamable HTTP, stateless, POST-only
+1. **Phase 1** (one PR): metadata at the advertised path, `invalid_token`, `schema`,
+   opt-in `read`, descriptions, instructions and output schemas; amend the identity
+   RFC's "initial tools" paragraph, the server MCP documentation, and lift
+   `unsupported_capability: mcp` in the self-contained server testing RFC.
+   `implementation` stays `partial`.
+2. **Phase 2** (one PR): mount for every credential source with the allowed-host
+   setting, read parity tools, resources, opt-in write tools. `implementation`
+   becomes `complete` for this RFC's scope.
+3. **Package retirement**, after a release contains phase 2: a final
+   `@modernrelay/omnigraph-mcp` version whose README and binary print a
+   deprecation pointing at the server's `/mcp`, then npm deprecation.
+4. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
+   name in `PolicyRequest` and the Cedar schema); one MCP tool per stored query
+   filtered by that scope; a Rust stdio bridge only if local desktop clients need
+   it; a token-lifetime cap separate from the 300 second admission-snapshot bound
+   only if live qualification shows provider access tokens live longer.
 
-- **Streamable HTTP** (MCP's current standard; we're already an HTTP server). One endpoint per scope (§5.7).
-- Because the server emits **no** server-initiated messages, implement the **minimal conformant** shape: client `POST`s JSON-RPC, server replies `application/json`. **No SSE channel, no `Mcp-Session-Id`, stateless** — each request authenticated independently via the bearer middleware. Honour the `MCP-Protocol-Version` header. SSE/sessions can be added later if subscriptions land.
-- **JSON-RPC methods:** `initialize` (advertise `{tools:{listChanged:false}, resources:{listChanged:false, subscribe:false}}` + serverInfo/version), `notifications/initialized` (no-op ack), `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`. `prompts/list` returns empty if probed.
-- **Library decision (Open Q2):** spike `rmcp` (official Rust MCP SDK) for conformance + Streamable-HTTP/Axum on edition 2024; **fall back to a hand-rolled ~150 LOC JSON-RPC-over-POST** (only the methods above) on friction. Given the tiny surface, hand-roll is an acceptable default.
+## Unresolved questions
 
-### 5.7 Endpoint routing (server- vs graph-scoped)
-
-- **Single-graph mode:** `POST /mcp` — graph tools + server tools (`health`, `graphs_list`).
-- **Multi-graph mode (MR-668):** `POST /graphs/{graph_id}/mcp` — graph-scoped tools for that graph; plus a server-level `POST /mcp` exposing only server-scoped tools (`health`, `graphs_list`). A per-graph endpoint never lists another graph's tools (isolation, tested). Mirrors the shipped `/graphs/{graph_id}/…` cluster routing. (Open Q5: confirm naming + whether server tools also appear on the per-graph endpoint.)
-
-### 5.8 Modular / decoupled auth (the cross-cutting requirement)
-
-**Invariant (load-bearing, satisfiable today):** the MCP handler receives an **already-resolved `ResolvedActor`** and **branches on nothing** about how the token was verified. No token parsing, no method check, no OAuth inside the MCP module. Today that actor comes from `require_bearer_auth`; when MR-956 lands it comes from a `TokenVerifier` — the MCP code is identical either way.
-
-```
-request → [auth middleware: ResolvedActor] → [MCP route] → Cedar → McpTool
-```
-
-**Server side — auth is config, not code:**
-
-| Deployment | Verifier | MCP change |
-|---|---|---|
-| On-prem, static bearer | `require_bearer_auth` / `StaticHashTokenVerifier` | none |
-| On-prem, customer IdP | `OidcJwtVerifier` → customer issuer (MR-956) | none |
-| Our cloud | `OidcJwtVerifier` → WorkOS, `tenant_id = Some(org_id)` (MR-956) | none |
-
-Token validation is offline (cached JWKS) — on-prem/air-gapped keeps working with no request-path cloud dependency. The MCP endpoint never terminates OAuth and never holds a client secret (Resource Server only).
-
-**Cloud client negotiation — additive, no MCP changes:** when MR-956 lands, the server publishes RFC 9728 `/.well-known/oauth-protected-resource` and returns `WWW-Authenticate: Bearer ..., resource_metadata="..."` on 401. A compliant MCP client (Claude) then auto-negotiates: static bearer to an on-prem endpoint; on a cloud 401 it discovers the WorkOS AS and runs OAuth/PKCE itself — **same endpoint URL, zero client-side branching.** This RFC only requires that MCP routes flow through the standard 401 path so that hook can be added later without touching MCP.
-
-**Multi-user identity pass-through (cloud):** the *caller's* token (a WorkOS JWT, audience-bound per-tenant) must reach the server so Cedar enforces per-user/per-tenant policy — never a shared service token. The MCP endpoint validates it offline and maps `org_id → tenant_id`. This is why the **remote path is the in-server HTTP MCP that Claude connects to directly** (its token flows through), not a stdio bridge impersonating a user.
-
-**Client-side credential acquisition (CLI/SDK/proxy) — pluggable `CredentialSource`** (RFC 0002 §5, MR-971), keyed by server name, so OAuth is a future *sibling key*, not a re-key:
-
-```yaml
-servers:
-  onprem: { endpoint: https://og.internal:8080, auth: { token: { env: OG_TOKEN } } }
-  edge:   { endpoint: https://og-edge,          auth: { token: { command: [vault, read, -field=token, secret/og] } } }
-  cloud:  { endpoint: https://api.omnigraph.cloud, auth: { oauth: { issuer: workos } } }   # future sibling
-```
-
-Implicit chain when `auth:` omitted: `OMNIGRAPH_TOKEN_<NAME>` → keychain `omnigraph:<name>` → `[<name>]` in `~/.omnigraph/credentials`; legacy `bearer_token_env` honoured. Secrets never inlined.
-
-### 5.9 Safety model — Cedar is the gate, default-deny is the floor
-
-With ad-hoc `query`/`mutate`/`schema_apply` present as tools, the **only** thing protecting an untrusted agent is the Cedar policy. Therefore:
-
-- **Default-deny when tokens are configured** (MR-723, shipped) is the floor — an actor with no grants sees an empty tool list.
-- **What works today (coarse action):** a policy can hide all ad-hoc tools and admin tools per-actor (`deny Read, Change, SchemaApply, Branch*`) while allowing stored queries (`allow InvokeQuery`). That already reproduces "can't run ad-hoc, can't read schema, can only call stored queries" — the agent sees *every* catalogued stored query plus nothing else.
-- **What needs PR 0b (per-query scope):** selecting *which* stored queries an actor may call (`allow InvokeQuery [find_user, list_orders]`, deny the rest). The shipped `invoke_query` is coarse (all stored queries or none). Until PR 0b adds a query-name dimension to `PolicyRequest` + the Cedar schema (RFC 0041's intended design), per-actor sub-selection of stored queries is **not expressible**; curation is graph-level through applied registry membership.
-- `schema_apply`, `branches_delete`, ad-hoc `mutate` require an explicit admin-tier grant; never in a default agent policy.
-- (Open Q3) Optional `mcp.allow_adhoc` server switch defaulting **off** for the ad-hoc `query`/`mutate` tools — defence-in-depth independent of Cedar, and independent of PR 0b.
-
-### 5.10 Result shaping and error mapping
-
-- **Success:** `tools/call` returns `content: [{type:"text", text:<json>}]` where `<json>` is the route's existing output envelope (read rows / mutation summary, i.e. `ReadOutput` / `ChangeOutput`). (Open Q4: also emit `structuredContent` + `outputSchema` — defer; text-JSON for v1.)
-- **Tool execution error** (bad params after schema validation, engine error): result with `isError:true` + a text content block.
-- **Authorization denial / unknown tool:** a single JSON-RPC error (`-32602`, message `"unknown tool"`) — identical for both so policy isn't probeable (same principle as the shipped `POST /queries/{name}` 404 masking).
-- **Auth failure** (bad/absent bearer): HTTP 401 from the middleware *before* MCP — carries `WWW-Authenticate` (the RFC 9728 hook), never masked as a tool error. (This is exactly the path the shipped `authorize`/`authorize_request` split preserves: operational failures keep their status; only *denials* are masked.)
-
-## Relationship to the `@modernrelay/omnigraph-mcp` stdio package
-
-Verified surface of the package (`omnigraph-ts`, pkg version `0.3.0`, `@modelcontextprotocol/sdk@^1.29.0`, **stdio only**): **13 tools** (`health`, `snapshot`, `read`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply`) and **2 resources** (`omnigraph://schema`, `omnigraph://branches`). It is a thin client over the SDK → HTTP routes and **forwards the caller's bearer verbatim** (no inspection).
-
-Once parity lands, **collapse to one implementation**: the in-server MCP is canonical (Cedar-gated, remote-capable, the path that becomes a Claude-web connector via MR-956). The stdio package degrades to a **thin stdio↔HTTP proxy** forwarding JSON-RPC (and the incoming `Authorization`) to `/mcp` — staying the local on-ramp for Claude Code/Desktop while sharing one tool set, one Cedar gate. Transition: keep the current independent stdio package on its `0.3.x`/`0.6.x` line; ship proxy mode in a later TS minor once the server endpoint is GA. (Note: the package is currently several minors behind the server — its vendored `spec/openapi.json` predates the stored-query routes — so it needs the standard re-sync regardless of MCP work.)
-
-## Testing
-
-- **Protocol conformance:** `initialize` handshake + advertised capabilities; `tools/list` shape; `tools/call` happy path; JSON-RPC error envelopes (`-32601` unknown method, `-32602` invalid params / unknown tool); `resources/list` + `resources/read`.
-- **Cedar filtering (coarse, today):** an actor with `allow InvokeQuery` + `deny Read/Change` sees *all* catalogued stored queries but **not** `query`/`mutate`/`schema_get`; `tools/call query` returns masked "unknown tool"; an admin sees the full catalog.
-- **Cedar filtering (per-query, gated on PR 0b):** actor scoped to `InvokeQuery [find_user]` sees *only* `find_user`; `tools/call list_orders` masks. **This test ships with PR 0b**, not PR 1 — it cannot pass against the coarse action.
-- **Parity per built-in:** each tool round-trips against the same expectations as its HTTP route (reuse route tests); `read`/`change` aliases dispatch identically to `query`/`mutate`.
-- **Double-gating:** a stored mutation requires both `InvokeQuery` and `Change`; `schema_apply` requires `SchemaApply`.
-- **Registry omission:** absent from `GET /queries`, MCP `tools/list`, and stored-query invocation.
-- **Schema generation:** table-driven over every `ParamKind` incl. nullable / list / vector(dim).
-- **Branch-scoped list approximation:** assert the documented R7 caveat — a branch-scoped policy lists `branches_create`, and `tools/call` is the authoritative gate (a denied target still 403s/masks).
-- **Multi-graph isolation:** `/graphs/a/mcp` never lists graph `b`'s tools; server `/mcp` exposes only server tools.
-- **Auth decoupling:** the MCP suite is green under the current `require_bearer_auth` and under a mock OIDC `ResolvedActor` source — proving verifier-agnosticism. A 401 carries `WWW-Authenticate`.
-- **OpenAPI:** the JSON-RPC endpoint is not REST — document only the envelope in utoipa (or exclude); keep `openapi.json` drift test green (`OMNIGRAPH_UPDATE_OPENAPI=1` to regenerate on intentional change).
-- **Cross-repo smoke (optional):** point `@modelcontextprotocol/sdk` (TS) at the HTTP endpoint in an `omnigraph-ts` integration test.
-
-## Rollout — phased by risk
-
-- **PR 0a — extract the reusable invoke path (small).** The coarse `invoke_query` gate + 404 denial-masking are **already shipped** in `server_invoke_query`. Extract the read/mutate dispatch into `invoke_stored_query(handle, name, params, branch/snapshot, actor)` so MCP `tools/call` and the HTTP route share one path. No behaviour change. *(Replaces the previous draft's "PR 0 — wire the gate", which was already done.)*
-- **PR 0b — per-query `invoke_query` scope (the safety prerequisite).** Add a query-name dimension to `PolicyRequest` + the Cedar schema (RFC 0041's intended design), wire it at `POST /queries/{name}` and in the stored-query `McpTool::authorization`. Independently useful (the `allow InvokeQuery [find_user]` policy). **Gates the per-query Cedar-filtering test and §5.9's recommended agent policy.**
-- **PR 1 — MCP transport + read-only parity + stored-query reads.** Endpoint(s), `initialize`/`tools/list`/`tools/call`/`resources/*`, the `McpTool` registry, Cedar-filtered listing, the read-only built-ins (`health`, `graphs_list`, `snapshot`, `read`/`query`, `schema_get`, `branches_list`, `commits_*`) + resources + stored-query *reads*. All auth-agnostic.
-- **PR 2 — mutating parity + stored-query mutations.** `change`/`mutate`, `ingest`, `branches_create/delete/merge`, `schema_apply`, stored-query mutations + the `mcp.allow_adhoc` switch.
-- **PR 3 — docs + agent on-ramp hook.** `docs/user/operations/server.md` MCP section (including the recommended agent policy + the coarse-vs-per-query caveat), `openapi.json` sync, the `omnigraph mcp install` config target (MR-974), and the downstream `omnigraph-ts` re-sync/proxy follow-up.
-- **Later (separate, MR-956):** RFC 9728 protected-resource metadata + WorkOS — slots in with zero MCP changes.
-- **Later (TS minor):** stdio package → proxy mode.
-
-## Migration / backwards compatibility
-
-- **Additive.** No `queries:` and no MCP traffic → today's behaviour unchanged. New endpoints are new routes.
-- **Cedar default-deny** (when tokens configured) means MCP exposes nothing until an actor is granted — safe by default.
-- The stdio package keeps working unchanged; proxy mode is opt-in later.
-- `openapi.json` only gains the documented MCP envelope; existing REST routes untouched.
-
-## Open Questions
-
-1. **BigInt/u64 as JSON string** (recommended, precision-safe) vs number.
-2. **`rmcp` vs hand-rolled** JSON-RPC (spike `rmcp` on edition 2024; default to hand-roll on friction).
-3. **Default-off `mcp.allow_adhoc`** for ad-hoc `query`/`mutate` (recommended) vs always-on + Cedar-only.
-4. **`structuredContent` + `outputSchema`** now vs text-JSON v1 (recommend v1 text-JSON).
-5. **Endpoint paths:** `/mcp` + `/graphs/{id}/mcp` — confirm naming and whether server-scoped tools also appear on the per-graph endpoint.
-6. **Stateless POST-only** confirmed (no near-term server-initiated messages) — revisit only if subscriptions land.
-7. **Legacy alias tools** (`read`/`change`): keep for client compat (the shipped package uses them), or drop and rely on `query`/`mutate`?
-8. **PR 0b shape:** per-query scope as a Cedar *resource* (`StoredQuery::"find_user"`) vs a `query_name` *context attribute* + policy condition — affects how `allow InvokeQuery [list]` is authored.
+None block acceptance. Live qualification against the managed control plane will
+answer whether a provider's access tokens outlive the 300 second bound and whether
+claude.ai sends an `Origin` header on connector calls; either answer is handled by
+a deferred item or the existing allowed-origin rule.
 
 ## Decision log
 
 - 2026-10-02: The `schema_apply` tool loses its `allow_data_loss` argument,
   following the removal of that field from the schema-apply route: a drop
   reclaims nothing at apply, so there is no destructive mode to select.
+- 2026-10-13: Amended for phases 1 and 2 (issue
+  [#991](https://github.com/ModernRelay/omnigraph/issues/991)), recording the
+  transport and tools the identity RFC shipped. Superseded sentences of the previous
+  draft: "the stdio package becomes a thin stdio↔HTTP proxy (local on-ramp) over it"
+  (the package is retired instead); the `schema_apply` and `ingest` parity rows and
+  "13 tools … 2 resources" (schema application stays operator-owned; `load` replaces
+  `ingest`; the package now has 15 tools and 4 resources); "`query`/`mutate` as
+  canonical with `read`/`change` retained as deprecated-but-live aliases" (`query` is
+  the shipped stored read, `read` the ad-hoc read, no aliases); the §5.4
+  Cedar-filtered `tools/list` (listing follows settings only, and visibility is not
+  permission); the §5.6 hand-rolled default (the SDK shipped); the §5.7 per-graph
+  endpoints (one `/mcp` with a `graph` argument); the §5.10 text-only results (results
+  are structured with output schemas where fixed); "RFC 9728 … slots in later" (it
+  shipped with OIDC trust); Open Questions 1 to 8, each answered above or deferred.
