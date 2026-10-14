@@ -629,12 +629,23 @@ impl ServerHandler for GraphTools {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![
+        let mut resources = vec![
             Resource::new(GRAPHS_RESOURCE, "graphs")
                 .with_title("Graphs")
                 .with_description("The graphs this server serves, as `graphs` returns them.")
                 .with_mime_type("application/json"),
-        ]))
+            Resource::new(BEST_PRACTICES_INDEX, "best-practices/index")
+                .with_title("Best-practices index")
+                .with_description("Lists every omnigraph://best-practices/* reference and what it covers. Read this first if you are not sure which reference applies.")
+                .with_mime_type("text/markdown"),
+        ];
+        resources.extend(BEST_PRACTICES.iter().map(|topic| {
+            Resource::new(topic.uri(), format!("best-practices/{}", topic.key))
+                .with_title(topic.title)
+                .with_description(topic.description)
+                .with_mime_type("text/markdown")
+        }));
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn list_resource_templates(
@@ -662,6 +673,13 @@ impl ServerHandler for GraphTools {
         let Some(resource) = GraphResource::parse(&request.uri) else {
             return Err(ErrorData::resource_not_found("resource not found", None));
         };
+        // References are compiled into the binary: no graph, policy or I/O.
+        if let Some(text) = resource.static_text() {
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(text, request.uri).with_mime_type("text/markdown"),
+            ])
+            .into());
+        }
         let admitted = match admitted(&context) {
             Ok(admitted) => admitted,
             Err(refusal) => return Err(refusal.resource_error().await),
@@ -699,18 +717,93 @@ impl ServerHandler for GraphTools {
 }
 
 const GRAPHS_RESOURCE: &str = "omnigraph://graphs";
+const BEST_PRACTICES_INDEX: &str = "omnigraph://best-practices/index";
+
+/// One skill reference served as a resource. The body is the agent skill's
+/// own `references/<key>.md`, embedded by `omnigraph-skill`; the description
+/// is what a model reads at `resources/list` time to decide whether to fetch it.
+struct BestPractice {
+    key: &'static str,
+    title: &'static str,
+    description: &'static str,
+}
+
+impl BestPractice {
+    fn uri(&self) -> String {
+        format!("omnigraph://best-practices/{}", self.key)
+    }
+
+    fn body(&self) -> &'static str {
+        let path = format!("references/{}.md", self.key);
+        omnigraph_skill::file(&path)
+            .and_then(|file| std::str::from_utf8(file.contents).ok())
+            .expect("every served reference is a UTF-8 file of the embedded skill")
+    }
+}
+
+/// The references an MCP caller can act on. The skill's other references
+/// cover the CLI, cluster configuration, server policy and upgrades, which are
+/// operator work rather than MCP tools.
+const BEST_PRACTICES: &[BestPractice] = &[
+    BestPractice {
+        key: "queries",
+        title: "GQ query best practices",
+        description: "Read before writing a query for `read`, `query` or `mutate`. Covers .gq grammar, choosing a declared query by name, parameter declarations, the PascalCase to lowerCamelCase edge casing trap, search operators that need a trailing `limit`, and the non-nullable lint rule.",
+    },
+    BestPractice {
+        key: "data",
+        title: "Data load patterns",
+        description: "Read before calling `load`. Covers choosing `merge`, `append` or `overwrite`, the branch, load, verify, merge loop for large or risky writes, embeddings that `merge` does not recompute, and when to use `mutate` instead.",
+    },
+    BestPractice {
+        key: "schema",
+        title: "Schema authoring and evolution",
+        description: "Read to interpret `schema` and .pg declarations. Covers decorators, inline enums, stable renames, and add-optional then backfill evolution. Schema changes are operator-owned through cluster apply, not an MCP tool.",
+    },
+    BestPractice {
+        key: "search",
+        title: "Vector and full-text search",
+        description: "Read before using `nearest`, `bm25` or `rrf`. Covers scoping first and ranking second, schema-declared embeddings, and the trailing `limit` requirement. Match vector dimensions and models to the live schema; CLI examples are not MCP tools.",
+    },
+    BestPractice {
+        key: "changes",
+        title: "Commits, change feeds and branch statements",
+        description: "Read before `commits_changes`, `changes_poll` or a conditional `mutate`. Covers exact read and write receipts, 412 refusals, paginated feeds, baseline resets, and branch statement outcomes.",
+    },
+];
+
+fn best_practices_index() -> String {
+    let mut text = String::from(
+        "# OmniGraph best-practices index\n\nThese references come from the OmniGraph agent skill shipped with this server.\n\n| Resource | Read before |\n|---|---|\n",
+    );
+    for topic in BEST_PRACTICES {
+        text.push_str(&format!("| `{}` | {} |\n", topic.uri(), topic.description));
+    }
+    text
+}
 
 /// A resource URI this server answers.
 enum GraphResource {
     Graphs,
     Schema(String),
     Branches(String),
+    BestPracticesIndex,
+    BestPractice(&'static BestPractice),
 }
 
 impl GraphResource {
     fn parse(uri: &str) -> Option<Self> {
         if uri == GRAPHS_RESOURCE {
             return Some(Self::Graphs);
+        }
+        if uri == BEST_PRACTICES_INDEX {
+            return Some(Self::BestPracticesIndex);
+        }
+        if let Some(key) = uri.strip_prefix("omnigraph://best-practices/") {
+            return BEST_PRACTICES
+                .iter()
+                .find(|topic| topic.key == key)
+                .map(Self::BestPractice);
         }
         let rest = uri.strip_prefix("omnigraph://graphs/")?;
         let (graph, kind) = rest.split_once('/')?;
@@ -721,6 +814,14 @@ impl GraphResource {
             "schema" => Some(Self::Schema(graph.to_owned())),
             "branches" => Some(Self::Branches(graph.to_owned())),
             _ => None,
+        }
+    }
+
+    fn static_text(&self) -> Option<String> {
+        match self {
+            Self::BestPracticesIndex => Some(best_practices_index()),
+            Self::BestPractice(topic) => Some(topic.body().to_owned()),
+            Self::Graphs | Self::Schema(_) | Self::Branches(_) => None,
         }
     }
 }
@@ -1082,6 +1183,9 @@ impl GraphTools {
                     handlers::server_branch_list(Extension(handle), Some(Extension(actor))).await?;
                 Ok(("application/json", pretty(&output.0)?))
             }
+            GraphResource::BestPracticesIndex | GraphResource::BestPractice(_) => Err(
+                ApiError::internal("static resources are answered without a graph read"),
+            ),
         }
     }
 
@@ -1920,6 +2024,14 @@ mod tests {
                 .structured_content
                 .unwrap();
             assert!(body.get("outcome_unknown").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn every_best_practice_resource_is_an_embedded_skill_reference() {
+        for topic in BEST_PRACTICES {
+            assert!(topic.body().starts_with('#'), "{}", topic.key);
+            assert!(best_practices_index().contains(&topic.uri()));
         }
     }
 

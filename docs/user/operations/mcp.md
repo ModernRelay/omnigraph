@@ -138,6 +138,11 @@ Schema changes and cluster deployments are not MCP tools; operators run them wit
 | `omnigraph://graphs` | The `graphs` result, JSON, under the same rule |
 | `omnigraph://graphs/{graph}/schema` (template) | The graph's `.pg` source |
 | `omnigraph://graphs/{graph}/branches` (template) | The `branches_list` result, JSON |
+| `omnigraph://best-practices/index` | Which reference to read for which task, Markdown |
+| `omnigraph://best-practices/{topic}` for `queries`, `data`, `schema`, `search`, `changes` | The agent skill's reference of that name, Markdown |
+
+The best-practices references are the `omnigraph` agent skill's own files,
+compiled into the server, so they always match its version.
 
 A resource read runs the same handler and policy action as its tool. A refusal
 is a JSON-RPC error whose `data` carries the HTTP `status` and `error` body; an
