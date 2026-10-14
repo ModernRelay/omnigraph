@@ -2702,28 +2702,36 @@ impl Omnigraph {
         &self,
         request: &crate::changes::GraphDiffRequest,
     ) -> Result<crate::changes::GraphDiffPage> {
-        let prepared = self.prepare_diff(request, false).await?;
+        let prepared = self.prepare_diff(request, None).await?;
         self.run_diff_page(prepared).await
     }
 
-    /// Resolve a graph diff page request once, reading lineage only: its
-    /// endpoints, its continuation position, and the branch each two-point
-    /// side reads ([`PreparedDiffPage::side_branches`]). A transport
-    /// authorizes those branches and then runs the page with
-    /// [`Self::run_diff_page`], so authorization and execution see the one
-    /// resolution. A continuation resolves its endpoints from the page token
-    /// and classifies each spelled side again for authorization.
-    pub async fn prepare_diff_page(
+    /// [`Self::diff_page`] for a caller that may read only some branches.
+    /// `can_read` answers for the branch each two-point side reads: a branch
+    /// itself, or a commit's authored branch (an unpublished proposal's or
+    /// unattached snapshot's recorded target). Each side is authorized as
+    /// soon as it is classified, before the next side is looked at and before
+    /// its snapshot opens, and a side `can_read` refuses is
+    /// [`OmniError::ReadTargetNotFound`] naming it, exactly as a side that
+    /// names nothing: the answer is not an existence oracle. A continuation
+    /// classifies and authorizes its sides again before it reopens the
+    /// token's commits. The branch form names its branches outright, so its
+    /// caller authorizes them before the call.
+    pub async fn diff_page_readable(
         &self,
         request: &crate::changes::GraphDiffRequest,
-    ) -> Result<PreparedDiffPage> {
-        self.prepare_diff(request, true).await
+        can_read: &mut ReadCheck<'_>,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        let prepared = self.prepare_diff(request, Some(can_read)).await?;
+        self.run_diff_page(prepared).await
     }
 
+    /// Resolve a graph diff page request, reading lineage only: its
+    /// endpoints and its continuation position.
     async fn prepare_diff(
         &self,
         request: &crate::changes::GraphDiffRequest,
-        side_branches_on_continuation: bool,
+        can_read: Option<&mut ReadCheck<'_>>,
     ) -> Result<PreparedDiffPage> {
         use crate::changes::token;
 
@@ -2738,12 +2746,12 @@ impl Omnigraph {
         let graph_identity = self.schema_view.load().schema_identity_domain.clone();
         let filter_digest = token::filter_digest(&request.scope);
         let sides_digest = token::sides_digest(&request.sides);
-        let (endpoints, resume, side_branches) = match request.page_token.as_deref() {
-            None => {
-                let (endpoints, side_branches) =
-                    self.resolve_diff_endpoints(&request.sides).await?;
-                (endpoints, None, side_branches)
-            }
+        let (endpoints, resume) = match request.page_token.as_deref() {
+            None => (
+                self.resolve_diff_endpoints(&request.sides, can_read)
+                    .await?,
+                None,
+            ),
             Some(encoded) => {
                 let decoded = token::decode_diff_page_token(encoded)?;
                 if decoded.graph_identity != token::hashed_identity(&graph_identity)
@@ -2758,13 +2766,12 @@ impl Omnigraph {
                         "diff page token was minted for a different filter scope",
                     ));
                 }
-                let mut side_branches = Vec::new();
-                if side_branches_on_continuation
+                if let Some(can_read) = can_read
                     && let crate::changes::GraphDiffSides::Between { from, to } = &request.sides
                 {
                     for side in [from, to] {
-                        let branch = self.classify_diff_read_target(side).await?.read_branch();
-                        side_branches.push((side.trim().to_string(), branch));
+                        self.authorized_diff_side(side, Some(&mut *can_read))
+                            .await?;
                     }
                 }
                 let endpoints = self
@@ -2780,7 +2787,7 @@ impl Omnigraph {
                     operation_rank: decoded.operation_rank,
                     change_index: decoded.change_index,
                 };
-                (endpoints, Some(resume), side_branches)
+                (endpoints, Some(resume))
             }
         };
         Ok(PreparedDiffPage {
@@ -2792,12 +2799,11 @@ impl Omnigraph {
             sides_digest,
             endpoints,
             resume,
-            side_branches,
         })
     }
 
-    /// Read one prepared graph diff page; see [`Self::prepare_diff_page`].
-    pub async fn run_diff_page(
+    /// Read one prepared graph diff page.
+    async fn run_diff_page(
         &self,
         prepared: PreparedDiffPage,
     ) -> Result<crate::changes::GraphDiffPage> {
@@ -2812,7 +2818,6 @@ impl Omnigraph {
             sides_digest,
             endpoints,
             resume,
-            side_branches: _,
         } = prepared;
         // Reclaimed history under either endpoint is a typed gap naming the
         // diff's `to` commit; a diff has no feed cursor to resume.
@@ -2936,33 +2941,29 @@ impl Omnigraph {
         ))
     }
 
-    /// Resolve a graph diff's sides to exact commits and their snapshots,
-    /// with the branch each two-point side reads (none for the branch form,
-    /// whose transport authorizes the two branches it names).
+    /// Resolve a graph diff's sides to exact commits and their snapshots.
+    /// The two-point form takes its sides in order, each authorized by
+    /// `can_read` before the next is looked at; the branch form's caller
+    /// authorizes the two branches it names.
     async fn resolve_diff_endpoints(
         &self,
         sides: &crate::changes::GraphDiffSides,
-    ) -> Result<(DiffEndpoints, Vec<(String, String)>)> {
+        mut can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<DiffEndpoints> {
         match sides {
             crate::changes::GraphDiffSides::Between { from, to } => {
-                let (from_commit_id, from_snapshot, from_branch) =
-                    self.resolve_diff_read_target(from).await?;
-                let (to_commit_id, to_snapshot, to_branch) =
-                    self.resolve_diff_read_target(to).await?;
-                let side_branches = vec![
-                    (from.trim().to_string(), from_branch),
-                    (to.trim().to_string(), to_branch),
-                ];
-                Ok((
-                    DiffEndpoints {
-                        from_commit_id,
-                        to_commit_id,
-                        base_commit_id: None,
-                        from_snapshot,
-                        to_snapshot,
-                    },
-                    side_branches,
-                ))
+                let (from_commit_id, from_snapshot) = self
+                    .resolve_diff_read_target(from, can_read.as_deref_mut())
+                    .await?;
+                let (to_commit_id, to_snapshot) =
+                    self.resolve_diff_read_target(to, can_read).await?;
+                Ok(DiffEndpoints {
+                    from_commit_id,
+                    to_commit_id,
+                    base_commit_id: None,
+                    from_snapshot,
+                    to_snapshot,
+                })
             }
             crate::changes::GraphDiffSides::Branch { source, target } => {
                 let (source_head, target_head, merge_base, source_snapshot, target_snapshot) =
@@ -2976,18 +2977,16 @@ impl Omnigraph {
                 } else if base_commit_id == target_head {
                     target_snapshot
                 } else {
-                    self.commit_snapshot(&base_commit_id).await?
+                    self.diff_endpoint_snapshot(&base_commit_id, &base_commit_id)
+                        .await?
                 };
-                Ok((
-                    DiffEndpoints {
-                        from_commit_id: base_commit_id.clone(),
-                        to_commit_id: source_head,
-                        base_commit_id: Some(base_commit_id),
-                        from_snapshot: base_snapshot,
-                        to_snapshot: source_snapshot,
-                    },
-                    Vec::new(),
-                ))
+                Ok(DiffEndpoints {
+                    from_commit_id: base_commit_id.clone(),
+                    to_commit_id: source_head,
+                    base_commit_id: Some(base_commit_id),
+                    from_snapshot: base_snapshot,
+                    to_snapshot: source_snapshot,
+                })
             }
         }
     }
@@ -3003,8 +3002,12 @@ impl Omnigraph {
             from_commit_id: from_commit_id.to_string(),
             to_commit_id: to_commit_id.to_string(),
             base_commit_id,
-            from_snapshot: self.commit_snapshot(from_commit_id).await?,
-            to_snapshot: self.commit_snapshot(to_commit_id).await?,
+            from_snapshot: self
+                .diff_endpoint_snapshot(from_commit_id, from_commit_id)
+                .await?,
+            to_snapshot: self
+                .diff_endpoint_snapshot(to_commit_id, to_commit_id)
+                .await?,
         })
     }
 
@@ -3019,34 +3022,76 @@ impl Omnigraph {
             .snapshot)
     }
 
-    /// Resolve one diff endpoint to its commit, the graph as of it, and the
-    /// branch it reads.
-    async fn resolve_diff_read_target(&self, target: &str) -> Result<(String, Snapshot, String)> {
-        let classified = self.classify_diff_read_target(target).await?;
-        let branch = classified.read_branch();
+    /// The graph as of one diff endpoint commit. A commit whose writing
+    /// branch is gone, or that a raced branch deletion hides mid-lookup, is
+    /// no longer readable: it is the not-found of the spelling that named it,
+    /// never the branch its record names, which the caller may not be allowed
+    /// to learn.
+    async fn diff_endpoint_snapshot(&self, commit_id: &str, spelling: &str) -> Result<Snapshot> {
+        self.commit_snapshot(commit_id)
+            .await
+            .map_err(|error| match error {
+                OmniError::BranchNotFound { .. } => OmniError::ReadTargetNotFound {
+                    target: spelling.to_string(),
+                },
+                error => error,
+            })
+    }
+
+    /// Resolve one authorized diff endpoint to its commit and the graph as
+    /// of it.
+    async fn resolve_diff_read_target(
+        &self,
+        side: &str,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<(String, Snapshot)> {
+        let (side, classified) = self.authorized_diff_side(side, can_read).await?;
         match classified {
             DiffReadTarget::Branch(resolved) => {
                 let commit_id = resolved.graph_commit_id.ok_or_else(|| {
-                    OmniError::manifest(format!("branch '{}' has no head commit", target.trim()))
+                    OmniError::manifest(format!("branch '{side}' has no head commit"))
                 })?;
-                Ok((commit_id, resolved.snapshot, branch))
+                Ok((commit_id, resolved.snapshot))
             }
             DiffReadTarget::Commit(commit) => {
-                let snapshot = self.commit_snapshot(&commit.graph_commit_id).await?;
-                Ok((commit.graph_commit_id, snapshot, branch))
+                let snapshot = self
+                    .diff_endpoint_snapshot(&commit.graph_commit_id, side)
+                    .await?;
+                Ok((commit.graph_commit_id, snapshot))
             }
         }
     }
 
-    /// Classify one diff endpoint: a live branch (its head now) or a graph
-    /// commit. A string naming both is refused, never resolved by precedence;
-    /// one naming neither is a typed not-found carrying only the caller's
-    /// spelling.
-    async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
-        let target = target.trim();
-        if target.is_empty() {
+    /// Classify one diff side as the caller spelled it, then, when the caller
+    /// may read only some branches, authorize the branch it reads before
+    /// anything else is resolved: a refused side is the not-found of a side
+    /// that names nothing. Answers the side's spelling with what it names.
+    async fn authorized_diff_side<'a>(
+        &self,
+        side: &'a str,
+        can_read: Option<&mut ReadCheck<'_>>,
+    ) -> Result<(&'a str, DiffReadTarget)> {
+        // The one place a side's spelling is decided.
+        let side = side.trim();
+        if side.is_empty() {
             return Err(OmniError::manifest("a diff endpoint cannot be empty"));
         }
+        let classified = self.classify_diff_read_target(side).await?;
+        if let Some(can_read) = can_read
+            && !can_read(&classified.read_branch())
+        {
+            return Err(OmniError::ReadTargetNotFound {
+                target: side.to_string(),
+            });
+        }
+        Ok((side, classified))
+    }
+
+    /// Classify one spelled diff endpoint: a live branch (its head now) or a
+    /// graph commit. A string naming both is refused, never resolved by
+    /// precedence; one naming neither is a typed not-found carrying only the
+    /// caller's spelling.
+    async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
         // A string the branch-name rules refuse cannot name a branch; that is
         // not an error here, since it may still name a commit.
         let as_branch = match normalize_branch_name(target) {
@@ -4518,6 +4563,10 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
     )))
 }
 
+/// A caller's answer to "may it read this branch?", asked once per two-point
+/// graph diff side; see [`Omnigraph::diff_page_readable`].
+pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
+
 /// What one graph diff endpoint names.
 enum DiffReadTarget {
     Branch(Box<crate::db::graph_coordinator::ResolvedTarget>),
@@ -4525,7 +4574,7 @@ enum DiffReadTarget {
 }
 
 impl DiffReadTarget {
-    /// The branch a transport authorizes `read` on: the branch itself, or the
+    /// The branch a caller authorizes `read` on: the branch itself, or the
     /// authored branch of the commit (an unpublished proposal's or unattached
     /// snapshot's recorded target).
     fn read_branch(&self) -> String {
@@ -4537,9 +4586,9 @@ impl DiffReadTarget {
     }
 }
 
-/// A graph diff page request resolved once; see
-/// [`Omnigraph::prepare_diff_page`].
-pub struct PreparedDiffPage {
+/// A graph diff page request resolved to its endpoints and continuation
+/// position.
+struct PreparedDiffPage {
     scope: crate::changes::ChangeFeedScope,
     max_changes: usize,
     max_bytes: u64,
@@ -4548,15 +4597,6 @@ pub struct PreparedDiffPage {
     sides_digest: String,
     endpoints: DiffEndpoints,
     resume: Option<crate::changes::enumerate::ContinuationKey>,
-    side_branches: Vec<(String, String)>,
-}
-
-impl PreparedDiffPage {
-    /// Each two-point side as the caller spelled it, with the branch it
-    /// reads; empty for the branch form.
-    pub fn side_branches(&self) -> &[(String, String)] {
-        &self.side_branches
-    }
 }
 
 /// A graph diff's two endpoints, resolved to exact commits and their

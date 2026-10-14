@@ -4548,24 +4548,55 @@ async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
         }
     }
 
-    // One resolution names the branch each side reads: a branch itself, and
-    // a commit's authored branch.
+    // A caller that may read only some branches is asked, side by side, for
+    // the branch each side reads (a branch itself, or a commit's authored
+    // branch) as soon as the side is classified. A refused side is the
+    // not-found of a side that names nothing, and the next side is never
+    // looked at, so an unknown `to` cannot reveal that `from` exists.
     db.branch_create("feature").await.unwrap();
     let on_feature = write_on(&db, "feature", "insert_person", &person("Fay", 30)).await;
-    let prepared = db
-        .prepare_diff_page(&diff_request(
-            between("main", &on_feature.graph_commit_id),
-            None,
-        ))
+    for from in ["feature", on_feature.graph_commit_id.as_str()] {
+        let mut asked = Vec::new();
+        let refused = db
+            .diff_page_readable(
+                &diff_request(between(from, "no-such-side"), None),
+                &mut |branch: &str| {
+                    asked.push(branch.to_string());
+                    branch == "main"
+                },
+            )
+            .await
+            .unwrap_err();
+        match refused {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, from),
+            other => panic!("expected ReadTargetNotFound for {from}, got {other:?}"),
+        }
+        assert_eq!(asked, ["feature"], "a refused side ends the resolution");
+    }
+    let mut asked = Vec::new();
+    db.diff_page_readable(
+        &diff_request(between(" main ", &on_feature.graph_commit_id), None),
+        &mut |branch: &str| {
+            asked.push(branch.to_string());
+            true
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked, ["main", "feature"]);
+
+    // A commit whose branch was deleted is no longer readable: it is that
+    // side's not-found, never the branch its record names.
+    db.branch_create("gone").await.unwrap();
+    let on_gone = write_on(&db, "gone", "insert_person", &person("Gil", 31)).await;
+    db.branch_delete("gone").await.unwrap();
+    match graph_diff_all(&db, between(&on_gone.graph_commit_id, "main"), None)
         .await
-        .unwrap();
-    assert_eq!(
-        prepared.side_branches(),
-        [
-            ("main".to_string(), "main".to_string()),
-            (on_feature.graph_commit_id.clone(), "feature".to_string()),
-        ]
-    );
+        .unwrap_err()
+    {
+        OmniError::ReadTargetNotFound { target } => assert_eq!(target, on_gone.graph_commit_id),
+        other => panic!("expected ReadTargetNotFound, got {other:?}"),
+    }
 }
 
 /// Continuations answer for the commits the first page resolved, even after

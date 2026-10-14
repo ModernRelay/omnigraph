@@ -1633,6 +1633,21 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .await
         .unwrap();
     let feature_commit = receipt.commit.graph_commit_id.clone();
+    // A commit whose branch is deleted afterwards.
+    db.branch_create_from(ReadTarget::branch("main"), "gone")
+        .await
+        .unwrap();
+    let gone_commit = db
+        .load_with_receipt(
+            "gone",
+            r#"{"type":"Person","data":{"name":"gone-only","age":41}}"#,
+            omnigraph::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap()
+        .commit
+        .graph_commit_id;
+    db.branch_delete("gone").await.unwrap();
     drop(db);
 
     let policy_path = temp.path().join("policy.yaml");
@@ -1687,9 +1702,9 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         "forbidden and unknown must share the same error code"
     );
 
-    // A graph diff resolves each side before it authorizes the branch the side
-    // resolves to, so a forbidden side, commit or branch, answers exactly as a
-    // side that names nothing.
+    // A graph diff classifies each side before it authorizes the branch the
+    // side resolves to, so a forbidden side, commit or branch, answers exactly
+    // as a side that names nothing.
     let get = |uri: String| {
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -1733,6 +1748,29 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
             format!("'{forbidden_side}' names no branch and no commit")
         );
         assert_eq!(forbidden["code"], unknown["code"]);
+    }
+    // The sides are authorized in order, each before the next is looked at: a
+    // forbidden `from` answers as an unknown `from` does whatever `to` names,
+    // so an unknown `to` cannot reveal that `from` exists. A commit whose
+    // branch was deleted is no longer readable and answers the same way.
+    let unknown_from_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    for (forbidden_from, unknown_from, to) in [
+        ("feature", "no-such-branch-2", "no-such-branch"),
+        (feature_commit.as_str(), unknown_from_id, unknown_id),
+        (gone_commit.as_str(), unknown_from_id, "main"),
+    ] {
+        for from in [forbidden_from, unknown_from] {
+            let expected = format!("'{from}' names no branch and no commit");
+            let (status, body) =
+                json_response(&app, get(format!("/diff?from={from}&to={to}"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["error"], expected, "/diff from {from} to {to}");
+            let statement = format!(r#"branch diff "{from}" to "{to}""#);
+            let (status, body) =
+                json_response(&app, statement_request("/query", "team-token", &statement)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["error"], expected, "{statement}");
+        }
     }
     // The branch routes name their branches outright: a read denial is a 403,
     // and a dry run is a read of both branches.
