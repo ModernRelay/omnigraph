@@ -165,8 +165,8 @@ jobs:
           # compiler, storage and seams; omnigraph-catalog adds core; planner
           # depends on compiler; engine depends on all of the above;
           # omnigraph-api-types and omnigraph-cluster depend on engine
-          # (+ compiler); server depends on engine + api-types + cluster;
-          # omnigraph-skill has no internal deps; cli depends on everything
+          # (+ compiler); omnigraph-skill has no internal deps; server depends
+          # on engine + api-types + cluster + skill; cli depends on everything
           # above it.
           publish_if_new omnigraph-compiler
           publish_if_new omnigraph-policy
@@ -178,6 +178,6 @@ jobs:
           publish_if_new omnigraph-engine
           publish_if_new omnigraph-api-types
           publish_if_new omnigraph-cluster
-          publish_if_new omnigraph-server
           publish_if_new omnigraph-skill
+          publish_if_new omnigraph-server
           publish_if_new omnigraph-cli

@@ -676,7 +676,7 @@ impl ServerHandler for GraphTools {
         // References are compiled into the binary: no graph, policy or I/O.
         if let Some(text) = resource.static_text() {
             return Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(text, request.uri).with_mime_type("text/markdown"),
+                ResourceContents::text(text?, request.uri).with_mime_type("text/markdown"),
             ])
             .into());
         }
@@ -733,11 +733,11 @@ impl BestPractice {
         format!("omnigraph://best-practices/{}", self.key)
     }
 
-    fn body(&self) -> &'static str {
+    /// The embedded reference, or `None` when the skill no longer carries it
+    /// as UTF-8; a unit test keeps every listed key present.
+    fn body(&self) -> Option<&'static str> {
         let path = format!("references/{}.md", self.key);
-        omnigraph_skill::file(&path)
-            .and_then(|file| std::str::from_utf8(file.contents).ok())
-            .expect("every served reference is a UTF-8 file of the embedded skill")
+        omnigraph_skill::file(&path).and_then(|file| std::str::from_utf8(file.contents).ok())
     }
 }
 
@@ -817,10 +817,12 @@ impl GraphResource {
         }
     }
 
-    fn static_text(&self) -> Option<String> {
+    fn static_text(&self) -> Option<Result<String, ErrorData>> {
         match self {
-            Self::BestPracticesIndex => Some(best_practices_index()),
-            Self::BestPractice(topic) => Some(topic.body().to_owned()),
+            Self::BestPracticesIndex => Some(Ok(best_practices_index())),
+            Self::BestPractice(topic) => Some(topic.body().map(str::to_owned).ok_or_else(|| {
+                ErrorData::internal_error("the embedded skill does not carry this reference", None)
+            })),
             Self::Graphs | Self::Schema(_) | Self::Branches(_) => None,
         }
     }
@@ -2030,7 +2032,10 @@ mod tests {
     #[test]
     fn every_best_practice_resource_is_an_embedded_skill_reference() {
         for topic in BEST_PRACTICES {
-            assert!(topic.body().starts_with('#'), "{}", topic.key);
+            let body = topic
+                .body()
+                .unwrap_or_else(|| panic!("{} is not embedded", topic.key));
+            assert!(body.starts_with('#'), "{}", topic.key);
             assert!(best_practices_index().contains(&topic.uri()));
         }
     }
