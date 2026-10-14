@@ -80,7 +80,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14; server HTTP requires v0.13.
+repair refuse. Normal engine open requires v14, v15 or v16; server HTTP requires v0.13.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -374,7 +374,10 @@ encoded into one bounded pending chunk only after snapshot production succeeds.
 Only initial process-capacity admission has a short timeout. An admitted
 producer waits for a frame credit or response closure, including the terminal
 baseline cursor. Slow readers retain their bounded reservation until delivery
-or disconnect; no short per-frame deadline truncates a valid stream.
+or disconnect; no short per-frame deadline truncates a valid stream. A producer
+hands its failure to the sender, which ends the body with a constant error and
+logs the failure's class, never its message: the HTTP trace layer logs a body
+error's text, and an engine message can hold object URIs or credentials.
 [Deployment limits](../user/deployment.md#admission-limits) distinguish this
 transport allowance from engine encoding and native memory.
 

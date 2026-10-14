@@ -24,7 +24,7 @@ omnigraph-policy = { path = "../omnigraph-policy", version = "0.13.0" }
 omnigraph-seams = { path = "../omnigraph-seams", version = "0.13.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

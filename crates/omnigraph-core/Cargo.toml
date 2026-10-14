@@ -14,6 +14,7 @@ dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "dep:lance-io"]
 test-util = []
 
 [dependencies]
+globset = { workspace = true }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.13.0" }
 omnigraph-seams = { path = "../omnigraph-seams", version = "0.13.0" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.13.0" }

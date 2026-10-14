@@ -1,0 +1,58 @@
+# issue: none
+# notes: Eight past/restore cycles with payload 4096 bytes and 1 publication(s) per load; equal final rows, deliberate retained-history difference.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node HistoryRow { key: String @key value: I64 payload: String }
+
+--- seed
+{"type":"HistoryRow","data":{"key":"row-0","value":0,"payload":"final"}}
+{"type":"HistoryRow","data":{"key":"row-1","value":0,"payload":"final"}}
+{"type":"HistoryRow","data":{"key":"row-2","value":0,"payload":"final"}}
+{"type":"HistoryRow","data":{"key":"row-3","value":0,"payload":"final"}}
+
+--- loop $cycle 0 8
+--- load generate: v1 seed: 0 mode: merge
+tables:
+  - kind: node
+    name: HistoryRow
+    rows: 4
+    commits: 1
+    batch_rows: 4
+    columns:
+      key: {kind: key, prefix: row-, width: 1}
+      value: {kind: literal, value: 0}
+      payload: {kind: repeat, text: x, count: 4096}
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: merge
+tables:
+  - kind: node
+    name: HistoryRow
+    rows: 4
+    commits: 1
+    batch_rows: 4
+    columns:
+      key: {kind: key, prefix: row-, width: 1}
+      value: {kind: literal, value: 0}
+      payload: {kind: literal, value: final}
+--- expect ok
+
+--- endloop
+
+--- query branch: main
+query current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }
+--- expect unordered
+{"key":"row-0","value":0,"payload":"final"}
+{"key":"row-1","value":0,"payload":"final"}
+{"key":"row-2","value":0,"payload":"final"}
+{"key":"row-3","value":0,"payload":"final"}
+--- expect shape
+key: String
+value: I64
+payload: String

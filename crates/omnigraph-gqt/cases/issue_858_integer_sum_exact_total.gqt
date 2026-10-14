@@ -1,0 +1,68 @@
+# issue: 858
+# red_on: 90b188bc
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    team: String
+    amount: I64
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","team":"cancel","amount":9007199254740993}}
+{"type":"Person","data":{"name":"b","team":"cancel","amount":-9007199254740992}}
+{"type":"Person","data":{"name":"c","team":"wide","amount":9223372036854775807}}
+{"type":"Person","data":{"name":"d","team":"wide","amount":1}}
+{"type":"Person","data":{"name":"e","team":"wide","amount":-9223372036854775807}}
+
+--- query
+query exact_total() {
+    match { $p: Person $p.team = "cancel" }
+    return { sum($p.amount) as total }
+}
+--- expect unordered
+{"total":1.0}
+--- expect shape
+total: F64
+--- expect plan
+type $p.amount: I64
+aggregate total: sum(I64) exact_integer round_to_nearest -> F64?
+result columns [total: F64?]
+
+--- query
+query grouped_total() {
+    match { $p: Person }
+    return { sum($p.amount) as total, $p.team }
+    order { total desc, $p.team }
+    limit 2
+}
+--- expect unordered
+{"total":1.0,"p.team":"cancel"}
+{"total":1.0,"p.team":"wide"}
+--- expect shape
+total: F64
+p.team: String
+--- expect plan
+type $p.amount: I64
+aggregate total: sum(I64) exact_integer round_to_nearest -> F64?
+result columns [total: F64?, p.team: String]
+
+--- query
+query unchanged_average() {
+    match { $p: Person $p.team = "cancel" }
+    return { avg($p.amount) as mean }
+}
+--- expect unordered
+{"mean":0.0}
+--- expect shape
+mean: F64
+--- expect plan
+type $p.amount: I64
+aggregate mean: avg(I64) float64 round_to_nearest -> F64?
+result columns [mean: F64?]

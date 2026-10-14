@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::SettingStmt;
+use omnigraph_compiler::query::ast::{BranchDiffSides, BranchRead, SettingStmt};
 use omnigraph_compiler::query::codes::Q003;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
@@ -173,6 +173,58 @@ impl Session {
             .collect()
     }
 
+    /// Answer a branch control read (`branch diff`, `branch merge-base`,
+    /// `branch merge … dry run`) with the engine call it names, an unspelled
+    /// `into` meaning `main`. It reads lineage and tables and writes nothing;
+    /// a transport authorizes the branches it names before calling it.
+    pub async fn branch_read(&self, read: &BranchRead) -> Result<crate::changes::BranchReadAnswer> {
+        use crate::changes::{BranchReadAnswer, ChangeFeedScope, GraphDiffRequest, GraphDiffSides};
+
+        let target = |into: &Option<String>| into.clone().unwrap_or_else(|| "main".to_string());
+        Ok(match read {
+            BranchRead::Diff { sides, page } => {
+                let sides = match sides {
+                    BranchDiffSides::Branch { source, into } => GraphDiffSides::Branch {
+                        source: source.clone(),
+                        target: target(into),
+                    },
+                    BranchDiffSides::Between { from, to } => GraphDiffSides::Between {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                };
+                BranchReadAnswer::Diff(
+                    self.diff_page(&GraphDiffRequest {
+                        sides,
+                        scope: ChangeFeedScope::default(),
+                        page_token: page.after_page.clone(),
+                        max_changes: page.limit,
+                        max_bytes: None,
+                    })
+                    .await?,
+                )
+            }
+            BranchRead::MergeBase { source, into } => {
+                let target = target(into);
+                let base = self.merge_base(source, &target).await?;
+                BranchReadAnswer::MergeBase {
+                    source: source.clone(),
+                    target,
+                    base,
+                }
+            }
+            BranchRead::MergeDryRun { source, into } => {
+                let target = target(into);
+                let result = self.branch_merge_dry_run(source, &target).await?;
+                BranchReadAnswer::MergeDryRun {
+                    source: source.clone(),
+                    target,
+                    outcome: result.outcome,
+                }
+            }
+        })
+    }
+
     /// The settings one call runs under: the session's, with the settings
     /// prefix of `source` applied in file order on a copy. The session is
     /// unchanged. A source without a prefix (`has_settings_prefix`) is not
@@ -275,6 +327,25 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, id.name());
         (rows[0].value.clone(), rows[0].source)
+    }
+
+    #[test]
+    fn write_max_bytes_default_is_the_existing_ceiling() {
+        assert_eq!(
+            SessionSettings::default().write_max_bytes(),
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES
+        );
+        assert_eq!(
+            SettingId::WriteMaxBytes.spec().default,
+            crate::storage_layer::KEYED_WRITE_MAX_BYTES.to_string()
+        );
+        assert!(matches!(
+            SettingId::WriteMaxBytes.spec().kind,
+            omnigraph_compiler::settings::SettingKind::Integer {
+                min: 1,
+                max: Some(33_554_432)
+            }
+        ));
     }
 
     #[test]

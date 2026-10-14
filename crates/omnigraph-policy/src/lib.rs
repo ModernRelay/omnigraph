@@ -23,6 +23,13 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
+    /// Publish an unpublished graph commit onto its recorded target branch
+    /// (`commit publish "<id>"`). Target-branch scoped like `branch_merge`:
+    /// the scope is the branch the commit lands on.
+    CommitPublish,
+    /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
+    /// scoped: the branch the proposal would have landed on.
+    CommitDrop,
     /// Reserved for **policy-management** surfaces. Per MR-724 Option A,
     /// this gates operator actions like hot-reloading policy / tokens
     /// (MR-726), querying the audit log (MR-732), and listing /
@@ -87,6 +94,8 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
+            Self::CommitPublish => "commit_publish",
+            Self::CommitDrop => "commit_drop",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
@@ -101,7 +110,12 @@ impl PolicyAction {
     fn uses_target_branch_scope(self) -> bool {
         matches!(
             self,
-            Self::BranchCreate | Self::SchemaApply | Self::BranchDelete | Self::BranchMerge
+            Self::BranchCreate
+                | Self::SchemaApply
+                | Self::BranchDelete
+                | Self::BranchMerge
+                | Self::CommitPublish
+                | Self::CommitDrop
         )
     }
 
@@ -121,6 +135,8 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
+            | Self::CommitPublish
+            | Self::CommitDrop
             | Self::Admin
             | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
@@ -181,6 +197,8 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
+            "commit_publish" => Ok(Self::CommitPublish),
+            "commit_drop" => Ok(Self::CommitDrop),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
@@ -302,7 +320,7 @@ impl PolicyConfig {
     /// `load` for callers whose policies don't live on the local filesystem
     /// (e.g. a cluster catalog on object storage).
     pub fn from_source(source: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(source)?;
+        let config: Self = yaml_serde::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
@@ -425,7 +443,7 @@ impl PolicyConfig {
 
 impl PolicyTestConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        let config: Self = yaml_serde::from_str(&fs::read_to_string(path)?)?;
         if config.version != 1 {
             bail!("policy test version must be 1");
         }
@@ -902,6 +920,8 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
@@ -1156,7 +1176,7 @@ rules:
 
     #[test]
     fn rejects_duplicate_rule_ids() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1182,7 +1202,7 @@ rules:
 
     #[test]
     fn rejects_unknown_group_references() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1203,7 +1223,7 @@ rules:
 
     #[test]
     fn rejects_invalid_scope_action_combinations() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1224,7 +1244,7 @@ rules:
 
     #[test]
     fn compiles_and_authorizes_branch_and_target_rules() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1293,7 +1313,7 @@ rules:
 
     #[test]
     fn policy_tests_enforce_expected_outcomes() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1336,7 +1356,7 @@ rules:
 
     #[test]
     fn schema_apply_uses_target_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1378,11 +1398,74 @@ rules:
         assert!(!deny.allowed);
     }
 
+    #[test]
+    fn commit_publish_and_drop_use_target_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: reviewers-publish
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish, commit_drop]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        for action in [PolicyAction::CommitPublish, PolicyAction::CommitDrop] {
+            let allow = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("main".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(allow.allowed, "{action:?} onto main");
+
+            let deny = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: Some("feature".to_string()),
+                    },
+                )
+                .unwrap();
+            assert!(!deny.allowed, "{action:?} onto feature");
+        }
+
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  reviewers: [act-ragnor]
+rules:
+  - id: bad
+    allow:
+      actors: { group: reviewers }
+      actions: [commit_publish]
+      branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let err = branch_scoped.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported action"));
+    }
+
     // ─── MR-668 — server-scoped action (graph_list) ─
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1432,7 +1515,7 @@ rules:
 
     #[test]
     fn invoke_query_authorizes_per_graph() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1483,7 +1566,7 @@ rules:
         // invoke_query is graph-scoped (like admin) — per-branch access is
         // enforced by the inner read/change gate — so a rule that puts a
         // `branch_scope` qualifier on it is rejected at validate().
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1506,7 +1589,7 @@ rules:
 
     #[test]
     fn server_scoped_rule_cannot_use_branch_scope() {
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1533,7 +1616,7 @@ rules:
         // A single rule must reference exactly one resource kind.
         // `graph_list` (Server) + `read` (Graph) in one allow block
         // is invalid — operators must split the rule.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:
@@ -1561,7 +1644,7 @@ rules:
         // as before, even when the compiled-in schema now declares
         // `Server` + `graph_*` actions. This pins the "Cedar refactor
         // is operator-invisible" promise.
-        let policy: PolicyConfig = serde_yaml::from_str(
+        let policy: PolicyConfig = yaml_serde::from_str(
             r#"
 version: 1
 groups:

@@ -1,0 +1,62 @@
+# issue: none
+# notes: Generated keyed edges derive their identity from endpoints and repeated merge loads keep one edge per key.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person { weight: I64 @key(@src, @dst) }
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 3
+    commits: 1
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+  - kind: edge
+    name: Knows
+    rows: 3
+    commits: 1
+    from: {kind: key, prefix: person-, width: 3}
+    to: {kind: literal, value: person-000}
+    columns:
+      weight: {kind: ordinal, start: 0, step: 1}
+
+--- loop $i 0 2
+--- load generate: v1 seed: 42 mode: merge
+tables:
+  - kind: edge
+    name: Knows
+    rows: 1
+    commits: 1
+    start: 1
+    from: {kind: key, prefix: person-, width: 3}
+    to: {kind: literal, value: person-000}
+    columns:
+      weight: {kind: literal, value: 9}
+--- expect ok
+--- endloop
+
+--- restart
+--- query
+query edges() {
+    match { $p: Person $p $e:knows $q }
+    return { $p.name, $q.name, $e.weight }
+}
+--- expect unordered
+{"p.name":"person-000","q.name":"person-000","e.weight":0}
+{"p.name":"person-001","q.name":"person-000","e.weight":9}
+{"p.name":"person-002","q.name":"person-000","e.weight":2}
+--- expect shape
+p.name: String
+q.name: String
+e.weight: I64

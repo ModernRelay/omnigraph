@@ -1,0 +1,83 @@
+# issue: none
+# traversal: auto
+# notes: Key narrowing embeds the id of the parameter value bound for this run; one query text run with a hit, a miss and a second hit returns each run's own rows, and a nullable-typed String parameter still narrows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+
+--- query
+set engine = v2;
+query by_block($s: String) {
+    match { $p: Person { slug: $s } }
+    return { $p.age }
+}
+--- params
+{"s": "alpha"}
+--- expect unordered
+{"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+pass scan_access
+
+--- query
+set engine = v2;
+query by_block($s: String) {
+    match { $p: Person { slug: $s } }
+    return { $p.age }
+}
+--- params
+{"s": "zeta"}
+--- expect unordered
+
+--- expect shape
+p.age: I32
+--- expect plan
+pass key_to_id
+
+--- query
+set engine = v2;
+query by_block($s: String) {
+    match { $p: Person { slug: $s } }
+    return { $p.age }
+}
+--- params
+{"s": "beta"}
+--- expect unordered
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id
+
+--- query
+set engine = v2;
+query nullable_typed($s: String?) {
+    match { $p: Person $p.slug = $s }
+    return { $p.age }
+}
+--- params
+{"s": "beta"}
+--- expect unordered
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id

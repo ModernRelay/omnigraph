@@ -1,0 +1,116 @@
+# issue: none
+# notes: One hot-table update; all idle current views remain exact.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+query hot_write() { update Hot set { value: 1 } where key = "hot" }
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle0
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle1
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle2
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle3
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"idle0"}
+{"name":"idle1"}
+{"name":"idle2"}
+{"name":"idle3"}
+--- expect shape
+name: String
+
+--- restart
+
+--- query branch: main
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":1}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle0
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle1
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle2
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: idle3
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+{"name":"idle0"}
+{"name":"idle1"}
+{"name":"idle2"}
+{"name":"idle3"}
+--- expect shape
+name: String

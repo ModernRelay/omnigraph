@@ -196,7 +196,7 @@ fn read_context(config: &Path) -> Result<Option<Context>> {
     if bytes.len() as u64 > MAX_CONTEXT {
         return Err(invalid());
     }
-    let context: Context = serde_yaml::from_slice(&bytes).map_err(|_| invalid())?;
+    let context: Context = yaml_serde::from_slice(&bytes).map_err(|_| invalid())?;
     if context.version != 1
         || identifier(&context.cluster).is_err()
         || !canonical_origin(&context.api).is_ok_and(|origin| origin == context.api)
@@ -217,7 +217,7 @@ fn save_context(config: &Path, context: &Context) -> Result<()> {
     let dir = config.join(".omnigraph");
     std::fs::create_dir_all(&dir).map_err(|_| fail())?;
     let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| fail())?;
-    let bytes = serde_yaml::to_string(context).map_err(|_| fail())?;
+    let bytes = yaml_serde::to_string(context).map_err(|_| fail())?;
     file.write_all(bytes.as_bytes()).map_err(|_| fail())?;
     file.as_file().sync_all().map_err(|_| fail())?;
     file.persist(dir.join("context")).map_err(|_| fail())?;

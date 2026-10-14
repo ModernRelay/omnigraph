@@ -68,16 +68,16 @@ end-to-end benchmark: one instrument, two profiles
 │   │   ├── network position ······· same-host · same-region · remote
 │   │   ├── execution surface ······ embedded engine · server
 │   │   └── cache condition
-│   │       ├── process lifecycle ·· fresh per repetition
+│   │       ├── process lifecycle ·· fresh per repetition · long-running-server
 │   │       ├── engine preparation · preparation-only · warmed-by-program
-│   │       │                        · reopened-after-program
+│   │       │                        · reopened-after-program · uncontrolled
 │   │       ├── OS page cache ······ uncontrolled · program-conditioned
 │   │       └── warm-up program ···· none · named program + iterations
 │   ├── 5 Protocol ─ how it is measured
 │   │   ├── deadline ··············· none · 30 s · 60 s · 180 s
 │   │   ├── attribution ············ per-phase on · off
 │   │   ├── schedule ··············· manual · earned per rule 5
-│   │   ├── repetition reset ······· plain copy · APFS clonefile · S3 version undo
+│   │   ├── repetition reset ······· none · plain copy · APFS clonefile · S3 version undo
 │   │   ├── timer ················· monotonic
 │   │   └── record contents ········ the run-record contract below
 │   └── acquisition quantity ······· requested repetitions
@@ -91,7 +91,7 @@ end-to-end benchmark: one instrument, two profiles
 │   │                    (recall/precision@k: future work)
 │   ├── cost ··········· $/query decomposed: requests · egress · compute · tokens
 │   ├── storage calls ·· counts per RFC 0031 layer-specific action class
-│   │                    (logical always · physical where exposed)
+│   │                    (logical for embedded · served/physical where exposed)
 │   ├── request timing · per-layer, per-action-class cumulative time
 │   │                    · matching calibration per layer-specific action class
 │   │                    · concurrency witness (physical layer, where captured:
@@ -111,7 +111,7 @@ end-to-end benchmark: one instrument, two profiles
 │   │                · per-layer presence statements (counts · calibration
 │   │                  · timing · witness)
 │   │                · directional labels (rule 3) · claim margins (rule 7)
-│   │                · the stamped fixture-manifest reference
+│   │                · the stamped fixture-manifest reference (embedded)
 │   │                · raw result rows (one per repetition)
 │   ├── cited by every published number
 │   ├── immutable from first publication; never appends repetitions
@@ -210,11 +210,29 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 
 **Fresh fixtures flatter; published numbers report the aged store too.** Separating Data from State is the anti-showroom commitment: fixtures must be buildable at both ends of the fixture-state axes, and a published number reports both ends where they differ materially, since a real store lives between them.
 
-**The tree's field list is normative.** The run record's persisted fields are enumerated in the tree's run-record branch; the field list is normative, not illustrative: a record missing any field is invalid, where conditional fields (marked "where captured") satisfy the requirement by stating their absence.
+**The tree's field list is normative.** The run record's persisted fields are enumerated in the tree's run-record branch; the field list is normative, not illustrative: a record missing any field is invalid, where conditional fields (marked "where captured") satisfy the requirement by stating their absence. Read-only served records use the explicit evidence substitutions and absences defined below.
 
-**Machine specification is record-level identity, not a factor.** It is auto-captured at run time, so a checked-in case definition could never assign it; keeping it outside the spec lets a definition assign every factor, lets one point's series span machines visibly, and loses nothing: rule 4 already forbids silent cross-machine comparison.
+**Machine specification is record-level identity, not a factor.** For embedded execution it is auto-captured at run time; served records keep declared server machine facts separate from observed client machine facts. A checked-in case definition cannot assign these record-level facts; keeping it outside the spec lets a definition assign every factor, lets one point's series span machines visibly, and loses nothing: rule 4 already forbids silent cross-machine comparison.
 
-**A fixture is validated once, before anything is ever measured against it.** Every fixture build ends with a validation pass: row counts per table match the spec, declared indexes are present and covering, fetched artifacts match their pinned digests, the declared State realization is checked, and both a logical-content digest and a physical store digest and inventory are computed. Validation ends by writing the ***fixture manifest*** (the logical fixture identity, both digests, the physical inventory, and a validation stamp); a fixture is ***frozen*** exactly when a stamped manifest exists, and run records reference fixtures by their stamped manifests, so a crash between validation and the stamp leaves an unusable build, harmlessly. A fixture that fails validation never freezes. This is deliberately separate from per-run verification (the case interface's verify obligation): fixture validation asks "is the world right?" once; run verification asks "did the run do real work?" every time. A wrong world validates no work, however real.
+**An embedded fixture is validated once, before measurement.** Every fixture build ends with a validation pass: row counts per table match the spec, declared indexes are present and covering, fetched artifacts match their pinned digests, the declared State realization is checked, and both a logical-content digest and a physical store digest and inventory are computed. Validation ends by writing the ***fixture manifest*** (the logical fixture identity, both digests, the physical inventory, and a validation stamp); a fixture is ***frozen*** exactly when a stamped manifest exists, and run records reference fixtures by their stamped manifests, so a crash between validation and the stamp leaves an unusable build, harmlessly. A fixture that fails validation never freezes. This is deliberately separate from per-run verification (the case interface's verify obligation): fixture validation asks "is the world right?" once; run verification asks "did the run do real work?" every time. A wrong world validates no work, however real.
+
+Read-only served acquisition uses an externally provisioned graph and a typed
+deployment receipt binding endpoint digest, graph, dataset recipe/logical
+witness, backend and declared server artifact/build facts. It does not remotely
+verify those facts or invent an embedded fixture manifest. Client build and
+machine observations remain separate; absent server observations stay absent.
+Such records are explicitly `declared-deployment` and claim-ineligible. Their
+server lifecycle is long-running with no reset, engine preparation is
+uncontrolled without an executed read prefix, and server OS page-cache state
+is always uncontrolled. A fresh client process proves no server restart or
+cache reset. The complete query program must be read-only, including suffixes
+and loop bodies; provisioning and mutation remain outside acquisition.
+The served interval includes request serialization on the client, the server's
+response encoding and the row decoding on the client; the embedded interval
+ends at the engine's Arrow batches, before any JSON rendering. Served and
+embedded points are never pooled, and their timings are not comparable beyond
+that difference. With zero warm-up reads the measured request also carries the
+client's connection setup (TCP, and TLS over HTTPS).
 
 ### Backends
 
@@ -222,16 +240,18 @@ The axes and sweep points live in the contract tree above (Summary); this sectio
 - **MinIO**: the repeatable rig. Real S3 request semantics at local latency, cheap enough that comparisons and sweeps run in numbers. Never simulates faults; fault injection belongs to the DST harness (RFC 0032, RFC 0037).
 - **Real S3**: the truth. Scheduled runs on a budget-capped scenario subset produce latency distributions and a regression trend over time, never single-run headline numbers, because a single real-network observation is weather, not climate.
 
-**Wall-clock is one measurement dimension; storage-call counts are the other,
-and every run records both.** The harness adopts both of RFC 0031's action
+**Wall-clock is one measurement dimension; storage-call counts are the other.** The harness adopts both of RFC 0031's action
 vocabularies unchanged. Logical operations use `get`, `put`, `put_part`,
 `head`, `list`, `delete`, `copy`, `rename`, and logical multipart
 complete/abort. Physical attempts use HTTP `GET`, `HEAD`, `LIST`, `PUT`,
 `POST`, and `DELETE`, refined into multipart initiation, part upload,
 completion, abort, and copy where RFC 0031 does so. Retries and multipart
 fan-out make those layers and vocabularies differ; there is no implicit
-logical-to-physical class mapping. The logical layer is mandatory in every
-record; the physical layer is recorded where the backend seam exposes it, and
+logical-to-physical class mapping. The logical layer is mandatory for embedded execution. A read-only served
+record may omit it when the public server API exposes no counting seam; it
+records `server-counters-not-exposed`, never zero or client-side substitutes,
+and remains claim-ineligible. The physical layer is recorded where the backend
+seam exposes it, and
 a record states per layer whether it is present or absent, never silently
 conflating the two. Counts land in the same record beside the timings, as
 measurement columns, not gates: RFC 0031's comparator remains the only pinned,
@@ -283,18 +303,42 @@ unavailable rather than assumed. This is the same-ruler pattern recorded in
 
 ### Adding a case: definition, not wiring
 
-**Protocol compliance is structural.** A new benchmark case enters by definition alone, at one of two tiers: a new point of an existing scenario is a schema-versioned declarative YAML ***case definition***. YAML is presentation: comments, key order, formatting, display names, and acquisition quantities do not enter identity. The harness parses it into the typed case schema, materializes defaults, and derives `point_id` from the identity-bearing projection, so the definition is its own registration. A new scenario kind implements a fixed harness interface whose obligations mirror the protocol (declare the factors it consumes, prepare against a fixture, run the measured operation, and verify non-vacuous work: an interface with no default verification, so a scenario that cannot prove it did real work cannot be added). Everything this RFC requires is inherited by every case from the harness, never reimplemented per case: point identity and display naming; the record contract and its identity keys, series keyed by spec and each record by invocation id; the release-build guard; cache-condition control; dispersion reporting. A case author cannot produce a rule-violating case without modifying the harness itself.
+**Protocol compliance is structural.** Authored single-operation workloads use
+one `gqt-v1` adapter. Ordinary GQT dataset files describe schema, seed and
+preparation; schema-less query files describe reads, the selected operation,
+and explicit following verification. Versioned case YAML references those
+files and supplies infrastructure: backend, reset, attribution, deadline, and
+selected ordinal plus the exact operation header/body echo. The adapter
+refuses moved/changed selectors, ambiguous repeated selections, prefix writes,
+and missing explicit verification rather than supplying a default oracle.
+
+The harness freezes contents, derives cache treatment from executed prefix
+reads/reopen, and binds final `point_id` only after dataset construction,
+cache validation, or served receipt binding supplies its logical witness. Syntax-only planning therefore
+reports a pre-build experiment digest, not a final point ID. Paths, display
+names, repetition counts, physical tree bytes, and cache hits remain outside
+point identity. The current logical-equivalence domain includes all live
+branches' current keyed contents and normalized two-parent history topology;
+it excludes generated unkeyed edge IDs and historical row images. Registered
+fixed sources additionally retain an identity-aware export digest before
+preparation. These limits must remain explicit in the record and documentation.
+
+The infrastructure still owns release admission, process/reset containment,
+identity, records/archive/projection, dispersion, and deadline enforcement.
+A new authored GQT workload needs no Rust scenario module. A future execution
+kind outside this adapter's envelope must implement the same protocol
+obligations rather than silently approximate unsupported work.
 
 ## Reference-level design: protocol rules
 
 Each rule states what it forbids; violating a measurement rule (1 to 4, 7) makes a number invalid, not merely unpolished, and violating a process rule (5, 6) makes the practice nonconforming, with the number-level consequence stated in the rule.
 
 1. **Open-loop driving with on-time validity.** Applies when the workload is scheduled (the realistic profile); a single-operation workload has no schedule to violate. Every scheduled-workload latency or throughput claim comes from an open-loop driver, and each workload declares its on-time validity rule. Numbers from an invalid run are unpublishable.
-2. **Release-build guard (wall-clock only).** A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC 0031's timing-versus-counting separation applied per dimension.
+2. **Release-build guard (wall-clock only).** The benchmark adapter owns this guard even when it shares a production GQT executor with correctness tests; the GQT runner does not acquire benchmark wall-clock. A wall-clock number is recorded only from a release-profile build, and the harness makes recording from any other build profile impossible without deliberately bypassing a guard. Wall-clock numbers from different build profiles never compare. Storage-call counts are the exception by nature: counting is build-profile-independent (the same operations issue the same calls at any optimization level), so counts may be compared across build profiles; this is RFC 0031's timing-versus-counting separation applied per dimension.
 3. **Repetitions, dispersion, controlled cache condition.** Every wall-clock cell reports its repetition count and a dispersion measure (percentiles, or median with minimum and maximum); bare means are banned, per DBTest 2018's guidance that means reported without dispersion mislead. A cell declares its complete cache condition, and every repetition must actually execute under it: mixing process lifecycles, engine preparation, page-cache conditions, or warm-up programs invalidates the cell. A tail percentile requires a sample count that supports it: p95 at least 20 samples (RFC 0031's rule), p99 at least 100; smaller-sample cells are directional evidence only, labeled so in the record. The requested repetition count is sample quantity, not cell identity: changing only that target keeps the same point and cell, while every record persists both requested and observed counts.
 4. **Identity on every number.** Every published number carries its backend identity and its machine specification; numbers from different backends or machine specifications never compare silently. Conclusions drawn only from a local backend are provisional and labeled so.
 5. **Manual before automatic.** The benchmark runs manually until its run-to-run variance is understood; only then may it earn a schedule, because automating un-understood variance automates the production of noise. Numbers produced by a schedule that was not earned this way are unpublishable. All scheduling (nightly MinIO runs, the real-S3 trend series, alerting) is a separate later change gated on that understanding.
-6. **This instrument never gates.** No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC 0031 §§6 and 11 assign them (RFC 0031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
+6. **This instrument never gates.** GQT parsing, declared result assertions, and benchmark-adapter integrity tests remain ordinary correctness gates; they do not gate on measured performance. No measurement from this instrument gates anything, at any CI stage. Wall-clock never gates because timing variance on shared runners converts a gate into a lottery; this instrument's per-run counts never gate because they are unpinned measurement columns, and turning an unpinned measurement into a gate would recreate the counting golden without its review discipline. Count-based gating belongs to the counting instruments, at the stages RFC 0031 §§6 and 11 assign them (RFC 0031 states its harness is a release gate and an on-demand tool, not a per-PR performance gate, aside from one deliberately bounded structural guard it mandates; this RFC neither adds a gate nor moves one). The number-level consequence: a number produced by this instrument stays a valid measurement even when misused as a gate; the gate is what must be removed.
 7. **Effects clear the floor.** Every comparison-bearing claim (a fix's effect, a regression, a difference between systems) must exceed the applicable per-metric noise floor by a declared margin, and the margin is itself persisted: a protocol-level default, or a per-claim declaration recorded beside the citation, never an after-the-fact choice. An effect below floor-plus-margin is reported as "no detected effect", never as a small effect. The floor is itself a recorded measurement, so every effect claim carries its own denominator.
 
 ## Relation to existing instruments

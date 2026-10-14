@@ -187,6 +187,19 @@ impl SnapshotDataset {
         self.inner.has_fts_index(column).await
     }
 
+    /// Whether a full-text segment on physical `column` holds postings; an
+    /// untrained segment, which only declares the analyzer, does not.
+    pub async fn has_fts_postings(&self, column: &str) -> Result<bool> {
+        self.inner.has_fts_postings(column).await
+    }
+
+    /// The names of this version's built index entries, read from the raw
+    /// index-metadata section; untrained full-text segments index no row
+    /// and are left out. Empty proves the version holds no built index.
+    pub async fn built_index_names(&self) -> Result<Vec<String>> {
+        self.inner.built_index_names().await
+    }
+
     /// Whether this dataset has a user vector index on physical `column`.
     pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
         self.inner.has_vector_index(column).await
@@ -261,8 +274,18 @@ impl Snapshot {
             .map(SchemaContractIdentity::from)
     }
 
-    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
-        self.inner.bind_catalog_aliases(catalog)
+    pub(crate) fn bind_catalog_aliases(
+        &mut self,
+        catalog: &Catalog,
+        live: &Snapshot,
+    ) -> Result<()> {
+        self.inner.bind_catalog_aliases(catalog, &live.inner)
+    }
+
+    /// Whether the accepted contract was published with the version this view
+    /// pins for `type_key` (see `omnigraph_catalog::Snapshot::contract_covers`).
+    pub(crate) fn contract_covers(&self, type_key: &str) -> bool {
+        self.inner.contract_covers(type_key)
     }
 
     /// Open a backing dataset at its pinned version by qualified graph type key. With read caches present

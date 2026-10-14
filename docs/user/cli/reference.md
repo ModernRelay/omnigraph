@@ -16,7 +16,7 @@ Most graph commands accept one of these scopes:
 |---|---|
 | positional URI | Direct access for commands whose positional slot is not used by another value |
 | `--store <URI>` | Direct access to one `file://`, `s3://`, or `az://` graph |
-| `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server |
+| `--server <NAME\|URL> --graph <ID>` | A graph served by a multi-graph server at an `http://`, `https://` or [`unix://`](index.md#use-a-server-through-a-unix-socket) URL |
 | `--cluster <DIR\|URI> --graph <ID>` | Direct maintenance of a cluster-managed graph |
 | `--profile <NAME>` | A named scope from operator config |
 
@@ -40,13 +40,14 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | Command | Purpose | Scope |
 |---|---|---|
 | `init` | Create an empty graph from a `.pg` schema | direct |
-| `query` | Run a read query, or the `branch list`, `show`, or `explain` statement | direct or served |
-| `mutate` | Run an insert/update/delete query, or a `branch create`, `branch delete`, or `branch merge` statement | direct or served |
+| `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
-| `blob get`, `blob stat` | Read or inspect one Blob cell | direct or served |
-| `branch create/list/delete/merge` | Manage graph branches | direct or served |
+| `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
-| `commit list/show/changes` | Inspect history or one commit's entity changes | direct or served |
+| `commit list/show/changes/publish/drop` | Inspect history (`list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it) | direct or served |
+| `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
@@ -69,7 +70,7 @@ server resolves the actor from the bearer token. Drop it, or use `--store <uri>`
 | `use` | Select a managed cluster for a config directory | managed API |
 | `profile list/show` | Inspect operator profiles | local |
 | `alias` | Invoke a personal stored-query alias | served |
-| `version` | Print build and storage-format information | local |
+| `version` | Print the package version, HTTP contract and storage formats; `--json` prints `version`, `http_contract` and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 `rebuild-full-text-indexes` accepts `--branch` (default `main`), `--json`, and
 `--as` for actor attribution. Direct maintenance does not load server policy;
@@ -135,12 +136,13 @@ omnigraph schema upgrade-system-columns ./graph.omni --check --json
 ```
 
 `--store` is an alternative to the positional storage URI. `omnigraph upgrade`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v14, offline and
-in place, keeping branches and commit history; stop every process using the
-graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 14 only. `check_passed`, `already_current` (a
-v14 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 14, `unsupported_target`)
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v16, offline and
+in place, keeping branches and commit history, and stamps a v14 or v15 graph
+to v16 with one metadata-only commit per live branch; stop every process using
+the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 16 only. `check_passed`, `already_current` (a
+v16 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 16, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster
@@ -168,19 +170,18 @@ and one request to 300 seconds; uncertain writes are never automatically
 retried. See [managed bulk loading](managed-data.md#bulk-loading) for limits,
 permissions, ordinary addressing, and reconciliation.
 
-Change-feed commands, cursor checkpointing, and baseline recovery are described
-in [Changes and Change Feeds](../branching/changes.md).
+Diffs, branch review and change feeds: [Changes, Diffs and Change Feeds](../branching/changes.md).
 
 ## Blob commands
 
 ```text
-omnigraph blob get  <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
-omnigraph blob stat <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
+omnigraph blob get|stat|put|clear <node|edge> <TYPE> <ID> <PROPERTY> [scope] [options]
 ```
 
 `get` accepts `--branch` or `--snapshot`, `--offset`, `--length`, and
-`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`.
-See [Blob values](../blobs.md).
+`--out <PATH>`. `stat` accepts `--branch` or `--snapshot` and `--json`. `put`
+reads `--file <PATH>` or stdin; `put` and `clear` accept `--branch`,
+`--if-match <TAG>`, `--json` and, on `--store`, `--as`. See [Blob values](../blobs.md).
 
 ## Operator configuration
 

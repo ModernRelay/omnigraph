@@ -91,6 +91,27 @@ string. Inspect and retry deletion separately; do not replay a successful merge.
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.
 
+## Preview a merge
+
+```bash
+omnigraph branch merge feature --into main --dry-run --store graph.omni --json
+```
+
+A dry run runs the merge through classification and constraint validation,
+then stops. It reports the outcome the merge would have now, or fails with the
+same structured conflict list, and writes nothing: `commit` is `null` and
+`dry_run` is `true`. It is a read of both branches, so it needs `read` on each
+and no `branch_merge` grant. It refuses `--as-commit` and `--delete-branch`.
+Over HTTP, send `dry_run: true` to `POST /graphs/{graph_id}/branches/merge`.
+The GQ statement `branch merge feature into main dry run` is the same read at
+`POST /query`: it answers one row with `source`, `target` and `outcome`, and a
+conflict is the 409 a merge answers.
+
+A dry run answers whether the merge would succeed. To see what it would change,
+use [`branch diff`](changes.md#review-a-branch). To review the exact result
+before it lands, merge `--as-commit` and inspect the proposal with
+`commit changes`; the proposal expires once the target branch moves.
+
 ## Conflicts
 
 When both sides changed the same logical data incompatibly, the merge returns a
@@ -106,11 +127,17 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
-A merge classifies both sides against their merge base, the nearest commit
-both branches descend from, counting a merged branch as an ancestor. Two
-branches that each merged the same third branch therefore share that
-branch's commit as their base, and an entity only one of them changed after
-that import merges cleanly. The record of such a commit lives in the branch
+A merge classifies both sides against their merge base, the newest commit
+both branches descend from, counting a merged branch as an ancestor: a
+commit both branches descend from that no other such commit descends from.
+When two such commits are each not an ancestor of the other, the base is the
+one nearest the two heads (the fewest commits between it and the heads,
+summed), then the one with the higher generation (its distance from the
+first commit along the longest path), then the one with the smaller commit
+id. Two branches that
+each merged the same third branch therefore share that branch's commit as
+their base, and an entity only one of them changed after that import merges
+cleanly. The record of such a commit lives in the branch
 it was merged from, and the merge can read it from a live branch or retained
 retired history. Cleanup preserves the exact selected base and the retired
 histories needed to resolve it. Recreating the logical branch name cannot

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
@@ -8,8 +10,14 @@ use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlanError;
+use crate::logical::{RuntimeInput, ScanAccess, ScanSpec};
 use crate::operation::TableRef;
 use crate::physical::{DatasetPin, GatePolicy};
+
+/// The source's answer to `PlanSource::index_split`, awaited by the
+/// finalization stage both query entry points share.
+pub type IndexSplitFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ScanAccess, PlanError>> + Send + 'a>>;
 
 /// Which pinned image a scan reads. `Parent` is the before side (`from`),
 /// `Child` the after side (`to`); a three-way merge adds `Base`. A GQ query
@@ -49,6 +57,8 @@ pub struct NodeTypeSpec {
     pub schema: SchemaRef,
     pub key: Vec<String>,
     pub object_columns: Vec<String>,
+    /// The projected node members, with logical names such as `@id`.
+    pub object_fields: arrow_schema::Fields,
     /// The table's manifest-resident row count (`entity_count`); `None` when
     /// the table is absent from the pinned snapshot.
     pub row_count: Option<u64>,
@@ -72,7 +82,6 @@ pub struct ExpandStatistics {
     pub edge_count: u64,
     pub src_node_count: u64,
     pub dst_node_count: u64,
-    pub same_type: bool,
     pub max_frontier_cap: u64,
     pub max_hops_cap: u32,
 }
@@ -84,6 +93,50 @@ pub struct FragmentStat {
     pub id: u64,
     pub rows: Option<u64>,
     pub bytes: Option<u64>,
+}
+
+/// One logical index at the table's pinned version, across all its segments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFact {
+    pub name: String,
+    pub column: String,
+    #[serde(flatten)]
+    pub kind: IndexKind,
+    pub coverage: Option<FragmentCoverage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IndexKind {
+    Btree { usable: bool },
+    Inverted,
+    Vector,
+    Unknown,
+}
+
+/// Coverage counts current fragments, not rows; absence means unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FragmentCoverage {
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl IndexFact {
+    /// Whether the index may narrow a scan: its coverage is unknown, or it
+    /// covers at least one current fragment. An index that covers none, such
+    /// as an untrained full-text segment that only declares an analyzer,
+    /// cannot.
+    pub fn may_narrow(&self) -> bool {
+        self.coverage.is_none_or(|coverage| coverage.covered > 0)
+    }
+
+    pub fn fully_covers_btree(&self, column: &str) -> bool {
+        self.column == column
+            && matches!(self.kind, IndexKind::Btree { usable: true })
+            && self
+                .coverage
+                .is_some_and(|coverage| coverage.total > 0 && coverage.covered == coverage.total)
+    }
 }
 
 /// The proof the engine's candidate path captured for one interval: the
@@ -104,6 +157,27 @@ pub struct AdjacencyProof {
 /// The planner's whole view of the store. Implemented by the engine over its
 /// pinned snapshot; implemented in memory by the planner's own tests.
 pub trait PlanSource {
+    /// Render a key value only when its identity agrees with supported persisted rows.
+    fn canonical_key_id(
+        &self,
+        _type_key: &str,
+        _value: &IRExpr,
+    ) -> Result<Option<String>, PlanError> {
+        Ok(None)
+    }
+
+    fn scan_runtime_input(&self, _scan: &ScanSpec) -> Option<RuntimeInput> {
+        None
+    }
+
+    fn index_split<'a>(&'a self, _scan: &'a ScanSpec) -> IndexSplitFuture<'a> {
+        Box::pin(async { Ok(ScanAccess::Sequential) })
+    }
+
+    fn index_facts(&self, _dataset_key: &str) -> Vec<IndexFact> {
+        Vec::new()
+    }
+
     /// Whether `property` holds at most one row per value in the table
     /// `type_key` names, beyond the `@key` columns `NodeTypeSpec::key` lists.
     fn is_unique_property(&self, _type_key: &str, _property: &str) -> bool {
@@ -191,11 +265,62 @@ pub trait PlanSource {
     fn gate_policy(&self) -> GatePolicy {
         GatePolicy::default()
     }
+
+    /// How far the full-text index of `property` covers the pinned table
+    /// `type_key` names. The default claims no coverage, the answer under
+    /// which every plan stays correct.
+    fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
+        FullTextCoverage::Absent
+    }
+}
+
+/// How far a property's full-text index covers the pinned dataset's
+/// fragments. Only full coverage makes a BM25 score independent of a filter
+/// applied before scoring: Lance scores the unindexed fragments flat, from
+/// statistics over the rows the filter admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullTextCoverage {
+    /// Every fragment of the pinned version is in a full-text segment.
+    Full,
+    /// A full-text index exists; some fragment is not in it.
+    Partial,
+    /// The property has no full-text index.
+    Absent,
+}
+
+impl FullTextCoverage {
+    /// The coverage the index facts of one table establish for `column`:
+    /// `Absent` with no index on it, `Full` only when it has a full-text
+    /// index and every full-text index on it has known coverage of every
+    /// current fragment, `Partial` otherwise. An index of unknown kind or
+    /// unknown coverage on the column never counts as full.
+    pub fn of_facts(facts: &[IndexFact], column: &str) -> Self {
+        let on_column: Vec<&IndexFact> =
+            facts.iter().filter(|fact| fact.column == column).collect();
+        let full_text = on_column
+            .iter()
+            .any(|fact| fact.kind == IndexKind::Inverted);
+        let unknown = on_column.iter().any(|fact| fact.kind == IndexKind::Unknown);
+        if !full_text {
+            return if unknown { Self::Partial } else { Self::Absent };
+        }
+        let full = !unknown
+            && on_column
+                .iter()
+                .filter(|fact| fact.kind == IndexKind::Inverted)
+                .all(|fact| {
+                    fact.coverage
+                        .is_some_and(|coverage| coverage.covered == coverage.total)
+                });
+        if full { Self::Full } else { Self::Partial }
+    }
 }
 
 /// An in-memory [`PlanSource`] for planner tests and registry fixtures.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySource {
+    index_facts: HashMap<String, Vec<IndexFact>>,
     schemas: HashMap<SideId, SchemaRef>,
     fragments: HashMap<SideId, Vec<FragmentStat>>,
     proof: Option<AdjacencyProof>,
@@ -208,9 +333,34 @@ pub struct MemorySource {
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
+    full_text: HashMap<(String, String), FullTextCoverage>,
+    /// When set, a key's canonical id renders as `id:<value>`, a parameter
+    /// resolved from these values.
+    canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
 }
 
 impl MemorySource {
+    pub fn with_full_text_coverage(
+        mut self,
+        type_key: &str,
+        property: &str,
+        coverage: FullTextCoverage,
+    ) -> Self {
+        self.full_text
+            .insert((type_key.to_string(), property.to_string()), coverage);
+        self
+    }
+
+    pub fn with_canonical_key_ids(mut self, params: omnigraph_compiler::ir::ParamMap) -> Self {
+        self.canonical_keys = Some(params);
+        self
+    }
+
+    pub fn with_index_facts(mut self, dataset_key: &str, facts: Vec<IndexFact>) -> Self {
+        self.index_facts.insert(dataset_key.to_string(), facts);
+        self
+    }
+
     pub fn with_query_memory_pool_bytes(mut self, bytes: u64) -> Self {
         self.query_memory_pool_bytes = bytes;
         self
@@ -289,6 +439,32 @@ impl MemorySource {
 }
 
 impl PlanSource for MemorySource {
+    fn canonical_key_id(
+        &self,
+        _type_key: &str,
+        value: &IRExpr,
+    ) -> Result<Option<String>, PlanError> {
+        let Some(params) = &self.canonical_keys else {
+            return Ok(None);
+        };
+        let literal = match value {
+            IRExpr::Literal(literal, _) => Some(literal),
+            IRExpr::Param(name, _) => params.get(name),
+            _ => None,
+        };
+        Ok(match literal {
+            Some(omnigraph_compiler::query::ast::Literal::String(key)) => Some(format!("id:{key}")),
+            _ => None,
+        })
+    }
+
+    fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
+        self.index_facts
+            .get(dataset_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn schema(&self, side: SideId) -> Result<SchemaRef, PlanError> {
         self.schemas
             .get(&side)
@@ -348,5 +524,12 @@ impl PlanSource for MemorySource {
 
     fn query_memory_pool_bytes(&self) -> u64 {
         self.query_memory_pool_bytes
+    }
+
+    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
+        self.full_text
+            .get(&(type_key.to_string(), property.to_string()))
+            .copied()
+            .unwrap_or(FullTextCoverage::Absent)
     }
 }

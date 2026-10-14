@@ -17,7 +17,8 @@
 //! handle writes again once the fault stops, without reopening.
 //! `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors, and
 //! `OMNIGRAPH_MATRIX_WRITERS=Insert,…` narrows the writers. Seams are
-//! process-global, so the matrix is serial.
+//! process-global, so every writer × window point is one serial `#[test]`,
+//! which nextest runs as its own process.
 #![cfg(feature = "failpoints")]
 
 mod helpers;
@@ -25,15 +26,18 @@ mod helpers;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use helpers::recovery::sidecar_operation_ids;
 use helpers::{
-    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load, mixed_params,
-    mutate_main, read_table,
+    MUTATION_QUERIES, Session, collect_column_strings, count_rows, init_and_load,
+    init_and_load_with_schema, mixed_params, mutate_main, read_table,
 };
+use omnigraph::BlobCell;
 use omnigraph::db::{
     CleanupPolicyOptions, Omnigraph, PreparedSchemaApply, ReadTarget, SystemColumnUpgradeOptions,
     SystemColumnUpgradeOutcome,
 };
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
@@ -51,7 +55,8 @@ const PARK_HIT_ENV: &str = "OMNIGRAPH_RFC0067_PARK_HIT";
 const PREPARED_SCHEMA_FILE: &str = "matrix-prepared-schema.json";
 /// What the child runs: one of the `Writer::child_op` strings (`insert`,
 /// `insert_and_friend`, `cleanup`, `ensure_indices`, `merge`, `schema_apply`,
-/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`).
+/// `prepared_schema_apply`, `optimize`, `load`, `fts_rebuild`, `system_column_upgrade`,
+/// `blob_put`, `blob_clear`).
 const OP_ENV: &str = "OMNIGRAPH_RFC0067_OP";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +69,12 @@ enum Writer {
     /// A fast-forward merge of a branch holding one Person insert into main:
     /// a pointer switch with no table effect, so only its pre-publish window.
     Merge,
-    /// Schema apply adding a nullable Person property: one detached rewrite
-    /// of Person, no row change, the contract row published atomically.
+    /// Schema apply evolving two tables by metadata-only commits, no row
+    /// change, the contract row published atomically: Knows renames `since`
+    /// and adds `weight` (a Project, then a Merge chained on it), and Person
+    /// adds `city` (one Merge).
     SchemaApply,
-    /// The same rewrite through an intent persisted before invocation and
+    /// The same evolution through an intent persisted before invocation and
     /// deserialized by the child; recovery never reruns that original intent.
     PreparedSchemaApply,
     /// Optimize over a Person table with four small fragments: one detached
@@ -86,10 +93,35 @@ enum Writer {
     /// spellings: one rename-only detached Project per table, staged and
     /// published through the schema-apply seams.
     SystemColumnUpgrade,
+    /// A Blob put replacing Alice's `photo` by exact id: one detached upsert
+    /// of the carried row through the mutation seams.
+    BlobPut,
+    /// A Blob clear of Alice's seeded `photo`: the same single-row upsert
+    /// carrying a null value.
+    BlobClear,
+}
+
+fn photo_schema() -> String {
+    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    photo: Blob?")
+}
+
+/// The Blob cell the Blob writers replace.
+fn alice_photo() -> BlobCell {
+    helpers::node_blob_cell("Person", "Alice", "photo")
+}
+
+/// The bytes a Blob put by `name` stores.
+fn photo_bytes(name: &str) -> Bytes {
+    Bytes::from(format!("{name}-photo").into_bytes())
 }
 
 fn city_schema() -> String {
-    helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String?")
+    helpers::TEST_SCHEMA
+        .replace("age: I32?", "age: I32?\n    city: String?")
+        .replace(
+            "since: Date?",
+            "met: Date? @rename_from(\"since\")\n    weight: I32?",
+        )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,13 +161,18 @@ impl Writer {
             Writer::Cleanup => vec![],
             Writer::EnsureIndices => vec![PostDetached(1), PrePublish],
             Writer::Merge => vec![PrePublish],
-            Writer::SchemaApply | Writer::PreparedSchemaApply => vec![PostDetached(1), PrePublish],
+            // Knows' Project and Merge, then Person's Merge: park inside
+            // Knows' chain, after it, and before publication.
+            Writer::SchemaApply | Writer::PreparedSchemaApply => {
+                vec![PostDetached(1), PostDetached(2), PrePublish]
+            }
             Writer::Optimize => vec![PostDetached(1), PrePublish],
             Writer::Load => vec![PostDetached(1), PrePublish],
             Writer::FtsRebuild => vec![PostDetached(1), PrePublish],
             // The upgrade stages one detached commit per table; park after
             // the first and the second to leave a half-staged tail.
             Writer::SystemColumnUpgrade => vec![PostDetached(1), PostDetached(2), PrePublish],
+            Writer::BlobPut | Writer::BlobClear => vec![PostDetached(1), PrePublish],
         }
     }
 
@@ -152,6 +189,8 @@ impl Writer {
             Writer::Load => "load",
             Writer::FtsRebuild => "fts_rebuild",
             Writer::SystemColumnUpgrade => "system_column_upgrade",
+            Writer::BlobPut => "blob_put",
+            Writer::BlobClear => "blob_clear",
         }
     }
 }
@@ -280,6 +319,34 @@ async fn insert_and_friend(db: &Session, name: &str) -> omnigraph::error::Result
     .map(|_| ())
 }
 
+/// The BlobPut writer's op: replace Alice's photo with `name`'s bytes.
+async fn put_photo(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    db.put_blob_at_as("main", alice_photo(), photo_bytes(name), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// The BlobClear writer's op.
+async fn clear_photo(db: &Session) -> omnigraph::error::Result<()> {
+    db.clear_blob_at_as("main", alice_photo(), None, None)
+        .await
+        .map(|_| ())
+}
+
+/// Alice's photo, `None` when the cell is null.
+async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
+    match db
+        .read_blob_at(ReadTarget::branch("main"), alice_photo())
+        .await
+    {
+        Ok(_) => Some(
+            helpers::read_managed_blob_bytes(db, ReadTarget::branch("main"), alice_photo()).await,
+        ),
+        Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound => None,
+        Err(error) => panic!("reading Alice's photo failed: {error}"),
+    }
+}
+
 /// The Load writer's op: two fresh rows through the loader's staging.
 async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
     let payload = format!(
@@ -302,7 +369,7 @@ fn reclaim_everything() -> CleanupPolicyOptions {
 
 /// Subprocess half of the matrix: not `serial`, the parent waits for it.
 #[test]
-#[ignore = "subprocess helper; exercised by rfc_0067_failure_window_matrix"]
+#[ignore = "subprocess helper; exercised by the rfc_0067_failure_window_matrix_* points"]
 fn rfc0067_matrix_child_process() {
     if std::env::var_os(CHILD_ENV).is_none() {
         return;
@@ -377,6 +444,8 @@ fn rfc0067_matrix_child_process() {
                     .upgrade_system_columns(upgrade_execute())
                     .await
                     .map(|_| ()),
+                "blob_put" => put_photo(&db, &name).await,
+                "blob_clear" => clear_photo(&db).await,
                 _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
@@ -574,6 +643,8 @@ async fn run_cell(
             .await
             .unwrap();
         db
+    } else if matches!(writer, Writer::BlobPut | Writer::BlobClear) {
+        init_and_load_with_schema(&dir, &photo_schema()).await
     } else {
         init_and_load(&dir).await
     };
@@ -627,6 +698,16 @@ async fn run_cell(
         .unwrap();
         db.ensure_indices().await.unwrap();
     }
+    // A clear cell clears a photo a put stored first.
+    if writer == Writer::BlobClear {
+        put_photo(&db, &format!("m{index}_seed")).await.unwrap();
+    }
+    let blob_writer = matches!(writer, Writer::BlobPut | Writer::BlobClear);
+    let photo_before = if blob_writer {
+        observe_photo(&db).await
+    } else {
+        None
+    };
     let (mut model, _) = observe_model(&db).await;
     let head_before = linear_head(&person_uri).await;
     let knows_head_before = linear_head(&knows_uri).await;
@@ -673,6 +754,8 @@ async fn run_cell(
                     .upgrade_system_columns(upgrade_execute())
                     .await
                     .map(|_| ()),
+                Writer::BlobPut => put_photo(&db, &write_name).await,
+                Writer::BlobClear => clear_photo(&db).await,
             };
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
@@ -832,6 +915,21 @@ async fn run_cell(
         same_handle, model,
         "{cell}: the writer's handle disagrees with a fresh one"
     );
+    if blob_writer {
+        // The cell holds the written value exactly when the write was
+        // acknowledged, on a fresh handle and on the writer's own.
+        let expected = match writer {
+            Writer::BlobPut if visible => Some(photo_bytes(&write_name).to_vec()),
+            Writer::BlobClear if visible => None,
+            _ => photo_before.clone(),
+        };
+        assert_eq!(observe_photo(&fresh).await, expected, "{cell}: photo");
+        assert_eq!(
+            observe_photo(&db).await,
+            expected,
+            "{cell}: the writer's handle reads a different photo"
+        );
+    }
     let person_pin = table_pin(&fresh, "node:Person").await;
     let knows_pin = table_pin(&fresh, "edge:Knows").await;
     let person_head = linear_head(&person_uri).await;
@@ -944,26 +1042,118 @@ async fn run_cell(
     )
 }
 
-/// The matrix, run outside libtest's 2-MiB thread: every cell chains a graph
-/// init, the faulted writer, a recovery actor and the oracle.
-#[test]
-#[serial]
-fn rfc_0067_failure_window_matrix() {
+impl Recovery {
+    /// A same-handle recovery after a kill or race is the parent's handle,
+    /// which never ran the writer; it applies to Return only.
+    fn applies(self, fault: Fault) -> bool {
+        self != Recovery::SameHandle || fault == Fault::Return
+    }
+}
+
+/// One matrix point, run outside libtest's 2-MiB thread: every cell chains a
+/// graph init, the faulted writer, a recovery actor and the oracle.
+fn run_point(writer: Writer, window: Window, faults: &'static [Fault]) {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
+        .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(run_matrix());
+                .block_on(run_matrix(writer, window, faults));
         })
         .unwrap()
         .join()
         .unwrap();
 }
 
-async fn run_matrix() {
+const ALL_FAULTS: &[Fault] = &[Fault::Return, Fault::Kill, Fault::Race];
+
+/// One `#[test]` per writer × window point; `POINTS` lists them for the
+/// coverage guard.
+macro_rules! matrix_points {
+    ($($name:ident: $writer:ident, $window:expr, $faults:expr;)+) => {
+        const POINTS: &[(Writer, Window, &[Fault])] =
+            &[$((Writer::$writer, $window, $faults),)+];
+        $(
+            #[test]
+            #[serial]
+            fn $name() {
+                run_point(Writer::$writer, $window, $faults);
+            }
+        )+
+    };
+}
+
+matrix_points! {
+    rfc_0067_failure_window_matrix_insert_post_detached_1: Insert, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_insert_pre_publish: Insert, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_1: MultiTable, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_post_detached_2: MultiTable, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_multi_table_pre_publish: MultiTable, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_post_detached_1: EnsureIndices, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_ensure_indices_pre_publish: EnsureIndices, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_merge_pre_publish: Merge, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_1: SchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_post_detached_2: SchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_schema_apply_pre_publish: SchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_1: PreparedSchemaApply, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_post_detached_2: PreparedSchemaApply, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_prepared_schema_apply_pre_publish: PreparedSchemaApply, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_post_detached_1: Optimize, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_optimize_pre_publish: Optimize, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_post_detached_1: Load, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_load_pre_publish: Load, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_post_detached_1: FtsRebuild, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_fts_rebuild_pre_publish: FtsRebuild, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_1: SystemColumnUpgrade, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_post_detached_2: SystemColumnUpgrade, Window::PostDetached(2), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_system_column_upgrade_pre_publish: SystemColumnUpgrade, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_put_post_detached_1: BlobPut, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_put_pre_publish: BlobPut, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_clear_post_detached_1: BlobClear, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_blob_clear_pre_publish: BlobClear, Window::PrePublish, ALL_FAULTS;
+}
+
+/// Every window of every writer is one point of `POINTS`, each fault exactly
+/// once, so a new window or writer cannot miss the matrix.
+#[test]
+fn every_writer_window_is_a_matrix_point() {
+    let writers = [
+        Writer::Insert,
+        Writer::MultiTable,
+        Writer::Cleanup,
+        Writer::EnsureIndices,
+        Writer::Merge,
+        Writer::SchemaApply,
+        Writer::PreparedSchemaApply,
+        Writer::Optimize,
+        Writer::Load,
+        Writer::FtsRebuild,
+        Writer::SystemColumnUpgrade,
+        Writer::BlobPut,
+        Writer::BlobClear,
+    ];
+    let mut covered: Vec<(Writer, Window, Fault)> = POINTS
+        .iter()
+        .flat_map(|(writer, window, faults)| {
+            faults.iter().map(move |fault| (*writer, *window, *fault))
+        })
+        .collect();
+    let mut expected: Vec<(Writer, Window, Fault)> = writers
+        .into_iter()
+        .flat_map(|writer| {
+            writer.windows().into_iter().flat_map(move |window| {
+                ALL_FAULTS.iter().map(move |fault| (writer, window, *fault))
+            })
+        })
+        .collect();
+    covered.sort_by_key(|cell| format!("{cell:?}"));
+    expected.sort_by_key(|cell| format!("{cell:?}"));
+    assert_eq!(covered, expected);
+}
+
+async fn run_matrix(writer: Writer, window: Window, faults: &[Fault]) {
     let _scenario = FailScenario::setup();
     let full = std::env::var("OMNIGRAPH_MATRIX").is_ok_and(|value| value == "full");
     // SameHandle is a DEFAULT actor: it is the generalized liveness check —
@@ -985,53 +1175,33 @@ async fn run_matrix() {
             Recovery::SameHandle,
         ]
     };
-    let writers = [
-        Writer::Insert,
-        Writer::MultiTable,
-        Writer::Cleanup,
-        Writer::EnsureIndices,
-        Writer::Merge,
-        Writer::SchemaApply,
-        Writer::PreparedSchemaApply,
-        Writer::Optimize,
-        Writer::Load,
-        Writer::FtsRebuild,
-        Writer::SystemColumnUpgrade,
-    ];
-    let faults = [Fault::Return, Fault::Kill, Fault::Race];
     let only: Option<Vec<String>> = std::env::var("OMNIGRAPH_MATRIX_WRITERS").ok().map(|list| {
         list.split(',')
             .map(|writer| writer.trim().to_string())
             .collect()
     });
+    if only
+        .as_ref()
+        .is_some_and(|list| !list.iter().any(|name| *name == format!("{writer:?}")))
+    {
+        return;
+    }
     let mut index = 0usize;
     let mut reports = Vec::new();
     let started = std::time::Instant::now();
-    for writer in writers {
-        if only
-            .as_ref()
-            .is_some_and(|list| !list.iter().any(|name| *name == format!("{writer:?}")))
-        {
-            continue;
-        }
-        for window in writer.windows() {
-            for fault in faults {
-                for recovery in &recoveries {
-                    // A same-handle recovery after a kill or race is the parent's
-                    // handle, which never ran the writer; keep it for Return only.
-                    if *recovery == Recovery::SameHandle && fault != Fault::Return {
-                        continue;
-                    }
-                    index += 1;
-                    let report = Box::pin(run_cell(index, writer, window, fault, *recovery)).await;
-                    eprintln!("MATRIX {report}");
-                    reports.push(report);
-                }
+    for fault in faults {
+        for recovery in &recoveries {
+            if !recovery.applies(*fault) {
+                continue;
             }
+            index += 1;
+            let report = Box::pin(run_cell(index, writer, window, *fault, *recovery)).await;
+            eprintln!("MATRIX {report}");
+            reports.push(report);
         }
     }
     eprintln!(
-        "MATRIX SUMMARY: {} cells passed the oracle in {:.1}s",
+        "MATRIX SUMMARY: {writer:?} {window:?} {faults:?}: {} cells passed the oracle in {:.1}s",
         reports.len(),
         started.elapsed().as_secs_f64()
     );

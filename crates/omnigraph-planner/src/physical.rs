@@ -9,14 +9,17 @@ use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy};
-use crate::error::PlanError;
+use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, KeyJoinKind, ScanSpec, filters_json, metadata_count_json, ordering_text, scan_json,
     tiebreak_text,
 };
 use crate::mirror::EdgeSelectionMirror;
-use crate::source::SideId;
+use crate::operation::TableRef;
+use crate::source::{FullTextCoverage, SideId};
+use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
 pub type NodeId = usize;
@@ -32,6 +35,12 @@ pub enum RankKind {
 }
 
 impl RankKind {
+    /// Whether the retrieval's contract is approximate: `nearest` membership
+    /// is, even when a run scores flat; `bm25` matching is exact.
+    pub fn approximate(self) -> bool {
+        self == Self::Nearest
+    }
+
     /// The column Lance appends and the direction the query sorts it by.
     pub fn score(self) -> (&'static str, bool) {
         match self {
@@ -65,7 +74,7 @@ pub struct GatePolicy {
 
 /// Prefilter admission ratio: the gate's selective plan runs when
 /// |eligible| / corpus is at or below this. It is the conservative crossover
-/// of the `rrf-gate` bench (`benches/scenarios.rs`) across both corpora.
+/// of the historical `rrf-gate` corpora retained under `benchmarks/deferred/`.
 pub const DEFAULT_GATE_RATIO: f64 = 0.10;
 
 /// Absolute ceiling on the eligible-id in-list: the in-list probe cost
@@ -123,6 +132,18 @@ pub struct Assumptions {
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
+    /// The full-text coverage of every property a ranked scan's eligibility
+    /// placement read, keyed `<table key>.<property>`. A pinned dataset
+    /// version fixes it, so the dataset pins re-establish it on replay.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub full_text: BTreeMap<String, FullTextCoverage>,
+}
+
+impl Assumptions {
+    /// The key a property's full-text coverage is recorded under.
+    pub fn full_text_key(type_key: &str, property: &str) -> String {
+        format!("{type_key}.{property}")
+    }
 }
 
 impl Assumptions {
@@ -134,18 +155,24 @@ impl Assumptions {
     /// `1..=i64::MAX`, or wildcard provenance without a captured limit.
     pub fn validated_traversal_work_limit(&self) -> Result<Option<NonZeroU64>, PlanError> {
         if self.settings.contains_key("traversal_work_limit") {
-            return Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry".to_string(),
-            });
+            return Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must use the captured typed allowance, not a duplicate settings entry",
+                None,
+            ));
         }
         match self.traversal_work_limit {
-            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::Unsupported {
-                detail: "traversal_work_limit must be in 1..=i64::MAX".to_string(),
-            }),
+            Some(limit) if limit == 0 || limit > i64::MAX as u64 => Err(PlanError::refused(
+                P003,
+                "traversal_work_limit must be in 1..=i64::MAX",
+                Some("set `traversal_work_limit` to a value in 1..=9223372036854775807"),
+            )),
             Some(limit) => Ok(NonZeroU64::new(limit)),
-            None if self.has_wildcard_traversal => Err(PlanError::Unsupported {
-                detail: "wildcard traversal requires a finite traversal_work_limit".to_string(),
-            }),
+            None if self.has_wildcard_traversal => Err(PlanError::refused(
+                P002,
+                "wildcard traversal requires a finite traversal_work_limit",
+                Some(SET_TRAVERSAL_WORK_LIMIT),
+            )),
             None => Ok(None),
         }
     }
@@ -167,12 +194,59 @@ pub struct Hop {
 /// ids of `ranked_type` that have every hop in `hops` and ANDs them into the
 /// scans `feeds` names as `id IN (...)`, when the gate policy admits the set.
 /// Empty `hops` admits nothing: the run records the shape fallback and the
-/// scans run as planned.
+/// scans run as planned. Every hop is a required first hop of the query, so
+/// the eligible set holds every row that can survive the traversal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
+    /// What an empty eligible set decides: the empty answer for a
+    /// standalone `nearest`, the unfiltered plan for a fusion.
+    pub on_empty: EmptyEligible,
+    /// Whether the recorded full-text coverage of every `bm25` scan in
+    /// `feeds` is full, the guard under which prefiltering keeps BM25
+    /// scores; true when it feeds no `bm25` scan.
+    pub coverage_admits: bool,
+}
+
+/// What a pre-pass's empty eligible set decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmptyEligible {
+    /// No row survives the traversal: the answer is empty and no scan runs.
+    ProvenEmpty,
+    /// The scans run unfiltered.
+    Postfilter,
+}
+
+/// The adaptive policy of a `nearest` scan, declared before it runs: what
+/// the scan may do after an attempt leaves it short of `fetch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NearestPolicy {
+    /// A short scan under a probe cap rescans under the cap times this,
+    /// and uncapped once that reaches the ranked partitions.
+    pub probe_factor: usize,
+    /// Rows the prefilter admitted at `_distance = +inf` (the partition
+    /// search did not reach them) are rescanned flat and exact.
+    pub flat_rescan_on_unreached: bool,
+    /// A short capped scan without Lance's partition counters rescans
+    /// uncapped (fail closed).
+    pub uncapped_on_missing_counters: bool,
+    /// A scan whose eligible set is no larger than `fetch` scores flat from
+    /// its first attempt.
+    pub flat_when_eligible_within_fetch: bool,
+}
+
+impl NearestPolicy {
+    /// The policy the planner declares: probe caps grow fourfold (20 → 80 →
+    /// 320 → none), and every fallback is on.
+    pub const DEFAULT: Self = Self {
+        probe_factor: 4,
+        flat_rescan_on_unreached: true,
+        uncapped_on_missing_counters: true,
+        flat_when_eligible_within_fetch: true,
+    };
 }
 
 impl Prefilter {
@@ -180,6 +254,19 @@ impl Prefilter {
     pub fn admits(&self) -> bool {
         !self.hops.is_empty() && !self.feeds.is_empty()
     }
+}
+
+/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
+/// eligible set and the members of its search predicates): before the index
+/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
+/// score is independent of a filter applied before scoring only when the
+/// property's full-text index covers every fragment; elsewhere eligibility
+/// applies after scoring, so the filter never changes a score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eligibility {
+    BeforeScoring,
+    AfterScoring,
 }
 
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
@@ -226,6 +313,7 @@ pub struct RankedAccess {
     pub kind: RankKind,
     pub property: String,
     pub query: IRExpr,
+    pub score: IRExpr,
     /// Candidates the scan asks the index for; `None` is every match.
     pub fetch: Option<usize>,
     /// The IVF partitions a `nearest` scan may probe per index delta, the
@@ -240,17 +328,20 @@ pub struct RankedAccess {
     /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
     /// `RankFuse` declares.
     pub prefilter: Option<Prefilter>,
+    /// Where the scan applies its eligibility: always before scoring on a
+    /// `nearest` scan, whose candidate window is drawn from eligible rows;
+    /// on a `bm25` scan before scoring only under recorded full coverage.
+    pub eligibility: Eligibility,
+    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    pub policy: Option<NearestPolicy>,
 }
 
 impl RankedAccess {
     /// The score ordering this ranking imposes on `binding`'s rows.
-    pub fn ordering(&self, binding: &str) -> IROrdering {
-        let (property, descending) = self.kind.score();
+    pub fn ordering(&self, _binding: &str) -> IROrdering {
+        let (_, descending) = self.kind.score();
         IROrdering {
-            expr: IRExpr::PropAccess {
-                variable: binding.to_string(),
-                property: property.to_string(),
-            },
+            expr: self.score.clone(),
             descending,
         }
     }
@@ -260,11 +351,17 @@ impl RankedAccess {
             "kind": self.kind,
             "property": self.property,
             "query": self.query.to_string(),
+            "typed_query": crate::typed::expr(&self.query),
+            "typed_score": crate::typed::expr(&self.score),
             "fetch": self.fetch,
             "scope": self.scope,
         });
-        if self.kind == RankKind::Nearest {
-            value["nprobes"] = json!(self.nprobes);
+        match self.kind {
+            RankKind::Nearest => {
+                value["nprobes"] = json!(self.nprobes);
+                value["policy"] = json!(self.policy);
+            }
+            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
         }
         value
     }
@@ -341,7 +438,59 @@ impl Estimate {
 pub struct StatisticSource {
     pub statistic: String,
     pub value: String,
-    pub origin: &'static str,
+    pub origin: String,
+}
+
+/// One key of the order a node's output leaves in, typed: the comparator a
+/// sort establishes, the score order a ranking scan produces, or the logical
+/// id order of a diff or merge plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderKey {
+    /// A diff or merge plan's logical column, ascending.
+    Column(String),
+    /// An expression with its direction and null placement.
+    Expr {
+        expr: IRExpr,
+        descending: bool,
+        nulls_first: bool,
+    },
+    /// A binding's identity metadata key (`@id`, or `@type` of a selected
+    /// edge): ascending, nulls first.
+    Identity(ColumnRef),
+    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
+    /// descending.
+    Fused { bindings: Vec<String> },
+}
+
+impl OrderKey {
+    /// A written or score sort key: ascending keys place nulls first,
+    /// descending keys nulls last (RFC 0047, "One total order").
+    pub fn of(ordering: &IROrdering) -> Self {
+        Self::Expr {
+            expr: ordering.expr.clone(),
+            descending: ordering.descending,
+            nulls_first: !ordering.descending,
+        }
+    }
+}
+
+impl std::fmt::Display for OrderKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(column) => f.write_str(column),
+            Self::Expr {
+                expr, descending, ..
+            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
+            Self::Identity(column) => write!(f, "${column} asc"),
+            Self::Fused { bindings } => {
+                let targets: Vec<String> = bindings
+                    .iter()
+                    .map(|binding| format!("${binding}"))
+                    .collect();
+                write!(f, "rrf({}) desc", targets.join(", "))
+            }
+        }
+    }
 }
 
 /// The properties a physical node declares: derived after selection,
@@ -350,7 +499,7 @@ pub struct StatisticSource {
 #[derive(Debug, Clone)]
 pub struct Properties {
     pub schema: SchemaRef,
-    pub ordering: Option<Vec<String>>,
+    pub ordering: Option<Vec<OrderKey>>,
     pub rows: Estimate,
     pub work_bytes: Estimate,
     pub retained_limit: Option<u64>,
@@ -358,11 +507,15 @@ pub struct Properties {
 }
 
 impl Properties {
-    /// A query plan prints no `schema`: its run-time schemas are the
-    /// engine's to derive, and the planner's are conservative input schemas.
+    /// Result nodes declare their typed columns separately. Pipeline schemas
+    /// remain conservative input schemas and are omitted for query plans.
     fn to_json(&self, query: bool) -> Value {
+        let ordering: Option<Vec<String>> = self
+            .ordering
+            .as_ref()
+            .map(|keys| keys.iter().map(ToString::to_string).collect());
         let mut value = json!({
-            "ordering": self.ordering,
+            "ordering": ordering,
             "rows": self.rows,
             "work_bytes": self.work_bytes,
             "retained_limit": self.retained_limit,
@@ -379,6 +532,29 @@ impl Properties {
         }
         value
     }
+}
+
+/// The prefix of the column a query's return projection carries for a
+/// `HydrateColumns` above it: `^n` holds binding `n`'s row address. No GQ
+/// alias or `binding.property` name starts with it.
+pub const ROW_ADDRESS_PREFIX: &str = "^";
+
+/// One binding whose return columns a `HydrateColumns` fetches: its pinned
+/// table and the columns, each with the return position it fills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedBinding {
+    pub binding: String,
+    pub table: TableRef,
+    pub columns: Vec<HydratedColumn>,
+}
+
+/// One deferred return item: `binding.property` under `output`, the return
+/// column at `position`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedColumn {
+    pub position: usize,
+    pub output: String,
+    pub property: String,
 }
 
 /// The operator catalog. The change-feed and merge nodes (`Scan`,
@@ -433,6 +609,15 @@ pub enum PhysicalNode {
         input: NodeId,
         side: SideId,
     },
+    /// Pass 6 on a query: the return columns only the output reads, fetched
+    /// for the rows that reached it by each binding's row address (the
+    /// `ROW_ADDRESS_PREFIX` column the projection below carries) from the
+    /// binding's pinned table, in bounded chunks, and placed at their return
+    /// positions between the input's other columns.
+    HydrateColumns {
+        input: NodeId,
+        bindings: Vec<HydratedBinding>,
+    },
     RowCompare {
         input: NodeId,
     },
@@ -465,6 +650,7 @@ pub enum PhysicalNode {
         right: NodeId,
         haystack: (String, String),
         needle: (String, String),
+        conjunct: IRExpr,
         residual: Vec<IRExpr>,
     },
     /// The in-memory arm of a GQ filter: the conjuncts the placement pass
@@ -496,14 +682,15 @@ pub enum PhysicalNode {
         inner: NodeId,
         outer_var: String,
         predicate: SubqueryPredicate,
+        aggregate: Option<AggregateSpec>,
     },
     /// The enclosing rows, the leaf of an `AntiJoin` inner tree.
     OuterReference {
         outer_var: String,
     },
     /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
-    /// ranked scan, fused by reciprocal rank; `k` as the query wrote it (`None`
-    /// the default), `limit` the fused rows, `prefilter` feeds the `bm25` arms.
+    /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
+    /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
     RankFuse {
         arms: [RankArm; 2],
         k: Option<IRExpr>,
@@ -515,10 +702,13 @@ pub enum PhysicalNode {
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Aggregate {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
+        aggregates: Vec<Option<AggregateSpec>>,
+        node_objects: Vec<crate::NodeObjectType>,
     },
     Sort {
         input: NodeId,
@@ -531,12 +721,45 @@ pub enum PhysicalNode {
 }
 
 impl PhysicalNode {
+    /// The most rows this node keeps of its input whatever any predicate
+    /// holds: its count cut. Every variant is listed, so a new node kind
+    /// cannot compile without a classification here; a field that gives an
+    /// existing kind a cut still needs its arm changed by hand. Plan
+    /// acceptance justifies every declared cut against the query.
+    pub fn row_cut(&self) -> Option<usize> {
+        match self {
+            Self::Limit { rows, .. } | Self::Page { rows, .. } => Some(*rows),
+            Self::Sort { fetch, .. } => *fetch,
+            Self::Scan { ranked, .. } => ranked.as_ref().and_then(|ranked| ranked.fetch),
+            // A fusion emits every arm row; its `limit` sizes only the
+            // nearest arm's window, which that arm's scan declares as its
+            // fetch.
+            Self::RankFuse { .. }
+            | Self::MetadataCount { .. }
+            | Self::SortMergeJoin { .. }
+            | Self::HashJoin { .. }
+            | Self::HydrateByAddress { .. }
+            | Self::HydrateColumns { .. }
+            | Self::RowCompare { .. }
+            | Self::ClassifyThreeWay { .. }
+            | Self::CrossJoin { .. }
+            | Self::ContainsJoin { .. }
+            | Self::Filter { .. }
+            | Self::Expand { .. }
+            | Self::AntiJoin { .. }
+            | Self::OuterReference { .. }
+            | Self::Projection { .. }
+            | Self::Aggregate { .. } => None,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::Scan { .. } => "Scan",
             Self::MetadataCount { .. } => "MetadataCount",
             Self::HashJoin { .. } => "HashJoin",
             Self::HydrateByAddress { .. } => "HydrateByAddress",
+            Self::HydrateColumns { .. } => "HydrateColumns",
             Self::SortMergeJoin { .. } => "SortMergeJoin",
             Self::RowCompare { .. } => "RowCompare",
             Self::ClassifyThreeWay { .. } => "ClassifyThreeWay",
@@ -557,6 +780,7 @@ impl PhysicalNode {
     pub fn inputs(&self) -> Vec<NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -582,6 +806,7 @@ impl PhysicalNode {
     fn inputs_mut(&mut self) -> Vec<&mut NodeId> {
         match self {
             Self::HydrateByAddress { input, .. }
+            | Self::HydrateColumns { input, .. }
             | Self::RowCompare { input, .. }
             | Self::ClassifyThreeWay { input }
             | Self::Page { input, .. }
@@ -640,6 +865,7 @@ impl<'a> TextContains<'a> {
             left,
             op: BinaryOp::Compare(CompOp::StringContains),
             right,
+            ..
         } = conjunct
         else {
             return None;
@@ -648,10 +874,12 @@ impl<'a> TextContains<'a> {
             IRExpr::PropAccess {
                 variable: haystack,
                 property: searched,
+                ty: _,
             },
             IRExpr::PropAccess {
                 variable: needle,
                 property: sought,
+                ty: _,
             },
         ) = (left.as_ref(), right.as_ref())
         else {
@@ -844,6 +1072,9 @@ impl PhysicalPlan {
                 ranked,
             } => {
                 let mut value = scan_json("Scan", spec);
+                if let Some(access) = &spec.access {
+                    access.explain(&mut value);
+                }
                 if let ScanInput::Dependent { .. } = source {
                     value["id_restriction"] = json!("input");
                     value["access"] = json!(AccessPath::IdLookup);
@@ -872,6 +1103,21 @@ impl PhysicalPlan {
                 "node": "HydrateByAddress",
                 "side": side,
             }),
+            PhysicalNode::HydrateColumns { bindings, .. } => json!({
+                "node": "HydrateColumns",
+                "bindings": bindings
+                    .iter()
+                    .map(|binding| json!({
+                        "binding": binding.binding,
+                        "table": binding.table.type_key,
+                        "columns": binding
+                            .columns
+                            .iter()
+                            .map(|column| column.property.as_str())
+                            .collect::<Vec<&str>>(),
+                    }))
+                    .collect::<Vec<Value>>(),
+            }),
             PhysicalNode::HashJoin {
                 binding, fallback, ..
             } => json!({
@@ -896,6 +1142,7 @@ impl PhysicalPlan {
             PhysicalNode::Filter { filters, .. } => json!({
                 "node": "Filter",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::Expand {
                 src,
@@ -929,11 +1176,15 @@ impl PhysicalPlan {
             PhysicalNode::AntiJoin {
                 outer_var,
                 predicate,
+                aggregate,
                 ..
             } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
                 "predicate": predicate.to_string(),
+                "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
+                "typed_left": crate::typed::block(&predicate.left),
+                "typed_right": crate::typed::expr(&predicate.right),
             }),
             PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
@@ -952,12 +1203,38 @@ impl PhysicalPlan {
                     .map(|arm| json!({ "binding": arm.binding, "kind": arm.kind }))
                     .collect::<Vec<Value>>(),
                 "k": k.as_ref().map(ToString::to_string),
+                "typed_k": k.as_ref().map(crate::typed::expr),
                 "limit": limit,
                 "row_tiebreak": tiebreak_text(row_tiebreak),
             }),
-            PhysicalNode::Projection { return_exprs, .. }
-            | PhysicalNode::Aggregate { return_exprs, .. } => json!({
+            PhysicalNode::Aggregate {
+                return_exprs,
+                aggregates,
+                ..
+            } => json!({
                 "node": node.name(),
+                "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
+                "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
+                    match (&projection.expr, spec) {
+                        (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
+                            "column": crate::optimizer::result_column(projection),
+                            "func": func.to_string(),
+                            "distinct": distinct,
+                            "input": signature.arg.spelling(),
+                            "accumulator": spec.accumulator,
+                            "overflow": spec.overflow,
+                            "result": signature.result.spelling(),
+                        }),
+                        _ => Value::Null,
+                    }
+                }).collect::<Vec<_>>(),
+            }),
+            PhysicalNode::Projection { return_exprs, .. } => json!({
+                "node": node.name(),
+                "columns": crate::output::return_columns(return_exprs),
+                "typed_exprs": crate::typed::returns(return_exprs),
                 "exprs": return_exprs
                     .iter()
                     .map(|projection| projection.expr.to_string())
@@ -971,16 +1248,19 @@ impl PhysicalPlan {
             } => json!({
                 "node": "Sort",
                 "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
                 "fetch": fetch,
                 "tiebreak": tiebreak_text(tiebreak),
             }),
             PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
                 "node": "CrossJoin",
                 "filters": filters_json(filters),
+                "typed_filters": crate::typed::exprs(filters),
             }),
             PhysicalNode::ContainsJoin {
                 haystack,
                 needle,
+                conjunct,
                 residual,
                 ..
             } => json!({
@@ -988,6 +1268,8 @@ impl PhysicalPlan {
                 "haystack": column_text(haystack),
                 "needle": column_text(needle),
                 "residual": filters_json(residual),
+                "typed_residual": crate::typed::exprs(residual),
+                "typed_conjunct": crate::typed::expr(conjunct),
             }),
             other => json!({ "node": other.name() }),
         };
@@ -1147,6 +1429,7 @@ impl PhysicalPlan {
             }
             PhysicalNode::RowCompare { input }
             | PhysicalNode::ClassifyThreeWay { input }
+            | PhysicalNode::HydrateColumns { input, .. }
             | PhysicalNode::Page { input, .. }
             | PhysicalNode::Limit { input, .. }
             | PhysicalNode::Filter { input, .. }

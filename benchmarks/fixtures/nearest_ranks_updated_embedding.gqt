@@ -1,0 +1,34 @@
+# issue: none
+# notes: Move d004 from 4.0 to -1.0 after indexing. It must rank second from -0.3.
+# notes: Limit 6 exceeds the five live rows, so the old vector must not appear as a duplicate.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    n: I64 @index
+    name: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","n":0,"name":"doc-000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","n":1,"name":"doc-001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","n":2,"name":"doc-002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","n":3,"name":"doc-003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","n":4,"name":"doc-004","embedding":[4.0,0.0,0.0,0.0]}}
+
+--- mutate
+query move_embedding($s: String, $e: Vector(4)) {
+    update Doc set { embedding: $e } where slug = $s
+}
+
+--- params
+{"s": "d004", "e": [-1.0, 0.0, 0.0, 0.0]}
+
+--- expect affected: nodes=1 edges=0

@@ -11,6 +11,7 @@ environments:
 node Person {
     name: String @key
     age: I32?
+    tags: [String]?
     payload: Blob?
     embedding: Vector(2)?
 }
@@ -18,9 +19,9 @@ node Person {
 edge Knows: Person -> Person
 
 --- seed
-{"type":"Person","data":{"name":"alice","age":30,"embedding":[1.0,2.0]}}
+{"type":"Person","data":{"name":"alice","age":30,"tags":["reader"],"embedding":[1.0,2.0]}}
 {"type":"Person","data":{"name":"bob","age":null}}
-{"type":"Person","data":{"name":"carol","age":41}}
+{"type":"Person","data":{"name":"carol","age":41,"tags":[]}}
 {"edge":"Knows","from":"alice","to":"bob","data":{}}
 {"edge":"Knows","from":"alice","to":"carol","data":{}}
 {"edge":"Knows","from":"bob","to":"carol","data":{}}
@@ -32,13 +33,16 @@ query object_and_vector() {
 }
 
 --- expect unordered
-{"p": {"@id": "alice", "name": "alice", "age": 30}, "p.embedding": [1.0, 2.0]}
+{"p": {"@id": "alice", "name": "alice", "age": 30, "tags": ["reader"]}, "p.embedding": [1.0, 2.0]}
 {"p": {"@id": "bob", "name": "bob"}}
-{"p": {"@id": "carol", "name": "carol", "age": 41}}
+{"p": {"@id": "carol", "name": "carol", "age": 41, "tags": []}}
 
 --- expect shape
 p: Person
 p.embedding: Vector(2)?
+
+--- expect plan
+result columns [p: Person, p.embedding: Vector(2)?]
 
 --- query
 query zero_rows() {
@@ -50,6 +54,9 @@ query zero_rows() {
 
 --- expect shape
 p: Person
+
+--- expect plan
+result columns [p: Person]
 
 --- query
 query count_alone() {
@@ -63,6 +70,9 @@ query count_alone() {
 --- expect shape
 n: I64
 
+--- expect plan
+result columns [n: I64?]
+
 --- query
 query friends_per_person() {
     match {
@@ -73,12 +83,15 @@ query friends_per_person() {
 }
 
 --- expect unordered
-{"p": {"@id": "alice", "name": "alice", "age": 30}, "friends": 2}
+{"p": {"@id": "alice", "name": "alice", "age": 30, "tags": ["reader"]}, "friends": 2}
 {"p": {"@id": "bob", "name": "bob"}, "friends": 1}
 
 --- expect shape
 p: Person
 friends: I64
+
+--- expect plan
+result columns [p: Person, friends: I64?]
 
 --- query
 query alias_ordered() {
@@ -88,12 +101,15 @@ query alias_ordered() {
 }
 
 --- expect ordered
-{"person": {"@id": "carol", "name": "carol", "age": 41}}
+{"person": {"@id": "carol", "name": "carol", "age": 41, "tags": []}}
 {"person": {"@id": "bob", "name": "bob"}}
-{"person": {"@id": "alice", "name": "alice", "age": 30}}
+{"person": {"@id": "alice", "name": "alice", "age": 30, "tags": ["reader"]}}
 
 --- expect shape
 person: Person
+
+--- expect plan
+result columns [person: Person]
 
 --- query
 query min_of_node() {

@@ -125,7 +125,10 @@ pub(crate) enum CommitEnumeration {
 /// Materialize the exact logical image for one row entering the page: the
 /// commit-era flat row image with the logical `id` hoisted out and, for
 /// edges, `src`/`dst` hoisted into public `{from, to}` endpoints. This is the
-/// only place Blob payloads are read for emitted changes.
+/// only place Blob payloads are read for emitted changes. Each managed Blob
+/// column takes one batched read of this row alone: the page admits one change
+/// at a time against its byte budget, so reading the next rows' payloads ahead
+/// could fetch values a closed page discards.
 async fn emitted_image(
     dataset: &Dataset,
     raw: &RawRow,

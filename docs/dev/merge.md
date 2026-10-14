@@ -15,6 +15,23 @@ uses the full lineage reader. A successful proof does not validate unread
 history: missing, malformed, or conflicting settled records outside the proof
 may remain undetected until a history read reaches them.
 
+The inconclusive case walks the commit graph from both heads by generation
+(`commit_graph.rs`, `lazy_merge_base_search`), reading a commit it does not
+hold from its `__history` block. Each branch's `__manifest` also carries a
+block registry (`history_block` and `history_merge` rows, storage format 15):
+one row per released first-parent run of a block, with its slot range, the
+generation and parent of its first slot, and one row per merge commit inside
+the run. The walk crosses a registered block from its last slot to its first
+without a read and reads blocks for commits no row covers and for final
+candidates tied on distance and generation. The publisher writes the rows when it releases
+a run and refuses a run whose commits are not the chain their ids claim, so a
+block without rows is walked from its records. Registry rows past
+`REGISTRY_HOT_ROWS` live in cold fragments of `__manifest` that a publish
+reuses by reference. A registry push repacks smaller cold fragments; a merge
+caches them by data-file path and imports only rows absent from the target.
+`optimize` preserves this fragment layout; only the catalog publisher repacks it.
+See the [block registry RFC](../rfcs/2026-10-10-merge-base-block-registry.md).
+
 ## Per-table decision
 
 For every table lifetime present in the accepted catalogs, merge compares:
@@ -41,6 +58,15 @@ The table classifier chooses one of four routes:
 An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
+
+A dry run (`Session::branch_merge_dry_run`, RFC 0030 §8.4) takes the same
+path through base resolution, classification and constraint validation, then
+returns before the queue guards and the first detached commit. It is a read:
+it takes neither the schema permit nor the branch gates, pins no merge-input
+tag (a reclaimed input surfaces as a typed gap), and stages only to the
+process-local scratch directory. The merge truth table runs it before every
+cell's merge and holds it to the merge's outcome and to zero object-store
+writes.
 
 On the adopt route, every target, main included, selects the source's exact
 table ref, version and pin: the target's registration takes the source's
@@ -87,6 +113,10 @@ filter-bearing Update shape. It performs no target MergeInsert join or target
 ID preflight. The marker is not a signature and raw Lance writers remain
 unsupported. RFC 0023 owns the detailed proof and performance evidence.
 
+The effective `write_max_bytes` is captured once. It accompanies the exact
+planned chunk rows through staging and publication, so scanner batch choices
+cannot change the admitted transaction boundaries.
+
 ## General route
 
 The `merge_lineage` session setting at `on` (the release default, `verify` in
@@ -116,8 +146,9 @@ the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
   row-width shape — the width estimate that plans chunk sizes only reduces
   retries, it is never load-bearing for the bound. A single indivisible row
   wider than the ceiling still hydrates alone;
-- Blob columns hydrate as descriptors; Blob-bearing rows are materialized
-  under the same operation budget;
+- Blob columns hydrate as descriptors; materialized Blob payloads share one
+  operation-wide `write_max_bytes` allowance (default 32 MiB), independent of
+  the row-and-descriptor allowance used for each write chunk;
 - selected new IDs stage as strict inserts, existing IDs as known-present
   updates, and removals as deletes;
 - the transaction plan is pre-minted and bounded before recovery arm;
@@ -315,11 +346,11 @@ structured error; it cannot replace the successful merge receipt. See
 ## Owners
 
 - `crates/omnigraph/src/exec/merge.rs` — classification and execution.
-- `crates/omnigraph/tests/merge_truth_table.rs` — operation-pair semantics.
-- `crates/omnigraph/tests/merge_fast_forward.rs` — pointer/proven-insert routes
+- `crates/omnigraph/tests/integration/merge_truth_table.rs` — operation-pair semantics.
+- `crates/omnigraph/tests/integration/merge_fast_forward.rs` — pointer/proven-insert routes
   and bounded fallback.
-- `crates/omnigraph/tests/branching.rs` — branch identity and Blob behavior.
-- `crates/omnigraph/tests/merge_cost.rs` — delta scope and manifest-history
+- `crates/omnigraph/tests/integration/branching.rs` — branch identity and Blob behavior.
+- `crates/omnigraph/tests/integration/merge_cost.rs` — delta scope and manifest-history
   cost contracts, not semantics.
 - `crates/omnigraph-core/src/instrumentation.rs` — route and timing probes.
 

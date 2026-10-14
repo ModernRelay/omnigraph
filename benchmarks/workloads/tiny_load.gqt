@@ -1,0 +1,33 @@
+# issue: none
+# notes: Shared benchmark dataset/query contract.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- load generate: v1 seed: 0 mode: append
+tables:
+  - kind: node
+    name: Item
+    rows: 1
+    commits: 1
+    batch_rows: 1
+    columns:
+      key: {kind: key, prefix: c, width: 1}
+      val: {kind: literal, value: 3}
+--- expect ok
+
+--- query branch: main
+query items() {
+    match { $i: Item }
+    return { $i.key as key, $i.val as val }
+}
+--- expect unordered
+{"key":"a","val":1}
+{"key":"b","val":2}
+{"key":"c0","val":3}
+--- expect shape
+key: String
+val: I64

@@ -156,6 +156,8 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "omnigraph-catalog/history.rs",
     "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
 /// Out-of-line modules are parsed as standalone files, so the walker cannot see
@@ -166,6 +168,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
 /// a new call inside a trusted implementation still requires an explicit
 /// protocol disposition.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
+    "engine/plan_source/key_tests.rs",
+    "engine/plan_source/scan_access/tests.rs",
+    "engine/plan_source/scan_access/planning_cost.rs",
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
@@ -245,14 +250,19 @@ write_surfaces! {
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence"],
     "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage"],
-    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt"],
+    "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt", "mutate_as_with_optional_branch_receipt"],
+    "exec/blob_write.rs" => MUTATION_V9 => ["put_blob_at_as", "clear_blob_at_as"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
     "loader/mod.rs" => WriteProtocol::Composed("optional branch create, then Load v9") => ["load_as", "load_as_with_receipt", "load_file_as", "load_file_as_with_receipt", "load_graph_batch_as", "load_graph_batch_as_with_receipt"],
+    "loader/mod.rs" => WriteProtocol::Composed("external object read under the Blob policy, then Load v9 on an existing branch") => ["load_csv_as_with_receipt"],
     "loader/mod.rs" => WriteProtocol::Composed("branch create when absent, then Load v9 alias") => ["ingest", "ingest_as", "ingest_file", "ingest_file_as"],
     "db/omnigraph.rs" => SCHEMA_V9 => ["apply_schema", "apply_schema_as", "apply_schema_as_with_catalog_check", "apply_prepared_schema_as"],
     "db/omnigraph.rs" => WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication") => ["settle_prepared_schema_as"],
     "db/omnigraph.rs" => SYSTEM_COLUMNS_V9 => ["upgrade_system_columns", "upgrade_system_columns_as"],
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
+    "exec/merge.rs" => WriteProtocol::Composed("Merge v9, published either as the target head or as an unpublished commit that keeps its merge-input tags") => ["branch_merge_as_with_options"],
+    "db/omnigraph.rs" => WriteProtocol::Exact("unpublished commit publication: the proposal's recorded changes replayed through the manifest publisher under its captured authority, required to allocate the proposal's own id") => ["publish_commit_as"],
+    "db/omnigraph.rs" => WriteProtocol::Composed("proposal tag removal confirmed by a readback, then merge-input tag release") => ["drop_commit_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
         "ensure_indices", "ensure_indices_on",
         "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
@@ -301,8 +311,11 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "resolved_branch_of"),
     ("db/omnigraph.rs", "sync_branch"),
     ("db/omnigraph.rs", "resolve_snapshot"),
-    ("db/omnigraph.rs", "diff_between"),
-    ("db/omnigraph.rs", "diff_commits"),
+    ("db/omnigraph.rs", "diff_page"),
+    ("db/omnigraph.rs", "merge_base"),
+    ("db/omnigraph.rs", "diff_read_target_branch"),
+    ("exec/merge.rs", "branch_merge_dry_run"),
+    ("session.rs", "branch_read"),
     ("db/omnigraph.rs", "commit_changes_page"),
     ("db/omnigraph.rs", "poll_change_feed"),
     ("db/omnigraph.rs", "capture_change_baseline"),
@@ -316,7 +329,10 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("blob.rs", "read_blob_at"),
     ("db/omnigraph.rs", "branch_list"),
     ("db/omnigraph.rs", "get_commit"),
+    ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    ("db/omnigraph.rs", "list_unpublished_commits"),
+    ("db/omnigraph.rs", "list_unattached_commits"),
     ("exec/query_doors.rs", "query"),
     ("exec/query_doors.rs", "query_with_head"),
     ("exec/query_doors.rs", "run_query_at"),
@@ -450,11 +466,6 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "resolve_commit_range",
-    ),
-    (
-        "db/graph_coordinator.rs",
-        "GraphCoordinator",
         "capture_change_cut",
     ),
     (
@@ -542,6 +553,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
+        "read_rows_at",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
         "record_in_live_branches",
     ),
     (
@@ -563,6 +579,36 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "list_graph_branches",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "unpublished_commit",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "unpublished_from_tag",
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "list_unpublished",
+    ),
+    (
+        "omnigraph-catalog/unattached.rs",
+        "ManifestCoordinator",
+        "unattached_commit",
+    ),
+    (
+        "omnigraph-catalog/unattached.rs",
+        "ManifestCoordinator",
+        "list_unattached",
+    ),
+    (
+        "omnigraph-catalog/unattached.rs",
+        "ManifestCoordinator",
+        "unattached_descendants",
     ),
 ];
 
@@ -626,6 +672,70 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "ManifestCoordinator",
         "delete_branch_with_expected",
         WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "propose_changes",
+        WriteProtocol::Exact(
+            "unpublished commit gateway: candidate rows detached under the exact captured authority, head unchanged",
+        ),
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "publish_unpublished",
+        WriteProtocol::Exact(
+            "publication of an unpublished commit through the shared publisher gateway",
+        ),
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "propose_unattached",
+        WriteProtocol::Exact(
+            "unattached snapshot gateway: the complete rows of a root over the live head, or of a child over its base snapshot's detached version, written detached under the root's exact captured authority; the head is unchanged",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "propose_changes",
+        WriteProtocol::Exact(
+            "unpublished commit gateway: candidate rows detached under the exact captured authority, head unchanged",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "publish_unpublished",
+        WriteProtocol::Exact(
+            "publication of an unpublished commit through the lowest manifest publisher gateway, required to allocate the candidate's own id",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unpublished.rs",
+        "ManifestCoordinator",
+        "drop_unpublished",
+        WriteProtocol::Composed(
+            "proposal tag removal confirmed by a readback, then merge-input tag release",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unattached.rs",
+        "ManifestCoordinator",
+        "propose_unattached",
+        WriteProtocol::Exact(
+            "unattached snapshot gateway: the complete rows of a root over the live head, or of a child over its base snapshot's detached version, written detached under the root's exact captured authority; the head is unchanged",
+        ),
+    ),
+    (
+        "omnigraph-catalog/unattached.rs",
+        "ManifestCoordinator",
+        "drop_unattached",
+        WriteProtocol::Composed(
+            "candidate tag removals descendants first, each confirmed by a readback before the next; the requested id goes last",
+        ),
     ),
 ];
 
@@ -713,7 +823,7 @@ gateway_surfaces! {
         "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
-        "has_fts_index", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+        "has_fts_index", "has_fts_postings", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
         "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded",
         "preflight_external_blob_uris", "prepare_keyed_write_batch_with_preflight",
@@ -722,8 +832,8 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "stage_delete", "stage_create_indices", "stage_compaction",
-        "stage_index_fold",
+        "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_create_indices",
+        "stage_compaction", "stage_index_fold",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -740,6 +850,9 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
     ],
+    "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
+        "commit_full_text_declarations",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "validate_initial_empty_table",
         "transaction_identity",
@@ -749,25 +862,26 @@ gateway_surfaces! {
         "scan_batches", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
-        "scan_stream_with", "scan_plan_with", "ordered_scan_error", "scan", "scan_with",
-        "fts_covers_all_fragments",
+        "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
         "count_rows",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
-        "has_btree_index", "has_fts_index",
+        "has_btree_index", "has_fts_index", "has_fts_postings",
         "has_vector_index", "first_row_id_for_filter",
-        "with_external_blob_policy", "preflight_external_blob_uris",
+        "with_external_blob_policy", "preflight_external_blob_uris", "read_external_object",
         "preflight_persisted_blob_selection", "prepare_keyed_write_batch_with_preflight",
         "prepare_overwrite_blob_references_with_preflight",
         "prepare_keyed_write_batch", "validate_keyed_write_batch", "first_existing_id",
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
+        "plan_table_compaction",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
-        "stage_rename_columns", "renamed_schema", "stage_delete", "stage_create_indices",
-        "stage_compaction", "stage_index_fold",
+        "stage_rename_columns", "renamed_schema", "stage_schema_evolution",
+        "plan_schema_evolution", "stage_delete", "stage_create_indices", "stage_compaction",
+        "stage_index_fold", "stage_full_text_declarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -784,13 +898,16 @@ gateway_surfaces! {
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("RFC 0067 detached staged commit gateway")) => [
         "commit_staged_detached",
     ],
+    "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
+        "commit_full_text_declarations",
+    ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
     ],
     "omnigraph-core/dataset_index.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
-        "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
-        "has_btree_index_on", "has_fts_index_on", "has_vector_index_on",
+        "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
+        "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -800,6 +917,12 @@ gateway_surfaces! {
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("manifest publisher gateway")) => [
         "publish_with_precondition",
+    ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("unpublished commit gateway: the candidate rows as a detached `__manifest` version under the exact captured authority, addressed by a put-if-absent proposal tag; the branch head is unchanged")) => [
+        "write_candidate",
+    ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("unattached snapshot gateway: the complete rows of a root or a child as a detached `__manifest` version under the root's exact captured authority, addressed by a put-if-absent candidate tag and acknowledged only after that authority is revalidated; the branch head is unchanged")) => [
+        "write_unattached_candidate",
     ],
     "omnigraph-catalog/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
@@ -832,7 +955,7 @@ durable_calls! {
     // deletion is last, so interrupted settlement can safely finish later.
     ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
     ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
-    ("db/upgrade.rs", "CommitBuilder::new(", 3, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent")),
+    ("db/upgrade.rs", "CommitBuilder::new(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the stamp-only route")),
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
@@ -847,9 +970,16 @@ durable_calls! {
     ("omnigraph-catalog/history.rs", ".put_if_absent(", 2, WriteProtocol::Composed("create-only puts of immutable `__history` objects: an extent of settled commit records (`write_extent`), issued by the publisher before its `__manifest` CAS and by branch deletion before the ref is retired, and a schema content object named by its hash")),
     ("omnigraph-catalog/publisher.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-catalog/publisher.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("manifest publisher trait forwarding")),
+    ("omnigraph-catalog/publisher.rs", ".tags(", 2, WriteProtocol::Composed("proposal or candidate tag put-if-absent at the detached candidate version, and its readback when the creation reports a conflict; one arm shared by the unpublished and the unattached writer")),
+    ("omnigraph-catalog/unpublished.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unpublished.rs", ".tags(", 2, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unpublished.rs", ".delete(", 1, WriteProtocol::Composed("release one proposal tag: after its publication, on an acknowledged drop, or by cleanup of an expired proposal; absence is the completed outcome")),
+    ("omnigraph-catalog/unattached.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unattached.rs", ".tags(", 1, WriteProtocol::ReadOnlyAccess),
+    ("omnigraph-catalog/unattached.rs", ".delete(", 1, WriteProtocol::Composed("release one candidate tag: on an acknowledged drop, descendants before their base, or by cleanup of an expired snapshot; absence is the completed outcome")),
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or
@@ -891,24 +1021,24 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 30, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 3, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 32, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "CommitBuilder::new(", 3, WriteProtocol::Composed("staged commit primitive")),
-    ("table_store.rs", ".create_index_builder(", 5, WriteProtocol::Composed("staged index primitive and RFC 0067 whole-rebuild fold")),
-    ("table_store.rs", ".execute_uncommitted(", 10, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".create_index_builder(", 6, WriteProtocol::Composed("staged index primitive, RFC 0067 whole-rebuild fold and untrained full-text declaration")),
+    ("table_store.rs", ".execute_uncommitted(", 11, WriteProtocol::Composed("staged physical primitive")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
     ("db/omnigraph/system_column_upgrade.rs", ".dataset()", 1, SYSTEM_COLUMNS_V9),
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
-    ("exec/merge.rs", ".dataset()", 4, WriteProtocol::Exact("RFC 0067 detached merge chain")),
+    ("exec/merge.rs", ".dataset()", 5, WriteProtocol::Exact("RFC 0067 detached merge chain, and the held source coordinates a merge `as commit` records")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached schema rewrite + incompatible original-empty-table retry")),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached metadata-only schema evolution + incompatible original-empty-table retry")),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
@@ -918,18 +1048,18 @@ durable_calls! {
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
     ("db/omnigraph.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher wrapper")),
     ("db/omnigraph/table_ops.rs", "commit_updates_on_branch_with_expected(", 1, WriteProtocol::Exact("shared publisher")),
-    ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 2, WriteProtocol::Exact("shared publisher")),
+    ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply/settlement.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication")),
     ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
+    ("omnigraph-catalog/unpublished.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("publication of an unpublished commit: its recorded changes through the ordinary publisher under the captured authority, required to allocate the candidate's own id")),
     ("db/omnigraph/table_ops.rs", ".commit_updates_with_actor_with_expected(", 2, WriteProtocol::TestOnly),
     ("db/omnigraph.rs", ".write_text_if_absent(", 2, WriteProtocol::Composed("bootstrap init claim + owned local-root create-if-absent probe")),
     ("db/omnigraph.rs", ".delete(", 2, WriteProtocol::Composed("bootstrap init claim release + owned local-root probe removal")),
     ("db/omnigraph.rs", "GraphCoordinator::init_commit_with_session(", 1, WriteProtocol::Bootstrap),
-    ("db/omnigraph/optimize.rs", "compact_files(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/optimize.rs", ".commit_staged_detached(", 3, WriteProtocol::Exact("RFC 0067 detached compaction rewrite, index fold and deferred index build")),
     ("db/omnigraph/optimize.rs", "commit_updates_on_branch_with_expected(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
@@ -959,6 +1089,7 @@ durable_calls! {
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // Commit-change enumeration: pinned parent/child handles for the ordered
     // merge's typed row comparison. Read-only by construction — the enumerator
     // stages no transaction and publishes nothing.
@@ -967,18 +1098,13 @@ durable_calls! {
     // candidate scan + parent before-image probe and the full-merge fallback.
     // Read-only — it stages and publishes nothing.
     ("changes/candidate_scan.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
-    // Net-diff cross-branch path: the same typed row comparison over two
-    // pinned snapshot handles, plus the same-lineage path reading each
-    // side's schema to resolve its system column spellings (RFC 0040
-    // Historical reads). Read-only — the diff stages and publishes nothing.
-    ("changes/mod.rs", ".dataset()", 11, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
-    ("db/omnigraph/schema_apply.rs", ".dataset()", 2, SCHEMA_V9),
+    ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 8, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 10, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }
@@ -2870,6 +2996,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
 const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/commit_graph.rs: omnigraph_catalog::commit_graph::CommitGraph",
     "db/commit_graph.rs: omnigraph_catalog::commit_graph::GraphCommit",
+    "db/commit_graph.rs: omnigraph_catalog::commit_graph::GraphCommitKind",
     "db/manifest.rs: omnigraph_catalog::DatasetEntry",
     "db/manifest.rs: omnigraph_catalog::DatasetUpdate",
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
@@ -2885,6 +3012,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "error.rs: omnigraph_core::error::Result",
     "error.rs: omnigraph_core::error::StorageFailure",
     "error.rs: omnigraph_core::error::StorageFailureKind",
+    "instrumentation.rs: omnigraph_core::instrumentation::capture_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::CountingStorageAdapter",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeTimingReading",
     "instrumentation.rs: omnigraph_core::instrumentation::MergeWriteProbes",
@@ -2899,6 +3027,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::RrfGateVerdict",
     "instrumentation.rs: omnigraph_core::instrumentation::StageWriteProbes",
     "instrumentation.rs: omnigraph_core::instrumentation::StorageReadCounts",
+    "instrumentation.rs: omnigraph_core::instrumentation::with_external_payload_read_stalled",
     "instrumentation.rs: omnigraph_core::instrumentation::with_merge_write_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_memory_limit",
@@ -2931,6 +3060,9 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "seams.rs: omnigraph_core::seams::decide_seam",
     "seams.rs: omnigraph_core::seams::effects_list",
     "seams.rs: omnigraph_core::seams::store_effects_list",
+    "seams.rs: omnigraph_core::seams::store::StoreAction",
+    "seams.rs: omnigraph_core::seams::store::Subject",
+    "seams.rs: omnigraph_core::seams::store::SUBJECT_MAX_BYTES",
     "storage.rs: omnigraph_core::storage::DecorateStorage",
     "storage.rs: omnigraph_core::storage::ListDirBounds",
     "storage.rs: omnigraph_core::storage::ObjectStorageAdapter",
@@ -3645,9 +3777,12 @@ fn lance_ordering_stays_behind_bounded_scan_executor() {
     );
 }
 
-/// Pins the per-file call counts of `read_blobs`, `read_blob_ranges` and
-/// `with_io_buffer_size_bytes` in the production sources of the engine crate and the
-/// `GUARDED_CRATES`.
+/// Pins the per-file call counts of Lance's Blob selection APIs, of
+/// `with_io_buffer_size_bytes`, and of `managed_blob_payloads`, the one batched
+/// managed read, in the production sources of the engine crate and the
+/// `GUARDED_CRATES`. A bulk Blob reader calls the helper and adds its row here;
+/// a second raw `read_blobs` call, or `take_blobs` and one `BlobFile::read` per
+/// row, fails.
 #[test]
 fn lance_batched_blob_read_call_counts_are_pinned() {
     let src = engine_src_root();
@@ -3658,8 +3793,12 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
         let ast = parse_rust_source(&contents, &relative);
         let inventory = call_inventory(&ast);
         for method in [
+            "managed_blob_payloads",
             "read_blobs",
             "read_blob_ranges",
+            "take_blobs",
+            "take_blobs_by_indices",
+            "take_blobs_by_addresses",
             "with_io_buffer_size_bytes",
         ] {
             let count = inventory.counts.get(method).copied().unwrap_or(0);
@@ -3672,11 +3811,19 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
     assert_eq!(
         sites,
         vec![
+            (
+                "managed_blob_payloads",
+                "db/omnigraph/export.rs".to_string(),
+                1
+            ),
+            ("managed_blob_payloads", "table_store.rs".to_string(), 1),
             ("read_blobs", "table_store.rs".to_string(), 1),
+            ("take_blobs", "blob.rs".to_string(), 1),
             ("with_io_buffer_size_bytes", "table_store.rs".to_string(), 1),
         ],
-        "the per-file call counts of read_blobs, read_blob_ranges and \
-         with_io_buffer_size_bytes changed"
+        "the per-file call counts of the Blob read APIs changed: a bulk Blob \
+         read goes through managed_blob_payloads, and only the single-cell \
+         read facade keeps take_blobs"
     );
 }
 

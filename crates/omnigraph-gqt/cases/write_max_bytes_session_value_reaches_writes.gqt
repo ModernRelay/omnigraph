@@ -1,0 +1,85 @@
+# issue: none
+# notes: Under write_max_bytes = 1 every row exceeds the row allowance, so each refusal is forced by the setting; the same insert under the default is admitted.
+# notes: A set prefix lowers only its own step; a settings-only step lowers every later write, survives a restart, and reset restores the default; a refused insert leaves no row, so its retry inserts the key once.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+}
+
+--- seed
+
+--- mutate
+set write_max_bytes = 1;
+query add_first() {
+    insert Doc { slug: "first" }
+}
+
+--- expect error: resource limit exceeded
+
+--- mutate
+query retry_first() {
+    insert Doc { slug: "first" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 1;
+
+--- expect ok
+
+--- restart
+
+--- mutate
+query add_second() {
+    insert Doc { slug: "second" }
+}
+
+--- expect error: resource limit exceeded
+
+--- query
+query docs_while_lowered() {
+    match { $d: Doc }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"first"}
+
+--- expect shape
+d.slug: String
+
+--- mutate
+reset write_max_bytes;
+
+--- expect ok
+
+--- mutate
+query retry_second() {
+    insert Doc { slug: "second" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query docs_after_reset() {
+    match { $d: Doc }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"first"}
+{"d.slug":"second"}
+
+--- expect shape
+d.slug: String

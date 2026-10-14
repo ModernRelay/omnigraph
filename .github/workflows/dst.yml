@@ -23,7 +23,7 @@ on:
 
 concurrency:
   group: dst-${{ github.ref }}
-  # Cache saves are push-only, so a superseded PR run loses nothing when
+  # Archive cache saves are push-only, so a superseded PR run loses nothing when
   # cancelled; main runs stay alive as ci.yml's do.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -145,6 +145,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -166,6 +170,13 @@ jobs:
           # Push-only saving protects the long-lived main cache from PR
           # eviction churn; PR runs still restore from it.
           save-if: ${{ github.event_name == 'push' }}
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
 
       # The whole active suite: lib proofs (arbiter, judges, classifiers,
       # census guards) + scenario pins + the torn-init pin. Instruments

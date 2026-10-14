@@ -1,0 +1,62 @@
+# issue: none
+# notes: The implicit tie-break orders by every declared binding's identity in
+# notes: binding-name order (RFC 0047, "One total order"). An anonymous `$_`
+# notes: endpoint is no declared binding: its identity may only follow the
+# notes: declared ones. `a` and `b` tie on rank; `a` reaches doc `y` and `b`
+# notes: reaches doc `x`, so ordering by the anonymous endpoint first would
+# notes: put `b` before `a`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    rank: I64
+}
+node Doc {
+    slug: String @key
+}
+edge Likes: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"a","rank":1}}
+{"type":"Person","data":{"name":"b","rank":1}}
+{"type":"Doc","data":{"slug":"x"}}
+{"type":"Doc","data":{"slug":"y"}}
+{"edge":"Likes","from":"a","to":"y"}
+{"edge":"Likes","from":"b","to":"x"}
+
+--- query
+query first_by_rank() {
+    match { $p: Person $p likes $_ }
+    return { $p.name }
+    order { $p.rank }
+    limit 1
+}
+
+--- expect ordered
+{"p.name": "a"}
+
+--- expect shape
+p.name: String
+
+--- query
+query all_by_rank() {
+    match { $p: Person $p likes $_ }
+    return { $p.name }
+    order { $p.rank }
+}
+
+--- expect ordered
+{"p.name": "a"}
+{"p.name": "b"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+sort tiebreak [$p.@id, $__anon_1.@id]

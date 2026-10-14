@@ -174,6 +174,16 @@ pub(crate) fn replaced_table_object_id(identity: TableIdentity, replaced_at: u64
     format!("{}@{replaced_at}", table_object_id(identity))
 }
 
+/// Row key of a `history_block` row: the block and the run of slots it describes.
+pub fn history_block_object_id(block: ulid::Ulid, first_slot: u16, last_slot: u16) -> String {
+    format!("history_block:{block}:{first_slot}-{last_slot}")
+}
+
+/// Row key of a `history_merge` row: the block and the slot of the merge commit.
+pub fn history_merge_object_id(block: ulid::Ulid, slot: u16) -> String {
+    format!("history_merge:{block}:{slot}")
+}
+
 pub(crate) fn table_uri_for_path(
     root_uri: &str,
     table_path: &str,

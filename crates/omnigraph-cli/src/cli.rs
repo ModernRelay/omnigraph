@@ -41,8 +41,8 @@ pub(crate) struct Cli {
     pub(crate) as_actor: Option<String>,
 
     /// Address a server by name (resolves to its `url` from `servers:` in
-    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL. Exclusive
-    /// with a positional URI.
+    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL or
+    /// `unix:///absolute/path.sock` socket. Exclusive with a positional URI.
     #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 
@@ -101,7 +101,7 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
+    /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
     /// Run a read query.
     Query {
@@ -110,13 +110,15 @@ pub(crate) enum Command {
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
         /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// `branch list` statement, or one `explain query …` statement, which
-        /// answers the plan the query would run under as results.
+        /// branch read statement (`branch list`, `branch diff`,
+        /// `branch merge-base`, `branch merge … dry run`), or one
+        /// `explain query …` statement, which answers the plan the query
+        /// would run under as results.
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
         /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// the `branch list` statement, which takes no name, params, --branch
-        /// or --snapshot, or an `explain query …` statement.
+        /// a branch read statement, which takes no name, params, --branch or
+        /// --snapshot, or an `explain query …` statement.
         #[arg(
             short = 'e',
             long = "query-string",
@@ -247,10 +249,42 @@ pub(crate) enum Command {
         #[arg(long = "type")]
         type_names: Vec<String>,
     },
-    /// Read one logical node or edge Blob cell.
+    /// Read, replace or clear one logical node or edge Blob cell.
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
+    },
+    /// Net entity changes between two read targets: a branch (its head now)
+    /// or a graph commit id. Auto-paginates; `branch diff` reviews a branch
+    /// against its merge base, `commit changes` reports one commit with its
+    /// cause.
+    Diff {
+        /// Graph URI
+        uri: Option<String>,
+        /// Read target the diff starts from
+        #[arg(long)]
+        from: String,
+        /// Read target the diff ends at
+        #[arg(long)]
+        to: String,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fetch exactly one page starting at this opaque token
+        /// (auto-paginates when omitted)
+        #[arg(long)]
+        page_token: Option<String>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
     },
     /// Commit history operations
     Commit {
@@ -290,7 +324,7 @@ pub(crate) enum Command {
         force: bool,
     },
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the format this binary serves (v14); other formats are rebuilt by export and load
+    /// the current format this binary serves (v16); other formats are rebuilt by export and load
     Upgrade {
         /// Standalone graph storage URI; alternatively use --store
         uri: Option<String>,
@@ -424,8 +458,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
-    /// Print the CLI version
-    Version,
+    /// Print the CLI version, the HTTP contract it speaks, and the storage
+    /// formats it writes and serves.
+    Version {
+        /// Emit the same facts as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -513,6 +552,61 @@ pub(crate) enum BlobCommand {
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
         /// Emit stable JSON metadata.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace one Blob value of an existing node or edge with raw bytes from
+    /// a file or stdin, as one graph commit.
+    Put {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Read the bytes from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set one nullable Blob value of an existing node or edge to null, as one
+    /// graph commit; a cell that is already null publishes nothing.
+    Clear {
+        /// Logical entity namespace.
+        #[arg(value_name = "ENTITY")]
+        entity: BlobEntityArg,
+        /// Accepted-schema node or edge type.
+        #[arg(value_name = "TYPE")]
+        type_name: String,
+        /// Logical entity id; the entity must exist.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Blob property name.
+        #[arg(value_name = "PROPERTY")]
+        property: String,
+        /// Write a named branch (defaults to main).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Write only while the cell's ETag is one of these entity tags, or,
+        /// as `*`, while the cell holds any value.
+        #[arg(long, value_name = "TAG")]
+        if_match: Option<String>,
+        /// Emit the receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -812,11 +906,63 @@ pub(crate) enum BranchCommand {
         /// and never fails the already-landed merge.
         #[arg(long)]
         delete_branch: bool,
+        /// Merge into an unpublished commit (`branch merge … as commit`): the
+        /// target head is unchanged until `omnigraph commit publish <id>`.
+        /// Exclusive with --delete-branch, whose source the commit still holds.
+        #[arg(long, conflicts_with = "delete_branch")]
+        as_commit: bool,
+        /// Run the merge through classification and validation and stop:
+        /// report the outcome, or fail with the conflicts, and write nothing.
+        /// A read of both branches.
+        #[arg(long, conflicts_with_all = ["delete_branch", "as_commit"])]
+        dry_run: bool,
         /// Session setting for this invocation (repeatable): `name=value` in
         /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
         /// `settings` field (the Session settings RFC).
         #[arg(long = "set", value_name = "NAME=VALUE")]
         settings: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What a branch changed since its merge base with a target branch: the
+    /// net entity changes from the base to the branch head. Auto-paginates.
+    Diff {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        source: String,
+        /// Branch the source is compared against (default main)
+        #[arg(long)]
+        into: Option<String>,
+        /// Changes per page (the server clamps at its public ceiling)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fetch exactly one page starting at this opaque token
+        /// (auto-paginates when omitted)
+        #[arg(long)]
+        page_token: Option<String>,
+        /// Filter by entity kind (repeatable): node | edge
+        #[arg(long = "kind", value_enum)]
+        kinds: Vec<ChangeKindArg>,
+        /// Filter by type name (repeatable)
+        #[arg(long = "type")]
+        types: Vec<String>,
+        /// Filter by operation (repeatable): insert | update | delete
+        #[arg(long = "op", value_enum)]
+        ops: Vec<ChangeOpArg>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The commit a merge of a source branch into a target branch would
+    /// classify against
+    MergeBase {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        source: String,
+        /// Branch the source would merge into (default main)
+        #[arg(long)]
+        into: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -857,7 +1003,7 @@ pub(crate) enum SchemaCommand {
         json: bool,
     },
     /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`); the storage format stays v14 (RFC 0040)
+    /// `__id`/`__src`/`__dst`); the storage layout is unchanged (RFC 0040)
     #[command(name = "upgrade-system-columns")]
     UpgradeSystemColumns {
         /// Standalone graph storage URI; alternatively use --store
@@ -879,6 +1025,33 @@ pub(crate) enum CommitCommand {
         uri: Option<String>,
         #[arg(long)]
         branch: Option<String>,
+        /// List the unpublished commits whose recorded target is the branch
+        /// (`as commit` writes awaiting `commit publish`) instead of its history
+        #[arg(long)]
+        unpublished: bool,
+        /// List the live unattached snapshots whose recorded target is the
+        /// branch (`as unattached branch` writes) instead of its history
+        #[arg(long, conflicts_with = "unpublished")]
+        unattached: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish an unpublished commit onto its recorded target branch
+    Publish {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop an unpublished commit or an unattached snapshot: the id and every
+    /// unattached descendant stop resolving and held merge inputs are released
+    Drop {
+        /// Graph URI
+        #[arg(long)]
+        uri: Option<String>,
+        commit_id: String,
         #[arg(long)]
         json: bool,
     },
