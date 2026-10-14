@@ -164,12 +164,12 @@ mod tests {
             "graph.omni",
             "--check",
             "--to-format",
-            "14",
+            "15",
             "--json",
         ])
         .unwrap();
         assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(14), json: true } if uri == "graph.omni")
+            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(15), json: true } if uri == "graph.omni")
         );
         assert_eq!(
             planes::command_capability(&cli.command),

@@ -175,7 +175,7 @@ fn validate_files(value: &Value) -> Result<BTreeMap<&str, &str>> {
         return Err(invalid_export());
     }
     let config = result.get("cluster.yaml").ok_or_else(invalid_export)?;
-    if !serde_yaml::from_str::<serde_yaml::Value>(config).is_ok_and(|yaml| yaml.is_mapping()) {
+    if !yaml_serde::from_str::<yaml_serde::Value>(config).is_ok_and(|yaml| yaml.is_mapping()) {
         return Err(invalid_export());
     }
     Ok(result)
@@ -343,7 +343,7 @@ fn publish(destination: &Path, files: &BTreeMap<&str, &str>, context: &Context) 
     write(
         &private,
         "context",
-        serde_yaml::to_string(context)
+        yaml_serde::to_string(context)
             .map_err(|_| write_failed())?
             .as_bytes(),
     )?;

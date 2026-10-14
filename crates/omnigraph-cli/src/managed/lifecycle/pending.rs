@@ -188,7 +188,7 @@ pub(super) fn bind(config: &Path, context: &Context) -> Result<()> {
     let dir = config.join(".omnigraph");
     let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| failure())?;
     file.write_all(
-        serde_yaml::to_string(context)
+        yaml_serde::to_string(context)
             .map_err(|_| failure())?
             .as_bytes(),
     )

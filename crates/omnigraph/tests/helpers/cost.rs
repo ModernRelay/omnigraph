@@ -42,6 +42,11 @@ use omnigraph::settings::SessionSettings;
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
+/// The deep point of every depth-swept cost gate (the shallow point stays per
+/// test): a per-commit regression over the span to this depth still exceeds
+/// every gate's slack, and each gate builds in well under a second.
+pub const DEEP_HISTORY_DEPTH: u64 = 40;
+
 /// Open a Lance dataset with its object-store tracker installed before the
 /// first manifest load. Cost fixtures must use this seam for cold-open evidence;
 /// wrapping an already-open handle misses latest-manifest resolution entirely.
@@ -239,6 +244,9 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// `__manifest` object-store writes: published versions, transaction files
+    /// and tags (merge-input holds and proposals among them).
+    pub manifest_writes: u64,
     /// Bytes returned by those real object-store reads. This distinguishes a
     /// physical-address take from scanning a compacted history-sized fragment
     /// even when both use a similar number of requests.
@@ -634,6 +642,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_writes: manifest.write_iops,
             manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
@@ -775,7 +784,7 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
 
 /// Emulated-S3 graph, bucket-gated. Returns `None` **only** when
 /// `OMNIGRAPH_S3_TEST_BUCKET` is unset, so the caller logs + skips — the
-/// `tests/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
+/// `tests/integration/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
 /// (the rustfs CI job), any `init`/seed failure is a real failure and panics
 /// rather than silently skipping — otherwise a down/misconfigured store would let
 /// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.

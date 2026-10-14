@@ -1,8 +1,20 @@
 //! Scenario-specific GQT authority records; legacy serializers stay unchanged.
-use crate::gqt_case::GqtPointIdentityV1;
-use crate::gqt_runner::{GqtRepObservation, RunExecution};
+use crate::case::Backend;
+use crate::dataset_cache::{DatasetManifestV1, validate_manifest_evidence};
+use crate::gqt_case::{GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec};
+use crate::gqt_evidence::PreparationProofV2;
+use crate::gqt_runner::{
+    GqtRepObservation, RunExecution, sample_evidence_matches, validate_merge_evidence,
+    validate_receipt_treatment, validate_sample,
+};
+use crate::gqt_served::ServerDeploymentReceiptV1;
+use crate::machine::{MachineIdentityV1, validate_machine_identity};
+use crate::model::{typed_sha256, valid_kebab_id};
 use crate::record::*;
+use omnigraph_gqt_core::{Item, Step, StepKind, parse_case};
 use serde::{Deserialize, Serialize};
+
+const MAX_SERVED_SUT_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GqtRunIdentityV1 {
@@ -27,13 +39,62 @@ pub struct GqtRunRecordV1 {
     pub format_version: u32,
     pub invocation: InvocationIdentityV1,
     pub run: GqtRunIdentityV1,
-    pub sut: SutIdentityV1,
-    pub machine: crate::machine::MachineIdentityV1,
-    pub backend: ObservedBackendV1,
-    pub fixture: crate::dataset_cache::DatasetManifestV1,
-    pub dataset_cache_hit: bool,
+    pub sut: GqtSutIdentityV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineIdentityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<ObservedBackendV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<DatasetManifestV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_cache_hit: Option<bool>,
     pub acquisition: AcquisitionV1,
     pub measurements: GqtMeasurementsV1,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GqtSutIdentityV1 {
+    Embedded(Box<SutIdentityV1>),
+    Served(Box<ServedSutIdentityV1>),
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServedSutIdentityV1 {
+    pub kind: ServedSutKind,
+    pub receipt: ServerDeploymentReceiptV1,
+    pub client_build: SutIdentityV1,
+    pub client_machine: MachineIdentityV1,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServedSutKind {
+    #[serde(rename = "declared-deployment")]
+    DeclaredDeployment,
+}
+impl ServedSutIdentityV1 {
+    pub(crate) fn validate(&self) -> RecordResult<()> {
+        self.receipt.validate().map_err(error)?;
+        validate_sut(&self.client_build)?;
+        validate_machine_identity(&self.client_machine).map_err(error)?;
+        self.validate_size()
+    }
+
+    pub(crate) fn validate_size(&self) -> RecordResult<()> {
+        if serde_json::to_vec(self).map_err(error)?.len() > MAX_SERVED_SUT_BYTES {
+            return Err(error("served SUT evidence exceeds 8 KiB"));
+        }
+        Ok(())
+    }
+}
+/// The target-specific evidence of one record, borrowed after its tuple shape is checked.
+pub(crate) enum GqtEvidence<'a> {
+    Embedded(EmbeddedEvidence<'a>),
+    Served(&'a ServedSutIdentityV1),
+}
+pub(crate) struct EmbeddedEvidence<'a> {
+    pub(crate) sut: &'a SutIdentityV1,
+    pub(crate) machine: &'a MachineIdentityV1,
+    pub(crate) backend: &'a ObservedBackendV1,
+    pub(crate) fixture: &'a DatasetManifestV1,
 }
 impl GqtRunRecordV1 {
     pub fn invocation(&self) -> &InvocationIdentityV1 {
@@ -43,7 +104,36 @@ impl GqtRunRecordV1 {
         &self.run.point_id
     }
     pub fn claim_eligible(&self) -> bool {
-        self.acquisition.is_complete() && self.sut.build.effective_codegen_options_proved
+        self.acquisition.is_complete()
+            && matches!(&self.sut, GqtSutIdentityV1::Embedded(sut) if sut.build.effective_codegen_options_proved)
+    }
+    pub(crate) fn evidence(&self) -> RecordResult<GqtEvidence<'_>> {
+        match (
+            &self.sut,
+            self.run.run_spec.environment.target,
+            &self.machine,
+            &self.backend,
+            &self.fixture,
+            self.dataset_cache_hit,
+        ) {
+            (
+                GqtSutIdentityV1::Embedded(sut),
+                Target::Engine,
+                Some(machine),
+                Some(backend),
+                Some(fixture),
+                Some(_),
+            ) => Ok(GqtEvidence::Embedded(EmbeddedEvidence {
+                sut,
+                machine,
+                backend,
+                fixture,
+            })),
+            (GqtSutIdentityV1::Served(sut), Target::Server, None, None, None, None) => {
+                Ok(GqtEvidence::Served(sut))
+            }
+            _ => Err(error("target and evidence tuple disagree")),
+        }
     }
 }
 fn error(message: impl std::fmt::Display) -> RecordError {
@@ -55,23 +145,47 @@ pub fn build(
     terminal: Option<AcquisitionTerminalV1>,
 ) -> RecordResult<GqtRunRecordV1> {
     execution.bound.revalidate().map_err(error)?;
-    for sample in &execution.samples {
-        crate::gqt_runner::validate_sample(
-            sample,
-            &execution.bound,
-            sample.repetition,
-            &execution.fixture.handoff.physical,
-            sample.elapsed_us,
-            true,
-        )
-        .map_err(error)?;
-    }
-    let crate::case::Backend::LocalFs {
-        filesystem,
-        storage_class,
-    } = execution.bound.identity.environment.backend
-    else {
-        return Err(error("unsupported backend"));
+    let (sut, machine, backend) = match (
+        &execution.server_receipt,
+        &execution.environment,
+        &execution.fixture,
+        execution.dataset_cache_hit,
+    ) {
+        (None, Some(environment), Some(_), Some(_)) => {
+            let Backend::LocalFs {
+                filesystem,
+                storage_class,
+            } = execution.bound.identity.environment.backend
+            else {
+                return Err(error("unsupported backend"));
+            };
+            (
+                GqtSutIdentityV1::Embedded(Box::new(sut_identity_for_build(&execution.build)?)),
+                Some(execution.machine.clone()),
+                Some(ObservedBackendV1::LocalFs {
+                    filesystem,
+                    storage_class,
+                    storage_protocol: environment.storage_protocol.clone(),
+                    probe: environment.probe.into(),
+                }),
+            )
+        }
+        (Some(receipt), None, None, None) => {
+            if receipt.bind(&execution.bound.plan).map_err(error)? != execution.bound {
+                return Err(error("server receipt binding mismatch"));
+            }
+            (
+                GqtSutIdentityV1::Served(Box::new(ServedSutIdentityV1 {
+                    kind: ServedSutKind::DeclaredDeployment,
+                    receipt: receipt.clone(),
+                    client_build: sut_identity_for_build(&execution.build)?,
+                    client_machine: execution.machine.clone(),
+                })),
+                None,
+                None,
+            )
+        }
+        _ => return Err(error("inconsistent execution evidence")),
     };
     let record = GqtRunRecordV1 {
         format_version: 1,
@@ -84,14 +198,9 @@ pub fn build(
             case_digest: execution.bound.plan.case_digest.clone(),
             run_spec: execution.bound.identity.clone(),
         },
-        sut: sut_identity_for_build(&execution.build)?,
-        machine: execution.machine.clone(),
-        backend: ObservedBackendV1::LocalFs {
-            filesystem,
-            storage_class,
-            storage_protocol: execution.environment.storage_protocol.clone(),
-            probe: execution.environment.probe.into(),
-        },
+        sut,
+        machine,
+        backend,
         fixture: execution.fixture.clone(),
         dataset_cache_hit: execution.dataset_cache_hit,
         acquisition: AcquisitionV1 {
@@ -107,13 +216,24 @@ pub fn build(
         measurements: GqtMeasurementsV1 {
             wall_clock: summarize(&execution.samples)?,
             raw_samples: execution.samples.clone(),
-            layer_presence: v1_layer_presence(),
+            layer_presence: layer_presence(execution.bound.identity.environment.target),
             claim_policy: ClaimPolicyV1 {
                 floor_multiplier_millis: DEFAULT_FLOOR_MULTIPLIER_MILLIS,
             },
         },
     };
-    validate(&record)?;
+    let proof = validate_with_proof(&record)?;
+    for (index, sample) in execution.samples.iter().enumerate() {
+        validate_sample(
+            sample,
+            &execution.bound,
+            (index + 1) as u32,
+            &proof,
+            sample.elapsed_us,
+            true,
+        )
+        .map_err(error)?;
+    }
     Ok(record)
 }
 fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> {
@@ -138,15 +258,14 @@ fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> 
     })
 }
 pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
-    crate::machine::validate_machine_identity(&r.machine).map_err(error)?;
+    validate_with_proof(r).map(drop)
+}
+fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
     validate_invocation(&r.invocation)?;
-    validate_sut(&r.sut)?;
-    validate_backend(&r.run.run_spec.environment.backend, &r.backend)?;
-    let point = crate::model::typed_sha256(&r.run.run_spec).map_err(error)?;
+    let proof = validate_target_evidence(r)?;
+    let point = typed_sha256(&r.run.run_spec).map_err(error)?;
     let spec = &r.run.run_spec;
-    crate::gqt_case::validate_point_spec(spec).map_err(error)?;
-    crate::dataset_cache::validate_manifest_evidence(&r.fixture).map_err(error)?;
-    let fixture = &r.fixture;
+    validate_point_spec(spec).map_err(error)?;
     if r.format_version != 1
         || r.run.point_identity_version != 1
         || spec.identity_version != 1
@@ -157,26 +276,18 @@ pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
                 spec.cache_condition.display_label(),
                 &point[..12]
             )
-        || fixture.format_version != 1
-        || fixture.recipe_sha256 != spec.dataset_recipe_sha256
-        || fixture.handoff.summary.logical_content_sha256 != spec.dataset_logical_digest
-        || fixture.handoff.summary.algorithm != spec.dataset_identity_algorithm
-        || fixture.reset != spec.protocol.reset
     {
-        return Err(error("point or dataset binding mismatch"));
+        return Err(error("point binding mismatch"));
     }
     for digest in [
         &r.run.case_digest,
-        &fixture.engine_digest,
-        &fixture.key,
-        &fixture.handoff.physical.digest_sha256,
         &spec.queries_sha256,
         &spec.dataset_recipe_sha256,
         &spec.dataset_logical_digest,
     ] {
         validate_sha256(digest, "digest")?;
     }
-    if !crate::model::valid_kebab_id(&r.run.case_id)
+    if !valid_kebab_id(&r.run.case_id)
         || r.run.case_id.len() > 128
         || spec.measured_step.ordinal == 0
         || spec.measured_step.text.trim().is_empty()
@@ -204,50 +315,37 @@ pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
         _ => return Err(error("invalid acquisition terminal")),
     }
     if r.measurements.wall_clock != summarize(&r.measurements.raw_samples)?
-        || r.measurements.layer_presence != v1_layer_presence()
+        || r.measurements.layer_presence != layer_presence(spec.environment.target)
         || r.measurements.claim_policy.floor_multiplier_millis != DEFAULT_FLOOR_MULTIPLIER_MILLIS
     {
         return Err(error("measurement summary or presence mismatch"));
     }
     for (i, s) in r.measurements.raw_samples.iter().enumerate() {
-        validate_call_totals(
-            i,
-            s.logical_store_calls.manifest,
-            s.logical_store_calls.table,
-            &s.control_store_calls,
-        )?;
+        if let (Some(logical), Some(control)) = (&s.logical_store_calls, &s.control_store_calls) {
+            validate_call_totals(i, logical.manifest, logical.table, control)?;
+        }
         let selected_kind = selected_kind(&spec.measured_step.text)?;
-        crate::gqt_runner::validate_merge_evidence(
-            s.merge.as_ref(),
-            selected_kind,
-            spec.protocol.attribution,
-        )
-        .map_err(error)?;
-        crate::gqt_runner::validate_receipt_treatment(
-            &s.steps,
-            spec.measured_step.ordinal,
-            &spec.cache_condition,
-        )
-        .map_err(error)?;
+        validate_merge_evidence(s.merge.as_ref(), selected_kind, spec.protocol.attribution)
+            .map_err(error)?;
+        validate_receipt_treatment(&s.steps, spec.measured_step.ordinal, &spec.cache_condition)
+            .map_err(error)?;
         let selected: Vec<_> = s
             .steps
             .iter()
             .filter(|step| step.ordinal == spec.measured_step.ordinal)
             .collect();
         if s.repetition != i as u32 + 1
-            || s.input_physical_digest_sha256 != fixture.handoff.physical.digest_sha256
-            || s.peak_rss_bytes.is_none_or(|n| n == 0)
+            || !sample_evidence_matches(s, &proof, true)
             || s.outcome != "expectations-passed"
-            || s.logical_store_calls.physical_attempts_observed
             || selected.len() != 1
             || selected[0].occurrence != 1
             || selected[0].kind != selected_kind.into()
             || selected[0].elapsed_us != s.elapsed_us
-            || s.steps.len() > crate::gqt_case::MAX_EXPANDED_STEPS
+            || s.steps.len() > MAX_EXPANDED_STEPS
             || !s.verification.selected_assertion_passed
             || s.verification.following_assertions == 0
             || s.verification.assertions_passed < 2
-            || s.verification.assertions_passed as usize > crate::gqt_case::MAX_EXPANDED_STEPS
+            || s.verification.assertions_passed as usize > MAX_EXPANDED_STEPS
             || s.verification.following_assertions >= s.verification.assertions_passed
         {
             return Err(error("invalid GQT sample"));
@@ -261,14 +359,71 @@ pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
             }
         }
     }
-    Ok(())
+    Ok(proof)
 }
+fn validate_target_evidence(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
+    let spec = &r.run.run_spec;
+    match r.evidence()? {
+        GqtEvidence::Embedded(EmbeddedEvidence {
+            sut,
+            machine,
+            backend,
+            fixture,
+        }) => {
+            validate_sut(sut)?;
+            validate_machine_identity(machine).map_err(error)?;
+            validate_backend(&spec.environment.backend, backend)?;
+            validate_manifest_evidence(fixture).map_err(error)?;
+            if fixture.recipe_sha256 != spec.dataset_recipe_sha256
+                || fixture.handoff.summary.logical_content_sha256 != spec.dataset_logical_digest
+                || fixture.handoff.summary.algorithm != spec.dataset_identity_algorithm
+                || fixture.reset != spec.protocol.reset
+            {
+                return Err(error("dataset binding mismatch"));
+            }
+            Ok(PreparationProofV2::Embedded {
+                physical_digest: fixture.handoff.physical.clone(),
+                metadata_digest: fixture.handoff.template_metadata.clone(),
+            })
+        }
+        GqtEvidence::Served(sut) => {
+            let receipt = &sut.receipt;
+            sut.validate()?;
+            if receipt.backend != spec.environment.backend
+                || receipt.dataset.recipe_sha256 != spec.dataset_recipe_sha256
+                || receipt.dataset.logical_content_sha256 != spec.dataset_logical_digest
+                || receipt.dataset.algorithm != spec.dataset_identity_algorithm
+            {
+                return Err(error("declared server dataset binding mismatch"));
+            }
+            Ok(PreparationProofV2::Served {
+                server_receipt_sha256: receipt.digest().map_err(error)?,
+            })
+        }
+    }
+}
+
+pub(crate) fn layer_presence(target: Target) -> MeasurementLayerPresenceV1 {
+    let mut presence = v1_layer_presence();
+    if target == Target::Server {
+        let absent = MeasurementPresenceV1::Absent {
+            reason: MeasurementAbsenceReasonV1::ServerCountersNotExposed,
+        };
+        presence.logical.counts = absent;
+        presence.logical.request_timing = absent;
+        presence.physical.counts = absent;
+        presence.physical.request_timing = absent;
+        presence.physical.concurrency_witness = absent;
+    }
+    presence
+}
+
 /// Closed archive dispatch keeps the exact historical field ordering intact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnyRunRecordV1 {
-    Legacy(RunRecordV1),
-    Gqt(GqtRunRecordV1),
+    Legacy(Box<RunRecordV1>),
+    Gqt(Box<GqtRunRecordV1>),
 }
 impl AnyRunRecordV1 {
     pub fn invocation(&self) -> &InvocationIdentityV1 {
@@ -338,17 +493,16 @@ pub fn parse(bytes: &[u8]) -> RecordResult<AnyRunRecordV1> {
 }
 impl From<RunRecordV1> for AnyRunRecordV1 {
     fn from(r: RunRecordV1) -> Self {
-        Self::Legacy(r)
+        Self::Legacy(Box::new(r))
     }
 }
 impl From<GqtRunRecordV1> for AnyRunRecordV1 {
     fn from(r: GqtRunRecordV1) -> Self {
-        Self::Gqt(r)
+        Self::Gqt(Box::new(r))
     }
 }
 
-fn selected_kind(text: &str) -> RecordResult<omnigraph_gqt_core::StepKind> {
-    use omnigraph_gqt_core::{Item, Step, StepKind};
+fn selected_kind(text: &str) -> RecordResult<StepKind> {
     let suffix = if text.trim() == "--- restart" {
         ""
     } else {
@@ -357,8 +511,7 @@ fn selected_kind(text: &str) -> RecordResult<omnigraph_gqt_core::StepKind> {
     let input = format!(
         "# issue: none\n# notes: Durable selected operation syntax.\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n{text}{suffix}"
     );
-    let case =
-        omnigraph_gqt_core::parse_case("record_selected_operation", &input).map_err(error)?;
+    let case = parse_case("record_selected_operation", &input).map_err(error)?;
     let descriptors = case.steps();
     let [selected] = descriptors.as_slice() else {
         return Err(error("selected echo must contain one operation"));

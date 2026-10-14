@@ -269,7 +269,7 @@ fn read_context(config: &Path) -> Result<Option<Context>> {
             "use a version 2 managed context; sign in with explicit --api and --organization, then bind again with use --api and --organization",
         )
     };
-    let context: Context = serde_yaml::from_slice(&bytes).map_err(|_| invalid())?;
+    let context: Context = yaml_serde::from_slice(&bytes).map_err(|_| invalid())?;
     if context.version != 2
         || organization_id(&context.organization_id).is_err()
         || identifier(&context.cluster).is_err()
@@ -292,7 +292,7 @@ fn save_context(config: &Path, context: &Context) -> Result<()> {
     let dir = config.join(".omnigraph");
     std::fs::create_dir_all(&dir).map_err(|_| fail())?;
     let mut file = tempfile::NamedTempFile::new_in(&dir).map_err(|_| fail())?;
-    let bytes = serde_yaml::to_string(context).map_err(|_| fail())?;
+    let bytes = yaml_serde::to_string(context).map_err(|_| fail())?;
     file.write_all(bytes.as_bytes()).map_err(|_| fail())?;
     file.as_file().sync_all().map_err(|_| fail())?;
     file.persist(dir.join("context")).map_err(|_| fail())?;

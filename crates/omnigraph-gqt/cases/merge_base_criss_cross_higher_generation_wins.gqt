@@ -1,0 +1,98 @@
+# issue: none
+# notes: Two incomparable common ancestors of different generation: left_second (generation 2) and
+# notes: right_first (generation 1). The higher generation is the base:
+# notes: from left_second right's later a=7 merges cleanly over the a=2 both sides carry; from right_first
+# notes: or the seed commit a=7 collides with a=2 and the merge conflicts.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+
+--- mutate
+branch create left;
+
+--- expect ok
+
+--- mutate
+branch create right;
+
+--- expect ok
+
+--- mutate branch: right
+query right_first() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: left
+query left_first() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: left
+query left_second() {
+    update Person set { age: 2 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create left_old from left;
+
+--- expect ok
+
+--- mutate
+branch create right_old from right;
+
+--- expect ok
+
+--- mutate
+branch merge right_old into left;
+
+--- expect outcome: merged
+
+--- mutate
+branch merge left_old into right;
+
+--- expect outcome: merged
+
+--- mutate branch: right
+query right_later() {
+    update Person set { age: 7 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge left into right;
+
+--- expect outcome: merged
+
+--- query branch: right
+query right_after_merge() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name":"a","p.age":7}
+{"p.name":"b","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32

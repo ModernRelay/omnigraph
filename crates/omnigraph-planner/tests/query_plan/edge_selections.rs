@@ -150,11 +150,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
             .unwrap();
         assert!(arms.iter().all(|arm| arm.binding == "a"));
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
-        );
+        assert!(leads_with_fused_score(&plan, "a"));
         let bound = omnigraph_planner::BoundPlan {
             plan,
             values: Default::default(),
@@ -195,7 +191,9 @@ fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
         descending: false,
     }];
     let source = source().with_traversal_work_limit(100);
-    let mut plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let mut plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let (fuse_id, secondary_input) = plan
         .live()
         .find_map(|(id, node)| match node {
@@ -463,8 +461,24 @@ fn literal_order_keys_keep_the_sort_and_remaining_identity_order() {
     }
 }
 
+/// Whether the plan's `Sort` leads with `<binding>._rrf desc`, the fused
+/// score column a `RankFuse` appends (RFC 0047 §Total order).
+fn leads_with_fused_score(plan: &omnigraph_planner::PhysicalPlan, binding: &str) -> bool {
+    plan.live().any(|(_, node)| match node {
+        PhysicalNode::Sort { order_by, .. } => order_by.first().is_some_and(|key| {
+            key.descending
+                && matches!(
+                    &key.expr,
+                    IRExpr::PropAccess { variable, property, .. }
+                        if variable == binding && property == "_rrf"
+                )
+        }),
+        _ => false,
+    })
+}
+
 #[test]
-fn fused_row_identity_survives_eliminated_sort() {
+fn fused_row_identity_declared_under_the_fused_score_sort() {
     let ranked = || {
         let arm = IRExpr::Bm25 {
             field: Box::new(prop("a", "text")),
@@ -496,6 +510,7 @@ fn fused_row_identity_survives_eliminated_sort() {
         (
             vec![IRExpr::Aggregate {
                 func: AggFunc::Count,
+                distinct: false,
                 arg: Box::new(IRExpr::Variable(
                     "b".into(),
                     omnigraph_compiler::ExprType::Node {
@@ -513,6 +528,9 @@ fn fused_row_identity_survives_eliminated_sort() {
             vec!["$b.@id"],
         ),
     ] {
+        let aggregate = returns
+            .iter()
+            .any(|expr| matches!(expr, IRExpr::Aggregate { .. }));
         let op = ir(vec![scan("a"), scan("b")], returns, order);
         let logical = resolve(&op, &source()).unwrap();
         let keys = logical
@@ -532,10 +550,10 @@ fn fused_row_identity_survives_eliminated_sort() {
             })
             .unwrap();
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+        assert_eq!(
+            leads_with_fused_score(&plan, "a"),
+            !aggregate,
+            "an aggregate with no key after the fusion stays unordered; every other shape sorts by the fused score first"
         );
     }
 }
@@ -604,7 +622,9 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
         .with_edge_version("knows", 5)
         .with_edge_version("likes", 9)
         .with_traversal_work_limit(123);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let expands: Vec<_> = plan
         .live()
         .filter_map(|(_, node)| match node {
@@ -681,25 +701,31 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
 #[test]
 fn issue_659_selection_admission_precedes_lowering_of_outer_named_edges() {
     let op = correlated(alternatives());
-    for (source, expected) in [
-        (source(), "require a finite traversal_work_limit"),
+    for (source, expected, code) in [
+        (source(), "require a finite traversal_work_limit", "P002"),
         (
             source().with_traversal_work_limit(0),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source().with_traversal_work_limit(i64::MAX as u64 + 1),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source()
                 .with_traversal_work_limit(100)
                 .with_traversal(Traversal::Csr),
             "do not support traversal = csr",
+            "P004",
         ),
     ] {
         let error = resolve(&op, &source).unwrap_err();
-        assert!(matches!(error, PlanError::Unsupported { .. }));
+        let PlanError::Unsupported(diagnostic) = &error else {
+            panic!("a refusal by design: {error:?}");
+        };
+        assert_eq!(diagnostic.code.as_str(), code, "{error}");
         assert!(error.to_string().contains(expected), "{error}");
     }
 }
@@ -714,7 +740,9 @@ fn named_query_ignores_a_source_selection_allowance() {
     let source = source()
         .with_traversal_work_limit(0)
         .with_traversal(Traversal::Csr);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert_eq!(plan.assumptions().traversal_work_limit, None);
     assert!(plan.live().any(|(_, node)| matches!(
         node,
@@ -900,7 +928,9 @@ fn issue_659_empty_wildcard_retains_historical_refusal_marker() {
         vec![],
     ));
     let source = source().with_traversal_work_limit(100);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert!(plan.assumptions().has_wildcard_traversal);
     assert!(
         plan.assumptions()

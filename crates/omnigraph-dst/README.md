@@ -115,7 +115,7 @@ crash: the storage wrapper stops forwarding, same process judges) and
 **lane B** (real death: a parent spawns `dst_child`, waits on the fsync'd
 barrier line at completion #k, SIGKILLs, then recovers and judges from the
 oplog). Lane B ships as a labeled preview; see `src/lane_b.rs`
-and `tests/lane_b.rs`.
+and `tests/integration/lane_b.rs`.
 
 ## Fault axes
 

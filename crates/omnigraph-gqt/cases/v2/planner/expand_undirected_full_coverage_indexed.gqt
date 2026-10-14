@@ -1,0 +1,39 @@
+# issue: none
+# traversal: auto
+# notes: An undirected hop needs both the src and the dst BTREE; both fully cover after the seed build, so the costed mode stays indexed_scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"start"}}
+{"type":"Person","data":{"name":"middle"}}
+{"type":"Person","data":{"name":"end"}}
+{"edge":"Knows","from":"start","to":"middle"}
+{"edge":"Knows","from":"middle","to":"end"}
+
+--- query
+set engine = v2;
+query around() {
+    match {
+        $a: Person { name: "middle" }
+        $a <knows> $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"start"}
+{"b.name":"end"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode indexed_scan ran indexed_scan

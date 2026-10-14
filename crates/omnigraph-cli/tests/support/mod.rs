@@ -66,6 +66,8 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+#[cfg(unix)]
+pub mod unix_gateway;
 
 pub fn write_managed_context(config: &Path, origin: &str) {
     fs::create_dir_all(config.join(".omnigraph")).unwrap();
@@ -144,6 +146,33 @@ pub fn output_failure(cmd: &mut Command) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+/// Thread cap for a matrix of independent CLI cases, each owning its fixture.
+pub const CASE_WORKERS: usize = 16;
+
+/// Run independent cases on at most `workers` threads. The first failing
+/// case's own panic payload reaches the caller, so its message is kept.
+pub fn for_each_concurrently<T: Send>(cases: Vec<T>, workers: usize, run: impl Fn(T) + Sync) {
+    let queue = std::sync::Mutex::new(cases.into_iter());
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let next = queue.lock().unwrap().next();
+                        let Some(case) = next else { break };
+                        run(case);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            if let Err(payload) = worker.join() {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    });
 }
 
 pub fn stdout_string(output: &Output) -> String {
@@ -353,7 +382,7 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
             early_exit = Some(status);
             break;
         }
-        sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(5));
     }
     // Kill + wait before reading stderr so the final buffered diagnostic is
     // visible for both a stalled process and an early startup failure.
@@ -900,7 +929,7 @@ pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
             "  types:\n",
             "    Decision:\n",
             "      target: embedding\n",
-            "      fields: [slug, intent]\n"
+            "      fields: [intent]\n"
         ),
     )
     .unwrap();
@@ -941,23 +970,6 @@ pub fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> Strin
 }
 
 // ---- RFC-009 Phase 1: parity-matrix harness ----
-
-/// Twin graphs for embedded-vs-remote comparison: the same loaded fixture
-/// copied to two roots, so write verbs can run once per arm on identical
-/// state. Returns (tempdir-guard, local_graph, remote_graph).
-pub fn twin_graphs() -> (TempDir, PathBuf, PathBuf) {
-    let temp = tempdir().unwrap();
-    let seed = temp.path().join("seed");
-    fs::create_dir_all(&seed).unwrap();
-    let graph = seed.join("server.omni");
-    init_graph(&graph);
-    load_fixture(&graph);
-    let local = temp.path().join("local.omni");
-    let remote = temp.path().join("remote.omni");
-    copy_dir(&graph, &local);
-    copy_dir(&graph, &remote);
-    (temp, local, remote)
-}
 
 pub fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
@@ -1298,7 +1310,7 @@ pub const PARITY_GRAPH_ID: &str = "parity";
 /// the served graph is the source of truth and the local twin mirrors it.
 ///
 /// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
-pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
+pub fn parity_configs(root: &Path, local_graph: &Path) -> PathBuf {
     parity_configs_with_schema(root, local_graph, &fixture("test.pg"))
 }
 
@@ -1410,17 +1422,20 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         local.env("NO_COLOR", "1");
     }
-    // The read commands (blob/query/changes/commit) reject `--as`: a served read
-    // resolves the actor from its bearer token and a direct read attributes
-    // none, so passing `--as` there is an error. Only the write verbs carry the
-    // parity actor on the direct arm.
-    if !matches!(
-        args.first().copied(),
-        Some("blob") | Some("query") | Some("changes") | Some("commit")
-    ) {
+    // The read commands (blob get/stat, branch diff/merge-base, query,
+    // changes, commit, diff) reject `--as`: a served read resolves the actor
+    // from its bearer token and a direct read attributes none, so passing
+    // `--as` there is an error. Only the write verbs, `blob put` and
+    // `blob clear` among them, carry the parity actor on the direct arm.
+    let read = match args {
+        ["blob", verb, ..] => matches!(*verb, "get" | "stat"),
+        ["branch", verb, ..] => matches!(*verb, "diff" | "merge-base"),
+        [verb, ..] => matches!(*verb, "query" | "changes" | "commit" | "diff"),
+        [] => false,
+    };
+    if !read {
         local.arg("--as").arg(PARITY_ACTOR);
     }
-    let local_out = local.output().unwrap();
 
     let mut remote = cli();
     remote
@@ -1435,8 +1450,11 @@ pub fn run_both(
     if args.first() == Some(&"blob") {
         remote.env("NO_COLOR", "1");
     }
-    let remote_out = remote.output().unwrap();
-    (local_out, remote_out)
+    std::thread::scope(|scope| {
+        let remote = scope.spawn(move || remote.output().unwrap());
+        let local_out = local.output().unwrap();
+        (local_out, remote.join().unwrap())
+    })
 }
 
 /// Parse, scrub, and pretty-print for diffable assertion messages.

@@ -4,6 +4,7 @@
 //! the disposable workspace into that blocking task. A canceled async caller
 //! therefore cannot drop the store while a child mutation is still live.
 
+use crate::gqt_protocol::RepetitionInputV2;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,8 +19,8 @@ use crate::gqt_case::BoundGqt as ValidatedCase;
 use crate::gqt_runner::GqtRepObservation as RepObservation;
 
 use crate::gqt_protocol::{
-    ChildFrameV1, MAX_WORKER_FRAME_BYTES, ParentFrameV1, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
-    WorkerRequestV1, WorkerStageV1, write_frame,
+    ChildFrameV2, MAX_WORKER_FRAME_BYTES, ParentFrameV2, WORKER_PROTOCOL_VERSION, WorkerBuildV1,
+    WorkerRequestV2, WorkerStageV1, write_frame,
 };
 use crate::machine::MachineIdentityV1;
 use crate::reset::{MetadataDigest, PhysicalDigest};
@@ -46,13 +47,10 @@ pub(crate) struct SupervisionInput {
     /// The first worker establishes this identity. Later workers must report
     /// it exactly before the supervisor sends Begin.
     pub expected_machine: Option<MachineIdentityV1>,
-    pub fixture_manifest_sha256: String,
+    pub execution: RepetitionInputV2,
     pub repetition: u32,
     pub case: ValidatedCase,
-    pub repetition_root: PathBuf,
     pub worker_scratch_root: PathBuf,
-    pub physical_digest: PhysicalDigest,
-    pub metadata_digest: MetadataDigest,
     pub deadline: Option<Duration>,
     #[cfg(test)]
     pub auxiliary_deadline_override: Option<Duration>,
@@ -68,24 +66,22 @@ pub(crate) struct SupervisedRepetition {
 /// Supervise one fresh worker process through exactly one selected operation.
 #[cfg(unix)]
 pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
-    if !lower_sha256(&input.fixture_manifest_sha256) {
-        return Err(RunnerError::new(
-            "fixture_stamp_invalid",
-            "repetition input does not carry a canonical pre-measurement fixture stamp digest",
-        )
-        .with_repetition(input.repetition));
-    }
-    let request = ParentFrameV1::Request {
+    input.execution.validate(&input.case).map_err(|e| {
+        RunnerError::new("worker_identity_mismatch", e).with_repetition(input.repetition)
+    })?;
+    let expected_proof = input
+        .execution
+        .proof()
+        .map_err(|e| RunnerError::new("worker_identity_mismatch", e))?;
+    let request = ParentFrameV2::Request {
         protocol_version: WORKER_PROTOCOL_VERSION,
-        request: Box::new(WorkerRequestV1 {
+        request: Box::new(WorkerRequestV2 {
             repetition: input.repetition,
             case: input.case.clone(),
             expected_point_id: input.case.point_id.clone(),
             expected_case_digest: input.case.plan.case_digest.clone(),
-            repetition_root: input.repetition_root.clone(),
+            execution: input.execution.clone(),
             worker_scratch_root: input.worker_scratch_root.clone(),
-            expected_physical_digest: input.physical_digest.clone(),
-            expected_metadata_digest: input.metadata_digest.clone(),
         }),
     };
     crate::gqt_protocol::write_frame(&mut std::io::sink(), &request)
@@ -94,7 +90,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
     let mut command = Command::new(&input.worker_executable);
     configure_benchmark_worker_environment(&mut command, &input.worker_scratch_root);
     command
-        .arg("__gqt-worker-v1")
+        .arg("__gqt-worker-v2")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -226,21 +222,19 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         }
     };
     let (worker_build, machine) = match ready {
-        ChildFrameV1::Ready {
+        ChildFrameV2::Ready {
             protocol_version,
             repetition,
             point_id,
             case_digest,
             worker_build,
             machine,
-            physical_digest,
-            metadata_digest,
+            proof,
         } if protocol_version == WORKER_PROTOCOL_VERSION
             && repetition == input.repetition
             && point_id == input.case.point_id
             && case_digest == input.case.plan.case_digest
-            && physical_digest == input.physical_digest
-            && metadata_digest == input.metadata_digest =>
+            && proof == expected_proof =>
         {
             if let Err(error) = validate_worker_build_attestation(
                 &worker_build,
@@ -272,7 +266,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
             }
             (*worker_build, *machine)
         }
-        ChildFrameV1::Failed {
+        ChildFrameV2::Failed {
             stage,
             code,
             message,
@@ -305,7 +299,28 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         }
     };
 
-    let begin = ParentFrameV1::Begin {
+    if let crate::gqt_protocol::RepetitionInputV2::Served { input: served } = &input.execution {
+        let evidence = crate::runner::build_evidence(Some(&worker_build))
+            .map_err(|e| e.to_string())
+            .and_then(|build| {
+                crate::record::sut_identity_from_build(&build).map_err(|e| e.to_string())
+            })
+            .and_then(|client_build| {
+                crate::gqt_record::ServedSutIdentityV1 {
+                    kind: crate::gqt_record::ServedSutKind::DeclaredDeployment,
+                    receipt: served.receipt.clone(),
+                    client_build,
+                    client_machine: machine.clone(),
+                }
+                .validate_size()
+                .map_err(|e| e.to_string())
+            });
+        if let Err(error) = evidence {
+            return worker.kill_error("prepare-protocol", "worker_protocol_error", error);
+        }
+    }
+
+    let begin = ParentFrameV2::Begin {
         protocol_version: WORKER_PROTOCOL_VERSION,
         repetition: input.repetition,
     };
@@ -337,14 +352,14 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         return worker.kill_error("measure-timeout", code, message);
     }
     let settled_elapsed_us = match settled {
-        ChildFrameV1::Settled {
+        ChildFrameV2::Settled {
             protocol_version,
             repetition,
             elapsed_us,
         } if protocol_version == WORKER_PROTOCOL_VERSION && repetition == input.repetition => {
             elapsed_us
         }
-        ChildFrameV1::Failed {
+        ChildFrameV2::Failed {
             stage,
             code,
             message,
@@ -406,7 +421,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         }
     };
     let mut sample = match complete {
-        ChildFrameV1::Complete {
+        ChildFrameV2::Complete {
             protocol_version,
             point_id,
             case_digest,
@@ -417,7 +432,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         {
             *sample
         }
-        ChildFrameV1::Failed {
+        ChildFrameV2::Failed {
             stage,
             code,
             message,
@@ -442,7 +457,7 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
                     sample,
                     &input.case,
                     input.repetition,
-                    &input.physical_digest,
+                    &expected_proof,
                     settled_elapsed_us,
                 )
             {
@@ -531,7 +546,22 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         )));
     }
 
-    sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes);
+    match &input.execution {
+        RepetitionInputV2::Embedded { .. } => {
+            sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes)
+        }
+        RepetitionInputV2::Served { .. } => {
+            sample.client_peak_rss_bytes = Some(child_exit.peak_rss_bytes)
+        }
+    }
+    crate::gqt_runner::validate_sample(
+        &sample,
+        &input.case,
+        input.repetition,
+        &expected_proof,
+        settled_elapsed_us,
+        true,
+    )?;
 
     if let Some(deadline) = input.deadline {
         let deadline_us = duration_us(deadline);
@@ -554,13 +584,6 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
     })
 }
 
-fn lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 #[cfg(not(unix))]
 pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<SupervisedRepetition> {
     Err(RunnerError::new(
@@ -579,7 +602,7 @@ struct WorkerProcess {
     stdin_stop: Option<Arc<AtomicBool>>,
     stdin_done: Option<Receiver<()>>,
     stdin_thread: Option<JoinHandle<()>>,
-    frames: Receiver<Result<ChildFrameV1, String>>,
+    frames: Receiver<Result<ChildFrameV2, String>>,
     stdout_stop: Option<Arc<AtomicBool>>,
     stdout_done: Option<Receiver<Result<(), String>>>,
     stdout_thread: Option<JoinHandle<()>>,
@@ -604,7 +627,7 @@ struct ReapedChild {
 
 #[cfg(unix)]
 impl WorkerProcess {
-    fn write(&mut self, frame: &ParentFrameV1, timeout: Duration) -> Result<(), String> {
+    fn write(&mut self, frame: &ParentFrameV2, timeout: Duration) -> Result<(), String> {
         let mut encoded = Vec::new();
         write_frame(&mut encoded, frame).map_err(|error| error.to_string())?;
         let commands = self
@@ -633,7 +656,7 @@ impl WorkerProcess {
         }
     }
 
-    fn receive(&self, timeout: Duration) -> Result<ChildFrameV1, ReceiveFailure> {
+    fn receive(&self, timeout: Duration) -> Result<ChildFrameV2, ReceiveFailure> {
         match self.frames.recv_timeout(timeout) {
             Ok(Ok(frame)) if frame.protocol_version() == WORKER_PROTOCOL_VERSION => Ok(frame),
             Ok(Ok(frame)) => Err(ReceiveFailure::Protocol(format!(
@@ -870,7 +893,7 @@ struct CaptureOutcome {
 
 #[cfg(unix)]
 struct FrameReader {
-    frames: Receiver<Result<ChildFrameV1, String>>,
+    frames: Receiver<Result<ChildFrameV2, String>>,
     stop: Arc<AtomicBool>,
     done: Receiver<Result<(), String>>,
     thread: JoinHandle<()>,
@@ -956,7 +979,7 @@ fn write_nonblocking(
 fn read_frame_pipe(
     reader: &mut impl Read,
     stop: &AtomicBool,
-    send: &mpsc::Sender<Result<ChildFrameV1, String>>,
+    send: &mpsc::Sender<Result<ChildFrameV2, String>>,
 ) -> Result<(), String> {
     let mut pending = Vec::new();
     let mut frames = 0usize;
@@ -990,7 +1013,7 @@ fn read_frame_pipe(
                             "worker emitted more than {MAX_CHILD_FRAMES} protocol frames"
                         ));
                     }
-                    let frame = serde_json::from_slice::<ChildFrameV1>(&framed)
+                    let frame = serde_json::from_slice::<ChildFrameV2>(&framed)
                         .map_err(|error| format!("could not decode worker frame: {error}"))?;
                     if send.send(Ok(frame)).is_err() {
                         return Ok(());
@@ -1218,7 +1241,7 @@ fn validate_sample_admission(
         sample,
         &input.case,
         input.repetition,
-        &input.physical_digest,
+        &input.execution.proof()?,
         settled_elapsed_us,
         false,
     )
@@ -1276,28 +1299,31 @@ pub(crate) fn preflight_plan(plan: &crate::gqt_case::PlannedGqt, cache: &Path) -
         )
         .map_err(|e| RunnerError::new("worker_protocol_error", e))?;
     let entry = cache.join("0".repeat(64));
-    let request = ParentFrameV1::Request {
+    let request = ParentFrameV2::Request {
         protocol_version: WORKER_PROTOCOL_VERSION,
-        request: Box::new(WorkerRequestV1 {
+        request: Box::new(WorkerRequestV2 {
             repetition: 10_000,
             expected_point_id: case.point_id.clone(),
             expected_case_digest: case.plan.case_digest.clone(),
             case,
-            repetition_root: entry.join("active"),
+            execution: RepetitionInputV2::Embedded {
+                repetition_root: entry.join("active"),
+                fixture_manifest_sha256: "0".repeat(64),
+                physical_digest: PhysicalDigest {
+                    files: u64::MAX,
+                    bytes: u64::MAX,
+                    digest_sha256: "0".repeat(64),
+                },
+                metadata_digest: MetadataDigest {
+                    entries: u64::MAX,
+                    files: u64::MAX,
+                    directories: u64::MAX,
+                    bytes: u64::MAX,
+                    shape_sha256: "0".repeat(64),
+                    state_sha256: "0".repeat(64),
+                },
+            },
             worker_scratch_root: entry.join("worker-scratch-00010000"),
-            expected_physical_digest: PhysicalDigest {
-                files: u64::MAX,
-                bytes: u64::MAX,
-                digest_sha256: "0".repeat(64),
-            },
-            expected_metadata_digest: MetadataDigest {
-                entries: u64::MAX,
-                files: u64::MAX,
-                directories: u64::MAX,
-                bytes: u64::MAX,
-                shape_sha256: "0".repeat(64),
-                state_sha256: "0".repeat(64),
-            },
         }),
     };
     crate::gqt_protocol::write_frame(&mut std::io::sink(), &request)

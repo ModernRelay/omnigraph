@@ -8,7 +8,7 @@ and exposes its ready applied graphs under `/graphs/{id}/…`; use
 Start with [Operating a cluster](clusters/index.md) to create and apply the
 deployment bundle.
 
-Servers use the v0.13 HTTP contract and open graph storage format v14. The
+Servers use the v0.13 HTTP contract and open graph storage formats v14 to v16. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. See [cluster deployments](clusters/index.md).
 
@@ -214,6 +214,22 @@ docker run --rm -p 8080:8080 \
 
 Terminate TLS at a load balancer or trusted reverse proxy. Keep bearer tokens
 and storage credentials in the platform's secret store.
+
+## Unix-socket access
+
+`omnigraph-server` listens on TCP only. Some local clients can open a Unix-domain
+socket but no TCP connection, such as an agent whose sandbox allows one socket
+path. To serve them, run a gateway that relays the socket to the server's
+loopback address unchanged, for example:
+
+```bash
+socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
+```
+
+Clients address it with `--server unix:///run/omnigraph/server.sock`. The
+gateway must pass requests and responses through unchanged, including the
+`Omnigraph-Http-Api` header. Restrict who may connect with the permissions of
+the socket's directory; bearer authentication and policy apply as over TCP.
 
 ## S3-compatible storage
 

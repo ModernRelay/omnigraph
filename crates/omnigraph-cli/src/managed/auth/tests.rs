@@ -320,6 +320,7 @@ async fn cached_login_does_not_restart_provider_authorization() {
 }
 
 #[tokio::test]
+#[ignore = "nightly: real 5 s device-flow poll intervals, 20 s in all"]
 async fn device_login_polls_the_provider_and_never_the_old_broker() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
     let transport = MockTransport::with(vec![
@@ -374,6 +375,7 @@ async fn device_deadline_prevents_a_poll_or_resource_request_after_expiry() {
 }
 
 #[tokio::test]
+#[ignore = "nightly: one real 5 s device-flow poll interval"]
 async fn failed_login_custody_attempts_to_revoke_the_new_provider_session() {
     struct RefusingStore;
     impl Store for RefusingStore {
@@ -558,6 +560,16 @@ async fn cache_original_session(store: &MemoryStore, origin: &str) {
 
 #[tokio::test]
 async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_organization() {
+    check_fresh_device_selection(false).await;
+}
+
+#[tokio::test]
+#[ignore = "nightly: one real 40 s synchronous Keychain consent delay"]
+async fn fresh_device_selection_excludes_keychain_consent_from_network_deadline() {
+    check_fresh_device_selection(true).await;
+}
+
+async fn check_fresh_device_selection(wait_for_consent: bool) {
     for initial_org in [None, Some("org_unenrolled")] {
         let api = IntentApiFixture::new(vec![
             metadata(120, "principal_one"),
@@ -572,7 +584,7 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
         };
         // Only one case waits for consent; both fresh organization profiles
         // retain their existing custody and provider-request assertions.
-        let device_store: &dyn Store = if initial_org.is_none() {
+        let device_store: &dyn Store = if wait_for_consent && initial_org.is_none() {
             &prompting_store
         } else {
             &store
@@ -590,7 +602,10 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
         )
         .await
         .unwrap();
-        assert_eq!(prompting_store.prompted.get(), initial_org.is_none());
+        assert_eq!(
+            prompting_store.prompted.get(),
+            wait_for_consent && initial_org.is_none()
+        );
         assert_eq!(result["data"]["account_id"], "org_other");
         assert_eq!(result["data"]["principal_id"], "principal_one");
         for (key, value) in before.iter().filter(|(key, _)| *key != &api.origin) {
@@ -626,6 +641,7 @@ async fn fresh_device_selection_uses_only_new_credentials_and_preserves_cached_o
 }
 
 #[tokio::test]
+#[ignore = "nightly: one real 35 s organization-selection network deadline"]
 async fn fresh_device_selection_network_timeout_preserves_cached_custody_without_replay() {
     let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
     let store = MemoryStore::default();

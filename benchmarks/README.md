@@ -39,10 +39,31 @@ Their fixture sizes, cache preparation and repetition boundaries differ from
 the historical Rust instruments; their timing series must not be combined.
 
 Unsupported workloads are preserved temporarily in [deferred/](deferred/README.md).
-Cleanup and optimization require GQ support. Concurrent, HTTP and streaming
-instruments require an executor that preserves their scheduling and transport.
-Their preserved sources are outside Cargo discovery and are not active scenarios.
+Cleanup and optimization require GQ support. Concurrent and streaming instruments require an executor that preserves their
+scheduling and transport. Their preserved sources are outside Cargo discovery
+and are not active scenarios. Read-only HTTP acquisition is available through
+the served variants below.
 Raw Lance and Rust collection comparisons are retired from the benchmark suite.
+
+### Served query and traversal variants
+
+`query-shapes-served` lists 13 query scenarios and `traversal-served` lists
+three traversal scenarios. Their schema-less workloads contain a warm-up read,
+the measured read, and explicit result verification. Embedded workload files
+and default selections are unchanged. Six embedded scenarios have no served
+twin because the server target has no door for them: `e2e-query-destination-search`,
+`e2e-nearest-prefilter`, `e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need
+indexes (search, nearest and RRF), and `e2e-traversal-selective-csr` and
+`e2e-traversal-selective-indexed` pin a traversal path.
+
+These scenarios require an externally provisioned graph and a typed deployment
+receipt. One invocation binds one graph and dataset recipe, so run different
+fixture recipes separately. The stock definitions declare server-local
+APFS/NVMe and same-host network position; other deployments need explicit
+custom environment settings. Server build and dataset facts remain declared,
+server counters remain absent, and these records are claim-ineligible. See the
+[served acquisition guide](../crates/omnigraph-bench/README.md#served-read-only-acquisition)
+for the command, receipt fields, cache semantics and evidence boundaries.
 
 ## Configuration
 
@@ -105,7 +126,8 @@ A generated load is selectable only when its recipe makes exactly one loader
 call; generation happens before its engine timer. Multi-call loads remain
 valid dataset construction steps.
 
-Cache treatment is derived, never authored as a label. No prefix reads means
+For embedded execution, cache treatment is derived, never authored as a label.
+No prefix reads means
 process-cold. Prefix reads on the same handle mean warmed-by-program. Prefix
 reads followed by one restart mean reopened-after-program. A read after that
 restart is refused. Settings and show steps are neutral; prefix writes belong
@@ -114,6 +136,8 @@ operation prove the preparation. A prefix expected parameter error that never
 calls the engine cannot establish a warm treatment. Every repetition is a
 fresh process; the OS page cache remains uncontrolled or conditioned by the
 named GQT read program. No page-cache-cold or storage-cold claim is implied.
+[Served acquisition](#served-query-and-traversal-variants) uses a long-running
+server with uncontrolled OS page-cache state.
 
 ### Preparing additional write history
 
@@ -145,6 +169,15 @@ These inputs establish correctness conditions, not performance results.
 | Repeated deletion/recreation | `repeated-deletion-recreation-{rows,branches}` | Four bounded cycles followed by the next insertion or branch creation. Every cycle verifies exact rows; the final branch inventory and reopened views are checked. Row churn and branch churn are separate treatments. |
 | Threshold crossings | `threshold-crossings-{before,at,after,production-control}` | A configured history-release boundary: two, three, or four updates at `history_release_bytes = 2048`, plus a three-update control at the production budget 262144, followed by an insert. Exact main/child contents are checked. |
 | Equal current state, different history | `equal-current-{narrow-one-batch,wide-one-batch,wide-four-batches}` | Four identical final rows after eight past/restore cycles. Prior payload width varies from 8 to 4096 bytes; a separate treatment publishes each load in four batches. Build witnesses check equal current contents and 18/18/66 reachable commits. |
+| Unattached branch root write (group `unattached-writes`, with `tiny-mutate-unattached`) | `very-long-history-32-write-unattached`, `unattached-chain-32-write` | The history checkpoint's next update written `as unattached branch` instead of on `main`: the row is checked at the snapshot before and after a restart, `main` keeps the fixture's value, and the snapshot is dropped. The chain case keeps the same 32 updates as one retained unattached chain (a root and 31 children) with `main` at the seed. Each twin pairs with the ordinary write on the same fixture (`very-long-history-32-write`, `tiny-mutate`). |
+
+An unattached record costs the root write only. A child `on` an earlier
+snapshot cannot be the selected step: its base id is bound by a write earlier
+in the same program, and writes before the selected step are refused. The
+engine's per-phase attribution covers `branch merge` only, so these mutation
+records carry elapsed time and logical store calls, not a publication or
+history-settlement phase split. Neither path's number stands in for a chained
+stream or for end-to-end published-write latency.
 
 The threshold fixtures preserve the configured shapes from the engine's
 history-release correctness cases. Their row assertions do not prove that a
@@ -158,7 +191,7 @@ Dataset and query basenames use the same scenario names with underscores.
 The history operations share `workloads/very_long_history_{read,write,reopen}.gqt`
 across depths, and equal-current cases share
 `workloads/equal_current_different_history.gqt`. The owning benchmark catalog
-test executes all 20 bounded pairs through dataset construction and the
+test executes all 20 bounded pairs, plus the two unattached twins, through dataset construction and the
 measured adapter, including their explicit restart verification. Parsing and
 suite admission also cover the larger recipes without executing them.
 
@@ -206,8 +239,11 @@ references, never the workstation. `show --workload FILE` lists parser ordinals
 and exact operation text; `init` validates whether the selected operation is measurable.
 
 Cache status reports source availability separately from the matching cache
-variant. Source states are `available`, `missing`, `invalid`, `unbound`; cache
-states are `missing`, `present`, `cached`, `busy`, `invalid`, `incomplete`, `unknown`.
+variant. Source states are `available`, `missing`, `invalid`, `unbound`,
+`not_applicable`; cache states are `missing`, `present`, `cached`, `busy`,
+`invalid`, `incomplete`, `unknown`. A served scenario reports `not_applicable`
+with the diagnostic `served_scenario_has_no_dataset_cache` and exits zero: it
+reads a provisioned graph and uses no dataset cache.
 `present` validates the published evidence; `--verify` also audits metadata and
 physical bytes before reporting `cached`. A busy entry returns immediately.
 Inspection never builds, creates directories/locks, restores, cleans or quarantines.
@@ -479,8 +515,7 @@ prefix as state-neutral `unpublished_run` recovery evidence. Resolve any `possib
 identity with `archive reconcile` before minting a replacement invocation. A
 later controlled-cloud adapter binds declared S3 facts, applies budget and lifecycle
 controls, executes the same typed plans, and uploads the same record format.
-S3 reset, server-mode execution, comparison/noise-floor
-reports, and proved operating-system page-cache eviction remain outside this
+S3 reset, served writes, comparison/noise-floor reports, and proved operating-system page-cache eviction remain outside this
 slice.
 
 ## Add a scenario
@@ -491,8 +526,10 @@ slice.
 4. Inspect it with `show NAME --config FILE`; optionally add its ID to a group.
 5. Run the explicit selection on a qualified release host.
 
-The final point ID binds the verified dataset logical witness, recipe/query
-contents, selected operation, derived cache treatment, and protocol/backend.
+The final point ID binds a dataset logical witness, verified by embedded
+acquisition or declared in the served deployment receipt, plus recipe/query
+contents, the selected operation, cache treatment, target, network position,
+backend and protocol.
 Planning can report only a pre-build experiment digest until the dataset is
 bound. Paths, case display IDs, repetitions, cache-hit status, and physical
 tree bytes do not enter the point ID. Historic `branch-merge-v1` records retain

@@ -184,24 +184,24 @@ fn manifest_guard_reads_cargo_dependency_tables_only() {
     assert_eq!(refused_dependencies("dependencies = {}\n"), none);
 
     assert_eq!(
-        refused_dependencies("[dependencies]\nserde_yaml = { workspace = true }\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[dependencies]\nyaml_serde = { workspace = true }\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
-        refused_dependencies("[dependencies.serde_yaml]\nworkspace = true\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[dependencies.yaml_serde]\nworkspace = true\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
-        refused_dependencies("[\"depend\\u0065ncies\"]\nserde_yaml.workspace = true\n"),
-        vec!["dependencies.serde_yaml"]
+        refused_dependencies("[\"depend\\u0065ncies\"]\nyaml_serde.workspace = true\n"),
+        vec!["dependencies.yaml_serde"]
     );
     assert_eq!(
         refused_dependencies("dependencies.libc.version = \"0.2\"\n"),
         vec!["dependencies.libc"]
     );
     assert_eq!(
-        refused_dependencies("target.'cfg(unix)'.dependencies.serde_yaml.workspace = true\n"),
-        vec!["target.cfg(unix).dependencies.serde_yaml"]
+        refused_dependencies("target.'cfg(unix)'.dependencies.yaml_serde.workspace = true\n"),
+        vec!["target.cfg(unix).dependencies.yaml_serde"]
     );
     assert_eq!(
         refused_dependencies("[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"),
@@ -879,8 +879,8 @@ fn arming_files(roots: &ArmingRoots) -> Vec<PathBuf> {
     files
 }
 
-/// What Rust arms: the arming files whole, plus the `cfg(test)` half of
-/// every production file under the `src/` roots.
+/// What the arming files name, whole; the `cfg(test)` half of the production
+/// files comes from `source_halves`, parsed once beside its crossing half.
 fn arming_names(roots: &ArmingRoots) -> Names {
     let mut names = Names::default();
     for file in arming_files(roots) {
@@ -888,15 +888,6 @@ fn arming_names(roots: &ArmingRoots) -> Names {
             let mut split = split_names(&text, &file.display().to_string());
             names.absorb(std::mem::take(&mut split.production));
             names.absorb(split.tests);
-        }
-    }
-    for root in &roots.src {
-        let mut files = Vec::new();
-        collect_ext(root, "rs", &mut files);
-        for file in files.into_iter().filter(|file| !is_test_source(root, file)) {
-            if let Ok(text) = std::fs::read_to_string(&file) {
-                names.absorb(split_names(&text, &file.display().to_string()).tests);
-            }
         }
     }
     names
@@ -990,8 +981,8 @@ fn seam_at_names(case: &str) -> Vec<String> {
             continue;
         }
         let body = lines[start + 1..end].join("\n");
-        if let Ok(serde_yaml::Value::Mapping(fields)) = serde_yaml::from_str(&body)
-            && let Some(at) = fields.get("at").and_then(serde_yaml::Value::as_str)
+        if let Ok(yaml_serde::Value::Mapping(fields)) = yaml_serde::from_str(&body)
+            && let Some(at) = fields.get("at").and_then(yaml_serde::Value::as_str)
         {
             names.push(at.to_string());
         }
@@ -1044,20 +1035,29 @@ fn crossing_files(src_root: &Path, catalog_path: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// What production code names, its `cfg(test)` half, comments and
-/// declarations excluded: a static counts as crossed only when code under
-/// `src/` names it.
-fn production_names(src_roots: &[PathBuf], catalog_path: &Path) -> Names {
-    let mut names = Names::default();
-    for file in src_roots
+/// Every production file under the `src/` roots parsed once: `.tests` is what
+/// its `cfg(test)` half arms, `.production` what the rest names (a static
+/// counts as crossed only there; the catalog's own declarations are excluded).
+fn source_halves(src_roots: &[PathBuf], catalog_path: &Path) -> Split {
+    let crossing: BTreeSet<PathBuf> = src_roots
         .iter()
         .flat_map(|root| crossing_files(root, catalog_path))
-    {
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            names.absorb(split_names(&text, &file.display().to_string()).production);
+        .collect();
+    let mut halves = Split::default();
+    for root in src_roots {
+        let mut files = Vec::new();
+        collect_ext(root, "rs", &mut files);
+        for file in files.into_iter().filter(|file| !is_test_source(root, file)) {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let split = split_names(&text, &file.display().to_string());
+                halves.tests.absorb(split.tests);
+                if crossing.contains(&file) {
+                    halves.production.absorb(split.production);
+                }
+            }
         }
     }
-    names
+    halves
 }
 
 /// A seam is a `pub static` beside its site, only indexed by the catalog:
@@ -1292,15 +1292,26 @@ fn catalogs_are_complete_unique_and_used() {
         "omnigraph_cluster::seams::catalog",
     );
 
-    let engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
-    let cluster_armers = armers(&cluster_arming_roots(), None);
-
-    let engine_src = production_names(&engine_roots, &engine_catalog_path);
-    let cluster_src = production_names(&cluster_roots, &cluster_catalog_path);
+    let engine_source = source_halves(&engine_roots, &engine_catalog_path);
+    let cluster_source = source_halves(&cluster_roots, &cluster_catalog_path);
+    let mut engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
+    engine_armers.rust.absorb(engine_source.tests);
+    let mut cluster_armers = armers(&cluster_arming_roots(), None);
+    cluster_armers.rust.absorb(cluster_source.tests);
 
     let mut violations = Vec::new();
-    check_catalog(&engine, &engine_src, &engine_armers, &mut violations);
-    check_catalog(&cluster, &cluster_src, &cluster_armers, &mut violations);
+    check_catalog(
+        &engine,
+        &engine_source.production,
+        &engine_armers,
+        &mut violations,
+    );
+    check_catalog(
+        &cluster,
+        &cluster_source.production,
+        &cluster_armers,
+        &mut violations,
+    );
     check_declaration_placement(
         &engine,
         &engine_catalog_path,

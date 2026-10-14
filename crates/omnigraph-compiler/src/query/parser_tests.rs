@@ -1479,6 +1479,7 @@ fn parse_branch(input: &str) -> BranchStmt {
         ),
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
         FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
+        FileBody::Commit(write) => panic!("expected a branch statement, got {write:?}"),
     }
 }
 
@@ -1499,7 +1500,216 @@ fn merge(source: &str, into: Option<&str>) -> BranchStmt {
     BranchStmt::Write(BranchWrite::Merge {
         source: source.to_string(),
         into: into.map(str::to_string),
+        as_commit: false,
     })
+}
+
+fn parse_commit(input: &str) -> CommitWrite {
+    match parse_query(input).unwrap().body {
+        FileBody::Commit(write) => write,
+        other => panic!("expected a commit statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn as_commit_marks_a_mutation_declaration_or_a_merge() {
+    let decl =
+        parse_query("query add($n: String) as commit {\n    insert Person { name: $n }\n}\n")
+            .unwrap();
+    let decl = decl.single_decl();
+    assert_eq!(decl.write_mode, MutationWriteMode::AsCommit);
+    assert_eq!(decl.mutations.len(), 1);
+    let plain =
+        parse_query("query add($n: String) {\n    insert Person { name: $n }\n}\n").unwrap();
+    assert_eq!(plain.single_decl().write_mode, MutationWriteMode::Publish);
+    let annotated = parse_query(
+        "query add($n: String) @description(\"adds\") as commit {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        annotated.single_decl().write_mode,
+        MutationWriteMode::AsCommit
+    );
+
+    let err =
+        parse_query("query q() as commit {\n    match { $p: Person }\n    return { $p.name }\n}\n")
+            .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`as commit` applies to a mutation; query `q` is read-only"),
+        "{err}"
+    );
+    let diagnostic = parse_query_diagnostic(
+        "query q() as commit {\n    match { $p: Person }\n    return { $p.name }\n}\n",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostic.code, Q005);
+    assert_eq!(
+        diagnostic.position,
+        Some(Position::at("query q() as commit {", 10))
+    );
+
+    assert_eq!(
+        parse_branch("branch merge b0 into main as commit"),
+        BranchStmt::Write(BranchWrite::Merge {
+            source: "b0".to_string(),
+            into: Some("main".to_string()),
+            as_commit: true,
+        })
+    );
+    assert_eq!(
+        parse_branch("branch merge b0 as commit"),
+        BranchStmt::Write(BranchWrite::Merge {
+            source: "b0".to_string(),
+            into: None,
+            as_commit: true,
+        })
+    );
+    assert_eq!(
+        parse_branch(r#"branch merge "as" into commit"#),
+        merge("as", Some("commit"))
+    );
+    for input in [
+        "branch merge as commit",
+        "branch merge b0 as commitx",
+        "branch merge b0 ascommit",
+        "branch merge b0 as",
+        "branch create b0 as commit",
+        "query q() ascommit {\n    insert Person { name: \"a\" }\n}\n",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn as_unattached_branch_marks_a_mutation_declaration_with_an_optional_base() {
+    let root = parse_query(
+        "query add($n: String) as unattached branch {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        root.single_decl().write_mode,
+        MutationWriteMode::Unattached { base: None }
+    );
+    assert_eq!(root.single_decl().mutations.len(), 1);
+
+    let literal = parse_query(
+        "query add($n: String) as unattached branch on \"01ARZ3NDEKTSV4RRFFQ69G5FAV\" {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        literal.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Literal(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()
+            )),
+        }
+    );
+
+    let param = parse_query(
+        "query add($n: String, $base: String) @description(\"adds\") as unattached branch on $base {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        param.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param("base".to_string())),
+        }
+    );
+
+    let read_only =
+        "query q() as unattached branch {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let err = parse_query(read_only).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`as unattached branch` applies to a mutation; query `q` is read-only"),
+        "{err}"
+    );
+    let diagnostic = parse_query_diagnostic(read_only).unwrap_err();
+    assert_eq!(diagnostic.code, Q005);
+    assert_eq!(
+        diagnostic.position,
+        Some(Position::at("query q() as unattached branch {", 10))
+    );
+
+    for operand in ["\"\"", "\" 01ARZ\"", "\"01ARZ \"", "\"01\\tARZ\""] {
+        let input = format!(
+            "query add($n: String) as unattached branch on {operand} {{\n    insert Person {{ name: $n }}\n}}\n"
+        );
+        let diagnostic = parse_query_diagnostic(&input).unwrap_err();
+        assert_eq!(diagnostic.code, Q004, "{input}");
+        assert!(
+            diagnostic.message.contains("is not a commit id"),
+            "{input}: {}",
+            diagnostic.message
+        );
+    }
+
+    for input in [
+        "branch merge b0 as unattached branch",
+        "branch merge b0 into main as unattached branch",
+        "query q() as unattached {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattachedbranch {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on b0 {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch onx \"01ARZ\" {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as commit as unattached branch {\n    insert Person { name: \"a\" }\n}\n",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn commit_statements_name_one_graph_commit_id() {
+    let id = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.3.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let publish = parse_commit(&format!("commit publish \"{id}\""));
+    assert_eq!(
+        publish,
+        CommitWrite::Publish {
+            graph_commit_id: id.to_string()
+        }
+    );
+    assert_eq!(publish.statement_name(), "commit publish");
+    assert_eq!(publish.graph_commit_id(), id);
+    let dropped = parse_commit(&format!("commit drop \"{id}\";"));
+    assert_eq!(
+        dropped,
+        CommitWrite::Drop {
+            graph_commit_id: id.to_string()
+        }
+    );
+    assert_eq!(dropped.statement_name(), "commit drop");
+    assert_eq!(
+        parse_commit(&format!("  commit\n  publish \"{id}\" // later\n")),
+        publish
+    );
+    for input in [
+        "commit publish",
+        "commit publish hb1.x",
+        "commit publish \"\"",
+        "commit publish \" id\"",
+        "commit publishx \"id\"",
+        "commit list",
+        "commitpublish \"id\"",
+        &format!("commit publish \"{id}\"\nbranch list"),
+        &format!("query q() {{\n    insert Person {{ name: \"a\" }}\n}}\ncommit publish \"{id}\""),
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+    let err = parse_query(&format!("commit publish \"{id}\"\nbranch list")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a commit statement stands alone in its file"),
+        "{err}"
+    );
+    assert_eq!(
+        parse_query(&format!("commit drop \"{id}\""))
+            .unwrap()
+            .into_declarations()
+            .unwrap_err(),
+        "`commit drop` is a commit statement, not a query declaration"
+    );
+    assert_eq!(parse_branch("branch create commit"), create("commit", None));
 }
 
 #[test]
@@ -1532,6 +1742,94 @@ fn branch_statements_parse_with_and_without_their_defaults() {
         parse_branch("  branch\n  list // trailing comment\n"),
         BranchStmt::List
     );
+}
+
+#[test]
+fn branch_control_reads_parse_as_reads() {
+    let read = |stmt: BranchStmt| match stmt {
+        BranchStmt::Read(read) => read,
+        other => panic!("expected a branch control read, got {other:?}"),
+    };
+    let names = |source: &str, into: Option<&str>| (source.to_string(), into.map(str::to_string));
+
+    let diff = parse_branch("branch diff feature");
+    assert!(!diff.is_write());
+    assert_eq!(diff.statement_name(), "branch diff");
+    assert_eq!(
+        read(diff),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: None,
+            },
+            page: DiffPageClause::default(),
+        }
+    );
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff feature into main after page "tok" limit 50"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: Some("main".to_string()),
+            },
+            page: DiffPageClause {
+                after_page: Some("tok".to_string()),
+                limit: Some(50),
+            },
+        }
+    );
+    // A commit id is quoted: it is not an identifier.
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV" to main limit 1"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Between {
+                from: "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                to: "main".to_string(),
+            },
+            page: DiffPageClause {
+                after_page: None,
+                limit: Some(1),
+            },
+        }
+    );
+
+    let base = parse_branch("branch merge-base feature into main");
+    assert!(!base.is_write());
+    assert_eq!(base.statement_name(), "branch merge-base");
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(read(base), BranchRead::MergeBase { source, into });
+
+    let dry = parse_branch("branch merge feature dry run");
+    assert!(!dry.is_write());
+    assert_eq!(dry.statement_name(), "branch merge dry run");
+    let (source, into) = names("feature", None);
+    assert_eq!(read(dry), BranchRead::MergeDryRun { source, into });
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(
+        read(parse_branch("branch merge feature into main dry run")),
+        BranchRead::MergeDryRun { source, into }
+    );
+
+    // `dry run` is the clause, never a branch named `dry`; quoted, it is one.
+    assert_eq!(parse_branch(r#"branch merge "dry""#), merge("dry", None));
+    assert!(parse_query("branch merge dry run").is_err());
+    for input in [
+        "branch merge feature dry run as commit",
+        "branch merge feature as commit dry run",
+        "branch merge-base feature dry run",
+        "branch diff feature to",
+        "branch diff feature into main to other",
+        "branch diff feature limit 0",
+        "branch diff feature limit 5 after page \"tok\"",
+        "branch diffx feature",
+        "branch merge-basefeature",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
 }
 
 #[test]
