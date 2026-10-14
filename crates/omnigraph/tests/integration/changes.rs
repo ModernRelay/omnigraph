@@ -4535,16 +4535,66 @@ async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
         OmniError::AmbiguousReadTarget { target } => assert_eq!(target, genesis),
         other => panic!("expected AmbiguousReadTarget, got {other:?}"),
     }
-    assert!(matches!(
-        db.diff_read_target_branch(&genesis).await.unwrap_err(),
-        OmniError::AmbiguousReadTarget { .. }
-    ));
 
-    match graph_diff_all(&db, between("main", "no-such-side"), None)
+    // A spelling no commit id has skips the commit lookup: an unknown name,
+    // and a malformed `hb1` address, are the same typed not-found.
+    for side in ["no-such-side", "hb1.not.a.commit"] {
+        match graph_diff_all(&db, between("main", side), None)
+            .await
+            .unwrap_err()
+        {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, side),
+            other => panic!("expected ReadTargetNotFound for {side}, got {other:?}"),
+        }
+    }
+
+    // A caller that may read only some branches is asked, side by side, for
+    // the branch each side reads (a branch itself, or a commit's authored
+    // branch) as soon as the side is classified. A refused side is the
+    // not-found of a side that names nothing, and the next side is never
+    // looked at, so an unknown `to` cannot reveal that `from` exists.
+    db.branch_create("feature").await.unwrap();
+    let on_feature = write_on(&db, "feature", "insert_person", &person("Fay", 30)).await;
+    for from in ["feature", on_feature.graph_commit_id.as_str()] {
+        let mut asked = Vec::new();
+        let refused = db
+            .diff_page_readable(
+                &diff_request(between(from, "no-such-side"), None),
+                &mut |branch: &str| {
+                    asked.push(branch.to_string());
+                    branch == "main"
+                },
+            )
+            .await
+            .unwrap_err();
+        match refused {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, from),
+            other => panic!("expected ReadTargetNotFound for {from}, got {other:?}"),
+        }
+        assert_eq!(asked, ["feature"], "a refused side ends the resolution");
+    }
+    let mut asked = Vec::new();
+    db.diff_page_readable(
+        &diff_request(between("main", &on_feature.graph_commit_id), None),
+        &mut |branch: &str| {
+            asked.push(branch.to_string());
+            true
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked, ["main", "feature"]);
+
+    // A commit whose branch was deleted is no longer readable: it is that
+    // side's not-found, never the branch its record names.
+    db.branch_create("gone").await.unwrap();
+    let on_gone = write_on(&db, "gone", "insert_person", &person("Gil", 31)).await;
+    db.branch_delete("gone").await.unwrap();
+    match graph_diff_all(&db, between(&on_gone.graph_commit_id, "main"), None)
         .await
         .unwrap_err()
     {
-        OmniError::ReadTargetNotFound { target } => assert_eq!(target, "no-such-side"),
+        OmniError::ReadTargetNotFound { target } => assert_eq!(target, on_gone.graph_commit_id),
         other => panic!("expected ReadTargetNotFound, got {other:?}"),
     }
 }

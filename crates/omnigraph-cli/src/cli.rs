@@ -267,7 +267,8 @@ pub(crate) enum Command {
         /// Read target the diff ends at
         #[arg(long)]
         to: String,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -426,6 +427,9 @@ pub(crate) enum Command {
         /// Reuse or renew a managed session; use browser device authorization when needed.
         #[arg(long, conflicts_with = "token")]
         api: Option<String>,
+        /// Select the managed organization; never changes an existing session account.
+        #[arg(long, requires = "api", conflicts_with = "name")]
+        organization: Option<String>,
         /// The token. Prefer piping via stdin over this flag (shell
         /// history).
         #[arg(long)]
@@ -440,6 +444,9 @@ pub(crate) enum Command {
         /// Revoke the managed session and remove its OS keychain entry.
         #[arg(long)]
         api: Option<String>,
+        /// Select the managed organization; never changes an existing session account.
+        #[arg(long, requires = "api", conflicts_with = "name")]
+        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -448,6 +455,9 @@ pub(crate) enum Command {
         cluster_id: String,
         #[arg(long)]
         api: String,
+        /// Select the managed organization.
+        #[arg(long)]
+        organization: Option<String>,
         #[arg(long, default_value = ".")]
         config: PathBuf,
         #[arg(long)]
@@ -655,7 +665,7 @@ pub(crate) enum ClusterCommand {
         /// Attest prior writers and accepted graph/control I/O are quiescent.
         #[arg(long, requires = "deployment_id")]
         writers_stopped: bool,
-        /// With --managed, the exact saved plan run to apply (required).
+        /// With --managed, the exact prepared preview to apply (required).
         #[arg(long)]
         plan: Option<String>,
         #[command(flatten)]
@@ -663,14 +673,15 @@ pub(crate) enum ClusterCommand {
     },
     /// Read deployment status without scanning graphs. --deployment-id selects
     /// an exact durable receipt through --server or --cluster ROOT.
-    /// With --managed, read cluster projections or a positional RUN_ID.
+    /// With --managed, read cluster projections or a positional delivery ID.
     Status {
-        /// With --managed, inspect this exact run instead of cluster projections.
+        /// With --managed, observe this exact deployment delivery.
+        #[arg(value_name = "DEPLOYMENT_ID", group = "status_deployment")]
         run_id: Option<String>,
-        #[arg(long)]
+        #[arg(long, group = "status_deployment")]
         deployment_id: Option<String>,
-        /// With --server, wait for this deployment's outcome.
-        #[arg(long, requires = "deployment_id")]
+        /// With --server or --managed, wait for this exact deployment's outcome.
+        #[arg(long, requires = "status_deployment")]
         wait: bool,
         /// Bound the local wait (default 300s, maximum 3600s); never cancels work.
         #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -718,6 +729,9 @@ pub(crate) enum ClusterCommand {
         name: String,
         #[arg(long)]
         api: String,
+        /// Select the organization when the folder is not yet bound.
+        #[arg(long)]
+        organization: Option<String>,
         /// Unbound configuration folder to bind after creation.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -726,6 +740,32 @@ pub(crate) enum ClusterCommand {
         json: bool,
         #[command(flatten)]
         run: ClusterRunArgs,
+    },
+    /// With --managed, list the clusters visible in the selected organization.
+    List {
+        #[arg(long)]
+        api: String,
+        #[arg(long)]
+        organization: Option<String>,
+        /// Configuration folder supplying an optional managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// With --managed, download an exact configuration revision into a new directory.
+    Pull {
+        /// New destination; existing files, directories and symlinks are never replaced.
+        #[arg(long)]
+        out: PathBuf,
+        /// Full lowercase Git commit ID; omission captures the current source head.
+        #[arg(long = "rev")]
+        revision: Option<String>,
+        /// Configuration folder containing the managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// With --managed, upload only referenced configuration files to the managed repository.
     Push {
@@ -792,6 +832,9 @@ pub(crate) enum ClusterCommand {
         /// API origin for recovery before a folder context exists.
         #[arg(long)]
         api: Option<String>,
+        /// Select the organization when the folder is not yet bound.
+        #[arg(long)]
+        organization: Option<String>,
         /// Poll until the operation reaches its canonical outcome.
         #[arg(long)]
         wait: bool,
@@ -805,7 +848,7 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// With --managed, read run history with its provenance and outcomes.
+    /// With --managed, read deployment delivery history with its provenance.
     History {
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -813,14 +856,15 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-        /// Include runs since this RFC 3339 timestamp.
+        /// Include deliveries created at or after this RFC 3339 timestamp.
         #[arg(long)]
         since: Option<String>,
     },
-    /// With --managed, cancel a pending run, or abandon an unused saved plan.
+    /// With --managed, cancel your queued delivery before its first dispatch attempt.
     Cancel {
+        #[arg(value_name = "DEPLOYMENT_ID")]
         run_id: String,
         /// Configuration folder containing the managed context.
         #[arg(long, default_value = ".")]
@@ -833,7 +877,7 @@ pub(crate) enum ClusterCommand {
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct ClusterRunArgs {
-    /// For served apply or managed operations, return after acceptance without waiting for completion.
+    /// Return without waiting for completion. Managed apply acknowledges durable delivery reservation only.
     #[arg(long)]
     pub(crate) no_wait: bool,
     /// For served apply or managed operations, bound the local wait in seconds (default 300, maximum 3600).
@@ -934,7 +978,8 @@ pub(crate) enum BranchCommand {
         /// Branch the source is compared against (default main)
         #[arg(long)]
         into: Option<String>,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -1070,7 +1115,8 @@ pub(crate) enum CommitCommand {
         #[arg(long)]
         uri: Option<String>,
         commit_id: String,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192: 8192 when the CLI follows every
+        /// page, 1000 for one `--page-token` fetch
         #[arg(long)]
         limit: Option<usize>,
         /// Fetch exactly one page starting at this opaque token
@@ -1144,7 +1190,8 @@ pub(crate) enum ChangesCommand {
         /// Start mode: now | beginning | after:<commit_id> (default now)
         #[arg(long, conflicts_with = "cursor")]
         start: Option<String>,
-        /// Changes per page (the server clamps at its public ceiling)
+        /// Changes per page, at most 8192 (default 8192; the CLI follows
+        /// every page)
         #[arg(long)]
         limit: Option<usize>,
         /// Filter by entity kind (repeatable): node | edge

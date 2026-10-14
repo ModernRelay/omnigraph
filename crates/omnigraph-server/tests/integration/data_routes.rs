@@ -3218,6 +3218,42 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     }
     let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
     assert_eq!(listed["commits"], json!([]));
+
+    // An ordinary write past a proposal's parent expires it: reads at its id
+    // answer 404, the listing drops it, a publish fails its precondition, and
+    // a drop still succeeds.
+    let rae = propose_person(&app, "Rae").await;
+    let rae_id = rae["graph_commit_id"].as_str().unwrap().to_string();
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "query add() { insert Person { name: \"Sol\", age: 34 } }"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for path in [
+        format!("/commits/{rae_id}"),
+        format!("/commits/{rae_id}/changes"),
+    ] {
+        let (status, body) = get_json(&app, g(&path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([]));
+    let (status, body) = json_response(
+        &app,
+        bodiless(Method::POST, &format!("/commits/{rae_id}/publish")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{rae_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 /// One mutation `as unattached branch` on main, a root when `base` is `None`

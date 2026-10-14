@@ -1633,6 +1633,21 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .await
         .unwrap();
     let feature_commit = receipt.commit.graph_commit_id.clone();
+    // A commit whose branch is deleted afterwards.
+    db.branch_create_from(ReadTarget::branch("main"), "gone")
+        .await
+        .unwrap();
+    let gone_commit = db
+        .load_with_receipt(
+            "gone",
+            r#"{"type":"Person","data":{"name":"gone-only","age":41}}"#,
+            omnigraph::loader::LoadMode::Merge,
+        )
+        .await
+        .unwrap()
+        .commit
+        .graph_commit_id;
+    db.branch_delete("gone").await.unwrap();
     drop(db);
 
     let policy_path = temp.path().join("policy.yaml");
@@ -1687,9 +1702,9 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         "forbidden and unknown must share the same error code"
     );
 
-    // A graph diff resolves each side before it authorizes the branch the side
-    // resolves to, so a forbidden side, commit or branch, answers exactly as a
-    // side that names nothing.
+    // A graph diff classifies each side before it authorizes the branch the
+    // side resolves to, so a forbidden side, commit or branch, answers exactly
+    // as a side that names nothing.
     let get = |uri: String| {
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -1733,6 +1748,29 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
             format!("'{forbidden_side}' names no branch and no commit")
         );
         assert_eq!(forbidden["code"], unknown["code"]);
+    }
+    // The sides are authorized in order, each before the next is looked at: a
+    // forbidden `from` answers as an unknown `from` does whatever `to` names,
+    // so an unknown `to` cannot reveal that `from` exists. A commit whose
+    // branch was deleted is no longer readable and answers the same way.
+    let unknown_from_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    for (forbidden_from, unknown_from, to) in [
+        ("feature", "no-such-branch-2", "no-such-branch"),
+        (feature_commit.as_str(), unknown_from_id, unknown_id),
+        (gone_commit.as_str(), unknown_from_id, "main"),
+    ] {
+        for from in [forbidden_from, unknown_from] {
+            let expected = format!("'{from}' names no branch and no commit");
+            let (status, body) =
+                json_response(&app, get(format!("/diff?from={from}&to={to}"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["error"], expected, "/diff from {from} to {to}");
+            let statement = format!(r#"branch diff "{from}" to "{to}""#);
+            let (status, body) =
+                json_response(&app, statement_request("/query", "team-token", &statement)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["error"], expected, "{statement}");
+        }
     }
     // The branch routes name their branches outright: a read denial is a 403,
     // and a dry run is a read of both branches.
@@ -2896,30 +2934,39 @@ async fn change_routes_enforce_bearer_and_policy() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// A padded branch spelling must not bypass branch-scope policy: the engine
-/// trims branch names late, so authorizing the caller's raw string would let
-/// `branch=%20main%20` be classified by Cedar as an unprotected named branch
-/// and then resolve to protected main. The feed and baseline handlers
-/// normalize BEFORE authorization, so every spelling of main is judged as
-/// main.
+/// The policy judges a branch name as written and the engine acts on the
+/// name it is given, so a spelling some layer could read as another branch
+/// (surrounding whitespace) is refused as a bad request before any policy
+/// decision, on every route that names a branch. An actor allowed to write
+/// and control only unprotected branches therefore cannot reach protected
+/// main through it, and protected main's head stays put.
 #[tokio::test(flavor = "multi_thread")]
-async fn padded_branch_spelling_cannot_bypass_change_route_policy() {
+async fn non_canonical_branch_names_are_refused_before_policy() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
+    session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap())
+        .branch_create("feature")
+        .await
+        .unwrap();
     let policy_path = temp.path().join("policy.yaml");
     fs::write(
         &policy_path,
         r#"
 version: 1
 groups:
-  side-readers: [act-a]
+  side-writers: [act-a]
 protected_branches: [main]
 rules:
-  - id: unprotected-only
+  - id: unprotected-data
     allow:
-      actors: { group: side-readers }
-      actions: [read, export]
+      actors: { group: side-writers }
+      actions: [read, export, change]
       branch_scope: unprotected
+  - id: unprotected-branch-control
+    allow:
+      actors: { group: side-writers }
+      actions: [branch_create, branch_delete, branch_merge]
+      target_branch_scope: unprotected
 "#,
     )
     .unwrap();
@@ -2931,58 +2978,158 @@ rules:
     .await
     .unwrap();
     let app = build_app(state);
-
-    // Plain main is protected: the unprotected-only rule denies it.
-    let (plain_status, _) = json_response(
-        &app,
+    let post = |path: &str, body: Value| {
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/changes?branch=main"))
-            .method(Method::GET)
-            .header("authorization", "Bearer token-a")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(plain_status, StatusCode::FORBIDDEN);
-
-    // The padded spelling resolves to the same protected main and must be
-    // denied identically — before normalization it was classified as an
-    // unprotected named branch and slipped through.
-    let (padded_status, _) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/changes?branch=%20main%20"))
-            .method(Method::GET)
-            .header("authorization", "Bearer token-a")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        padded_status,
-        StatusCode::FORBIDDEN,
-        "a padded spelling of main must be authorized as main"
-    );
-
-    // Baseline (export) takes its branch from the JSON body; the same padded
-    // spelling must be denied the same way.
-    let (baseline_status, _) = json_response(
-        &app,
-        Request::builder()
-            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/changes/baseline"))
+            .uri(g(path))
             .method(Method::POST)
             .header("authorization", "Bearer token-a")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"branch":" main "}"#))
-            .unwrap(),
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(path))
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mutate = |branch: &str| {
+        json!({
+            "query": MUTATION_QUERIES,
+            "name": "insert_person",
+            "params": { "name": "Mina", "age": 28 },
+            "branch": branch,
+        })
+    };
+    let person = r#"{"type": "Person", "data": {"name": "Zed", "age": 40}}"#;
+    let main_head = || async {
+        session(Omnigraph::open(graph.to_str().unwrap()).await.unwrap())
+            .list_commits(None)
+            .await
+            .unwrap()[0]
+            .graph_commit_id
+            .clone()
+    };
+
+    // The canonical spellings are judged as the policy says: feature takes the
+    // actor's write, which also gives the merges below something to publish,
+    // and protected main refuses it.
+    let (status, body) = json_response(&app, post("/mutate", mutate("feature"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = json_response(&app, post("/mutate", mutate("main"))).await;
+    assert_forbidden(status, body, "a write to protected main");
+    let (status, body) = json_response(
+        &app,
+        post(
+            "/branches/merge",
+            json!({"source": "feature", "target": "main"}),
+        ),
     )
     .await;
-    assert_eq!(
-        baseline_status,
-        StatusCode::FORBIDDEN,
-        "a padded baseline branch must be authorized as main"
-    );
+    assert_forbidden(status, body, "a merge into protected main");
+    let (status, body) = json_response(&app, get("/changes?branch=main")).await;
+    assert_forbidden(status, body, "the change feed of protected main");
+    let before = main_head().await;
+
+    for (main, encoded) in [
+        (" main", "%20main"),
+        ("main ", "main%20"),
+        (" main ", "%20main%20"),
+        ("main\t", "main%09"),
+    ] {
+        let requests = [
+            ("POST /mutate", post("/mutate", mutate(main))),
+            (
+                "POST /load",
+                post("/load", json!({"branch": main, "data": person})),
+            ),
+            (
+                "POST /load from",
+                post(
+                    "/load",
+                    json!({"branch": "fresh", "from": main, "data": person}),
+                ),
+            ),
+            (
+                "POST /branches/merge",
+                post(
+                    "/branches/merge",
+                    json!({"source": "feature", "target": main}),
+                ),
+            ),
+            (
+                "POST /branches",
+                post("/branches", json!({"from": main, "name": "fresh"})),
+            ),
+            (
+                "POST /query",
+                post(
+                    "/query",
+                    json!({
+                        "query": "query people() { match { $p: Person } return { $p.name } }",
+                        "branch": main,
+                    }),
+                ),
+            ),
+            ("GET /snapshot", get(&format!("/snapshot?branch={encoded}"))),
+            ("GET /commits", get(&format!("/commits?branch={encoded}"))),
+            ("GET /changes", get(&format!("/changes?branch={encoded}"))),
+            (
+                "GET /diff",
+                get(&format!("/diff?from=feature&to={encoded}")),
+            ),
+            (
+                "GET /branches/diff",
+                get(&format!("/branches/diff?source=feature&target={encoded}")),
+            ),
+            (
+                "GET /branches/merge-base",
+                get(&format!(
+                    "/branches/merge-base?source=feature&target={encoded}"
+                )),
+            ),
+            (
+                "POST /branches/merge dry run",
+                post(
+                    "/branches/merge",
+                    json!({"source": "feature", "target": main, "dry_run": true}),
+                ),
+            ),
+            (
+                "POST /changes/baseline",
+                post("/changes/baseline", json!({"branch": main})),
+            ),
+        ];
+        for (route, request) in requests {
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(
+                main_head().await,
+                before,
+                "{route} with branch {main:?} reached protected main: {status} {body}"
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{route} with branch {main:?}: {body}"
+            );
+            let error: ErrorOutput = serde_json::from_value(body).unwrap();
+            assert_eq!(
+                error.code,
+                Some(omnigraph_server::api::ErrorCode::BadRequest),
+                "{route} with branch {main:?}"
+            );
+        }
+    }
+    // A branch statement spells the same names and gets the same refusal.
+    let (status, body) = json_response(
+        &app,
+        statement_request("/mutate", "token-a", r#"branch merge feature into " main""#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(main_head().await, before);
 }
