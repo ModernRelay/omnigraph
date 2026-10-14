@@ -33,6 +33,7 @@ tokio = { workspace = true }
 yaml_serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
+tower-http = { workspace = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "internal-logs"] }

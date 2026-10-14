@@ -32,9 +32,14 @@ The SDK's `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` control sampling;
 the default follows the parent, or samples a root request.
 
 Only explicitly authored request and native-operation spans are exported.
-`RUST_LOG` still controls logging, and the `rmcp`, `lance::dataset_events` and
+`RUST_LOG` controls logging (`info` by default), and the `rmcp`, `lance::dataset_events` and
 `lance::file_audit` targets remain restricted to warnings/errors, even with
-debug overrides. Collect stdout separately for logs; the server does not send
+debug overrides. These targets can include query arguments/results, full storage
+URIs and deletion predicates. `omnigraph_server::init_tracing()` also enforces
+the restrictions; embedders using their own subscriber must preserve them.
+A failed Blob delivery, change-route request or streamed response is logged by
+its error class, never by its message; see [HTTP errors](troubleshooting.md#http-errors).
+Collect stdout separately for logs; the server does not send
 the same logs over OTLP. Resource attributes are operator-provided metadata;
 do not place secrets or graph contents in them.
 
