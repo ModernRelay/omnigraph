@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford
 created: 2026-10-13
-updated: 2026-10-13
+updated: 2026-10-14
 discussion: https://github.com/ModernRelay/omnigraph/pull/996
 supersedes: []
 superseded_by: []
@@ -185,23 +185,36 @@ caches hold manifests, file footers, column metadata and index pages. Lance
 are paid once per process and per table version, so they do not decide
 between alternatives that run many times.
 
-| Operator | Serial depth (warm) | Source of the shape |
-|---|---|---|
-| Table scan (`ScanExec`, pipelined) with `F` fragments, `C` projected columns | `⌈F × C / N⌉` (one GET per column page; fragments open together and share one scheduler capped at `N`) | `operators/scan/pipelined.rs`; Lance `filtered_read.rs` |
-| Scan with a pushed key or index filter | 1 (index from cache, then one take wave over the matching fragments only) | Lance `ScalarIndexExec`; GQT step logs |
-| `id_lookup` over a frontier of `n` rows | `Σ_slices ⌈R_s / N⌉` over `⌈n / 256⌉` slices, which are awaited one at a time; `R_s` is the projected columns times the fragments holding the slice's ids (in the measured runs 38–52 requests, one wave per slice) | `operators/scan/input.rs` `hydrate_nodes` |
-| `HashJoin` build of a destination table | depth of the destination scan, plus 1 because the build waits for the probe's first batch | `operators/hash_join.rs` |
-| Indexed `Expand`, per hop and orientation | `⌈2 × min(F_e, matched) / N⌉` per input batch of at most 8,192 rows, plus a full scan of the edge table's unindexed fragments | `operators/single_hop.rs`; `engine/graph.rs` |
-| CSR `Expand` | the build's depth `Σ_types ⌈2 × F_e / N⌉` plus its bytes, priced per query | `graph_index/mod.rs` |
-| `MetadataCount` | 0 | `operators/metadata_count.rs` |
+| Operator | Serial depth (warm) | Bytes priced | Source of the shape |
+|---|---|---|---|
+| Table scan (`ScanExec`, pipelined) with `F` fragments, `C` projected columns | `⌈F × C / N⌉` (one GET per column page; fragments open together and share one scheduler capped at `N`) | the projected columns' bytes over all fragments | `operators/scan/pipelined.rs`; Lance `filtered_read.rs` |
+| Scan with a pushed key or index filter | 1 (index from cache, then one take wave over the matching fragments only) | 0 | Lance `ScalarIndexExec`; GQT step logs |
+| `id_lookup` over a frontier of `n` rows | `Σ_slices ⌈R_s / N⌉` over `⌈n / 256⌉` slices, which are awaited one at a time; `R_s` is the projected columns times the fragments holding the slice's ids (in the measured runs 38–52 requests, one wave per slice) | 0 | `operators/scan/input.rs` `hydrate_nodes` |
+| `HashJoin` build of a destination table | depth of the destination scan, plus 1 because the build waits for the probe's first batch | the build's projected bytes (`build_side_bytes`, as the memory admission computes them) | `operators/hash_join.rs` |
+| Indexed `Expand`, per hop and orientation | `⌈2 × min(F_e, matched) / N⌉` per input batch, plus a full scan of the edge table's unindexed fragments. The lookup is one Lance scan per input batch and orientation over all of the batch's distinct source ids (`scan_neighbor_map`). An input batch is the producer's, at most the session's 8,192 rows and smaller when the producer reaches its byte target first. The 256-row `EXPAND_OUTPUT_ROWS` bounds only the output chunks, which issue no requests | 0 for the indexed take; the unindexed fragments' key and opposite-endpoint columns | `operators/single_hop.rs` `prepare`; `engine/graph.rs` `scan_neighbor_map` |
+| CSR `Expand` | the build's depth `Σ_types ⌈2 × F_e / N⌉`, priced per query | the `src` and `dst` columns' bytes of every edge table it covers | `graph_index/mod.rs` |
+| `MetadataCount` | 0 | 0 | `operators/metadata_count.rs` |
+
+Bytes come from the column statistics and file sizes the planner already
+reads for `hash_join` admission, falling back to whole-file bytes as
+`build_side_bytes` does today. Dependent reads (a key-filtered scan,
+`id_lookup`, an indexed take) price zero bytes in this RFC. That
+understates them: Lance fetches whole chunks, and in the measured run
+`id_lookup` over 0.5% of Person read 4.0 MB against a full scan's 4.8 MB.
+But the error leans toward today's choice, and a chunk-level byte
+estimate can refine it later without changing the model.
 
 The CSR is priced as a build because the planner cannot see the
 process-wide `RuntimeCache` without taking a hidden input (see
 Alternatives). Inside one plan, a CSR an earlier operator realized is
-already free (`csr_cached`), and this RFC keeps that rule as it is. Today
-every `AntiJoin` sets `csr_cached`, even when its block will not build
-the CSR. Correcting that would change local plans, so it is a separate
-fix.
+already free (`csr_cached`). Today every `AntiJoin` sets `csr_cached`
+(`Lowering::lower`, the `AntiJoin` arm in `optimizer.rs`), even when its
+block will not build the CSR. Once step 2 makes the CSR's price the main
+lever on object storage, that flag would make an `Expand` after such a
+block see the CSR as free, and then pay its build at run time. Correcting
+the flag is therefore a co-requisite of step 2 (Rollout). It is tracked
+as its own change because it also changes some local plans, which the
+profile itself never does.
 
 Applied to the measured plans, the model reproduces the measured order. In
 the 200,000-row `$c`-first plan, the indexed hop (3 waves) prices above the
@@ -211,6 +224,19 @@ key lookup, the CSR and the `hash_join`. On a warm server the CSR is
 usually already built, so the run costs about 4 waves against today's 9.
 The acceptance threshold in Evidence holds the implementation to the
 measured numbers.
+
+### Known limitation: average-degree estimates
+
+Serial depth is computed from the same row estimates as today's model,
+and those use an edge type's average fanout. A hub root, a node whose
+degree is far above average, is therefore under-priced: its frontier,
+and with it the number of `id_lookup` slices, is larger than estimated.
+The review of PR #973 flags the same effect for its correlated-block
+strategy, which reported an estimate of 1,890 rows against 42,912 actual.
+The request term does not cause this error, but it multiplies its cost
+on object storage, since each missed slice is a round trip. The
+traversal mode already re-decides at run time on the observed frontier;
+the destination access path does not (Unresolved question 5).
 
 ### Where each decision uses it
 
@@ -283,12 +309,14 @@ measured numbers.
 ## Compatibility and reversibility
 
 No storage, wire or query-language change. Bound plans need regeneration
-across the version bump, as every plan-envelope change does. Local and
-DST plans are unchanged, and the GQT corpus with them: GQT runs on local
-and DST storage, which keep the local profile, and the one case that
-declares both environments and asserts a mode
+across the version bump, as every plan-envelope change does. The profile
+leaves local and DST plans unchanged, and the GQT corpus with them. GQT
+runs on local and DST storage, which keep the local profile, and the one
+case that declares both environments and asserts a mode
 (`issue_659_typed_edge_alternation.gqt`) asserts a budgeted selection,
-which ignores cost.
+which ignores cost. The one local change in this RFC's rollout is the
+`AntiJoin` `csr_cached` correction that lands with step 2, which carries
+its own case updates.
 
 Reverting takes two constants: setting the object-store profile's
 `latency_units` and `byte_units` to zero restores today's plans everywhere,
@@ -344,7 +372,8 @@ without a format change.
   does not reach a replay.
 - **Calibration record**: the in-region request timings above and the
   reference-host measurement behind `latency_units`, kept beside the
-  benchmark fixtures.
+  benchmark fixtures with the host description and command that Rollout
+  step 4 lists.
 
 ## Rollout
 
@@ -353,9 +382,15 @@ without a format change.
    profiles price waves at zero, so no plan changes. This can ship alone.
 2. **Expand mode** uses the object-store profile, at plan time and in the
    run-time re-decisions. This is the first change object-store plans see.
+   It lands together with the `AntiJoin` `csr_cached` correction, whose
+   local plan changes are reviewed with their own GQT updates.
 3. **Access path** uses the object-store profile.
-4. **Calibration** of `latency_units` against the benchmark host, recorded
-   with the fixtures.
+4. **Calibration** of `latency_units` and `byte_units` against a reference
+   host. The record, kept with the fixtures, names the host's CPU model,
+   core count, memory, operating system and storage, the Rust toolchain
+   and Lance versions, the exact benchmark command and fixture, and the
+   measured per-row cost the constants are derived from, so a later
+   maintainer can reproduce the ratio.
 
 `implementation` advances to `in-progress` with step 1 and to `complete`
 with step 4. Anchor selection, cache-aware CSR pricing and the other
@@ -379,6 +414,12 @@ decisions are separate work that reads the same profile.
    `__graph_index/csr-current.bin` turns a CSR build into one GET. Knowing
    whether it matches the pins at plan time costs a request. The proposal
    is to price the build and leave the artifact as a run-time discount.
+5. **A run-time switch for the access path.** Expand mode corrects an
+   under-estimated frontier at run time; `id_lookup` cannot become a
+   `hash_join` once it runs. A declared switch, taken when the observed
+   frontier's slices outgrow the build's price and reported as `ran`,
+   would bound the hub-root error. The proposal is to leave it to a
+   follow-up and record the limitation here.
 
 ## Decision log
 
@@ -386,3 +427,11 @@ decisions are separate work that reads the same profile.
   DST, `s3-like` and `unit` models; local CLI), the in-region request
   timings on the hosted personal graph, and a survey of the cost-driven
   decisions and their recording.
+- 2026-10-14: review on PR #996. Added a priced-bytes column to the
+  request model and stated that dependent reads price zero bytes; made
+  the `AntiJoin` `csr_cached` correction a co-requisite of step 2;
+  clarified that an indexed hop scans once per input batch (the 256-row
+  `EXPAND_OUTPUT_ROWS` bounds only output chunks); required the
+  calibration record to name its host and command; added the
+  average-degree limitation from PR #973's review and Unresolved
+  question 5.
