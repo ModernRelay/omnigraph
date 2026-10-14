@@ -2881,6 +2881,91 @@ fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
     server.assert_complete();
 }
 
+/// A `--server` value or a configured server `url:` is a server address: any
+/// scheme but `http`, `https` or `unix` is refused as one for every served
+/// verb, never resolved as graph storage. A `unix://` URL outside `--server`
+/// is refused like an `http://` one.
+#[test]
+fn server_scope_refuses_a_non_server_scheme_issue_979() {
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  bad:\n    url: ftp://graph.example.com\n",
+    )
+    .unwrap();
+    let rows = home.path().join("rows.jsonl");
+    fs::write(&rows, r#"{"type":"Person","data":{"name":"X","age":1}}"#).unwrap();
+    let rows = rows.to_str().unwrap();
+    let data_verbs: [&[&str]; 5] = [
+        &[
+            "query",
+            "-e",
+            "query q() { match { $p: Person } return { $p.name } }",
+        ],
+        &[
+            "mutate",
+            "-e",
+            "query add($name: String) { insert Person { name: $name } }",
+            "--params",
+            r#"{"name":"X"}"#,
+        ],
+        &["load", "--mode", "merge", "--data", rows],
+        &["export"],
+        &["blob", "get", "node", "Document", "readme", "content"],
+    ];
+    let mut invocations: Vec<Vec<&str>> = Vec::new();
+    for verb in data_verbs {
+        invocations.push(verb.to_vec());
+        invocations.push([verb, &["--graph", "knowledge"][..]].concat());
+    }
+    invocations.push(vec!["graphs", "list"]);
+    invocations.push(vec!["cluster", "status"]);
+    for server in [
+        "ftp://graph.example.com",
+        "s3://bucket/graph.omni",
+        "file:///tmp/graph.omni",
+        "bad",
+    ] {
+        for arguments in &invocations {
+            let output = output_failure(
+                cli()
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .args(arguments)
+                    .args(["--server", server]),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("invalid server address"),
+                "{server} {arguments:?}: {stderr}"
+            );
+            if server == "bad" {
+                assert!(
+                    stderr.contains("server 'bad' in the operator config"),
+                    "{arguments:?}: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("storage_root_invalid")
+                    && !stderr.contains("unsupported storage URI scheme"),
+                "{server} {arguments:?}: {stderr}"
+            );
+        }
+    }
+
+    let output = output_failure(cli().args([
+        "query",
+        "--store",
+        "unix:///tmp/og.sock",
+        "-e",
+        "query q() { match { $p: Person } return { $p.name } }",
+    ]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be addressed with `--server <url>`"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn as_on_a_served_write_is_rejected() {
     use crate::support::managed_http::IntentApiFixture;

@@ -312,6 +312,7 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/cluster/deployments",
     "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/{resource_path}",
 ];
 
 /// In multi-mode `server_openapi`, every protected path-item is
@@ -2788,7 +2789,7 @@ async fn branch_create_body(
 /// when route nesting changes" class.
 #[derive(Deserialize)]
 pub(crate) struct BranchPath {
-    branch: String,
+    pub(crate) branch: String,
 }
 
 #[utoipa::path(
@@ -3164,7 +3165,7 @@ pub(crate) async fn server_commit_list(
 /// for the design rationale — same pattern, different field name.
 #[derive(Deserialize)]
 pub(crate) struct CommitPath {
-    commit_id: String,
+    pub(crate) commit_id: String,
 }
 
 #[utoipa::path(

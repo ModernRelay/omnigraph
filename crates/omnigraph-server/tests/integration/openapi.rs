@@ -192,6 +192,7 @@ fn openapi_info_contains_version() {
 // protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/{resource_path}",
     "/healthz",
     "/readyz",
     "/graphs",
@@ -2191,7 +2192,11 @@ async fn auth_mode_healthz_still_has_no_security() {
         .body(Body::empty())
         .unwrap();
     let (_, json) = json_response(&app, request).await;
-    for path in ["/healthz", "/.well-known/oauth-protected-resource"] {
+    for path in [
+        "/healthz",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
+    ] {
         let operation = &json["paths"][path]["get"];
         assert!(
             operation.get("security").is_none() || operation["security"].is_null(),
@@ -2369,6 +2374,7 @@ async fn multi_mode_openapi_keeps_management_paths_flat() {
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
     ] {
         assert!(
             paths.contains_key(flat),
@@ -2408,6 +2414,7 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
                 | "/cluster/deployments"
                 | "/cluster/deployments/{id}"
                 | "/.well-known/oauth-protected-resource"
+                | "/.well-known/oauth-protected-resource/{resource_path}"
         ) {
             continue;
         }
@@ -2480,6 +2487,7 @@ async fn multi_mode_openapi_declares_graph_id_path_parameter() {
         "/cluster/deployments",
         "/cluster/deployments/{id}",
         "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
     ] {
         let item = paths.get(flat).unwrap();
         for method in ["get", "head", "post", "put", "delete", "patch"] {
@@ -2611,7 +2619,7 @@ fn openapi_describes_api_contract_admission_and_response_identity() {
                 .iter()
                 .filter(|parameter| parameter["name"] == HTTP_API_CONTRACT_HEADER)
                 .collect();
-            let oauth = path == "/.well-known/oauth-protected-resource";
+            let oauth = path.starts_with("/.well-known/oauth-protected-resource");
             let protected =
                 path == "/graphs" || path.starts_with("/graphs/") || path.starts_with("/cluster/");
             if protected {

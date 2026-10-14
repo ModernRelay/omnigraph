@@ -185,6 +185,36 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
 
+## Use a server through a Unix socket
+
+A server may also be reached through a Unix-domain socket, for example a local
+gateway in front of `omnigraph-server`. A sandboxed agent that is denied network
+access may still be allowed to connect to one socket path. Address the socket
+with a `unix://` URL followed by its absolute path:
+
+```bash
+omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
+  --server unix:///run/omnigraph/server.sock --graph knowledge
+```
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  local:
+    url: unix:///run/omnigraph/server.sock
+```
+
+The whole path names the socket, so a socket URL has no host, path prefix,
+query or fragment. A path may contain spaces, written as is or as `%20`. The
+CLI sends the same HTTP/1.1 requests over the socket as over TCP: the
+`HEAD /healthz` discovery, the contract header, the bearer token, and no
+redirects or automatic retries. Proxy settings do not apply. `unix://`
+addresses work on Unix platforms only.
+
+A `--server` value or server `url:` must use `http://`, `https://` or
+`unix://`. Any other scheme fails as an invalid server address; use `--store`
+for graph storage.
+
 ## Manage a cluster
 
 Self-hosted `cluster` commands read a directory containing `cluster.yaml`, or address

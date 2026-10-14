@@ -31,6 +31,7 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
+pub use mcp::McpSettings;
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
     RegistryLookup, RegistrySnapshot, StartupFailure,
@@ -112,6 +113,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         mcp::resource_metadata,
+        mcp::resource_metadata_at_resource_path,
         deployment::status,
         deployment::lookup,
         deployment::apply,
@@ -237,6 +239,7 @@ pub struct ManagedServerConfig {
     canonical_root: String,
     trust: Option<data_tokens::DataTokenTrust>,
     oidc_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 }
 
 impl ManagedServerConfig {
@@ -251,6 +254,12 @@ impl ManagedServerConfig {
     /// Change only the shutdown bound, preserving the validated root binding.
     pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
         self.config.shutdown_grace = grace;
+        self
+    }
+
+    /// Set the MCP boot settings, preserving the validated root binding.
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = mcp;
         self
     }
 }
@@ -398,6 +407,8 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    /// MCP boot settings: which opt-in tools `/mcp` lists and admits.
+    mcp: Arc<McpSettings>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
@@ -767,6 +778,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -820,6 +832,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -911,6 +924,17 @@ impl AppState {
         self
     }
 
+    /// Attach the MCP boot settings `/mcp` reads for every request.
+    #[must_use]
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = Arc::new(mcp);
+        self
+    }
+
+    pub(crate) fn mcp_settings(&self) -> &McpSettings {
+        &self.mcp
+    }
+
     pub(crate) fn oidc_resource_metadata(&self) -> Option<serde_json::Value> {
         self.oidc_identity_trust
             .as_ref()
@@ -922,6 +946,14 @@ impl AppState {
             .get("resource")?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Whether any bearer credential can authenticate a request: static
+    /// tokens, signed data tokens or OIDC. Fixed at construction.
+    pub(crate) fn has_credential_source(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+            || self.data_token_trust.is_some()
+            || self.oidc_identity_trust.is_some()
     }
 
     fn requires_bearer_auth(&self) -> bool {
@@ -2726,7 +2758,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
-    if state.oidc_identity_trust.is_some() {
+    // MCP needs an authenticated caller; without a credential source there is
+    // no actor for its policy checks, so the endpoint does not exist.
+    if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
     app.layer(middleware::from_fn(http_contract::identify_response))
@@ -2736,19 +2770,26 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    serve_config(config, None, None).await
+    serve_config(config, None, None, McpSettings::default()).await
+}
+
+/// Serve with explicit MCP boot settings (`--mcp-*` flags and their
+/// environment variables, resolved by [`McpSettings::resolve`]).
+pub async fn serve_with_mcp_settings(config: ServerConfig, mcp: McpSettings) -> Result<()> {
+    serve_config(config, None, None, mcp).await
 }
 
 /// Serve settings whose offline data-token trust was validated against their
 /// applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
-    serve_config(config.config, config.trust, config.oidc_trust).await
+    serve_config(config.config, config.trust, config.oidc_trust, config.mcp).await
 }
 
 async fn serve_config(
     config: ServerConfig,
     data_token_trust: Option<data_tokens::DataTokenTrust>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 ) -> Result<()> {
     // RFC 0049: the signal listener is installed before anything else, so
     // the shutdown bound covers startup. On the signal it sets `draining`,
@@ -2866,7 +2907,8 @@ async fn serve_config(
             Arc::clone(&draining),
             shutdown_grace,
         )
-        .with_process_defaults(process_defaults);
+        .with_process_defaults(process_defaults)
+        .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     let startup_owner = operations

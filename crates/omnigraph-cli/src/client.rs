@@ -264,13 +264,13 @@ async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScop
 }
 
 /// A remote graph must be addressed with `--server` (RFC-011): a positional or
-/// `--uri` `http(s)://` URL no longer auto-dispatches to a server. A remote URL
-/// produced by a server scope (`via_server`) is fine.
+/// `--uri` server URL (`http(s)://` or `unix://`) no longer auto-dispatches to a
+/// server. A remote URL produced by a server scope (`via_server`) is fine.
 fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
     if !via_server && is_remote_uri(uri) {
         bail!(
             "a remote graph must be addressed with `--server <url>` — a positional \
-             (or `--uri`) http(s):// URL no longer dispatches to a server"
+             (or `--uri`) http(s):// or unix:// URL no longer dispatches to a server"
         );
     }
     Ok(())
@@ -344,14 +344,8 @@ impl GraphClient {
                  --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
             );
         };
-        let client = Self::registry_client(server)?;
-        if !is_remote_uri(client.uri()) {
-            bail!(
-                "a server scope resolves to an http(s):// URL; `{}` is not one",
-                client.uri()
-            );
-        }
-        Ok(client)
+        // `resolve_server_flag` refuses any scope that is not a server address.
+        Self::registry_client(server)
     }
 
     /// Resolve the addressing (positional URI / `--target` / `--server`)
@@ -984,7 +978,7 @@ impl GraphClient {
                     http.request(
                         Method::POST,
                         remote_url(base_url, &["changes", "baseline"], &[])?,
-                    ),
+                    )?,
                     token.as_deref(),
                 )
                 .json(&ChangeBaselineRequest {
@@ -1075,7 +1069,7 @@ impl GraphClient {
                         http.request(
                             Method::POST,
                             remote_url(base_url, &["load", "ndjson"], &query)?,
-                        ),
+                        )?,
                         token.as_deref(),
                     ),
                     data,
@@ -2024,7 +2018,7 @@ impl GraphClient {
                 ..
             } => {
                 let request = apply_bearer_token(
-                    http.request(Method::POST, remote_url(base_url, &["export"], &[])?),
+                    http.request(Method::POST, remote_url(base_url, &["export"], &[])?)?,
                     token.as_deref(),
                 )
                 .json(&ExportRequest {
@@ -2111,7 +2105,7 @@ impl GraphClient {
             } => {
                 let http = http.blob_delivery()?;
                 let mut request = apply_bearer_token(
-                    http.request(Method::GET, blob_url(base_url, query)?),
+                    http.request(Method::GET, blob_url(base_url, query)?)?,
                     token.as_deref(),
                 );
                 if let Some(range) = range {
@@ -2194,7 +2188,7 @@ impl GraphClient {
             } => {
                 let http = http.blob_delivery()?;
                 let request = apply_bearer_token(
-                    http.request(Method::HEAD, blob_url(base_url, query)?),
+                    http.request(Method::HEAD, blob_url(base_url, query)?)?,
                     token.as_deref(),
                 );
                 let response = http.send(request).await.map_err(blob_transport_error)?;
@@ -2274,10 +2268,10 @@ impl GraphClient {
                 let url = blob_write_url(base_url, query)?;
                 let request = match bytes {
                     Some(bytes) => http
-                        .request(Method::PUT, url)
+                        .request(Method::PUT, url)?
                         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                         .body(bytes),
-                    None => http.request(Method::DELETE, url),
+                    None => http.request(Method::DELETE, url)?,
                 };
                 let request = apply_bearer_token(request, token.as_deref());
                 let request = match if_match {
@@ -2671,6 +2665,83 @@ mod tests {
         );
         assert!(!format!("{error:?}").contains("secret"));
         assert!(!serde_json::to_string(contract).unwrap().contains("secret"));
+    }
+
+    /// A `unix://` root's whole path names the socket: the server receives
+    /// only the HTTP target after the root, with the same discovery, bearer
+    /// and contract rules as over TCP. A URL outside the root is never sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_http_over_a_unix_socket_sends_root_relative_targets_issue_979() {
+        let server = IntentApiFixture::graph(vec![contract_reply(200, json!({"ok": true}))]);
+        let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
+        let root = gateway.url();
+        let http = GraphHttpClient::new(&root).unwrap();
+        let base = resolve_server_flag(Some(&root), Some("knowledge"))
+            .unwrap()
+            .unwrap();
+        let value: Value = remote_json(
+            &http,
+            Method::GET,
+            remote_url(&base, &["branches", "etl/run 1"], &[("branch", "a b")]).unwrap(),
+            None,
+            Some("data-bearer"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!({"ok": true}));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        assert!(!requests[0].headers.contains_key("authorization"));
+        assert_eq!(
+            requests[1].path,
+            "/graphs/knowledge/branches/etl%2Frun%201?branch=a+b"
+        );
+        assert_eq!(requests[1].headers["host"], "localhost");
+        assert_eq!(requests[1].headers["authorization"], "Bearer data-bearer");
+        assert_eq!(
+            requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+            omnigraph_api_types::HTTP_API_CONTRACT
+        );
+        assert_eq!(gateway.connections(), 2, "both requests used the socket");
+        server.assert_complete();
+
+        let escaped = resolve_server_flag(Some(&root), Some("../.."))
+            .unwrap()
+            .unwrap();
+        for outside in [
+            format!("{root}2/graphs"),
+            remote_url(&escaped, &["snapshot"], &[]).unwrap(),
+        ] {
+            let error = http.request(Method::GET, outside.clone()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the Unix-socket server root"),
+                "{outside}: {error}"
+            );
+        }
+        assert_eq!(server.requests().len(), 2);
+
+        // Removing the socket fails discovery before the data request.
+        drop(gateway);
+        let error = remote_json::<Value>(
+            &http,
+            Method::GET,
+            remote_url(&base, &["snapshot"], &[]).unwrap(),
+            None,
+            Some("data-bearer"),
+        )
+        .await
+        .unwrap_err();
+        let contract = error.downcast_ref::<ApiContractError>().unwrap();
+        assert!(!contract.request_dispatched);
+        assert!(
+            contract.error.contains("connection failed (Unix socket)"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

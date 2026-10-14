@@ -5666,6 +5666,7 @@ dependencies = [
  "omnigraph-policy",
  "omnigraph-server",
  "omnigraph-skill",
+ "percent-encoding",
  "predicates",
  "reqwest 0.12.28",
  "serde",

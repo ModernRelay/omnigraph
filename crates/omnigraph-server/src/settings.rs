@@ -392,6 +392,7 @@ pub async fn load_server_settings_with_identity_trust(
         canonical_root,
         trust,
         oidc_trust,
+        mcp: McpSettings::default(),
     })
 }
 

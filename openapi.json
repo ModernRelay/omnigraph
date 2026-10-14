@@ -31,6 +31,39 @@
         }
       }
     },
+    "/.well-known/oauth-protected-resource/{resource_path}": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "The same metadata at the location the `/mcp` challenge advertises for a\nresource identifier with a path: the well-known prefix followed by that\npath (`/.well-known/oauth-protected-resource/mcp` for `https://host/mcp`).\nEvery other suffix is 404.",
+        "operationId": "oauthProtectedResourceMetadataAtResourcePath",
+        "parameters": [
+          {
+            "name": "resource_path",
+            "in": "path",
+            "description": "The configured resource identifier's path, without its leading `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public OAuth protected resource metadata",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Not the configured resource's path, or OAuth resource identity is not configured"
+          }
+        }
+      }
+    },
     "/cluster/deployments": {
       "get": {
         "tags": [

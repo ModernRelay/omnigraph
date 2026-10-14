@@ -41,8 +41,8 @@ pub(crate) struct Cli {
     pub(crate) as_actor: Option<String>,
 
     /// Address a server by name (resolves to its `url` from `servers:` in
-    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL. Exclusive
-    /// with a positional URI.
+    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL or
+    /// `unix:///absolute/path.sock` socket. Exclusive with a positional URI.
     #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 

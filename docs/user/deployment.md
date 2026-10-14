@@ -215,6 +215,22 @@ docker run --rm -p 8080:8080 \
 Terminate TLS at a load balancer or trusted reverse proxy. Keep bearer tokens
 and storage credentials in the platform's secret store.
 
+## Unix-socket access
+
+`omnigraph-server` listens on TCP only. Some local clients can open a Unix-domain
+socket but no TCP connection, such as an agent whose sandbox allows one socket
+path. To serve them, run a gateway that relays the socket to the server's
+loopback address unchanged, for example:
+
+```bash
+socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
+```
+
+Clients address it with `--server unix:///run/omnigraph/server.sock`. The
+gateway must pass requests and responses through unchanged, including the
+`Omnigraph-Http-Api` header. Restrict who may connect with the permissions of
+the socket's directory; bearer authentication and policy apply as over TCP.
+
 ## S3-compatible storage
 
 For AWS S3, configure the standard AWS credential chain and region. For a
