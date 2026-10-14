@@ -291,18 +291,13 @@ fn validate_cluster_arguments(
                 if plan.is_none() {
                     return Err(Cli::command().error(
                         clap::error::ErrorKind::MissingRequiredArgument,
-                        "cluster apply --managed requires --plan <PLAN_ID>",
+                        "cluster apply --managed requires --plan <PREVIEW_ID>",
                     ));
                 }
             }
-            ClusterCommand::Status {
-                deployment_id,
-                wait,
-                timeout,
-                ..
-            } if deployment_id.is_some() || *wait || timeout.is_some() => {
+            ClusterCommand::Status { deployment_id, .. } if deployment_id.is_some() => {
                 return Err(conflict(
-                    "--managed status accepts a positional RUN_ID; --deployment-id, --wait and --timeout apply only to server deployments",
+                    "--managed status accepts a positional DEPLOYMENT_ID; --deployment-id selects a server or storage deployment",
                 ));
             }
             _ => {}
@@ -313,6 +308,8 @@ fn validate_cluster_arguments(
     }
     match command {
         ClusterCommand::Create { .. }
+        | ClusterCommand::List { .. }
+        | ClusterCommand::Pull { .. }
         | ClusterCommand::Push { .. }
         | ClusterCommand::Delete { .. }
         | ClusterCommand::UndoDelete { .. }
@@ -341,7 +338,7 @@ fn validate_cluster_arguments(
             run_id: Some(_), ..
         } => {
             return Err(conflict(
-                "a positional RUN_ID requires --managed; use --deployment-id for a server or storage deployment",
+                "a positional delivery ID requires --managed; use --deployment-id for a server or storage deployment",
             ));
         }
         _ => {}
@@ -1676,6 +1673,10 @@ async fn run(cli: Cli) -> Result<()> {
                         ..
                     }) => bail!("{}", commit_write_at_read_door(&write)),
                     Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        ..
+                    }) => bail!("{}", helpers::load_at_read_door(&stmt)),
+                    Ok(QueryFile {
                         body: FileBody::Show(id),
                         settings: prefix,
                         ..
@@ -1792,6 +1793,25 @@ async fn run(cli: Cli) -> Result<()> {
                             &query_source,
                             write,
                             has_target,
+                            name.is_some() || params_json.is_some(),
+                            if_commit.is_some(),
+                            cli.yes,
+                            json,
+                            &settings,
+                        )
+                        .await
+                    }
+                    Ok(QueryFile {
+                        body: FileBody::Load(stmt),
+                        settings: prefix,
+                        ..
+                    }) => {
+                        refuse_process_prefix_when_remote(&client, &prefix)?;
+                        run_load_statement_cli(
+                            &client,
+                            &query_source,
+                            stmt,
+                            branch.as_deref(),
                             name.is_some() || params_json.is_some(),
                             if_commit.is_some(),
                             cli.yes,
@@ -2333,6 +2353,8 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
@@ -2506,6 +2528,53 @@ async fn run_commit_statement_cli(
     client
         .commit_write_statement(query_source, write, settings)
         .await
+}
+
+/// The `mutate` door's load-statement path: envelope refusals as for a
+/// branch statement, `--branch` as the target, overwrite consent, then the
+/// round trip under the base `embedded_file_source_policy` installs.
+#[allow(clippy::too_many_arguments)]
+async fn run_load_statement_cli(
+    client: &client::GraphClient,
+    query_source: &str,
+    stmt: omnigraph_compiler::query::ast::LoadStmt,
+    branch: Option<&str>,
+    has_name_or_params: bool,
+    has_expected_head: bool,
+    yes: bool,
+    json: bool,
+    settings: &[(SettingId, SettingValue)],
+) -> Result<ChangeOutput> {
+    refuse_statement_envelope(false, has_name_or_params, has_expected_head)?;
+    if stmt.mode == omnigraph_compiler::query::ast::LoadStmtMode::Overwrite {
+        confirm_destructive("load csv (mode overwrite)", client.uri(), yes, json)?;
+    }
+    let policy = if client.is_remote() {
+        None
+    } else {
+        embedded_file_source_policy(&stmt.source)?
+    };
+    client
+        .load_statement(branch, query_source, stmt, policy, settings)
+        .await
+}
+
+/// One embedded-only base over a `file://` source's directory, so a direct
+/// run authorizes the statement by the policy's own rule (base outside the
+/// graph root included); any other scheme installs nothing.
+fn embedded_file_source_policy(source: &str) -> Result<Option<omnigraph::ExternalBlobPolicy>> {
+    let Some(path) = source.strip_prefix("file://") else {
+        return Ok(None);
+    };
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        bail!("`load csv \"{source}\"`: a `file://` source is an absolute path to a file");
+    };
+    let base = omnigraph::ExternalBlobBase::new(
+        format!("file://{parent}/"),
+        omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+    )
+    .map_err(|error| color_eyre::eyre::eyre!("`load csv \"{source}\"`: {error}"))?;
+    Ok(Some(omnigraph::ExternalBlobPolicy::allow(vec![base])?))
 }
 
 #[cfg(test)]

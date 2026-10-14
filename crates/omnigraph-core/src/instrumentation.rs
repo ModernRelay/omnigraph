@@ -712,6 +712,29 @@ tokio::task_local! {
     static STAGE_WRITE_PROBES: StageWriteProbes;
 }
 
+tokio::task_local! {
+    static EXTERNAL_PAYLOAD_READ_STALL: ();
+}
+
+/// Run `fut` with every external object payload read parked forever at its
+/// request site, so a test can prove that a deadline around the read fires
+/// and nothing after it runs. Production leaves this task-local unset, so
+/// the read only pays the unset lookup.
+pub async fn with_external_payload_read_stalled<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    EXTERNAL_PAYLOAD_READ_STALL.scope((), fut).await
+}
+
+/// Park here before an external object payload read when a test asked for
+/// the stall; return at once otherwise.
+pub async fn external_payload_read_stall() {
+    if EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Deterministic probe for the number of table-fragment staging futures that
 /// are inside their storage call at once.
 ///

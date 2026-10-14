@@ -92,10 +92,10 @@ omnigraph-azure-admission --help
 ```
 
 `omnigraph version` reports what the binary itself speaks, without opening a
-graph or contacting a server. For example, release 0.13.0 prints:
+graph or contacting a server. For example, a 0.14.0 edge build prints:
 
 ```text
-omnigraph 0.13.0
+omnigraph 0.14.0
 internal-schema 16 (serves v14 to v16)
 http-contract 0.13
 ```
@@ -104,7 +104,7 @@ http-contract 0.13
 
 ```json
 {
-  "version": "0.13.0",
+  "version": "0.14.0",
   "http_contract": "0.13",
   "internal_schema": {
     "writes": 16,

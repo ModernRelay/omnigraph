@@ -3454,7 +3454,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
-            .arg(" feature ")
+            .arg("feature")
             .arg("--json"),
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
@@ -3506,7 +3506,12 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
-    for (source, target) in [(" ", "main"), ("review", "\t")] {
+    for (source, target) in [
+        (" ", "main"),
+        ("review", "\t"),
+        (" review ", "main"),
+        ("review", " main "),
+    ] {
         let server = IntentApiFixture::graph(vec![]);
         let output = output_failure(cli().args([
             "--server",
@@ -3519,9 +3524,10 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             "--into",
             target,
         ]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("branch merge source and target must not be empty"),
+            stderr.contains("has leading or trailing whitespace")
+                || stderr.contains("contains a control character"),
             "{output:?}"
         );
         assert!(server.requests().is_empty());
@@ -3535,7 +3541,7 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
         "created_at": 1234567
     });
     let mut matrix = Vec::new();
-    for (statement, padded) in [(false, false), (false, true), (true, false)] {
+    for statement in [false, true] {
         let mut cases = vec![
             ("fast_forward", Some(commit.clone()), true),
             ("merged", Some(commit.clone()), true),
@@ -3558,13 +3564,13 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             cases.push(("merged", Some(bad_commit), false));
         }
         for (outcome, receipt, valid) in cases {
-            matrix.push((statement, padded, outcome, receipt, valid));
+            matrix.push((statement, outcome, receipt, valid));
         }
     }
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(statement, padded, outcome, receipt, valid)| {
+        |(statement, outcome, receipt, valid)| {
             let mut body = if statement {
                 json!({"branch":"main", "query_name":"branch merge",
                     "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
@@ -3580,8 +3586,6 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             command.args(["--server", &server.origin, "--graph", "knowledge"]);
             if statement {
                 command.args(["mutate", "-e", "branch merge review into main", "--json"]);
-            } else if padded {
-                command.args(["branch", "merge", " review ", "--into", " main ", "--json"]);
             } else {
                 command.args(["branch", "merge", "review", "--json"]);
             }
@@ -3664,9 +3668,9 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                     "knowledge",
                     "branch",
                     "merge",
-                    " review ",
+                    "review",
                     "--into",
-                    " main ",
+                    "main",
                     "--delete-branch",
                     "--json",
                 ])

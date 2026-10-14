@@ -2763,6 +2763,80 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
     assert_eq!(body["error"], "branch 'review/x' not found");
 }
 
+/// A `load csv` statement naming a source no base admits; the loaded test
+/// graph has no external Blob policy, so the served default, deny, applies.
+const LOAD_CSV_PEOPLE: &str =
+    "load csv \"s3://imports/people.csv\" into node:Person mode append header";
+
+/// Served `load csv` on `/mutate`, with and without the request `branch`:
+/// a graph without a policy denies the source before any byte is read, so
+/// no commit is published.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    for request in [
+        json!({"query": LOAD_CSV_PEOPLE}),
+        json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
+        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode append header"}),
+    ] {
+        let (status, body) = json_response(&app, json_post("/mutate", &request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("ingress is denied for this graph"),
+            "{request}: {error}"
+        );
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a denied load publishes nothing"
+    );
+
+    let required = omnigraph::loader::CSV_SOURCE_MAX_BYTES + LOAD_CSV_PEOPLE.len() as u64;
+    let graph = graph_path(temp.path());
+    for per_actor in [false, true] {
+        for capacity in [required - 1, required] {
+            let mut limits = omnigraph_server::workload::WorkloadLimits::default();
+            if per_actor {
+                limits.per_actor_bytes_max = capacity;
+            } else {
+                limits.global_bytes_max = capacity;
+            }
+            let workload = omnigraph_server::workload::WorkloadController::with_limits(limits);
+            let state = AppState::new_with_workload(
+                graph.to_string_lossy().to_string(),
+                Omnigraph::open(graph.to_str().unwrap()).await.unwrap(),
+                Vec::new(),
+                workload.clone(),
+            );
+            let operations = state.operation_runtime().clone();
+            let app = build_app(state);
+            let (status, body) = json_response(
+                &app,
+                json_post("/mutate", &json!({"query": LOAD_CSV_PEOPLE})),
+            )
+            .await;
+            if capacity < required {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+                assert_eq!(body["code"], "too_many_requests", "{body}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("ingress is denied for this graph"),
+                    "{body}"
+                );
+            }
+            assert_eq!(main_head_commit_id(&app).await, head);
+            assert_admission_open(&operations, &workload, "csv source admission").await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statement_refusals_name_the_door_and_the_envelope() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -2849,6 +2923,26 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
             json!({"query": EXPLAIN_ADULTS}),
             "statement 'explain' is a read; use POST /query",
         ),
+        (
+            "/query",
+            json!({"query": LOAD_CSV_PEOPLE}),
+            "statement 'load csv' is a control write; use POST /mutate",
+        ),
+        (
+            "/query",
+            json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
+            target_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": LOAD_CSV_PEOPLE, "name": "x"}),
+            name_refusal,
+        ),
+        (
+            "/mutate",
+            json!({"query": LOAD_CSV_PEOPLE, "branch": "main", "params": {"a": 1}}),
+            name_refusal,
+        ),
     ];
     for (path, request, expected) in cases {
         let (status, body) = json_response(&app, json_post(path, &request)).await;
@@ -2864,6 +2958,10 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
         (
             json!({"query": "branch create b0", "name": "x"}),
             name_refusal,
+        ),
+        (
+            json!({"query": LOAD_CSV_PEOPLE}),
+            "a branch statement takes no commit precondition",
         ),
     ];
     for (request, expected) in conditional {
@@ -3119,6 +3217,42 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
     }
     let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
     assert_eq!(listed["commits"], json!([]));
+
+    // An ordinary write past a proposal's parent expires it: reads at its id
+    // answer 404, the listing drops it, a publish fails its precondition, and
+    // a drop still succeeds.
+    let rae = propose_person(&app, "Rae").await;
+    let rae_id = rae["graph_commit_id"].as_str().unwrap().to_string();
+    let (status, body) = json_response(
+        &app,
+        json_post(
+            "/mutate",
+            &json!({"query": "query add() { insert Person { name: \"Sol\", age: 34 } }"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for path in [
+        format!("/commits/{rae_id}"),
+        format!("/commits/{rae_id}/changes"),
+    ] {
+        let (status, body) = get_json(&app, g(&path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    let (_, listed) = get_json(&app, g("/commits?unpublished=true")).await;
+    assert_eq!(listed["commits"], json!([]));
+    let (status, body) = json_response(
+        &app,
+        bodiless(Method::POST, &format!("/commits/{rae_id}/publish")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let response = app
+        .clone()
+        .oneshot(bodiless(Method::DELETE, &format!("/commits/{rae_id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 /// One mutation `as unattached branch` on main, a root when `base` is `None`

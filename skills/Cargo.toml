@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-skill"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "The omnigraph agent skill, embedded byte for byte for the OmniGraph CLI."
 license = "MIT"

@@ -5,9 +5,10 @@
 
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
+use omnigraph::loader::{CSV_SOURCE_MAX_BYTES, CsvLoadRequest};
 use omnigraph_compiler::query::ast::{
     BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME,
-    SettingStmt, show_statement_name,
+    LoadStmt, SettingStmt, show_statement_name,
 };
 use omnigraph_compiler::settings::{SettingId, SettingRow};
 
@@ -118,6 +119,70 @@ pub(super) fn commit_write_at_read_door(write: &CommitWrite) -> ApiError {
         refusals::CONTROL_WRITE_AT_READ_DOOR,
         write.statement_name(),
     ))
+}
+
+/// `load csv` is a write: the refusal a branch write meets at the read
+/// door, under the statement's own name.
+pub(super) fn load_at_read_door(stmt: &LoadStmt) -> ApiError {
+    ApiError::bad_request(refusals::with_statement(
+        refusals::CONTROL_WRITE_AT_READ_DOOR,
+        stmt.statement_name(),
+    ))
+}
+
+/// Run one `load csv` statement as a mutation body: the request `branch`
+/// (defaulting to `main` only here) receives the load after the `Change`
+/// check on it and admission; the answer counts the loaded nodes and edges
+/// and carries the load's own publication.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_load_statement(
+    state: &AppState,
+    handle: &GraphRequest,
+    session: &Session,
+    actor: Option<&AuthenticatedActor>,
+    ingress: IngressLease,
+    stmt: LoadStmt,
+    branch: Option<String>,
+    source_len: usize,
+) -> std::result::Result<ChangeOutput, ApiError> {
+    let branch = branch.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+    let actor_arc = actor
+        .map(|actor| Arc::clone(&actor.actor_id))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
+    let retained_input_bytes = (source_len as u64).saturating_add(CSV_SOURCE_MAX_BYTES);
+    let admission = state
+        .workload
+        .try_admit(&actor_arc, retained_input_bytes)
+        .map_err(ApiError::from_workload_reject)?;
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref().to_string());
+    let query_name = stmt.statement_name().to_string();
+    let request = CsvLoadRequest::from_statement(&stmt);
+    let session = session.clone();
+    owned_write(state, admission, ingress, handle.clone(), async move {
+        let receipt = session
+            .load_csv_as_with_receipt(&branch, &request, actor_id.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?;
+        Ok(ChangeOutput {
+            branch: receipt.result.branch,
+            query_name,
+            affected_nodes: receipt.result.nodes_loaded.values().sum(),
+            affected_edges: receipt.result.edges_loaded.values().sum(),
+            actor_id,
+            commit: Some(api::commit_output(&receipt.commit)),
+            outcome: None,
+        })
+    })
+    .await
 }
 
 pub(super) fn read_at_write_door(statement_name: &str) -> ApiError {

@@ -45,9 +45,9 @@ mod dispatch;
 use dispatch::{
     CommitControlOutcome, Door, ReadDispatch, branch_read_body, classify, commit_control_body,
     commit_write_at_read_door, control_write_at_read_door, explain_at_write_door,
-    read_at_write_door, refuse_empty_file, refuse_explain, refuse_process_settings,
-    refuse_statement_envelope, refuse_wrong_door, run_branch_statement, run_commit_statement,
-    session_with_prefix, show_at_write_door,
+    load_at_read_door, read_at_write_door, refuse_empty_file, refuse_explain,
+    refuse_process_settings, refuse_statement_envelope, refuse_wrong_door, run_branch_statement,
+    run_commit_statement, run_load_statement, session_with_prefix, show_at_write_door,
 };
 
 /// Liveness probe.
@@ -603,8 +603,12 @@ pub(crate) enum Authz {
 }
 
 /// HTTP-layer Cedar policy gate, returning the allow/deny [`Authz`] decision
-/// and reserving `Err` for operational failures (401 missing bearer, 500
-/// policy-evaluation error). Two sources of the policy engine:
+/// and reserving `Err` for operational failures (400 non-canonical branch
+/// name, 401 missing bearer, 500 policy-evaluation error). Every route names
+/// its branches in the [`PolicyRequest`], so the request's names are refused
+/// here, before any rule and in every runtime mode, when they are not
+/// canonical: the decision judges a name as written and the engine opens that
+/// same name. Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*.
 ///   * Management handler — captures the current registry snapshot policy so
@@ -622,6 +626,7 @@ pub(crate) fn authorize(
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
+    require_canonical_branches([request.branch.as_deref(), request.target_branch.as_deref()])?;
     if let Some(actor) = actor {
         if actor.source == AuthSource::SignedData && policy.is_none() {
             return Ok(Authz::Denied(
@@ -698,9 +703,24 @@ pub(crate) fn authorize(
     }
 }
 
+/// Refuse a request's branch names that are not canonical
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]) as a 400. [`authorize`]
+/// applies it to every [`PolicyRequest`]; a route that looks a branch up before
+/// it authorizes applies it first.
+pub(crate) fn require_canonical_branches<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+) -> std::result::Result<(), ApiError> {
+    for name in names.into_iter().flatten() {
+        omnigraph_policy::ensure_canonical_branch_name(name)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Thin wrapper over [`authorize`] for the handlers that treat any denial as a
 /// 403: a denial becomes `ApiError::forbidden`, and operational failures
-/// (401 missing bearer, 500 policy-evaluation error) propagate unchanged. The
+/// (400 non-canonical branch name, 401 missing bearer, 500 policy-evaluation
+/// error) propagate unchanged. The
 /// stored-query invoke handler does **not** use this — it consumes the
 /// [`Authz`] decision directly to hide a denial as a 404 while letting an
 /// operational failure keep its true status.
@@ -1404,7 +1424,7 @@ pub(crate) async fn server_export(
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid export request", rejection))?;
-    let branch = normalize_change_branch(request.branch.as_deref())?;
+    let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -1592,6 +1612,28 @@ pub(crate) async fn run_mutate(
             let session = session_with_prefix(&session, &file.settings)?;
             return run_commit_statement(&state, &handle, &session, actor, ingress, write).await;
         }
+        FileBody::Load(stmt) => {
+            if door == Door::Query {
+                return Err(load_at_read_door(&stmt));
+            }
+            refuse_statement_envelope(
+                false,
+                name.is_some() || params_json.is_some(),
+                expected_head.is_some(),
+            )?;
+            let session = session_with_prefix(&session, &file.settings)?;
+            return run_load_statement(
+                &state,
+                &handle,
+                &session,
+                actor,
+                ingress,
+                stmt,
+                branch,
+                query.len(),
+            )
+            .await;
+        }
         FileBody::Show(id) => return Err(show_at_write_door(id)),
         FileBody::Explain(_) => {
             refuse_explain(door)?;
@@ -1776,6 +1818,14 @@ pub(crate) async fn run_query(
                 false,
             )?;
             return Err(commit_write_at_read_door(&write));
+        }
+        FileBody::Load(stmt) => {
+            refuse_statement_envelope(
+                branch.is_some() || snapshot.is_some(),
+                name.is_some() || params_json.is_some(),
+                false,
+            )?;
+            return Err(load_at_read_door(&stmt));
         }
         FileBody::Show(id) => {
             refuse_statement_envelope(
@@ -2340,6 +2390,7 @@ async fn authorize_load_scope(
     branch: &str,
     from: Option<&str>,
 ) -> std::result::Result<(), ApiError> {
+    require_canonical_branches([Some(branch), from])?;
     let branch_exists = handle
         .engine
         .branch_list()
@@ -4009,10 +4060,26 @@ fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), A
     Ok(())
 }
 
-/// A side of a graph diff the caller must spell.
+/// The branch a change route names, `main` when it names none, as written: a
+/// name that is not canonical is refused before authorization reads it.
+fn requested_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
+    let branch = branch.unwrap_or("main");
+    require_canonical_branches([Some(branch)])?;
+    Ok(branch.to_string())
+}
+
+/// A side of a graph diff the caller must spell, passed on as written. A
+/// branch name and a commit id are never trimmed, so a spelling neither could
+/// be is refused here (the change routes' error allowlist would hide the
+/// engine's refusal behind a 500).
 fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result<String, ApiError> {
     match value {
-        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        Some(value) if !value.trim().is_empty() => {
+            omnigraph_policy::ensure_canonical_branch_name(&value).map_err(|error| {
+                ApiError::bad_request(format!("query parameter '{name}': {error}"))
+            })?;
+            Ok(value)
+        }
         _ => Err(ApiError::bad_request(format!(
             "query parameter '{name}' is required"
         ))),
@@ -4207,8 +4274,8 @@ pub(crate) async fn branch_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
-    let source = normalize_change_branch(Some(source))?;
-    let target = normalize_change_branch(target)?;
+    let source = requested_branch(Some(source))?;
+    let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
     handle
         .engine
@@ -4269,8 +4336,8 @@ pub(crate) async fn merge_base_body(
     source: &str,
     target: Option<&str>,
 ) -> std::result::Result<(String, String, omnigraph::changes::MergeBase), ApiError> {
-    let source = normalize_change_branch(Some(source))?;
-    let target = normalize_change_branch(target)?;
+    let source = requested_branch(Some(source))?;
+    let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
     let base = handle
         .engine
@@ -4396,20 +4463,6 @@ fn parse_change_feed_start(
     }
 }
 
-/// Normalize a caller-supplied change-surface branch BEFORE authorization so
-/// Cedar and the engine classify the same identity. The engine trims late
-/// (its own branch normalization), so authorizing the raw string would let a
-/// padded spelling like " main " be classified as an unprotected named branch
-/// and then resolve to protected main — a policy bypass. Empty-after-trim is
-/// a malformed request rather than an implicit main.
-fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
-    let trimmed = branch.unwrap_or("main").trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::bad_request("branch name cannot be empty"));
-    }
-    Ok(trimmed.to_string())
-}
-
 #[utoipa::path(
     get,
     path = "/changes",
@@ -4444,7 +4497,7 @@ pub(crate) async fn server_changes_feed(
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
     validate_change_http_limit(params.limit)?;
-    let branch = normalize_change_branch(params.branch.as_deref())?;
+    let branch = requested_branch(params.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -4522,7 +4575,7 @@ pub(crate) async fn server_changes_baseline(
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = normalize_change_branch(request.branch.as_deref())?;
+    let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),

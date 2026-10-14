@@ -37,6 +37,11 @@ start; see [cluster deployments](../clusters/index.md).
 An unapplied resource edit does not activate it, although changing or breaking
 the directory's config can change where boot looks for applied state.
 
+For first boot of a fresh, empty S3 cluster initialized by the library, use
+`--bootstrap-handoff FILE` with its exact receipt. This is a one-time ownership
+claim, not a restart or recovery path; see
+[first boot from a bootstrap receipt](../clusters/index.md#first-boot-from-a-bootstrap-receipt).
+
 ### Logs
 
 The server logs to standard output at `info` unless `RUST_LOG` sets other
@@ -300,7 +305,7 @@ is an error unless the request supplies `from`. This differs from the CLI,
 where `--mode` is always required.
 
 See [Mutations and loading](../mutations/index.md) for the record shape and load
-modes.
+modes, including [CSV statements on `/mutate`](../mutations/index.md#csv-loading).
 
 ## Deliver Blob values
 
