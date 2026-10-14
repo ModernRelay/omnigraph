@@ -33,14 +33,17 @@ a missing target branch by combining `--branch <name>` with `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
-`POST /mutate` and the listing to `POST /query`, each with no request target,
-name, or parameters:
+`POST /mutate`, and the listing and the branch reads to `POST /query`, each
+with no request target, name, or parameters:
 
 ```text
 branch create "review/add-benchmark" from main
 branch merge "review/add-benchmark" into main
 branch delete "review/abandoned"
 branch list
+branch diff "review/add-benchmark" into main
+branch merge-base "review/add-benchmark" into main
+branch merge "review/add-benchmark" into main dry run
 ```
 
 `from` defaults to `main` and `into` defaults to `main`. A name outside the
@@ -53,7 +56,12 @@ that publishes a commit reports it in `commit`. `branch list` answers one row
 per branch in column `name`, sorted by name. Each statement runs under the same
 policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch}`,
 `POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
-refused on `POST /mutate` as a control write is refused on `POST /query`.
+refused on `POST /mutate` as a control write is refused on `POST /query`. The
+branch reads `branch diff`, `branch merge-base` and `branch merge … dry run`
+answer rows as `branch list` does and take their routes' checks; see
+[reviewing a branch](changes.md#review-a-branch) and
+[previewing a merge](merge.md#preview-a-merge). A bare `dry run` after the
+names is the clause, so a branch named `dry` is quoted.
 
 Branches are cheap until written: unchanged data remains shared with the source.
 A branch remains after a normal merge, so prefer `--delete-branch` or delete it
@@ -239,10 +247,13 @@ versions that commit needs. Branch deletion can likewise end access to branch-on
 
 ## Changes and feeds
 
-Inspect the logical changes made by one commit:
+Inspect the logical changes made by one commit, compare two points, or review
+what a branch changed since it left `main`:
 
 ```bash
 omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph diff --from <commit-id> --to main --store graph.omni --json
+omnigraph branch diff feature --store graph.omni --json
 ```
 
 For continuous consumption, `omnigraph changes poll` follows complete commits
@@ -250,7 +261,7 @@ on one branch and returns an opaque resume cursor. If cleanup has reclaimed
 required history, create a coherent snapshot and new cursor with
 `omnigraph changes baseline`.
 
-See [Changes and Change Feeds](changes.md) for filters, pagination, cursor
-checkpointing, and `410` retention-gap recovery.
+See [Changes, Diffs and Change Feeds](changes.md) for filters, pagination,
+cursor checkpointing, and `410` retention-gap recovery.
 
 See [Merging Branches](merge.md) for merge outcomes and conflict handling.

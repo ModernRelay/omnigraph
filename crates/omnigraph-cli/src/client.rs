@@ -34,15 +34,16 @@ use omnigraph_api_types::{
     BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutcome,
     BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput, ChangeBaselineOutput,
     ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOpOutput, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, EntityKindOutput,
-    ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse, GraphListResponse,
-    InvokeStoredQueryRequest, QueryRequest, ReadOutput, SchemaApplyOutput, SchemaOutput,
-    SettingsRequest, SnapshotOutput, branch_list_read_output, change_baseline_output,
-    change_feed_output, change_scope, commit_changes_output, commit_output, read_output,
+    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
+    EntityKindOutput, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryResponse,
+    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryRequest, ReadOutput,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
+    branch_read_output, change_baseline_output, change_feed_output, change_scope,
+    commit_changes_output, commit_output, diff_output, merge_base_output, read_output,
     schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite};
+use omnigraph_compiler::query::ast::{BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -107,11 +108,29 @@ fn validate_merge_output(
     target: &str,
     delete_branch: bool,
     as_commit: bool,
+    dry_run: bool,
 ) -> Result<()> {
     if output.source != source || output.target != target {
         bail!(
             "invalid merge response: source or target differs from the request; effects are unknown; reconcile before retrying"
         );
+    }
+    if output.dry_run != dry_run {
+        bail!(
+            "invalid merge response: the dry-run flag contradicts the request; effects are unknown; reconcile before retrying"
+        );
+    }
+    if dry_run {
+        // A dry run writes nothing: no commit, no deletion.
+        if output.commit.is_some()
+            || output.branch_deleted.is_some()
+            || output.branch_delete_error_details.is_some()
+        {
+            bail!(
+                "invalid merge response: a dry run reported a write; effects are unknown; reconcile before retrying"
+            );
+        }
+        return Ok(());
     }
     validate_merge_receipt(
         output.outcome,
@@ -1507,6 +1526,43 @@ impl GraphClient {
         }
     }
 
+    /// A branch control read from `-e`/`--query` (`branch diff`,
+    /// `branch merge-base`, `branch merge … dry run`): `POST /query` with the
+    /// source and the `--set` values, or the embedded engine's answer in the
+    /// one `ReadOutput` shape the server renders.
+    pub(crate) async fn branch_read_statement(
+        &self,
+        query_source: &str,
+        read: BranchRead,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ReadOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_query_request(query_source);
+                request.settings = Self::remote_settings(settings)?;
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let session = Self::open_read_session(uri, settings).await?;
+                Ok(branch_read_output(&session.branch_read(&read).await?)?)
+            }
+        }
+    }
+
     /// The `show` statement from `-e`/`--query`: `POST /query` with the
     /// source and the `--set` values, or the embedded session's rows after
     /// the source's prefix, both as the one `ReadOutput` shape
@@ -1724,12 +1780,14 @@ impl GraphClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn branch_merge(
         &self,
         source: &str,
         into: &str,
         delete_branch: bool,
         as_commit: bool,
+        dry_run: bool,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
         // Dispatch, receipt validation and optional deletion all use the names
@@ -1754,11 +1812,27 @@ impl GraphClient {
                         target: Some(into.to_string()),
                         delete_branch,
                         as_commit,
+                        dry_run,
                         settings: Self::remote_settings(settings)?,
                     })?),
                     token.as_deref(),
                 )
                 .await?
+            }
+            GraphClient::Embedded { uri, actor } if dry_run => {
+                // A read of both branches, composed as the server's dry run.
+                let session = Self::open_read_session(uri, settings).await?;
+                let result = session.branch_merge_dry_run(source, into).await?;
+                BranchMergeOutput {
+                    source: source.to_string(),
+                    target: into.to_string(),
+                    outcome: result.outcome.into(),
+                    commit: None,
+                    actor_id: actor.clone(),
+                    branch_deleted: None,
+                    branch_delete_error_details: None,
+                    dry_run: true,
+                }
             }
             GraphClient::Embedded { uri, actor } => {
                 let session = Self::open_write_session(uri, settings).await?;
@@ -1789,11 +1863,119 @@ impl GraphClient {
                     actor_id: actor.map(String::from),
                     branch_deleted,
                     branch_delete_error_details,
+                    dry_run: false,
                 }
             }
         };
-        validate_merge_output(&output, source, into, delete_branch, as_commit)?;
+        validate_merge_output(&output, source, into, delete_branch, as_commit, dry_run)?;
         Ok(output)
+    }
+
+    /// Fetch one bounded page of a graph diff. Auto-pagination is owned by the
+    /// command output loop, as for `commit_changes_page`.
+    pub(crate) async fn diff_page(
+        &self,
+        sides: DiffSidesArg<'_>,
+        page_token: Option<&str>,
+        limit: Option<usize>,
+        filter: &ChangeFilterArgs<'_>,
+    ) -> Result<DiffOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                let limit_value = limit.map(|limit| limit.to_string());
+                let (segments, sides): (&[&str], [(&str, &str); 2]) = match sides {
+                    DiffSidesArg::Between { from, to } => (&["diff"], [("from", from), ("to", to)]),
+                    DiffSidesArg::Branch { source, target } => (
+                        &["branches", "diff"],
+                        [("source", source), ("target", target)],
+                    ),
+                };
+                let mut query: Vec<(&str, &str)> = sides.to_vec();
+                if let Some(page_token) = page_token {
+                    query.push(("page_token", page_token));
+                }
+                if let Some(limit) = limit_value.as_deref() {
+                    query.push(("limit", limit));
+                }
+                let filter_pairs = filter.query_pairs();
+                query.extend(
+                    filter_pairs
+                        .iter()
+                        .map(|(name, value)| (*name, value.as_str())),
+                );
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, segments, &query)?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let session = Self::open_read_session(uri, &[]).await?;
+                let sides = match sides {
+                    DiffSidesArg::Between { from, to } => {
+                        omnigraph::changes::GraphDiffSides::Between {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                        }
+                    }
+                    DiffSidesArg::Branch { source, target } => {
+                        omnigraph::changes::GraphDiffSides::Branch {
+                            source: source.to_string(),
+                            target: target.to_string(),
+                        }
+                    }
+                };
+                let page = session
+                    .diff_page(&omnigraph::changes::GraphDiffRequest {
+                        sides,
+                        scope: change_scope(filter.kinds, filter.types, filter.ops),
+                        page_token: page_token.map(str::to_string),
+                        max_changes: limit,
+                        max_bytes: None,
+                    })
+                    .await?;
+                Ok(diff_output(&page))
+            }
+        }
+    }
+
+    /// The merge base of `source` and `target`, with the heads it was
+    /// computed from.
+    pub(crate) async fn merge_base(&self, source: &str, target: &str) -> Result<MergeBaseOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                ..
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(
+                        base_url,
+                        &["branches", "merge-base"],
+                        &[("source", source), ("target", target)],
+                    )?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let session = Self::open_read_session(uri, &[]).await?;
+                let base = session.merge_base(source, target).await?;
+                Ok(merge_base_output(source, target, &base))
+            }
+        }
     }
 
     /// Apply a standalone graph's schema with the caller's catalog validator.
@@ -2233,6 +2415,15 @@ fn verified_blob_precondition(error: color_eyre::eyre::Report) -> color_eyre::ey
         Ok(remote) => remote.into(),
         Err(error) => error,
     }
+}
+
+/// The two sides of a graph diff, as the command spelled them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DiffSidesArg<'a> {
+    /// Two read targets: branches or commit ids.
+    Between { from: &'a str, to: &'a str },
+    /// A source branch against its merge base with a target branch.
+    Branch { source: &'a str, target: &'a str },
 }
 
 /// Shared spelling of the change-surface filters across the three verbs; one
@@ -2997,7 +3188,7 @@ mod tests {
             (
                 "branch merge",
                 client
-                    .branch_merge("review", "main", false, false, &settings)
+                    .branch_merge("review", "main", false, false, false, &settings)
                     .await
                     .map(|_| ()),
             ),
@@ -3104,7 +3295,7 @@ mod tests {
             .await
             .unwrap();
         client
-            .branch_merge("review", "main", false, false, &settings)
+            .branch_merge("review", "main", false, false, false, &settings)
             .await
             .unwrap();
 

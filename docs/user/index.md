@@ -24,7 +24,7 @@ deployment.
 ## History and collaboration
 
 - [Branches, commits, and snapshots](branching/index.md)
-- [Commit changes, change feeds, and baselines](branching/changes.md)
+- [Commit changes, diffs, branch review, change feeds, and baselines](branching/changes.md)
 - [Merging and conflicts](branching/merge.md)
 
 ## CLI and HTTP
