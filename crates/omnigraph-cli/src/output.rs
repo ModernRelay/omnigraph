@@ -1071,6 +1071,57 @@ pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result
     Ok(())
 }
 
+/// What this binary speaks, learned without contacting a server: the
+/// `omnigraph-http-api` value a server must match exactly, and the storage
+/// formats it writes and serves.
+#[derive(Debug, Serialize)]
+pub(crate) struct VersionOutput {
+    pub(crate) version: &'static str,
+    pub(crate) http_contract: &'static str,
+    pub(crate) internal_schema: InternalSchemaOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InternalSchemaOutput {
+    /// The stamp this binary's publications write.
+    pub(crate) writes: u32,
+    /// The inclusive range of stamps normal open serves, lowest first.
+    pub(crate) serves: [u32; 2],
+}
+
+impl VersionOutput {
+    pub(crate) fn current() -> Self {
+        use omnigraph::db::manifest::{
+            INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        };
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
+            internal_schema: InternalSchemaOutput {
+                writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
+                serves: [
+                    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    INTERNAL_MANIFEST_SCHEMA_VERSION,
+                ],
+            },
+        }
+    }
+}
+
+pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    let [lowest, highest] = output.internal_schema.serves;
+    println!("omnigraph {}", output.version);
+    println!(
+        "internal-schema {} (serves v{lowest} to v{highest})",
+        output.internal_schema.writes
+    );
+    println!("http-contract {}", output.http_contract);
+    Ok(())
+}
+
 /// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
 pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
     let operator = crate::operator::load_operator_config().unwrap_or_default();

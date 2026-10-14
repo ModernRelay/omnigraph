@@ -156,6 +156,37 @@ in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
 
+## CSV fixtures and the load statement
+
+A `--- mutate` step may hold one `load csv` statement
+([CSV loading](../../docs/user/mutations/index.md#csv-loading)); its
+`branch:` argument is the statement's target, as for a mutation declaration,
+and its `--- expect` takes the control-write forms (`ok`, `error: <needle>`).
+`--- bind commit $name` after it binds the load's commit. The source is a
+URI the engine reads under the case's external Blob policy, or the bare name
+of a `--- csv <name>` section: that section's body is the file's text, the
+runner writes every such section into a fresh directory before the store
+opens, rewrites the statement's source to the file's `file://` URI, and
+installs one `embedded_only` base over that directory on the case's handles,
+across a `--- restart` too, so the statement is authorized by the rule any
+source meets. A bare name without its section refuses the case. A served
+environment refuses fixture sections and bare source names at admission,
+before starting a worker or making any server request. A `load csv` step
+there names an absolute
+URI the server may read, and the `omnigraph-engine` environment is the one
+that runs section-backed loads. The step is reported as a `load` kind.
+
+```text
+--- csv person.csv
+id|firstName
+2|bob
+
+--- mutate branch: work
+load csv "person.csv" into node:Person mode append delimiter "|" header
+
+--- expect ok
+```
+
 ## Generated fixtures and loads
 
 An ordinary `--- seed` contains JSONL and loads with overwrite semantics.

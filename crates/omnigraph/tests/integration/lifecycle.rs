@@ -287,6 +287,70 @@ async fn prepared_graph_create_reconciles_only_its_own_exact_genesis() {
 }
 
 #[tokio::test]
+async fn prepared_graph_and_reopened_lance_writes_keep_the_storage_lifetime() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let prepared = Omnigraph::prepare_graph_create(uri, TEST_SCHEMA)
+        .await
+        .unwrap();
+    let scope = omnigraph::storage::StorageIoScope::new();
+    let db = session(
+        Omnigraph::apply_prepared_graph_create_with_io_scope(&prepared, Some(scope.clone()))
+            .await
+            .unwrap(),
+    );
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Scoped")], &[("$age", 1)]),
+    )
+    .await
+    .unwrap();
+    db.branch_create("first").await.unwrap();
+    scope.wait_idle().await;
+    assert!(!scope.is_uncertain());
+    scope.close();
+    assert!(db.branch_create("closed").await.is_err());
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "closed")
+    );
+    drop(db);
+
+    let reopened_scope = omnigraph::storage::StorageIoScope::new();
+    let reopened = session(
+        Omnigraph::open_with_io_scope(uri, reopened_scope.clone())
+            .await
+            .unwrap(),
+    );
+    mutate_main(
+        &reopened,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Scoped")], &[("$age", 2)]),
+    )
+    .await
+    .unwrap();
+    reopened.branch_create("second").await.unwrap();
+    reopened_scope.wait_idle().await;
+    assert!(!reopened_scope.is_uncertain());
+    reopened_scope.close();
+    assert!(reopened.branch_create("also-closed").await.is_err());
+    assert!(
+        !reopened
+            .branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|name| name == "also-closed")
+    );
+}
+
+#[tokio::test]
 async fn prepared_graph_create_rejects_mutated_serialized_input_before_effects() {
     let dir = tempfile::tempdir().unwrap();
     let prepared = Omnigraph::prepare_graph_create(dir.path().to_str().unwrap(), TEST_SCHEMA)

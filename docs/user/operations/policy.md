@@ -107,7 +107,18 @@ cluster APIs keep their explicit trust boundary.
 
 Graph rules may use `branch_scope` for a source branch or
 `target_branch_scope` for a destination branch. Values are `any`, `protected`,
-or `unprotected`; a rule may not set both. Server actions and graph-wide
+or `unprotected`; a rule may not set both. A branch is protected when the
+bundle's `protected_branches` list names it exactly:
+
+```yaml
+protected_branches: [main, release]
+```
+
+Branch names are compared as written. A `protected_branches` entry that is
+empty, has leading or trailing whitespace, or contains a control character
+fails policy validation, and a request naming such a branch is refused as a
+bad request before any rule is evaluated (see
+[branch names](../branching/index.md#branch-names)). Server actions and graph-wide
 `invoke_query` rules do not take branch scopes. `commit_publish` and
 `commit_drop` take `target_branch_scope`: the scope is the branch the
 unpublished commit recorded as its target. Writing an unpublished commit

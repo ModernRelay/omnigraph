@@ -31,6 +31,39 @@
         }
       }
     },
+    "/.well-known/oauth-protected-resource/{resource_path}": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "The same metadata at the location the `/mcp` challenge advertises for a\nresource identifier with a path: the well-known prefix followed by that\npath (`/.well-known/oauth-protected-resource/mcp` for `https://host/mcp`).\nEvery other suffix is 404.",
+        "operationId": "oauthProtectedResourceMetadataAtResourcePath",
+        "parameters": [
+          {
+            "name": "resource_path",
+            "in": "path",
+            "description": "The configured resource identifier's path, without its leading `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public OAuth protected resource metadata",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Not the configured resource's path, or OAuth resource identity is not configured"
+          }
+        }
+      }
+    },
     "/cluster/deployments": {
       "get": {
         "tags": [
@@ -10964,7 +10997,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes and\nthe only one it serves; a graph at any other version is refused until\nit is upgraded offline or rebuilt.",
+            "description": "The internal-schema (storage-format) version this binary writes, the\nhighest it serves. Normal open serves every version from the binary's\nlowest supported one up to this one; a graph below that range is\nrefused until it is upgraded offline or rebuilt, and a graph above it\nneeds a newer binary.",
             "minimum": 0
           },
           "source_version": {
@@ -11848,7 +11881,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. This binary serves only its own storage-format version; a\ngraph at any other version is refused until it is upgraded offline or rebuilt.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. It may be below the version the binary writes (the\n`internal_schema_version` of `GET /healthz`): normal open serves a range\nof versions, and a branch in that range takes the current one at its\nfirst publish.",
             "minimum": 0
           }
         }

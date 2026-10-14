@@ -264,13 +264,13 @@ async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScop
 }
 
 /// A remote graph must be addressed with `--server` (RFC-011): a positional or
-/// `--uri` `http(s)://` URL no longer auto-dispatches to a server. A remote URL
-/// produced by a server scope (`via_server`) is fine.
+/// `--uri` server URL (`http(s)://` or `unix://`) no longer auto-dispatches to a
+/// server. A remote URL produced by a server scope (`via_server`) is fine.
 fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
     if !via_server && is_remote_uri(uri) {
         bail!(
             "a remote graph must be addressed with `--server <url>` — a positional \
-             (or `--uri`) http(s):// URL no longer dispatches to a server"
+             (or `--uri`) http(s):// or unix:// URL no longer dispatches to a server"
         );
     }
     Ok(())
@@ -344,14 +344,8 @@ impl GraphClient {
                  --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
             );
         };
-        let client = Self::registry_client(server)?;
-        if !is_remote_uri(client.uri()) {
-            bail!(
-                "a server scope resolves to an http(s):// URL; `{}` is not one",
-                client.uri()
-            );
-        }
-        Ok(client)
+        // `resolve_server_flag` refuses any scope that is not a server address.
+        Self::registry_client(server)
     }
 
     /// Resolve the addressing (positional URI / `--target` / `--server`)
@@ -518,10 +512,26 @@ impl GraphClient {
         uri: &str,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<Session> {
+        Self::open_write_session_with_external_blob_policy(uri, settings, None).await
+    }
+
+    /// An embedded write session, with `external_blob_policy` installed on
+    /// its fresh handle when given: the one way a CLI run admits a source
+    /// outside the graph (a `load csv "file://…"` statement run directly).
+    async fn open_write_session_with_external_blob_policy(
+        uri: &str,
+        settings: &[(SettingId, SettingValue)],
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
         crate::admission::ensure_graph(uri).await?;
         crate::command_outcome::writable_open();
-        let mut session = Arc::new(Omnigraph::open(uri).await?).session(defaults, sources);
+        let db = Omnigraph::open(uri).await?;
+        let db = match external_blob_policy {
+            Some(policy) => db.with_external_blob_policy(policy)?,
+            None => db,
+        };
+        let mut session = Arc::new(db).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
         }
@@ -984,7 +994,7 @@ impl GraphClient {
                     http.request(
                         Method::POST,
                         remote_url(base_url, &["changes", "baseline"], &[])?,
-                    ),
+                    )?,
                     token.as_deref(),
                 )
                 .json(&ChangeBaselineRequest {
@@ -1075,7 +1085,7 @@ impl GraphClient {
                         http.request(
                             Method::POST,
                             remote_url(base_url, &["load", "ndjson"], &query)?,
-                        ),
+                        )?,
                         token.as_deref(),
                     ),
                     data,
@@ -1421,6 +1431,66 @@ impl GraphClient {
                     actor_id: actor.clone(),
                     commit,
                     outcome: Some(outcome),
+                })
+            }
+        }
+    }
+
+    /// A `load csv` statement from `-e`/`--query`: `POST /mutate` with the
+    /// source and the request `branch`, or the engine call on the branch
+    /// (`main` when unspelled), answered as the server answers it: the
+    /// branch that received the load, `load csv` as the name, the loaded
+    /// node and edge counts, and the load's own publication.
+    pub(crate) async fn load_statement(
+        &self,
+        branch: Option<&str>,
+        query_source: &str,
+        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+        settings: &[(SettingId, SettingValue)],
+    ) -> Result<ChangeOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+            } => {
+                let mut request = branch_statement_change_request(query_source);
+                request.branch = branch.map(str::to_string);
+                request.settings = Self::remote_settings(settings)?;
+                remote_json_bounded(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["mutate"], &[])?,
+                    Some(serde_json::to_value(request)?),
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, actor } => {
+                let query_name = stmt.statement_name().to_string();
+                let request = omnigraph::loader::CsvLoadRequest::from_statement(&stmt);
+                let mut session = Self::open_write_session_with_external_blob_policy(
+                    uri,
+                    settings,
+                    external_blob_policy,
+                )
+                .await?;
+                Self::apply_prefix(&mut session, query_source)?;
+                let receipt = session
+                    .load_csv_as_with_receipt(branch.unwrap_or("main"), &request, actor.as_deref())
+                    .await?;
+                Ok(ChangeOutput {
+                    branch: receipt.result.branch,
+                    query_name,
+                    affected_nodes: receipt.result.nodes_loaded.values().sum(),
+                    affected_edges: receipt.result.edges_loaded.values().sum(),
+                    actor_id: actor.clone(),
+                    commit: Some(commit_output(&receipt.commit)),
+                    outcome: None,
                 })
             }
         }
@@ -1790,12 +1860,11 @@ impl GraphClient {
         dry_run: bool,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
-        // Use the engine's canonical spelling for dispatch, receipt validation,
-        // and optional deletion. Padding must not cause a post-publication error.
-        let source = source.trim();
-        let into = into.trim();
-        if source.is_empty() || into.is_empty() {
-            bail!("branch merge source and target must not be empty");
+        // Dispatch, receipt validation and optional deletion all use the names
+        // as given, so refuse one the engine and the server would refuse before
+        // any storage or HTTP work: none can then fail after publication.
+        for name in [source, into] {
+            omnigraph_policy::ensure_canonical_branch_name(name)?;
         }
         let output = match self {
             GraphClient::Remote {
@@ -2024,7 +2093,7 @@ impl GraphClient {
                 ..
             } => {
                 let request = apply_bearer_token(
-                    http.request(Method::POST, remote_url(base_url, &["export"], &[])?),
+                    http.request(Method::POST, remote_url(base_url, &["export"], &[])?)?,
                     token.as_deref(),
                 )
                 .json(&ExportRequest {
@@ -2111,7 +2180,7 @@ impl GraphClient {
             } => {
                 let http = http.blob_delivery()?;
                 let mut request = apply_bearer_token(
-                    http.request(Method::GET, blob_url(base_url, query)?),
+                    http.request(Method::GET, blob_url(base_url, query)?)?,
                     token.as_deref(),
                 );
                 if let Some(range) = range {
@@ -2194,7 +2263,7 @@ impl GraphClient {
             } => {
                 let http = http.blob_delivery()?;
                 let request = apply_bearer_token(
-                    http.request(Method::HEAD, blob_url(base_url, query)?),
+                    http.request(Method::HEAD, blob_url(base_url, query)?)?,
                     token.as_deref(),
                 );
                 let response = http.send(request).await.map_err(blob_transport_error)?;
@@ -2274,10 +2343,10 @@ impl GraphClient {
                 let url = blob_write_url(base_url, query)?;
                 let request = match bytes {
                     Some(bytes) => http
-                        .request(Method::PUT, url)
+                        .request(Method::PUT, url)?
                         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                         .body(bytes),
-                    None => http.request(Method::DELETE, url),
+                    None => http.request(Method::DELETE, url)?,
                 };
                 let request = apply_bearer_token(request, token.as_deref());
                 let request = match if_match {
@@ -2671,6 +2740,83 @@ mod tests {
         );
         assert!(!format!("{error:?}").contains("secret"));
         assert!(!serde_json::to_string(contract).unwrap().contains("secret"));
+    }
+
+    /// A `unix://` root's whole path names the socket: the server receives
+    /// only the HTTP target after the root, with the same discovery, bearer
+    /// and contract rules as over TCP. A URL outside the root is never sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_http_over_a_unix_socket_sends_root_relative_targets_issue_979() {
+        let server = IntentApiFixture::graph(vec![contract_reply(200, json!({"ok": true}))]);
+        let gateway = crate::unix_gateway_fixture::UnixGateway::new(&server.origin);
+        let root = gateway.url();
+        let http = GraphHttpClient::new(&root).unwrap();
+        let base = resolve_server_flag(Some(&root), Some("knowledge"))
+            .unwrap()
+            .unwrap();
+        let value: Value = remote_json(
+            &http,
+            Method::GET,
+            remote_url(&base, &["branches", "etl/run 1"], &[("branch", "a b")]).unwrap(),
+            None,
+            Some("data-bearer"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!({"ok": true}));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "HEAD");
+        assert_eq!(requests[0].path, "/healthz");
+        assert!(!requests[0].headers.contains_key("authorization"));
+        assert_eq!(
+            requests[1].path,
+            "/graphs/knowledge/branches/etl%2Frun%201?branch=a+b"
+        );
+        assert_eq!(requests[1].headers["host"], "localhost");
+        assert_eq!(requests[1].headers["authorization"], "Bearer data-bearer");
+        assert_eq!(
+            requests[1].headers[omnigraph_api_types::HTTP_API_CONTRACT_HEADER],
+            omnigraph_api_types::HTTP_API_CONTRACT
+        );
+        assert_eq!(gateway.connections(), 2, "both requests used the socket");
+        server.assert_complete();
+
+        let escaped = resolve_server_flag(Some(&root), Some("../.."))
+            .unwrap()
+            .unwrap();
+        for outside in [
+            format!("{root}2/graphs"),
+            remote_url(&escaped, &["snapshot"], &[]).unwrap(),
+        ] {
+            let error = http.request(Method::GET, outside.clone()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the Unix-socket server root"),
+                "{outside}: {error}"
+            );
+        }
+        assert_eq!(server.requests().len(), 2);
+
+        // Removing the socket fails discovery before the data request.
+        drop(gateway);
+        let error = remote_json::<Value>(
+            &http,
+            Method::GET,
+            remote_url(&base, &["snapshot"], &[]).unwrap(),
+            None,
+            Some("data-bearer"),
+        )
+        .await
+        .unwrap_err();
+        let contract = error.downcast_ref::<ApiContractError>().unwrap();
+        assert!(!contract.request_dispatched);
+        assert!(
+            contract.error.contains("connection failed (Unix socket)"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

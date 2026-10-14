@@ -291,6 +291,55 @@ pub struct PolicyRequest {
     pub target_branch: Option<String>,
 }
 
+/// A branch name refused by [`ensure_canonical_branch_name`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BranchNameError {
+    Empty,
+    ControlCharacter(String),
+    SurroundingWhitespace(String),
+}
+
+impl fmt::Display for BranchNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BranchNameError::Empty => write!(f, "branch name cannot be empty"),
+            BranchNameError::ControlCharacter(name) => {
+                write!(f, "branch name {name:?} contains a control character")
+            }
+            BranchNameError::SurroundingWhitespace(name) => {
+                write!(f, "branch name {name:?} has leading or trailing whitespace")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BranchNameError {}
+
+/// Accept a branch name only in a spelling no layer reads differently.
+///
+/// A policy decision compares the request's branch names with
+/// `protected_branches` as written, and the engine opens the branch it is
+/// given, so the two decide about one branch only while nothing rewrites the
+/// name between them. A name that a reader could take for another spelling
+/// is refused rather than corrected: an empty name, one with leading or
+/// trailing whitespace (the Unicode set `str::trim` removes), or one holding a
+/// control character. Every surface that accepts a branch name applies this
+/// rule before it authorizes or resolves the name. Lance's `check_valid_branch`
+/// refuses whitespace and control characters in a ref name, so no branch
+/// created through it is made unreachable by the rule.
+pub fn ensure_canonical_branch_name(name: &str) -> Result<(), BranchNameError> {
+    if name.chars().any(char::is_control) {
+        return Err(BranchNameError::ControlCharacter(name.to_string()));
+    }
+    if name.trim() != name {
+        return Err(BranchNameError::SurroundingWhitespace(name.to_string()));
+    }
+    if name.is_empty() {
+        return Err(BranchNameError::Empty);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyDecision {
     pub allowed: bool,
@@ -344,10 +393,11 @@ impl PolicyConfig {
             }
         }
 
+        // A request's branch is compared with these names as written, so an
+        // entry no request can spell would protect nothing.
         for branch in &self.protected_branches {
-            if branch.trim().is_empty() {
-                bail!("protected branch names must not be blank");
-            }
+            ensure_canonical_branch_name(branch)
+                .map_err(|err| eyre!("protected_branches: {err}"))?;
         }
 
         let mut seen_rule_ids = HashSet::new();
@@ -563,6 +613,15 @@ impl PolicyEngine {
     /// supplying a `PolicyRequest` cannot smuggle identity through the
     /// same struct that carries the requested action.
     pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
+        // The decision compares these names with `protected_branches` as
+        // written; one a caller could have meant as another spelling has no
+        // decision, whoever asks.
+        for branch in [&request.branch, &request.target_branch]
+            .into_iter()
+            .flatten()
+        {
+            ensure_canonical_branch_name(branch)?;
+        }
         if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
                 None,
@@ -1170,8 +1229,8 @@ rules:
         }
     }
     use super::{
-        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
-        PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
+        BranchNameError, PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine,
+        PolicyExpectation, PolicyRequest, PolicyResourceKind, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
@@ -1309,6 +1368,48 @@ rules:
             .unwrap();
         assert!(admin.allowed);
         assert_eq!(admin.matched_rule_id.as_deref(), Some("admins-promote"));
+
+        // A spelling of protected main that is not main as written gets no
+        // decision, on either side of a transition, whoever asks.
+        for (actor, name) in [
+            ("act-bruno", " main"),
+            ("act-bruno", "main "),
+            ("act-bruno", "main\u{3000}"),
+            ("act-bruno", "\tmain"),
+            ("act-bruno", ""),
+            ("act-unknown", " main"),
+        ] {
+            for (branch, target_branch) in [
+                (Some(name.to_string()), None),
+                (Some("feature".to_string()), Some(name.to_string())),
+            ] {
+                let request = PolicyRequest {
+                    action: PolicyAction::BranchMerge,
+                    branch,
+                    target_branch,
+                };
+                let err = engine.authorize(actor, &request).unwrap_err();
+                assert!(err.downcast_ref::<BranchNameError>().is_some(), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn protected_branches_must_be_canonical() {
+        for entry in [r#"" main""#, r#""main ""#, r#""\tmain""#, r#""""#] {
+            let source = format!(
+                "version: 1\ngroups:\n  team: [act-a]\nprotected_branches: [{entry}]\nrules: []\n"
+            );
+            let err = PolicyConfig::from_source(&source).unwrap_err().to_string();
+            assert!(
+                err.starts_with("protected_branches: branch name"),
+                "{entry}: {err}"
+            );
+        }
+        PolicyConfig::from_source(
+            "version: 1\ngroups:\n  team: [act-a]\nprotected_branches: [main, release/1.2]\nrules: []\n",
+        )
+        .unwrap();
     }
 
     #[test]
