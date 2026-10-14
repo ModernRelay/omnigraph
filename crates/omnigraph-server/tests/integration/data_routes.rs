@@ -2794,7 +2794,8 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
         "a denied load publishes nothing"
     );
 
-    let required = omnigraph::loader::CSV_SOURCE_MAX_BYTES + LOAD_CSV_PEOPLE.len() as u64;
+    let required = omnigraph_compiler::settings::SessionSettings::default().load_source_max_bytes()
+        + LOAD_CSV_PEOPLE.len() as u64;
     let graph = graph_path(temp.path());
     for per_actor in [false, true] {
         for capacity in [required - 1, required] {
@@ -3949,6 +3950,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "request"
             ),
             show_row(
+                "load_source_max_bytes",
+                "33554432",
+                "33554432",
+                "default",
+                "request"
+            ),
+            show_row(
                 "history_release_bytes",
                 "262144",
                 "262144",
@@ -4144,12 +4152,12 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         );
     }
     let head = main_head_commit_id(&app).await;
-    for limit in [0, 33554433] {
+    for limit in [0, -1] {
         let (status, body) = json_response(&app, json_post("/mutate", &json!({
             "query":MUTATION_QUERIES,"name":"insert_person","params":{"name":"refused","age":1},
             "settings":{"write_max_bytes":limit}
         }))).await;
-        assert_settings_refusal_needle(status, &body, "1..=33554432");
+        assert_settings_refusal_needle(status, &body, "an integer of at least 1");
     }
     let data = json!({"type":"Person","data":{"name":"x".repeat(4094),"age":1}}).to_string();
     for path in ["/load", "/load/ndjson"] {

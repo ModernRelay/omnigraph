@@ -111,10 +111,17 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
-    /// `write_max_bytes`: independent row-data and Blob-payload allowances, `1..=33554432`.
+    /// `write_max_bytes`: independent row-data and Blob-payload allowances, at
+    /// least `1`; a value raised above the default is held in memory as one
+    /// typed batch at commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = write_max_bytes_schema)]
     pub write_max_bytes: Option<i64>,
+    /// `load_source_max_bytes`: the largest object a `load csv` statement
+    /// reads, at least `1`; an `i64` like `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = load_source_max_bytes_schema)]
+    pub load_source_max_bytes: Option<i64>,
     /// `history_release_bytes`: the byte budget of a branch's buffer of
     /// unreleased commits for this request's mutate or merge publishes, `1024..=262144`; an
     /// `i64` like `traversal_work_limit`.
@@ -148,6 +155,9 @@ impl SettingsRequest {
         }
         if let Some(bytes) = self.write_max_bytes {
             assignments.push((SettingId::WriteMaxBytes, SettingValue::Integer(bytes)));
+        }
+        if let Some(bytes) = self.load_source_max_bytes {
+            assignments.push((SettingId::LoadSourceMaxBytes, SettingValue::Integer(bytes)));
         }
         if let Some(bytes) = self.history_release_bytes {
             assignments.push((SettingId::HistoryReleaseBytes, SettingValue::Integer(bytes)));
@@ -192,6 +202,10 @@ fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
 
 fn write_max_bytes_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::WriteMaxBytes)
+}
+
+fn load_source_max_bytes_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::LoadSourceMaxBytes)
 }
 
 fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
@@ -2876,18 +2890,20 @@ mod tests {
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
             write_max_bytes: Some(4093),
+            load_source_max_bytes: Some(8186),
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":2048}}",
+            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":8186,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
             request_rows[3],
             request_rows[4],
-            request_rows[5]
+            request_rows[5],
+            request_rows[6]
         );
-        assert_eq!(request_rows.len(), 6);
+        assert_eq!(request_rows.len(), 7);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

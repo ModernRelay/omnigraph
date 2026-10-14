@@ -563,6 +563,10 @@ impl GraphClient {
                 SettingId::WriteMaxBytes => {
                     request.write_max_bytes = Some(given.get(SettingId::WriteMaxBytes).parse()?)
                 }
+                SettingId::LoadSourceMaxBytes => {
+                    request.load_source_max_bytes =
+                        Some(given.get(SettingId::LoadSourceMaxBytes).parse()?)
+                }
                 SettingId::HistoryReleaseBytes => {
                     request.history_release_bytes =
                         Some(given.get(SettingId::HistoryReleaseBytes).parse()?)

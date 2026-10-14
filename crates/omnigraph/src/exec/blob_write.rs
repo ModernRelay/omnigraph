@@ -20,8 +20,9 @@ use super::mutation::{
 };
 use super::staging::{MutationStaging, PendingMode};
 use crate::blob::{
-    BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag, BlobPrecondition,
-    BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag, resolve_blob_cell,
+    BLOB_WRITE_MAX_BYTES, BLOB_WRITE_PAYLOAD_RESOURCE, BlobCell, BlobDescriptor, BlobEtag,
+    BlobPrecondition, BlobWriteOutcome, entity_label, locate_blob_cell, managed_blob_etag,
+    resolve_blob_cell,
 };
 use crate::changes::EntityKind;
 use crate::db::Omnigraph;
@@ -61,7 +62,7 @@ impl Session {
     /// Replace one Blob cell of an existing node or edge with managed bytes.
     ///
     /// The entity must exist; the write never inserts a row. `bytes` is at
-    /// most the session's `write_max_bytes` (32 MiB by default), inclusive,
+    /// most the smaller of `write_max_bytes` and 32 MiB, inclusive,
     /// and is refused before any table is opened when it is larger. The row's
     /// other Blob cells are carried by value, so they share the operation's
     /// payload allowance, and a stored external
@@ -79,7 +80,14 @@ impl Session {
     ) -> Result<BlobWriteOutcome> {
         let length = u64::try_from(bytes.len())
             .map_err(|_| OmniError::manifest_internal("Blob write payload length exceeds u64"))?;
-        WriteBudget::from_settings(self.settings()).check(BLOB_WRITE_PAYLOAD_RESOURCE, length)?;
+        let limit = self.settings().write_max_bytes().min(BLOB_WRITE_MAX_BYTES);
+        if length > limit {
+            return Err(OmniError::resource_limit(
+                BLOB_WRITE_PAYLOAD_RESOURCE,
+                limit,
+                length,
+            ));
+        }
         self.write_blob_cell_as(
             branch,
             cell,
