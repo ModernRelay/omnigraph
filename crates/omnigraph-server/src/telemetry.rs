@@ -12,7 +12,7 @@ use axum::response::Response;
 use color_eyre::eyre::{Result, bail, eyre};
 use opentelemetry::KeyValue;
 use opentelemetry::propagation::{Extractor, TextMapPropagator};
-use opentelemetry::trace::{Status, TraceContextExt, TracerProvider};
+use opentelemetry::trace::{Status, TracerProvider};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -233,12 +233,19 @@ where
             .format_event(ctx, Writer::new(&mut encoded), event)?;
         let mut record: serde_json::Value =
             serde_json::from_str(&encoded).map_err(|_| fmt::Error)?;
-        let context = Span::current().context();
-        let span = context.span();
-        let span_context = span.span_context();
-        if span_context.is_valid() {
-            record["trace_id"] = span_context.trace_id().to_string().into();
-            record["span_id"] = span_context.span_id().to_string().into();
+        // Use the event's registry scope: recursive dispatcher access through
+        // Span::current() inside a subscriber can return a disabled span.
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope {
+                let extensions = span.extensions();
+                if let Some(data) = extensions.get::<tracing_opentelemetry::OtelData>()
+                    && let (Some(trace_id), Some(span_id)) = (data.trace_id(), data.span_id())
+                {
+                    record["trace_id"] = trace_id.to_string().into();
+                    record["span_id"] = span_id.to_string().into();
+                    break;
+                }
+            }
         }
         writeln!(writer, "{record}")
     }
@@ -321,7 +328,7 @@ pub(crate) fn operation_finished(kind: &'static str, succeeded: bool, uncertain:
     if !succeeded || uncertain {
         Span::current().set_status(Status::error(outcome));
     }
-    tracing::info!(target: TARGET, "operation.kind" = kind, "operation.outcome" = outcome, "native operation completed");
+    tracing::info!(target: TARGET, operation_kind = kind, operation_outcome = outcome, "native operation completed");
 }
 
 pub(crate) fn deployment_id(id: &str) {
@@ -544,7 +551,10 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].name, "GET <unmatched>");
-        assert!(!spans[0].parent_span_id.is_valid());
+        assert_eq!(
+            spans[0].parent_span_id,
+            opentelemetry::trace::SpanId::INVALID
+        );
         assert!(spans[0].span_context.is_valid());
         assert!(!captured.output().contains("PRIVATE"));
         provider.shutdown().unwrap();
