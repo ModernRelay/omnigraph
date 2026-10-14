@@ -4575,7 +4575,7 @@ async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
     }
     let mut asked = Vec::new();
     db.diff_page_readable(
-        &diff_request(between(" main ", &on_feature.graph_commit_id), None),
+        &diff_request(between("main", &on_feature.graph_commit_id), None),
         &mut |branch: &str| {
             asked.push(branch.to_string());
             true

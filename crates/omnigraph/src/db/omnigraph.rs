@@ -547,9 +547,10 @@ impl Omnigraph {
         legacy_system_columns: bool,
         prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -704,6 +705,15 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open within a caller-owned storage lifetime, including all Lance writes.
+    pub async fn open_with_io_scope(
+        uri: &str,
+        scope: crate::storage::StorageIoScope,
+    ) -> Result<Self> {
+        let storage = crate::storage::storage_for_uri_scoped(uri, scope)?;
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
@@ -762,9 +772,10 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -1025,12 +1036,20 @@ impl Omnigraph {
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
+    ///
+    /// Before any of these, a branch name in `scope` that is not canonical is
+    /// refused as a bad request: the decision judges the name as written, and
+    /// the writer then opens that same name.
     pub(crate) fn enforce(
         &self,
         action: omnigraph_policy::PolicyAction,
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
+        let (branch, target_branch) = scope.to_branch_pair();
+        for name in [branch, target_branch].into_iter().flatten() {
+            ensure_canonical_branch_name(name)?;
+        }
         let Some(checker) = self.policy.as_ref() else {
             return Ok(());
         };
@@ -3045,7 +3064,7 @@ impl Omnigraph {
         side: &str,
         can_read: Option<&mut ReadCheck<'_>>,
     ) -> Result<(String, Snapshot)> {
-        let (side, classified) = self.authorized_diff_side(side, can_read).await?;
+        let classified = self.authorized_diff_side(side, can_read).await?;
         match classified {
             DiffReadTarget::Branch(resolved) => {
                 let commit_id = resolved.graph_commit_id.ok_or_else(|| {
@@ -3062,20 +3081,15 @@ impl Omnigraph {
         }
     }
 
-    /// Classify one diff side as the caller spelled it, then, when the caller
-    /// may read only some branches, authorize the branch it reads before
-    /// anything else is resolved: a refused side is the not-found of a side
-    /// that names nothing. Answers the side's spelling with what it names.
-    async fn authorized_diff_side<'a>(
+    /// Classify one diff side, then, when the caller may read only some
+    /// branches, authorize the branch it reads before anything else is
+    /// resolved: a refused side is the not-found of a side that names
+    /// nothing.
+    async fn authorized_diff_side(
         &self,
-        side: &'a str,
+        side: &str,
         can_read: Option<&mut ReadCheck<'_>>,
-    ) -> Result<(&'a str, DiffReadTarget)> {
-        // The one place a side's spelling is decided.
-        let side = side.trim();
-        if side.is_empty() {
-            return Err(OmniError::manifest("a diff endpoint cannot be empty"));
-        }
+    ) -> Result<DiffReadTarget> {
         let classified = self.classify_diff_read_target(side).await?;
         if let Some(can_read) = can_read
             && !can_read(&classified.read_branch())
@@ -3084,14 +3098,20 @@ impl Omnigraph {
                 target: side.to_string(),
             });
         }
-        Ok((side, classified))
+        Ok(classified)
     }
 
-    /// Classify one spelled diff endpoint: a live branch (its head now) or a
-    /// graph commit. A string naming both is refused, never resolved by
-    /// precedence; one naming neither is a typed not-found carrying only the
-    /// caller's spelling.
+    /// Classify one diff endpoint: a live branch (its head now) or a graph
+    /// commit. A string naming both is refused, never resolved by precedence;
+    /// one naming neither is a typed not-found carrying only the caller's
+    /// spelling.
     async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
+        if target.is_empty() {
+            return Err(OmniError::manifest("a diff endpoint cannot be empty"));
+        }
+        // A branch name and a commit id are both taken as written, so a
+        // spelling neither could be is refused rather than trimmed.
+        ensure_canonical_branch_name(target)?;
         // A string the branch-name rules refuse cannot name a branch; that is
         // not an error here, since it may still name a commit.
         let as_branch = match normalize_branch_name(target) {
@@ -4097,18 +4117,23 @@ impl Omnigraph {
     }
 }
 
+/// A caller's branch name as the engine addresses it: `None` for main, the
+/// name itself otherwise. The name is taken as written, the spelling a policy
+/// decision judged; one that is not canonical is refused, never corrected.
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err(OmniError::manifest(
-            "branch name cannot be empty".to_string(),
-        ));
-    }
+    ensure_canonical_branch_name(branch)?;
     if branch == "main" {
         return Ok(None);
     }
     crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
+}
+
+/// Refuse a branch name that is not canonical as a bad request
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]).
+pub(crate) fn ensure_canonical_branch_name(branch: &str) -> Result<()> {
+    omnigraph_policy::ensure_canonical_branch_name(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()))
 }
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit

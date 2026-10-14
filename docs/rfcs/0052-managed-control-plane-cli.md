@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-05
-updated: 2026-10-06
+updated: 2026-10-12
 discussion: https://github.com/ModernRelay/omnigraph/pull/629
 supersedes: []
 superseded_by: []
@@ -101,12 +101,24 @@ must be a regular file and neither it nor `.omnigraph` may be a symbolic link;
 a dangling link is a refusal, never permission to select Core:
 
 ```yaml
-version: 1
+version: 2
 cluster: CLUSTER_ID
 api: https://control.example
+organization_id: org_customer
 ```
 
 `use` first verifies access to the cluster, then atomically writes this file.
+The organization is selected explicitly with `--organization`, by the bound
+folder, or by the sole cached organization for that API. Multiple cached
+organizations without a selection refuse; there is no most-recent fallback.
+Ordinary commands refuse an explicit API or organization conflicting with
+a bound folder before a request. Fully explicit `login` and `logout` select
+the named API/organization session independently of the folder. Fully explicit
+`use CLUSTER_ID --api ORIGIN --organization ORG_ID` verifies access, then may
+replace a previous binding or obsolete/invalid regular context file; symbolic
+links and special files still refuse. `login`, `logout`, `use`, and unbound
+`cluster create` and `cluster operation` accept `--organization`. Each invocation pins its verified
+account and principal across refresh, submission, polling and recovery.
 Unknown fields and malformed values refuse. API addresses are canonical
 origins, without userinfo, path, query, or fragment. HTTPS is mandatory except
 exact loopback hosts for local integration. Redirects are refused; each
@@ -152,6 +164,10 @@ flag cannot select service execution.
 No stored graph or server API format changes. Bound managed commands refuse
 without context; its absence cannot select direct execution. Deploy a compatible
 CLI and API together.
+Managed discovery and context version 2 require a fresh managed sign-in and
+folder binding. Version 1 contexts and credential custody are not migrated.
+Named-server/static credentials, graph HTTP contracts and storage formats
+are unchanged.
 The server SDK and Python SDK gain no new authority or dependencies.
 
 ## Alternatives

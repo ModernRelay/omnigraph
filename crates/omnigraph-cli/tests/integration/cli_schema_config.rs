@@ -12,20 +12,36 @@ use crate::support;
 use crate::support::*;
 
 #[test]
-fn version_command_prints_current_cli_version() {
+fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_977() {
+    use omnigraph::db::manifest::{
+        INTERNAL_MANIFEST_SCHEMA_VERSION as WRITES, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION as LOWEST,
+    };
+    use omnigraph_api_types::HTTP_API_CONTRACT;
+
+    // The first two lines keep their earlier text and position; the contract
+    // line follows them.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
-
-    assert!(
-        stdout.contains(&format!("omnigraph {}", env!("CARGO_PKG_VERSION"))),
-        "version output must include the CLI version line, got: {stdout}"
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            format!("omnigraph {}", env!("CARGO_PKG_VERSION")),
+            format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
+            format!("http-contract {HTTP_API_CONTRACT}"),
+        ],
     );
-    assert!(
-        stdout.contains(&format!(
-            "internal-schema {}",
-            omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
-        )),
-        "version output must include the internal-schema line, got: {stdout}"
+
+    // Equality with the whole object pins the field set: a field added or
+    // renamed changes this test.
+    let output = output_success(cli().args(["version", "--json"]));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "http_contract": HTTP_API_CONTRACT,
+            "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
+        }),
     );
 }
 

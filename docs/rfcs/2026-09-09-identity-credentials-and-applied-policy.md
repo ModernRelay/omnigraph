@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-06
+updated: 2026-10-12
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -271,7 +271,8 @@ of a particular deployment remain separate from the accepted library contract.
 This extension replaces the opaque managed login/session brokerage described
 in RFC 0052 with direct AuthKit public-client
 device login and refresh through the official SDK. Login metadata pins the
-provider family, client, issuer, organization and fixed endpoints. The API
+provider family, client, issuer and fixed endpoints. Discovery version 2 has
+no organization field: the verified session and folder context bind it. The API
 verifies the raw access token and returns stable principal identity. The CLI
 uses a new OS-keychain namespace, an eight-hour absolute renewable deadline,
 serialized refresh with a pending-before-send marker and atomic credential
@@ -279,6 +280,36 @@ replacement, and no automatic retry after an uncertain exchange. Old managed
 sessions require new login. The API and CLI switch together; no broker
 compatibility path or gradual authentication migration is required.
 Direct/static configuration remains supported.
+
+The version 2 keychain namespace holds a separate device session for each
+canonical API and organization. A bounded index contains at most 128 selected
+organizations per API; credential records retain the exact provider, account,
+principal, subject and session identity. A command selects one organization
+once. Another shell's login cannot retarget that command, even within the same
+organization. Refresh must retain the entire selected identity and original
+eight-hour deadline. Logout removes only the selected organization's custody.
+
+First login may use the organization's selection in the hosted provider flow.
+For explicit `--organization`, a fresh device response for another organization
+or no organization is selected through the provider's documented refresh
+`organization_id` parameter before resource-server acceptance. Only that fresh
+response's refresh token may be exchanged, once; no intermediate credential is
+saved. The exchange must preserve the expected provider, client, user and session
+and return the requested organization, whose bearer the API verifies before
+custody. The initial organization need not be enrolled at the API. Indexed
+credentials are inspected read-only to refuse a provider-session collision
+before selection or revocation; their token pairs are never used or changed.
+The serialized, read-only keychain checks, including interactive OS consent,
+finish before the network budget starts. Selection and resource-server
+verification share one 35-second network budget. An uncertain selection requires
+a new explicit device login, without replay.
+Device initiation/exchange use only the official SDK parameters. Ordinary
+renewal names only the already selected organization and retains the complete
+identity; it cannot switch or clone an existing organization's session.
+Ambiguous cached selection refuses. A version 1
+managed session or context requires fresh sign-in and binding. The data cache
+also separates API, organization and cluster; its independent expiry and
+explicit clearing contract remain unchanged.
 
 Normal native data commands acquire a self-only identity credential before
 execution. A permission refusal never triggers login or mutation replay.
@@ -309,9 +340,11 @@ per-cluster native signing key.
 
 When OIDC trust is configured, the server exposes protected-resource metadata
 and a stateless `/mcp` transport built on the official Rust MCP SDK. Its
-initial tools provide graph existence, stored-read catalog and stored-read
-invocation through the same HTTP handler functions and Cedar gates. The
+initial tools provided graph existence, stored-read catalog and stored-read
+invocation through the same HTTP handler functions and Cedar gates; the
 read-kind assertion prevents invoking a mutation through the read tool.
+[RFC 0003](0003-mcp-server-surface.md) owns the tool catalog, discovery paths
+and mounting from then on.
 Protocol framing, negotiation and cancellation use the SDK. Requests are
 bounded to 64 KiB, returned tool data to 1 MiB, read attempts to 30 seconds
 and concurrent tools to 16. Tool visibility is not permission to invoke.

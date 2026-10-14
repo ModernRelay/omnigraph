@@ -21,8 +21,116 @@ pub enum FileBody {
     Queries(Vec<QueryDecl>),
     Branch(BranchStmt),
     Commit(CommitWrite),
+    Load(LoadStmt),
     Show(Option<SettingId>),
     Explain(QueryDecl),
+}
+
+/// A top-level load statement: `load csv "<uri>" into node:Person mode
+/// overwrite [delimiter "|"] [header] [columns (a, b)]`. The source is an
+/// object the engine reads under the graph's external Blob policy; the
+/// statement loads into the request's branch like a mutation declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadStmt {
+    /// The URI as written, decoded from its string literal.
+    pub source: String,
+    pub target: LoadTarget,
+    pub mode: LoadStmtMode,
+    /// One ASCII byte; `,` when unspelled.
+    pub delimiter: u8,
+    /// Whether the first record names the columns.
+    pub header: bool,
+    /// Property names by column position, `from`/`to` for an edge file's
+    /// endpoints; `None` when the header names the columns.
+    pub columns: Option<Vec<String>>,
+}
+
+/// The declared type a load statement fills, as spelled: `node:Person` or
+/// `edge:Knows`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadTarget {
+    Node(String),
+    Edge(String),
+}
+
+impl LoadTarget {
+    /// The catalog table key, `node:<name>` or `edge:<name>`.
+    pub fn table_key(&self) -> String {
+        match self {
+            LoadTarget::Node(name) => format!("node:{name}"),
+            LoadTarget::Edge(name) => format!("edge:{name}"),
+        }
+    }
+
+    pub fn type_name(&self) -> &str {
+        match self {
+            LoadTarget::Node(name) | LoadTarget::Edge(name) => name,
+        }
+    }
+}
+
+/// `mode overwrite | append | merge`, the load modes `omnigraph load` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStmtMode {
+    Overwrite,
+    Append,
+    Merge,
+}
+
+impl LoadStmtMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadStmtMode::Overwrite => "overwrite",
+            LoadStmtMode::Append => "append",
+            LoadStmtMode::Merge => "merge",
+        }
+    }
+}
+
+impl LoadStmt {
+    /// The statement's two keywords.
+    pub fn statement_name(&self) -> &'static str {
+        "load csv"
+    }
+
+    /// The statement as the grammar reads it back: every spelled option in
+    /// its canonical order, the default delimiter left unspelled.
+    pub fn render(&self) -> String {
+        let mut statement = format!(
+            "load csv {} into {} mode {}",
+            render_string_literal(&self.source),
+            self.target.table_key(),
+            self.mode.as_str()
+        );
+        if self.delimiter != b',' {
+            let _ = write!(
+                statement,
+                " delimiter {}",
+                render_string_literal(&(self.delimiter as char).to_string())
+            );
+        }
+        if self.header {
+            statement.push_str(" header");
+        }
+        if let Some(columns) = &self.columns {
+            let _ = write!(statement, " columns ({})", columns.join(", "));
+        }
+        statement
+    }
+
+    /// Refusal text for a consumer that expected `query` declarations.
+    pub fn not_a_declaration_message(&self) -> String {
+        format!(
+            "`{}` is a load statement, not a query declaration",
+            self.statement_name()
+        )
+    }
+}
+
+/// `text` as a GQ string literal: quoted, with the backslash and the quote
+/// escaped.
+fn render_string_literal(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// A top-level control write on an unpublished commit:
@@ -118,6 +226,7 @@ impl FileBody {
             FileBody::Queries(queries) => Ok(queries),
             FileBody::Branch(stmt) => Err(stmt.not_a_declaration_message()),
             FileBody::Commit(write) => Err(write.not_a_declaration_message()),
+            FileBody::Load(stmt) => Err(stmt.not_a_declaration_message()),
             FileBody::Show(id) => Err(format!(
                 "`{}` is a settings statement, not a query declaration",
                 show_statement_name(id)
@@ -192,6 +301,7 @@ impl QueryFile {
             },
             FileBody::Branch(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Commit(write) => panic!("{}", write.not_a_declaration_message()),
+            FileBody::Load(stmt) => panic!("{}", stmt.not_a_declaration_message()),
             FileBody::Show(id) => panic!("`{}` is not a declaration", show_statement_name(*id)),
             FileBody::Explain(_) => panic!("{EXPLAIN_NOT_A_DECLARATION}"),
         }

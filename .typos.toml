@@ -15,6 +15,7 @@ extend-ignore-re = ['\bmis-\w+']
 
 # Tokens that occur in prose and code alike.
 [default.extend-words]
+AIMD = "AIMD"               # additive-increase/multiplicative-decrease retry policy; Lance's lance_aimd_max_retries option
 AKS = "AKS"                 # Azure Kubernetes Service (RFC 0029 assets)
 BA = "BA"                   # AB/BA measurement-order labels (RFCs 0023, 0031); also the hex fragment of the short commit SHAs 2aab48ba (RFC 0019) and da466ba (vocabulary guard test). Cost: a bare "ba" typed for "by" passes
 fof = "fof"                 # friend-of-friend: pattern variable in test queries and the query reference

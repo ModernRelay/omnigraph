@@ -1442,6 +1442,8 @@ mod owned_shutdown {
                     "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
                     if mode.starts_with("startup-") {
                         r#"{"startup-operator":"startup-secret"}"#
+                    } else if mode == "v2-finish" {
+                        r#"{"restart-operator":"restart-secret"}"#
                     } else {
                         "{}"
                     },
@@ -1512,6 +1514,33 @@ mod owned_shutdown {
         ).unwrap();
         socket.flush().unwrap();
         socket
+    }
+
+    async fn mcp_schema(client: &reqwest::Client, address: &str) -> Value {
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("restart-secret")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "schema", "arguments": {"graph": "knowledge"}}
+            }))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        let schema = body["result"]["structuredContent"].clone();
+        assert!(
+            schema["schema_source"]
+                .as_str()
+                .unwrap()
+                .contains("node Person")
+        );
+        schema
     }
 
     fn server_config(root: &Path, grace: Duration) -> omnigraph_server::ServerConfig {
@@ -1639,7 +1668,40 @@ mod owned_shutdown {
             .await
             .unwrap();
             config.shutdown_grace = Duration::from_secs(5);
-            omnigraph_server::serve(config).await.unwrap();
+            if mode == "v2-swallowed-error" {
+                let scope = config
+                    .cluster_admission
+                    .as_ref()
+                    .unwrap()
+                    .io_scope()
+                    .unwrap();
+                let storage =
+                    omnigraph::storage::storage_for_uri_scoped(root.to_str().unwrap(), scope)
+                        .unwrap();
+                let fault_root = root.clone();
+                tokio::spawn(async move {
+                    while !fault_root.join("inject-error").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    fs::write(fault_root.join("file-blocker"), b"file").unwrap();
+                    // Deliberately swallow a real backend error. Logical owner
+                    // completion cannot erase the storage scope's uncertainty.
+                    assert!(
+                        storage
+                            .write_text(
+                                fault_root.join("file-blocker/child").to_str().unwrap(),
+                                "no",
+                            )
+                            .await
+                            .is_err()
+                    );
+                    fs::write(fault_root.join("fault-reached"), b"reached").unwrap();
+                });
+            }
+            if let Err(error) = omnigraph_server::serve(config).await {
+                eprintln!("native shutdown refused: {error:?}");
+                std::process::exit(2);
+            }
             fs::write(root.join("serve-returned"), b"returned").unwrap();
             std::process::exit(0);
         }
@@ -1988,9 +2050,21 @@ mod owned_shutdown {
             .len();
         let (mut child, address, output_thread) = spawn_owned_child(root, mode);
         wait_ready(&address, &mut child.0, "serving").await;
+        // Keep the authenticated MCP connection pool alive across shutdown;
+        // its server-side owners must drain before the native lock is released.
+        let mcp_client = reqwest::Client::new();
+        let schema_before = if mode == "v2-finish" {
+            Some(mcp_schema(&mcp_client, &address).await)
+        } else {
+            None
+        };
         let fault_started = Instant::now();
         let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
         if v2 {
+            if mode == "v2-swallowed-error" {
+                fs::write(root.join("inject-error"), b"inject").unwrap();
+                wait_marker(&root.join("fault-reached"), &mut child.0);
+            }
             let signal = if mode == "v2-crash" {
                 libc::SIGKILL
             } else {
@@ -2051,21 +2125,53 @@ mod owned_shutdown {
             if mode == "v2-finish" {
                 assert_eq!(status.code(), Some(0));
                 assert!(root.join("serve-returned").exists());
-            } else {
+            } else if mode == "v2-crash" {
                 use std::os::unix::process::ExitStatusExt;
                 assert_eq!(status.signal(), Some(libc::SIGKILL));
+            } else {
+                assert_eq!(status.code(), Some(2));
             }
             output_thread.join().unwrap();
-            assert_eq!(
-                fs::read(root.join("__cluster/lock.json")).unwrap(),
-                retained_lock.unwrap()
-            );
             assert_eq!(
                 fs::read(root.join("__cluster/state.json")).unwrap(),
                 ledger_before.unwrap()
             );
-            let refusal = cluster_settings(root).await.unwrap_err();
-            assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+            if mode == "v2-finish" {
+                assert!(!root.join("__cluster/lock.json").exists());
+                // Ordinary boot, without a repair command, must reopen the
+                // same populated graph under a newly acquired lifetime.
+                let (mut successor, address, output_thread) = spawn_owned_child(root, mode);
+                wait_ready(&address, &mut successor.0, "serving").await;
+                assert_eq!(
+                    Some(mcp_schema(&mcp_client, &address).await),
+                    schema_before,
+                    "the restarted server must serve the same schema through authenticated MCP"
+                );
+                let successor_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
+                assert_ne!(Some(successor_lock), retained_lock);
+                assert_eq!(
+                    unsafe { libc::kill(successor.0.id() as libc::pid_t, libc::SIGTERM) },
+                    0
+                );
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let status = loop {
+                    if let Some(status) = successor.0.try_wait().unwrap() {
+                        break status;
+                    }
+                    assert!(Instant::now() < deadline, "successor shutdown timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(0));
+                output_thread.join().unwrap();
+                assert!(!root.join("__cluster/lock.json").exists());
+            } else {
+                assert_eq!(
+                    fs::read(root.join("__cluster/lock.json")).unwrap(),
+                    retained_lock.unwrap()
+                );
+                let refusal = cluster_settings(root).await.unwrap_err();
+                assert!(refusal.to_string().contains("state_lock_held"), "{refusal}");
+            }
             return;
         }
         assert_eq!(
@@ -2149,6 +2255,11 @@ mod owned_shutdown {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnected_write_and_shutdown_share_ownership_v2_crash() {
         disconnected_write_and_shutdown_share_ownership("v2-crash").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnected_write_and_shutdown_share_ownership_v2_swallowed_error() {
+        disconnected_write_and_shutdown_share_ownership("v2-swallowed-error").await;
     }
 }
 

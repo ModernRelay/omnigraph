@@ -3,11 +3,36 @@ use super::*;
 
 mod capture;
 mod pending;
+mod source;
+
+pub(super) fn outcome_exit(state: &str) -> Result<Option<i32>> {
+    Ok(match state {
+        "converged" => Some(0),
+        "failed" => Some(1),
+        "refused" | "blocked" => Some(2),
+        "partially_converged" => Some(3),
+        "recovery_required" => Some(4),
+        "stalled" => Some(5),
+        "cancelled" => Some(6),
+        "proposed" | "offered" | "running" => None,
+        _ => return Err(Failure::protocol()),
+    })
+}
+
+fn operation_exit(body: &Value) -> Result<Option<i32>> {
+    outcome_exit(
+        body.pointer("/data/state")
+            .and_then(Value::as_str)
+            .ok_or_else(Failure::protocol)?,
+    )
+}
 
 pub(super) fn handles(command: &ClusterCommand) -> bool {
     matches!(
         command,
         ClusterCommand::Create { .. }
+            | ClusterCommand::List { .. }
+            | ClusterCommand::Pull { .. }
             | ClusterCommand::Delete { .. }
             | ClusterCommand::UndoDelete { .. }
             | ClusterCommand::Push { .. }
@@ -15,8 +40,8 @@ pub(super) fn handles(command: &ClusterCommand) -> bool {
     )
 }
 
-fn client(origin: &str) -> Result<Api> {
-    Api::authenticated(origin.into())
+async fn client(origin: &str, organization: Option<&str>) -> Result<Api> {
+    Api::authenticated(origin.into(), organization).await
 }
 
 fn context_required(config: &Path) -> Result<Context> {
@@ -31,7 +56,19 @@ fn context_required(config: &Path) -> Result<Context> {
 pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
     let (config, _) = config_and_json(command);
     match command {
-        ClusterCommand::Create { name, api, run, .. } => {
+        ClusterCommand::List {
+            api, organization, ..
+        } => source::list(config, api, organization.as_deref()).await,
+        ClusterCommand::Pull { out, revision, .. } => {
+            source::pull(config, out, revision.as_deref()).await
+        }
+        ClusterCommand::Create {
+            name,
+            api,
+            organization,
+            run,
+            ..
+        } => {
             if name.is_empty()
                 || name.len() > 64
                 || name.trim() != name
@@ -44,14 +81,17 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             }
             let origin = canonical_origin(api)?;
             let body = json!({"name":name});
+            let context = read_context(config)?;
+            let selected =
+                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
             submit(
-                &client(&origin)?,
+                &client(&origin, selected).await?,
                 Submission {
                     config,
                     path: "/v1/clusters".into(),
                     body,
                     kind: "create",
-                    context: read_context(config)?,
+                    context,
                     incarnation: None,
                     run,
                     tombstone: false,
@@ -87,7 +127,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             };
             let path = format!("/v1/clusters/{}:{kind}", context.cluster);
             submit(
-                &client(&context.api)?,
+                &client(&context.api, Some(&context.organization_id)).await?,
                 Submission {
                     config,
                     path,
@@ -104,6 +144,7 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
         ClusterCommand::Operation {
             operation_id: id,
             api,
+            organization,
             wait,
             timeout,
             ..
@@ -129,7 +170,9 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
                     ));
                 }
             };
-            let api = client(&origin)?;
+            let selected =
+                selected_organization(context.as_ref(), &origin, organization.as_deref())?;
+            let api = client(&origin, selected).await?;
             let options = ClusterRunArgs {
                 no_wait: !wait,
                 timeout: *timeout,
@@ -177,7 +220,8 @@ pub(super) async fn dispatch(command: &ClusterCommand) -> Result<(Value, i32)> {
             }
             let context = context_required(config)?;
             let body = capture::request(config, expected_revision, message)?;
-            let body = client(&context.api)?
+            let body = client(&context.api, Some(&context.organization_id))
+                .await?
                 .request(
                     Method::POST,
                     &format!("/v1/clusters/{}/config", context.cluster),
@@ -232,7 +276,7 @@ impl Identity {
                 "lifecycle response identity or action differs from the request",
             ));
         }
-        run_exit(body)?;
+        operation_exit(body)?;
         Ok(Self {
             cluster_id: cluster_id.into(),
             incarnation: incarnation.into(),
@@ -277,27 +321,12 @@ struct PrincipalIdentity {
     account_id: String,
 }
 
-async fn principal(api: &Api, deadline: Instant) -> Result<PrincipalIdentity> {
-    let response = tokio::time::timeout_at(
-        deadline,
-        api.request(Method::GET, "/v1/auth/session", None, None),
-    )
-    .await
-    .map_err(|_| {
-        Failure::new(
-            "wait_timeout",
-            "principal lookup exceeded the local deadline",
-            5,
-        )
-    })??;
-    let identity: PrincipalIdentity =
-        serde_json::from_value(response["data"].clone()).map_err(|_| Failure::protocol())?;
-    for field in [&identity.principal_id, &identity.account_id] {
-        if field.is_empty() || field.len() > 256 || field.chars().any(char::is_control) {
-            return Err(Failure::protocol());
-        }
-    }
-    Ok(identity)
+fn principal(api: &Api) -> Result<PrincipalIdentity> {
+    let selected = api.selection.as_ref().ok_or_else(Failure::protocol)?;
+    Ok(PrincipalIdentity {
+        principal_id: selected.principal_id.clone(),
+        account_id: selected.account_id.clone(),
+    })
 }
 
 fn definitive_refusal(response: &Response) -> bool {
@@ -348,24 +377,31 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
     let current = read_context(intent.config)?;
     if intent.kind == "create" {
         intent.context = current;
-    } else if current.as_ref().map(|c| (&c.api, &c.cluster))
-        != intent.context.as_ref().map(|c| (&c.api, &c.cluster))
+    } else if current
+        .as_ref()
+        .map(|c| (&c.api, &c.cluster, &c.organization_id))
+        != intent
+            .context
+            .as_ref()
+            .map(|c| (&c.api, &c.cluster, &c.organization_id))
     {
         return Err(Failure::refused(
             "context_mismatch",
             "folder context changed before submission",
         ));
     }
-    if intent.context.as_ref().is_some_and(|c| c.api != api.origin) {
+    if intent.context.as_ref().is_some_and(|c| {
+        c.api != api.origin || !api.account_id().is_ok_and(|org| org == c.organization_id)
+    }) {
         return Err(Failure::refused(
             "context_mismatch",
             "the pending create uses another API origin",
         ));
     }
     let deadline = Instant::now() + Duration::from_secs(intent.run.timeout.unwrap_or(300));
-    // The service scopes idempotency to the principal. The same captured bearer
-    // performs this read and the submission, including after a session renewal.
-    let principal = principal(api, deadline).await?;
+    // Idempotency belongs to the selected account and principal. The captured
+    // identity owns the submission, including after a session renewal.
+    let principal = principal(api)?;
     let pending = pending::prepare(
         intent.config,
         &api.origin,
@@ -418,7 +454,8 @@ async fn submit(api: &Api, mut intent: Submission<'_>) -> Result<(Value, i32)> {
             pending::bind(
                 intent.config,
                 &Context {
-                    version: 1,
+                    version: 2,
+                    organization_id: principal.account_id.clone(),
                     cluster: identity.cluster_id.clone(),
                     api: api.origin.clone(),
                 },
@@ -456,7 +493,7 @@ async fn wait_operation(
         return Ok((body, 0));
     }
     loop {
-        if let Some(exit) = run_exit(&body)? {
+        if let Some(exit) = operation_exit(&body)? {
             return Ok((body, exit));
         }
         let phase = body

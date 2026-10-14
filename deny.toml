@@ -23,10 +23,6 @@ unsound = "all"
 # advisory also removes its row here.
 unused-ignored-advisory = "deny"
 ignore = [
-  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via hyper 0.14 inside aws-smithy-http-client (aws feature only); the 0.3 line carries no patch, cleared when the AWS SDK leaves hyper 0.14" },
-  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 via rustls 0.21 inside aws-smithy-http-client (aws feature only); no patch in the 0.101 line, same clearing event as RUSTSEC-2026-0258; the 0.103 line in the tree is patched, and this ignore would also hide a regression there" },
-  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7, same path and clearing event as RUSTSEC-2026-0098" },
-  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7, same path and clearing event as RUSTSEC-2026-0098" },
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4 via object_store 0.13.2 (DataFusion 54, Lance 11); patched only in 0.41, cleared when object_store bumps quick-xml" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4, same path and clearing event as RUSTSEC-2026-0194" },
   { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a proc-macro pulled by lance-bitpacking 11.0.0, cleared when Lance replaces it" },
