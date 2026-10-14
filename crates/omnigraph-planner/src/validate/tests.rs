@@ -783,6 +783,119 @@ fn another_alias_or_item_fails_the_projection() {
 }
 
 #[test]
+fn changed_aggregate_comparison_returns_are_refused() {
+    let fixture = Fixture::new(
+        "query q() { match { $d: Doc { open: true } } return { $d.title as n, count($d.year) > 1 as many } }",
+        &[],
+    );
+    for mutation in ["alias", "constant", "distinct", "group", "unused"] {
+        let mut plan = fixture.plan();
+        for id in node_ids(&plan, |node| {
+            matches!(
+                node,
+                PhysicalNode::Projection { .. } | PhysicalNode::Aggregate { .. }
+            )
+        }) {
+            match plan.node_mut(id).unwrap() {
+                PhysicalNode::Projection { return_exprs, .. } => match mutation {
+                    "alias" => return_exprs[1].alias = Some("changed".into()),
+                    "constant" => {
+                        let IRExpr::Binary { right, .. } = &mut return_exprs[1].expr else {
+                            panic!("comparison")
+                        };
+                        let IRExpr::Literal(value, _) = right.as_mut() else {
+                            panic!("literal")
+                        };
+                        *value = Literal::Integer(2);
+                    }
+                    _ => {}
+                },
+                PhysicalNode::Aggregate {
+                    return_exprs,
+                    aggregates,
+                    ..
+                } => match mutation {
+                    "distinct" => {
+                        let IRExpr::Aggregate { distinct, .. } = &mut return_exprs[1].expr else {
+                            panic!("aggregate")
+                        };
+                        *distinct = true;
+                    }
+                    "group" => {
+                        let IRExpr::PropAccess { property, .. } = &mut return_exprs[0].expr else {
+                            panic!("group property")
+                        };
+                        *property = "slug".into();
+                    }
+                    "unused" => {
+                        let mut item = return_exprs[1].clone();
+                        item.column = "extra".into();
+                        item.alias = Some("extra".into());
+                        return_exprs.push(item);
+                        aggregates.push(aggregates[1]);
+                    }
+                    _ => {}
+                },
+                _ => unreachable!(),
+            }
+            if let Some(PhysicalNode::Aggregate {
+                return_exprs,
+                node_objects,
+                ..
+            }) = plan.node(id)
+            {
+                let mut properties = plan.properties(id).unwrap().clone();
+                properties.schema =
+                    crate::output::return_schema(return_exprs, node_objects).unwrap();
+                plan.set_properties(id, properties);
+            }
+        }
+        let (check, detail) = fixture.refused(plan);
+        assert_eq!(check, "projection", "{mutation}: {detail}");
+    }
+}
+
+#[test]
+fn a_second_projection_cannot_introduce_grouping() {
+    let fixture = Fixture::new(
+        "query q() { match { $d: Doc $d.title contains \"graph\" } return { $d.year } }",
+        &[],
+    );
+    let mut plan = fixture.plan();
+    let id = node_ids(&plan, |node| {
+        matches!(node, PhysicalNode::Projection { .. })
+    })[0];
+    let PhysicalNode::Projection {
+        input,
+        return_exprs,
+        node_objects,
+    } = plan.node(id).unwrap().clone()
+    else {
+        panic!("projection")
+    };
+    let aggregate = plan.add(PhysicalNode::Aggregate {
+        input,
+        aggregates: vec![None; return_exprs.len()],
+        return_exprs: return_exprs.clone(),
+        node_objects: node_objects.clone(),
+    });
+    plan.set_properties(aggregate, plan.properties(id).unwrap().clone());
+    *plan.node_mut(id).unwrap() = PhysicalNode::Projection {
+        input: aggregate,
+        return_exprs: return_exprs
+            .into_iter()
+            .map(|mut item| {
+                item.expr = IRExpr::AliasRef(item.column.clone(), item.ty.clone());
+                item
+            })
+            .collect(),
+        node_objects,
+    };
+    let (check, detail) = fixture.refused(plan);
+    assert_eq!(check, "projection", "{detail}");
+}
+
+#[test]
 fn a_score_read_from_another_column_fails_the_projection() {
     let fixture = ranked();
     let mut plan = fixture.plan();

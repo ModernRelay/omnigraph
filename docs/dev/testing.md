@@ -131,7 +131,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
+The guards pin only substrate behavior OmniGraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, index coverage and segment ownership, stable row IDs, vector ordering fences, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and its guard together.
 
 ## Server and CLI ownership
 
@@ -142,7 +142,11 @@ timeout without replaying a committed merge. Its deployment matrix holds a real
 admitted request through drain, disconnects or times out the caller before
 durable acceptance, and loses replies after acceptance. Exact-ID observation
 must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit.
+PID; neither apply nor recovery polling may resubmit. The `unix://` server
+transport goes through `tests/support/unix_gateway.rs`, a byte-for-byte
+Unix-socket relay to the server's TCP address: `system_remote` runs the CLI's
+data verbs through it, and the in-source `client.rs` tests own the request
+target, discovery and refusals over the socket.
 
 Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
 
@@ -165,6 +169,10 @@ retries, malformed-receipt refusal, terminal outcomes and caller timeout without
 replay. Its managed fixtures cover status/history scope and filters, explicit
 `--managed` selection, and wrong-mode refusals before context or external access.
 Direct apply must ignore both valid and malformed managed folder context.
+Managed deployment fixtures also exercise immutable preview/delivery bodies,
+original-ID recovery, current authorization refusals, bounded waiting through
+uncertain delivery/archival, and queued-only cancellation. They do not replace
+native server execution tests or establish deployed service compatibility.
 CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
 replacement, graph addition, policy grant/revocation and management handoff;
 the original submitter retains only its exact receipt access after restart.

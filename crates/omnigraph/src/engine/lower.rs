@@ -1272,11 +1272,20 @@ pub(super) fn in_order(batch: RecordBatch, names: &[String]) -> Result<RecordBat
     batch.project(&indices).map_err(OmniError::arrow_internal)
 }
 
-/// The return's column names in return order, for the root of `plan`.
+/// The return's column names in return order when the result node under the
+/// root's sort and limit is an `Aggregate`; a `Projection` root, including one
+/// above an aggregate, already emits its columns in order.
 pub(super) fn return_order(plan: &PhysicalPlan) -> Option<Vec<String>> {
-    let returns = plan.live().find_map(|(_, node)| match node {
-        PhysicalNode::Aggregate { return_exprs, .. } => Some(return_exprs),
-        _ => None,
-    })?;
-    Some(returns.iter().map(return_name).collect())
+    let mut id = plan.root();
+    loop {
+        match plan.node(id)? {
+            PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Limit { input, .. }
+            | PhysicalNode::Page { input, .. } => id = *input,
+            PhysicalNode::Aggregate { return_exprs, .. } => {
+                return Some(return_exprs.iter().map(return_name).collect());
+            }
+            _ => return None,
+        }
+    }
 }

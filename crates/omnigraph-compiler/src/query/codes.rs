@@ -72,6 +72,7 @@ codes! {
     T55 = "an unattached base parameter is undeclared or not a String";
     T56 = "distinct does not apply to an aggregated return";
     T57 = "distinct applies only to count";
+    T58 = "a Boolean return item compares aggregates with constants only";
 
     // Planner.
     P001 = "a ranking orders a binding a traversal reaches";

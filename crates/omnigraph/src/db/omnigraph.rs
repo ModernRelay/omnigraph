@@ -18,9 +18,9 @@ use omnigraph_compiler::{
 };
 
 use crate::db::graph_coordinator::{
-    CapturedLineage, GraphCoordinator, PublishedSnapshot, ResolvedCommitRange, commit_not_found,
+    CapturedLineage, GraphCoordinator, PublishedSnapshot, commit_not_found,
 };
-use crate::error::{OmniError, Result, dataset_subject};
+use crate::error::{ManifestErrorKind, OmniError, Result, dataset_subject};
 use crate::runtime_cache::RuntimeCache;
 use crate::seams::{decide_seam, fail};
 use crate::storage::{
@@ -547,9 +547,10 @@ impl Omnigraph {
         legacy_system_columns: bool,
         prepared: Option<&PreparedGraphCreate>,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -704,6 +705,15 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open within a caller-owned storage lifetime, including all Lance writes.
+    pub async fn open_with_io_scope(
+        uri: &str,
+        scope: crate::storage::StorageIoScope,
+    ) -> Result<Self> {
+        let storage = crate::storage::storage_for_uri_scoped(uri, scope)?;
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
@@ -762,9 +772,10 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
         mode: OpenMode,
     ) -> Result<Self> {
+        let lance_access =
+            crate::lance_access::LanceAccessContext::with_io_scope(storage.io_scope());
         let storage = crate::storage::decorate(storage);
         let root = normalize_root_uri(uri)?;
-        let lance_access = crate::lance_access::LanceAccessContext::new();
         let write_queue_identity = write_queue_root_identity(&root)?;
         let write_queue =
             crate::db::write_queue::WriteQueueManager::for_root(&write_queue_identity);
@@ -1025,12 +1036,20 @@ impl Omnigraph {
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
+    ///
+    /// Before any of these, a branch name in `scope` that is not canonical is
+    /// refused as a bad request: the decision judges the name as written, and
+    /// the writer then opens that same name.
     pub(crate) fn enforce(
         &self,
         action: omnigraph_policy::PolicyAction,
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
+        let (branch, target_branch) = scope.to_branch_pair();
+        for name in [branch, target_branch].into_iter().flatten() {
+            ensure_canonical_branch_name(name)?;
+        }
         let Some(checker) = self.policy.as_ref() else {
             return Ok(());
         };
@@ -2475,70 +2494,6 @@ impl Omnigraph {
 
     // ─── Change detection ────────────────────────────────────────────────
 
-    pub async fn diff_between(
-        &self,
-        from: impl Into<ReadTarget>,
-        to: impl Into<ReadTarget>,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let from_resolved = self.resolved_target(from).await?;
-        let to_resolved = self.resolved_target(to).await?;
-        crate::changes::diff_snapshots(
-            &self.table_store,
-            &from_resolved.snapshot,
-            &to_resolved.snapshot,
-            filter,
-            to_resolved.branch.clone().or(from_resolved.branch.clone()),
-            to_resolved.graph_commit_id.clone(),
-        )
-        .await
-    }
-
-    /// Diff two graph commits. Resolves each commit to
-    /// `(graph_branch, graph_manifest_version)`
-    /// and creates branch-aware snapshots. Supports cross-branch comparison.
-    pub async fn diff_commits(
-        &self,
-        from_commit_id: &str,
-        to_commit_id: &str,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let coord = self.coordinator.read().await;
-        let range = coord
-            .resolve_commit_range(
-                &SnapshotId::new(from_commit_id),
-                &SnapshotId::new(to_commit_id),
-            )
-            .await?;
-        // Classify direct adjacency from the child's persisted first-parent
-        // pointer without changing this API's net-current result shape. The
-        // future feed can reuse that relationship without an ancestry index.
-        let (from_commit, to_commit) = match range {
-            ResolvedCommitRange::FirstParent(edge) => (edge.parent, edge.child),
-            ResolvedCommitRange::Arbitrary { from, to } => (from, to),
-        };
-        let from_snap = coord
-            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
-                from_commit.graph_commit_id.clone(),
-            )))
-            .await?;
-        let to_snap = coord
-            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
-                to_commit.graph_commit_id.clone(),
-            )))
-            .await?;
-        drop(coord);
-        crate::changes::diff_snapshots(
-            &self.table_store,
-            &from_snap.snapshot,
-            &to_snap.snapshot,
-            filter,
-            to_snap.branch.clone().or(from_snap.branch.clone()),
-            to_snap.graph_commit_id.clone(),
-        )
-        .await
-    }
-
     /// One bounded, deterministic page of the exact entity changes a graph
     /// commit made relative to its first parent, in graph vocabulary with
     /// exact before/after images. The parentless genesis commit has no diff;
@@ -2754,6 +2709,329 @@ impl Omnigraph {
             &request,
         )
         .await
+    }
+
+    /// One bounded page of a graph diff (RFC 0030 §8): the net entity changes
+    /// between two read targets, or between a source branch's merge base with
+    /// a target and the source head, in the commit diff's entity shape and
+    /// order, without a cause. The first page resolves both endpoints to
+    /// exact graph commits; its page token keeps them, so later pages answer
+    /// for the same commits whatever the named branches did since.
+    pub async fn diff_page(
+        &self,
+        request: &crate::changes::GraphDiffRequest,
+    ) -> Result<crate::changes::GraphDiffPage> {
+        use crate::changes::token;
+
+        let max_changes = request
+            .max_changes
+            .unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_CHANGES);
+        let max_bytes = request
+            .max_bytes
+            .unwrap_or(crate::changes::COMMIT_CHANGES_DEFAULT_BYTES);
+        crate::changes::enumerate::validate_change_page_limits(max_changes, max_bytes)?;
+
+        let graph_identity = self.schema_view.load().schema_identity_domain.clone();
+        let filter_digest = token::filter_digest(&request.scope);
+        let sides_digest = token::sides_digest(&request.sides);
+        let (endpoints, resume) = match request.page_token.as_deref() {
+            None => (self.resolve_diff_endpoints(&request.sides).await?, None),
+            Some(encoded) => {
+                let decoded = token::decode_diff_page_token(encoded)?;
+                if decoded.graph_identity != token::hashed_identity(&graph_identity)
+                    || decoded.sides != sides_digest
+                {
+                    return Err(token::cursor_rejected(
+                        "diff page token does not match this graph and these sides",
+                    ));
+                }
+                if decoded.filter_digest != filter_digest {
+                    return Err(token::cursor_rejected(
+                        "diff page token was minted for a different filter scope",
+                    ));
+                }
+                let endpoints = self
+                    .reopen_diff_endpoints(
+                        &decoded.from_commit_id,
+                        &decoded.to_commit_id,
+                        decoded.base_commit_id.clone(),
+                    )
+                    .await?;
+                let resume = crate::changes::enumerate::ContinuationKey {
+                    type_id: decoded.type_id,
+                    position: decoded.position,
+                    operation_rank: decoded.operation_rank,
+                    change_index: decoded.change_index,
+                };
+                (endpoints, Some(resume))
+            }
+        };
+
+        // Reclaimed history under either endpoint is a typed gap naming the
+        // diff's `to` commit; a diff has no feed cursor to resume.
+        let to_commit_id = endpoints.to_commit_id.clone();
+        let map_gap = |error| match error {
+            OmniError::HistoricalVersionReclaimed { .. } => OmniError::ChangeFeedGap {
+                cursor: None,
+                first_unreadable_commit_id: to_commit_id.clone(),
+            },
+            error => error,
+        };
+        let mut budget = crate::changes::enumerate::PageBudget::new(max_changes, max_bytes);
+        let mut changes = Vec::new();
+        let outcome = crate::changes::enumerate::enumerate_commit_changes(
+            &self.table_store,
+            &endpoints.from_snapshot,
+            &endpoints.to_snapshot,
+            &graph_identity,
+            &endpoints.to_commit_id,
+            &request.scope,
+            resume.as_ref(),
+            &mut budget,
+            &mut changes,
+        )
+        .await
+        .map_err(map_gap)?;
+
+        let next_page_token = match outcome {
+            crate::changes::enumerate::CommitEnumeration::Complete => None,
+            crate::changes::enumerate::CommitEnumeration::Truncated(key) => {
+                Some(token::encode_token(&token::DiffPageTokenV1 {
+                    version: token::TOKEN_VERSION,
+                    kind: token::KIND_DIFF_PAGE.to_string(),
+                    graph_identity: token::hashed_identity(&graph_identity),
+                    sides: sides_digest,
+                    from_commit_id: endpoints.from_commit_id.clone(),
+                    to_commit_id: endpoints.to_commit_id.clone(),
+                    base_commit_id: endpoints.base_commit_id.clone(),
+                    filter_digest,
+                    type_id: key.type_id,
+                    position: key.position,
+                    operation_rank: key.operation_rank,
+                    change_index: key.change_index,
+                })?)
+            }
+            crate::changes::enumerate::CommitEnumeration::Exhausted { required_bytes } => {
+                return Err(OmniError::resource_limit(
+                    "commit_changes_page_bytes",
+                    max_bytes,
+                    required_bytes,
+                ));
+            }
+        };
+
+        Ok(crate::changes::GraphDiffPage {
+            from_commit_id: endpoints.from_commit_id,
+            to_commit_id: endpoints.to_commit_id,
+            base_commit_id: endpoints.base_commit_id,
+            changes,
+            next_page_token,
+        })
+    }
+
+    /// The merge base of `source` and `target` (RFC 0030 §8.4): the commit a
+    /// merge of `source` into `target` would classify against, by the rule
+    /// branch merge uses, with the two heads it was computed from. Reads
+    /// lineage only.
+    pub async fn merge_base(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<crate::changes::MergeBase> {
+        let (source_head, target_head, merge_base, _, _) =
+            self.capture_merge_base(source, target).await?;
+        Ok(crate::changes::MergeBase {
+            source_commit_id: source_head,
+            target_commit_id: target_head,
+            merge_base,
+        })
+    }
+
+    /// Capture both branches from one view each and resolve their merge base,
+    /// returning the heads, the base commit and the source head's snapshot.
+    async fn capture_merge_base(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<(
+        String,
+        String,
+        crate::db::commit_graph::GraphCommit,
+        Snapshot,
+        Snapshot,
+    )> {
+        let source_branch = normalize_branch_name(source)?;
+        let target_branch = normalize_branch_name(target)?;
+        let (source_txn, target_txn, source_commits, target_commits) = self
+            .open_merge_write_txns(source_branch.as_deref(), target_branch.as_deref())
+            .await?;
+        let source_head = source_txn
+            .effective_graph_head
+            .clone()
+            .ok_or_else(|| OmniError::manifest("source branch has no head commit".to_string()))?;
+        let target_head = target_txn
+            .effective_graph_head
+            .clone()
+            .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
+        let merge_base = Self::resolve_merge_base(
+            &source_commits.graph,
+            &target_commits.graph,
+            &source_head,
+            &target_head,
+        )
+        .await?;
+        Ok((
+            source_head,
+            target_head,
+            merge_base,
+            source_txn.base,
+            target_txn.base,
+        ))
+    }
+
+    /// Resolve a graph diff's sides to exact commits and their snapshots.
+    async fn resolve_diff_endpoints(
+        &self,
+        sides: &crate::changes::GraphDiffSides,
+    ) -> Result<DiffEndpoints> {
+        match sides {
+            crate::changes::GraphDiffSides::Between { from, to } => {
+                let (from_commit_id, from_snapshot) = self.resolve_diff_read_target(from).await?;
+                let (to_commit_id, to_snapshot) = self.resolve_diff_read_target(to).await?;
+                Ok(DiffEndpoints {
+                    from_commit_id,
+                    to_commit_id,
+                    base_commit_id: None,
+                    from_snapshot,
+                    to_snapshot,
+                })
+            }
+            crate::changes::GraphDiffSides::Branch { source, target } => {
+                let (source_head, target_head, merge_base, source_snapshot, target_snapshot) =
+                    self.capture_merge_base(source, target).await?;
+                let base_commit_id = merge_base.graph_commit_id.clone();
+                // The base is usually an ancestor neither head is at; when it
+                // is one of the captured heads, its captured snapshot is the
+                // base snapshot.
+                let base_snapshot = if base_commit_id == source_head {
+                    source_snapshot.clone()
+                } else if base_commit_id == target_head {
+                    target_snapshot
+                } else {
+                    self.commit_snapshot(&base_commit_id).await?
+                };
+                Ok(DiffEndpoints {
+                    from_commit_id: base_commit_id.clone(),
+                    to_commit_id: source_head,
+                    base_commit_id: Some(base_commit_id),
+                    from_snapshot: base_snapshot,
+                    to_snapshot: source_snapshot,
+                })
+            }
+        }
+    }
+
+    /// Reopen the exact commits a diff page token names.
+    async fn reopen_diff_endpoints(
+        &self,
+        from_commit_id: &str,
+        to_commit_id: &str,
+        base_commit_id: Option<String>,
+    ) -> Result<DiffEndpoints> {
+        Ok(DiffEndpoints {
+            from_commit_id: from_commit_id.to_string(),
+            to_commit_id: to_commit_id.to_string(),
+            base_commit_id,
+            from_snapshot: self.commit_snapshot(from_commit_id).await?,
+            to_snapshot: self.commit_snapshot(to_commit_id).await?,
+        })
+    }
+
+    /// The graph as of one commit, published or not.
+    async fn commit_snapshot(&self, commit_id: &str) -> Result<Snapshot> {
+        Ok(self
+            .coordinator
+            .read()
+            .await
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(commit_id)))
+            .await?
+            .snapshot)
+    }
+
+    /// The branch a transport authorizes `read` on for one graph diff side:
+    /// the branch itself, or the authored branch of the commit the side names
+    /// (an unpublished proposal's or unattached snapshot's recorded target).
+    /// Refuses exactly as the diff would: ambiguity and absence are typed.
+    pub async fn diff_read_target_branch(&self, target: &str) -> Result<String> {
+        Ok(match self.classify_diff_read_target(target).await? {
+            DiffReadTarget::Branch(resolved) => {
+                resolved.branch.unwrap_or_else(|| "main".to_string())
+            }
+            DiffReadTarget::Commit(commit) => {
+                commit.graph_branch.unwrap_or_else(|| "main".to_string())
+            }
+        })
+    }
+
+    /// Resolve one diff endpoint to its commit and the graph as of it.
+    async fn resolve_diff_read_target(&self, target: &str) -> Result<(String, Snapshot)> {
+        match self.classify_diff_read_target(target).await? {
+            DiffReadTarget::Branch(resolved) => {
+                let commit_id = resolved.graph_commit_id.ok_or_else(|| {
+                    OmniError::manifest(format!("branch '{target}' has no head commit"))
+                })?;
+                Ok((commit_id, resolved.snapshot))
+            }
+            DiffReadTarget::Commit(commit) => {
+                let snapshot = self.commit_snapshot(&commit.graph_commit_id).await?;
+                Ok((commit.graph_commit_id, snapshot))
+            }
+        }
+    }
+
+    /// Classify one diff endpoint: a live branch (its head now) or a graph
+    /// commit. A string naming both is refused, never resolved by precedence;
+    /// one naming neither is a typed not-found carrying only the caller's
+    /// spelling.
+    async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
+        if target.is_empty() {
+            return Err(OmniError::manifest("a diff endpoint cannot be empty"));
+        }
+        // A branch name and a commit id are both taken as written, so a
+        // spelling neither could be is refused rather than trimmed.
+        ensure_canonical_branch_name(target)?;
+        // A string the branch-name rules refuse cannot name a branch; that is
+        // not an error here, since it may still name a commit.
+        let as_branch = match normalize_branch_name(target) {
+            Err(_) => None,
+            Ok(_) => match self.resolved_target(ReadTarget::branch(target)).await {
+                Ok(resolved) => Some(resolved),
+                Err(OmniError::BranchNotFound { .. }) => None,
+                Err(error) => return Err(error),
+            },
+        };
+        let as_commit = match self
+            .coordinator
+            .read()
+            .await
+            .resolve_commit(&SnapshotId::new(target))
+            .await
+        {
+            Ok(commit) => Some(commit),
+            Err(OmniError::Manifest(error)) if error.kind == ManifestErrorKind::NotFound => None,
+            Err(OmniError::BranchNotFound { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        match (as_branch, as_commit) {
+            (Some(_), Some(_)) => Err(OmniError::AmbiguousReadTarget {
+                target: target.to_string(),
+            }),
+            (Some(resolved), None) => Ok(DiffReadTarget::Branch(Box::new(resolved))),
+            (None, Some(commit)) => Ok(DiffReadTarget::Commit(commit)),
+            (None, None) => Err(OmniError::ReadTargetNotFound {
+                target: target.to_string(),
+            }),
+        }
     }
 
     pub async fn entity_at_target(
@@ -3717,18 +3995,23 @@ impl Omnigraph {
     }
 }
 
+/// A caller's branch name as the engine addresses it: `None` for main, the
+/// name itself otherwise. The name is taken as written, the spelling a policy
+/// decision judged; one that is not canonical is refused, never corrected.
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err(OmniError::manifest(
-            "branch name cannot be empty".to_string(),
-        ));
-    }
+    ensure_canonical_branch_name(branch)?;
     if branch == "main" {
         return Ok(None);
     }
     crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
+}
+
+/// Refuse a branch name that is not canonical as a bad request
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]).
+pub(crate) fn ensure_canonical_branch_name(branch: &str) -> Result<()> {
+    omnigraph_policy::ensure_canonical_branch_name(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()))
 }
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
@@ -4181,6 +4464,22 @@ pub(crate) fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result
         "invalid table key '{}'",
         table_key
     )))
+}
+
+/// What one graph diff endpoint names.
+enum DiffReadTarget {
+    Branch(Box<crate::db::graph_coordinator::ResolvedTarget>),
+    Commit(GraphCommit),
+}
+
+/// A graph diff's two endpoints, resolved to exact commits and their
+/// snapshots.
+struct DiffEndpoints {
+    from_commit_id: String,
+    to_commit_id: String,
+    base_commit_id: Option<String>,
+    from_snapshot: Snapshot,
+    to_snapshot: Snapshot,
 }
 
 #[cfg(test)]

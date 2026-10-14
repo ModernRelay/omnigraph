@@ -520,6 +520,9 @@ fn completed(expr: TypedExpr) -> Result<TypedExpr> {
 enum Scope<'a> {
     /// A read clause over the match bindings.
     Read,
+    /// A `return` item or order key: a comparison may take an aggregate
+    /// operand, evaluated per group after aggregation.
+    Return,
     /// A mutation `where`: a bare name is a property of the target.
     MutationWhere(&'a MutationTarget),
     /// An assignment value or an inline binding match on `type_name`:
@@ -537,11 +540,16 @@ enum ConstantClause {
 }
 
 impl Scope<'_> {
+    /// A read over the match bindings: a filter, an order key or a return item.
+    fn is_read(self) -> bool {
+        matches!(self, Scope::Read | Scope::Return)
+    }
+
     /// The refusal of an aggregate, search or ranking call in this scope, the
     /// call's keyword in front (T44); `None` in a read.
     fn call_refusal(self, keyword: &str) -> Option<CompilerError> {
         match self {
-            Scope::Read => None,
+            Scope::Read | Scope::Return => None,
             Scope::MutationWhere(_) => Some(CompilerError::typed(
                 T44,
                 format!(
@@ -829,7 +837,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
     let mut returns = Vec::with_capacity(query.return_clause.len());
     for proj in &query.return_clause {
         let alias = proj.alias.as_deref();
-        let typed = resolve_expr(catalog, &proj.expr, &ctx, &params, Scope::Read)?;
+        let typed = resolve_expr(catalog, &proj.expr, &ctx, &params, Scope::Return)?;
         let resolved = typed.ty();
         reject_blob_read_value(&resolved, &proj.expr)?;
         check_projection(&proj.expr, alias, &query.order_clause)?;
@@ -858,12 +866,34 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
         });
     }
 
+    let has_agg = query
+        .return_clause
+        .iter()
+        .any(|p| expr_contains_aggregate(&p.expr));
+
     // Typecheck order expressions
     let mut orders = Vec::with_capacity(query.order_clause.len());
     for (index, ord) in query.order_clause.iter().enumerate() {
-        let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Read)?;
+        let typed = resolve_expr(catalog, &ord.expr, &ctx, &params, Scope::Return)?;
         reject_blob_read_value(&typed.ty(), &ord.expr)?;
-        bind_order_key(index, &ord.expr, &query.return_clause, &ctx, query.distinct)?;
+        let carried_meta = has_agg
+            && matches!(typed, TypedExpr::PropAccess { .. })
+            && typed.meta_field_result_key().is_some_and(|name| {
+                returns.iter().any(|item| {
+                    item.alias.is_none()
+                        && item.expr.meta_field_result_key().as_deref() == Some(name.as_str())
+                })
+            });
+        if !carried_meta {
+            bind_order_key(
+                index,
+                &ord.expr,
+                &query.return_clause,
+                &ctx,
+                query.distinct,
+                has_agg,
+            )?;
+        }
         if matches!(ord.expr, Expr::Bm25 { .. } | Expr::Rrf { .. })
             && ord.explicit
             && !ord.descending
@@ -905,10 +935,6 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
 
     // T9: If any return expression is an aggregate, non-aggregate expressions
     // must be valid group-by keys (PropAccess or Variable).
-    let has_agg = query
-        .return_clause
-        .iter()
-        .any(|p| matches!(p.expr, Expr::Aggregate { .. }));
     if query.distinct && has_agg {
         return Err(CompilerError::typed(
             T56,
@@ -919,17 +945,20 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
     }
     if has_agg {
         for proj in &query.return_clause {
-            if !matches!(proj.expr, Expr::Aggregate { .. }) {
-                match &proj.expr {
-                    Expr::PropAccess { .. } | Expr::Variable(_) => {}
-                    _ => {
-                        return Err(CompilerError::typed(
-                            T9,
-                            "non-aggregate expressions in an aggregate query must be \
-                             property accesses or variables"
-                                .to_string(),
-                        ));
-                    }
+            match &proj.expr {
+                Expr::Aggregate { .. } | Expr::PropAccess { .. } | Expr::Variable(_) => {}
+                Expr::Binary { .. } | Expr::Not(_) | Expr::IsNull { .. } | Expr::In { .. }
+                    if expr_contains_aggregate(&proj.expr) =>
+                {
+                    check_aggregate_comparison_leaves(&proj.expr, &params)?;
+                }
+                _ => {
+                    return Err(CompilerError::typed(
+                        T9,
+                        "non-aggregate expressions in an aggregate query must be \
+                         property accesses or variables"
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -950,17 +979,24 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedR
 }
 
 /// T42 (RFC 2026-09-24-shared-expression-model, "Order keys bind against the
-/// return list"): a property key sorts through its hidden column (none under
-/// `distinct`), the leading rank key is the search node's; others bind to return.
+/// return list"): a property key has a hidden column only on ungrouped rows;
+/// the leading rank key is the search node's; others bind to return.
 fn bind_order_key(
     index: usize,
     key: &Expr,
     return_clause: &[Projection],
     ctx: &TypeContext,
     distinct: bool,
+    aggregate: bool,
 ) -> Result<()> {
     let exempt = match key {
-        Expr::PropAccess { .. } => !distinct,
+        Expr::PropAccess { variable, property } => {
+            !distinct
+                && (!aggregate
+                    || (property == EDGE_TYPE_META
+                        && matches!(ctx.bindings.get(variable),
+                            Some(BoundVariable::Edge { type_names }) if type_names.len() == 1)))
+        }
         Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. } => index == 0,
         _ => false,
     };
@@ -2472,7 +2508,7 @@ fn contextual_literal_type(
 
 /// A direct null under a Boolean operator in a read is a nullable Bool.
 fn contextual_boolean(expr: &mut TypedExpr, scope: Scope<'_>) {
-    if matches!(scope, Scope::Read)
+    if scope.is_read()
         && matches!(
             expr,
             TypedExpr::Literal {
@@ -2488,6 +2524,24 @@ fn contextual_boolean(expr: &mut TypedExpr, scope: Scope<'_>) {
     }
 }
 
+/// In a return item or order key an aggregate operand is its per-group value;
+/// match filters retain the aggregate type T7 refuses.
+fn aggregate_value_type(ty: ResolvedType, scope: Scope<'_>) -> ResolvedType {
+    match ty {
+        ResolvedType::Aggregate(ExprType::Value {
+            scalar,
+            list,
+            nullable,
+        }) if matches!(scope, Scope::Return) => ResolvedType::Scalar(PropType {
+            scalar,
+            nullable,
+            list,
+            enum_values: None,
+        }),
+        other => other,
+    }
+}
+
 /// `left <op> right` over two resolved operands: the operand rules of a
 /// comparison (T7, T38) and its type, `Bool`, nullable when an operand is; in
 /// a mutation `where`, a target property against a constant keeps the T3/T7 texts.
@@ -2497,9 +2551,9 @@ fn typecheck_comparison(
     right: &mut TypedExpr,
     scope: Scope<'_>,
 ) -> Result<PropType> {
-    let mut left_type = left.ty();
-    let mut right_type = right.ty();
-    if matches!(scope, Scope::Read) {
+    let mut left_type = aggregate_value_type(left.ty(), scope);
+    let mut right_type = aggregate_value_type(right.ty(), scope);
+    if scope.is_read() {
         let left_is_null = matches!(
             left,
             TypedExpr::Literal {
@@ -2845,7 +2899,7 @@ fn resolve_expr(
         }),
         Expr::PropAccess { variable, property } => {
             let ty = match scope {
-                Scope::Read => {
+                Scope::Read | Scope::Return => {
                     let prop = read_property_type(catalog, ctx, variable, property)?;
                     if matches!(prop.scalar, ScalarType::Blob) {
                         return Err(CompilerError::typed(
@@ -3291,7 +3345,7 @@ fn resolve_expr(
             // Could be a query parameter or a bound variable
             let ty = if let Some(prop_type) = params.get(name) {
                 ResolvedType::Scalar(prop_type.clone())
-            } else if !matches!(scope, Scope::Read) {
+            } else if !scope.is_read() {
                 return Err(scope.undeclared_parameter(name));
             } else if let Some(bv) = ctx.bindings.get(name) {
                 match bv {
@@ -3344,7 +3398,7 @@ fn resolve_expr(
         }
         Expr::AliasRef(name) => {
             let ty = match scope {
-                Scope::Read => ctx
+                Scope::Read | Scope::Return => ctx
                     .aliases
                     .get(name)
                     .cloned()
@@ -3386,7 +3440,7 @@ fn resolve_expr(
             let mut list = resolve_expr(catalog, list, ctx, params, scope)?;
             let list_type = list.ty();
             if !matches!(&list_type, ResolvedType::Scalar(list) if list.list)
-                && !(matches!(scope, Scope::Read)
+                && !(scope.is_read()
                     && matches!(
                         list,
                         TypedExpr::Literal {
@@ -3459,7 +3513,7 @@ fn resolve_expr(
             expr: inner,
             negated,
         } => {
-            let inner = if let Scope::Read = scope
+            let inner = if scope.is_read()
                 && let Expr::PropAccess { variable, property } = inner.as_ref()
             {
                 visits::expr(inner);
@@ -3478,7 +3532,7 @@ fn resolve_expr(
             } else {
                 resolve_expr(catalog, inner, ctx, params, scope)?
             };
-            let inner_type = inner.ty();
+            let inner_type = aggregate_value_type(inner.ty(), scope);
             if !matches!(inner_type, ResolvedType::Scalar(_)) {
                 return Err(CompilerError::typed(
                     T41,
@@ -4012,6 +4066,48 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
         } => expr_references_any(left, vars) || expr_references_any(right, vars),
         Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_references_any(inner, vars),
         _ => false,
+    }
+}
+
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => expr_contains_aggregate(left) || expr_contains_aggregate(right),
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => expr_contains_aggregate(inner),
+        _ => false,
+    }
+}
+
+/// T58: a Boolean return item over an aggregate is evaluated after
+/// aggregation, where only the group's aggregates and constants exist.
+fn check_aggregate_comparison_leaves(
+    expr: &Expr,
+    params: &HashMap<String, PropType>,
+) -> Result<()> {
+    match expr {
+        Expr::Aggregate { .. } | Expr::Literal(_) | Expr::Now => Ok(()),
+        Expr::Variable(name) if params.contains_key(name) => Ok(()),
+        Expr::Binary { left, right, .. }
+        | Expr::In {
+            needle: left,
+            list: right,
+        } => {
+            check_aggregate_comparison_leaves(left, params)?;
+            check_aggregate_comparison_leaves(right, params)
+        }
+        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => {
+            check_aggregate_comparison_leaves(inner, params)
+        }
+        other => Err(CompilerError::typed(
+            T58,
+            format!(
+                "`{other}` beside an aggregate: a Boolean return item compares aggregates with constants only; project the group value on its own"
+            ),
+        )),
     }
 }
 

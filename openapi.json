@@ -31,6 +31,39 @@
         }
       }
     },
+    "/.well-known/oauth-protected-resource/{resource_path}": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "The same metadata at the location the `/mcp` challenge advertises for a\nresource identifier with a path: the well-known prefix followed by that\npath (`/.well-known/oauth-protected-resource/mcp` for `https://host/mcp`).\nEvery other suffix is 404.",
+        "operationId": "oauthProtectedResourceMetadataAtResourcePath",
+        "parameters": [
+          {
+            "name": "resource_path",
+            "in": "path",
+            "description": "The configured resource identifier's path, without its leading `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public OAuth protected resource metadata",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "Not the configured resource's path, or OAuth resource identity is not configured"
+          }
+        }
+      }
+    },
     "/cluster/deployments": {
       "get": {
         "tags": [
@@ -3089,13 +3122,363 @@
         ]
       }
     },
+    "/graphs/{graph_id}/branches/diff": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "What a branch changed since its merge base with a target.",
+        "description": "The merge base is the commit `POST /branches/merge` would classify\nagainst; it and the source head are captured together. Changes the target\nmade after the base do not appear. Paged like `GET /diff`.",
+        "operationId": "cluster_getBranchDiff",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "description": "Branch whose changes are reported.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "Branch the source is compared against. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Opaque continuation from the preceding page of this response.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes per page, as for `GET /diff`.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Repeatable filter: node | edge.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/EntityKindOutput"
+              }
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Repeatable filter: accepted-schema type name.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "op",
+            "in": "query",
+            "description": "Repeatable filter: insert | update | delete.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What `source` changed since its merge base with `target`: the net entity changes from the base to the source head",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing source, an invalid filter or limit, or a rejected page token; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The actor cannot read one of the branches",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A branch is not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The base and the source head cross a schema boundary; see change_diff_refusal",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Retained history for the base is no longer readable; see change_feed_gap",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds the public change ceiling",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/branches/merge": {
       "post": {
         "tags": [
           "branches"
         ],
         "summary": "Merge one branch into another.",
-        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success. `commit`\ncarries this merge's own target publication, including for a fast-forward;\nan already-up-to-date merge returns `commit: null`.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error_details`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
+        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success. `commit`\ncarries this merge's own target publication, including for a fast-forward;\nan already-up-to-date merge returns `commit: null`.\n\nWith `dry_run: true` the merge stops after classification and validation:\nthe response reports the outcome it would have now (`commit: null`,\n`dry_run: true`), a conflict answers the same 409, and nothing is written.\nA dry run is a read of both branches and needs no `branch_merge` grant.\n\nWith `delete_branch: true` the source branch is deleted after a successful\nmerge, under its own `branch_delete` policy check. The merge is durable by\nthen, so a deletion refusal or failure never fails the request; it is\nreported via `branch_deleted: false` + `branch_delete_error_details`.\n\nThe GQ statement `branch merge` on `POST /mutate` runs the same body\n(without the deletion composition) and answers the same 409 on conflict.",
         "operationId": "cluster_mergeBranches",
         "parameters": [
           {
@@ -3343,6 +3726,238 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/branches/merge-base": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "The merge base of two branches.",
+        "description": "Reads lineage only, by the rule `POST /branches/merge` uses.",
+        "operationId": "cluster_getMergeBase",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "description": "Branch that would be merged.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "query",
+            "description": "Branch that would receive the merge. Defaults to `main`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The commit a merge of `source` into `target` would classify against, with the two heads",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeBaseOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing or unknown parameter; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The actor cannot read one of the branches",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A branch is not found",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading lineage",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before lineage can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
                 }
               }
             }
@@ -5341,6 +5956,335 @@
         ]
       }
     },
+    "/graphs/{graph_id}/diff": {
+      "get": {
+        "tags": [
+          "changes"
+        ],
+        "summary": "Net entity changes between two read targets.",
+        "description": "`from` and `to` each name a branch (its head now) or a graph commit\n(published, an unpublished proposal, or an unattached snapshot); a string\nnaming both is refused. The first page resolves both sides to exact\ncommits and names them; a large result continues via the opaque\n`page_token`, and every page answers for those same commits.",
+        "operationId": "cluster_getDiff",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "description": "Read target the diff starts from: a branch name (its head now) or a\ngraph commit id. A string naming both is refused.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "description": "Read target the diff ends at, spelled as `from`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Opaque continuation from the preceding page of this response.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum changes per page. Server default applies when absent; above\nthe public ceiling the request fails with 413.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Repeatable filter: node | edge.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/EntityKindOutput"
+              }
+            }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "description": "Repeatable filter: accepted-schema type name.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "op",
+            "in": "query",
+            "description": "Repeatable filter: insert | update | delete.",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ChangeOpOutput"
+              }
+            }
+          },
+          {
+            "name": "omnigraph-http-api",
+            "in": "header",
+            "description": "exactly one omnigraph-http-api header with value 0.13 is required",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "0.13"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Net entity changes between the two resolved commits, in frozen (kind, type, id, op) order, without a cause",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing side, an invalid filter or limit, a side naming both a branch and a commit, or a rejected page token; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A side names no branch and no commit, or the actor cannot read the branch it resolves to",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The two sides cross a schema boundary; see change_diff_refusal",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Retained history for an endpoint is no longer readable; see change_feed_gap",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Requested limit exceeds the public change ceiling",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Server observer, ingress or operation admission capacity exhausted; honor Retry-After",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Minimum delay before a caller-bounded retry of this refused request; not a scheduled server retry."
+              },
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure while reading changes",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Recovery required before changes can be read; Known graph unavailable (graph_unavailable) or server operation admission closed; reconcile any earlier write before retrying",
+            "headers": {
+              "omnigraph-http-api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.13"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/graphs/{graph_id}/export": {
       "post": {
         "tags": [
@@ -6245,7 +7189,7 @@
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`, which requires and\nvalidates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.\n\nPairs with `POST /query` (read-only).\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` is rejected with 400;\nsend it to `POST /query`.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 when the prepared\nwrite authority changes before effects.\n\nConditional callers use `POST /mutate/if-graph-commit`, which requires and\nvalidates `Omnigraph-If-Graph-Commit`. This endpoint rejects that header.\n\nPairs with `POST /query` (read-only).\n\nThe GQ statements `branch create`, `branch delete`, and `branch merge`\n(grammar: `BranchStmt` in `omnigraph-compiler`) are also served\nhere, with no `branch`, `name`, or `params`: each runs the handler body\nof its `/branches` route (same Cedar action, admission check, and errors,\nincluding the 409 of a conflicting merge) and answers a `ChangeOutput`\nwhose `outcome` names the effect. `branch list` and the branch control\nreads (`branch diff`, `branch merge-base`, `branch merge … dry run`) are\nrejected with 400; send them to `POST /query`.",
         "operationId": "cluster_mutate",
         "parameters": [
           {
@@ -6303,7 +7247,7 @@
             }
           },
           "400": {
-            "description": "Bad request - also returned when `branch list` arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
+            "description": "Bad request - also returned when `branch list` or a branch control read (`branch diff`, `branch merge-base`, `branch merge … dry run`) arrives here instead of POST /query, when a request target accompanies a branch statement, when a name or parameters accompany a branch statement, and when a commit precondition accompanies a branch statement; api_contract_mismatch when the required API contract header is missing, duplicated or unsupported",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -7676,7 +8620,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query.",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` for writes. Select a branch or snapshot and obtain\nthe pinned graph-commit token with the response. Cedar authorizes Read.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`.\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` for writes. Select a branch or snapshot and obtain\nthe pinned graph-commit token with the response. Cedar authorizes Read.\n\nThe GQ statement `branch list` is also served here, with no `branch`,\n`snapshot`, `name`, or `params`: it answers one result per branch (field\n`name`, byte order) under the same `read` check as `GET /branches`. So are\nthe branch control reads, each under its route's checks and errors:\n`branch diff <source> [into <target>]` and `branch diff <from> to <to>`\n(one result per entity change, fields `kind`, `type`, `id`, `op`,\n`before`, `after`; the compared commits and the continuation token in\n`page`; `after page \"<token>\"` and `limit <n>` continue and bound it),\n`branch merge-base <source> [into <target>]` and\n`branch merge <source> [into <target>] dry run` (one result each).\n`branch create`, `branch delete`, and `branch merge` are rejected with\n400; send them to `POST /mutate`.\n\nThe GQ statement `explain query …` is served here too: the query is not\nrun, and the result describes its v2 logical, physical and available\nDataFusion trees, one result per node (fields `tree`, `depth`, `node`, `detail`), followed by\n`plan` entries for the passes and the document's other fields, under the\nrequest's target and `params`.",
         "operationId": "cluster_query",
         "parameters": [
           {
@@ -8670,6 +9614,10 @@
               }
             ]
           },
+          "dry_run": {
+            "type": "boolean",
+            "description": "`true` for a dry run: `outcome` is what the merge would do now, and\n`commit` is `null` because nothing was written."
+          },
           "outcome": {
             "$ref": "#/components/schemas/BranchMergeOutcome"
           },
@@ -8694,6 +9642,10 @@
           "delete_branch": {
             "type": "boolean",
             "description": "Delete the source branch after a successful merge. The deletion runs\nunder its own `branch_delete` policy check; a refusal or failure is\nreported via `branch_deleted` / `branch_delete_error_details` on the response\nand never fails the already-landed merge."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Run the merge through classification and validation and stop: the\nresponse reports the outcome the merge would have now, a conflict\nfails with the same `409` a merge returns, and nothing is written.\nA read of both branches; refused together with `as_commit` and\n`delete_branch`."
           },
           "settings": {
             "oneOf": [
@@ -9485,6 +10437,45 @@
           }
         }
       },
+      "DiffOutput": {
+        "type": "object",
+        "description": "One bounded page of a graph diff: the net entity changes between two\nresolved commits, in the commit diff's entity shape and order. There is no\ncause: a range has no single author.",
+        "required": [
+          "from_commit_id",
+          "to_commit_id",
+          "changes"
+        ],
+        "properties": {
+          "base_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The merge base, present only for a branch diff."
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EntityChangeOutput"
+            }
+          },
+          "from_commit_id": {
+            "type": "string",
+            "description": "The commit the `from` side resolved to; for a branch diff, the merge\nbase."
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Continue THIS bounded response; later pages answer for the same two\ncommits. Absent on the final page."
+          },
+          "to_commit_id": {
+            "type": "string",
+            "description": "The commit the `to` side resolved to; for a branch diff, the source\nhead."
+          }
+        }
+      },
       "EntityChangeOutput": {
         "type": "object",
         "description": "One entity change. Cause is stated once on the enclosing block, never here.\nAn insert carries only `after`, an update exact `before` and `after`, a\ndelete only `before`.",
@@ -10006,7 +10997,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The internal-schema (storage-format) version this binary writes and\nthe only one it serves; a graph at any other version is refused until\nit is upgraded offline or rebuilt.",
+            "description": "The internal-schema (storage-format) version this binary writes, the\nhighest it serves. Normal open serves every version from the binary's\nlowest supported one up to this one; a graph below that range is\nrefused until it is upgraded offline or rebuilt, and a graph above it\nneeds a newer binary.",
             "minimum": 0
           },
           "source_version": {
@@ -10218,6 +11209,34 @@
           "append",
           "merge"
         ]
+      },
+      "MergeBaseOutput": {
+        "type": "object",
+        "description": "The commit a merge of `source` into `target` would classify against, and\nthe two heads it was computed from.",
+        "required": [
+          "source",
+          "target",
+          "source_commit_id",
+          "target_commit_id",
+          "merge_base"
+        ],
+        "properties": {
+          "merge_base": {
+            "$ref": "#/components/schemas/CommitOutput"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_commit_id": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "target_commit_id": {
+            "type": "string"
+          }
+        }
       },
       "MergeConflictKindOutput": {
         "type": "string",
@@ -10484,7 +11503,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch\nstatement `branch list`, sent with no `name`, `params`, `branch`, or\n`snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch\nstatement `branch list` or a branch control read (`branch diff …`,\n`branch merge-base …`, `branch merge … dry run`), sent with no `name`,\n`params`, `branch`, or `snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "settings": {
@@ -10530,6 +11549,17 @@
             ],
             "description": "Effective graph head commit id of the exact snapshot this read was\nserved from. On a fresh named branch this is the inherited source head,\nso it is immediately usable as `Omnigraph-If-Graph-Commit` (CLI:\n`--if-commit`) for the branch's first conditional write. The id and rows\ncome from one pinned version, so no separate id fetch is needed."
           },
+          "page": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadPageOutput",
+                "description": "Page state of a paged control read (`branch diff`); absent for every\nother answer."
+              }
+            ]
+          },
           "query_name": {
             "type": "string"
           },
@@ -10540,6 +11570,37 @@
           "rows": {},
           "target": {
             "$ref": "#/components/schemas/ReadTargetOutput"
+          }
+        }
+      },
+      "ReadPageOutput": {
+        "type": "object",
+        "description": "The page state a `branch diff` answer carries: the exact commits it\ncompares, and the token `after page \"<token>\"` continues it with, absent\non its last page.",
+        "properties": {
+          "base_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The merge base, for a branch's diff since it."
+          },
+          "from_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_page_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_commit_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -10820,7 +11881,7 @@
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
-            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. This binary serves only its own storage-format version; a\ngraph at any other version is refused until it is upgraded offline or rebuilt.",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at. It may be below the version the binary writes (the\n`internal_schema_version` of `GET /healthz`): normal open serves a range\nof versions, and a branch in that range takes the current one at its\nfirst publish.",
             "minimum": 0
           }
         }

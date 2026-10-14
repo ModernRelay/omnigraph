@@ -119,6 +119,22 @@ impl LowerCtx<'_> {
 /// let catalog: omnigraph_compiler::catalog::Catalog = unimplemented!();
 /// let _ = omnigraph_compiler::lower_query(&catalog, &checked);
 /// ```
+fn typed_contains_aggregate(expr: &TypedExpr) -> bool {
+    match expr {
+        TypedExpr::Aggregate { .. } => true,
+        TypedExpr::Binary { left, right, .. }
+        | TypedExpr::In {
+            needle: left,
+            list: right,
+            ..
+        } => typed_contains_aggregate(left) || typed_contains_aggregate(right),
+        TypedExpr::Not { inner, .. } | TypedExpr::IsNull { inner, .. } => {
+            typed_contains_aggregate(inner)
+        }
+        _ => false,
+    }
+}
+
 pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryIR> {
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
@@ -156,7 +172,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let has_aggregates = query
         .returns
         .iter()
-        .any(|item| matches!(&item.expr, TypedExpr::Aggregate { .. }));
+        .any(|item| typed_contains_aggregate(&item.expr));
     let aggregate_meta_columns: HashSet<String> = query
         .returns
         .iter()

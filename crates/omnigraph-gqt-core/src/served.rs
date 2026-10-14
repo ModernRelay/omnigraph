@@ -18,11 +18,12 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::{
-    Bindings, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item, ListStep, LoadStep,
-    MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput, QueryExpect, QueryStep, Seed,
-    ShowStep, Step, StepFail, WriteExpect, bound_snapshot, bound_source, check_error_expect,
-    check_rows_json, expectation_evidence, merge_outcome_word, operation, record_binding,
-    resolve_operand, step_kind, step_label, substitute_all,
+    Bindings, BranchReadStep, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item,
+    ListStep, LoadStep, MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput,
+    QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail, WriteExpect, bound_snapshot,
+    bound_source, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
+    operation, record_binding, resolve_operand, step_kind, step_label, substitute_all,
+    substitute_bound,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -51,6 +52,9 @@ impl std::fmt::Debug for ServerTarget {
 /// naming each so the author sees what keeps the case in-process only.
 pub fn admit_served(case: &Case) -> Result<(), String> {
     let mut refused = Vec::new();
+    if !case.csv_sections.is_empty() {
+        refused.push("`--- csv` fixtures (engine execution only)".to_string());
+    }
     if !case.seams.is_empty() {
         let ordinals = case
             .seams
@@ -83,16 +87,29 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
                     refused.push(format!("step {ordinal} (expect same as v1)"));
                 }
             }
-            Step::Control(control) if !control.prefix.is_empty() => {
-                refused.push(format!(
-                    "step {ordinal} ({} with a settings prefix)",
-                    control.name
-                ));
+            Step::Control(control) => {
+                if !control.prefix.is_empty() {
+                    refused.push(format!(
+                        "step {ordinal} ({} with a settings prefix)",
+                        control.name
+                    ));
+                }
+                if let ControlWrite::Load { stmt, .. } = &control.write
+                    && !stmt.source.contains("://")
+                {
+                    refused.push(format!(
+                        "step {ordinal} (load csv source without an absolute URI)"
+                    ));
+                }
             }
             Step::Show(show) if !show.prefix.is_empty() => {
                 refused.push(format!("step {ordinal} (show with a settings prefix)"));
             }
-            Step::Mutate(_) | Step::Load(_) | Step::Control(_) | Step::List(_) | Step::Show(_) => {}
+            Step::Mutate(_)
+            | Step::Load(_)
+            | Step::List(_)
+            | Step::Show(_)
+            | Step::BranchRead(_) => {}
         }
     }
     if refused.is_empty() {
@@ -157,10 +174,10 @@ async fn execute_served_inner<H: ExecutionHost>(
                     case.source_lines.get(&ordinal).map(|line| *line as u64),
                     step_kind(step),
                 );
-                let outcome =
-                    match step {
-                        Step::Query(q) => query(host, &client, q, binding, &bindings).await,
-                        Step::Mutate(m) => mutate(host, &client, m, binding, &bindings)
+                let outcome = match step {
+                    Step::Query(q) => query(host, &client, q, binding, &bindings).await,
+                    Step::Mutate(m) => {
+                        mutate(host, &client, m, binding, &bindings)
                             .await
                             .and_then(|commit| {
                                 record_binding(
@@ -169,27 +186,29 @@ async fn execute_served_inner<H: ExecutionHost>(
                                     commit,
                                     &step_label(ordinal, "mutate", binding),
                                 )
-                            }),
-                        Step::Load(l) => load(host, &client, l, binding).await,
-                        Step::Control(c) => control(host, &client, c, binding, &bindings)
-                            .await
-                            .and_then(|commit| {
-                                record_binding(
-                                    &mut bindings,
-                                    c.bind.as_deref(),
-                                    commit,
-                                    &step_label(ordinal, c.name, binding),
-                                )
-                            }),
-                        Step::List(l) => list(host, &client, l, binding).await,
-                        Step::Show(s) => show(host, &client, s, binding).await,
-                        Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
-                            Err(StepFail::new(
-                                step_label(ordinal, step_kind(step), binding),
-                                "unsupported_environment: refused by served admission".into(),
-                            ))
-                        }
-                    };
+                            })
+                    }
+                    Step::Load(l) => load(host, &client, l, binding).await,
+                    Step::Control(c) => control(host, &client, c, binding, &bindings)
+                        .await
+                        .and_then(|commit| {
+                            record_binding(
+                                &mut bindings,
+                                c.bind.as_deref(),
+                                commit,
+                                &step_label(ordinal, c.name, binding),
+                            )
+                        }),
+                    Step::List(l) => list(host, &client, l, binding).await,
+                    Step::Show(s) => show(host, &client, s, binding).await,
+                    Step::BranchRead(r) => branch_read(host, &client, r, binding, &bindings).await,
+                    Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
+                        Err(StepFail::new(
+                            step_label(ordinal, step_kind(step), binding),
+                            "unsupported_environment: refused by served admission".into(),
+                        ))
+                    }
+                };
                 host.measure_step_end(ordinal as u64);
                 host.record("assertion", || match &outcome {
                     Ok(()) => serde_json::json!({"status": "passed"}),
@@ -728,6 +747,15 @@ fn control_statement(write: &ControlWrite, bindings: &Bindings) -> Result<String
             "commit drop {}",
             string_literal(&resolve_operand(graph_commit_id, bindings)?)
         ),
+        ControlWrite::Load { stmt, .. } => {
+            if !stmt.source.contains("://") {
+                return Err(format!(
+                    "`load csv \"{}\"` names a `--- csv` section, which only the engine environment materializes; a served load names an absolute URI the server may read",
+                    stmt.source
+                ));
+            }
+            stmt.render()
+        }
     })
 }
 
@@ -745,7 +773,10 @@ async fn control(
         query: control_statement(&step.write, bindings).map_err(&fail)?,
         name: None,
         params: None,
-        branch: None,
+        branch: match &step.write {
+            ControlWrite::Load { branch, .. } => branch.clone(),
+            _ => None,
+        },
         settings: None,
     };
     let outcome = operation(
@@ -789,6 +820,19 @@ async fn control(
                         output.outcome
                     )));
                 }
+            }
+            check_write_expect(host, name, expect, outcome)
+                .map(|()| commit)
+                .map_err(fail)
+        }
+        ControlWrite::Load { expect, .. } => {
+            if let (WriteExpect::Ok, Ok(output)) = (expect, &outcome)
+                && (output.outcome.is_some() || output.commit.is_none())
+            {
+                return Err(fail(format!(
+                    "`{name}` answered as a branch statement, not as a load: {:?}",
+                    output.outcome
+                )));
             }
             check_write_expect(host, name, expect, outcome)
                 .map(|()| commit)
@@ -869,6 +913,48 @@ async fn show(
         &format!("`{name}` succeeded"),
         binding,
     )
+}
+
+/// A branch control read at the `/query` door: the statement sent with its
+/// bound names replaced, its rows held against the expect with the same
+/// names replaced in the expected rows.
+async fn branch_read(
+    host: &impl ExecutionHost,
+    client: &ServerClient,
+    step: &BranchReadStep,
+    binding: Option<(&str, &str)>,
+    bindings: &Bindings,
+) -> Result<(), StepFail> {
+    let name = step.read.statement_name();
+    let label = step_label(step.ordinal, name, binding);
+    let fail = |message: String| StepFail::new(label.clone(), message);
+    let text = substitute_bound(&step.source, bindings);
+    let outcome = operation(host, step.ordinal, statement(client, &text))
+        .await
+        .map_err(&fail)?
+        .map_err(&fail)?;
+    match &step.expect {
+        QueryExpect::Rows {
+            ordered,
+            body_raw,
+            span,
+            ..
+        } => {
+            let actual = outcome.map_err(|e| fail(format!("`{name}` failed: {e}")))?;
+            check_rows_json(
+                host,
+                &label,
+                &actual,
+                *ordered,
+                &substitute_bound(body_raw, bindings),
+                *span,
+                binding,
+            )
+        }
+        QueryExpect::Error { needle } => {
+            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded")).map_err(fail)
+        }
+    }
 }
 
 /// A read statement (`branch list`, `show …`) at the `/query` door, sent

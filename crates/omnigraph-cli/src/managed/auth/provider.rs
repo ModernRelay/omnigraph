@@ -18,7 +18,6 @@ pub(super) struct Config {
     pub provider: String,
     pub client_id: String,
     pub issuer: String,
-    pub organization_id: String,
     pub authorization_endpoint: String,
     pub device_authorization_endpoint: String,
     pub token_endpoint: String,
@@ -27,11 +26,10 @@ pub(super) struct Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         let issuer = url::Url::parse(&self.issuer).map_err(|_| Failure::protocol())?;
-        if self.version != 1
+        if self.version != 2
             || self.provider != "workos_authkit"
             || !self.client_id.starts_with("client_")
-            || !self.organization_id.starts_with("org_")
-            || [&self.client_id, &self.organization_id].iter().any(|s| {
+            || [&self.client_id].iter().any(|s| {
                 s.len() > 128 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             })
             || self.issuer.len() > 2048
@@ -192,10 +190,10 @@ impl Provider {
     pub async fn refresh(
         &self,
         token: &str,
-        config: &Config,
+        organization: &str,
     ) -> std::result::Result<workos::AuthenticateResponse, workos::Error> {
         let mut params = AuthenticateWithRefreshTokenParams::new(token);
-        params.organization_id = Some(config.organization_id.clone());
+        params.organization_id = Some(organization.into());
         self.0
             .user_management()
             .authenticate_with_refresh_token_with_options(

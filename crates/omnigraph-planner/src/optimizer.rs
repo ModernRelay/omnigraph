@@ -207,7 +207,7 @@ fn resolve_query(
     let mut ranked = false;
     let has_aggregates = return_exprs
         .iter()
-        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+        .any(|projection| contains_aggregate(&projection.expr));
     let grouped = has_aggregates || *distinct;
     if let Some(leading) = orderings.first() {
         if let Some(mut node) = search_node(current, &leading.expr, *limit) {
@@ -226,21 +226,39 @@ fn resolve_query(
             ranked = true;
         }
     }
-    let mut reads = Vec::new();
-    for IRProjection { expr, .. } in return_exprs {
-        reads_of_expr(expr, &mut reads);
-    }
     let schema = return_schema(return_exprs, &node_object_types(return_exprs, source)?)?;
     current = if grouped {
-        plan.add(
+        let (grouped_exprs, above) = split_aggregate_return(return_exprs);
+        let mut reads = Vec::new();
+        for IRProjection { expr, .. } in &grouped_exprs {
+            reads_of_expr(expr, &mut reads);
+        }
+        let grouped_schema =
+            return_schema(&grouped_exprs, &node_object_types(&grouped_exprs, source)?)?;
+        let aggregate = plan.add(
             LogicalNode::Aggregate {
                 input: current,
                 reads,
-                return_exprs: return_exprs.clone(),
+                return_exprs: grouped_exprs,
             },
-            schema.clone(),
-        )
+            grouped_schema,
+        );
+        match above {
+            Some(above) => plan.add(
+                LogicalNode::Projection {
+                    input: aggregate,
+                    reads: Vec::new(),
+                    return_exprs: above,
+                },
+                schema.clone(),
+            ),
+            None => aggregate,
+        }
     } else {
+        let mut reads = Vec::new();
+        for IRProjection { expr, .. } in return_exprs {
+            reads_of_expr(expr, &mut reads);
+        }
         plan.add(
             LogicalNode::Projection {
                 input: current,
@@ -632,6 +650,100 @@ fn fused_score(binding: &str) -> IRExpr {
                 false,
             ),
         ),
+    }
+}
+
+pub(crate) fn contains_aggregate(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Aggregate { .. } => true,
+        IRExpr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        IRExpr::Not(inner, _)
+        | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Cast { expr: inner, .. } => contains_aggregate(inner),
+        _ => false,
+    }
+}
+
+/// The `Aggregate` node's items (group keys, plain aggregates, and each
+/// aggregate leaf of a Boolean item under the leaf's GQ text) and, when a
+/// Boolean item compares aggregates, the `Projection` items reading them by alias.
+fn split_aggregate_return(
+    return_exprs: &[IRProjection],
+) -> (Vec<IRProjection>, Option<Vec<IRProjection>>) {
+    let is_plain = |projection: &IRProjection| {
+        matches!(projection.expr, IRExpr::Aggregate { .. }) || !contains_aggregate(&projection.expr)
+    };
+    if return_exprs.iter().all(is_plain) {
+        return (return_exprs.to_vec(), None);
+    }
+    let mut grouped: Vec<IRProjection> = return_exprs
+        .iter()
+        .filter(|p| is_plain(p))
+        .cloned()
+        .collect();
+    let above = return_exprs
+        .iter()
+        .map(|projection| IRProjection {
+            expr: if is_plain(projection) {
+                IRExpr::AliasRef(projection.column.clone(), projection.ty.clone())
+            } else {
+                hoist_aggregates(&projection.expr, &mut grouped)
+            },
+            alias: projection.alias.clone(),
+            column: projection.column.clone(),
+            ty: projection.ty.clone(),
+        })
+        .collect();
+    (grouped, Some(above))
+}
+
+fn hoist_aggregates(expr: &IRExpr, grouped: &mut Vec<IRProjection>) -> IRExpr {
+    match expr {
+        IRExpr::Aggregate { .. } => {
+            let ty = expr.ty().clone();
+            let column = match grouped.iter().find(|p| p.expr == *expr) {
+                Some(projection) => projection.column.clone(),
+                None => {
+                    let column = expr.to_string();
+                    grouped.push(IRProjection {
+                        expr: expr.clone(),
+                        alias: None,
+                        column: column.clone(),
+                        ty: ty.clone(),
+                    });
+                    column
+                }
+            };
+            IRExpr::AliasRef(column, ty)
+        }
+        IRExpr::Binary {
+            left,
+            op,
+            right,
+            ty,
+        } => IRExpr::Binary {
+            left: Box::new(hoist_aggregates(left, grouped)),
+            op: *op,
+            right: Box::new(hoist_aggregates(right, grouped)),
+            ty: ty.clone(),
+        },
+        IRExpr::Not(inner, ty) => {
+            IRExpr::Not(Box::new(hoist_aggregates(inner, grouped)), ty.clone())
+        }
+        IRExpr::IsNull {
+            expr: inner,
+            negated,
+            ty,
+        } => IRExpr::IsNull {
+            expr: Box::new(hoist_aggregates(inner, grouped)),
+            negated: *negated,
+            ty: ty.clone(),
+        },
+        IRExpr::Cast { expr: inner, ty } => IRExpr::Cast {
+            expr: Box::new(hoist_aggregates(inner, grouped)),
+            ty: ty.clone(),
+        },
+        other => other.clone(),
     }
 }
 
@@ -2720,7 +2832,7 @@ impl Lowering<'_> {
     /// ranking's score keys then the user's; over an aggregate, or a `distinct`
     /// return with or without a ranking, the user's keys then every group key.
     fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
-        let grouped = match self.physical.node(input) {
+        let aggregate_at = |id: NodeId| match self.physical.node(id) {
             Some(PhysicalNode::Aggregate {
                 return_exprs,
                 aggregates,
@@ -2728,6 +2840,10 @@ impl Lowering<'_> {
             }) => Some((return_exprs, aggregates)),
             _ => None,
         };
+        let grouped = aggregate_at(input).or_else(|| match self.physical.node(input) {
+            Some(PhysicalNode::Projection { input: below, .. }) => aggregate_at(*below),
+            _ => None,
+        });
         let Some(ranking) = &self.ranking else {
             return Some(match grouped {
                 Some((return_exprs, aggregates)) if aggregates.iter().all(Option::is_none) => {

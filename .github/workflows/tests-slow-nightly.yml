@@ -79,10 +79,15 @@ jobs:
             managed::data::tests::managed_load_sends_exact_ndjson_and_preserves_the_server_receipt \
             managed::auth::tests::device_login_polls_the_provider_and_never_the_old_broker \
             managed::auth::tests::failed_login_custody_attempts_to_revoke_the_new_provider_session \
+            managed::auth::tests::device_login_refuses_another_organization_before_saving_credentials \
+            managed::auth::tests::fresh_device_selection_excludes_keychain_consent_from_network_deadline \
+            managed::auth::tests::fresh_device_selection_network_timeout_preserves_cached_custody_without_replay \
             cli_cluster_e2e::cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart \
             cli_cluster::core_live_apply_captures_server_file_root_without_local_storage_access \
             cli_cluster::managed_lifecycle_wait_reports_tombstone_and_checks_every_poll_identity \
-            cli_cluster::managed_plan_polls_the_accepted_run_and_timeout_does_not_cancel_it \
+            cli_cluster::managed_apply_polls_original_delivery_without_resubmission_or_cancellation \
+            cli_cluster::managed_native_outcomes_preserve_activation_archive_and_uncertainty \
+            cli_cluster::managed_poll_identity_mismatch_retains_original_delivery_and_native_ids \
             cli_cluster::managed_lifecycle_bad_acceptance_and_deadline_keep_recovery_identity \
             repro_issue_723::grouped_transfer_aggregation_streams_at_scale_issue_723 \
             repro_issue_703::expand_projection_avoids_offset_overflow_scale_issue_703 \

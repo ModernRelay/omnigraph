@@ -1,0 +1,106 @@
+# issue: none
+# notes: Without a header, `columns (…)` names the properties by position and the delimiter
+# notes: defaults to a comma; `mode merge` upserts by the `@key`, an empty field stores null,
+# notes: a key repeated inside one file is refused by the `@unique` check, and `mode overwrite`
+# notes: replaces the whole type.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+    age: I32?
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice","age":30}}
+
+--- csv people.csv
+2,bob,41
+3,carol,52
+
+--- mutate
+load csv "people.csv" into node:Person mode append columns (id, name, age)
+
+--- expect ok
+
+--- query
+query appended() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice", "p.age": 30}
+{"p.id": 2, "p.name": "bob", "p.age": 41}
+{"p.id": 3, "p.name": "carol", "p.age": 52}
+
+--- expect shape
+p.id: I64
+p.name: String
+p.age: I32?
+
+--- csv repeated_key.csv
+id,name,age
+4,dave,
+4,dave,19
+
+--- mutate
+load csv "repeated_key.csv" into node:Person mode merge header
+
+--- expect error: @unique violation on Person.id
+
+--- csv merge.csv
+id,name,age
+1,alice,31
+4,dave,
+
+--- mutate
+load csv "merge.csv" into node:Person mode merge header
+
+--- expect ok
+
+--- query
+query merged() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice", "p.age": 31}
+{"p.id": 2, "p.name": "bob", "p.age": 41}
+{"p.id": 3, "p.name": "carol", "p.age": 52}
+{"p.id": 4, "p.name": "dave"}
+
+--- expect shape
+p.id: I64
+p.name: String
+p.age: I32?
+
+--- csv replace.csv
+id;name;age
+9;zed;1
+
+--- mutate
+load csv "replace.csv" into node:Person mode overwrite delimiter ";" header
+
+--- expect ok
+
+--- query
+query replaced() {
+    match { $p: Person }
+    return { $p.id, $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.id": 9, "p.name": "zed", "p.age": 1}
+
+--- expect shape
+p.id: I64
+p.name: String
+p.age: I32?

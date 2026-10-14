@@ -403,7 +403,33 @@ fn parity_branch_merge() {
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
-    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    // A name is used as written on both arms: a padded spelling of a branch
+    // is refused, never read as the branch, before any effect.
+    for args in [
+        &["branch", "merge", " feature ", "--into", " main ", "--json"][..],
+        &["branch", "merge", "feature", "--into", "main ", "--json"][..],
+        &[
+            "mutate",
+            "--branch",
+            " main",
+            "-e",
+            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "--json",
+        ][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert_parity("padded branch name", &l, &r);
+        for output in [&l, &r] {
+            // `--json` reports the error on stdout.
+            assert!(
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("has leading or trailing whitespace"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_write_parity("branch merge own publication", &l, &r);
     for output in [&l, &r] {
         let payload = parse_stdout_json(output);
@@ -426,9 +452,9 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        " feature2 ",
+        "feature2",
         "--into",
-        " main ",
+        "main",
         "--delete-branch",
         "--json",
     ]);
@@ -490,9 +516,10 @@ fn parity_branch_merge() {
         let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
         for output in [&l, &r] {
             assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("branch merge source and target must not be empty"),
+                stderr.contains("has leading or trailing whitespace")
+                    || stderr.contains("contains a control character"),
                 "{output:?}"
             );
         }
@@ -1404,6 +1431,155 @@ fn parity_commit_changes_filtered() {
         "commit", "changes", &commit_id, "--kind", "node", "--op", "insert", "--json",
     ]);
     assert_parity("commit changes filtered", &l, &r);
+}
+
+#[test]
+fn parity_diff_over_shared_history() {
+    let p = parity();
+    let commit_id = fixture_load_commit(&p);
+    let (l, _r) = p.run(&["commit", "show", &commit_id, "--json"]);
+    let parent = parse_stdout_json(&l)["parent_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // --limit 1 walks page tokens on both arms; the shared history makes the
+    // endpoints, type ids and rows byte-identical.
+    let (l, r) = p.run(&[
+        "diff", "--from", &parent, "--to", "main", "--limit", "1", "--json",
+    ]);
+    assert_parity("diff", &l, &r);
+    let (local, remote) = (parse_stdout_json(&l), parse_stdout_json(&r));
+    assert_eq!(local, remote, "diff JSON diverges unscrubbed");
+    assert_eq!(local["from_commit_id"], parent.as_str());
+    assert!(!local["changes"].as_array().unwrap().is_empty());
+    // The commit form and the two-point form from its parent agree.
+    let (commit, _) = p.run(&["commit", "changes", &commit_id, "--json"]);
+    let (between, _) = p.run(&["diff", "--from", &parent, "--to", &commit_id, "--json"]);
+    assert_eq!(
+        parse_stdout_json(&commit)["changes"],
+        parse_stdout_json(&between)["changes"]
+    );
+    // A side naming nothing is the same refusal on both arms.
+    let (l, r) = p.run(&["diff", "--from", "main", "--to", "nowhere"]);
+    assert_eq!(l.status.code(), r.status.code());
+    for output in [&l, &r] {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("'nowhere' names no branch and no commit"),
+            "{output:?}"
+        );
+    }
+}
+
+/// Each arm writes its own commits, so commit ids differ between the arms;
+/// only those are normalized before the outputs are compared.
+fn without_commit_ids(output: &std::process::Output) -> serde_json::Value {
+    fn normalize(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if key.ends_with("commit_id") && value.is_string() {
+                        *value = serde_json::Value::String(format!("<{key}>"));
+                    } else {
+                        normalize(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(normalize),
+            _ => {}
+        }
+    }
+    let mut payload = parse_stdout_json(output);
+    normalize(&mut payload);
+    if let Some(base) = payload.get_mut("merge_base") {
+        for key in ["graph_manifest_version", "created_at"] {
+            base[key] = serde_json::Value::Null;
+        }
+    }
+    payload
+}
+
+#[test]
+fn parity_branch_review() {
+    let p = parity();
+    let (l, r) = p.run(&["branch", "create", "--from", "main", "feature", "--json"]);
+    assert_parity("branch create (review setup)", &l, &r);
+    let (l, r) = p.run(&[
+        "mutate",
+        "--branch",
+        "feature",
+        "-e",
+        "query add() { insert Person { name: \"Reviewed\", age: 31 } }",
+        "--json",
+    ]);
+    assert_write_parity("review source write", &l, &r);
+    for args in [
+        &["branch", "merge-base", "feature", "--json"][..],
+        &[
+            "branch", "diff", "feature", "--into", "main", "--limit", "1", "--json",
+        ][..],
+        &["diff", "--from", "main", "--to", "feature", "--json"][..],
+        &["branch", "merge", "feature", "--dry-run", "--json"][..],
+        // The same reads as GQ statements at the query door.
+        &["query", "-e", "branch merge-base feature", "--json"][..],
+        &[
+            "query",
+            "-e",
+            "branch diff feature into main limit 1",
+            "--json",
+        ][..],
+        &["query", "-e", "branch diff main to feature", "--json"][..],
+        &["query", "-e", "branch merge feature dry run", "--json"][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert!(
+            l.status.success() && r.status.success(),
+            "{args:?}: {l:?} {r:?}"
+        );
+        assert_eq!(
+            without_commit_ids(&l),
+            without_commit_ids(&r),
+            "{args:?}: JSON diverges beyond commit ids"
+        );
+    }
+    let (l, _r) = p.run(&["branch", "diff", "feature", "--json"]);
+    let review = parse_stdout_json(&l);
+    assert_eq!(review["changes"][0]["id"], "Reviewed");
+    assert_eq!(review["changes"][0]["op"], "insert");
+    assert_eq!(review["base_commit_id"], review["from_commit_id"]);
+    let (l, _r) = p.run(&["branch", "merge", "feature", "--dry-run", "--json"]);
+    let dry = parse_stdout_json(&l);
+    assert_eq!(dry["outcome"], "fast_forward");
+    assert_eq!(dry["dry_run"], true);
+    assert!(dry["commit"].is_null());
+    let (l, _r) = p.run(&["query", "-e", "branch diff feature", "--json"]);
+    let rows = parse_stdout_json(&l);
+    assert_eq!(rows["query_name"], "branch diff");
+    assert_eq!(rows["rows"][0]["id"], "Reviewed");
+    assert_eq!(rows["rows"][0]["type"], "Person");
+    assert_eq!(rows["page"]["base_commit_id"], review["base_commit_id"]);
+    let (l, r) = p.run(&["query", "-e", "branch merge feature dry run", "--json"]);
+    for output in [&l, &r] {
+        assert_eq!(
+            parse_stdout_json(output)["rows"][0]["outcome"],
+            "fast_forward"
+        );
+    }
+    // A branch read sent through `mutate` is refused as a read on both arms.
+    let (l, r) = p.run(&["mutate", "-e", "branch diff feature"]);
+    for output in [&l, &r] {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("statement 'branch diff' is a read; use POST /query"),
+            "{output:?}"
+        );
+    }
+    // The dry run wrote nothing: the real merge still has work to do.
+    let (l, r) = p.run(&["branch", "merge", "feature", "--json"]);
+    assert_write_parity("merge after the dry run", &l, &r);
+    assert_eq!(parse_stdout_json(&l)["outcome"], "fast_forward");
 }
 
 #[test]

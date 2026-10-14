@@ -130,6 +130,17 @@ inherits its base's recorded target. A name is bound once, before every use,
 outside a loop, and survives `--- restart`; the served path binds from the
 `ChangeOutput.commit` the route answered and sends `snapshot` on the read.
 
+A `--- query` step may hold a branch control read (RFC 0030 §8.5):
+`branch diff <source> [into <target>]`, `branch diff <from> to <to>`,
+`branch merge-base <source> [into <target>]` or
+`branch merge <source> [into <target>] dry run`. It takes `unordered`,
+`ordered` or `error:`; its rows are the statement's answer, compared as JSON
+whatever their key order, and it carries no shape section, since its columns
+are the statement's. A side spelled `"${name}"` runs with the commit
+`--- bind commit $name` captured, and `${name}` in an expected row stands for
+the same id. The engine and DST paths call `Session::branch_read`; the served
+path sends the statement to `POST /query`.
+
 The configuration accepts 1–16 distinct environment parameter sets,
 1–600000 milliseconds, and 1–64 distinct unsigned 64-bit seeds per DST
 environment. The required corpus refuses budgets above 10000 milliseconds;
@@ -144,6 +155,37 @@ ends a body keeps the final line break the file shows. Each DST seed runs twice
 in fresh worker processes; completed assertion failures also replay and later
 seeds still run within the file budget. Matching replay of a failing graph
 assertion remains a failure unless it meets the explicit known-failure contract below.
+
+## CSV fixtures and the load statement
+
+A `--- mutate` step may hold one `load csv` statement
+([CSV loading](../../docs/user/mutations/index.md#csv-loading)); its
+`branch:` argument is the statement's target, as for a mutation declaration,
+and its `--- expect` takes the control-write forms (`ok`, `error: <needle>`).
+`--- bind commit $name` after it binds the load's commit. The source is a
+URI the engine reads under the case's external Blob policy, or the bare name
+of a `--- csv <name>` section: that section's body is the file's text, the
+runner writes every such section into a fresh directory before the store
+opens, rewrites the statement's source to the file's `file://` URI, and
+installs one `embedded_only` base over that directory on the case's handles,
+across a `--- restart` too, so the statement is authorized by the rule any
+source meets. A bare name without its section refuses the case. A served
+environment refuses fixture sections and bare source names at admission,
+before starting a worker or making any server request. A `load csv` step
+there names an absolute
+URI the server may read, and the `omnigraph-engine` environment is the one
+that runs section-backed loads. The step is reported as a `load` kind.
+
+```text
+--- csv person.csv
+id|firstName
+2|bob
+
+--- mutate branch: work
+load csv "person.csv" into node:Person mode append delimiter "|" header
+
+--- expect ok
+```
 
 ## Generated fixtures and loads
 
