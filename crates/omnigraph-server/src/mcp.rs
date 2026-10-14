@@ -1,4 +1,5 @@
-//! Read-only MCP transport over the existing graph discovery and stored-query handlers.
+//! Read-only MCP transport over the existing graph discovery, schema, stored-query
+//! and inline-query handlers.
 //! The official SDK owns protocol framing, negotiation and cancellation.
 use std::future::Future;
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::{Bytes, to_bytes};
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -33,6 +34,61 @@ use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 pub(crate) const REQUEST_BYTES: usize = 64 * 1024;
 const RESULT_BYTES: usize = 1024 * 1024;
 const READ_DEADLINE: Duration = Duration::from_secs(30);
+const RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// Environment equivalent of `--mcp-allow-adhoc`.
+pub const MCP_ALLOW_ADHOC_ENV: &str = "OMNIGRAPH_MCP_ALLOW_ADHOC";
+
+/// Process boot settings for `/mcp`. They select which opt-in tools are listed
+/// and admitted; they never grant anything, since every tool still runs only
+/// what the applied policy allows its caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct McpSettings {
+    /// Lists and admits the ad-hoc `read` tool.
+    pub allow_adhoc: bool,
+}
+
+impl McpSettings {
+    /// The boot flags, each enabled also by its environment variable.
+    pub fn resolve(allow_adhoc: bool) -> Self {
+        Self {
+            allow_adhoc: allow_adhoc || env_flag(MCP_ALLOW_ADHOC_ENV),
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+/// Whether `path` is protected-resource metadata: the root document or the
+/// path-suffixed location the challenge advertises.
+pub(crate) fn is_resource_metadata_path(path: &str) -> bool {
+    path.strip_prefix(RESOURCE_METADATA_PATH)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The metadata URL a client derives from the resource identifier (RFC 9728
+/// §3.1): the well-known prefix inserted before the resource's path.
+fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(resource).ok()?;
+    let path = format!(
+        "{RESOURCE_METADATA_PATH}{}",
+        url.path().trim_end_matches('/')
+    );
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
+}
+
+/// The metadata path this server advertises, fixed by its boot binding.
+#[derive(Clone)]
+pub(crate) struct AdvertisedMetadataPath(Arc<str>);
 
 /// Mount only when an explicitly configured OIDC resource enables this surface.
 /// Every HTTP request authenticates again; no MCP session retains an actor.
@@ -75,13 +131,24 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
             state.clone(),
             handlers::require_bearer_auth,
         ))
-        .route_layer(middleware::from_fn_with_state(state, resource_challenge));
-    Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(resource_metadata),
-        )
-        .merge(protected)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            resource_challenge,
+        ));
+    // Computed once from the fixed binding. A wildcard route compared with the
+    // raw request path keeps the configured path out of the router's syntax.
+    let advertised = state
+        .oidc_resource_url()
+        .and_then(|resource| advertised_metadata_url(&resource))
+        .map(|url| AdvertisedMetadataPath(Arc::from(url.path())));
+    let mut discovery = Router::new().route(RESOURCE_METADATA_PATH, get(resource_metadata));
+    if let Some(advertised) = advertised {
+        discovery = discovery.route(
+            &format!("{RESOURCE_METADATA_PATH}/{{*resource_path}}"),
+            get(resource_metadata_at_resource_path).layer(Extension(advertised)),
+        );
+    }
+    discovery.merge(protected)
 }
 
 #[utoipa::path(get, path = "/.well-known/oauth-protected-resource", tag = "management",
@@ -95,25 +162,57 @@ pub(crate) async fn resource_metadata(State(state): State<AppState>) -> Response
     }
 }
 
+/// The same metadata at the location the `/mcp` challenge advertises for a
+/// resource identifier with a path: the well-known prefix followed by that
+/// path (`/.well-known/oauth-protected-resource/mcp` for `https://host/mcp`).
+/// Every other suffix is 404.
+#[utoipa::path(get, path = "/.well-known/oauth-protected-resource/{resource_path}", tag = "management",
+    operation_id = "oauthProtectedResourceMetadataAtResourcePath",
+    params(("resource_path" = String, Path, description = "The configured resource identifier's path, without its leading `/`")),
+    responses((status = 200, description = "Public OAuth protected resource metadata", body = Value),
+              (status = 404, description = "Not the configured resource's path, or OAuth resource identity is not configured")))]
+pub(crate) async fn resource_metadata_at_resource_path(
+    State(state): State<AppState>,
+    Extension(AdvertisedMetadataPath(advertised)): Extension<AdvertisedMetadataPath>,
+    uri: Uri,
+) -> Response {
+    if uri.path() == &*advertised {
+        resource_metadata(State(state)).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 async fn resource_challenge(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Response {
+    // RFC 6750 §3.1: `invalid_token` answers a presented bearer credential
+    // that was refused; a request without one gets no error code.
+    let presented = request
+        .headers()
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .any(|value| {
+            value
+                .as_bytes()
+                .get(..7)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"bearer "))
+        });
     let mut response = next.run(request).await;
     if response.status() == StatusCode::UNAUTHORIZED {
-        if let Some(mut url) = state
+        if let Some(url) = state
             .oidc_resource_url()
-            .and_then(|url| url::Url::parse(&url).ok())
+            .and_then(|resource| advertised_metadata_url(&resource))
         {
-            let path = format!(
-                "/.well-known/oauth-protected-resource{}",
-                url.path().trim_end_matches('/')
-            );
-            url.set_path(&path);
-            url.set_query(None);
-            url.set_fragment(None);
-            if let Ok(value) = HeaderValue::from_str(&format!("Bearer resource_metadata=\"{url}\""))
+            let error = if presented {
+                "error=\"invalid_token\", "
+            } else {
+                ""
+            };
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("Bearer {error}resource_metadata=\"{url}\""))
             {
                 response
                     .headers_mut()
@@ -151,12 +250,29 @@ struct QueryArguments {
     #[serde(default)]
     branch: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadArguments {
+    graph: String,
+    query: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    params: Option<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    snapshot: Option<String>,
+}
 
 impl ServerHandler for GraphTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("omnigraph-server", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Discover graph names, list readable stored queries, then invoke a named read. Applied graph policy governs every read. Mutation tools are unavailable.")
+            .with_server_info(Implementation::new(
+                "omnigraph-server",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(instructions(self.state.mcp_settings()))
     }
 
     async fn list_tools(
@@ -164,11 +280,15 @@ impl ServerHandler for GraphTools {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(ListToolsResult::with_all_items(tools(
+            self.state.mcp_settings(),
+        )))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+        tools(self.state.mcp_settings())
+            .into_iter()
+            .find(|tool| tool.name == name)
     }
 
     async fn call_tool(
@@ -312,6 +432,35 @@ impl GraphTools {
                 .0;
                 bounded_result(&output)
             }
+            "schema" => {
+                let args: GraphArguments = arguments_as(arguments)?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_schema_get(Extension(handle), Some(Extension(actor)))
+                    .await?
+                    .0;
+                bounded_result(&output)
+            }
+            "read" if self.state.mcp_settings().allow_adhoc => {
+                let args: ReadArguments = arguments_as(arguments)?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let request: crate::api::QueryRequest = serde_json::from_value(json!({
+                    "query": args.query,
+                    "name": args.name,
+                    "params": args.params,
+                    "branch": args.branch,
+                    "snapshot": args.snapshot,
+                }))
+                .map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))?;
+                let output = handlers::server_query(
+                    State(self.state.clone()),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    Ok(Json(request)),
+                )
+                .await?
+                .0;
+                bounded_result(&output)
+            }
             _ => Err(ApiError::bad_request("unknown MCP tool")),
         }
     }
@@ -339,14 +488,242 @@ fn arguments_as<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ApiEr
     serde_json::from_value(value).map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))
 }
 
-fn tools() -> Vec<Tool> {
-    let text = json!({"type":"string","minLength":1});
-    [
-        ("graphs", "List effective graph identifiers and display names.", json!({"type":"object","properties":{},"additionalProperties":false})),
-        ("queries", "List stored reads visible under the graph's applied read policy. Invocation is separately authorized.", json!({"type":"object","properties":{"graph":text},"required":["graph"],"additionalProperties":false})),
-        ("query", "Invoke a named stored read under the graph's applied policy. Defaults to the main branch; mutations are refused.", json!({"type":"object","properties":{"graph":text,"name":text,"params":{"type":"object"},"branch":text},"required":["graph","name"],"additionalProperties":false})),
-    ].into_iter().map(|(name, description, schema)| Tool::new(name, description, schema.as_object().expect("literal object").clone())
-        .with_annotations(ToolAnnotations::new().read_only(true))).collect()
+/// Which boot setting, if any, lists and admits a tool.
+#[derive(Clone, Copy)]
+enum Gate {
+    Always,
+    Adhoc,
+}
+
+impl Gate {
+    fn open(self, settings: &McpSettings) -> bool {
+        match self {
+            Gate::Always => true,
+            Gate::Adhoc => settings.allow_adhoc,
+        }
+    }
+}
+
+struct ToolSpec {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    input: fn() -> Value,
+    /// Success shape, for tools whose result is fixed. The declared output
+    /// schema also admits the error envelope: clients validate any structured
+    /// content against it, including an `isError` result's.
+    output: Option<fn() -> Value>,
+    gate: Gate,
+}
+
+const TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "graphs",
+        title: "List graphs",
+        description: "List the graphs this server serves: each graph's `graph_id` and display name. Every other tool takes one of these ids as `graph`. Listing a graph does not mean your credential may read it.",
+        input: no_arguments_schema,
+        output: Some(graphs_output_schema),
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "schema",
+        title: "Read a graph's schema",
+        description: "Return a graph's schema as `.pg` source (`schema_source`): its node and edge types, properties with their types, keys, edge endpoints and declared embeddings. Call this before writing any query: GQ names types, properties and edges exactly as declared here, and edges are matched in lowerCamelCase.",
+        input: graph_schema,
+        output: Some(schema_output_schema),
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "queries",
+        title: "List stored reads",
+        description: "List a graph's stored reads: each `name`, its description and instruction, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run one with `query`. Invocation is authorized separately, so a listed read can still be refused.",
+        input: graph_schema,
+        output: Some(queries_output_schema),
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "query",
+        title: "Run a stored read",
+        description: "Run a stored read by `name` with `params` keyed by its declared parameter names (see `queries`). Reads `branch`, `main` when omitted. Returns `rows`, `row_count` and the read's `graph_commit_id`. Stored mutations are refused.",
+        input: query_schema,
+        output: None,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "read",
+        title: "Run a GQ read",
+        description: "Run a GQ read query you write. Call `schema` first. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; pick one declared query with `name` when the source declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Also answers `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` and `explain query …`, sent without `branch`, `snapshot`, `name` or `params`. Mutations and branch writes are refused. Returns `rows`, `row_count` and `graph_commit_id`.",
+        input: read_schema,
+        output: None,
+        gate: Gate::Adhoc,
+    },
+];
+
+fn instructions(settings: &McpSettings) -> String {
+    let mut text = String::from(
+        "OmniGraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n\
+         1. Call `graphs` for graph ids.\n\
+         2. Call `schema` for the graph before writing a query: it declares the types, properties, keys and edges a query may name.\n\
+         3. Prefer a stored read: `queries` lists them with typed parameters, and `query` runs one.\n",
+    );
+    if settings.allow_adhoc {
+        text.push_str(
+            "4. Otherwise write a GQ read and run it with `read`, with every value passed as a declared, typed parameter. `read` refuses mutations.\n",
+        );
+    }
+    text.push_str(
+        "Results carry the read's `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+    );
+    text
+}
+
+fn tools(settings: &McpSettings) -> Vec<Tool> {
+    TOOLS
+        .iter()
+        .filter(|spec| spec.gate.open(settings))
+        .map(|spec| {
+            let mut tool = Tool::new(spec.name, spec.description, object((spec.input)()))
+                .with_title(spec.title)
+                .with_annotations(ToolAnnotations::new().read_only(true).open_world(false));
+            if let Some(output) = spec.output {
+                tool = tool.with_raw_output_schema(Arc::new(object(json!({
+                    "type": "object",
+                    "anyOf": [output(), error_schema()],
+                }))));
+            }
+            tool
+        })
+        .collect()
+}
+
+fn object(value: Value) -> serde_json::Map<String, Value> {
+    match value {
+        Value::Object(map) => map,
+        _ => unreachable!("tool schemas are JSON object literals"),
+    }
+}
+
+fn text_schema(description: &str) -> Value {
+    json!({"type": "string", "minLength": 1, "description": description})
+}
+
+fn graph_argument() -> Value {
+    text_schema("Graph id, from `graphs`.")
+}
+
+fn no_arguments_schema() -> Value {
+    json!({"type": "object", "properties": {}, "additionalProperties": false})
+}
+
+fn graph_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"graph": graph_argument()},
+        "required": ["graph"],
+        "additionalProperties": false,
+    })
+}
+
+fn query_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "graph": graph_argument(),
+            "name": text_schema("Stored read name, from `queries`."),
+            "params": {"type": "object", "description": "Values keyed by the read's declared parameter names."},
+            "branch": text_schema("Branch to read. Defaults to `main`."),
+        },
+        "required": ["graph", "name"],
+        "additionalProperties": false,
+    })
+}
+
+fn read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "graph": graph_argument(),
+            "query": text_schema("GQ source declaring one or more read queries, or one branch read or `explain` statement."),
+            "name": text_schema("Which declared query to run when `query` declares several."),
+            "params": {"type": "object", "description": "Values keyed by the query's declared parameter names, without `$`."},
+            "branch": text_schema("Branch to read. Defaults to `main`. Not with `snapshot`."),
+            "snapshot": text_schema("Graph commit id to read instead of a branch head."),
+        },
+        "required": ["graph", "query"],
+        "additionalProperties": false,
+    })
+}
+
+/// The `isError` envelope: an HTTP refusal (`status` and the route's `error`
+/// body) or an MCP-side refusal (`code` and `message`).
+fn error_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {"type": "integer"},
+            "error": {"type": "object"},
+            "code": {"type": "string"},
+            "message": {"type": "string"},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn graphs_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"graphs": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"graph_id": {"type": "string"}, "display_name": {"type": "string"}},
+            "required": ["graph_id", "display_name"],
+        }}},
+        "required": ["graphs"],
+    })
+}
+
+fn schema_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "schema_source": {"type": "string"},
+            "system_columns": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "src": {"type": "string"}, "dst": {"type": "string"}},
+                "required": ["id", "src", "dst"],
+            },
+        },
+        "required": ["schema_source"],
+    })
+}
+
+fn queries_output_schema() -> Value {
+    let kind = json!({"type": "string", "enum": ["string", "bool", "int", "bigint", "float", "date", "datetime", "blob", "vector", "list"]});
+    json!({
+        "type": "object",
+        "properties": {"queries": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "description": {"type": "string"},
+                "instruction": {"type": "string"},
+                "mutation": {"type": "boolean"},
+                "params": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "kind": kind,
+                        "item_kind": kind,
+                        "vector_dim": {"type": "integer"},
+                        "nullable": {"type": "boolean"},
+                    },
+                    "required": ["name", "kind", "nullable"],
+                }},
+            },
+            "required": ["name", "tool_name", "mutation", "params"],
+        }}},
+        "required": ["queries"],
+    })
 }
 
 struct LimitedBytes(Vec<u8>);

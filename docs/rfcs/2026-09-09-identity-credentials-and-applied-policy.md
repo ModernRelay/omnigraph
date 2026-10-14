@@ -309,9 +309,11 @@ per-cluster native signing key.
 
 When OIDC trust is configured, the server exposes protected-resource metadata
 and a stateless `/mcp` transport built on the official Rust MCP SDK. Its
-initial tools provide graph existence, stored-read catalog and stored-read
-invocation through the same HTTP handler functions and Cedar gates. The
+initial tools provided graph existence, stored-read catalog and stored-read
+invocation through the same HTTP handler functions and Cedar gates; the
 read-kind assertion prevents invoking a mutation through the read tool.
+[RFC 0003](0003-mcp-server-surface.md) owns the tool catalog, discovery paths
+and mounting from then on.
 Protocol framing, negotiation and cancellation use the SDK. Requests are
 bounded to 64 KiB, returned tool data to 1 MiB, read attempts to 30 seconds
 and concurrent tools to 16. Tool visibility is not permission to invoke.

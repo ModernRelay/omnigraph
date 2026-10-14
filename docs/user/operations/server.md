@@ -186,30 +186,10 @@ never fetch keys or call a control service, so publisher outages eventually
 prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
-With this profile configured, the server additionally exposes:
-
-- `GET /.well-known/oauth-protected-resource`: public resource identifier,
-  authorization server and supported bearer delivery, without identity lists.
-- `/mcp`: Streamable HTTP MCP using the maintained Rust SDK. Authentication
-  failures advertise protected-resource metadata for standard OAuth clients.
-
-The initial MCP tools are `graphs` (IDs and names), `queries` (permitted stored
-read names for one graph), and `query` (a named stored read with parameters and
-an optional branch). Mutation definitions are excluded and cannot be invoked
-through a read tool. These tools use the same actor and Cedar checks as HTTP
-graph requests. Limits are 30 seconds to wait, 16 concurrent executions,
-64 KiB requests and 1 MiB results. Cancelled or expired callers stop waiting;
-execution retains its input and slot until it finishes, with no later result
-lookup. See [admission and shutdown](../deployment.md).
-
-Verbose MCP SDK logs contain query arguments and results, so the server keeps
-them out of its log; see [Logs](#logs).
-
-Requests require the resource authority or a loopback host; browsers must use
-the resource origin, while native clients can omit `Origin`. The deployment
-must separately supply a reachable server URL and public metadata at the
-advertised resource location. Direct/static deployments without this option
-keep their existing routes and do not expose MCP.
+With this profile configured, the server also serves public
+protected-resource metadata and an OAuth challenge on `/mcp`, so standard OAuth
+clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
+endpoint, its tools, settings and limits.
 
 ## Route families
 
@@ -222,8 +202,8 @@ keep their existing routes and do not expose MCP.
 | `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
-| `GET /.well-known/oauth-protected-resource` | Public OIDC resource metadata; only when OIDC trust is configured |
-| `/mcp` | Stored reads and discovery over MCP; only when OIDC trust is configured |
+| `GET /.well-known/oauth-protected-resource`, also at the resource's path suffix | Public OIDC resource metadata; only when OIDC trust is configured |
+| `/mcp` | The [MCP endpoint](mcp.md); only when OIDC trust is configured |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |

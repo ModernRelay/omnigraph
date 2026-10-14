@@ -60,6 +60,18 @@ fn trust(root: &std::path::Path) -> Arc<OidcIdentityTrust> {
 }
 
 async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
+    fixture_app_with(omnigraph_server::McpSettings::default()).await
+}
+
+fn adhoc() -> omnigraph_server::McpSettings {
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.allow_adhoc = true;
+    settings
+}
+
+async fn fixture_app_with(
+    settings: omnigraph_server::McpSettings,
+) -> (tempfile::TempDir, Router, AppState) {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let policy = temp.path().join("policy.yaml");
@@ -139,7 +151,8 @@ async fn fixture_app() -> (tempfile::TempDir, Router, AppState) {
         None,
     )
     .unwrap()
-    .with_oidc_identity_trust(trust(temp.path()));
+    .with_oidc_identity_trust(trust(temp.path()))
+    .with_mcp_settings(settings);
     (temp, omnigraph_server::build_app(state.clone()), state)
 }
 
@@ -195,7 +208,7 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["graphs", "queries", "query"]);
+    assert_eq!(names, vec!["graphs", "schema", "queries", "query"]);
     for tool in list["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
     }
@@ -356,6 +369,35 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(metadata["resource"], RESOURCE);
     assert!(!metadata.to_string().contains("stable_alice"));
+    // The challenge's URL itself answers the same document, so a client
+    // probing the path-suffixed location first needs no proxy rewrite.
+    let advertised = "/.well-known/oauth-protected-resource/clusters/A/incarnations/one";
+    let response = app
+        .clone()
+        .oneshot(Request::get(advertised).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key(HTTP_API_CONTRACT_HEADER));
+    let at_path: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(at_path, metadata);
+    for other in [
+        "/.well-known/oauth-protected-resource/clusters/A",
+        "/.well-known/oauth-protected-resource/clusters/A/incarnations/one/",
+        "/.well-known/oauth-protected-resource/clusters/A/incarnations/two",
+        "/.well-known/oauth-protected-resource/clusters/A/incarnations/one/extra",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/clusters/%41/incarnations/one",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(other).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{other}");
+    }
     let response = app
         .clone()
         .oneshot(Request::get("/no-such-route").body(Body::empty()).unwrap())
@@ -373,15 +415,29 @@ async fn mcp_authenticates_every_request_and_enforces_resource_and_http_bounds()
         token("unknown", RESOURCE),
         "ogc_retired".into(),
     ] {
+        let response = app
+            .clone()
+            .oneshot(rpc(Some(&wrong), "tools/list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // RFC 6750: a presented, refused bearer is `invalid_token`.
         assert_eq!(
-            app.clone()
-                .oneshot(rpc(Some(&wrong), "tools/list", json!({})))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
+            response.headers()["www-authenticate"],
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://data.example/.well-known/oauth-protected-resource/clusters/A/incarnations/one\""
         );
     }
+    // Another scheme is not a presented bearer credential.
+    let mut basic = rpc(None, "tools/list", json!({}));
+    basic
+        .headers_mut()
+        .insert("authorization", "Basic YWxpY2U6eA==".parse().unwrap());
+    let response = app.clone().oneshot(basic).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()["www-authenticate"],
+        "Bearer resource_metadata=\"https://data.example/.well-known/oauth-protected-resource/clusters/A/incarnations/one\""
+    );
     let mut forged = rpc(None, "tools/list", json!({}));
     forged
         .extensions_mut()
@@ -553,5 +609,215 @@ async fn mcp_requires_explicit_resource_identity_configuration() {
         .unwrap()
         .status(),
         StatusCode::NOT_FOUND
+    );
+}
+
+async fn tool_list(app: &Router, token: &str) -> Vec<Value> {
+    let (status, list) = json_response(app, rpc(Some(token), "tools/list", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    list["result"]["tools"].as_array().unwrap().clone()
+}
+
+async fn instructions(app: &Router, token: &str) -> String {
+    let (status, body) = json_response(
+        app,
+        rpc(
+            Some(token),
+            "initialize",
+            json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["result"]["instructions"].as_str().unwrap().to_owned()
+}
+
+/// One line per tool: name, required arguments, read-only hint, whether an
+/// output schema is declared. The opt-in `read` tool appears only when the
+/// server enables it.
+#[tokio::test]
+async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
+    let alice = token("alice", RESOURCE);
+    for (settings, expected) in [
+        (
+            omnigraph_server::McpSettings::default(),
+            vec![
+                "graphs [] read_only output",
+                "schema [graph] read_only output",
+                "queries [graph] read_only output",
+                "query [graph,name] read_only",
+            ],
+        ),
+        (
+            adhoc(),
+            vec![
+                "graphs [] read_only output",
+                "schema [graph] read_only output",
+                "queries [graph] read_only output",
+                "query [graph,name] read_only",
+                "read [graph,query] read_only",
+            ],
+        ),
+    ] {
+        let enabled = settings.allow_adhoc;
+        let (_temp, app, _state) = fixture_app_with(settings).await;
+        let tools = tool_list(&app, &alice).await;
+        let lines: Vec<String> = tools
+            .iter()
+            .map(|tool| {
+                let required: Vec<&str> = tool["inputSchema"]["required"]
+                    .as_array()
+                    .map(|names| names.iter().map(|n| n.as_str().unwrap()).collect())
+                    .unwrap_or_default();
+                assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+                assert!(tool["title"].as_str().is_some_and(|t| !t.is_empty()));
+                assert!(tool["description"].as_str().unwrap().len() > 60);
+                assert_eq!(tool["annotations"]["openWorldHint"], false);
+                let mut line = format!(
+                    "{} [{}]{}",
+                    tool["name"].as_str().unwrap(),
+                    required.join(","),
+                    if tool["annotations"]["readOnlyHint"] == true {
+                        " read_only"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(output) = tool.get("outputSchema") {
+                    assert_eq!(output["type"], "object");
+                    assert_eq!(output["anyOf"].as_array().unwrap().len(), 2);
+                    line.push_str(" output");
+                }
+                line
+            })
+            .collect();
+        assert_eq!(lines, expected);
+        let text = instructions(&app, &alice).await;
+        assert!(text.contains("Call `schema`"), "{text}");
+        assert_eq!(text.contains("`read`"), enabled, "{text}");
+        if !enabled {
+            let refused = call(&app, &alice, "read", json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"})).await;
+            assert!(refused.get("error").is_some(), "{refused}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
+    let (temp, app, _state) = fixture_app_with(adhoc()).await;
+    let alice = token("alice", RESOURCE);
+    let bob = token("bob", RESOURCE);
+
+    // `schema` answers exactly the route's body.
+    let schema = call(&app, &alice, "schema", json!({"graph":"default"})).await;
+    assert_eq!(schema["result"]["isError"], false, "{schema}");
+    let (status, native) = json_response(&app, get_request("/graphs/default/schema", &alice)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(schema["result"]["structuredContent"], native);
+    assert!(
+        native["schema_source"]
+            .as_str()
+            .unwrap()
+            .contains("node Person")
+    );
+    // `queries` carries each stored read's typed parameters.
+    let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
+    let person = catalog["result"]["structuredContent"]["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|query| query["name"] == "person")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        person["params"],
+        json!([{"name":"name","kind":"string","nullable":false}])
+    );
+
+    // `read` answers exactly `POST /query`'s body, including branch reads.
+    let source = "query adults($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } order { $p.name asc } }";
+    for arguments in [
+        json!({"graph":"default","query":source,"params":{"min":30}}),
+        json!({"graph":"default","query":source,"params":{"min":30},"branch":"main"}),
+        json!({"graph":"default","query":"branch list"}),
+    ] {
+        let read = call(&app, &alice, "read", arguments.clone()).await;
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        let mut body = arguments.clone();
+        body.as_object_mut().unwrap().remove("graph");
+        let request = Request::post("/graphs/default/query")
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {alice}"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, native) = json_response(&app, request).await;
+        assert_eq!(status, StatusCode::OK, "{native}");
+        assert_eq!(read["result"]["structuredContent"], native);
+    }
+
+    // A denied actor gets the route's refusal in the shared envelope.
+    for (tool, arguments) in [
+        ("schema", json!({"graph":"default"})),
+        (
+            "read",
+            json!({"graph":"default","query":source,"params":{"min":1}}),
+        ),
+    ] {
+        let denied = call(&app, &bob, tool, arguments).await;
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+        assert_eq!(
+            denied["result"]["structuredContent"]["status"], 403,
+            "{denied}"
+        );
+        assert_eq!(
+            denied["result"]["structuredContent"]["error"]["code"],
+            "forbidden"
+        );
+    }
+
+    // Writes never pass through `read`, and leave the graph unchanged.
+    let before = manifest_dataset_version(&graph_path(temp.path())).await;
+    for query in [
+        "query add() { insert Person { name: \"Mallory\", age: 1 } }",
+        "query bump() { update Person set { age: 99 } where name = \"Alice\" }",
+        "query drop() { delete Person where name = \"Alice\" }",
+        "branch create feature from main",
+    ] {
+        let refused = call(
+            &app,
+            &alice,
+            "read",
+            json!({"graph":"default","query":query}),
+        )
+        .await;
+        assert_eq!(refused["result"]["isError"], true, "{query}: {refused}");
+        assert_eq!(
+            refused["result"]["structuredContent"]["status"], 400,
+            "{query}: {refused}"
+        );
+    }
+    let unknown = call(
+        &app,
+        &alice,
+        "read",
+        json!({"graph":"default","query":"branch list","settings":{}}),
+    )
+    .await;
+    assert_eq!(unknown["result"]["isError"], true, "{unknown}");
+    assert_eq!(
+        manifest_dataset_version(&graph_path(temp.path())).await,
+        before
+    );
+
+    // The request bound applies to the inline source as to any MCP request.
+    let oversized = rpc(
+        Some(&alice),
+        "tools/call",
+        json!({"name":"read","arguments":{"graph":"default","query":format!("// {}\nbranch list", "x".repeat(64 * 1024))}}),
+    );
+    assert_eq!(
+        app.clone().oneshot(oversized).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
     );
 }

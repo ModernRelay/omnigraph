@@ -312,6 +312,7 @@ const ALWAYS_FLAT_PATHS: &[&str] = &[
     "/cluster/deployments",
     "/cluster/deployments/{id}",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/{resource_path}",
 ];
 
 /// In multi-mode `server_openapi`, every protected path-item is

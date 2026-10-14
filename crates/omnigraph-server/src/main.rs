@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    init_tracing, load_server_settings, load_server_settings_with_identity_trust,
-    resolve_shutdown_grace, serve, serve_with_data_token_trust,
+    McpSettings, init_tracing, load_server_settings, load_server_settings_with_identity_trust,
+    resolve_shutdown_grace, serve_with_data_token_trust, serve_with_mcp_settings,
 };
 
 #[derive(Debug, Parser)]
@@ -50,6 +50,11 @@ struct Cli {
     /// termination grace must be longer.
     #[arg(long)]
     shutdown_grace_seconds: Option<u64>,
+    /// List and admit the MCP `read` tool, which runs ad-hoc GQ reads under the
+    /// caller's applied `read` policy. Off by default. Equivalent to setting
+    /// `OMNIGRAPH_MCP_ALLOW_ADHOC=1`.
+    #[arg(long)]
+    mcp_allow_adhoc: bool,
 }
 
 #[tokio::main]
@@ -58,6 +63,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
+    let mcp = McpSettings::resolve(cli.mcp_allow_adhoc);
     match (cli.data_token_trust, cli.oidc_identity_trust) {
         (data, oidc) if data.is_some() || oidc.is_some() => {
             let settings = load_server_settings_with_identity_trust(
@@ -69,7 +75,8 @@ async fn main() -> Result<()> {
                 oidc.as_deref(),
             )
             .await?
-            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?);
+            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?)
+            .with_mcp_settings(mcp);
             serve_with_data_token_trust(settings).await
         }
         _ => {
@@ -81,7 +88,7 @@ async fn main() -> Result<()> {
             )
             .await?;
             settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
-            serve(settings).await
+            serve_with_mcp_settings(settings, mcp).await
         }
     }
 }
