@@ -45,6 +45,7 @@ deployment.
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
 - [Storage failures and restart](operations/storage-failures.md)
+- [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
 - [Storage-format upgrades](operations/upgrade.md)

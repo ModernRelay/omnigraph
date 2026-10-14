@@ -15,6 +15,7 @@ mod mcp;
 pub mod operations;
 mod redacted_cause;
 mod settings;
+pub mod telemetry;
 use extract::{ApiJson, ApiPath, ApiQuery};
 use handlers::*;
 use settings::*;
@@ -87,7 +88,6 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
@@ -3434,23 +3434,17 @@ fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subsc
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    use tracing_subscriber::layer::SubscriberExt as _;
+    telemetry::subscriber(filter, writer, false, None)
+}
 
-    tracing_subscriber::registry()
-        .with(filter)
-        // This independent metadata filter cannot be overridden by a more
-        // specific RUST_LOG directive, and keeps graph values, storage URIs
-        // and entity IDs out of dependency logs.
-        .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            let target = metadata.target();
-            let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
-                target
-                    .strip_prefix(restricted)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
-            });
-            !restricted || *metadata.level() <= tracing::Level::WARN
-        }))
-        .with(tracing_subscriber::fmt::layer().with_writer(writer))
+fn safe_log_metadata(metadata: &tracing::Metadata<'_>) -> bool {
+    let target = metadata.target();
+    let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
+        target
+            .strip_prefix(restricted)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    !restricted || *metadata.level() <= tracing::Level::WARN
 }
 
 /// Install native server logging with MCP protocol payload logs and Lance's
@@ -3485,6 +3479,19 @@ pub(crate) mod test_log_capture {
         ) -> impl tracing::Subscriber + Send + Sync {
             let writer = self.clone();
             super::server_log_subscriber(EnvFilter::new(directives), move || writer.clone())
+        }
+
+        pub(crate) fn json_subscriber(
+            &self,
+            directives: &str,
+        ) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            super::telemetry::subscriber(
+                EnvFilter::new(directives),
+                move || writer.clone(),
+                true,
+                None,
+            )
         }
 
         /// Everything written so far, with ANSI styling removed so a test can
@@ -3528,16 +3535,23 @@ mod log_filter_tests {
     #[test]
     fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
         // Each directive set, and whether it enables DEBUG on unrestricted targets.
-        for (directives, debug) in [
+        for ((directives, debug), json) in [
             ("trace", true),
             ("debug,rmcp::service=trace", true),
             (
                 "info,lance::dataset_events=trace,lance::file_audit=trace",
                 false,
             ),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|json| (case, json)))
+        {
             let captured = Capture::default();
-            let subscriber = captured.subscriber(directives);
+            let subscriber: Box<dyn tracing::Subscriber + Send + Sync> = if json {
+                Box::new(captured.json_subscriber(directives))
+            } else {
+                Box::new(captured.subscriber(directives))
+            };
             tracing::subscriber::with_default(subscriber, || {
                 tracing::debug!(target: "rmcp::service", request = "PRIVATE_REQUEST_MARKER", "received request");
                 tracing::trace!(target: "rmcp::transport::streamable_http_server::tower", message = "PRIVATE_RESULT_MARKER");
@@ -3747,7 +3761,7 @@ pub fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn(http_contract::identify_response))
         .layer(middleware::from_fn_with_state(challenge, challenge::answer))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(telemetry::http_request))
         .with_state(state)
 }
 
