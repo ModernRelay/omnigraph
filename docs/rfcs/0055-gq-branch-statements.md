@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-09-06
+updated: 2026-10-13
 discussion: https://github.com/ModernRelay/omnigraph/pull/626
 supersedes: []
 superseded_by: []
@@ -177,9 +177,9 @@ the target's head and the source are unchanged.
 Guarantee: a statement and its route produce the same engine effect, the
 same Cedar decision, the same admission check, and the same error mapping
 for every input the compiler accepts, because they run one handler body
-(Design); a padded or control-character name is refused at the statement
-and trimmed, or passed, by the route (Grammar), the one input class where
-the fronts differ. They differ
+(Design); a padded or control-character name is refused at both fronts,
+by the compiler at the statement and by the route before authorization
+(Grammar). They differ
 only in envelope; a merge conflict is the same 409 on both fronts.
 
 Guarantee: `branch list` is authorized as `GET /branches` is, `read` with
@@ -328,7 +328,8 @@ empty name, a name with leading or trailing whitespace, and a name
 carrying a control character (Unicode category Cc, `char::is_control`), so
 that the
 spelled name and the name the engine acts on are one string; every other
-rule is the engine's (`normalize_branch_name` trims and refuses empty,
+rule is the engine's (`normalize_branch_name` refuses, never trims, the same
+empty, padded and control-character names,
 `ensure_logical_branch_name` refuses an incarnation-shaped segment, and
 `ensure_branch_create_namespace_safe` refuses an existing name and an
 ancestor or descendant of a live name, `crates/omnigraph/src/db/omnigraph.rs:3787-3799,
@@ -713,7 +714,8 @@ at that commit).
    `takes no arguments` text as its prefix, and `branch:` with no name
    after it with `` `--- {kind} branch:` needs a branch name ``. The name
    is not checked further at parse time: it passes to the engine, whose
-   `normalize_branch_name` trims and refuses empty (Grammar).
+   `normalize_branch_name` refuses an empty, padded or control-character
+   name (Grammar).
 2. A `--- mutate` step may hold a control write and a `--- query` step may
    hold `branch list`, classified by the compiler. The wrong kind is
    refused beside the existing read/mutation refusals (`lib.rs:803-812`)
@@ -1493,3 +1495,16 @@ None.
   expectation in item 3 of the first-cases entry above, "both are red and
   held out of the corpus until their fixes" in the 2026-09-06 entry, and
   the Motivation's listing of seed 221206 among the engine findings.
+- 2026-10-13: [RFC 0030](0030-cdc-time-travel.md) §8.5 adds the branch
+  control reads `branch diff`, `branch merge-base` and
+  `branch merge … dry run`, which enter `POST /query` and `omnigraph query`
+  beside `branch list` and are refused at `POST /mutate` as reads. This
+  supersedes "`branch list` is the only branch statement `POST /query`
+  accepts" in User and operational behavior; the read door stays read-only.
+- 2026-10-13: a route and the engine refuse an empty, padded or
+  control-character branch name as written instead of trimming it, so the
+  statement and its route refuse the same names. This supersedes, in Design,
+  "a padded or control-character name is refused at the statement and
+  trimmed, or passed, by the route (Grammar), the one input class where the
+  fronts differ", and in Grammar and Logic tests, "`normalize_branch_name`
+  trims and refuses empty".

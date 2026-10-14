@@ -1480,6 +1480,7 @@ fn parse_branch(input: &str) -> BranchStmt {
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
         FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
         FileBody::Commit(write) => panic!("expected a branch statement, got {write:?}"),
+        FileBody::Load(stmt) => panic!("expected a branch statement, got {stmt:?}"),
     }
 }
 
@@ -1509,6 +1510,98 @@ fn parse_commit(input: &str) -> CommitWrite {
         FileBody::Commit(write) => write,
         other => panic!("expected a commit statement, got {other:?}"),
     }
+}
+
+fn parse_load(input: &str) -> LoadStmt {
+    match parse_query(input).unwrap().body {
+        FileBody::Load(stmt) => stmt,
+        other => panic!("expected a load statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_statement_parses_every_option() {
+    let stmt = parse_load(
+        "load csv \"s3://bucket/imports/knows.csv\" into edge:Knows mode append delimiter \"|\" header columns (from, to, creationDate);",
+    );
+    assert_eq!(
+        stmt,
+        LoadStmt {
+            source: "s3://bucket/imports/knows.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadStmtMode::Append,
+            delimiter: b'|',
+            header: true,
+            columns: Some(vec![
+                "from".to_string(),
+                "to".to_string(),
+                "creationDate".to_string()
+            ]),
+        }
+    );
+    assert_eq!(stmt.statement_name(), "load csv");
+    assert_eq!(stmt.target.table_key(), "edge:Knows");
+}
+
+#[test]
+fn load_statement_defaults_to_comma_and_header_names() {
+    let stmt =
+        parse_load("load csv \"file:///tmp/person.csv\" into node:Person mode overwrite header");
+    assert_eq!(stmt.target, LoadTarget::Node("Person".to_string()));
+    assert_eq!(stmt.mode, LoadStmtMode::Overwrite);
+    assert_eq!(stmt.delimiter, b',');
+    assert!(stmt.header);
+    assert_eq!(stmt.columns, None);
+}
+
+#[test]
+fn load_statement_refusals_name_the_missing_or_repeated_part() {
+    let cases = [
+        (
+            "load csv \"s3://b/p.csv\" into node:Person header",
+            "names its mode",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append",
+            "names its columns",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append mode merge header",
+            "`mode` is given twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append columns (a, a)",
+            "column `a` is named twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header delimiter \"||\"",
+            "one printable ASCII character",
+        ),
+        (
+            "load csv \"\" into node:Person mode append header",
+            "non-empty URI",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header\nquery q() { match { $p: Person } return { $p.id } }",
+            "a load statement stands alone in its file",
+        ),
+    ];
+    for (input, expected) in cases {
+        let error = parse_query(input).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{input}: expected {expected:?} in {error:?}"
+        );
+    }
+}
+
+#[test]
+fn load_statement_is_not_a_declaration() {
+    let file = parse_query("load csv \"s3://b/p.csv\" into node:Person mode append header");
+    assert_eq!(
+        file.unwrap().into_declarations().unwrap_err(),
+        "`load csv` is a load statement, not a query declaration"
+    );
 }
 
 #[test]
@@ -1742,6 +1835,94 @@ fn branch_statements_parse_with_and_without_their_defaults() {
         parse_branch("  branch\n  list // trailing comment\n"),
         BranchStmt::List
     );
+}
+
+#[test]
+fn branch_control_reads_parse_as_reads() {
+    let read = |stmt: BranchStmt| match stmt {
+        BranchStmt::Read(read) => read,
+        other => panic!("expected a branch control read, got {other:?}"),
+    };
+    let names = |source: &str, into: Option<&str>| (source.to_string(), into.map(str::to_string));
+
+    let diff = parse_branch("branch diff feature");
+    assert!(!diff.is_write());
+    assert_eq!(diff.statement_name(), "branch diff");
+    assert_eq!(
+        read(diff),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: None,
+            },
+            page: DiffPageClause::default(),
+        }
+    );
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff feature into main after page "tok" limit 50"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: Some("main".to_string()),
+            },
+            page: DiffPageClause {
+                after_page: Some("tok".to_string()),
+                limit: Some(50),
+            },
+        }
+    );
+    // A commit id is quoted: it is not an identifier.
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV" to main limit 1"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Between {
+                from: "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                to: "main".to_string(),
+            },
+            page: DiffPageClause {
+                after_page: None,
+                limit: Some(1),
+            },
+        }
+    );
+
+    let base = parse_branch("branch merge-base feature into main");
+    assert!(!base.is_write());
+    assert_eq!(base.statement_name(), "branch merge-base");
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(read(base), BranchRead::MergeBase { source, into });
+
+    let dry = parse_branch("branch merge feature dry run");
+    assert!(!dry.is_write());
+    assert_eq!(dry.statement_name(), "branch merge dry run");
+    let (source, into) = names("feature", None);
+    assert_eq!(read(dry), BranchRead::MergeDryRun { source, into });
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(
+        read(parse_branch("branch merge feature into main dry run")),
+        BranchRead::MergeDryRun { source, into }
+    );
+
+    // `dry run` is the clause, never a branch named `dry`; quoted, it is one.
+    assert_eq!(parse_branch(r#"branch merge "dry""#), merge("dry", None));
+    assert!(parse_query("branch merge dry run").is_err());
+    for input in [
+        "branch merge feature dry run as commit",
+        "branch merge feature as commit dry run",
+        "branch merge-base feature dry run",
+        "branch diff feature to",
+        "branch diff feature into main to other",
+        "branch diff feature limit 0",
+        "branch diff feature limit 5 after page \"tok\"",
+        "branch diffx feature",
+        "branch merge-basefeature",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
 }
 
 #[test]

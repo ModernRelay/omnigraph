@@ -7,7 +7,7 @@ fn saved(origin: &str, seconds: i64) -> Session {
         OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + seconds)
             .unwrap();
     Session {
-        version: 1,
+        version: 2,
         origin: origin.into(),
         config: config(),
         identity: Identity {
@@ -200,7 +200,7 @@ async fn logout_clears_local_custody_and_reports_unconfirmed_provider_revocation
     )]);
     let store = MemoryStore::default();
     save(&store, &saved(&api.origin, 120)).unwrap();
-    let result = logout(&store, &api.origin).await.unwrap();
+    let result = logout(&store, &api.origin, None).await.unwrap();
     assert_eq!(result["data"]["provider_revocation_confirmed"], false);
     assert!(store.0.borrow().is_empty());
     api.assert_complete();
@@ -231,4 +231,101 @@ async fn concurrent_refresh_waiter_observes_one_completed_rotation() {
     assert_eq!(first, second);
     assert_eq!(transport.requests.lock().unwrap().len(), 1);
     api.assert_complete();
+}
+
+fn in_organization(mut session: Session, organization: &str) -> Session {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    let parts: Vec<_> = session.access_token.split('.').collect();
+    let mut claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    claims["org_id"] = json!(organization);
+    session.access_token = format!(
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(claims.to_string()),
+        parts[2]
+    );
+    session.identity.account_id = organization.into();
+    session.refresh_token = format!("refresh-{organization}");
+    session
+}
+
+#[tokio::test]
+async fn organization_custody_is_separate_and_logout_preserves_the_other_session() {
+    let api = IntentApiFixture::new(vec![IntentReply::json(
+        200,
+        json!({"data":{"logged_out":true},"meta":{}}),
+    )]);
+    let store = MemoryStore::default();
+    let first = in_organization(saved(&api.origin, 120), "org_one");
+    let second = in_organization(saved(&api.origin, 120), "org_two");
+    save(&store, &first).unwrap();
+    save(&store, &second).unwrap();
+    assert_eq!(
+        load(&store, &api.origin).err().unwrap().body["type"],
+        "organization_required"
+    );
+    assert_eq!(
+        load_selected(&store, &api.origin, Some("org_one"))
+            .unwrap()
+            .unwrap()
+            .refresh_token,
+        "refresh-org_one"
+    );
+    assert_eq!(
+        load_selected(&store, &api.origin, Some("org_two"))
+            .unwrap()
+            .unwrap()
+            .refresh_token,
+        "refresh-org_two"
+    );
+    assert!(logout(&store, &api.origin, None).await.is_err());
+    assert!(api.requests().is_empty());
+    let result = logout(&store, &api.origin, Some("org_one")).await.unwrap();
+    assert_eq!(result["data"]["organization_id"], "org_one");
+    assert_eq!(result["data"]["provider_revocation_confirmed"], true);
+    assert!(
+        load_selected(&store, &api.origin, Some("org_one"))
+            .unwrap()
+            .is_none()
+    );
+    let remaining = load(&store, &api.origin).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(remaining).unwrap(),
+        serde_json::to_value(second).unwrap()
+    );
+    api.assert_complete();
+}
+
+#[tokio::test]
+async fn invocation_pin_refuses_a_parallel_login_before_refresh_or_request() {
+    let origin = "https://api.example";
+    let store = MemoryStore::default();
+    let first = saved(origin, -1);
+    save(&store, &first).unwrap();
+    let mut other = first.clone();
+    other.identity.principal_id = "principal_other".into();
+    save(&store, &other).unwrap();
+    let transport = MockTransport::with(vec![]);
+    let error = credential_selected(&store, origin, &first.identity, &transport.provider())
+        .await
+        .unwrap_err();
+    assert_eq!(error.body["type"], "session_identity_mismatch");
+    assert!(transport.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        load(&store, origin).unwrap().unwrap().identity.principal_id,
+        "principal_other"
+    );
+}
+
+#[test]
+fn legacy_singleton_index_and_context_cannot_select_an_organization() {
+    let store = MemoryStore::default();
+    store
+        .put(
+            "https://api.example",
+            &format!("credential:{}", "a".repeat(64)),
+        )
+        .unwrap();
+    assert!(load_selected(&store, "https://api.example", Some("org_test")).is_err());
 }

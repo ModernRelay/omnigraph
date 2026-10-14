@@ -194,7 +194,7 @@ then dated RFCs by date.
 | [0027](0027-lineage-merge-deltas.md) | Lineage-based merge deltas | maintainer | draft | not-started |
 | [0028](0028-stable-schema-identity.md) | Stable schema identity and table incarnation | maintainer | accepted | complete |
 | [0029](0029-azure-blob-storage.md) | Native Azure Blob storage | public | accepted | in-progress |
-| [0030](0030-cdc-time-travel.md) | Graph change feed and retained-history contract | maintainer | accepted | partial |
+| [0030](0030-cdc-time-travel.md) | Graph diffs, change feeds and retained history | maintainer | accepted | partial |
 | [0031](0031-comparative-cost-harness.md) | Comparative cost harness | maintainer | draft | not-started |
 | [0032](0032-adversarial-correctness-harness.md) | Adversarial correctness harness | maintainer | draft | not-started |
 | [0033](0033-blob-management.md) | Blob management | maintainer | accepted | partial |

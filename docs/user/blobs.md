@@ -28,7 +28,10 @@ allowed URI bases in its graph configuration. Direct `--store` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
 external references. Credentials must not appear in stored URIs. An allowed
 base must lie outside the cluster's storage root and every graph root; see
-[External Blob references](clusters/config.md#external-blob-references).
+[External Blob references](clusters/config.md#external-blob-references). The
+same bases admit the source of a `load csv` statement
+([CSV loading](mutations/index.md#csv-loading)), which reads the object once
+and stores no reference to it.
 
 Write mode determines ownership:
 

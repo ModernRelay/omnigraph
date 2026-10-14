@@ -4,9 +4,9 @@ A `.gq` file contains named, typed queries. Read queries match graph patterns
 and return columns; mutation queries use the same declaration form and are
 covered in [Mutations](../mutations/index.md). A file may instead hold exactly
 one statement, never beside a query declaration: a branch statement (`branch
-create`, `branch delete`, `branch merge`, or `branch list`; see
-[Branches, Commits, and History](../branching/index.md)), a `show` statement
-(see [session settings](#session-settings)), or an `explain` statement, which
+create`, `delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches,
+Commits, and History](../branching/index.md)), a `show` statement (see
+[session settings](#session-settings)), or an `explain` statement, which
 answers the plan a read query would run under instead of its rows (see
 [Explain](explain.md)). Any of them may open with
 [session settings](#session-settings) lines.

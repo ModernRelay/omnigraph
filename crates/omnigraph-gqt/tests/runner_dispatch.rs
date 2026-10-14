@@ -1,6 +1,39 @@
 use std::path::Path;
 use std::process::Command;
 
+/// A case cannot assert its own file-admission failure.
+#[test]
+fn csv_missing_fixture_is_refused_before_execution() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/csv_missing_fixture.gqt");
+    let text = std::fs::read_to_string(fixture).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("csv_missing_fixture.gqt");
+    for extra in ["", "--- csv unrelated.csv\nname\nalice\n"] {
+        std::fs::write(
+            &path,
+            text.replace("--- mutate", &format!("{extra}--- mutate")),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&path)
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted a missing CSV fixture");
+        let summary = report(&output).1;
+        assert_eq!(summary["code"], "invalid_case", "{summary}");
+        assert!(
+            summary["result"]["Err"]
+                .as_str()
+                .unwrap()
+                .contains("names no `--- csv people.csv` section"),
+            "{summary}"
+        );
+    }
+}
+
 #[test]
 fn refuses_unknown_or_unobserved_faults() {
     let expected = if cfg!(tokio_unstable) {
@@ -723,6 +756,37 @@ fn server_target_admission_refuses_before_workers() {
             "{expected}: a worker ran"
         );
     }
+    let csv_case = dir.path().join("served_csv.gqt");
+    let served_text = std::fs::read_to_string(&served).unwrap();
+    for (fixture, expected) in [
+        (
+            "--- csv people.csv\nid\n1\n",
+            "`--- csv` fixtures (engine execution only)",
+        ),
+        ("", "load csv source without an absolute URI"),
+    ] {
+        std::fs::write(
+            &csv_case,
+            format!(
+                "{served_text}\n{fixture}\n--- mutate\nload csv \"people.csv\" into node:Person mode append header\n--- expect ok\n"
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+            .arg(&csv_case)
+            .args(["--server", "http://127.0.0.1:1", "--graph", "default"])
+            .arg("--artifacts")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{expected}: {stderr}");
+        assert!(
+            report(&output).1["attempts"].as_array().unwrap().is_empty(),
+            "{expected}: a worker ran"
+        );
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
         .arg(&served)
         .args(["--target", "omnigraph-engine"])
@@ -1366,8 +1430,11 @@ fn measure_counts_schema_contract_requests_issue_817() {
     // first write, and Lance's detached commit loads the base's indexes. Behind
     // a strict insert's inline transaction the index section lies outside the
     // tail block the open read, and Lance opens the manifest again without the
-    // size it already learned: that HEAD is the one read a step may repeat.
-    let repeated_manifest_heads = |step: u64| -> u64 {
+    // size it already learned: that HEAD is one read a step may repeat. The
+    // other is the catalog freshness probe's HEAD of the held `__manifest`
+    // version, which a write makes when it captures its branch and again when
+    // it revalidates that capture.
+    let repeated_heads = |step: u64, class: &str| -> u64 {
         let group = measurements
             .iter()
             .find(|group| group["slot"] == "step" && group["step"] == step)
@@ -1377,7 +1444,7 @@ fn measure_counts_schema_contract_requests_issue_817() {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|request| request["class"] == "table_meta" && request["verb"] == "head")
+            .filter(|request| request["class"] == class && request["verb"] == "head")
             .filter(|request| !seen.insert(request["path"].as_str().unwrap().to_string()))
             .count() as u64
     };
@@ -1389,14 +1456,20 @@ fn measure_counts_schema_contract_requests_issue_817() {
         );
         assert_eq!(
             counts["repeat_reads"],
-            repeated_manifest_heads(step),
+            repeated_heads(step, "table_meta") + repeated_heads(step, "manifest_meta"),
             "step {step}: neither the inline contract nor table data repeats a read, \
-             except the reopen of an indexed table's manifest"
+             except the reopen of an indexed table's manifest and the freshness \
+             probe's HEAD of the held `__manifest` version"
         );
     }
     assert_eq!(
-        repeated_manifest_heads(2),
+        repeated_heads(2, "table_meta"),
         1,
         "the second insert reopens the first insert's manifest for its index section"
+    );
+    assert_eq!(
+        repeated_heads(3, "manifest_meta"),
+        0,
+        "a read probes its branch's freshness once"
     );
 }

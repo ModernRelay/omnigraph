@@ -13,8 +13,8 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use crate::cli::{
-    BlobCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand, QueriesCommand,
-    SchemaCommand,
+    BlobCommand, BranchCommand, ChangesCommand, Cli, ClusterCommand, Command, GraphsCommand,
+    QueriesCommand, SchemaCommand,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +201,10 @@ fn flag_applies(flag: ScopeFlag, capability: Capability, cmd: &Command) -> bool 
                     command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
                 } | Command::Changes { .. }
                     | Command::Commit { .. }
+                    | Command::Diff { .. }
+                    | Command::Branch {
+                        command: BranchCommand::Diff { .. } | BranchCommand::MergeBase { .. }
+                    }
                     | Command::Query { .. }
             ),
             Control => matches!(
@@ -271,6 +275,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Export { .. }
         | Command::Blob { .. }
         | Command::Commit { .. }
+        | Command::Diff { .. }
         | Command::Changes { .. }
         | Command::Graphs { .. } => Plane::Data,
         Command::Schema {
@@ -301,7 +306,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Logout { .. }
         | Command::Use { .. }
         | Command::Profile { .. }
-        | Command::Version => Plane::Session,
+        | Command::Version { .. } => Plane::Session,
     }
 }
 
@@ -309,7 +314,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
 /// families so messages read `schema plan`, `queries validate`, etc.).
 pub(crate) fn command_label(cmd: &Command) -> &'static str {
     match cmd {
-        Command::Version => "version",
+        Command::Version { .. } => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
         Command::Use { .. } => "use",
@@ -338,6 +343,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             BlobCommand::Clear { .. } => "blob clear",
         },
         Command::Commit { .. } => "commit",
+        Command::Diff { .. } => "diff",
         Command::Changes { command } => match command {
             ChangesCommand::Poll { .. } => "changes poll",
             ChangesCommand::Baseline { .. } => "changes baseline",

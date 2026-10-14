@@ -34,13 +34,26 @@ impl Default for LanceAccessContext {
 
 impl LanceAccessContext {
     pub fn new() -> Self {
+        Self::with_registry(Arc::clone(&STORE_REGISTRY))
+    }
+
+    /// Bind every store opened by either session to one explicit lifetime scope.
+    /// The dedicated registry prevents a cached unscoped client from bypassing it.
+    pub fn with_io_scope(scope: Option<omnigraph_storage::StorageIoScope>) -> Self {
+        match scope {
+            Some(scope) => Self::with_registry(scoped::registry(scope)),
+            None => Self::new(),
+        }
+    }
+
+    fn with_registry(registry: Arc<ObjectStoreRegistry>) -> Self {
         Self {
             data_session: Arc::new(Session::new(
                 DEFAULT_INDEX_CACHE_SIZE,
                 DEFAULT_METADATA_CACHE_SIZE,
-                Arc::clone(&STORE_REGISTRY),
+                Arc::clone(&registry),
             )),
-            control_session: control_session(),
+            control_session: Arc::new(Session::new(0, 0, registry)),
         }
     }
 
@@ -52,6 +65,8 @@ impl LanceAccessContext {
         Arc::clone(&self.control_session)
     }
 }
+
+mod scoped;
 
 /// Control-plane session for `__manifest` and other mutable-tip metadata.
 ///

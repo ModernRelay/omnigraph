@@ -2929,6 +2929,91 @@ fn ambiguous_or_positional_http_scopes_are_rejected_without_network_io() {
     server.assert_complete();
 }
 
+/// A `--server` value or a configured server `url:` is a server address: any
+/// scheme but `http`, `https` or `unix` is refused as one for every served
+/// verb, never resolved as graph storage. A `unix://` URL outside `--server`
+/// is refused like an `http://` one.
+#[test]
+fn server_scope_refuses_a_non_server_scheme_issue_979() {
+    let home = tempdir().unwrap();
+    fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  bad:\n    url: ftp://graph.example.com\n",
+    )
+    .unwrap();
+    let rows = home.path().join("rows.jsonl");
+    fs::write(&rows, r#"{"type":"Person","data":{"name":"X","age":1}}"#).unwrap();
+    let rows = rows.to_str().unwrap();
+    let data_verbs: [&[&str]; 5] = [
+        &[
+            "query",
+            "-e",
+            "query q() { match { $p: Person } return { $p.name } }",
+        ],
+        &[
+            "mutate",
+            "-e",
+            "query add($name: String) { insert Person { name: $name } }",
+            "--params",
+            r#"{"name":"X"}"#,
+        ],
+        &["load", "--mode", "merge", "--data", rows],
+        &["export"],
+        &["blob", "get", "node", "Document", "readme", "content"],
+    ];
+    let mut invocations: Vec<Vec<&str>> = Vec::new();
+    for verb in data_verbs {
+        invocations.push(verb.to_vec());
+        invocations.push([verb, &["--graph", "knowledge"][..]].concat());
+    }
+    invocations.push(vec!["graphs", "list"]);
+    invocations.push(vec!["cluster", "status"]);
+    for server in [
+        "ftp://graph.example.com",
+        "s3://bucket/graph.omni",
+        "file:///tmp/graph.omni",
+        "bad",
+    ] {
+        for arguments in &invocations {
+            let output = output_failure(
+                cli()
+                    .env("OMNIGRAPH_HOME", home.path())
+                    .args(arguments)
+                    .args(["--server", server]),
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("invalid server address"),
+                "{server} {arguments:?}: {stderr}"
+            );
+            if server == "bad" {
+                assert!(
+                    stderr.contains("server 'bad' in the operator config"),
+                    "{arguments:?}: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains("storage_root_invalid")
+                    && !stderr.contains("unsupported storage URI scheme"),
+                "{server} {arguments:?}: {stderr}"
+            );
+        }
+    }
+
+    let output = output_failure(cli().args([
+        "query",
+        "--store",
+        "unix:///tmp/og.sock",
+        "-e",
+        "query q() { match { $p: Person } return { $p.name } }",
+    ]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be addressed with `--server <url>`"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn as_on_a_served_write_is_rejected() {
     use crate::support::managed_http::IntentApiFixture;
@@ -3417,7 +3502,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("merge")
             .arg("--uri")
             .arg(&graph)
-            .arg(" feature ")
+            .arg("feature")
             .arg("--json"),
     );
     let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
@@ -3469,7 +3554,12 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
-    for (source, target) in [(" ", "main"), ("review", "\t")] {
+    for (source, target) in [
+        (" ", "main"),
+        ("review", "\t"),
+        (" review ", "main"),
+        ("review", " main "),
+    ] {
         let server = IntentApiFixture::graph(vec![]);
         let output = output_failure(cli().args([
             "--server",
@@ -3482,9 +3572,10 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             "--into",
             target,
         ]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("branch merge source and target must not be empty"),
+            stderr.contains("has leading or trailing whitespace")
+                || stderr.contains("contains a control character"),
             "{output:?}"
         );
         assert!(server.requests().is_empty());
@@ -3498,7 +3589,7 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
         "created_at": 1234567
     });
     let mut matrix = Vec::new();
-    for (statement, padded) in [(false, false), (false, true), (true, false)] {
+    for statement in [false, true] {
         let mut cases = vec![
             ("fast_forward", Some(commit.clone()), true),
             ("merged", Some(commit.clone()), true),
@@ -3521,13 +3612,13 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             cases.push(("merged", Some(bad_commit), false));
         }
         for (outcome, receipt, valid) in cases {
-            matrix.push((statement, padded, outcome, receipt, valid));
+            matrix.push((statement, outcome, receipt, valid));
         }
     }
     for_each_concurrently(
         matrix,
         CASE_WORKERS,
-        |(statement, padded, outcome, receipt, valid)| {
+        |(statement, outcome, receipt, valid)| {
             let mut body = if statement {
                 json!({"branch":"main", "query_name":"branch merge",
                     "affected_nodes":0, "affected_edges":0, "actor_id":"alice",
@@ -3543,8 +3634,6 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
             command.args(["--server", &server.origin, "--graph", "knowledge"]);
             if statement {
                 command.args(["mutate", "-e", "branch merge review into main", "--json"]);
-            } else if padded {
-                command.args(["branch", "merge", " review ", "--into", " main ", "--json"]);
             } else {
                 command.args(["branch", "merge", "review", "--json"]);
             }
@@ -3627,9 +3716,9 @@ fn remote_merge_requires_consistent_receipts_without_replay() {
                     "knowledge",
                     "branch",
                     "merge",
-                    " review ",
+                    "review",
                     "--into",
-                    " main ",
+                    "main",
                     "--delete-branch",
                     "--json",
                 ])
