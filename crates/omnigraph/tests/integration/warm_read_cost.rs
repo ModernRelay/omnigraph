@@ -63,15 +63,20 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
             io.version_probes, 1,
             "warm same-branch read performs exactly one version probe"
         );
-        for branch in ["main", " main "] {
+        let (resolved, io) = measure(db.resolve_snapshot("main")).await;
+        let resolved = resolved.unwrap();
+        assert_eq!(Some(resolved.as_str()), head.as_deref());
+        assert_eq!(io.internal_open_count, 0);
+        assert_eq!(io.manifest_scan_count, 0);
+        assert_eq!(io.version_probes, 1);
+        // A name that is not canonical is refused before any storage request.
+        for branch in [" main ", " "] {
             let (resolved, io) = measure(db.resolve_snapshot(branch)).await;
-            let resolved = resolved.unwrap();
-            assert_eq!(Some(resolved.as_str()), head.as_deref());
+            assert!(resolved.is_err(), "{branch:?}");
             assert_eq!(io.internal_open_count, 0);
             assert_eq!(io.manifest_scan_count, 0);
-            assert_eq!(io.version_probes, 1);
+            assert_eq!(io.version_probes, 0);
         }
-        assert!(db.resolve_snapshot(" ").await.is_err());
     })
     .await;
 }

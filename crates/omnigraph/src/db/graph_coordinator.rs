@@ -19,6 +19,7 @@ use super::manifest::{
     PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
     UnattachedWriteBase, UnpublishedCommit, UnpublishedMergeInputs,
 };
+use super::omnigraph::normalize_branch_name;
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
 
@@ -1040,20 +1041,6 @@ fn updates_to_changes(updates: &[DatasetUpdate]) -> Vec<ManifestChange> {
         .cloned()
         .map(ManifestChange::Update)
         .collect()
-}
-
-fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err(OmniError::manifest(
-            "branch name cannot be empty".to_string(),
-        ));
-    }
-    if branch == "main" {
-        return Ok(None);
-    }
-    crate::branch_names::ensure_logical_branch_name(branch)?;
-    Ok(Some(branch.to_string()))
 }
 
 #[cfg(test)]

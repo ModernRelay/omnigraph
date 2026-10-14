@@ -403,7 +403,33 @@ fn parity_branch_merge() {
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
-    let (l, r) = p.run(&["branch", "merge", " feature ", "--into", " main ", "--json"]);
+    // A name is used as written on both arms: a padded spelling of a branch
+    // is refused, never read as the branch, before any effect.
+    for args in [
+        &["branch", "merge", " feature ", "--into", " main ", "--json"][..],
+        &["branch", "merge", "feature", "--into", "main ", "--json"][..],
+        &[
+            "mutate",
+            "--branch",
+            " main",
+            "-e",
+            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "--json",
+        ][..],
+    ] {
+        let (l, r) = p.run(args);
+        assert_parity("padded branch name", &l, &r);
+        for output in [&l, &r] {
+            // `--json` reports the error on stdout.
+            assert!(
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("has leading or trailing whitespace"),
+                "{args:?}: {output:?}"
+            );
+        }
+    }
+    let (l, r) = p.run(&["branch", "merge", "feature", "--into", "main", "--json"]);
     assert_write_parity("branch merge own publication", &l, &r);
     for output in [&l, &r] {
         let payload = parse_stdout_json(output);
@@ -426,9 +452,9 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "branch",
         "merge",
-        " feature2 ",
+        "feature2",
         "--into",
-        " main ",
+        "main",
         "--delete-branch",
         "--json",
     ]);
@@ -490,9 +516,10 @@ fn parity_branch_merge() {
         let (l, r) = p.run(&["branch", "merge", source, "--into", target]);
         for output in [&l, &r] {
             assert_eq!(output.status.code(), Some(1));
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("branch merge source and target must not be empty"),
+                stderr.contains("has leading or trailing whitespace")
+                    || stderr.contains("contains a control character"),
                 "{output:?}"
             );
         }

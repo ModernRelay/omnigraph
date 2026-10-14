@@ -1732,12 +1732,11 @@ impl GraphClient {
         as_commit: bool,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<BranchMergeOutput> {
-        // Use the engine's canonical spelling for dispatch, receipt validation,
-        // and optional deletion. Padding must not cause a post-publication error.
-        let source = source.trim();
-        let into = into.trim();
-        if source.is_empty() || into.is_empty() {
-            bail!("branch merge source and target must not be empty");
+        // Dispatch, receipt validation and optional deletion all use the names
+        // as given, so refuse one the engine and the server would refuse before
+        // any storage or HTTP work: none can then fail after publication.
+        for name in [source, into] {
+            omnigraph_policy::ensure_canonical_branch_name(name)?;
         }
         let output = match self {
             GraphClient::Remote {

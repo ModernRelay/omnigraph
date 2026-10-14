@@ -602,8 +602,12 @@ pub(crate) enum Authz {
 }
 
 /// HTTP-layer Cedar policy gate, returning the allow/deny [`Authz`] decision
-/// and reserving `Err` for operational failures (401 missing bearer, 500
-/// policy-evaluation error). Two sources of the policy engine:
+/// and reserving `Err` for operational failures (400 non-canonical branch
+/// name, 401 missing bearer, 500 policy-evaluation error). Every route names
+/// its branches in the [`PolicyRequest`], so the request's names are refused
+/// here, before any rule and in every runtime mode, when they are not
+/// canonical: the decision judges a name as written and the engine opens that
+/// same name. Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*.
 ///   * Management handler — captures the current registry snapshot policy so
@@ -621,6 +625,7 @@ pub(crate) fn authorize(
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
+    require_canonical_branches([request.branch.as_deref(), request.target_branch.as_deref()])?;
     if let Some(actor) = actor {
         if actor.source == AuthSource::SignedData && policy.is_none() {
             return Ok(Authz::Denied(
@@ -697,9 +702,24 @@ pub(crate) fn authorize(
     }
 }
 
+/// Refuse a request's branch names that are not canonical
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]) as a 400. [`authorize`]
+/// applies it to every [`PolicyRequest`]; a route that looks a branch up before
+/// it authorizes applies it first.
+pub(crate) fn require_canonical_branches<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+) -> std::result::Result<(), ApiError> {
+    for name in names.into_iter().flatten() {
+        omnigraph_policy::ensure_canonical_branch_name(name)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Thin wrapper over [`authorize`] for the handlers that treat any denial as a
 /// 403: a denial becomes `ApiError::forbidden`, and operational failures
-/// (401 missing bearer, 500 policy-evaluation error) propagate unchanged. The
+/// (400 non-canonical branch name, 401 missing bearer, 500 policy-evaluation
+/// error) propagate unchanged. The
 /// stored-query invoke handler does **not** use this — it consumes the
 /// [`Authz`] decision directly to hide a denial as a 404 while letting an
 /// operational failure keep its true status.
@@ -1396,7 +1416,7 @@ pub(crate) async fn server_export(
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid export request", rejection))?;
-    let branch = normalize_change_branch(request.branch.as_deref())?;
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2326,6 +2346,7 @@ async fn authorize_load_scope(
     branch: &str,
     from: Option<&str>,
 ) -> std::result::Result<(), ApiError> {
+    require_canonical_branches([Some(branch), from])?;
     let branch_exists = handle
         .engine
         .branch_list()
@@ -4053,20 +4074,6 @@ fn parse_change_feed_start(
     }
 }
 
-/// Normalize a caller-supplied change-surface branch BEFORE authorization so
-/// Cedar and the engine classify the same identity. The engine trims late
-/// (its own branch normalization), so authorizing the raw string would let a
-/// padded spelling like " main " be classified as an unprotected named branch
-/// and then resolve to protected main — a policy bypass. Empty-after-trim is
-/// a malformed request rather than an implicit main.
-fn normalize_change_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
-    let trimmed = branch.unwrap_or("main").trim();
-    if trimmed.is_empty() {
-        return Err(ApiError::bad_request("branch name cannot be empty"));
-    }
-    Ok(trimmed.to_string())
-}
-
 #[utoipa::path(
     get,
     path = "/changes",
@@ -4101,7 +4108,7 @@ pub(crate) async fn server_changes_feed(
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
     validate_change_http_limit(params.limit)?;
-    let branch = normalize_change_branch(params.branch.as_deref())?;
+    let branch = params.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -4179,7 +4186,7 @@ pub(crate) async fn server_changes_baseline(
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = normalize_change_branch(request.branch.as_deref())?;
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),

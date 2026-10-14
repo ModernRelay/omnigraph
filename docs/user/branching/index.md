@@ -60,12 +60,23 @@ A branch remains after a normal merge, so prefer `--delete-branch` or delete it
 when review is complete. Live branches retain the history they depend on and can
 prevent `omnigraph cleanup` from reclaiming old data.
 
+## Branch names
+
 Branch names may contain `/`, but live names must not be path prefixes of one
 another. For example, `review` and `review/alice` cannot coexist. `main` is
 reserved. A parent branch can be deleted while descendants remain. A path segment
 may not end in `.` followed by 26 upper-case letters and digits: that shape is
 reserved for OmniGraph's internal per-life branch identity. Ordinary dotted
 names such as `release.1.2` are fine.
+
+A branch name is used exactly as written. A name that is empty, has leading or
+trailing whitespace, or contains a control character is refused wherever a
+branch is named: the branch a read or write targets, `from`, merge sources and
+targets, branch create and delete, Blob writes, change feeds and branch
+statements. The server answers `400 Bad Request` before authorization, the
+embedded engine returns a bad-request error before any effect, and the CLI
+reports either error. Names are never trimmed, so `main ` does not name
+`main`.
 
 Deleting a branch and creating another with the same name yields a fresh
 branch lifetime. Readers that captured the deleted branch fail with a typed

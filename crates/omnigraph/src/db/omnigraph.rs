@@ -1025,12 +1025,20 @@ impl Omnigraph {
     /// * If policy is installed AND actor is Some → call
     ///   `PolicyChecker::check(action, scope, actor)`; map denial /
     ///   internal failure to `OmniError::Policy(...)`.
+    ///
+    /// Before any of these, a branch name in `scope` that is not canonical is
+    /// refused as a bad request: the decision judges the name as written, and
+    /// the writer then opens that same name.
     pub(crate) fn enforce(
         &self,
         action: omnigraph_policy::PolicyAction,
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
+        let (branch, target_branch) = scope.to_branch_pair();
+        for name in [branch, target_branch].into_iter().flatten() {
+            ensure_canonical_branch_name(name)?;
+        }
         let Some(checker) = self.policy.as_ref() else {
             return Ok(());
         };
@@ -3717,18 +3725,23 @@ impl Omnigraph {
     }
 }
 
+/// A caller's branch name as the engine addresses it: `None` for main, the
+/// name itself otherwise. The name is taken as written, the spelling a policy
+/// decision judged; one that is not canonical is refused, never corrected.
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
-    let branch = branch.trim();
-    if branch.is_empty() {
-        return Err(OmniError::manifest(
-            "branch name cannot be empty".to_string(),
-        ));
-    }
+    ensure_canonical_branch_name(branch)?;
     if branch == "main" {
         return Ok(None);
     }
     crate::branch_names::ensure_logical_branch_name(branch)?;
     Ok(Some(branch.to_string()))
+}
+
+/// Refuse a branch name that is not canonical as a bad request
+/// ([`omnigraph_policy::ensure_canonical_branch_name`]).
+pub(crate) fn ensure_canonical_branch_name(branch: &str) -> Result<()> {
+    omnigraph_policy::ensure_canonical_branch_name(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()))
 }
 
 /// Build a `ResolvedTarget` from the warm coordinator without opening the commit
