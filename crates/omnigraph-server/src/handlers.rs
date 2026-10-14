@@ -1423,7 +1423,7 @@ pub(crate) async fn server_export(
 ) -> std::result::Result<Response, ApiError> {
     let Json(request) = request
         .map_err(|rejection| ApiError::json_rejection("invalid export request", rejection))?;
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -4029,10 +4029,26 @@ fn validate_change_http_limit(limit: Option<usize>) -> std::result::Result<(), A
     Ok(())
 }
 
-/// A side of a graph diff the caller must spell.
+/// The branch a change route names, `main` when it names none, as written: a
+/// name that is not canonical is refused before authorization reads it.
+fn requested_branch(branch: Option<&str>) -> std::result::Result<String, ApiError> {
+    let branch = branch.unwrap_or("main");
+    require_canonical_branches([Some(branch)])?;
+    Ok(branch.to_string())
+}
+
+/// A side of a graph diff the caller must spell, passed on as written. A
+/// branch name and a commit id are never trimmed, so a spelling neither could
+/// be is refused here (the change routes' error allowlist would hide the
+/// engine's refusal behind a 500).
 fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result<String, ApiError> {
     match value {
-        Some(value) if !value.trim().is_empty() => Ok(value.trim().to_string()),
+        Some(value) if !value.trim().is_empty() => {
+            omnigraph_policy::ensure_canonical_branch_name(&value).map_err(|error| {
+                ApiError::bad_request(format!("query parameter '{name}': {error}"))
+            })?;
+            Ok(value)
+        }
         _ => Err(ApiError::bad_request(format!(
             "query parameter '{name}' is required"
         ))),
@@ -4227,8 +4243,8 @@ pub(crate) async fn branch_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
-    let source = normalize_change_branch(Some(source))?;
-    let target = normalize_change_branch(target)?;
+    let source = requested_branch(Some(source))?;
+    let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
     handle
         .engine
@@ -4289,8 +4305,8 @@ pub(crate) async fn merge_base_body(
     source: &str,
     target: Option<&str>,
 ) -> std::result::Result<(String, String, omnigraph::changes::MergeBase), ApiError> {
-    let source = normalize_change_branch(Some(source))?;
-    let target = normalize_change_branch(target)?;
+    let source = requested_branch(Some(source))?;
+    let target = requested_branch(target)?;
     authorize_branch_reads(actor, handle.policy.as_deref(), [&source, &target])?;
     let base = handle
         .engine
@@ -4450,7 +4466,7 @@ pub(crate) async fn server_changes_feed(
 ) -> std::result::Result<Json<api::ChangeFeedOutput>, ApiError> {
     let params = parse_change_query(raw.as_deref(), CHANGE_FEED_PARAMS)?;
     validate_change_http_limit(params.limit)?;
-    let branch = params.branch.unwrap_or_else(|| "main".to_string());
+    let branch = requested_branch(params.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -4528,7 +4544,7 @@ pub(crate) async fn server_changes_baseline(
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<api::ChangeBaselineRequest>,
 ) -> std::result::Result<Response, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let branch = requested_branch(request.branch.as_deref())?;
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),

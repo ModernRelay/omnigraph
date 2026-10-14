@@ -3041,6 +3041,27 @@ rules:
             ("GET /commits", get(&format!("/commits?branch={encoded}"))),
             ("GET /changes", get(&format!("/changes?branch={encoded}"))),
             (
+                "GET /diff",
+                get(&format!("/diff?from=feature&to={encoded}")),
+            ),
+            (
+                "GET /branches/diff",
+                get(&format!("/branches/diff?source=feature&target={encoded}")),
+            ),
+            (
+                "GET /branches/merge-base",
+                get(&format!(
+                    "/branches/merge-base?source=feature&target={encoded}"
+                )),
+            ),
+            (
+                "POST /branches/merge dry run",
+                post(
+                    "/branches/merge",
+                    json!({"source": "feature", "target": main, "dry_run": true}),
+                ),
+            ),
+            (
                 "POST /changes/baseline",
                 post("/changes/baseline", json!({"branch": main})),
             ),

@@ -2967,7 +2967,7 @@ impl Omnigraph {
         match self.classify_diff_read_target(target).await? {
             DiffReadTarget::Branch(resolved) => {
                 let commit_id = resolved.graph_commit_id.ok_or_else(|| {
-                    OmniError::manifest(format!("branch '{}' has no head commit", target.trim()))
+                    OmniError::manifest(format!("branch '{target}' has no head commit"))
                 })?;
                 Ok((commit_id, resolved.snapshot))
             }
@@ -2983,10 +2983,12 @@ impl Omnigraph {
     /// one naming neither is a typed not-found carrying only the caller's
     /// spelling.
     async fn classify_diff_read_target(&self, target: &str) -> Result<DiffReadTarget> {
-        let target = target.trim();
         if target.is_empty() {
             return Err(OmniError::manifest("a diff endpoint cannot be empty"));
         }
+        // A branch name and a commit id are both taken as written, so a
+        // spelling neither could be is refused rather than trimmed.
+        ensure_canonical_branch_name(target)?;
         // A string the branch-name rules refuse cannot name a branch; that is
         // not an error here, since it may still name a commit.
         let as_branch = match normalize_branch_name(target) {
