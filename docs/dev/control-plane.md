@@ -4,6 +4,16 @@ The cluster control plane turns a local declarative bundle into a durable applie
 
 ## Authority model
 
+Server telemetry is separate from deployment authority. The optional OTLP
+subscriber exports an explicit span allowlist with W3C request context; it
+does not export arbitrary dependency spans or protocol payloads. Owned reads
+and writes carry child spans through their existing process-owned futures.
+Exporter loss or shutdown does not alter native admission, publication, recovery
+or clean-exit evidence. JSON logs use the same restricted dependency-target
+filter as text logs. Configuration is in the
+[observability guide](../user/operations/observability.md); telemetry and log-filter
+unit tests own context propagation, redaction and the actual OTLP transport.
+
 There are three distinct views:
 
 1. **Desired configuration** — `cluster.yaml` and referenced files in an operator workspace.

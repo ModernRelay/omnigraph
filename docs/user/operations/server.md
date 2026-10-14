@@ -44,6 +44,9 @@ claim, not a restart or recovery path; see
 
 ### Logs
 
+Use [server logs and traces](observability.md) for JSON logging, optional OTLP
+export and correlation with incoming W3C trace context.
+
 The server logs to standard output at `info` unless `RUST_LOG` sets other
 levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
 their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,

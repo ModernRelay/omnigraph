@@ -42,6 +42,7 @@ deployment.
 - [Operating a cluster](clusters/index.md)
 - [`cluster.yaml` reference](clusters/config.md)
 - [Deployment](deployment.md)
+- [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
 - [Storage-format upgrades](operations/upgrade.md)

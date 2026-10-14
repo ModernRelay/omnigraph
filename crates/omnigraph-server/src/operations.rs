@@ -255,6 +255,11 @@ impl OperationRuntime {
                         uncertain: true,
                     },
                 };
+                crate::telemetry::operation_finished(
+                    "write",
+                    result.result.is_ok(),
+                    result.uncertain,
+                );
                 // A known result carries its reservation through pending delivery.
                 // Consumption releases admission before the handler can respond;
                 // abandonment destroys the output before releasing its ownership.
@@ -270,7 +275,7 @@ impl OperationRuntime {
                     owner,
                 });
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("write")),
         );
         Ok(OwnedResponse(receiver))
     }
@@ -428,10 +433,11 @@ impl ReadObserver {
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                crate::telemetry::operation_finished("read", result.is_ok(), false);
                 // No result history: an absent waiter drops the result here.
                 let _ = sender.send(result);
             }
-            .in_current_span(),
+            .instrument(crate::telemetry::operation_span("read")),
         );
         OwnedReadResponse {
             receiver,
