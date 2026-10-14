@@ -2462,6 +2462,10 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         vec![
             "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
         ],
+        vec![
+            "blob", "put", "node", "Document", "readme", "content", "--file", data,
+        ],
+        vec!["blob", "clear", "node", "Document", "readme", "content"],
     ];
     let not_started = |action: &str| serde_json::json!({"execution":"not_started","effects":"none","action":action});
     let unknown = |action: &str| serde_json::json!({"execution":"unknown","effects":"unknown","action":action});

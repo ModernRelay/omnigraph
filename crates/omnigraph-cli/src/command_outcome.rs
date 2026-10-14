@@ -169,28 +169,12 @@ impl Failure {
             evidence.dispatched == 1 && evidence.last_request_effectful && !evidence.writable_open;
         let conditional =
             precondition.is_some_and(|value| value.http_status == Some(412)) && single;
-        let retry = remote.is_some_and(|remote| {
-            remote.status == StatusCode::TOO_MANY_REQUESTS
-                && matches!(remote.output.code, Some(ErrorCode::TooManyRequests))
-                && !remote.output.error.trim().is_empty()
-                && is_plain_refusal(&remote.output)
-                && single
-        });
-        // The server authenticates, checks the contract header and applies
-        // policy before it admits a write; each code under its own status
-        // proves the request was refused there.
-        let refused = remote.is_some_and(|remote| {
-            matches!(
-                (remote.status, &remote.output.code),
-                (StatusCode::UNAUTHORIZED, Some(ErrorCode::Unauthorized))
-                    | (StatusCode::FORBIDDEN, Some(ErrorCode::Forbidden))
-                    | (
-                        StatusCode::BAD_REQUEST,
-                        Some(ErrorCode::ApiContractMismatch)
-                    )
-            ) && is_plain_refusal(&remote.output)
-                && single
-        });
+        let admission = remote
+            .filter(|remote| {
+                single && !remote.output.error.trim().is_empty() && is_plain_refusal(&remote.output)
+            })
+            .and_then(|remote| admission_refusal(remote.status, remote.output.code.as_ref()));
+        let retry = matches!(admission, Some(Action::Retry));
         let contract = error.downcast_ref::<ApiContractError>();
         let request_dispatched = contract.map(|value| value.request_dispatched);
         let http_status = remote
@@ -220,9 +204,8 @@ impl Failure {
                     .unwrap_or_else(|| ErrorOutput::message(error.to_string())),
             }
         };
-        let not_started = retry
+        let not_started = admission.is_some()
             || conditional
-            || refused
             || (evidence.dispatched == 0 && !evidence.writable_open);
         let action = if retry {
             Action::Retry
@@ -271,6 +254,20 @@ impl Failure {
                 1
             },
         }
+    }
+}
+
+/// The typed refusals the server sends before it admits a write, each code
+/// under its own status. A busy actor may retry the whole command; failed
+/// authentication, an unsupported contract or a policy denial needs a changed
+/// credential, client or grant first.
+fn admission_refusal(status: StatusCode, code: Option<&ErrorCode>) -> Option<Action> {
+    match (status, code?) {
+        (StatusCode::TOO_MANY_REQUESTS, ErrorCode::TooManyRequests) => Some(Action::Retry),
+        (StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized)
+        | (StatusCode::BAD_REQUEST, ErrorCode::ApiContractMismatch)
+        | (StatusCode::FORBIDDEN, ErrorCode::Forbidden) => Some(Action::Refresh),
+        _ => None,
     }
 }
 
