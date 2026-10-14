@@ -1442,6 +1442,8 @@ mod owned_shutdown {
                     "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
                     if mode.starts_with("startup-") {
                         r#"{"startup-operator":"startup-secret"}"#
+                    } else if mode == "v2-finish" {
+                        r#"{"restart-operator":"restart-secret"}"#
                     } else {
                         "{}"
                     },
@@ -1512,6 +1514,33 @@ mod owned_shutdown {
         ).unwrap();
         socket.flush().unwrap();
         socket
+    }
+
+    async fn mcp_schema(client: &reqwest::Client, address: &str) -> Value {
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("restart-secret")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "schema", "arguments": {"graph": "knowledge"}}
+            }))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        let schema = body["result"]["structuredContent"].clone();
+        assert!(
+            schema["schema_source"]
+                .as_str()
+                .unwrap()
+                .contains("node Person")
+        );
+        schema
     }
 
     fn server_config(root: &Path, grace: Duration) -> omnigraph_server::ServerConfig {
@@ -2021,6 +2050,14 @@ mod owned_shutdown {
             .len();
         let (mut child, address, output_thread) = spawn_owned_child(root, mode);
         wait_ready(&address, &mut child.0, "serving").await;
+        // Keep the authenticated MCP connection pool alive across shutdown;
+        // its server-side owners must drain before the native lock is released.
+        let mcp_client = reqwest::Client::new();
+        let schema_before = if mode == "v2-finish" {
+            Some(mcp_schema(&mcp_client, &address).await)
+        } else {
+            None
+        };
         let fault_started = Instant::now();
         let retained_lock = v2.then(|| fs::read(root.join("__cluster/lock.json")).unwrap());
         if v2 {
@@ -2105,6 +2142,11 @@ mod owned_shutdown {
                 // same populated graph under a newly acquired lifetime.
                 let (mut successor, address, output_thread) = spawn_owned_child(root, mode);
                 wait_ready(&address, &mut successor.0, "serving").await;
+                assert_eq!(
+                    Some(mcp_schema(&mcp_client, &address).await),
+                    schema_before,
+                    "the restarted server must serve the same schema through authenticated MCP"
+                );
                 let successor_lock = fs::read(root.join("__cluster/lock.json")).unwrap();
                 assert_ne!(Some(successor_lock), retained_lock);
                 assert_eq!(
