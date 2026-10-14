@@ -408,7 +408,8 @@ owning `run_read` ownership through cancellation and the result bound.
    self-contained server testing RFC.
 2. **Best-practices resources** in
    [#995](https://github.com/ModernRelay/omnigraph/pull/995), with the 30 second
-   write wait and the `graph_list` instruction from this review in their own PR.
+   write wait and the `graph_list` instruction from this review in
+   [#999](https://github.com/ModernRelay/omnigraph/pull/999).
    `implementation` stays `partial` until these and the package retirement land.
 3. **Package retirement**, after a release contains phases 1 and 2: a final
    `@modernrelay/omnigraph-mcp` version whose README and binary print a
