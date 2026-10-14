@@ -102,6 +102,9 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                     Rule::commit_stmt => {
                         statement = Some(FileBody::Commit(parse_commit_stmt(inner)?));
                     }
+                    Rule::load_stmt => {
+                        statement = Some(FileBody::Load(parse_load_stmt(inner)?));
+                    }
                     Rule::show_stmt => {
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
@@ -113,6 +116,7 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
                             Some(FileBody::Show(_)) => "a show statement",
                             Some(FileBody::Explain(_)) => "an `explain` statement",
                             Some(FileBody::Commit(_)) => "a commit statement",
+                            Some(FileBody::Load(_)) => "a load statement",
                             _ => "a branch statement",
                         };
                         return Err(diagnostic_at(
@@ -408,6 +412,154 @@ fn parse_commit_stmt(
         Rule::commit_drop => Ok(CommitWrite::Drop { graph_commit_id }),
         other => unreachable!("grammar: commit_stmt admits no {other:?}"),
     }
+}
+
+fn parse_load_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<LoadStmt, QueryDiagnostic> {
+    let at = pair.clone();
+    let mut source = None;
+    let mut target = None;
+    let mut mode = None;
+    let mut delimiter = None;
+    let mut header = None;
+    let mut columns = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::string_lit => {
+                let decoded = decode_string_literal(inner.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &inner))?;
+                if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                    return Err(diagnostic_at(
+                        Q004,
+                        "a load source is a non-empty URI without control characters",
+                        &inner,
+                    ));
+                }
+                source = Some(decoded);
+            }
+            Rule::load_target => {
+                let mut parts = inner.clone().into_inner();
+                let kind = parts
+                    .next()
+                    .expect("grammar: load_target opens with load_kind");
+                let name = parts
+                    .next()
+                    .expect("grammar: load_target closes with type_name")
+                    .as_str()
+                    .to_string();
+                target = Some(match kind.as_str() {
+                    "node" => LoadTarget::Node(name),
+                    "edge" => LoadTarget::Edge(name),
+                    other => unreachable!("grammar: load_kind admits no {other}"),
+                });
+            }
+            Rule::load_option => {
+                let option = inner
+                    .clone()
+                    .into_inner()
+                    .next()
+                    .expect("grammar: load_option holds one form");
+                match option.as_rule() {
+                    Rule::load_mode => {
+                        refuse_repeated_load_option(mode.is_some(), "mode", &option)?;
+                        let name = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::load_mode_name)
+                            .expect("grammar: load_mode names its mode");
+                        mode = Some(match name.as_str() {
+                            "overwrite" => LoadStmtMode::Overwrite,
+                            "append" => LoadStmtMode::Append,
+                            "merge" => LoadStmtMode::Merge,
+                            other => unreachable!("grammar: load_mode_name admits no {other}"),
+                        });
+                    }
+                    Rule::load_delimiter => {
+                        refuse_repeated_load_option(delimiter.is_some(), "delimiter", &option)?;
+                        let literal = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::string_lit)
+                            .expect("grammar: load_delimiter holds one string literal");
+                        let decoded = decode_string_literal(literal.as_str()).map_err(|error| {
+                            diagnostic_at(Q004, parse_error_message(error), &literal)
+                        })?;
+                        let bytes = decoded.as_bytes();
+                        if bytes.len() != 1 || !bytes[0].is_ascii() || bytes[0].is_ascii_control() {
+                            return Err(diagnostic_at(
+                                Q004,
+                                "a load delimiter is one printable ASCII character",
+                                &literal,
+                            ));
+                        }
+                        delimiter = Some(bytes[0]);
+                    }
+                    Rule::load_header => {
+                        refuse_repeated_load_option(header.is_some(), "header", &option)?;
+                        header = Some(true);
+                    }
+                    Rule::load_columns => {
+                        refuse_repeated_load_option(columns.is_some(), "columns", &option)?;
+                        let mut names: Vec<String> = Vec::new();
+                        for part in option
+                            .into_inner()
+                            .filter(|part| part.as_rule() == Rule::ident)
+                        {
+                            let name = part.as_str().to_string();
+                            if names.contains(&name) {
+                                return Err(diagnostic_at(
+                                    Q004,
+                                    format!("column `{name}` is named twice"),
+                                    &part,
+                                ));
+                            }
+                            names.push(name);
+                        }
+                        columns = Some(names);
+                    }
+                    other => unreachable!("grammar: load_option admits no {other:?}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(mode) = mode else {
+        return Err(diagnostic_at(
+            Q004,
+            "a load statement names its mode: `mode overwrite`, `mode append` or `mode merge`",
+            &at,
+        ));
+    };
+    let header = header.unwrap_or(false);
+    if !header && columns.is_none() {
+        return Err(diagnostic_at(
+            Q004,
+            "a load without `header` names its columns: `columns (a, b, …)`",
+            &at,
+        ));
+    }
+    Ok(LoadStmt {
+        source: source.expect("grammar: load_stmt names one source literal"),
+        target: target.expect("grammar: load_stmt names one target"),
+        mode,
+        delimiter: delimiter.unwrap_or(b','),
+        header,
+        columns,
+    })
+}
+
+fn refuse_repeated_load_option(
+    seen: bool,
+    option: &str,
+    at: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<(), QueryDiagnostic> {
+    if seen {
+        return Err(diagnostic_at(
+            Q004,
+            format!("`{option}` is given twice in one load statement"),
+            at,
+        ));
+    }
+    Ok(())
 }
 
 /// A quoted graph commit id operand: decoded, non-empty, untrimmed-equal
