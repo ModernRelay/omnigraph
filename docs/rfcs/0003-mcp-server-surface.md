@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-13
+updated: 2026-10-14
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -67,7 +67,8 @@ protocol diverged.
 
 ## What shipped before this amendment
 
-The identity RFC shipped, behind `--oidc-identity-trust` only:
+The phases below have since shipped (see [Rollout](#rollout)). Before them, the
+identity RFC shipped, behind `--oidc-identity-trust` only:
 
 - `GET /.well-known/oauth-protected-resource` (root path only) and a 401 from
   `/mcp` whose challenge names `<resource origin>/.well-known/oauth-protected-resource<resource path>`;
@@ -112,11 +113,15 @@ argument; there are no per-graph MCP endpoints.
 | Server credential sources | `/mcp` | Protected-resource metadata and OAuth challenge |
 |---|---|---|
 | none (`--unauthenticated` or policy-only) | not mounted | not served |
-| static bearer tokens and/or signed data tokens | mounted (phase 2) | not served; 401 carries no challenge |
+| static bearer tokens and/or signed data tokens | mounted | not served; 401 carries no challenge |
 | OIDC identity trust (alone or with the above) | mounted | served; 401 carries the challenge |
 
 Authentication is the server's existing middleware: static tokens, then signed
 data tokens, then OIDC. A 401 happens before the request body is collected.
+Without OIDC, a 401 from `/mcp`, like every other 401 the server returns today,
+carries no `WWW-Authenticate` header. RFC 9110 §15.5.2 asks for one; a plain
+`WWW-Authenticate: Bearer`, which advertises no OAuth flow, belongs to a
+server-wide follow-up rather than to `/mcp` alone.
 
 ### Discovery (OIDC only)
 
@@ -138,7 +143,8 @@ defaults, the OIDC resource authority when configured, and every host named by t
 new allowed-host setting. With OIDC, the resource origin is the allowed browser
 origin, as today. Without OIDC there is no resource origin, so a request carrying
 any `Origin` header is refused with 403; native clients (Claude Code, Cursor) send
-none.
+none. That refusal is OmniGraph's own layer, not the SDK's: see
+[Host and Origin checks](#host-and-origin-checks).
 
 ### Settings
 
@@ -188,7 +194,11 @@ Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-h
 `graphs_list` is the shipped `graphs`. Discovery admits only identity
 credentials (OIDC or signed identity tokens), so for any other credential, such
 as a static token, `graphs` calls `GET /graphs` under `graph_list`, as the
-package did, and returns only ids and names. `read` also serves what `POST /query`
+package did, and returns only ids and names. `graph_list` is server-scoped, and
+without an applied cluster policy every server-scoped action is denied, so on a
+default static-token server `graphs` returns 403. The tool description and the
+server instructions say so, and tell a model to ask for a `graph_list` permit or
+to use a graph id the user supplies. `read` also serves what `POST /query`
 serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
 and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
 serves. Stored mutations stay unavailable through `query`; they arrive with
@@ -199,8 +209,10 @@ they are operator-owned through `omnigraph cluster plan/apply`.
 
 ### Tool results
 
-- Success: `structuredContent` is the handler's JSON response body, byte-equal in
-  value to the HTTP route's body, plus the SDK's text duplicate for older clients.
+- Success: `structuredContent` is the handler's JSON response body, equal in
+  value to the HTTP route's body except where the catalog names a projection
+  (`queries` without stored mutations, the `graphs` fallback's ids and names),
+  plus the SDK's text duplicate for older clients.
 - Failure: `isError: true` with `structuredContent` either
   `{"status": <http status>, "error": <the route's ErrorOutput>}` for a handler
   refusal, or `{"code": "...", "message": "..."}` for an MCP-side refusal
@@ -224,8 +236,8 @@ write contract below.
 | `omnigraph://graphs` | the `graphs` result, JSON | as `graphs` |
 | `omnigraph://graphs/{graph}/schema` (template) | the `.pg` source, `text/plain` | `read` |
 | `omnigraph://graphs/{graph}/branches` (template) | `GET /branches` JSON | `read` |
-| `omnigraph://best-practices/index` | index of the references below, `text/markdown` | identity required |
-| `omnigraph://best-practices/{topic}` for `queries`, `data`, `schema`, `search`, `changes` | `skills/omnigraph/references/{topic}.md` | identity required |
+| `omnigraph://best-practices/index` | index of the references below, `text/markdown` | any authenticated actor |
+| `omnigraph://best-practices/{topic}` for `queries`, `data`, `schema`, `search`, `changes` | `skills/omnigraph/references/{topic}.md` | any authenticated actor |
 
 The package's `omnigraph://schema` and `omnigraph://branches` were single-graph:
 the package was configured with one graph id. The server is multi-graph, so these
@@ -242,15 +254,33 @@ The write tools keep the npm package's contract:
   the conditional route (`/mutate/if-graph-commit`), so a stale head fails with 412
   before effects. A read's `graph_commit_id` is the value to pass.
 - **No automatic retry.** The server never replays a tool call.
-- **Outcome unknown is reported, not replayed.** Writes register through the
-  server's owned-write boundary, so dropping the caller's wait never cancels them.
-  When the wait ends first (cancellation or the 60 second write wait), the result
-  is `isError: true` with `outcome_unknown: true` and an instruction to reconcile
-  before replaying. A handler error that the server reports as completion-uncertain
-  keeps that report.
+- **A lost response is an unknown outcome.** Writes register through the server's
+  owned-write boundary, so the end of the caller's wait never cancels them. The
+  server waits 30 seconds for a write, as for a read, which is below the MCP
+  TypeScript SDK's default 60 second request timeout, so a client on that default
+  normally receives the server's answer. When the server's wait ends first, the
+  result is `isError: true` with `outcome_unknown: true`; a handler error the
+  server marks completion-uncertain carries the same flag. When the client gives
+  up first, or cancels (in Streamable HTTP a cancellation closes the request, after
+  which the server sends nothing for it), no result arrives at all, and the caller
+  must treat that the same way. Atomic publication does not make a write
+  exactly-once after a lost acknowledgement ([first-principles data systems,
+  §B.1](../dev/systems.md#b1-a-guarantee-record)). Before replaying, reconcile: read the target with
+  `read` or `snapshot` and compare its `graph_commit_id` with the one the write was
+  based on, or list the branch's commits with `commits_list` and look for the
+  write's effect. A replay of `mutate` should carry `if_graph_commit` so a write
+  that did land fails with 412 instead of applying twice.
 - **Bounds.** A write's arguments, including `load` data, fit in the 64 KiB MCP
-  request; larger loads use `POST /load/ndjson`. Each write also reserves write
-  ingress and per-actor write admission exactly as its HTTP route does.
+  request; larger loads use `POST /load/ndjson`. Each write reserves write ingress
+  for its argument bytes and per-actor write admission as its HTTP route does.
+  Unlike the HTTP route, it is observed in the read lane and shares the 16 MCP
+  slots with reads, so read pressure can refuse it with `capacity_exceeded`. An
+  HTTP write takes the separate write observer lane, which exists so slow readers
+  cannot block writes; `/mcp` is one read-class route whose operation is known
+  only after its body is parsed. A separate MCP write slot pool with the write
+  observer, or classifying on the `Mcp-Method` and `Mcp-Name` headers before body
+  collection, would close the gap; this RFC accepts the trade-off because MCP
+  writes are opt-in and the refusal is explicit and retryable.
 
 ## Design
 
@@ -283,6 +313,15 @@ request path with the advertised path computed once at router construction; it
 never echoes or decodes the request path. Using a wildcard instead of registering
 the configured path as a literal route keeps an unusual resource path from
 reaching the router's path syntax.
+
+### Host and Origin checks
+
+`rmcp` 3.3.0 checks `Host` against its allowed list and `Origin` against its
+allowed origins, but treats an empty origin list as unrestricted. With OIDC the
+list holds the resource origin. Without OIDC, OmniGraph's router adds a layer
+between authentication and body admission that refuses any request carrying
+`Origin` with 403, and an integration test pins it, so an SDK upgrade that changes
+its default cannot remove the refusal silently.
 
 ### Challenge
 
@@ -359,15 +398,19 @@ owning `run_read` ownership through cancellation and the result bound.
 
 ## Rollout
 
-1. **Phase 1** (one PR): metadata at the advertised path, `invalid_token`, `schema`,
-   opt-in `read`, descriptions, instructions and output schemas; amend the identity
-   RFC's "initial tools" paragraph, the server MCP documentation, and lift
-   `unsupported_capability: mcp` in the self-contained server testing RFC.
-   `implementation` stays `partial`.
-2. **Phase 2** (one PR): mount for every credential source with the allowed-host
-   setting, read parity tools, resources, opt-in write tools. `implementation`
-   becomes `complete` for this RFC's scope.
-3. **Package retirement**, after a release contains phase 2: a final
+1. **Phases 1 and 2, shipped together** in
+   [#994](https://github.com/ModernRelay/omnigraph/pull/994) (`cea15256`); the
+   separate phase 1 PR, #993, closed unmerged. Metadata at the advertised path,
+   `invalid_token`, `schema`, opt-in `read`, descriptions, instructions and output
+   schemas; mounting for every credential source with the allowed-host setting,
+   read parity tools, graph resources and opt-in write tools; the identity RFC's
+   "initial tools" paragraph, the MCP user guide, and `via mcp` in the
+   self-contained server testing RFC.
+2. **Best-practices resources** in
+   [#995](https://github.com/ModernRelay/omnigraph/pull/995), with the 30 second
+   write wait and the `graph_list` instruction from this review in their own PR.
+   `implementation` stays `partial` until these and the package retirement land.
+3. **Package retirement**, after a release contains phases 1 and 2: a final
    `@modernrelay/omnigraph-mcp` version whose README and binary print a
    deprecation pointing at the server's `/mcp`, then npm deprecation.
 4. **Deferred, separate decisions:** per-stored-query `invoke_query` scope (a query
@@ -388,6 +431,14 @@ a deferred item or the existing allowed-origin rule.
 - 2026-10-02: The `schema_apply` tool loses its `allow_data_loss` argument,
   following the removal of that field from the schema-apply route: a drop
   reclaims nothing at apply, so there is no destructive mode to select.
+- 2026-10-14: Review of the amendment. The write wait drops from 60 to 30 seconds,
+  below the MCP TypeScript SDK's default request timeout, and a lost response is
+  stated as an unknown outcome with its reconcile step (supersedes "the 60 second
+  write wait"). MCP writes are recorded as observed in the read lane and sharing
+  the 16 slots (supersedes "exactly as its HTTP route does"). The best-practices
+  resources are open to any authenticated actor (supersedes "identity required").
+  Success bodies equal the route's except named projections (supersedes
+  "byte-equal in value"). Rollout records that phases 1 and 2 shipped together.
 - 2026-10-13: Amended for phases 1 and 2 (issue
   [#991](https://github.com/ModernRelay/omnigraph/issues/991)), recording the
   transport and tools the identity RFC shipped. Superseded sentences of the previous
