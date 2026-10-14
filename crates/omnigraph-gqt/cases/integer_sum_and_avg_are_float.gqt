@@ -25,16 +25,31 @@ node Person {
 --- query
 query totals() {
     match { $p: Person }
-    return { sum($p.age) as total, avg($p.age) as mean, count($p) as n }
+    return {
+        sum($p.age) as total,
+        avg($p.age) as mean,
+        count($p) as n,
+        count(distinct $p) as distinct_n,
+        count(distinct $p.team) as teams
+    }
 }
 
 --- expect unordered
-{"total": 51.0, "mean": 25.5, "n": 4}
+{"total": 51.0, "mean": 25.5, "n": 4, "distinct_n": 4, "teams": 2}
 
 --- expect shape
 total: F64
 mean: F64
 n: I64
+distinct_n: I64
+teams: I64
+
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
+aggregate distinct_n: count(distinct Person) count error -> I64?
+aggregate teams: count(distinct String) count error -> I64?
 
 --- query
 query totals_by_team() {
@@ -52,6 +67,11 @@ total: F64?
 mean: F64?
 n: I64
 
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
+
 --- query
 query totals_of_nobody() {
     match {
@@ -68,6 +88,11 @@ query totals_of_nobody() {
 n: I64
 total: F64?
 mean: F64?
+
+--- expect plan
+aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
+aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate n: count(Person) count error -> I64?
 
 --- query
 query birthdates_by_team() {

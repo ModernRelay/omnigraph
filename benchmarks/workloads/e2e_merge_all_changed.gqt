@@ -1,0 +1,323 @@
+# issue: none
+# notes: Merge all 64 changed vectors into a diverged target; exact rows on both branches, including the unrelated target insert. One operation on a fresh handle is timed; checks and restart are outside the timer.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- mutate
+branch merge "source" into "main"
+--- expect outcome: merged
+
+--- query
+branch list
+
+--- expect unordered
+{"name":"main"}
+{"name":"source"}
+--- expect shape
+name: String
+
+--- query branch: main
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base001","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base002","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base003","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base004","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base005","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base006","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base007","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base008","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base009","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base010","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base011","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base012","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base013","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base014","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base015","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base016","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base017","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base018","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base019","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base020","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base021","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base022","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base023","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base024","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base025","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base026","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base027","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base028","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base029","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base030","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base031","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base032","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base033","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base034","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base035","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base036","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base037","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base038","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base039","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base040","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base041","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base042","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base043","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base044","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base045","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base046","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base047","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base048","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"main-only","embedding":[500.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+
+--- query branch: source
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base001","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base002","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base003","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base004","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base005","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base006","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base007","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base008","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base009","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base010","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base011","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base012","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base013","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base014","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base015","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base016","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base017","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base018","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base019","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base020","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base021","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base022","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base023","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base024","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base025","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base026","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base027","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base028","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base029","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base030","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base031","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base032","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base033","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base034","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base035","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base036","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base037","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base038","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base039","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base040","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base041","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base042","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base043","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base044","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base045","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base046","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base047","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base048","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[-1.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+
+--- restart
+
+--- query
+branch list
+
+--- expect unordered
+{"name":"main"}
+{"name":"source"}
+--- expect shape
+name: String
+
+--- query branch: main
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base001","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base002","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base003","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base004","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base005","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base006","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base007","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base008","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base009","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base010","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base011","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base012","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base013","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base014","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base015","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base016","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base017","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base018","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base019","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base020","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base021","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base022","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base023","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base024","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base025","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base026","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base027","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base028","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base029","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base030","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base031","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base032","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base033","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base034","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base035","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base036","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base037","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base038","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base039","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base040","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base041","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base042","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base043","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base044","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base045","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base046","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base047","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base048","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"main-only","embedding":[500.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+
+--- query branch: source
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base001","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base002","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base003","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base004","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base005","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base006","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base007","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base008","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base009","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base010","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base011","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base012","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base013","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base014","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base015","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base016","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base017","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base018","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base019","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base020","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base021","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base022","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base023","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base024","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base025","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base026","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base027","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base028","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base029","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base030","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base031","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base032","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base033","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base034","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base035","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base036","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base037","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base038","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base039","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base040","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base041","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base042","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base043","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base044","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base045","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base046","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base047","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base048","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[-1.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[-1.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+

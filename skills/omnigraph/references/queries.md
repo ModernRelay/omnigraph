@@ -305,6 +305,8 @@ query friend_counts() {
 ```
 
 Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
+once to `F64`; `avg` uses a floating-point accumulator.
 
 - `min`/`max` accept numeric, String, Bool (`false` before `true`), Date, and
   DateTime values and return the column's own type; lists, vectors, and Blobs

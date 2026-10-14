@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::timeout;
 
+use crate::redacted_cause::RedactedCause;
+
 /// At most two produced chunks may wait behind the response consumer.
 pub(crate) const EXPORT_QUEUE_CHUNKS: usize = 2;
 /// Queued and yielded chunks share these credits; clones and slices keep a
@@ -23,6 +25,9 @@ pub(crate) const EXPORT_QUEUE_RESERVED_BYTES: usize =
 pub(crate) const EXPORT_PROCESS_QUEUE_RESERVED_BYTES: usize = 8 * EXPORT_QUEUE_RESERVED_BYTES;
 /// A saturated request waits only briefly for a queue reservation.
 pub(crate) const EXPORT_RESERVATION_TIMEOUT: Duration = Duration::from_millis(250);
+/// The body error of a stream that failed after its 200 headers. The client
+/// reads no text from it; the server's HTTP trace layer logs it.
+const SERVED_STREAM_FAILED: &str = "served stream failed after response headers";
 
 static PROCESS_EXPORT_QUEUE_BYTES: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -105,6 +110,8 @@ pub(crate) struct ExportQueueLease {
 pub(crate) struct ExportSender {
     sender: mpsc::Sender<ExportFrame>,
     lease: Arc<ExportQueueLease>,
+    /// Names the stream in the failure log.
+    stream: &'static str,
 }
 
 impl ExportSender {
@@ -159,7 +166,25 @@ impl ExportSender {
         self.send_chunk(output.0).await
     }
 
-    pub(crate) async fn finish(&self, cut: ExportCut, error: Option<io::Error>) {
+    /// End the response, with the failure that ended it. An engine message
+    /// can hold object URIs or credentials, so the body error is a constant
+    /// and the log names the failure by its class. A failure after the client
+    /// has gone reaches nobody and is not logged.
+    pub(crate) async fn finish(&self, cut: ExportCut, failure: Option<OmniError>) {
+        let error = failure.map(|failure| {
+            if !self.sender.is_closed() {
+                let cause = RedactedCause::of(&failure);
+                tracing::error!(
+                    error_kind = "served_stream_failed",
+                    stream = self.stream,
+                    error_variant = cause.variant,
+                    storage_kind = ?cause.storage_kind,
+                    manifest_kind = ?cause.manifest_kind,
+                    "served stream failed after response headers"
+                );
+            }
+            io::Error::other(SERVED_STREAM_FAILED)
+        });
         let _ = self
             .sender
             .send(ExportFrame::Terminal {
@@ -221,12 +246,16 @@ pub(crate) struct ExportBodyStream {
     done: bool,
 }
 
-pub(crate) fn channel(lease: Arc<ExportQueueLease>) -> (ExportSender, ExportBodyStream) {
+pub(crate) fn channel(
+    lease: Arc<ExportQueueLease>,
+    stream: &'static str,
+) -> (ExportSender, ExportBodyStream) {
     let (sender, receiver) = mpsc::channel(EXPORT_QUEUE_CHUNKS);
     (
         ExportSender {
             sender,
             lease: Arc::clone(&lease),
+            stream,
         },
         ExportBodyStream {
             receiver,
@@ -313,7 +342,7 @@ mod tests {
         );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
         sender
             .send_chunk(vec![b'x'; EXPORT_CHUNK_MAX_BYTES])
             .await
@@ -357,7 +386,7 @@ mod tests {
             Duration::from_millis(10),
         );
         let lease = transport.reserve().await.unwrap();
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
 
         sender
             .send_chunk(vec![b'a'; EXPORT_CHUNK_MAX_BYTES])
@@ -454,7 +483,7 @@ mod tests {
     async fn missing_terminal_frame_is_a_body_error_not_clean_eof() {
         let transport = ExportTransport::new(4, 4, Duration::from_millis(10));
         let lease = transport.reserve().await.unwrap();
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
         drop(sender);
 
         let error = body.next().await.unwrap().unwrap_err();
@@ -484,7 +513,7 @@ mod tests {
         );
         let lease = transport.reserve().await.unwrap();
         let producer_lease = Arc::clone(&lease);
-        let (sender, mut body) = channel(lease);
+        let (sender, mut body) = channel(lease, "export");
 
         let data_sender = sender.clone();
         let (cut, result) = cut
@@ -527,11 +556,45 @@ mod tests {
             EXPORT_QUEUE_RESERVED_BYTES
         );
 
+        // An engine failure after the headers reaches the body as a constant
+        // and the log as its class: the trace layer logs a body error's text,
+        // and an engine message can hold object URIs or credentials.
+        let capture = crate::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
+        let (sender, mut body) = channel(transport.reserve().await.unwrap(), "export");
+        sender
+            .finish(
+                cut,
+                Some(OmniError::Storage(omnigraph::error::StorageFailure::new(
+                    omnigraph::error::StorageFailureKind::Unknown,
+                    "storage: GET s3://private-bucket/graph/nodes/0a.lance?token=secret",
+                ))),
+            )
+            .await;
+        drop(sender);
+        let error = body.next().await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), SERVED_STREAM_FAILED);
+        assert!(body.next().await.is_none());
+        drop(body);
+        let logs = capture.output();
+        for expected in [
+            r#"error_kind="served_stream_failed""#,
+            r#"stream="export""#,
+            r#"error_variant="Storage""#,
+            "storage_kind=Some(Unknown)",
+        ] {
+            assert!(logs.contains(expected), "missing {expected}: {logs}");
+        }
+        for leaked in ["private-bucket", "0a.lance", "token", "secret"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+
         // Baseline sends its cursor after the outer export/closed select has
         // completed. Receiver closure must release this producer's cut even
         // when all frame credits survive in transport-owned clones or slices.
         let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
-        let (sender, mut body) = channel(transport.reserve().await.unwrap());
+        let (sender, mut body) = channel(transport.reserve().await.unwrap(), "change_baseline");
         let mut retained = Vec::new();
         for _ in 0..EXPORT_OUTSTANDING_FRAMES {
             sender
@@ -547,9 +610,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(matches!(error, OmniError::Io(_)));
-                sender
-                    .finish(cut, Some(io::Error::other(error.to_string())))
-                    .await;
+                sender.finish(cut, Some(error)).await;
             };
             tokio::pin!(terminal);
             assert!(futures::poll!(&mut terminal).is_pending());
@@ -557,6 +618,11 @@ mod tests {
             assert!(futures::poll!(&mut terminal).is_ready());
         }
         drop(sender);
+        assert_eq!(
+            capture.output().matches("served_stream_failed").count(),
+            1,
+            "a failure after the client has gone is not logged"
+        );
         assert_eq!(transport.available_bytes.available_permits(), 0);
         let retry = db.capture_served_export_cut("main", &[]).await.unwrap();
         drop(retry);

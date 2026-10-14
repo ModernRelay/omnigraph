@@ -24,7 +24,7 @@ use crate::error::{OmniError, StorageFailureKind};
 use crate::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use crate::storage_layer::{
     IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
-    PendingScanBudget, ProvenInsertChunk, SnapshotHandle,
+    PendingScanBudget, PendingUsage, ProvenInsertChunk, SnapshotHandle, WriteBudget,
 };
 use crate::table_store::{StagedWrite, TableStore};
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, StructArray, UInt64Array};
@@ -188,6 +188,74 @@ fn blob_person_pk_batch(id: &str, payload: &[u8]) -> RecordBatch {
     .unwrap()
 }
 
+#[test]
+fn write_max_bytes_separates_only_typed_valid_blob_payloads() {
+    let batch = blob_person_pk_batch("one", &vec![0; 4093]);
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 4093);
+    assert!(usage.rows < 4093);
+    assert!(batch.get_array_memory_size() as u64 > 4093);
+    let content = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let null_content = StructArray::new(
+        content.fields().clone(),
+        content.columns().to_vec(),
+        Some(datafusion::arrow::buffer::NullBuffer::from(vec![false])),
+    );
+    let null_batch = RecordBatch::try_new(
+        batch.schema(),
+        vec![batch.column(0).clone(), Arc::new(null_content)],
+    )
+    .unwrap();
+    assert_eq!(super::write_batch_bytes(&null_batch).unwrap().payload, 0);
+    let ordinary = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "bytes",
+            DataType::LargeBinary,
+            false,
+        )])),
+        vec![Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            vec![0; 4094].as_slice(),
+        ]))],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&ordinary).unwrap();
+    assert_eq!(usage.payload, 0);
+    assert!(
+        usage.rows > 4093,
+        "ordinary binary bytes stay in the row account"
+    );
+    let mut builder = lance::blob::BlobArrayBuilder::new(3);
+    for _ in 0..3 {
+        builder.push_bytes(vec![0; 2730]).unwrap();
+    }
+    let content = builder.finish().unwrap();
+    let data = content
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .column_by_name("data")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::LargeBinaryArray>()
+        .unwrap();
+    assert!(
+        data.values().capacity() > 8190,
+        "fixture must retain payload capacity slack"
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![lance::blob::blob_field("content", true)])),
+        vec![content],
+    )
+    .unwrap();
+    let usage = super::write_batch_bytes(&batch).unwrap();
+    assert_eq!(usage.payload, 8190);
+    assert!(usage.rows < 8190);
+}
+
 fn staged_key_filter(
     staged: &StagedWrite,
 ) -> &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter {
@@ -257,15 +325,22 @@ fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
 fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
     PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64,
-        KEYED_WRITE_MAX_BYTES,
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64,
+            bytes: KEYED_WRITE_MAX_BYTES,
+            payload_bytes: 0,
+        },
+        WriteBudget::default(),
     ))
     .expect("the exact keyed row/byte limits are inclusive");
 
     let row_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        KEYED_WRITE_MAX_ROWS as u64 + 1,
-        0,
+        PendingUsage {
+            rows: KEYED_WRITE_MAX_ROWS as u64 + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one row over must be rejected");
@@ -280,8 +355,11 @@ fn pending_scan_budget_caps_are_inclusive_and_one_over_is_typed() {
 
     let byte_error = PendingScanAccount::new(PendingScanBudget::new(
         "test:people",
-        0,
-        KEYED_WRITE_MAX_BYTES + 1,
+        PendingUsage {
+            bytes: KEYED_WRITE_MAX_BYTES + 1,
+            ..PendingUsage::default()
+        },
+        WriteBudget::default(),
     ))
     .err()
     .expect("one byte over must be rejected");
@@ -423,6 +501,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
             person_pk_batch(&[("alice", Some(31)), ("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -475,6 +554,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -505,6 +585,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -528,6 +609,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::KnownPresentUpdate,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -561,6 +643,7 @@ async fn all_new_upsert_certifies_insert_absence_and_persists_it_in_history() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -660,6 +743,7 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
             person_pk_batch(&[("alice", Some(31))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -718,6 +802,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             person_pk_batch(&[("alice", Some(99))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -745,6 +830,7 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
             person_pk_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         ),
     )
     .await
@@ -836,6 +922,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -952,6 +1039,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -966,6 +1054,7 @@ async fn concurrent_proven_strict_inserts_of_same_key_land_exactly_one_effect() 
             )
             .unwrap(),
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1012,6 +1101,7 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
             person_pk_batch(&[("carol", Some(40))]),
             KeyedWriteSemantics::StrictInsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap();
@@ -1022,7 +1112,12 @@ async fn proven_insert_chunk_rejects_target_version_reuse_before_staging() {
     let version_before_rejection = advanced.version().version;
 
     let error = store
-        .stage_proven_strict_insert(advanced, chunk, SYSTEM_COLUMNS_LEGACY)
+        .stage_proven_strict_insert(
+            advanced,
+            chunk,
+            SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1075,7 +1170,7 @@ async fn proven_insert_rejects_prepared_blob_descriptors_before_staging() {
     let version_before_rejection = target.version().version;
 
     let error = store
-        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY)
+        .stage_proven_strict_insert(target, chunk, SYSTEM_COLUMNS_LEGACY, WriteBudget::default())
         .await
         .unwrap_err();
     assert!(
@@ -1118,6 +1213,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 )
                 .unwrap(),
                 SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1128,6 +1224,7 @@ async fn proven_and_general_strict_same_key_conflict_in_both_commit_orders() {
                 person_pk_batch(&[("bob", Some(26))]),
                 KeyedWriteSemantics::StrictInsert,
                 SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
             )
             .await
             .unwrap();
@@ -1233,6 +1330,7 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             person_batch(&[("bob", Some(25))]),
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -1265,6 +1363,7 @@ async fn keyed_write_rejects_missing_or_non_id_primary_key() {
             wrong_batch,
             KeyedWriteSemantics::Upsert,
             SYSTEM_COLUMNS_LEGACY,
+            WriteBudget::default(),
         )
         .await
         .unwrap_err();
@@ -1288,6 +1387,39 @@ fn proven_insert_delta_scan_never_enables_strict_batch_size() {
 }
 
 #[tokio::test]
+async fn write_max_bytes_proven_insert_compacts_a_single_retained_row() {
+    let schema = person_pk_schema();
+    let parent = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "small".to_string(),
+                "x".repeat(5000),
+            ])),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+        ],
+    )
+    .unwrap();
+    let slice = parent.slice(0, 1);
+    let settings = omnigraph_compiler::settings::SessionSettings::default()
+        .with("write_max_bytes", "4093")
+        .unwrap();
+    let budget = WriteBudget::from_settings(&settings);
+    let retained = slice.get_array_memory_size() as u64;
+    assert!(retained > budget.bytes() && retained <= 2 * budget.bytes());
+    let reader = arrow_array::RecordBatchIterator::new([Ok(slice)], schema.clone());
+    let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let output: Vec<_> =
+        super::bounded_proven_insert_stream(schema, raw, "Person".to_string(), budget)
+            .try_collect()
+            .await
+            .unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert!(super::write_batch_bytes(&output[0]).unwrap().rows <= budget.bytes());
+}
+
+#[tokio::test]
 async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
     let schema = person_pk_schema();
     let batches = (0..10)
@@ -1305,11 +1437,15 @@ async fn proven_insert_boundary_normalizer_coalesces_safe_small_batches() {
         .collect::<Vec<_>>();
     let reader = arrow_array::RecordBatchIterator::new(batches, schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let output: Vec<RecordBatch> =
-        super::bounded_proven_insert_stream(schema, raw, "Person".to_string())
-            .try_collect()
-            .await
-            .unwrap();
+    let output: Vec<RecordBatch> = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    )
+    .try_collect()
+    .await
+    .unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].num_rows(), 10);
     assert!(u64::try_from(output[0].get_array_memory_size()).unwrap() <= KEYED_WRITE_MAX_BYTES);
@@ -1346,7 +1482,12 @@ async fn proven_insert_boundary_normalizer_splits_retained_parent_lazily() {
 
     let reader = arrow_array::RecordBatchIterator::new([Ok(parent)], schema.clone());
     let raw = lance_datafusion::utils::reader_to_stream(Box::new(reader));
-    let mut output = super::bounded_proven_insert_stream(schema, raw, "Person".to_string());
+    let mut output = super::bounded_proven_insert_stream(
+        schema,
+        raw,
+        "Person".to_string(),
+        WriteBudget::default(),
+    );
 
     for _ in 0..3 {
         let batch = output
@@ -1452,7 +1593,11 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 0, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage::default(),
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
@@ -1474,7 +1619,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8190, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8190,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect("projection containing key_column must succeed");
@@ -1495,7 +1647,14 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
             Some(&["id", "note"]),
             None,
             Some("id"),
-            PendingScanBudget::new("test:people", 8191, 0),
+            PendingScanBudget::new(
+                "test:people",
+                PendingUsage {
+                    rows: 8191,
+                    ..PendingUsage::default()
+                },
+                WriteBudget::default(),
+            ),
         )
         .await
         .expect_err("pending + unshadowed committed output must share the row budget");
@@ -2666,4 +2825,277 @@ fn compaction_blob_batch_rows_bounds_one_batch() {
     assert_eq!(compaction_blob_batch_rows(BUDGET), 1);
     assert_eq!(compaction_blob_batch_rows(BUDGET / 2 + 1), 1);
     assert_eq!(compaction_blob_batch_rows(BUDGET / 2), 2);
+}
+
+/// Lance applies a per-run source budget only to the tasks its own planner
+/// returns, so the dropped-column tasks the graph planner appends would run
+/// outside it: options that set any budget are refused before planning.
+#[tokio::test]
+async fn table_compaction_planning_refuses_source_budgets() {
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let unbudgeted = TableStore::plan_table_compaction(&ds, &CompactionOptions::default()).await;
+    assert!(unbudgeted.is_ok(), "{unbudgeted:?}");
+
+    let budgets = [
+        CompactionOptions {
+            max_source_fragments: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_rows: Some(1),
+            ..CompactionOptions::default()
+        },
+        CompactionOptions {
+            max_source_bytes: Some(1),
+            ..CompactionOptions::default()
+        },
+    ];
+    for options in budgets {
+        match TableStore::plan_table_compaction(&ds, &options).await {
+            Err(OmniError::Manifest(manifest))
+                if manifest.kind == crate::error::ManifestErrorKind::Internal => {}
+            other => panic!("a source budget must be refused, got {other:?}"),
+        }
+    }
+}
+
+/// The schema-evolution planner reads only the manifest: renames and drops
+/// plan one Project, additions one Merge, both a Project then a Merge, an
+/// unchanged schema nothing; every change that would need a rewrite refuses.
+#[tokio::test]
+async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
+    use crate::db::STABLE_PROPERTY_ID_METADATA_KEY as MARKER;
+
+    fn pk_id() -> Field {
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+    fn marked(name: &str, data_type: DataType, nullable: bool, id: &str) -> Field {
+        Field::new(name, data_type, nullable)
+            .with_metadata([(MARKER.to_string(), id.to_string())].into_iter().collect())
+    }
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("evolve.lance");
+    let schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        ],
+    )
+    .unwrap();
+    let ds = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        uri.to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let age_id = ds.schema().field("age").unwrap().id;
+    let max_id = ds.manifest.max_field_id();
+
+    let mut unchanged = TableStore::plan_schema_evolution(&ds, &schema, &[]).unwrap();
+    assert!(unchanged.project.is_none() && unchanged.merge.is_none());
+    assert!(
+        store
+            .stage_schema_evolution(&ds, &mut unchanged)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let renamed = Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]);
+    let mut plan =
+        TableStore::plan_schema_evolution(&ds, &renamed, &renames(&[("age", "years")])).unwrap();
+    assert!(plan.merge.is_none());
+    let project = plan.project.clone().unwrap();
+    assert_eq!(project.field("years").unwrap().id, age_id);
+    assert!(project.field("note").is_none());
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        staged.transaction.operation,
+        Operation::Project {
+            preserves_nullability: true,
+            ..
+        }
+    ));
+    assert_eq!(staged.transaction.read_version, ds.version().version);
+    // The plan is consumed; a step staged against a dataset the previous
+    // step did not leave refuses.
+    assert!(plan.project.is_none());
+    let error = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not the ones the plan expects"),
+        "{error}"
+    );
+
+    let added = Schema::new(vec![
+        pk_id(),
+        marked("age", DataType::Int32, true, "1"),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("note", DataType::Utf8, true, "2"),
+    ]);
+    let mut plan = TableStore::plan_schema_evolution(&ds, &added, &[]).unwrap();
+    assert!(plan.project.is_none());
+    let merge = plan.merge.clone().unwrap();
+    assert_eq!(
+        merge
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "age", "city", "note"],
+        "the evolved schema keeps the target's column order"
+    );
+    assert_eq!(merge.field("city").unwrap().id, max_id + 1);
+    let staged = store
+        .stage_schema_evolution(&ds, &mut plan)
+        .await
+        .unwrap()
+        .unwrap();
+    match &staged.transaction.operation {
+        Operation::Merge { fragments, .. } => {
+            assert_eq!(fragments.as_slice(), ds.manifest.fragments.as_slice())
+        }
+        other => panic!("expected a Merge, got {other:?}"),
+    }
+
+    let both = Schema::new(vec![
+        pk_id(),
+        marked("city", DataType::Utf8, true, "3"),
+        marked("years", DataType::Int32, true, "1"),
+    ]);
+    let plan =
+        TableStore::plan_schema_evolution(&ds, &both, &renames(&[("age", "years")])).unwrap();
+    let project = plan.project.unwrap();
+    assert_eq!(
+        project
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["id", "years"],
+        "the Project carries the renames and drops, the Merge the additions"
+    );
+    assert!(plan.merge.unwrap().field("city").is_some());
+
+    let refusals = [
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, true, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Vec::new(),
+            "without a rewrite",
+        ),
+        (
+            Schema::new(vec![
+                pk_id(),
+                marked("age", DataType::Int32, true, "1"),
+                marked("city", DataType::Utf8, false, "3"),
+            ]),
+            Vec::new(),
+            "is not nullable",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "9")]),
+            Vec::new(),
+            "carries property identity 1, not 9",
+        ),
+        (
+            Schema::new(vec![pk_id(), marked("years", DataType::Int32, true, "1")]),
+            renames(&[("ghost", "years")]),
+            "which the dataset does not have",
+        ),
+    ];
+    for (target, renames, expected) in refusals {
+        let error = TableStore::plan_schema_evolution(&ds, &target, &renames).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected '{expected}', got: {error}"
+        );
+    }
+
+    // A column written before property markers existed adopts its identity
+    // from the target, as the replaced full-table rewrite did.
+    let unmarked_schema = Arc::new(Schema::new(vec![
+        pk_id(),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let unmarked = Dataset::write(
+        arrow_array::RecordBatchIterator::new(
+            vec![Ok(RecordBatch::try_new(
+                unmarked_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])),
+                    Arc::new(Int32Array::from(vec![Some(1)])),
+                ],
+            )
+            .unwrap())],
+            unmarked_schema,
+        ),
+        dir.path().join("unmarked.lance").to_str().unwrap(),
+        Some(lance::dataset::WriteParams {
+            enable_stable_row_ids: true,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let marked_target = Schema::new(vec![pk_id(), marked("age", DataType::Int32, true, "1")]);
+    let adopted = TableStore::plan_schema_evolution(&unmarked, &marked_target, &[])
+        .unwrap()
+        .project
+        .unwrap();
+    assert_eq!(
+        adopted
+            .field("age")
+            .unwrap()
+            .metadata
+            .get(MARKER)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        adopted.field("age").unwrap().id,
+        unmarked.schema().field("age").unwrap().id
+    );
 }

@@ -18,7 +18,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::branch_merge::{BranchMergePlan, FixtureBuildSummary, initialize_local_fixture};
-use crate::case::{CaseV1, ResetMode};
+use crate::legacy::case::{CaseV1, ResetMode};
+use crate::legacy::case::{ValidatedCase, validate_case};
 use crate::reset::{
     MetadataDigest, PhysicalDigest, TraversalLimits, freeze_clonefile_template,
     freeze_plain_copy_template,
@@ -33,7 +34,6 @@ use crate::runner::{
     validate_fixture_child_runtime_overrides,
 };
 use crate::runner::{RunnerError, RunnerResult};
-use crate::{ValidatedCase, validate_case};
 
 const FIXTURE_PROTOCOL_VERSION: u32 = 2;
 const MAX_FIXTURE_PROTOCOL_BYTES: u64 = 1024 * 1024;
@@ -181,7 +181,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::S3Versioning => {
+        ResetMode::None | ResetMode::S3Versioning => {
             return failure(
                 "unsupported_runner_axis",
                 "local fixture worker cannot freeze an S3 reset template",
@@ -766,13 +766,13 @@ fn duration_us(duration: Duration) -> u64 {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::parse_case;
+    use crate::legacy::case::parse_case;
 
     use super::*;
 
     fn test_case() -> ValidatedCase {
         parse_case(include_str!(
-            "../../../benchmarks/cases/branch-merge-d50-warm.case-v1.yaml"
+            "../tests/fixtures/legacy/branch-merge-d50-warm.case-v1.yaml"
         ))
         .into_result()
         .unwrap()
@@ -791,15 +791,17 @@ mod tests {
     }
 
     fn aged_case(mut definition: CaseV1) -> ValidatedCase {
-        definition.fixture.preparation =
-            Some(crate::case::FixturePreparation::ReversibleUpdatesV1 {
+        definition.fixture.preparation = Some(
+            crate::legacy::case::FixturePreparation::ReversibleUpdatesV1 {
                 additional_commits: 8,
                 rows_per_commit: 3,
                 seed: 42,
-                maintenance: crate::case::PreparationMaintenance::None,
-            });
-        definition.fixture.state.aging = crate::case::Aging::SmallCommits;
-        definition.fixture.state.deletion_history = crate::case::DeletionHistory::ReversibleUpdates;
+                maintenance: crate::legacy::case::PreparationMaintenance::None,
+            },
+        );
+        definition.fixture.state.aging = crate::legacy::case::Aging::SmallCommits;
+        definition.fixture.state.deletion_history =
+            crate::legacy::case::DeletionHistory::ReversibleUpdates;
         definition.fixture.state.history_depth += 8;
         validate_case(definition).into_result().unwrap()
     }
@@ -1130,7 +1132,9 @@ mod tests {
                     .unwrap()
                     .restore_active()
                     .unwrap(),
-                    ResetMode::S3Versioning => panic!("test helper does not support S3 reset"),
+                    ResetMode::None | ResetMode::S3Versioning => {
+                        panic!("test helper does not support S3 reset")
+                    }
                 };
                 assert_eq!(restored.root(), active);
                 verify_physical_tree(&active, &physical, TraversalLimits::default()).unwrap();

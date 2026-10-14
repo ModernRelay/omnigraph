@@ -9,14 +9,14 @@ use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, normalize_root_uri};
 
 use super::commit_graph::{
-    CommitGraph, FirstParentEdge, GraphCommit, HistoryCache, Lineage,
-    graph_commit_from_manifest_row,
+    CommitGraph, GraphCommit, HistoryCache, Lineage, graph_commit_from_manifest_row,
 };
 use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
-    GenesisManifestAttempt, HistoryRecord, HistoryReleaseBytes, LineageIntent, ManifestChange,
-    ManifestCoordinator, ManifestIncarnation, ManifestInitError, PublishPrecondition,
-    SchemaContractRow,
+    GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
+    LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
+    PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
+    UnattachedWriteBase, UnpublishedCommit, UnpublishedMergeInputs,
 };
 use super::snapshot::Snapshot;
 use crate::seams::{decide_seam, fail};
@@ -94,25 +94,6 @@ pub struct ResolvedTarget {
     pub snapshot: Snapshot,
 }
 
-/// Internal lineage classification for an existing two-commit diff request.
-/// Arbitrary ranges retain net-current semantics; direct adjacency is derived
-/// only from the child's persisted first-parent pointer.
-pub(crate) enum ResolvedCommitRange {
-    FirstParent(FirstParentEdge),
-    Arbitrary { from: GraphCommit, to: GraphCommit },
-}
-
-fn classify_commit_range(from: GraphCommit, to: GraphCommit) -> ResolvedCommitRange {
-    if to.parent_commit_id.as_deref() == Some(from.graph_commit_id.as_str()) {
-        ResolvedCommitRange::FirstParent(FirstParentEdge {
-            parent: from,
-            child: to,
-        })
-    } else {
-        ResolvedCommitRange::Arbitrary { from, to }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedSnapshot {
     pub graph_manifest_version: u64,
@@ -133,17 +114,22 @@ pub(crate) struct GraphCoordinator {
 pub(crate) struct CapturedLineage {
     head: HistoryRecord,
     buffer: CommitBuffer,
+    /// The block registry of the captured version, hot rows and cold.
+    registry: crate::db::manifest::LineageRegistry,
     pub graph: CommitGraph,
 }
 
 impl CapturedLineage {
     /// The records a merge of the captured branch appends to `__history`: its
-    /// buffered commits after `merge_base`, oldest first, then its head.
-    pub(crate) fn into_records(self, merge_base: &str) -> BranchRecords {
+    /// buffered commits after `merge_base`, oldest first, then its head, and
+    /// the registry rows absent from the captured target.
+    pub(crate) fn into_records(mut self, merge_base: &str, target: &Self) -> BranchRecords {
+        self.registry.retain_missing(&target.registry);
         BranchRecords {
             buffer: self.buffer,
             head: self.head,
             merge_base: Some(merge_base.to_string()),
+            registry: self.registry,
         }
     }
 }
@@ -423,10 +409,12 @@ impl GraphCoordinator {
 
     /// The head this coordinator holds, as a merge captures it.
     pub(crate) async fn captured_lineage(&self) -> Result<CapturedLineage> {
+        let graph = self.manifest.commit_graph();
         Ok(CapturedLineage {
             head: self.manifest.head_record().clone(),
             buffer: self.manifest.buffer().clone(),
-            graph: self.manifest.commit_graph(),
+            registry: graph.registry().await?,
+            graph,
         })
     }
 
@@ -605,8 +593,49 @@ impl GraphCoordinator {
         };
         match record {
             Some(record) => settled_commit_state(self.root_uri(), &session, record).await,
-            None => Err(commit_not_found(snapshot_id)),
+            None => {
+                if let Some(candidate) = self.unpublished_commit(id).await? {
+                    candidate.require_readable()?;
+                    return Ok(CommitState {
+                        commit: candidate.graph_commit(),
+                        snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                    });
+                }
+                match self.unattached_commit(id).await? {
+                    Some(candidate) => {
+                        candidate.require_readable()?;
+                        Ok(CommitState {
+                            commit: candidate.graph_commit(),
+                            snapshot: Snapshot::wrap(candidate.snapshot(self.root_uri())?),
+                        })
+                    }
+                    None => Err(commit_not_found(snapshot_id)),
+                }
+            }
         }
+    }
+
+    /// The unpublished commit `id` names, read after every published
+    /// resolution missed: one tag read on a miss of a published id.
+    async fn unpublished_commit(&self, id: &str) -> Result<Option<UnpublishedCommit>> {
+        ManifestCoordinator::unpublished_commit(
+            self.root_uri(),
+            &self.manifest.control_session(),
+            id,
+        )
+        .await
+    }
+
+    /// The unattached snapshot `id` names, read after the published and the
+    /// proposal resolutions missed: one tag listing on a miss of a canonical
+    /// ULID, nothing for any other id spelling.
+    async fn unattached_commit(&self, id: &str) -> Result<Option<UnattachedCommit>> {
+        ManifestCoordinator::unattached_commit(
+            self.root_uri(),
+            &self.manifest.control_session(),
+            id,
+        )
+        .await
     }
 
     /// The record of a commit a read of `__history` did not find: held by the
@@ -640,8 +669,18 @@ impl GraphCoordinator {
         {
             return Ok(graph_commit_from_manifest_row(commit));
         }
-        match self.record_in_live_branches(id).await? {
-            Some(record) => Ok(graph_commit_from_manifest_row(record.commit)),
+        if let Some(record) = self.record_in_live_branches(id).await? {
+            return Ok(graph_commit_from_manifest_row(record.commit));
+        }
+        if let Some(candidate) = self.unpublished_commit(id).await? {
+            candidate.require_readable()?;
+            return Ok(candidate.graph_commit());
+        }
+        match self.unattached_commit(id).await? {
+            Some(candidate) => {
+                candidate.require_readable()?;
+                Ok(candidate.graph_commit())
+            }
             None => Err(commit_not_found(snapshot_id)),
         }
     }
@@ -654,22 +693,6 @@ impl GraphCoordinator {
             Some(held) => Ok(Some(graph_commit_from_manifest_row(held.clone()))),
             None => self.history().get_commit_answering(commit_id),
         }
-    }
-
-    /// Resolve both endpoints and classify direct first-parent adjacency from
-    /// the child's persisted parent pointer.
-    ///
-    /// This is deliberately O(1) after the two commits are resolved: it adds
-    /// no ancestry index or history walk. Arbitrary ranges retain the existing
-    /// net-current diff semantics.
-    pub(crate) async fn resolve_commit_range(
-        &self,
-        from_id: &SnapshotId,
-        to_id: &SnapshotId,
-    ) -> Result<ResolvedCommitRange> {
-        let from = self.resolve_commit(from_id).await?;
-        let to = self.resolve_commit(to_id).await?;
-        Ok(classify_commit_range(from, to))
     }
 
     pub(crate) async fn head_commit_id(&self) -> Result<Option<SnapshotId>> {
@@ -839,6 +862,80 @@ impl GraphCoordinator {
         })
     }
 
+    /// Write `changes` as an unpublished commit under the exact `authority`
+    /// (RFC "Unpublished graph commits"): the head and this coordinator's
+    /// view stay as captured. The commit reports the detached version it
+    /// lives at and `published: false`.
+    pub(crate) async fn propose_changes(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: &LineageIntent,
+        authority: &GraphHeadExpectation,
+        merge: Option<UnpublishedMergeInputs>,
+    ) -> Result<GraphCommit> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .propose_changes(changes, expected_table_versions, intent, authority, merge)
+            .await?;
+        let mut commit = graph_commit_from_manifest_row(outcome.head);
+        commit.graph_manifest_version = outcome.detached_version;
+        commit.published = false;
+        commit.kind = crate::db::GraphCommitKind::Unpublished;
+        Ok(commit)
+    }
+
+    /// Write `changes` as an unattached snapshot (RFC "Unattached graph
+    /// branches") under the exact `authority` the chain's root captured: a
+    /// root over the live head or a child over the snapshot `base` names.
+    /// The head and this coordinator's view stay as captured. The commit
+    /// reports the detached version it lives at, its root and
+    /// `published: false`.
+    pub(crate) async fn propose_unattached(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: &UnattachedIntent,
+        authority: &GraphHeadExpectation,
+        base: &UnattachedWriteBase,
+    ) -> Result<GraphCommit> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .propose_unattached(changes, expected_table_versions, intent, authority, base)
+            .await?;
+        let mut commit = graph_commit_from_manifest_row(outcome.head);
+        commit.graph_manifest_version = outcome.detached_version;
+        commit.published = false;
+        commit.kind = crate::db::GraphCommitKind::Unattached;
+        commit.root_commit_id = Some(outcome.root_commit_id);
+        Ok(commit)
+    }
+
+    /// Publish `candidate` on this coordinator's branch, its recorded target.
+    /// The view must be a fresh open at the live head: the publication
+    /// derives its changes from the view's rows.
+    pub(crate) async fn publish_unpublished(
+        &mut self,
+        candidate: &UnpublishedCommit,
+    ) -> Result<PublishedSnapshot> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self.manifest.publish_unpublished(candidate).await?;
+        fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        let record = outcome.commit.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "the publication of an unpublished commit returned no graph commit record",
+            )
+        })?;
+        let commit = graph_commit_from_manifest_row(record);
+        Ok(PublishedSnapshot {
+            graph_manifest_version: outcome.version,
+            _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
+            commit,
+        })
+    }
+
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
     /// fresh intent nonce (stable across CAS retries) and a timestamp. The returned
     /// publication carries the actual addressed graph commit ID.
@@ -896,7 +993,7 @@ async fn settled_commit_state(
     })
 }
 
-fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
+pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
     OmniError::manifest_not_found(format!("commit '{}' not found", snapshot_id))
 }
 
@@ -1165,64 +1262,6 @@ mod tests {
             .unwrap()
             .expect("a released commit answers its intent nonce");
         assert_eq!(&found.graph_commit_id, released);
-    }
-
-    fn commit(
-        id: &str,
-        parent_commit_id: Option<&str>,
-        merged_parent_commit_id: Option<&str>,
-    ) -> GraphCommit {
-        GraphCommit {
-            graph_commit_id: id.to_string(),
-            graph_branch: None,
-            graph_manifest_version: 1,
-            generation: 0,
-            parent_commit_id: parent_commit_id.map(str::to_string),
-            merged_parent_commit_id: merged_parent_commit_id.map(str::to_string),
-            actor_id: None,
-            created_at: 0,
-        }
-    }
-
-    #[test]
-    fn commit_range_classification_uses_only_the_child_first_parent_pointer() {
-        let root = commit("root", None, None);
-        let child = commit("child", Some("root"), None);
-        match classify_commit_range(root.clone(), child.clone()) {
-            ResolvedCommitRange::FirstParent(edge) => {
-                assert_eq!(edge.parent.graph_commit_id, "root");
-                assert_eq!(edge.child.graph_commit_id, "child");
-            }
-            ResolvedCommitRange::Arbitrary { .. } => {
-                panic!("a direct child must classify as a first-parent edge")
-            }
-        }
-        assert!(matches!(
-            classify_commit_range(child.clone(), root.clone()),
-            ResolvedCommitRange::Arbitrary { .. }
-        ));
-        assert!(matches!(
-            classify_commit_range(root, commit("grandchild", Some("child"), None)),
-            ResolvedCommitRange::Arbitrary { .. }
-        ));
-
-        let left = commit("left", Some("root"), None);
-        let right = commit("right", Some("root"), None);
-        let merge = commit("merge", Some("left"), Some("right"));
-        match classify_commit_range(left, merge.clone()) {
-            ResolvedCommitRange::FirstParent(edge) => {
-                assert_eq!(edge.parent.graph_commit_id, "left");
-                assert_eq!(edge.child.graph_commit_id, "merge");
-                assert_eq!(edge.child.merged_parent_commit_id.as_deref(), Some("right"));
-            }
-            ResolvedCommitRange::Arbitrary { .. } => {
-                panic!("a merge must be adjacent only to its persisted first parent")
-            }
-        }
-        assert!(matches!(
-            classify_commit_range(right, merge),
-            ResolvedCommitRange::Arbitrary { .. }
-        ));
     }
 
     #[tokio::test]

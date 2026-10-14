@@ -1,6 +1,6 @@
 //! Lane B replay judge — the reference-model judgment shared by every
 //! real-kill instrument (the `dst_child` binary's parents in
-//! `tests/lane_b.rs`, and any future baseline runner).
+//! `tests/integration/lane_b.rs`, and any future baseline runner).
 //!
 //! Rebuilds the expected lb- world by replaying the op log (Jepsen
 //! history semantics: `ok` must have effect, `err` must not, the single

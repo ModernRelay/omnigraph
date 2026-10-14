@@ -18,6 +18,8 @@ members = [
     "crates/omnigraph-server",
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",
+    "crates/omnigraph-gqt-core",
+    "crates/omnigraph-gqt-served",
     "tools/omnigraph-vocabulary-guard",
 ]
 default-members = [
@@ -80,7 +82,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower = "0.5"
@@ -110,6 +112,9 @@ walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 hmac = "0.12"
 httpdate = "1"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
 
 [workspace.lints.clippy]
 # Nested guards often read clearer than one merged condition (Polars allows this too).

@@ -1,0 +1,64 @@
+# issue: none
+# notes: `commit drop` removes an unpublished commit's addressability: its id is not found by a read, a
+# notes: second drop, or a publish, and the branch never saw the write.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $bob
+
+--- mutate
+commit drop "${bob}"
+
+--- expect ok
+
+--- query snapshot: $bob
+query names_at_dropped() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- mutate
+commit drop "${bob}"
+
+--- expect error: not found
+
+--- mutate
+commit publish "${bob}"
+
+--- expect error: not found
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

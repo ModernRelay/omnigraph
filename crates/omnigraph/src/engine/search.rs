@@ -3,9 +3,7 @@
 //! values; the per-pass `Pass` the overfetch ladder and the prefilter gates
 //! write; the gates and probe ladders themselves.
 
-use omnigraph_planner::{
-    GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode, RankKind,
-};
+use omnigraph_planner::{GatePolicy, Hop, NodeId, OverfetchRung, Prefilter, PrefilterMode};
 
 use super::*;
 
@@ -13,6 +11,7 @@ use super::*;
 /// with the bound query value and this pass's widening and gate verdicts.
 #[derive(Debug, Default, Clone)]
 pub(super) struct SearchMode {
+    pub(super) scalar_index: Option<bool>,
     /// Vector ANN search on the scan's binding.
     pub(super) nearest: Option<NearestTarget>,
     /// Maximum number of IVF payload partitions a nearest scan may search,
@@ -22,12 +21,17 @@ pub(super) struct SearchMode {
     /// The nearest scan runs flat (`use_index(false)`, every row scored): the
     /// overfetch loop's exact pass.
     pub(super) nearest_exact: bool,
+    /// The adaptive policy the plan declares for the nearest scan.
+    pub(super) nearest_policy: Option<omnigraph_planner::NearestPolicy>,
     /// The nearest prefilter gate proved the answer empty: no node of the
     /// ranked type satisfies an Expand's first hop. Read off the `Pass` by
     /// `Lowering::search_mode`; an RRF arm's pass never carries it.
     pub(super) answer_proven_empty: bool,
     /// BM25 full-text search on the scan's binding.
     pub(super) bm25: Option<Bm25Target>,
+    /// The plan places the scan's eligibility after scoring: its filter
+    /// runs as Lance's postfilter, so BM25 statistics read every row.
+    pub(super) eligibility_after_scoring: bool,
     /// The set a gate ANDs into the ranked scan as `id IN (...)`, read off the
     /// `Pass` by `Lowering::search_mode`; the arms an `rrf()` prefilter feeds
     /// are the plan's `Prefilter.feeds`.
@@ -130,14 +134,6 @@ impl Pass {
     }
 }
 
-/// What the `rrf` gate reads of one arm of an `rrf()`: the index it ranks
-/// with and the ranked property, whose FTS coverage the gate checks.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ArmTarget<'a> {
-    pub(super) kind: RankKind,
-    pub(super) property: &'a str,
-}
-
 /// Shared eligible-id set, `Debug`-opaque so a logged `SearchMode` prints the
 /// cardinality instead of up to `GatePolicy::max_ids` id strings.
 #[derive(Clone)]
@@ -149,12 +145,30 @@ impl std::fmt::Debug for EligibleIds {
     }
 }
 
-/// What the nearest scan reported back to the query level: the LAST scan of
-/// the ranked variable in a pass. `rows == k` means the scan was full, so a
-/// shortfall above it can only be recovered by asking for more candidates.
-#[derive(Debug, Default, Clone, Copy)]
+/// What each nearest table scan of one pass reported, by its plan node: a
+/// standalone search order has one, an `rrf()` one per nearest arm.
+pub(super) type ScanReports = std::collections::BTreeMap<NodeId, ScanReport>;
+
+/// What one nearest scan reported back to the query level in a pass.
+/// `rows == k` means the scan was full, so a shortfall above it can only be
+/// recovered by asking for more candidates.
+#[derive(Debug, Default, Clone)]
 pub(super) struct ScanReport {
     pub(super) nearest_scan: Option<NearestScanReport>,
+    /// Every Lance attempt of that nearest scan in this pass, in order: the
+    /// probe cap it ran under and whether it scored flat.
+    pub(super) probes: Vec<ProbeAttempt>,
+}
+
+/// One attempt of a nearest scan's probe ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ProbeAttempt {
+    /// The probe cap; `None` is uncapped.
+    pub(crate) maximum_nprobes: Option<usize>,
+    /// The attempt scored every admitted row (`use_index(false)`).
+    pub(crate) flat: bool,
+    /// Rows the attempt returned.
+    pub(crate) rows: usize,
 }
 
 /// One nearest scan as `execute_node_scan`'s ladder left it.
@@ -228,11 +242,69 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k)` as the fusion runs it: the rank constant and the fused rows.
+/// `rrf(a, b, k)` as the fusion runs it: the rank constant. The query's
+/// `limit` cuts the fused rows in the `Sort` above the fusion, never here.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RrfMode {
     pub(super) k: u32,
-    pub(super) limit: usize,
+}
+
+#[derive(Debug, PartialEq)]
+enum NearestQuery {
+    Vector(Vec<f32>),
+    Text(String),
+}
+
+/// Evaluate the stored query type before conversion to the vector API's F32 values.
+fn resolve_nearest_query(expr: &IRExpr, params: &ParamMap) -> Result<NearestQuery> {
+    use datafusion::scalar::ScalarValue;
+    use omnigraph_compiler::types::ExprType;
+
+    let array = super::constant::evaluate_constant_array(expr, params)?;
+    let value = ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)?;
+    let values = match (expr.ty(), value) {
+        (
+            ExprType::Value {
+                scalar: ScalarType::String,
+                list: false,
+                ..
+            },
+            ScalarValue::Utf8(Some(text)),
+        ) => return Ok(NearestQuery::Text(text)),
+        (
+            ExprType::Value {
+                scalar: ScalarType::Vector(_),
+                list: false,
+                ..
+            },
+            ScalarValue::FixedSizeList(values),
+        ) if !values.is_null(0) => values.value(0),
+        (
+            ExprType::Value {
+                scalar, list: true, ..
+            },
+            ScalarValue::List(values),
+        ) if scalar.is_numeric() && !values.is_null(0) => values.value(0),
+        _ => {
+            return Err(OmniError::manifest(
+                "nearest query must resolve to a non-null String or numeric vector",
+            ));
+        }
+    };
+    let values =
+        arrow_cast::cast(&values, &DataType::Float32).map_err(OmniError::arrow_internal)?;
+    let values = values
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal("nearest vector conversion did not yield F32")
+        })?;
+    if values.null_count() != 0 || values.values().iter().any(|value| !value.is_finite()) {
+        return Err(OmniError::manifest(
+            "nearest vector elements must be non-null finite F32 values",
+        ));
+    }
+    Ok(NearestQuery::Vector(values.values().to_vec()))
 }
 
 /// Resolve a nearest query vector, embedding string inputs with the property's
@@ -245,10 +317,9 @@ pub(super) async fn resolve_nearest_query_vec(
     params: &ParamMap,
     embedding: &EmbeddingResolver<'_>,
 ) -> Result<Vec<f32>> {
-    let lit = resolve_literal_or_param(expr, params)?;
-    match lit {
-        Literal::List(_) => literal_to_f32_vec(&lit),
-        Literal::String(text) => {
+    match resolve_nearest_query(expr, params)? {
+        NearestQuery::Vector(values) => Ok(values),
+        NearestQuery::Text(text) => {
             let (expected_dim, recorded_model) =
                 nearest_property_dim_and_model(catalog, type_name, property)?;
             let client = embedding.resolve().await?;
@@ -265,44 +336,19 @@ pub(super) async fn resolve_nearest_query_vec(
             }
             client.embed_query_text(&text, expected_dim).await
         }
-        _ => Err(OmniError::manifest(
-            "nearest query must be a string or list of floats".to_string(),
-        )),
     }
 }
 
-pub(super) fn resolve_literal_or_param(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
-    Ok(match expr {
-        IRExpr::Literal(lit) => lit.clone(),
-        IRExpr::Param(name) => params
-            .get(name)
-            .cloned()
-            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?,
-        _ => {
-            return Err(OmniError::manifest(
-                "nearest query must be a literal or parameter".to_string(),
-            ));
-        }
-    })
-}
-
-/// Resolve a literal vector expression to a Vec<f32>.
-pub(super) fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
-    match lit {
-        Literal::List(items) => items
-            .iter()
-            .map(|item| match item {
-                Literal::Float(f) => Ok(*f as f32),
-                Literal::Integer(n) => Ok(*n as f32),
-                _ => Err(OmniError::manifest(
-                    "vector elements must be numeric".to_string(),
-                )),
-            })
-            .collect(),
-        _ => Err(OmniError::manifest(
-            "nearest query must be a list of floats".to_string(),
-        )),
-    }
+/// The rank constant defaults only when the optional expression is absent.
+pub(super) fn resolve_rrf_k(expr: Option<&IRExpr>, params: &ParamMap) -> Result<u32> {
+    let Some(expr) = expr else {
+        return Ok(60);
+    };
+    let value = resolve_to_int(expr, params)?;
+    u32::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| OmniError::manifest("rrf k must be greater than 0 and fit U32"))
 }
 
 /// Resolve the nearest() target property's vector dimension and the embedding
@@ -339,63 +385,6 @@ pub(super) fn nearest_property_dim_and_model(
     Ok((dim, recorded_model))
 }
 
-/// A value bound through the Rust `ParamMap` API skips the JSON param arm: refuse a
-/// time-bearing `Date` string, a `DateTime` string finer than a millisecond, and a
-/// literal of another kind on a `Date` or `DateTime` parameter.
-pub(crate) fn check_param_date_literals(
-    params: &ParamMap,
-    declared: &[omnigraph_compiler::query::ast::Param],
-) -> Result<()> {
-    fn check(name: &str, lit: &Literal) -> Result<()> {
-        match lit {
-            Literal::Date(value) => omnigraph_compiler::check_date_literal(value)
-                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
-            Literal::DateTime(value) => omnigraph_compiler::check_datetime_literal(value)
-                .map_err(|reason| OmniError::manifest(format!("param '{name}': {reason}"))),
-            Literal::List(items) => items.iter().try_for_each(|item| check(name, item)),
-            _ => Ok(()),
-        }
-    }
-    params.iter().try_for_each(|(name, lit)| check(name, lit))?;
-    for param in declared {
-        let Some(lit) = params.get(&param.name) else {
-            continue;
-        };
-        let scalar = param
-            .type_name
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let is_scalar = |lit: &Literal| match lit {
-            Literal::Date(_) => scalar == "Date",
-            Literal::DateTime(_) => scalar == "DateTime",
-            Literal::Null => param.nullable,
-            _ => false,
-        };
-        let well_typed = match param.type_name.as_str() {
-            "Date" | "DateTime" => is_scalar(lit),
-            "[Date]" => match lit {
-                Literal::List(items) => items.iter().all(is_scalar),
-                other => is_scalar(other),
-            },
-            "[DateTime]" => match lit {
-                Literal::List(items) => items
-                    .iter()
-                    .all(|item| matches!(item, Literal::DateTime(_))),
-                Literal::Null => param.nullable,
-                _ => false,
-            },
-            _ => true,
-        };
-        if !well_typed {
-            return Err(OmniError::manifest(format!(
-                "param '{}': expected {}, got {lit:?}",
-                param.name, param.type_name
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
 /// plans — prefilter (the uncapped bm25 arms rank only the traversal's
 /// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
@@ -413,7 +402,8 @@ pub(crate) fn check_param_date_literals(
 /// - the eligible set MUST over-approximate the traversal's survivors (a
 ///   superset only costs speedup; a subset changes answers) — every
 ///   shape the planner's `prefilter` admits is an instance;
-/// - full FTS fragment coverage (uncovered fragments are scored
+/// - full FTS fragment coverage, the plan's recorded fact
+///   (`Prefilter::coverage_admits`; uncovered fragments are scored
 ///   filter-dependently, so a mask would change their scores);
 /// - `nearest` arms are never prefiltered (their constitutive `k` makes a
 ///   prefiltered run answer-different) — the caller's threading rule;
@@ -427,10 +417,9 @@ pub(crate) fn check_param_date_literals(
 /// `rrf_gate_verdicts` probe entry.
 pub(super) async fn rrf_prefilter_gate(
     context: &EngineContext<'_>,
-    arms: [ArmTarget<'_>; 2],
     prefilter: &Prefilter,
     policy: GatePolicy,
-) -> Option<EligibleIds> {
+) -> (Option<EligibleIds>, RrfGateVerdict) {
     let fall_back =
         |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
             tracing::debug!(
@@ -438,53 +427,33 @@ pub(super) async fn rrf_prefilter_gate(
                 forced,
                 "rrf prefilter gate fell back to the postfilter plan"
             );
-            record_rrf_gate_verdict(RrfGateVerdict {
+            let verdict = RrfGateVerdict {
                 plan: RrfGatePlan::Postfilter,
                 fallback: Some(fallback),
                 forced,
                 eligible,
                 corpus,
-            });
+            };
+            record_rrf_gate_verdict(verdict.clone());
+            (None, verdict)
         };
 
     if policy.mode == PrefilterMode::ForcePostfilter {
-        fall_back(RrfGateFallback::Forced, true, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Forced, true, None, None);
     }
     let forced = policy.mode == PrefilterMode::ForcePrefilter;
     if !prefilter.admits() {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Shape, forced, None, None);
     }
-    let bm25_props: Vec<&str> = arms
-        .iter()
-        .filter(|arm| arm.kind == RankKind::Bm25)
-        .map(|arm| arm.property)
-        .collect();
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
     let snapshot = context.snapshot;
     let Some(node_entry) = snapshot.dataset(&node_key) else {
-        fall_back(RrfGateFallback::Shape, forced, None, None);
-        return None;
+        return fall_back(RrfGateFallback::Shape, forced, None, None);
     };
     let corpus = node_entry.entity_count;
-    match snapshot.open_lance_dataset(&node_key).await {
-        Ok(ds) => {
-            for prop in &bm25_props {
-                match crate::table_store::TableStore::fts_covers_all_fragments(&ds, prop).await {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-                        return None;
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-            return None;
-        }
+    if !prefilter.coverage_admits {
+        return fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
     }
 
     #[cfg_attr(not(debug_assertions), allow(unused_mut))]
@@ -501,22 +470,22 @@ pub(super) async fn rrf_prefilter_gate(
     {
         EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
         EligibleOutcome::FallBack { fallback, eligible } => {
-            fall_back(fallback, forced, eligible, Some(corpus));
-            return None;
+            return fall_back(fallback, forced, eligible, Some(corpus));
         }
     };
     #[cfg(debug_assertions)]
     if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
         ids.retain(|id| *id != dropped);
     }
-    record_rrf_gate_verdict(RrfGateVerdict {
+    let verdict = RrfGateVerdict {
         plan: RrfGatePlan::Prefilter,
         fallback: None,
         forced,
         eligible: Some(eligible_count),
         corpus: Some(corpus),
-    });
-    Some(EligibleIds(Arc::new(ids)))
+    };
+    record_rrf_gate_verdict(verdict.clone());
+    (Some(EligibleIds(Arc::new(ids))), verdict)
 }
 
 /// Outcome of the adjacency eligible-id computation shared by the rrf and
@@ -634,7 +603,7 @@ pub(super) async fn nearest_prefilter_gate(
     context: &EngineContext<'_>,
     prefilter: &Prefilter,
     policy: GatePolicy,
-) -> NearestGatePlan {
+) -> (NearestGatePlan, RrfGateVerdict) {
     let forced = policy.mode != PrefilterMode::Auto;
     let fall_back = |fallback: RrfGateFallback, eligible: Option<u64>, corpus: Option<u64>| {
         tracing::debug!(
@@ -642,27 +611,29 @@ pub(super) async fn nearest_prefilter_gate(
             forced,
             "nearest prefilter gate fell back to the unfiltered scan"
         );
-        record_ann_prefilter_verdict(RrfGateVerdict {
+        let verdict = RrfGateVerdict {
             plan: RrfGatePlan::Postfilter,
             fallback: Some(fallback),
             forced,
             eligible,
             corpus,
-        });
+        };
+        record_ann_prefilter_verdict(verdict.clone());
+        verdict
     };
     if policy.mode == PrefilterMode::ForcePostfilter {
-        fall_back(RrfGateFallback::Forced, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Forced, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     }
     if !prefilter.admits() {
-        fall_back(RrfGateFallback::Shape, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Shape, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     }
     let ranked_type = prefilter.ranked_type.as_str();
     let node_key = format!("node:{ranked_type}");
     let Some(node_entry) = context.snapshot.dataset(&node_key) else {
-        fall_back(RrfGateFallback::Shape, None, None);
-        return NearestGatePlan::Postfilter;
+        let verdict = fall_back(RrfGateFallback::Shape, None, None);
+        return (NearestGatePlan::Postfilter, verdict);
     };
     let corpus = node_entry.entity_count;
     match adjacency_eligible_ids(
@@ -677,22 +648,28 @@ pub(super) async fn nearest_prefilter_gate(
     .await
     {
         EligibleOutcome::Ids { ids, eligible } => {
-            record_ann_prefilter_verdict(RrfGateVerdict {
+            let verdict = RrfGateVerdict {
                 plan: RrfGatePlan::Prefilter,
                 fallback: None,
                 forced,
                 eligible: Some(eligible),
                 corpus: Some(corpus),
-            });
-            NearestGatePlan::Prefilter(EligibleIds(Arc::new(ids)))
+            };
+            record_ann_prefilter_verdict(verdict.clone());
+            (
+                NearestGatePlan::Prefilter(EligibleIds(Arc::new(ids))),
+                verdict,
+            )
         }
         EligibleOutcome::FallBack { fallback, eligible } => {
-            fall_back(fallback, eligible, Some(corpus));
-            if fallback == RrfGateFallback::EmptyEligible {
-                NearestGatePlan::ProvenEmpty
-            } else {
-                NearestGatePlan::Postfilter
-            }
+            let verdict = fall_back(fallback, eligible, Some(corpus));
+            let plan = match (fallback, prefilter.on_empty) {
+                (RrfGateFallback::EmptyEligible, omnigraph_planner::EmptyEligible::ProvenEmpty) => {
+                    NearestGatePlan::ProvenEmpty
+                }
+                _ => NearestGatePlan::Postfilter,
+            };
+            (plan, verdict)
         }
     }
 }
@@ -718,7 +695,19 @@ pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
         call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
             Some(call)
         }
-        _ => None,
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(_, _)
+        | IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::Cast { .. }
+        | IRExpr::IsNull { .. } => None,
     }
 }
 
@@ -732,7 +721,7 @@ pub(super) fn is_search_filter(filter: &IRExpr) -> bool {
 pub(crate) fn is_positive_search_filter(filter: &IRExpr) -> bool {
     matches!(
         filter.comparison_parts(),
-        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true))))
+        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)))
             if matches!(call, IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. })
     )
 }
@@ -747,17 +736,16 @@ pub(crate) fn search_filter_query(
     let Some(call) = search_call(filter) else {
         return Ok(None);
     };
-    is_positive_search_filter(filter)
-        .then(|| build_fts_query(call, params))
-        .flatten()
-        .map(Some)
-        .ok_or_else(|| {
-            OmniError::manifest(format!(
-                "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
-                 match_text() only as a bare call or compared to true, over a property and a \
-                 string query"
-            ))
-        })
+    if is_positive_search_filter(filter)
+        && let Some(query) = build_fts_query(call, params)?
+    {
+        return Ok(Some(query));
+    }
+    Err(OmniError::manifest(format!(
+        "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
+         match_text() only as a bare call or compared to true, over a property and a \
+         string query"
+    )))
 }
 
 /// The columns the plan's scan projection names for one bound variable
@@ -805,13 +793,15 @@ pub(super) fn collect_referenced_edge_names(
     }
 }
 
-/// Per-rung multiplier of the probe ladder (20 → 80 → 320 → none).
-pub(super) const ANN_PROBE_ESCALATION_FACTOR: usize = 4;
-
-/// The next rung of the probe ladder after `current` starved a scan: ×4, or
-/// no cap once the next rung would cover the ranked partitions anyway.
-pub(super) fn next_probe_budget(current: usize, partitions_ranked: usize) -> Option<usize> {
-    let next = current.saturating_mul(ANN_PROBE_ESCALATION_FACTOR);
+/// The next rung of the probe ladder after `current` starved a scan: times
+/// the plan's declared `factor`, or no cap once the next rung would cover
+/// the ranked partitions anyway.
+pub(super) fn next_probe_budget(
+    current: usize,
+    partitions_ranked: usize,
+    factor: usize,
+) -> Option<usize> {
+    let next = current.saturating_mul(factor);
     (next < partitions_ranked).then_some(next)
 }
 
@@ -835,10 +825,12 @@ pub(super) enum LadderStep {
 }
 
 /// The ladder's decision after one nearest scan under `maximum` (`None` =
-/// uncapped) returned `rows` of the `k` asked for. `summary` is Lance's
-/// `(partitions_searched, partitions_ranked)`, each absent on a flat plan.
+/// uncapped) returned `rows` of the `k` asked for, within the plan's
+/// declared `policy`. `summary` is Lance's `(partitions_searched,
+/// partitions_ranked)`, each absent on a flat plan.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ladder_step(
+    policy: omnigraph_planner::NearestPolicy,
     rows: usize,
     k: usize,
     known_matches: Option<usize>,
@@ -848,7 +840,7 @@ pub(super) fn ladder_step(
     maximum: Option<usize>,
     last_rung: Option<(usize, u64)>,
 ) -> LadderStep {
-    if has_infinite_distance {
+    if has_infinite_distance && policy.flat_rescan_on_unreached {
         return LadderStep::FlatRescan;
     }
     let Some(maximum) = maximum else {
@@ -867,8 +859,12 @@ pub(super) fn ladder_step(
         Some((None, None)) => return LadderStep::Stop,
         Some((Some(searched), Some(ranked))) => (searched, ranked),
         Some((Some(_), None)) | Some((None, Some(_))) | None => {
-            return LadderStep::RescanUncapped {
-                summary_missing: true,
+            return if policy.uncapped_on_missing_counters {
+                LadderStep::RescanUncapped {
+                    summary_missing: true,
+                }
+            } else {
+                LadderStep::Stop
             };
         }
     };
@@ -878,7 +874,11 @@ pub(super) fn ladder_step(
     if last_rung == Some((rows, searched)) {
         return LadderStep::Stop;
     }
-    match next_probe_budget(maximum, usize::try_from(ranked).unwrap_or(usize::MAX)) {
+    match next_probe_budget(
+        maximum,
+        usize::try_from(ranked).unwrap_or(usize::MAX),
+        policy.probe_factor,
+    ) {
         Some(next) => LadderStep::Rescan(next),
         None => LadderStep::RescanUncapped {
             summary_missing: false,
@@ -906,6 +906,34 @@ mod ann_probe_budget_tests {
     };
 
     const IVF_SHORT: Option<(Option<u64>, Option<u64>)> = Some((Some(1), Some(1_000)));
+    const POLICY: omnigraph_planner::NearestPolicy = omnigraph_planner::NearestPolicy::DEFAULT;
+
+    /// The ladder takes its factor and its fallbacks from the plan's
+    /// declared policy, not from a constant of its own.
+    #[test]
+    fn the_ladder_runs_the_declared_policy() {
+        let wider = omnigraph_planner::NearestPolicy {
+            probe_factor: 2,
+            ..POLICY
+        };
+        assert_eq!(
+            ladder_step(wider, 3, 10, None, None, false, IVF_SHORT, Some(20), None),
+            LadderStep::Rescan(40)
+        );
+        let no_rescan = omnigraph_planner::NearestPolicy {
+            flat_rescan_on_unreached: false,
+            uncapped_on_missing_counters: false,
+            ..POLICY
+        };
+        assert_eq!(
+            ladder_step(no_rescan, 3, 10, None, None, true, IVF_SHORT, None, None),
+            LadderStep::Stop
+        );
+        assert_eq!(
+            ladder_step(no_rescan, 3, 10, None, None, false, None, Some(20), None),
+            LadderStep::Stop
+        );
+    }
 
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case carries a probe cap.
     #[test]
@@ -1009,22 +1037,42 @@ mod ann_probe_budget_tests {
     /// Rust test: no `.gqt` fixture trains an IVF index, so no case ranks partitions.
     #[test]
     fn probe_ladder_multiplies_then_uncaps() {
-        assert_eq!(next_probe_budget(20, 1_000), Some(80));
-        assert_eq!(next_probe_budget(80, 1_000), Some(320));
-        assert_eq!(next_probe_budget(320, 1_000), None);
-        assert_eq!(next_probe_budget(20, 60), None);
-        assert_eq!(next_probe_budget(1, 100), Some(4));
+        assert_eq!(next_probe_budget(20, 1_000, 4), Some(80));
+        assert_eq!(next_probe_budget(80, 1_000, 4), Some(320));
+        assert_eq!(next_probe_budget(320, 1_000, 4), None);
+        assert_eq!(next_probe_budget(20, 60, 4), None);
+        assert_eq!(next_probe_budget(1, 100, 4), Some(4));
     }
 
     /// Rust test: an infinite `_distance` needs a trained IVF index; no `.gqt` fixture has one.
     #[test]
     fn ladder_rescans_flat_on_an_infinite_distance_before_every_other_stop() {
         assert_eq!(
-            ladder_step(10, 10, Some(10), Some(10), true, IVF_SHORT, None, None),
+            ladder_step(
+                POLICY,
+                10,
+                10,
+                Some(10),
+                Some(10),
+                true,
+                IVF_SHORT,
+                None,
+                None
+            ),
             LadderStep::FlatRescan
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, true, Some((None, None)), Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                true,
+                Some((None, None)),
+                Some(20),
+                None
+            ),
             LadderStep::FlatRescan
         );
     }
@@ -1033,7 +1081,7 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_without_a_cap() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, None, None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, None, None),
             LadderStep::Stop
         );
     }
@@ -1042,7 +1090,7 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_the_scan_is_full() {
         assert_eq!(
-            ladder_step(10, 10, None, None, false, IVF_SHORT, Some(20), None),
+            ladder_step(POLICY, 10, 10, None, None, false, IVF_SHORT, Some(20), None),
             LadderStep::Stop
         );
     }
@@ -1051,11 +1099,31 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_every_known_match_is_here() {
         assert_eq!(
-            ladder_step(5, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                5,
+                10,
+                Some(5),
+                None,
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(4, 10, Some(5), None, false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                4,
+                10,
+                Some(5),
+                None,
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Rescan(80)
         );
     }
@@ -1064,11 +1132,31 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_the_scan_holds_the_whole_dataset() {
         assert_eq!(
-            ladder_step(7, 10, None, Some(7), false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                7,
+                10,
+                None,
+                Some(7),
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(7, 10, None, Some(8), false, IVF_SHORT, Some(20), None),
+            ladder_step(
+                POLICY,
+                7,
+                10,
+                None,
+                Some(8),
+                false,
+                IVF_SHORT,
+                Some(20),
+                None
+            ),
             LadderStep::Rescan(80)
         );
     }
@@ -1077,7 +1165,17 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_treats_a_summary_with_neither_counter_as_a_flat_scan() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, Some((None, None)), Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                Some((None, None)),
+                Some(20),
+                None
+            ),
             LadderStep::Stop
         );
     }
@@ -1087,7 +1185,7 @@ mod ann_probe_budget_tests {
     fn ladder_fails_closed_without_both_counters() {
         for summary in [None, Some((Some(1), None)), Some((None, Some(8)))] {
             assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                ladder_step(POLICY, 3, 10, None, None, false, summary, Some(20), None),
                 LadderStep::RescanUncapped {
                     summary_missing: true
                 },
@@ -1101,7 +1199,7 @@ mod ann_probe_budget_tests {
     fn ladder_stops_when_every_ranked_partition_was_searched() {
         for summary in [Some((Some(8), Some(8))), Some((Some(9), Some(8)))] {
             assert_eq!(
-                ladder_step(3, 10, None, None, false, summary, Some(20), None),
+                ladder_step(POLICY, 3, 10, None, None, false, summary, Some(20), None),
                 LadderStep::Stop,
                 "summary {summary:?}"
             );
@@ -1112,15 +1210,45 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_stops_when_widening_changed_nothing() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 1))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((3, 1))
+            ),
             LadderStep::Stop
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((3, 0))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((3, 0))
+            ),
             LadderStep::Rescan(320)
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(80), Some((2, 1))),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                IVF_SHORT,
+                Some(80),
+                Some((2, 1))
+            ),
             LadderStep::Rescan(320)
         );
     }
@@ -1129,21 +1257,223 @@ mod ann_probe_budget_tests {
     #[test]
     fn ladder_climbs_then_uncaps() {
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(20), None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, Some(20), None),
             LadderStep::Rescan(80)
         );
         assert_eq!(
-            ladder_step(3, 10, None, None, false, IVF_SHORT, Some(320), None),
+            ladder_step(POLICY, 3, 10, None, None, false, IVF_SHORT, Some(320), None),
             LadderStep::RescanUncapped {
                 summary_missing: false
             }
         );
         let narrow_index = Some((Some(1), Some(60)));
         assert_eq!(
-            ladder_step(3, 10, None, None, false, narrow_index, Some(20), None),
+            ladder_step(
+                POLICY,
+                3,
+                10,
+                None,
+                None,
+                false,
+                narrow_index,
+                Some(20),
+                None
+            ),
             LadderStep::RescanUncapped {
                 summary_missing: false
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod typed_search_value_tests {
+    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k, search_filter_query};
+    use crate::engine::scan::{
+        build_fts_query, resolve_to_int, resolve_to_string, scan_output_schema,
+    };
+    use crate::engine::search::SearchMode;
+    use lance_index::scalar::inverted::query::FtsQuery;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::ir::{IRExpr, ParamMap};
+    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
+
+    fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(kind, nullable))
+    }
+
+    fn widened_integer(value: i64) -> IRExpr {
+        IRExpr::Cast {
+            expr: Box::new(IRExpr::Literal(
+                Literal::Integer(value),
+                scalar(ScalarType::I32, false),
+            )),
+            ty: scalar(ScalarType::I64, false),
+        }
+    }
+
+    fn fuzzy(max_edits: Option<IRExpr>) -> IRExpr {
+        IRExpr::Fuzzy {
+            field: Box::new(IRExpr::PropAccess {
+                variable: "d".into(),
+                property: "text".into(),
+                ty: scalar(ScalarType::String, false),
+            }),
+            query: Box::new(IRExpr::Literal(
+                Literal::String("needle".into()),
+                scalar(ScalarType::String, false),
+            )),
+            max_edits: max_edits.map(Box::new),
+            ty: scalar(ScalarType::Bool, false),
+        }
+    }
+
+    #[test]
+    fn cast_search_options_execute_nondefault_values() {
+        let params = ParamMap::new();
+        let k = widened_integer(5);
+        k.check_types().unwrap();
+        assert_eq!(resolve_rrf_k(Some(&k), &params).unwrap(), 5);
+        assert_eq!(resolve_rrf_k(None, &params).unwrap(), 60);
+        for (max_edits, expected) in [(Some(widened_integer(1)), 1), (None, 2)] {
+            let call = fuzzy(max_edits);
+            call.check_types().unwrap();
+            let FtsQuery::Match(query) = build_fts_query(&call, &params).unwrap().unwrap().query
+            else {
+                panic!("expected fuzzy match query");
+            };
+            assert_eq!(query.fuzziness, Some(expected));
+        }
+    }
+
+    #[test]
+    fn search_option_payloads_execute_in_their_stored_type() {
+        let integer = IRExpr::Param("edits".into(), scalar(ScalarType::I32, false));
+        let params = ParamMap::from([("edits".into(), Literal::Float(1.0))]);
+        assert_eq!(resolve_to_int(&integer, &params).unwrap(), 1);
+        let float = IRExpr::Literal(Literal::Integer(1), scalar(ScalarType::F32, false));
+        assert!(resolve_to_int(&float, &ParamMap::new()).is_err());
+        let date = IRExpr::Literal(
+            Literal::String("2026-10-05".into()),
+            scalar(ScalarType::Date, false),
+        );
+        assert!(resolve_to_string(&date, &ParamMap::new()).is_err());
+        let wide = IRExpr::Param("wide".into(), scalar(ScalarType::U64, false));
+        let params = ParamMap::from([("wide".into(), Literal::Float(2_f64.powi(63)))]);
+        assert_eq!(resolve_to_int(&wide, &params).unwrap(), 1_i128 << 63);
+        assert!(resolve_rrf_k(Some(&wide), &params).is_err());
+    }
+
+    #[test]
+    fn supplied_invalid_search_options_refuse_before_empty_scan_execution() {
+        let catalog =
+            build_catalog(&parse_schema("node Doc { text: String @index }").unwrap()).unwrap();
+        let params = ParamMap::new();
+        for option in [
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::I64, true)),
+            IRExpr::Literal(Literal::Integer(-1), scalar(ScalarType::I64, false)),
+            IRExpr::Literal(
+                Literal::Integer(i64::from(u32::MAX) + 1),
+                scalar(ScalarType::I64, false),
+            ),
+            IRExpr::Param("missing".into(), scalar(ScalarType::I64, false)),
+        ] {
+            assert!(resolve_rrf_k(Some(&option), &params).is_err());
+            let call = fuzzy(Some(option));
+            call.check_types().unwrap();
+            let filter = IRExpr::comparison(
+                call,
+                CompOp::Eq,
+                IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool, false)),
+            );
+            assert!(search_filter_query(&filter, &params).is_err());
+            assert!(
+                scan_output_schema(
+                    "Doc",
+                    "d",
+                    &[filter],
+                    &params,
+                    &catalog,
+                    &SearchMode::default(),
+                    None
+                )
+                .is_err()
+            );
+        }
+        let zero = IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64, false));
+        assert!(resolve_rrf_k(Some(&zero), &params).is_err());
+        assert!(
+            build_fts_query(&fuzzy(Some(zero)), &params)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn nearest_vector_conversion_preserves_the_recorded_list_domain() {
+        let value = (1_i64 << 62) + (1_i64 << 38) + 1;
+        let expected = 2_f32.powi(62);
+        assert!(value as f32 > expected);
+        let literal = Literal::List(vec![Literal::Integer(value)]);
+        let float = IRExpr::Literal(
+            literal.clone(),
+            ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+        );
+        let integer = IRExpr::Literal(
+            literal,
+            ExprType::from_prop(&PropType::list_of(ScalarType::I64, false)),
+        );
+        assert_eq!(
+            resolve_nearest_query(&float, &ParamMap::new()).unwrap(),
+            NearestQuery::Vector(vec![expected])
+        );
+        assert_eq!(
+            resolve_nearest_query(&integer, &ParamMap::new()).unwrap(),
+            NearestQuery::Vector(vec![value as f32])
+        );
+        let vector = IRExpr::Param("vector".into(), scalar(ScalarType::Vector(2), false));
+        let params = ParamMap::from([(
+            "vector".into(),
+            Literal::List(vec![Literal::Float(0.1), Literal::Integer(1)]),
+        )]);
+        assert_eq!(
+            resolve_nearest_query(&vector, &params).unwrap(),
+            NearestQuery::Vector(vec![0.1_f32, 1.0])
+        );
+    }
+
+    #[test]
+    fn nearest_refuses_nulls_nonfinite_elements_and_payload_kind_shortcuts() {
+        let params = ParamMap::new();
+        for query in [
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::String, true)),
+            IRExpr::Literal(Literal::Null, scalar(ScalarType::Vector(2), true)),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Null]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F32, false)),
+            ),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Float(f64::MAX)]),
+                ExprType::from_prop(&PropType::list_of(ScalarType::F64, false)),
+            ),
+            IRExpr::Literal(
+                Literal::List(vec![Literal::Integer(1)]),
+                scalar(ScalarType::String, false),
+            ),
+            IRExpr::Literal(
+                Literal::String("needle".into()),
+                scalar(ScalarType::Vector(2), false),
+            ),
+        ] {
+            assert!(resolve_nearest_query(&query, &params).is_err(), "{query:?}");
+        }
+        let text = IRExpr::Param("text".into(), scalar(ScalarType::String, false));
+        let params = ParamMap::from([("text".into(), Literal::String("needle".into()))]);
+        assert_eq!(
+            resolve_nearest_query(&text, &params).unwrap(),
+            NearestQuery::Text("needle".into())
         );
     }
 }

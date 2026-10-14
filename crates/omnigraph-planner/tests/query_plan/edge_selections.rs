@@ -34,7 +34,6 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
                         edge_count: edges,
                         src_node_count: 5,
                         dst_node_count: 16,
-                        same_type: true,
                         max_frontier_cap: 100,
                         max_hops_cap: 6,
                     },
@@ -113,7 +112,11 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
         };
         let arm = IRExpr::Bm25 {
             field: Box::new(prop("a", "text")),
-            query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+            query: Box::new(IRExpr::Literal(
+                Literal::String("needle".into()),
+                value_type(ScalarType::String, false),
+            )),
+            ty: value_type(ScalarType::F32, false),
         };
         let op = ir(
             vec![scan("a"), downstream],
@@ -122,6 +125,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
                 primary: Box::new(arm.clone()),
                 secondary: Box::new(arm),
                 k: None,
+                ty: value_type(ScalarType::F64, false),
             }],
         );
         let logical = resolve(&op, &source).unwrap();
@@ -146,11 +150,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
             .unwrap();
         assert!(arms.iter().all(|arm| arm.binding == "a"));
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
-        );
+        assert!(leads_with_fused_score(&plan, "a"));
         let bound = omnigraph_planner::BoundPlan {
             plan,
             values: Default::default(),
@@ -175,18 +175,25 @@ fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
     *edge_binding = Some("inner_edge".into());
     let arm = |binding| IRExpr::Bm25 {
         field: Box::new(prop(binding, "text")),
-        query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+        query: Box::new(IRExpr::Literal(
+            Literal::String("needle".into()),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     query.order_by = vec![IROrdering {
         expr: IRExpr::Rrf {
             primary: Box::new(arm("a")),
             secondary: Box::new(arm("b")),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         },
         descending: false,
     }];
     let source = source().with_traversal_work_limit(100);
-    let mut plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let mut plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let (fuse_id, secondary_input) = plan
         .live()
         .find_map(|(id, node)| match node {
@@ -235,7 +242,11 @@ fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
 fn every_nested_rank_fuse_validates_its_row_keys_issue_659() {
     let arm = IRExpr::Bm25 {
         field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+        query: Box::new(IRExpr::Literal(
+            Literal::String("needle".into()),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     let op = ir(
         vec![scan("a"), scan("b")],
@@ -244,6 +255,7 @@ fn every_nested_rank_fuse_validates_its_row_keys_issue_659() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         }],
     );
     let (mut plan, _) = physical(&op, &source());
@@ -278,7 +290,11 @@ fn every_nested_rank_fuse_validates_its_row_keys_issue_659() {
 fn rank_fuse_without_downstream_bindings_keeps_an_empty_key_list_issue_659() {
     let arm = IRExpr::Bm25 {
         field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+        query: Box::new(IRExpr::Literal(
+            Literal::String("needle".into()),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     let op = ir(
         vec![scan("a")],
@@ -287,6 +303,7 @@ fn rank_fuse_without_downstream_bindings_keeps_an_empty_key_list_issue_659() {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         }],
     );
     let (mut plan, _) = physical(&op, &source());
@@ -318,13 +335,25 @@ fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
         for (order, edge_keys) in [
             (vec![prop("a", "rank")], vec!["@type", "@id"]),
             (vec![prop("e", SYSTEM_COLUMNS_V3.id)], vec!["@type"]),
-            (vec![IRExpr::AliasRef("edge_id".into())], vec!["@type"]),
+            (
+                vec![IRExpr::AliasRef(
+                    "edge_id".into(),
+                    value_type(ScalarType::String, false),
+                )],
+                vec!["@type"],
+            ),
             (vec![prop("e", EDGE_TYPE_COLUMN)], vec!["@id"]),
-            (vec![IRExpr::AliasRef("edge_type".into())], vec!["@id"]),
+            (
+                vec![IRExpr::AliasRef(
+                    "edge_type".into(),
+                    value_type(ScalarType::String, false),
+                )],
+                vec!["@id"],
+            ),
             (
                 vec![
-                    IRExpr::AliasRef("edge_type".into()),
-                    IRExpr::AliasRef("edge_id".into()),
+                    IRExpr::AliasRef("edge_type".into(), value_type(ScalarType::String, false)),
+                    IRExpr::AliasRef("edge_id".into(), value_type(ScalarType::String, false)),
                 ],
                 vec![],
             ),
@@ -344,7 +373,9 @@ fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
                 order,
             ));
             query.return_exprs[1].alias = Some("edge_id".into());
+            query.return_exprs[1].column = "edge_id".into();
             query.return_exprs[2].alias = Some("edge_type".into());
+            query.return_exprs[2].column = "edge_type".into();
             let source = source().with_traversal_work_limit(100);
             let op = Operation::Query(Box::new(query));
             let (plan, _) = physical(&op, &source);
@@ -385,7 +416,10 @@ fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
 
 #[test]
 fn literal_order_keys_keep_the_sort_and_remaining_identity_order() {
-    let literal = IRExpr::Literal(Literal::String("Knows".into()));
+    let literal = IRExpr::Literal(
+        Literal::String("Knows".into()),
+        value_type(ScalarType::String, false),
+    );
     for (returns, order, expected_keys, expected_tiebreak) in [
         (
             vec![prop("a", "slug")],
@@ -427,17 +461,38 @@ fn literal_order_keys_keep_the_sort_and_remaining_identity_order() {
     }
 }
 
+/// Whether the plan's `Sort` leads with `<binding>._rrf desc`, the fused
+/// score column a `RankFuse` appends (RFC 0047 §Total order).
+fn leads_with_fused_score(plan: &omnigraph_planner::PhysicalPlan, binding: &str) -> bool {
+    plan.live().any(|(_, node)| match node {
+        PhysicalNode::Sort { order_by, .. } => order_by.first().is_some_and(|key| {
+            key.descending
+                && matches!(
+                    &key.expr,
+                    IRExpr::PropAccess { variable, property, .. }
+                        if variable == binding && property == "_rrf"
+                )
+        }),
+        _ => false,
+    })
+}
+
 #[test]
-fn fused_row_identity_survives_eliminated_sort() {
+fn fused_row_identity_declared_under_the_fused_score_sort() {
     let ranked = || {
         let arm = IRExpr::Bm25 {
             field: Box::new(prop("a", "text")),
-            query: Box::new(IRExpr::Literal(Literal::String("needle".into()))),
+            query: Box::new(IRExpr::Literal(
+                Literal::String("needle".into()),
+                value_type(ScalarType::String, false),
+            )),
+            ty: value_type(ScalarType::F32, false),
         };
         IRExpr::Rrf {
             primary: Box::new(arm.clone()),
             secondary: Box::new(arm),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         }
     };
     for (returns, order, expected) in [
@@ -455,12 +510,27 @@ fn fused_row_identity_survives_eliminated_sort() {
         (
             vec![IRExpr::Aggregate {
                 func: AggFunc::Count,
-                arg: Box::new(IRExpr::Variable("b".into())),
+                distinct: false,
+                arg: Box::new(IRExpr::Variable(
+                    "b".into(),
+                    omnigraph_compiler::ExprType::Node {
+                        type_name: "T".into(),
+                    },
+                )),
+                signature: AggSignature {
+                    arg: ExprType::Node {
+                        type_name: "T".into(),
+                    },
+                    result: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
+                },
             }],
             vec![ranked()],
             vec!["$b.@id"],
         ),
     ] {
+        let aggregate = returns
+            .iter()
+            .any(|expr| matches!(expr, IRExpr::Aggregate { .. }));
         let op = ir(vec![scan("a"), scan("b")], returns, order);
         let logical = resolve(&op, &source()).unwrap();
         let keys = logical
@@ -480,10 +550,10 @@ fn fused_row_identity_survives_eliminated_sort() {
             })
             .unwrap();
         assert_eq!(tiebreak_text(keys), expected);
-        assert!(
-            !plan
-                .live()
-                .any(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
+        assert_eq!(
+            leads_with_fused_score(&plan, "a"),
+            !aggregate,
+            "an aggregate with no key after the fusion stays unordered; every other shape sorts by the fused score first"
         );
     }
 }
@@ -527,10 +597,11 @@ fn correlated(edges: EdgeSelection) -> Operation {
                 outer_var: "b".to_string(),
                 inner: vec![selected("b", "x", edges)],
                 predicate: omnigraph_compiler::ir::SubqueryPredicate {
-                    func: AggFunc::Count,
-                    arg: None,
+                    left: omnigraph_compiler::ir::BlockAggregateExpr::CountRows {
+                        ty: value_type(ScalarType::I64, false),
+                    },
                     op: CompOp::Eq,
-                    right: IRExpr::Literal(Literal::Integer(0)),
+                    right: IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
                 },
             },
         ],
@@ -551,7 +622,9 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
         .with_edge_version("knows", 5)
         .with_edge_version("likes", 9)
         .with_traversal_work_limit(123);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     let expands: Vec<_> = plan
         .live()
         .filter_map(|(_, node)| match node {
@@ -628,25 +701,31 @@ fn issue_659_nested_selection_budgets_every_expand_and_pins_every_member() {
 #[test]
 fn issue_659_selection_admission_precedes_lowering_of_outer_named_edges() {
     let op = correlated(alternatives());
-    for (source, expected) in [
-        (source(), "require a finite traversal_work_limit"),
+    for (source, expected, code) in [
+        (source(), "require a finite traversal_work_limit", "P002"),
         (
             source().with_traversal_work_limit(0),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source().with_traversal_work_limit(i64::MAX as u64 + 1),
             "must be in 1..=i64::MAX",
+            "P003",
         ),
         (
             source()
                 .with_traversal_work_limit(100)
                 .with_traversal(Traversal::Csr),
             "do not support traversal = csr",
+            "P004",
         ),
     ] {
         let error = resolve(&op, &source).unwrap_err();
-        assert!(matches!(error, PlanError::Unsupported { .. }));
+        let PlanError::Unsupported(diagnostic) = &error else {
+            panic!("a refusal by design: {error:?}");
+        };
+        assert_eq!(diagnostic.code.as_str(), code, "{error}");
         assert!(error.to_string().contains(expected), "{error}");
     }
 }
@@ -661,7 +740,9 @@ fn named_query_ignores_a_source_selection_allowance() {
     let source = source()
         .with_traversal_work_limit(0)
         .with_traversal(Traversal::Csr);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert_eq!(plan.assumptions().traversal_work_limit, None);
     assert!(plan.live().any(|(_, node)| matches!(
         node,
@@ -753,7 +834,6 @@ fn issue_659_union_estimate_does_not_use_one_members_fanout() {
                 edge_count: 10,
                 src_node_count: 10,
                 dst_node_count: 10,
-                same_type: true,
                 max_frontier_cap: 100,
                 max_hops_cap: 6,
             },
@@ -780,11 +860,19 @@ fn issue_659_budgeted_search_declares_no_topology_prefilter() {
     let nearest = IRExpr::Nearest {
         variable: "a".to_string(),
         property: "embedding".to_string(),
-        query: Box::new(IRExpr::Param("q".to_string())),
+        query: Box::new(IRExpr::Param(
+            "q".to_string(),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     let bm25 = IRExpr::Bm25 {
         field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Param("q".to_string())),
+        query: Box::new(IRExpr::Param(
+            "q".to_string(),
+            value_type(ScalarType::String, false),
+        )),
+        ty: value_type(ScalarType::F32, false),
     };
     for order in [
         nearest.clone(),
@@ -792,6 +880,7 @@ fn issue_659_budgeted_search_declares_no_topology_prefilter() {
             primary: Box::new(nearest),
             secondary: Box::new(bm25),
             k: None,
+            ty: value_type(ScalarType::F64, false),
         },
     ] {
         let op = ir(
@@ -839,7 +928,9 @@ fn issue_659_empty_wildcard_retains_historical_refusal_marker() {
         vec![],
     ));
     let source = source().with_traversal_work_limit(100);
-    let plan = omnigraph_planner::plan_query(&query, &source, &bounds()).unwrap();
+    let plan =
+        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
+            .unwrap();
     assert!(plan.assumptions().has_wildcard_traversal);
     assert!(
         plan.assumptions()

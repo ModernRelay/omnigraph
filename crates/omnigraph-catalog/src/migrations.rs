@@ -15,17 +15,20 @@
 //!
 //! ## Served stamps
 //!
-//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, which since v10 is one
-//! stamp: every served graph may carry table pins that name a detached Lance
-//! version and no linear one (RFC "Detached-only tables"), which an older
-//! binary would misread as reclaimed history. Both RFC 0040 system column
-//! vintages (`id`/`src`/`dst` and `__id`/`__src`/`__dst`) live under that
-//! stamp; the vintage is read from the schema IR, never from the stamp.
-//! Normal open never converts: a v8, v9 or v13 standalone root is converted
-//! by the offline `omnigraph upgrade`, whose intent, receipts and fence live
-//! here; a graph at any other stamp below v14 is rebuilt by export and load,
-//! and normal open refuses a graph that carries a pending storage-upgrade
-//! intent.
+//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, v14 to v16: every served
+//! graph may carry table pins that name a detached Lance version and no
+//! linear one (RFC "Detached-only tables"), which an older binary would
+//! misread as reclaimed history. Both RFC 0040 system column vintages
+//! (`id`/`src`/`dst` and `__id`/`__src`/`__dst`) live under every served
+//! stamp; the vintage is read from the schema IR, never from the stamp. v15
+//! adds row kinds a v14 reader refuses, v16 adds a reserved tag kind a v15
+//! reader would protect forever, and neither needs anything of an older row
+//! set, so a v14 or v15 branch is read as it is and a publish under this
+//! binary stamps it 16 in its CAS. Normal open never converts: a v8, v9 or v13
+//! standalone root is converted by the offline `omnigraph upgrade`, whose
+//! intent, receipts and fence live here; a graph at any other stamp below
+//! v14 is rebuilt by export and load, and normal open refuses a graph that
+//! carries a pending storage-upgrade intent.
 //! Fresh graphs receive their stamp atomically in the manifest Create commit.
 //!
 //! ## Forward-version protection
@@ -110,19 +113,102 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   the commit id, and each commit names its archived schema content under
 ///   `__history/schemas/`. A v13 binary would read the buffer as the whole
 ///   history, so the stamp refuses it before any open. Two unreleased
-///   prototype layouts were stamped 14 and 15 in development trees only;
-///   neither shipped and neither has a conversion route.
+///   prototype layouts used the stamps 14 and 15 in development trees before
+///   the layouts here took them; neither shipped and neither has a
+///   conversion route.
+///
+/// - v15 — a branch's `__manifest` also holds the block registry: one
+///   `history_block` row per released first-parent run (the block, its slot
+///   range, the generation of its first slot and that slot's parent) and one
+///   `history_merge` row per merge commit in a released run, kept in
+///   fragments of their own that a publish names again instead of rewriting
+///   (`commit.rs`); the packed record gains `block_id`, `first_slot` and
+///   `last_slot`. A v14 binary refuses the rows' type, so the stamp refuses
+///   it before any open. A v14 graph is served as it is: each branch is
+///   stamped 15 by its first publish under this binary, in the CAS that
+///   writes the first rows, and nothing is converted offline. The same stamp
+///   fences the one other thing a v14 binary cannot interpret: the reserved
+///   `unpublished_<commit id>` tags that name a detached `__manifest` version
+///   holding an unpublished graph commit (RFC "Unpublished graph commits"),
+///   whose head row carries the proposal's captured clock `M + 1` rather than
+///   its physical version; a v14 binary would retain such a tag forever and
+///   refuse to delete its branch. `as commit` is refused on a v14 ref and
+///   never advances a stamp; `omnigraph upgrade` stamps a v14 graph's live
+///   refs 15 without waiting for a publish.
+///
+/// - v16 — a branch's `__manifest` may also be addressed by the reserved
+///   `unattached_<root>_<commit id>` tags that name a detached version
+///   holding an unattached graph branch (RFC "Unattached graph branches"):
+///   a complete snapshot under a version 2 candidate property, never
+///   publishable, dropped or expired with the head it captured. The rows a
+///   v15 binary reads are unchanged, but it would protect such a tag as a
+///   user tag forever and refuse to retire its branch, so the stamp refuses
+///   it before any open. A v15 graph is served as it is: each branch is
+///   stamped 16 by its first publish under this binary or by `omnigraph
+///   upgrade`'s stamp-only route, and `as unattached branch` is refused on a
+///   ref below 16, naming that upgrade.
 ///
 /// v1–v13 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
-/// A v8, v9 or v13 standalone root reaches v14 through the offline
-/// `omnigraph upgrade`.
-pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 14;
+/// A v8, v9 or v13 standalone root reaches v16 through the offline
+/// `omnigraph upgrade`, which also stamps a v14 or v15 graph's live refs v16.
+pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 16;
 
-/// Normal open serves only format 14. A v8, v9 or v13 standalone root is
-/// converted by the offline `omnigraph upgrade`; a graph at any other lower
-/// stamp, and a cluster-managed graph, is rebuilt by export and load.
+/// Normal open serves formats 14 to 16: a v15 row set is a v14 row set plus
+/// registry rows and a v16 row set is a v15 row set, so a v14 or v15 branch is
+/// read as it is and stamped 16 by its first publish. A v8, v9 or v13
+/// standalone root is converted by the offline `omnigraph upgrade`; a graph at
+/// any other lower stamp, and a cluster-managed graph, is rebuilt by export
+/// and load.
 pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 14;
+
+/// The first stamp whose `__manifest` may carry an unpublished graph commit.
+pub const UNPUBLISHED_COMMITS_STAMP: u32 = 15;
+
+/// Whether a ref stamped `stamp` may hold, read or publish an unpublished
+/// graph commit. A served stamp below it names the explicit upgrade.
+pub fn supports_unpublished_commits(stamp: u32) -> bool {
+    stamp >= UNPUBLISHED_COMMITS_STAMP
+}
+
+/// Refuse an unpublished-commit operation on a ref stamped below
+/// [`UNPUBLISHED_COMMITS_STAMP`].
+pub fn require_unpublished_commits(stamp: u32) -> Result<()> {
+    if supports_unpublished_commits(stamp) {
+        return Ok(());
+    }
+    Err(OmniError::manifest(format!(
+        "__manifest is stamped at internal schema v{stamp}; unpublished graph commits need \
+         v{UNPUBLISHED_COMMITS_STAMP}. Stop every process on the graph, retain a verified \
+         backup and run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`; \
+         the upgrade changes the stamp of each live branch and nothing else."
+    )))
+}
+
+/// The first stamp whose `__manifest` may carry an unattached graph branch
+/// (RFC "Unattached graph branches"): a v15 binary would protect its
+/// `unattached_` tag as a user tag forever.
+pub const UNATTACHED_BRANCHES_STAMP: u32 = 16;
+
+/// Whether a ref stamped `stamp` may hold, read, extend or drop an unattached
+/// graph branch. A served stamp below it names the explicit upgrade.
+pub fn supports_unattached_branches(stamp: u32) -> bool {
+    stamp >= UNATTACHED_BRANCHES_STAMP
+}
+
+/// Refuse an unattached-branch operation on a ref stamped below
+/// [`UNATTACHED_BRANCHES_STAMP`].
+pub fn require_unattached_branches(stamp: u32) -> Result<()> {
+    if supports_unattached_branches(stamp) {
+        return Ok(());
+    }
+    Err(OmniError::manifest(format!(
+        "__manifest is stamped at internal schema v{stamp}; unattached graph branches need \
+         v{UNATTACHED_BRANCHES_STAMP}. Stop every process on the graph, retain a verified \
+         backup and run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`; \
+         the upgrade changes the stamp of each live branch and nothing else."
+    )))
+}
 
 /// The stamp a fresh graph of the given system column vintage is born with:
 /// CURRENT for both `id`/`src`/`dst` and `__id`/`__src`/`__dst` since v10.
@@ -174,6 +260,11 @@ pub fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         13 => {
             "a main development build from 2026-10-01 to 2026-10-04 (schema contract in manifest)"
         }
+        14 => {
+            "a main development build from 2026-10-04 to 2026-10-10 (history released to immutable extents)"
+        }
+        15 => "a main development build from 2026-10-10 to 2026-10-11 (block registry)",
+        16 => "a main development build from 2026-10-11 (unattached graph branches)",
         _ => "an unrecognized older release",
     }
 }
@@ -287,7 +378,8 @@ pub fn is_served_stamp(stamp: u32) -> bool {
 /// - any other `stamp < MIN_SUPPORTED`: the graph was made by an older
 ///   omnigraph whose storage format this binary does not read — rebuild via
 ///   export/import.
-/// - `MIN_SUPPORTED..=CURRENT` is served as-is and never migrated on open.
+/// - `MIN_SUPPORTED..=CURRENT` is served as-is and never migrated on open; a
+///   publish writes `CURRENT`.
 pub fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
     if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
@@ -666,6 +758,23 @@ pub fn branch_completed(
     Ok(true)
 }
 
+/// The stamp alone: one metadata-only transaction that stamps a ref `target`,
+/// keeping every other key and every row (the stamp-only route).
+#[doc(hidden)]
+pub fn stamp_operation(target: u32) -> Operation {
+    Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+        schema_metadata_updates: Some(UpdateMap {
+            update_entries: vec![
+                (INTERNAL_SCHEMA_VERSION_KEY.to_string(), target.to_string()).into(),
+            ],
+            replace: false,
+        }),
+    }
+}
+
 /// The fence: one metadata-only transaction that stamps main `target` and
 /// sets the intent, keeping every other key and every row.
 #[doc(hidden)]
@@ -744,16 +853,28 @@ mod tests {
     /// the floor or above the ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 14);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 14);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 16);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 16);
         assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                 INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
-            (14, 14)
+            (14, 16)
         );
+        assert_eq!(
+            (UNPUBLISHED_COMMITS_STAMP, UNATTACHED_BRANCHES_STAMP),
+            (15, 16)
+        );
+        assert!(require_unpublished_commits(15).is_ok());
+        let fenced = require_unattached_branches(15).unwrap_err().to_string();
+        assert!(
+            fenced.contains("unattached graph branches need v16")
+                && fenced.contains("`omnigraph upgrade <graph>`"),
+            "got: {fenced}"
+        );
+        assert!(require_unattached_branches(16).is_ok());
         for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
             assert!(
                 refuse_if_stamp_unsupported(stamp).is_ok(),
@@ -763,7 +884,7 @@ mod tests {
         let below = refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1)
             .expect_err("a sub-floor stamp must be refused")
             .to_string();
-        assert!(below.contains("reads only v14 to v14"), "got: {below}");
+        assert!(below.contains("reads only v14 to v16"), "got: {below}");
         assert!(
             below.contains(release_for_internal_schema_version(
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1
@@ -798,7 +919,7 @@ mod tests {
             UPGRADE_SOURCE_FORMATS,
             [8, 9, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1]
         );
-        for stamp in 1..INTERNAL_MANIFEST_SCHEMA_VERSION {
+        for stamp in 1..MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
             let refusal = refuse_if_stamp_unsupported(stamp)
                 .expect_err("a sub-floor stamp is refused")
                 .to_string();
@@ -846,7 +967,7 @@ mod tests {
             future.contains(&format!("internal schema v{future_stamp}")),
             "got: {future}"
         );
-        assert!(future.contains("reads only v14 to v14"), "got: {future}");
+        assert!(future.contains("reads only v14 to v16"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 
@@ -865,12 +986,15 @@ mod tests {
             "an unreleased v7 development build"
         );
         assert_eq!(
-            [10, 11, 12, 13].map(release_for_internal_schema_version),
+            [10, 11, 12, 13, 14, 15, 16].map(release_for_internal_schema_version),
             [
                 "a main development build from 2026-09-21 to 2026-09-25 (detached table commits)",
                 "a main development build from 2026-09-25 to 2026-09-28 (detached-only tables)",
                 "a main development build from 2026-09-28 to 2026-10-01 (packed catalog record)",
                 "a main development build from 2026-10-01 to 2026-10-04 (schema contract in manifest)",
+                "a main development build from 2026-10-04 to 2026-10-10 (history released to immutable extents)",
+                "a main development build from 2026-10-10 to 2026-10-11 (block registry)",
+                "a main development build from 2026-10-11 (unattached graph branches)",
             ]
         );
         assert_eq!(

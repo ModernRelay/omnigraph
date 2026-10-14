@@ -125,9 +125,9 @@ from a request`.
 A stored query takes no `--set`: `omnigraph query <name>` without `-e` or
 `--query` runs under the process defaults.
 
-## Read Blob values
+## Read and write Blob values
 
-Read a managed Blob cell to a file or inspect its metadata:
+Read a managed Blob cell to a file, inspect its metadata, or replace it:
 
 ```bash
 omnigraph blob get node Document doc-42 body \
@@ -135,11 +135,16 @@ omnigraph blob get node Document doc-42 body \
 
 omnigraph blob stat node Document doc-42 body \
   --store ./graph.omni --json
+
+omnigraph blob put node Document doc-42 body \
+  --store ./graph.omni --file body.bin
 ```
 
 `blob get` writes bytes to stdout when `--out` is omitted. Add `--offset` and
 `--length` for a range. The CLI reports external references but does not follow
-them. See [Blob values](../blobs.md) for the complete contract.
+them. `blob put` reads stdin when `--file` is omitted, and `blob clear` sets a
+nullable cell to null; both accept `--if-match`. See [Blob values](../blobs.md)
+for the complete contract.
 
 ## Inspect and maintain a graph
 
@@ -179,6 +184,36 @@ omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
 
 The token is stored separately from `config.yaml`. A server resolves the actor
 from the token; clients cannot override it with `--as`.
+
+## Use a server through a Unix socket
+
+A server may also be reached through a Unix-domain socket, for example a local
+gateway in front of `omnigraph-server`. A sandboxed agent that is denied network
+access may still be allowed to connect to one socket path. Address the socket
+with a `unix://` URL followed by its absolute path:
+
+```bash
+omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
+  --server unix:///run/omnigraph/server.sock --graph knowledge
+```
+
+```yaml
+# ~/.omnigraph/config.yaml
+servers:
+  local:
+    url: unix:///run/omnigraph/server.sock
+```
+
+The whole path names the socket, so a socket URL has no host, path prefix,
+query or fragment. A path may contain spaces, written as is or as `%20`. The
+CLI sends the same HTTP/1.1 requests over the socket as over TCP: the
+`HEAD /healthz` discovery, the contract header, the bearer token, and no
+redirects or automatic retries. Proxy settings do not apply. `unix://`
+addresses work on Unix platforms only.
+
+A `--server` value or server `url:` must use `http://`, `https://` or
+`unix://`. Any other scheme fails as an invalid server address; use `--store`
+for graph storage.
 
 ## Manage a cluster
 

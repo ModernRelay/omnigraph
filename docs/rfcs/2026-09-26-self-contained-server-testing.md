@@ -50,7 +50,7 @@ stopped. A shutdown can observe a returned error while accepted storage work is 
 pending. Testing either condition only through the engine misses the server's
 admission, authorization, body ownership and shutdown behavior.
 
-The current [GQT admission code](../../crates/omnigraph-gqt/src/runner_config.rs)
+The current [GQT admission code](../../crates/omnigraph-gqt-core/src/runner_config.rs)
 still parses a declared `target` field, recognizes both server names there
 and admits only the ordinary engine route on local filesystem storage without
 seams or concurrent blocks and engine-DST on in-memory storage when built with
@@ -175,7 +175,7 @@ separately.
 |---|---|
 | `omnigraph-gqt` runner (`src/lib.rs`) | Case parsing, server epoch identities, comparisons, capability admission and terminal reporting |
 | `omnigraph-gqt` supervisor (`src/dst_runner.rs`) | Immutable input, worker/server/helper lifetime, real deadlines, replay and containment |
-| `omnigraph-gqt` client adapters, one per API (`engine`, `http`, `cli`; `mcp` once an MCP tool executes an authored GQ read) | Dispatch of each step by its header's API against the one owned server; the physical read after containment |
+| `omnigraph-gqt` client adapters, one per API (`engine`, `http`, `cli`, `mcp`) | Dispatch of each step by its header's API against the one owned server; the physical read after containment |
 | CLI/server process support (`crates/omnigraph-cli/tests/support/mod.rs`: `converged_loaded_cluster`, `spawn_server_with_cluster`, `TestServer`) | Local cluster provisioning, production connection adapter, readiness and lifecycle controls |
 | `omnigraph-dst` `run_universe` | One controlled scheduling, time, entropy and storage environment; its server consumer is owned by the Deterministic server execution proposal |
 | Engine test support (`crates/omnigraph/tests/helpers/`) | Real engine calls, storage controls and physical-state oracles |
@@ -209,7 +209,7 @@ that path.
 | Step header | Where the step goes under the `omnigraph-server` route |
 |---|---|
 | `via http` | The runner's real HTTP client, kernel TCP on loopback, the real server process and its listener, `axum::serve`, router, authorization, handler, the embedded engine, and the response back over the same socket. |
-| `via mcp` | The server's MCP surface at `/mcp` (`crates/omnigraph-server/src/mcp.rs`, streamable HTTP, mounted only when an OIDC resource is configured). Its shipped tools invoke stored reads only, so `via mcp` is refused before fixture effects as `unsupported_capability: mcp` until a tool that executes an authored GQ read exists ([RFC 0003](0003-mcp-server-surface.md) or its amendment); `via mcp` is admitted on `--- query` only. |
+| `via mcp` | The server's MCP surface at `/mcp` (`crates/omnigraph-server/src/mcp.rs`, streamable HTTP, mounted only when an OIDC resource is configured). A `--- query` step runs its authored GQ read through the `read` tool ([RFC 0003](0003-mcp-server-surface.md)), so the owned server starts with `--mcp-allow-adhoc`; `via mcp` is admitted on `--- query` only. |
 | `--- cli` | The `omnigraph` binary spawned by the runner in served mode against the same listener, so the CLI's own HTTP client crosses the same socket path; its evidence is exit code, stdout and stderr. |
 | `via engine` | On a `--- query`, a read-only `Omnigraph` open of the owned root, admitted only after a lifecycle step has contained the serving process: the physical read. `--- mutate via engine` in such a file is refused as `invalid_case`. |
 

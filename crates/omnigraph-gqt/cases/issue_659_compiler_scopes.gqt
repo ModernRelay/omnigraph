@@ -9,8 +9,8 @@ environments:
     storage: local-filesystem
 
 --- schema
-node Person { name: String @key }
-node Company { name: String @key }
+node Person { name: String @key value: I64? }
+node Company { name: String @key value: String? }
 edge WorksAt: Person -> Company
 edge Employs: Company -> Person
 edge Knows: Person -> Person
@@ -337,3 +337,19 @@ query nested_local_names_remain_independent() {
 --- expect shape
 person: String
 company: String
+
+--- query
+query sibling_inner_names_keep_distinct_types() {
+    match {
+        $p: Person { name: "p" }
+        exists { $p knows $x $x.value is null }
+        exists { $p worksAt $x $x.value is null }
+    }
+    return { $p.name as person }
+}
+--- expect unordered
+{"person":"p"}
+--- expect shape
+person: String
+--- expect plan
+result columns [person: String]

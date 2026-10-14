@@ -1,6 +1,7 @@
 //! The catalog of query compile diagnostic codes (RFC 0047). A code is
 //! stable once published: its meaning is frozen, its message text may
-//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's; the
+//! improve. `Q…` codes are the parser's, `T…` codes the typechecker's, `P…`
+//! codes the planner's; the
 //! numbering has gaps where earlier stages were withdrawn, and a withdrawn
 //! number is never reused.
 
@@ -19,7 +20,7 @@ codes! {
     Q001 = "the source does not match the grammar at this position";
     Q002 = "a query declaration is missing its parameter list";
     Q003 = "a settings statement is refused";
-    Q004 = "a branch, show or explain statement is misplaced or malformed";
+    Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
 
     // Typechecker.
@@ -40,7 +41,6 @@ codes! {
     T15 = "traversal hop bounds or nearest operands are invalid";
     T16 = "update is not supported for edge types";
     T17 = "nearest ordering requires a limit";
-    T18 = "alias ordering cannot be combined with nearest";
     T19 = "search or fuzzy operands are invalid";
     T20 = "match_text or bm25 operands are invalid";
     T21 = "rrf operands are invalid or its ordering lacks a limit";
@@ -52,8 +52,7 @@ codes! {
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";
     T36 = "an alias cannot be projected";
-    T37 = "rrf cannot be projected";
-    T38 = "a search predicate must stand alone or be compared with true";
+    T38 ="a search predicate must stand alone or be compared with true";
     T39 = "an exists or aggregate block must reference an outer-bound variable";
     T40 = "an aggregate block argument or comparison value is invalid";
     T41 = "a filter or Boolean expression has invalid operands";
@@ -69,6 +68,18 @@ codes! {
     T51 = "unknown type";
     T52 = "nested list literals are not supported";
     T53 = "list literal elements must share one scalar type";
+    T54 = "a relevance ranking does not accept the asc modifier";
+    T55 = "an unattached base parameter is undeclared or not a String";
+    T56 = "distinct does not apply to an aggregated return";
+    T57 = "distinct applies only to count";
+    T58 = "a Boolean return item compares aggregates with constants only";
+
+    // Planner.
+    P001 = "a ranking orders a binding a traversal reaches";
+    P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
+    P003 = "the traversal work limit is out of range or recorded twice";
+    P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
+    P005 = "an rrf() ranks two bindings one traversal connects";
 }
 
 #[cfg(test)]
@@ -82,7 +93,10 @@ mod tests {
         for code in ALL {
             assert!(seen.insert(code.as_str()), "duplicate code {code}");
             let (prefix, number) = code.as_str().split_at(1);
-            assert!(matches!(prefix, "Q" | "T"), "{code}: unknown namespace");
+            assert!(
+                matches!(prefix, "Q" | "T" | "P"),
+                "{code}: unknown namespace"
+            );
             assert!(
                 number.parse::<u32>().is_ok(),
                 "{code}: the number must parse"

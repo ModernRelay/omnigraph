@@ -24,7 +24,7 @@ deployment.
 ## History and collaboration
 
 - [Branches, commits, and snapshots](branching/index.md)
-- [Commit changes, change feeds, and baselines](branching/changes.md)
+- [Commit changes, diffs, branch review, change feeds, and baselines](branching/changes.md)
 - [Merging and conflicts](branching/merge.md)
 
 ## CLI and HTTP
@@ -34,6 +34,7 @@ deployment.
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [HTTP server](operations/server.md)
+- [MCP](operations/mcp.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment

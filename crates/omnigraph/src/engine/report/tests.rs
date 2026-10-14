@@ -929,6 +929,57 @@ async fn a_ranked_scan_a_sort_a_projection_and_a_limit_build_one_operator_each()
     }
 }
 
+/// A top-k over ten docs whose output alone reads `text`: the scan reads the
+/// narrow columns and the row address, and one `HydrateExec` above the
+/// limit takes the two kept rows' text by address.
+#[tokio::test]
+async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = doc_graph(&dir).await;
+    let source = r#"query two_texts() {
+        match { $d: Doc }
+        return { $d.slug, $d.text }
+        order { $d.slug desc }
+        limit 2
+    }"#;
+    let (result, run) = captured(db.query(
+        ReadTarget::branch("main"),
+        source,
+        "two_texts",
+        &ParamMap::new(),
+    ))
+    .await;
+    let run = run.expect("the query ran on engine v2");
+    let batch = result.unwrap().concat_batches().unwrap();
+    let texts: Vec<&str> = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(Option::unwrap)
+        .collect();
+    assert_eq!(texts, ["needle 9", "needle 8"]);
+    assert_covers(&run);
+    let hydrate = node_id(&run.plan, |node| {
+        matches!(node, PhysicalNode::HydrateColumns { .. })
+    });
+    assert_eq!(
+        hydrate,
+        run.plan.root(),
+        "the hydration sits above the limit"
+    );
+    assert_eq!(operator(&run, hydrate), "HydrateExec");
+    assert_eq!(row(&run, hydrate).attempts[0].actual_rows, 2);
+    let returns = node_id(&run.plan, |node| {
+        matches!(node, PhysicalNode::Projection { .. })
+    });
+    assert_eq!(row(&run, returns).attempts[0].actual_rows, 10, "every doc");
+    for row in run.report.rows() {
+        assert_eq!(row.status, RowStatus::Executed, "{row:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_rank_fuse_is_one_operator_over_two_arm_scans() {
     let dir = tempfile::tempdir().unwrap();

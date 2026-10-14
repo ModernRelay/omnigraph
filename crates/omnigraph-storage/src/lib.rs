@@ -3794,11 +3794,8 @@ mod tests {
         assert!(failure.message.contains("injected list failure"));
     }
 
-    /// The executable backend contract: every assertion here must hold for
-    /// EVERY backend (the divergence class this adapter closed was "two
-    /// implementations, one prose contract, no referee"). The S3 variant
-    /// runs bucket-gated in `tests/s3_storage.rs`
-    /// (`s3_adapter_conditional_writes_contract`).
+    /// Shared backend assertions; S3 runs in
+    /// `tests/integration/s3_storage.rs::s3_adapter_conditional_writes_contract`.
     async fn contract_suite(adapter: &dyn StorageAdapter, root: &str) {
         // Write/read round-trip; replace is in-place and atomic.
         let a = format!("{root}/contract/a.json");

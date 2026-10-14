@@ -1,0 +1,118 @@
+# issue: 788
+# red_on: 2026-10-09, upstream main: a search-led aggregate planned no Sort at all, so the groups came back in the Aggregate's own order whatever keys followed bm25() or rrf().
+# notes: The leading search function selects the population an aggregate reads and does not order the groups; the keys after it order the groups, then every group key ascending (RFC 0047 §One total order), so the order is total and `expect ordered` holds.
+# notes: x has 1 doc, y has 2; the n desc / n asc pair is red whatever order the Aggregate emits groups in. Engine v1 drops the key too (exec/query.rs "historical no-sort behavior"), so no v1 step.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    kind: String
+    text: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","kind":"x","text":"needle"}}
+{"type":"Doc","data":{"slug":"b","kind":"y","text":"needle"}}
+{"type":"Doc","data":{"slug":"c","kind":"y","text":"needle"}}
+
+--- query
+set engine = v2;
+query largest_group($t: String) {
+    match { $d: Doc }
+    return { $d.kind, count($d) as n }
+    order { bm25($d.text, $t), n desc }
+    limit 1
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.kind":"y","n":2}
+
+--- expect shape
+d.kind: String
+n: I64
+
+--- query
+set engine = v2;
+query smallest_group($t: String) {
+    match { $d: Doc }
+    return { $d.kind, count($d) as n }
+    order { bm25($d.text, $t), n asc }
+    limit 1
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.kind":"x","n":1}
+
+--- expect shape
+d.kind: String
+n: I64
+
+--- query
+set engine = v2;
+query every_group_ordered($t: String) {
+    match { $d: Doc }
+    return { $d.kind, count($d) as n }
+    order { bm25($d.text, $t), n desc }
+    limit 10
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.kind":"y","n":2}
+{"d.kind":"x","n":1}
+
+--- expect shape
+d.kind: String
+n: I64
+
+--- query
+set engine = v2;
+query fused_largest_group($t: String) {
+    match { $d: Doc }
+    return { $d.kind, count($d) as n }
+    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), n desc }
+    limit 1
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.kind":"y","n":2}
+
+--- expect shape
+d.kind: String
+n: I64
+
+--- query
+set engine = v2;
+query fused_smallest_group($t: String) {
+    match { $d: Doc }
+    return { $d.kind, count($d) as n }
+    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), n asc }
+    limit 1
+}
+
+--- params
+{"t": "needle"}
+
+--- expect ordered
+{"d.kind":"x","n":1}
+
+--- expect shape
+d.kind: String
+n: I64

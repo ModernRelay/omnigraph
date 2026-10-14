@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-09-04
-updated: 2026-09-06
+updated: 2026-10-13
 discussion: https://github.com/ModernRelay/omnigraph/pull/626
 supersedes: []
 superseded_by: []
@@ -1493,3 +1493,9 @@ None.
   expectation in item 3 of the first-cases entry above, "both are red and
   held out of the corpus until their fixes" in the 2026-09-06 entry, and
   the Motivation's listing of seed 221206 among the engine findings.
+- 2026-10-13: [RFC 0030](0030-cdc-time-travel.md) §8.5 adds the branch
+  control reads `branch diff`, `branch merge-base` and
+  `branch merge … dry run`, which enter `POST /query` and `omnigraph query`
+  beside `branch list` and are refused at `POST /mutate` as reads. This
+  supersedes "`branch list` is the only branch statement `POST /query`
+  accepts" in User and operational behavior; the read door stays read-only.

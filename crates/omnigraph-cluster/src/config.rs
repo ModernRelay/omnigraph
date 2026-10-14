@@ -381,7 +381,7 @@ fn parse_cluster_config_captured(config_dir: &Path, capture: &mut SourceCapture)
         };
     }
 
-    let raw = match serde_yaml::from_str::<RawClusterConfig>(&text) {
+    let raw = match yaml_serde::from_str::<RawClusterConfig>(&text) {
         Ok(raw) => Some(raw),
         Err(err) => {
             diagnostics.push(Diagnostic::error(
@@ -1351,7 +1351,7 @@ fn stored_declarations(
 /// so an operator carrying a development `cluster.yaml` is told what happened
 /// and what to do.
 pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(text) else {
         return Vec::new();
     };
     let Some(graphs) = value.get("graphs").and_then(|graphs| graphs.as_mapping()) else {
@@ -1372,7 +1372,7 @@ pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
 }
 
 pub(crate) fn future_field_diagnostics(text: &str) -> Vec<Diagnostic> {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(text) else {
         return Vec::new();
     };
     let Some(mapping) = value.as_mapping() else {

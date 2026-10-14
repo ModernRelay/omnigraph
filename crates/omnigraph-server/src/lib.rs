@@ -10,6 +10,7 @@ mod http_contract;
 mod ingress;
 mod mcp;
 pub mod operations;
+mod redacted_cause;
 mod settings;
 use handlers::*;
 use settings::*;
@@ -31,6 +32,7 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
+pub use mcp::McpSettings;
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
     RegistryLookup, RegistrySnapshot, StartupFailure,
@@ -44,12 +46,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
-    GraphBatchLoadQuery, GraphDiscoveryEntry, GraphDiscoveryResponse, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
+    BlobReadQuery, BlobSelectorOutput, BlobWriteOutput, BlobWriteQuery, BranchCreateOutput,
+    BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutput,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
+    ErrorOutput, ExportRequest, GraphBatchLoadOutput, GraphBatchLoadQuery, GraphDiscoveryEntry,
+    GraphDiscoveryResponse, GraphInfo, GraphListResponse, HealthOutput, IngestOutput,
+    IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotQuery,
     graph_batch_load_receipt_output, ingest_receipt_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
@@ -111,6 +114,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         mcp::resource_metadata,
+        mcp::resource_metadata_at_resource_path,
         deployment::status,
         deployment::lookup,
         deployment::apply,
@@ -122,6 +126,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_snapshot,
         handlers::server_blob_get,
         handlers::server_blob_head,
+        handlers::server_blob_put,
+        handlers::server_blob_delete,
         handlers::server_query,
         handlers::server_export,
         handlers::server_mutate,
@@ -138,7 +144,12 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_commit_publish,
+        handlers::server_commit_drop,
         handlers::server_commit_changes,
+        handlers::server_diff,
+        handlers::server_branch_diff,
+        handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
     ),
@@ -229,6 +240,7 @@ pub struct ManagedServerConfig {
     canonical_root: String,
     trust: Option<data_tokens::DataTokenTrust>,
     oidc_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 }
 
 impl ManagedServerConfig {
@@ -243,6 +255,12 @@ impl ManagedServerConfig {
     /// Change only the shutdown bound, preserving the validated root binding.
     pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
         self.config.shutdown_grace = grace;
+        self
+    }
+
+    /// Set the MCP boot settings, preserving the validated root binding.
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = mcp;
         self
     }
 }
@@ -390,6 +408,8 @@ pub struct AppState {
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    /// MCP boot settings: which opt-in tools `/mcp` lists and admits.
+    mcp: Arc<McpSettings>,
     /// Bounded process-wide ownership for queued served-export bytes. The
     /// response body and detached producer jointly retain each reservation.
     export_transport: export_transport::ExportTransport,
@@ -463,6 +483,7 @@ enum ApiErrorDetails {
     ExternalBlobSource(api::ExternalBlobSourceOutput),
     RecoveryRequired(api::RecoveryRequiredOutput),
     PreconditionFailure(api::PreconditionFailureOutput),
+    BlobPreconditionFailure(api::BlobPreconditionFailureOutput),
     ChangeFeedGap(api::ChangeFeedGapOutput),
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
@@ -758,6 +779,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -811,6 +833,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
             witness: Arc::new(BootWitness::default()),
@@ -841,6 +864,17 @@ impl AppState {
     pub fn with_process_defaults(mut self, defaults: ProcessDefaults) -> Self {
         self.process_defaults = Arc::new(defaults);
         self
+    }
+
+    /// The bytes one Blob put may store, inclusive: the process
+    /// `write_max_bytes`, at most `BLOB_WRITE_MAX_BYTES`. A put takes no
+    /// request settings, so this is known before its body is read; ingress
+    /// reserves it and the route refuses a body past it.
+    pub(crate) fn blob_put_limit(&self) -> u64 {
+        self.process_defaults
+            .settings
+            .write_max_bytes()
+            .min(omnigraph::BLOB_WRITE_MAX_BYTES)
     }
 
     /// One session for one request: the process defaults, then the typed
@@ -891,6 +925,17 @@ impl AppState {
         self
     }
 
+    /// Attach the MCP boot settings `/mcp` reads for every request.
+    #[must_use]
+    pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
+        self.mcp = Arc::new(mcp);
+        self
+    }
+
+    pub(crate) fn mcp_settings(&self) -> &McpSettings {
+        &self.mcp
+    }
+
     pub(crate) fn oidc_resource_metadata(&self) -> Option<serde_json::Value> {
         self.oidc_identity_trust
             .as_ref()
@@ -902,6 +947,14 @@ impl AppState {
             .get("resource")?
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Whether any bearer credential can authenticate a request: static
+    /// tokens, signed data tokens or OIDC. Fixed at construction.
+    pub(crate) fn has_credential_source(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+            || self.data_token_trust.is_some()
+            || self.oidc_identity_trust.is_some()
     }
 
     fn requires_bearer_auth(&self) -> bool {
@@ -1038,6 +1091,19 @@ impl ApiError {
         }
     }
 
+    /// HTTP 409 with [`ErrorCode::UnattachedCannotPublish`]: a publish
+    /// addressed an unattached snapshot, a kind that never publishes; no
+    /// durable effect happened.
+    fn unattached_cannot_publish(message: impl Into<String>) -> Self {
+        Self {
+            completion_uncertain: false,
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::UnattachedCannotPublish),
+            message: message.into().into_boxed_str(),
+            details: None,
+        }
+    }
+
     fn unsupported_media_type(message: impl Into<String>) -> Self {
         Self {
             completion_uncertain: false,
@@ -1078,6 +1144,27 @@ impl ApiError {
             code: Some(ErrorCode::Conflict),
             message: message.into().into_boxed_str(),
             details: None,
+        }
+    }
+
+    /// HTTP 412 for a Blob write whose `If-Match` did not hold. The
+    /// `blob_precondition_failure` detail carries the cell's current
+    /// validator, and the response repeats it in `ETag` when there is one.
+    /// It keeps the closed [`ErrorCode::Conflict`] signal and never the
+    /// graph-commit `precondition_failure` detail.
+    pub(crate) fn blob_write_precondition_failed(current_etag: Option<String>) -> Self {
+        Self {
+            completion_uncertain: false,
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
+            message: format!(
+                "Blob write precondition failed; the cell's current validator is {}",
+                current_etag.as_deref().unwrap_or("<none>")
+            )
+            .into_boxed_str(),
+            details: Some(Box::new(ApiErrorDetails::BlobPreconditionFailure(
+                api::BlobPreconditionFailureOutput { current_etag },
+            ))),
         }
     }
 
@@ -1351,6 +1438,9 @@ impl ApiError {
                             actual,
                         },
                     ),
+                    Some(ManifestConflictDetails::UnattachedCannotPublish { .. }) => {
+                        Self::unattached_cannot_publish(err.message)
+                    }
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -1420,6 +1510,8 @@ impl ApiError {
             OmniError::BranchNotFound { branch } => {
                 Self::not_found(format!("branch '{branch}' not found"))
             }
+            error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
+            error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
             // Retention loss under a change continuation: 410 with the
             // structured resume hint. Recovery is the baseline handshake.
             OmniError::ChangeFeedGap {
@@ -1472,6 +1564,9 @@ impl ApiError {
                 ),
                 api::PreconditionFailureOutput { expected, actual },
             ),
+            OmniError::BlobWritePreconditionFailed { current_etag } => {
+                Self::blob_write_precondition_failed(current_etag)
+            }
             err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
             err @ OmniError::StoredExternalBlobDenied { .. } => Self::bad_request(err.to_string()),
             OmniError::ExternalBlobSource { uri, reason } => {
@@ -1581,6 +1676,14 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
             );
         }
+        if let Some(ApiErrorDetails::BlobPreconditionFailure(failure)) = self.details.as_deref()
+            && let Some(etag) = failure
+                .current_etag
+                .as_deref()
+                .and_then(|etag| axum::http::HeaderValue::from_str(etag).ok())
+        {
+            headers.insert(axum::http::header::ETAG, etag);
+        }
         let status = self.status;
         (status, headers, Json(self.into_output())).into_response()
     }
@@ -1608,6 +1711,9 @@ impl ApiError {
                 ApiErrorDetails::RecoveryRequired(value) => output.recovery_required = Some(value),
                 ApiErrorDetails::PreconditionFailure(value) => {
                     output.precondition_failure = Some(value)
+                }
+                ApiErrorDetails::BlobPreconditionFailure(value) => {
+                    output.blob_precondition_failure = Some(value)
                 }
                 ApiErrorDetails::ChangeFeedGap(value) => output.change_feed_gap = Some(value),
                 ApiErrorDetails::ChangeDiffRefusal(value) => {
@@ -1964,6 +2070,38 @@ mod api_error_tests {
             .unwrap();
         let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.code, Some(ErrorCode::Internal));
+
+        // A Blob write's failed If-Match: 412 under the closed conflict code,
+        // the current validator in the detail and in `ETag`, and never the
+        // graph-commit precondition detail.
+        for current in [Some("\"current\""), None] {
+            let response = ApiError::from_omni(OmniError::blob_write_precondition_failed(
+                current.map(str::to_string),
+            ))
+            .into_response();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ETAG)
+                    .map(|etag| etag.to_str().unwrap()),
+                current
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error.code, Some(ErrorCode::Conflict));
+            assert!(error.precondition_failure.is_none());
+            assert_eq!(
+                error
+                    .blob_precondition_failure
+                    .expect("structured Blob precondition")
+                    .current_etag
+                    .as_deref(),
+                current
+            );
+        }
     }
 
     #[tokio::test]
@@ -2139,6 +2277,52 @@ mod external_blob_startup_tests {
         );
     }
 
+    /// The startup log names a graph that failed to open by its root without
+    /// the userinfo, query or fragment the configured URI may carry.
+    #[tokio::test]
+    async fn blocked_startup_logs_the_root_without_credentials() {
+        let capture = super::test_log_capture::Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let temp = tempfile::tempdir().unwrap();
+        // A query string carries a presigned signature or SAS token.
+        let uri = format!(
+            "file://{}/missing.omni?token=secret-token#secret-fragment",
+            temp.path().display()
+        );
+        let key = GraphKey::cluster(GraphId::try_from("blocked").unwrap());
+        let prepared = PreparedGraphOpen {
+            cfg: GraphStartupConfig {
+                startup_failure: None,
+                graph_id: "blocked".to_string(),
+                uri: uri.clone(),
+                policy: None,
+                embedding: None,
+                external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
+                queries: QueryRegistry::default(),
+            },
+            pending: Arc::new(LoadingGraph {
+                key: key.clone(),
+                uri: uri.clone(),
+                policy: None,
+            }),
+            expected: None,
+        };
+        let error = match open_prepared_graph(prepared).await {
+            Ok(_) => panic!("a missing root must not open"),
+            Err(error) => error,
+        };
+        assert_eq!(error.failure, StartupFailure::OpenFailed);
+        let entry = blocked_startup_graph(key, uri, error);
+        assert!(matches!(entry, GraphEntry::Blocked(_)));
+
+        let logs = capture.output();
+        assert!(logs.contains("graph blocked during startup"), "{logs}");
+        assert!(logs.contains("missing.omni"), "{logs}");
+        for leaked in ["secret-token", "secret-fragment"] {
+            assert!(!logs.contains(leaked), "log leaked {leaked}: {logs}");
+        }
+    }
+
     #[tokio::test]
     async fn startup_policy_and_identity_refuse_before_graph_open() {
         let temp = tempfile::tempdir().unwrap();
@@ -2210,6 +2394,14 @@ mod external_blob_startup_tests {
     }
 }
 
+/// Log targets held to WARN/ERROR whatever RUST_LOG says, with their
+/// `::`-separated children. rmcp logs full protocol requests at DEBUG and
+/// responses at TRACE. Lance logs at INFO every table load, write, commit,
+/// compaction and cleanup with the table's full storage URI, every delete with
+/// its predicate (which names entity IDs), and every file it creates or
+/// deletes.
+const RESTRICTED_LOG_TARGETS: &[&str] = &["rmcp", "lance::dataset_events", "lance::file_audit"];
+
 fn server_log_subscriber<W>(filter: EnvFilter, writer: W) -> impl tracing::Subscriber + Send + Sync
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
@@ -2218,19 +2410,26 @@ where
 
     tracing_subscriber::registry()
         .with(filter)
-        // rmcp logs full protocol requests at DEBUG and responses at TRACE.
         // This independent metadata filter cannot be overridden by a more
-        // specific RUST_LOG directive and keeps graph values out of SDK logs.
+        // specific RUST_LOG directive, and keeps graph values, storage URIs
+        // and entity IDs out of dependency logs.
         .with(tracing_subscriber::filter::filter_fn(|metadata| {
-            let sdk = metadata.target() == "rmcp" || metadata.target().starts_with("rmcp::");
-            !sdk || *metadata.level() <= tracing::Level::WARN
+            let target = metadata.target();
+            let restricted = RESTRICTED_LOG_TARGETS.iter().any(|restricted| {
+                target
+                    .strip_prefix(restricted)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            });
+            !restricted || *metadata.level() <= tracing::Level::WARN
         }))
         .with(tracing_subscriber::fmt::layer().with_writer(writer))
 }
 
-/// Install native server logging with MCP protocol payload logs disabled.
-/// Embedders using their own subscriber must equivalently restrict the `rmcp`
-/// and `rmcp::*` targets to WARN/ERROR even when other targets use DEBUG/TRACE.
+/// Install native server logging with MCP protocol payload logs and Lance's
+/// dataset-event and file-audit logs disabled. Embedders using their own
+/// subscriber must equivalently restrict the `rmcp`, `lance::dataset_events`
+/// and `lance::file_audit` targets, and their `::` children, to WARN/ERROR
+/// even when other targets use DEBUG/TRACE.
 pub fn init_tracing() {
     use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -2299,8 +2498,16 @@ mod log_filter_tests {
     use super::test_log_capture::Capture;
 
     #[test]
-    fn verbose_sdk_payloads_remain_filtered_under_specific_directives() {
-        for directives in ["trace", "debug,rmcp::service=trace"] {
+    fn restricted_dependency_logs_remain_filtered_under_specific_directives() {
+        // Each directive set, and whether it enables DEBUG on unrestricted targets.
+        for (directives, debug) in [
+            ("trace", true),
+            ("debug,rmcp::service=trace", true),
+            (
+                "info,lance::dataset_events=trace,lance::file_audit=trace",
+                false,
+            ),
+        ] {
             let captured = Capture::default();
             let subscriber = captured.subscriber(directives);
             tracing::subscriber::with_default(subscriber, || {
@@ -2311,24 +2518,87 @@ mod log_filter_tests {
                 tracing::error!(target: "rmcp", "SDK_ERROR_MARKER");
                 tracing::debug!(target: "omnigraph_server", "NATIVE_DEBUG_MARKER");
                 tracing::debug!(target: "rmcp_extension", "UNRELATED_DEBUG_MARKER");
+                tracing::info!(target: "lance::dataset_events", uri = "PRIVATE_URI_MARKER", "loading");
+                tracing::info!(target: "lance::file_audit", path = "PRIVATE_PATH_MARKER", "create");
+                tracing::warn!(target: "lance::dataset_events", "LANCE_WARNING_MARKER");
+                tracing::info!(target: "lance::execution", "LANCE_EXECUTION_MARKER");
             });
             let output = captured.output();
             for private in [
                 "PRIVATE_REQUEST_MARKER",
                 "PRIVATE_RESULT_MARKER",
                 "PRIVATE_ROOT_MARKER",
+                "PRIVATE_URI_MARKER",
+                "PRIVATE_PATH_MARKER",
             ] {
                 assert!(!output.contains(private), "{directives}: {output}");
             }
             for visible in [
                 "SDK_WARNING_MARKER",
                 "SDK_ERROR_MARKER",
-                "NATIVE_DEBUG_MARKER",
-                "UNRELATED_DEBUG_MARKER",
+                "LANCE_WARNING_MARKER",
+                "LANCE_EXECUTION_MARKER",
             ] {
                 assert!(output.contains(visible), "{directives}: {output}");
             }
+            for unrestricted in ["NATIVE_DEBUG_MARKER", "UNRELATED_DEBUG_MARKER"] {
+                assert_eq!(
+                    output.contains(unrestricted),
+                    debug,
+                    "{directives}: {output}"
+                );
+            }
         }
+    }
+
+    /// A request log names the graph by its ID. Its storage root is physical
+    /// placement and can carry credentials an operator wrote into the URI. The
+    /// whole log is checked, so Lance's own events, which the subscriber
+    /// restricts by target name, also prove the root never reaches it.
+    #[tokio::test]
+    async fn stored_query_invocation_logs_the_graph_id_not_its_storage_root() {
+        use tower::ServiceExt as _;
+
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("info"));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("private-storage-root.omni");
+        let uri = root.to_string_lossy().into_owned();
+        super::Omnigraph::init(&uri, "node Doc { slug: String @key }")
+            .await
+            .unwrap();
+        let registry = super::QueryRegistry::from_specs(vec![super::queries::RegistrySpec {
+            name: "docs".to_string(),
+            source: "query docs() { match { $d: Doc } return { $d.slug } }".to_string(),
+            expose: false,
+            tool_name: None,
+        }])
+        .unwrap();
+        let state = super::AppState::open_single_with_queries(uri, Vec::new(), None, registry)
+            .await
+            .unwrap();
+        let response = super::build_app(state)
+            .oneshot(
+                axum::http::Request::post("/graphs/default/queries/docs")
+                    .header(
+                        super::api::HTTP_API_CONTRACT_HEADER,
+                        super::api::HTTP_API_CONTRACT,
+                    )
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let output = capture.output();
+        let invoked = output
+            .lines()
+            .find(|line| line.contains("stored query invoked"))
+            .unwrap_or_else(|| panic!("no invocation log: {output}"));
+        assert!(invoked.contains("graph_id=default"), "{invoked}");
+        assert!(!output.contains("private-storage-root"), "{output}");
     }
 }
 
@@ -2388,7 +2658,13 @@ pub fn build_app(state: AppState) -> Router {
         // Register HEAD explicitly. Axum's GET fallback would invoke the GET
         // handler and could begin payload work before stripping the body; the
         // dedicated handler makes the zero-payload-read contract structural.
-        .route("/blob", get(server_blob_get).head(server_blob_head))
+        .route(
+            "/blob",
+            get(server_blob_get)
+                .head(server_blob_head)
+                .put(server_blob_put)
+                .delete(server_blob_delete),
+        )
         .route("/export", post(server_export))
         .route("/query", post(server_query))
         .route("/mutate", post(server_mutate))
@@ -2414,9 +2690,16 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
+        .route("/branches/diff", get(server_branch_diff))
+        .route("/branches/merge-base", get(server_merge_base))
         .route("/commits", get(server_commit_list))
-        .route("/commits/{commit_id}", get(server_commit_show))
+        .route(
+            "/commits/{commit_id}",
+            get(server_commit_show).delete(server_commit_drop),
+        )
+        .route("/commits/{commit_id}/publish", post(server_commit_publish))
         .route("/commits/{commit_id}/changes", get(server_commit_changes))
+        .route("/diff", get(server_diff))
         .route("/changes", get(server_changes_feed))
         .route("/changes/baseline", post(server_changes_baseline))
         .route_layer(middleware::from_fn_with_state(
@@ -2476,7 +2759,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
-    if state.oidc_identity_trust.is_some() {
+    // MCP needs an authenticated caller; without a credential source there is
+    // no actor for its policy checks, so the endpoint does not exist.
+    if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
     app.layer(middleware::from_fn(http_contract::identify_response))
@@ -2486,19 +2771,26 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    serve_config(config, None, None).await
+    serve_config(config, None, None, McpSettings::default()).await
+}
+
+/// Serve with explicit MCP boot settings (`--mcp-*` flags and their
+/// environment variables, resolved by [`McpSettings::resolve`]).
+pub async fn serve_with_mcp_settings(config: ServerConfig, mcp: McpSettings) -> Result<()> {
+    serve_config(config, None, None, mcp).await
 }
 
 /// Serve root-bound settings whose enabled identity trust was validated against
 /// the applied snapshot's canonical root before any graph engine open.
 pub async fn serve_with_data_token_trust(config: ManagedServerConfig) -> Result<()> {
-    serve_config(config.config, config.trust, config.oidc_trust).await
+    serve_config(config.config, config.trust, config.oidc_trust, config.mcp).await
 }
 
 async fn serve_config(
     config: ServerConfig,
     data_token_trust: Option<data_tokens::DataTokenTrust>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
+    mcp: McpSettings,
 ) -> Result<()> {
     // RFC 0049: the signal listener is installed before anything else, so
     // the shutdown bound covers startup. On the signal it sets `draining`,
@@ -2616,7 +2908,8 @@ async fn serve_config(
             Arc::clone(&draining),
             shutdown_grace,
         )
-        .with_process_defaults(process_defaults);
+        .with_process_defaults(process_defaults)
+        .with_mcp_settings(mcp);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     let startup_owner = operations
@@ -3116,7 +3409,11 @@ async fn open_prepared_graph(
     let db = opened.map_err(|err| {
         failure(
             StartupFailure::OpenFailed,
-            eyre!("open graph '{}' at {}: {err}", graph_id, uri),
+            eyre!(
+                "open graph '{}' at {}: {err}",
+                graph_id,
+                omnigraph::storage::redacted_storage_uri(&uri)
+            ),
         )
     })?;
     verify_server_schema_contract(&db, expected.as_ref())

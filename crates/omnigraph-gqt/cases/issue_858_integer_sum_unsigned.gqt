@@ -1,0 +1,28 @@
+# issue: 858
+# red_on: 90b188bc
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Amount {
+    id: String @key
+    amount: U64
+}
+--- seed
+{"type":"Amount","data":{"id":"a","amount":18446744073709551615}}
+{"type":"Amount","data":{"id":"b","amount":2049}}
+--- query
+query unsigned_total() {
+    match { $a: Amount }
+    return { sum($a.amount) as total }
+}
+--- expect unordered
+{"total":18446744073709551616.0}
+--- expect shape
+total: F64
+--- expect plan
+aggregate total: sum(U64) exact_integer round_to_nearest -> F64?
