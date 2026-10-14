@@ -208,7 +208,22 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["graphs", "schema", "queries", "query"]);
+    assert_eq!(
+        names,
+        vec![
+            "health",
+            "graphs",
+            "schema",
+            "queries",
+            "query",
+            "snapshot",
+            "branches_list",
+            "commits_list",
+            "commits_get",
+            "commits_changes",
+            "changes_poll",
+        ]
+    );
     for tool in list["result"]["tools"].as_array().unwrap() {
         assert_eq!(tool["annotations"]["readOnlyHint"], true);
     }
@@ -589,27 +604,21 @@ async fn mcp_shares_response_lifetimes_closed_admission_and_the_status_lane() {
 }
 
 #[tokio::test]
-async fn mcp_requires_explicit_resource_identity_configuration() {
+async fn mcp_needs_a_credential_source_and_discovery_needs_an_oidc_resource() {
+    // An unauthenticated server has no actor for MCP's policy checks.
     let (_temp, app) = app_for_loaded_graph().await;
-    assert_eq!(
-        app.clone()
-            .oneshot(rpc(None, "tools/list", json!({})))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        app.oneshot(
-            Request::get("/.well-known/oauth-protected-resource")
-                .body(Body::empty())
-                .unwrap()
-        )
-        .await
-        .unwrap()
-        .status(),
-        StatusCode::NOT_FOUND
-    );
+    for uri in ["/mcp", "/.well-known/oauth-protected-resource"] {
+        let request = if uri == "/mcp" {
+            rpc(None, "tools/list", json!({}))
+        } else {
+            Request::get(uri).body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
 }
 
 async fn tool_list(app: &Router, token: &str) -> Vec<Value> {
@@ -642,20 +651,55 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
         (
             omnigraph_server::McpSettings::default(),
             vec![
+                "health [] read_only output",
                 "graphs [] read_only output",
                 "schema [graph] read_only output",
                 "queries [graph] read_only output",
                 "query [graph,name] read_only",
+                "snapshot [graph] read_only",
+                "branches_list [graph] read_only output",
+                "commits_list [graph] read_only",
+                "commits_get [graph,commit_id] read_only",
+                "commits_changes [graph,commit_id] read_only",
+                "changes_poll [graph] read_only",
             ],
         ),
         (
             adhoc(),
             vec![
+                "health [] read_only output",
                 "graphs [] read_only output",
                 "schema [graph] read_only output",
                 "queries [graph] read_only output",
                 "query [graph,name] read_only",
                 "read [graph,query] read_only",
+                "snapshot [graph] read_only",
+                "branches_list [graph] read_only output",
+                "commits_list [graph] read_only",
+                "commits_get [graph,commit_id] read_only",
+                "commits_changes [graph,commit_id] read_only",
+                "changes_poll [graph] read_only",
+            ],
+        ),
+        (
+            writes(omnigraph_server::McpSettings::default()),
+            vec![
+                "health [] read_only output",
+                "graphs [] read_only output",
+                "schema [graph] read_only output",
+                "queries [graph] read_only output",
+                "query [graph,name] read_only",
+                "snapshot [graph] read_only",
+                "branches_list [graph] read_only output",
+                "commits_list [graph] read_only",
+                "commits_get [graph,commit_id] read_only",
+                "commits_changes [graph,commit_id] read_only",
+                "changes_poll [graph] read_only",
+                "mutate [graph,query]",
+                "load [graph,mode,data]",
+                "branches_create [graph,name]",
+                "branches_delete [graph,name]",
+                "branches_merge [graph,source]",
             ],
         ),
     ] {
@@ -671,7 +715,7 @@ async fn mcp_tool_list_follows_the_adhoc_setting_and_describes_every_tool() {
                     .unwrap_or_default();
                 assert_eq!(tool["inputSchema"]["additionalProperties"], false);
                 assert!(tool["title"].as_str().is_some_and(|t| !t.is_empty()));
-                assert!(tool["description"].as_str().unwrap().len() > 60);
+                assert!(tool["description"].as_str().unwrap().len() > 20);
                 assert_eq!(tool["annotations"]["openWorldHint"], false);
                 let mut line = format!(
                     "{} [{}]{}",
@@ -820,4 +864,456 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         app.clone().oneshot(oversized).await.unwrap().status(),
         StatusCode::PAYLOAD_TOO_LARGE
     );
+}
+
+fn writes(mut settings: omnigraph_server::McpSettings) -> omnigraph_server::McpSettings {
+    settings.allow_writes = true;
+    settings
+}
+
+/// A server with static bearer tokens only: actor `default` may do anything.
+async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), "secret".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(settings);
+    (temp, omnigraph_server::build_app(state))
+}
+
+#[tokio::test]
+async fn static_token_server_serves_mcp_without_oauth_discovery() {
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.allowed_hosts = vec!["graphs.internal:8080".into()];
+    let (_temp, app) = static_token_app(settings).await;
+
+    let response = app
+        .clone()
+        .oneshot(rpc(Some("secret"), "tools/list", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for credential in [None, Some("wrong")] {
+        let response = app
+            .clone()
+            .oneshot(rpc(credential, "tools/list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // No OIDC resource: nothing to discover, so no OAuth challenge.
+        assert!(!response.headers().contains_key("www-authenticate"));
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::get("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    for (host, expected) in [
+        ("graphs.internal:8080", StatusCode::OK),
+        ("127.0.0.1", StatusCode::OK),
+        ("graphs.internal", StatusCode::FORBIDDEN),
+        ("attacker.example", StatusCode::FORBIDDEN),
+    ] {
+        let mut request = rpc(Some("secret"), "tools/list", json!({}));
+        request.headers_mut().insert("host", host.parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            expected,
+            "{host}"
+        );
+    }
+    // No resource origin exists to allow, so any browser Origin is refused.
+    for origin in ["https://attacker.example", "http://localhost", "null"] {
+        let mut request = rpc(Some("secret"), "tools/list", json!({}));
+        request
+            .headers_mut()
+            .insert("origin", origin.parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "{origin}"
+        );
+    }
+    // A static token is not an identity, so `graphs` asks `GET /graphs`,
+    // whose `graph_list` action only a server-scoped policy grants.
+    let graphs = call(&app, "secret", "graphs", json!({})).await;
+    assert_eq!(
+        graphs["result"]["structuredContent"]["status"], 403,
+        "{graphs}"
+    );
+    let (status, native) = json_response(&app, get_request("/graphs", "secret")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(graphs["result"]["structuredContent"]["error"], native);
+    let schema = call(&app, "secret", "schema", json!({"graph":"default"})).await;
+    assert_eq!(schema["result"]["isError"], false, "{schema}");
+}
+
+async fn http_get(app: &Router, uri: &str, token: &str) -> Value {
+    let (status, body) = json_response(app, get_request(uri, token)).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    body
+}
+
+#[tokio::test]
+async fn mcp_read_parity_tools_equal_their_routes() {
+    let (_temp, app) = static_token_app(writes(omnigraph_server::McpSettings::default())).await;
+    // A commit to inspect, through the MCP write path.
+    let written = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":"query add($name: String) { insert Person { name: $name, age: 41 } }","params":{"name":"Dana"}}),
+    )
+    .await;
+    assert_eq!(written["result"]["isError"], false, "{written}");
+    let commit = written["result"]["structuredContent"]["commit"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let health = call(&app, "secret", "health", json!({})).await;
+    let (_, native_health) =
+        json_response(&app, Request::get("/healthz").body(Body::empty()).unwrap()).await;
+    assert_eq!(health["result"]["structuredContent"], native_health);
+
+    for (tool, arguments, uri) in [
+        (
+            "snapshot",
+            json!({"graph":"default"}),
+            "/graphs/default/snapshot".to_string(),
+        ),
+        (
+            "snapshot",
+            json!({"graph":"default","branch":"main"}),
+            "/graphs/default/snapshot?branch=main".to_string(),
+        ),
+        (
+            "branches_list",
+            json!({"graph":"default"}),
+            "/graphs/default/branches".to_string(),
+        ),
+        (
+            "commits_list",
+            json!({"graph":"default"}),
+            "/graphs/default/commits".to_string(),
+        ),
+        (
+            "commits_get",
+            json!({"graph":"default","commit_id":commit}),
+            format!("/graphs/default/commits/{commit}"),
+        ),
+        (
+            "commits_changes",
+            json!({"graph":"default","commit_id":commit,"kind":["node"],"op":["insert"],"limit":10}),
+            format!("/graphs/default/commits/{commit}/changes?kind=node&op=insert&limit=10"),
+        ),
+        (
+            "changes_poll",
+            json!({"graph":"default","start":"beginning","type":["Person"]}),
+            "/graphs/default/changes?start=beginning&type=Person".to_string(),
+        ),
+    ] {
+        let result = call(&app, "secret", tool, arguments).await;
+        assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+        assert_eq!(
+            result["result"]["structuredContent"],
+            http_get(&app, &uri, "secret").await,
+            "{tool}"
+        );
+    }
+    // The route's own refusals pass through unchanged.
+    let refused = call(
+        &app,
+        "secret",
+        "changes_poll",
+        json!({"graph":"default","start":"now","cursor":"x"}),
+    )
+    .await;
+    assert_eq!(refused["result"]["isError"], true);
+    assert_eq!(refused["result"]["structuredContent"]["status"], 400);
+}
+
+#[tokio::test]
+async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
+    let (_temp, app, _state) = fixture_app().await;
+    let alice = token("alice", RESOURCE);
+    let bob = token("bob", RESOURCE);
+    let (status, listed) =
+        json_response(&app, rpc(Some(&alice), "resources/list", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let uris: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert_eq!(uris, vec!["omnigraph://graphs"]);
+    let (_, templates) = json_response(
+        &app,
+        rpc(Some(&alice), "resources/templates/list", json!({})),
+    )
+    .await;
+    let templates: Vec<&str> = templates["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uriTemplate"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        templates,
+        vec![
+            "omnigraph://graphs/{graph}/schema",
+            "omnigraph://graphs/{graph}/branches"
+        ]
+    );
+
+    let read = |token: String, uri: &'static str| {
+        let app = app.clone();
+        async move {
+            json_response(
+                &app,
+                rpc(Some(&token), "resources/read", json!({"uri":uri})),
+            )
+            .await
+            .1
+        }
+    };
+    let schema = read(alice.clone(), "omnigraph://graphs/default/schema").await;
+    let contents = &schema["result"]["contents"][0];
+    assert_eq!(contents["mimeType"], "text/plain", "{schema}");
+    let native = http_get(&app, "/graphs/default/schema", &alice).await;
+    assert_eq!(contents["text"], native["schema_source"]);
+    let branches = read(alice.clone(), "omnigraph://graphs/default/branches").await;
+    let text = branches["result"]["contents"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        http_get(&app, "/graphs/default/branches", &alice).await
+    );
+    let graphs = read(bob.clone(), "omnigraph://graphs").await;
+    let text = graphs["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(serde_json::from_str::<Value>(text).unwrap()["graphs"].is_array());
+
+    // Policy decides, and an unknown resource is not found.
+    let denied = read(bob, "omnigraph://graphs/default/schema").await;
+    assert_eq!(denied["error"]["data"]["status"], 403, "{denied}");
+    for uri in [
+        "omnigraph://graphs/unknown/schema",
+        "omnigraph://graphs/default/secrets",
+        "omnigraph://schema",
+    ] {
+        let missing = json_response(
+            &app,
+            rpc(Some(&alice), "resources/read", json!({"uri":uri})),
+        )
+        .await
+        .1;
+        assert_eq!(missing["error"]["code"], -32002, "{uri}: {missing}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_write_tools_are_opt_in_conditional_and_policy_gated() {
+    // Off by default: absent and refused, with nothing written.
+    let (temp, app) = static_token_app(omnigraph_server::McpSettings::default()).await;
+    let before = manifest_dataset_version(&graph_path(temp.path())).await;
+    let names: Vec<String> = tool_list(&app, "secret")
+        .await
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    for write in [
+        "mutate",
+        "load",
+        "branches_create",
+        "branches_delete",
+        "branches_merge",
+    ] {
+        assert!(!names.iter().any(|name| name == write), "{write}");
+        let refused = call(&app, "secret", write, json!({"graph":"default"})).await;
+        assert!(refused.get("error").is_some(), "{write}: {refused}");
+    }
+    assert_eq!(
+        manifest_dataset_version(&graph_path(temp.path())).await,
+        before
+    );
+
+    let (temp, app) = static_token_app(writes(adhoc())).await;
+    let tools = tool_list(&app, "secret").await;
+    for (name, destructive, idempotent) in [
+        ("mutate", true, false),
+        ("load", true, false),
+        ("branches_create", false, false),
+        ("branches_delete", true, true),
+        ("branches_merge", true, false),
+    ] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{name}");
+        assert_eq!(
+            tool["annotations"]["destructiveHint"], destructive,
+            "{name}"
+        );
+        assert_eq!(tool["annotations"]["idempotentHint"], idempotent, "{name}");
+        assert!(
+            tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("outcome_unknown")
+        );
+    }
+    assert!(
+        instructions(&app, "secret")
+            .await
+            .contains("if_graph_commit")
+    );
+
+    // A conditional write against a stale head is refused before effects.
+    let read = call(
+        &app,
+        "secret",
+        "read",
+        json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name } }"}),
+    )
+    .await;
+    let head = read["result"]["structuredContent"]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let insert = "query add($name: String) { insert Person { name: $name, age: 7 } }";
+    let first = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Eve"},"if_graph_commit":head}),
+    )
+    .await;
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let after_first = manifest_dataset_version(&graph_path(temp.path())).await;
+    let stale = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Frank"},"if_graph_commit":head}),
+    )
+    .await;
+    assert_eq!(stale["result"]["isError"], true, "{stale}");
+    assert_eq!(
+        stale["result"]["structuredContent"]["status"], 412,
+        "{stale}"
+    );
+    assert!(
+        stale["result"]["structuredContent"]
+            .get("outcome_unknown")
+            .is_none()
+    );
+    assert_eq!(
+        manifest_dataset_version(&graph_path(temp.path())).await,
+        after_first
+    );
+
+    // Load, then a branch round trip: create, write, merge, delete.
+    let loaded = call(
+        &app,
+        "secret",
+        "load",
+        json!({"graph":"default","mode":"merge","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Gina\",\"age\":50}}"}),
+    )
+    .await;
+    assert_eq!(loaded["result"]["isError"], false, "{loaded}");
+    for (tool, arguments) in [
+        (
+            "branches_create",
+            json!({"graph":"default","name":"feature"}),
+        ),
+        (
+            "mutate",
+            json!({"graph":"default","query":insert,"params":{"name":"Hal"},"branch":"feature"}),
+        ),
+        (
+            "branches_merge",
+            json!({"graph":"default","source":"feature"}),
+        ),
+        (
+            "branches_delete",
+            json!({"graph":"default","name":"feature"}),
+        ),
+    ] {
+        let result = call(&app, "secret", tool, arguments).await;
+        assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+    }
+    let names = call(
+        &app,
+        "secret",
+        "read",
+        json!({"graph":"default","query":"query names() { match { $p: Person } return { $p.name } order { $p.name asc } }"}),
+    )
+    .await;
+    let rows = names["result"]["structuredContent"]["rows"].to_string();
+    for name in ["Eve", "Gina", "Hal"] {
+        assert!(rows.contains(name), "{name}: {rows}");
+    }
+    assert!(!rows.contains("Frank"));
+    let branches = call(&app, "secret", "branches_list", json!({"graph":"default"})).await;
+    assert_eq!(
+        branches["result"]["structuredContent"]["branches"],
+        json!(["main"])
+    );
+    let missing = call(
+        &app,
+        "secret",
+        "branches_delete",
+        json!({"graph":"default","name":"feature"}),
+    )
+    .await;
+    assert_eq!(missing["result"]["structuredContent"]["status"], 404);
+
+    // Each write keeps its route's policy action: `change` without
+    // `branch_create` refuses branch creation.
+    let (_temp, app, _state) =
+        fixture_app_with(writes(omnigraph_server::McpSettings::default())).await;
+    let alice = token("alice", RESOURCE);
+    let bob = token("bob", RESOURCE);
+    let created = call(
+        &app,
+        &alice,
+        "branches_create",
+        json!({"graph":"default","name":"x"}),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["structuredContent"]["status"], 403,
+        "{created}"
+    );
+    let denied = call(
+        &app,
+        &bob,
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Ivy"}}),
+    )
+    .await;
+    assert_eq!(
+        denied["result"]["structuredContent"]["status"], 403,
+        "{denied}"
+    );
+    let allowed = call(
+        &app,
+        &alice,
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Ivy"}}),
+    )
+    .await;
+    assert_eq!(allowed["result"]["isError"], false, "{allowed}");
 }

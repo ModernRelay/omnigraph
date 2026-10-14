@@ -187,8 +187,8 @@ prevent new OIDC access; accepted operations can finish. Admission refresh does
 not restart writers. Graph configuration retains its normal activation.
 
 With this profile configured, the server also serves public
-protected-resource metadata and an OAuth challenge on `/mcp`, so standard OAuth
-clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
+protected-resource metadata and an OAuth challenge on its [`/mcp`](mcp.md)
+endpoint, so standard OAuth clients such as Claude can sign in. The [MCP guide](mcp.md) describes the
 endpoint, its tools, settings and limits.
 
 ## Route families
@@ -203,7 +203,7 @@ endpoint, its tools, settings and limits.
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{id}` | Authorized deployment status and current-process activation observation |
 | `GET /.well-known/oauth-protected-resource`, also at the resource's path suffix | Public OIDC resource metadata; only when OIDC trust is configured |
-| `/mcp` | The [MCP endpoint](mcp.md); only when OIDC trust is configured |
+| `/mcp` | The [MCP endpoint](mcp.md); when static tokens, signed data tokens or OIDC trust are configured |
 | `/graphs/{id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{id}/mutate/if-graph-commit` | Run an inline conditional mutation |
 | `/graphs/{id}/queries` | List and invoke stored queries, including conditional mutations |

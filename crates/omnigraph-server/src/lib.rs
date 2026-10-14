@@ -948,6 +948,14 @@ impl AppState {
             .map(str::to_owned)
     }
 
+    /// Whether any bearer credential can authenticate a request: static
+    /// tokens, signed data tokens or OIDC. Fixed at construction.
+    pub(crate) fn has_credential_source(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+            || self.data_token_trust.is_some()
+            || self.oidc_identity_trust.is_some()
+    }
+
     fn requires_bearer_auth(&self) -> bool {
         if !self.bearer_tokens.is_empty()
             || self.data_token_trust.is_some()
@@ -2750,7 +2758,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/readyz", get(server_ready))
         .route("/openapi.json", get(server_openapi))
         .merge(protected);
-    if state.oidc_identity_trust.is_some() {
+    // MCP needs an authenticated caller; without a credential source there is
+    // no actor for its policy checks, so the endpoint does not exist.
+    if state.has_credential_source() {
         app = app.merge(mcp::router(state.clone()));
     }
     app.layer(middleware::from_fn(http_contract::identify_response))
