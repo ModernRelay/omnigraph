@@ -1,7 +1,7 @@
 # issue: none
 # notes: The per-query memory pool is the `query_memory_bytes` session setting: a tiny value
-# notes: refuses a query whose tracked work exceeds it, the default (150 MiB) and a raised
-# notes: value run the same query, and `show` reports the raised value with source `file`.
+# notes: refuses a query whose tracked work exceeds it; the default (150 MiB) and a raised
+# notes: value run the same query through both the engine and the server.
 
 --- runner
 timeout_ms: 10000
@@ -59,10 +59,3 @@ query raised_runs() {
 
 --- expect shape
 p.id: I64
-
---- query
-set query_memory_bytes = 1073741824;
-show query_memory_bytes;
-
---- expect unordered
-{"name": "query_memory_bytes", "value": "1073741824", "default": "157286400", "source": "file", "scope": "request"}

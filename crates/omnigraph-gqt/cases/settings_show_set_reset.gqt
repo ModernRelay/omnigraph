@@ -151,3 +151,10 @@ show write_max_bytes;
 
 --- expect unordered
 {"name": "write_max_bytes", "value": "67108864", "default": "33554432", "source": "file", "scope": "request"}
+
+--- query
+set query_memory_bytes = 1073741824;
+show query_memory_bytes;
+
+--- expect unordered
+{"name": "query_memory_bytes", "value": "1073741824", "default": "157286400", "source": "file", "scope": "request"}
