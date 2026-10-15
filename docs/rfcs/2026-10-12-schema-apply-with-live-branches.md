@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-12
-updated: 2026-10-12
+updated: 2026-10-15
 discussion: null
 supersedes: []
 superseded_by: []
@@ -139,6 +139,10 @@ In the common cases this means:
   A catch-up merge advances the target's head, so unpublished commits and
   unattached snapshots rooted at the earlier head expire as they do after
   any other publication.
+
+`branch merge --dry-run` runs the same capture and classification and reports
+the same outcome, including `schema_diverged` and the contract the merge would
+publish, without effects.
 
 A branch that changed a table a newer contract changed cannot merge that table
 in either direction. Its rows stay readable and exportable on the branch; the
@@ -348,7 +352,10 @@ live branch:
    buffered, else from one history record read. The merge capture path and
    `pinned_graph_commit` are not reused: the first refuses differing contracts
    and replaces a one-entry authority cache per branch, and the second opens a
-   full snapshot. A base written by a since-deleted branch is accepted here.
+   full snapshot. `Omnigraph::merge_base` and the merge dry run are built on
+   the merge capture, so they accept differing contracts once merge does, but
+   they build a full write capture per call. A base written by a since-deleted
+   branch is accepted here.
 5. Refuse when the branch's registration of a changed table differs from the
    base's. Tables the branch can already not merge because of an earlier
    apply are reported, not refused.
@@ -373,19 +380,18 @@ the table after the branch forked.
 - Snapshot-id reads and the change-feed baseline bind the current contract of
   the branch that wrote the commit, which target resolution already records.
   Today they use the handle's bound branch, which is main in production, so a
-  lagging branch's commits would be typed with main's contract. The binding of
-  historical properties by stable identity proposed in
-  [ModernRelay/omnigraph#959](https://github.com/ModernRelay/omnigraph/pull/959)
-  takes both its catalog and the live view that its coverage check compares
-  pins with from the handle's bound branch; both must come from the writing
-  branch.
-- This rule types queries. Decoding change images is a separate rule: the
-  graph diffs and change feeds amendment
-  ([ModernRelay/omnigraph#964](https://github.com/ModernRelay/omnigraph/pull/964))
-  decodes each endpoint under its own archived contract, which this RFC leaves
-  unchanged. Until that lands, a branch's change feed reports a schema
-  boundary at the commit where the branch takes a contract that changes a
-  table, as it does at a schema apply on main today.
+  lagging branch's commits would be typed with main's contract. Historical
+  reads bind properties by stable identity since
+  [ModernRelay/omnigraph#959](https://github.com/ModernRelay/omnigraph/pull/959);
+  that binding takes both its catalog and the live view that its coverage
+  check compares pins with from the handle's bound branch, and both must come
+  from the writing branch.
+- This rule types queries. Decoding change images is a separate rule:
+  [RFC 0030](0030-cdc-time-travel.md)'s phase C6, still design-stage, decodes
+  each endpoint under its own archived schema, which this RFC leaves
+  unchanged. Until C6 lands, a branch's change feed reports a schema boundary
+  at the commit where the branch takes a contract that changes a table, as it
+  does at a schema apply on main today.
 - The accepted-catalog cache holds one entry today. It becomes a small cache
   keyed by contract identity, so serving branches on two contracts does not
   rebuild the catalog and miss the compiled-query cache on every switch.
@@ -546,7 +552,8 @@ merge, then deletes or exports the rest.
 ### Code survey
 
 Each assumption above was checked in code at commit `a3af0c85`; the facts
-quoted in Motivation and Design were rechecked at `f53bf4fb`:
+quoted in Motivation and Design were rechecked at `f53bf4fb`, and the stamp,
+the refusals, merge capture and the publisher again at `fe69c039`:
 
 - Contract rows: only schema apply and the system-column upgrade produce
   `ManifestChange::SchemaContract` outside tests; the publisher carries the
@@ -617,7 +624,7 @@ It also found the gaps in tests and surfaces listed below.
 | Owner | Proof |
 |---|---|
 | `tests/schema_apply.rs` | Apply with a live untouched branch leaves its pins and contract; refusal names each branch and changed table; non-table changes never refuse; a full-text `@index` counts as a change; preview lists affected branches; budget and walk-limit refusals; incarnation recheck |
-| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without the other side changing the table; type add, rename and drop; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with an older base; criss-cross refusal; the published contract has the larger sequence |
+| `tests/integration/merge_truth_table.rs` | Each schema change in both directions between main and a branch and between two named branches, with and without the other side changing the table; type add, rename and drop; `Person → Human → Person` with a branch caught up to the middle contract; a property dropped and re-added under the same name with an older base; criss-cross refusal; the published contract has the larger sequence; the dry run reports the same outcome |
 | `tests/merge_fast_forward.rs` | Catch-up fast forward publishes the contract and reads no rows of taken tables |
 | `omnigraph-catalog` tests | The ordering property over every pair of commits, including content-equal contracts with different sequences; sequence 0 for pre-17 rows; the publisher refuses a lower sequence or a contract change without lineage |
 | `tests/failpoints.rs`, `tests/detached_commit_matrix.rs` | A catch-up merge interrupted before publication leaves the branch's contract and pins; after publication both are complete |
@@ -692,8 +699,9 @@ until their conversion and conflict semantics are specified.
   were corrected.
 - 2026-10-12: Aligned with open proposals. The sequence lives beside the
   contract head so archived schema content stays content-only for the change
-  feed amendment (#964). Historical-property binding (#959) takes its catalog
-  and coverage view from the writing branch. Contract writers proposed in
+  feed contract (#964, which landed in RFC 0030 through #966).
+  Historical-property binding (#959) takes its catalog and coverage view from
+  the writing branch. Contract writers proposed in
   #884 increment the sequence, and its validation-tightening steps must enter
   the signature or refuse with live branches. Access-restricting contract
   changes from #951 take effect on every branch at once. Restore in #677 must
