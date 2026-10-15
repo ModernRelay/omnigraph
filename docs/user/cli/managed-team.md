@@ -55,9 +55,9 @@ as `--after CURSOR` to fetch the next page. A null cursor means the last page.
 To resend or cancel an invitation, use its exact ID:
 
 ```sh
-omnigraph org invitations resend inv_example --managed \
+omnigraph org invitations resend invitation_example --managed \
   --idempotency-key resend-avery-20261015
-omnigraph org invitations revoke inv_example --managed \
+omnigraph org invitations revoke invitation_example --managed \
   --idempotency-key revoke-avery-20261015
 ```
 
