@@ -1,7 +1,7 @@
 //! Managed control routing (RFC 0052) and offline data credentials (RFC 0053).
 //! Explicit --managed selects this routing; context supplies its bound authority.
 
-use crate::cli::{Cli, ClusterCommand, ClusterRunArgs, Command};
+use crate::cli::{Cli, ClusterCommand, ClusterMembersCommand, ClusterRunArgs, Command};
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,6 +15,7 @@ mod auth;
 pub(crate) mod data;
 mod deployment;
 mod lifecycle;
+mod members;
 
 /// Managed transports must not render an endpoint's reflected credential.
 pub(crate) fn scrub_response_error(text: String, secret: &str) -> String {
@@ -64,16 +65,23 @@ pub(crate) struct Output {
     body: Value,
     exit: i32,
     json: bool,
+    human: Option<String>,
 }
 
 impl Output {
     fn from_result(result: Result<Value>, json: bool, exit: i32) -> Self {
         match result {
-            Ok(body) => Self { body, exit, json },
+            Ok(body) => Self {
+                body,
+                exit,
+                json,
+                human: None,
+            },
             Err(err) => Self {
                 body: err.body,
                 exit: err.exit,
                 json,
+                human: None,
             },
         }
     }
@@ -81,6 +89,8 @@ impl Output {
     pub(crate) fn emit(self) -> color_eyre::Result<i32> {
         if self.json {
             println!("{}", serde_json::to_string(&self.body)?);
+        } else if let Some(human) = self.human {
+            print!("{human}");
         } else if let Some(detail) = self.body.get("detail").and_then(Value::as_str) {
             eprintln!(
                 "{}: {detail}",
@@ -571,6 +581,9 @@ fn config_and_json(command: &ClusterCommand) -> (&Path, bool) {
         | ClusterCommand::Delete { config, json, .. }
         | ClusterCommand::UndoDelete { config, json, .. }
         | ClusterCommand::Push { config, json, .. } => (config, *json),
+        ClusterCommand::Members {
+            command: ClusterMembersCommand::List { config, json },
+        } => (config, *json),
         _ => unreachable!("local-only commands cannot select --managed"),
     }
 }
@@ -707,6 +720,9 @@ pub(crate) async fn dispatch(cli: &Cli) -> Option<Output> {
             };
             if let Err(err) = scope {
                 return Some(Output::from_result(Err(err), json, 2));
+            }
+            if matches!(command, ClusterCommand::Members { .. }) {
+                return Some(members::list(config, json).await);
             }
             if lifecycle::handles(command) {
                 return Some(match lifecycle::dispatch(command).await {

@@ -753,6 +753,11 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
+    /// With --managed, list explicitly enrolled cluster members.
+    Members {
+        #[command(subcommand)]
+        command: ClusterMembersCommand,
+    },
     /// With --managed, download an exact configuration revision into a new directory.
     Pull {
         /// New destination; existing files, directories and symlinks are never replaced.
@@ -870,6 +875,19 @@ pub(crate) enum ClusterCommand {
         #[arg(long, default_value = ".")]
         config: PathBuf,
         /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ClusterMembersCommand {
+    /// List explicit cluster enrollment; graph permissions are evaluated by Cedar separately.
+    List {
+        /// Configuration folder containing the managed context.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit the API envelope instead of a readable member table.
         #[arg(long)]
         json: bool,
     },
