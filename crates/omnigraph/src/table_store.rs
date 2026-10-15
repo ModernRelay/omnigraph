@@ -70,8 +70,7 @@ use crate::blob::{
 };
 use crate::dataset_index::{
     has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, is_untrained_full_text, user_indices_for_column, validate_full_text_demand,
-    validate_full_text_scan,
+    is_full_text_index, is_untrained_full_text, validate_full_text_demand, validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
@@ -1038,6 +1037,64 @@ impl PreflightedExternalBlob {
         Ok(payload_size)
     }
 
+    async fn read_full_bounded(&self, max_bytes: u64, resource: &str) -> Result<Arc<[u8]>> {
+        if self.object_size > max_bytes {
+            return Err(OmniError::resource_limit(
+                resource,
+                max_bytes,
+                self.object_size,
+            ));
+        }
+        let uri = self.normalized_uri.as_str();
+        crate::instrumentation::external_payload_read_stall().await;
+        let response = self
+            .store
+            .inner
+            .get_opts(&self.path, object_store::GetOptions::default())
+            .await
+            .map_err(|error| OmniError::external_blob_source(uri, error.to_string()))?;
+        let object_size = response.meta.size;
+        if object_size > max_bytes {
+            return Err(OmniError::resource_limit(resource, max_bytes, object_size));
+        }
+        if response.range != (0..object_size) {
+            return Err(OmniError::external_blob_source(
+                uri,
+                "external object response did not contain the whole object",
+            ));
+        }
+        let capacity = usize::try_from(object_size)
+            .map_err(|_| OmniError::resource_limit(resource, usize::MAX as u64, object_size))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut stream = response.into_stream();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|error| OmniError::external_blob_source(uri, error.to_string()))?
+        {
+            let actual = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+            if actual > max_bytes {
+                return Err(OmniError::resource_limit(resource, max_bytes, actual));
+            }
+            if actual > object_size {
+                return Err(OmniError::external_blob_source(
+                    uri,
+                    "external object response exceeded its declared size",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != capacity {
+            return Err(OmniError::external_blob_source(
+                uri,
+                "external object response ended before its declared size",
+            ));
+        }
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(bytes.into())
+    }
+
     async fn read_full(&self) -> Result<Arc<[u8]>> {
         let uri = self.normalized_uri.as_str().to_string();
         if self.object_size == 0 {
@@ -1050,6 +1107,7 @@ impl PreflightedExternalBlob {
                 self.object_size,
             )
         })?;
+        crate::instrumentation::external_payload_read_stall().await;
         let bytes = self
             .store
             .read_one_range(&self.path, 0..end)
@@ -1519,6 +1577,25 @@ impl TableStore {
         Ok(ExternalBlobPreflight {
             by_input: Arc::new(by_input),
         })
+    }
+
+    /// One whole external object for a `load csv` statement: authorized by
+    /// the graph's external Blob policy, its size checked against `max_bytes`
+    /// before any payload byte is read, then read in full. Shares the
+    /// preflight the Blob ingress path runs, so every refusal the policy
+    /// knows (`Deny`, a URI outside every base, a `file://` target escaping
+    /// its base) is the same refusal here.
+    pub(crate) async fn read_external_object(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+        resource: &'static str,
+    ) -> Result<Arc<[u8]>> {
+        let preflight = self.preflight_external_blob_uri_iter(1, [uri]).await?;
+        let entry = preflight.by_input.get(uri).ok_or_else(|| {
+            OmniError::manifest_internal("external object preflight dropped its one input")
+        })?;
+        entry.read_full_bounded(max_bytes, resource).await
     }
 
     // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
@@ -5289,44 +5366,6 @@ impl TableStore {
         has_fts_postings_on(ds, column).await
     }
 
-    /// Metadata-only check (no data IO) of whether the FTS (inverted) index
-    /// entries on `column` together cover EVERY current fragment of `ds`.
-    /// The FTS twin of `dataset_index::key_column_index_coverage`, consumed as a
-    /// correctness fence by the rrf prefilter gate: rows in fragments no
-    /// entry covers are scored by a filter-dependent batch-derived scorer
-    /// instead of the index-global BM25 statistics (lance
-    /// `inverted/index.rs`), so a prefilter mask would change their scores
-    /// and the gate's two plans would stop being answer-identical.
-    /// Coverage is the UNION across same-column entries: index optimization
-    /// creates delta entries each covering a disjoint fragment subset, and
-    /// demanding one all-covering entry would permanently disable the
-    /// prefilter plan on exactly the append + optimize maintenance schedule
-    /// production tables follow. `false` is always safe — the gate then
-    /// runs the postfilter plan — so every unprovable case (no FTS index,
-    /// an entry without a fragment bitmap) contributes nothing.
-    pub(crate) async fn fts_covers_all_fragments(ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = user_indices_for_column(ds, column).await?;
-        let fts_bitmaps: Vec<_> = indices
-            .iter()
-            .filter(|index| {
-                index
-                    .index_details
-                    .as_ref()
-                    .map(|details| IndexDetails(details.clone()).supports_fts())
-                    .unwrap_or(false)
-            })
-            .filter_map(|index| index.fragment_bitmap.as_ref())
-            .collect();
-        if fts_bitmaps.is_empty() {
-            return Ok(false);
-        }
-        Ok(ds.fragments().iter().all(|f| {
-            fts_bitmaps
-                .iter()
-                .any(|bitmap| bitmap.contains(f.id as u32))
-        }))
-    }
-
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_vector_index_on(ds, column).await
     }
@@ -7606,6 +7645,27 @@ mod tests {
         let first = preflight.entry(&uris[0]).unwrap();
         let second = preflight.entry(&uris[1]).unwrap();
         assert!(Arc::ptr_eq(first, second));
+
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"payload changed").unwrap();
+        std::fs::rename(&replacement, &object).unwrap();
+        assert_eq!(
+            first
+                .read_full_bounded(15, "csv_source_bytes")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"payload changed",
+            "the complete replacement must be read, never the prefix at the preflight size"
+        );
+
+        std::fs::write(&replacement, b"payload changed!").unwrap();
+        std::fs::rename(&replacement, &object).unwrap();
+        assert!(matches!(
+            first.read_full_bounded(15, "csv_source_bytes").await.unwrap_err(),
+            OmniError::ResourceLimitExceeded { ref resource, limit: 15, actual: 16 }
+                if resource == "csv_source_bytes"
+        ));
     }
 
     #[test]

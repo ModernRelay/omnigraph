@@ -1071,6 +1071,57 @@ pub(crate) fn print_profile_detail(detail: &ProfileDetail, json: bool) -> Result
     Ok(())
 }
 
+/// What this binary speaks, learned without contacting a server: the
+/// `omnigraph-http-api` value a server must match exactly, and the storage
+/// formats it writes and serves.
+#[derive(Debug, Serialize)]
+pub(crate) struct VersionOutput {
+    pub(crate) version: &'static str,
+    pub(crate) http_contract: &'static str,
+    pub(crate) internal_schema: InternalSchemaOutput,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct InternalSchemaOutput {
+    /// The stamp this binary's publications write.
+    pub(crate) writes: u32,
+    /// The inclusive range of stamps normal open serves, lowest first.
+    pub(crate) serves: [u32; 2],
+}
+
+impl VersionOutput {
+    pub(crate) fn current() -> Self {
+        use omnigraph::db::manifest::{
+            INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        };
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
+            internal_schema: InternalSchemaOutput {
+                writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
+                serves: [
+                    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+                    INTERNAL_MANIFEST_SCHEMA_VERSION,
+                ],
+            },
+        }
+    }
+}
+
+pub(crate) fn print_version(output: &VersionOutput, json: bool) -> Result<()> {
+    if json {
+        return print_json(output);
+    }
+    let [lowest, highest] = output.internal_schema.serves;
+    println!("omnigraph {}", output.version);
+    println!(
+        "internal-schema {} (serves v{lowest} to v{highest})",
+        output.internal_schema.writes
+    );
+    println!("http-contract {}", output.http_contract);
+    Ok(())
+}
+
 /// Table prefs cascade (RFC-011): operator defaults.table_* > built-in.
 pub(crate) fn resolve_table_render_options() -> ReadRenderOptions {
     let operator = crate::operator::load_operator_config().unwrap_or_default();
@@ -1355,6 +1406,140 @@ impl CommitChangesHumanStream {
         io::stdout().flush()?;
         Ok(())
     }
+}
+
+/// The endpoints a graph diff page names; every page of one auto-paginated
+/// diff must name the same ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DiffEndpointsHeader {
+    from_commit_id: String,
+    to_commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_commit_id: Option<String>,
+}
+
+impl DiffEndpointsHeader {
+    fn of(page: &omnigraph_api_types::DiffOutput) -> Self {
+        Self {
+            from_commit_id: page.from_commit_id.clone(),
+            to_commit_id: page.to_commit_id.clone(),
+            base_commit_id: page.base_commit_id.clone(),
+        }
+    }
+}
+
+fn print_diff_endpoints_human(header: &DiffEndpointsHeader) {
+    if let Some(base_commit_id) = &header.base_commit_id {
+        println!("merge_base: {base_commit_id}");
+    }
+    println!("from: {}", header.from_commit_id);
+    println!("to: {}", header.to_commit_id);
+}
+
+pub(crate) fn print_diff_human(page: &omnigraph_api_types::DiffOutput) {
+    print_diff_endpoints_human(&DiffEndpointsHeader::of(page));
+    for change in &page.changes {
+        print_entity_change_row(change);
+    }
+    if let Some(next_page_token) = &page.next_page_token {
+        println!("next_page_token: {}", next_page_token);
+    }
+}
+
+/// Incremental JSON rendering for an auto-paginated graph diff: the endpoint
+/// fields once, then one open `changes` array, each change serialized as its
+/// page arrives.
+pub(crate) struct DiffJsonStream<W: Write> {
+    writer: W,
+    header: Option<DiffEndpointsHeader>,
+    first_change: bool,
+}
+
+impl<W: Write> DiffJsonStream<W> {
+    pub(crate) fn new(writer: W) -> Self {
+        Self {
+            writer,
+            header: None,
+            first_change: true,
+        }
+    }
+
+    pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
+        let header = DiffEndpointsHeader::of(page);
+        match &self.header {
+            None => {
+                self.writer.write_all(b"{\n  \"from_commit_id\": ")?;
+                serde_json::to_writer(&mut self.writer, &header.from_commit_id)?;
+                self.writer.write_all(b",\n  \"to_commit_id\": ")?;
+                serde_json::to_writer(&mut self.writer, &header.to_commit_id)?;
+                if let Some(base_commit_id) = &header.base_commit_id {
+                    self.writer.write_all(b",\n  \"base_commit_id\": ")?;
+                    serde_json::to_writer(&mut self.writer, base_commit_id)?;
+                }
+                self.writer.write_all(b",\n  \"changes\": [")?;
+                self.header = Some(header);
+            }
+            Some(seen) if seen == &header => {}
+            Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
+        }
+        for change in &page.changes {
+            if !self.first_change {
+                self.writer.write_all(b",")?;
+            }
+            self.writer.write_all(b"\n    ")?;
+            write_pretty_inline(&mut self.writer, change, 4)?;
+            self.first_change = false;
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<W> {
+        if self.header.is_none() {
+            bail!("diff auto-pagination completed without a page");
+        }
+        if self.first_change {
+            self.writer.write_all(b"]\n}\n")?;
+        } else {
+            self.writer.write_all(b"\n  ]\n}\n")?;
+        }
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+
+/// Incremental human rendering for an auto-paginated graph diff.
+pub(crate) struct DiffHumanStream {
+    header: Option<DiffEndpointsHeader>,
+}
+
+impl DiffHumanStream {
+    pub(crate) fn new() -> Self {
+        Self { header: None }
+    }
+
+    pub(crate) fn write_page(&mut self, page: &omnigraph_api_types::DiffOutput) -> Result<()> {
+        let header = DiffEndpointsHeader::of(page);
+        match &self.header {
+            None => {
+                print_diff_endpoints_human(&header);
+                self.header = Some(header);
+            }
+            Some(seen) if seen == &header => {}
+            Some(_) => bail!("diff continuation changed its endpoints while auto-paginating"),
+        }
+        for change in &page.changes {
+            print_entity_change_row(change);
+        }
+        io::stdout().flush()?;
+        Ok(())
+    }
+}
+
+pub(crate) fn print_merge_base_human(output: &omnigraph_api_types::MergeBaseOutput) {
+    println!("merge_base: {}", output.merge_base.graph_commit_id);
+    println!("source: {} at {}", output.source, output.source_commit_id);
+    println!("target: {} at {}", output.target, output.target_commit_id);
 }
 
 /// Incremental JSON rendering for one auto-paginated feed poll.

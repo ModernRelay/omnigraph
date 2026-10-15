@@ -360,6 +360,7 @@ async fn hydrate(
             &dataset,
             declared,
             &binding.table.type_key,
+            plan.snapshot.contract_covers(&binding.table.type_key),
             properties.iter().copied(),
         )
         .map_err(external)?;

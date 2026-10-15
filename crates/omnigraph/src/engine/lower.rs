@@ -60,8 +60,9 @@ pub(super) struct Lowered {
     pub(super) root: Plan,
     /// The one operator of every live node, the tree `root` heads.
     pub(super) operators: HashMap<NodeId, Plan>,
-    /// What the ranked scan reported in this pass, for the overfetch ladder.
-    pub(super) report: Arc<Mutex<ScanReport>>,
+    /// What each nearest scan reported in this pass, by plan node: the
+    /// overfetch ladder's input and the run's probe decisions.
+    pub(super) report: Arc<Mutex<ScanReports>>,
     /// The in-memory filter applications of the tree, one per conjunct.
     in_memory_filters: usize,
 }
@@ -161,6 +162,7 @@ impl<'a> Lowering<'a> {
                     None => ranked.nprobes,
                 };
                 mode.nearest_exact = rung.is_some_and(|rung| rung.exact);
+                mode.nearest_policy = ranked.policy;
             }
             RankKind::Bm25 => {
                 let text = resolve_to_string(&ranked.query, self.params())?;
@@ -168,6 +170,8 @@ impl<'a> Lowering<'a> {
                     property: ranked.property.clone(),
                     text,
                 });
+                mode.eligibility_after_scoring =
+                    ranked.eligibility == omnigraph_planner::Eligibility::AfterScoring;
             }
         }
         Ok(mode)
@@ -362,7 +366,7 @@ struct Walk<'l, 'a> {
     lowering: &'l Lowering<'a>,
     pass: &'l Pass,
     scope: Scope,
-    report: Arc<Mutex<ScanReport>>,
+    report: Arc<Mutex<ScanReports>>,
     outers: Vec<OuterScope>,
     operators: HashMap<NodeId, Plan>,
     in_memory_filters: usize,
@@ -388,7 +392,7 @@ impl<'l, 'a> Walk<'l, 'a> {
                 }),
                 ctx: Arc::new(ProjectionContext::for_plan(lowering.catalog, lowering.plan)),
             },
-            report: Arc::new(Mutex::new(ScanReport::default())),
+            report: Arc::new(Mutex::new(ScanReports::new())),
             outers: Vec::new(),
             operators: HashMap::new(),
             in_memory_filters: 0,
@@ -520,6 +524,7 @@ impl Lower for Walk<'_, '_> {
                 ScanSource::Table {
                     mode: Box::new(mode),
                     report: Arc::clone(&self.report),
+                    node: id,
                 }
             }
             _ => {
@@ -896,6 +901,7 @@ impl Lower for Walk<'_, '_> {
                 (
                     IRExpr::Aggregate {
                         func,
+                        distinct,
                         arg,
                         signature,
                     },
@@ -959,6 +965,7 @@ impl Lower for Walk<'_, '_> {
                     let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
                         .schema(Arc::clone(&input_schema))
                         .alias(name)
+                        .with_distinct(*distinct)
                         .build()
                         .map(Arc::new)
                         .map_err(OmniError::datafusion)?;
@@ -1260,11 +1267,20 @@ pub(super) fn in_order(batch: RecordBatch, names: &[String]) -> Result<RecordBat
     batch.project(&indices).map_err(OmniError::arrow_internal)
 }
 
-/// The return's column names in return order, for the root of `plan`.
+/// The return's column names in return order when the result node under the
+/// root's sort and limit is an `Aggregate`; a `Projection` root, including one
+/// above an aggregate, already emits its columns in order.
 pub(super) fn return_order(plan: &PhysicalPlan) -> Option<Vec<String>> {
-    let returns = plan.live().find_map(|(_, node)| match node {
-        PhysicalNode::Aggregate { return_exprs, .. } => Some(return_exprs),
-        _ => None,
-    })?;
-    Some(returns.iter().map(return_name).collect())
+    let mut id = plan.root();
+    loop {
+        match plan.node(id)? {
+            PhysicalNode::Sort { input, .. }
+            | PhysicalNode::Limit { input, .. }
+            | PhysicalNode::Page { input, .. } => id = *input,
+            PhysicalNode::Aggregate { return_exprs, .. } => {
+                return Some(return_exprs.iter().map(return_name).collect());
+            }
+            _ => return None,
+        }
+    }
 }

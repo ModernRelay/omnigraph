@@ -101,6 +101,7 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
         "malformed-token",
         "wrong-actor",
         "wrong-expiry",
+        "wrong-organization",
     ] {
         let mut cached = credential(&context, "https://data.example");
         expire_identity(&mut cached);
@@ -108,6 +109,16 @@ async fn acquisition_preserves_explicit_target_priority_and_refuses_retired_cred
             "retired-cache" => cached.version = 1,
             "malformed-token" => cached.token = DATA_TOKEN.into(),
             "wrong-actor" => cached.actor = "principal:other".into(),
+            "wrong-organization" => {
+                cached = credential(
+                    &Context {
+                        organization_id: "org_other".into(),
+                        ..context.clone()
+                    },
+                    "https://data.example",
+                );
+                expire_identity(&mut cached);
+            }
             "wrong-expiry" => {
                 cached.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(60))
                     .format(&Rfc3339)
@@ -218,7 +229,8 @@ async fn acquisition_never_reuses_another_principal_or_accepts_a_wrong_issued_id
 
 fn context() -> Context {
     Context {
-        version: 1,
+        version: 2,
+        organization_id: "org_test".into(),
         cluster: "cluster-a".into(),
         api: "https://control.example".into(),
     }
@@ -233,7 +245,7 @@ fn identity_credential(context: &Context, endpoint: &str) -> Credential {
     let kid = "a".repeat(64);
     let header = json!({"typ":"JWT","alg":"ES256","kid":kid});
     let claims = json!({"version":2,"iss":context.api,"aud":format!("urn:omnigraph:data:{}", context.cluster),
-        "sub":"alice","account_id":"account-a","cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
+        "sub":"alice","account_id":context.organization_id,"cluster_id":context.cluster,"cluster_incarnation":"incarnation-a",
         "principal_kind":"human","assurance":"verified_human","iat":now,"exp":now+3600,"jti":"test-credential"});
     Credential {
         version: 2,
@@ -620,11 +632,20 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
         "incarnation",
         "endpoint",
         "token",
+        "organization",
     ] {
         let mut context = context();
         let cp = IntentApiFixture::with_origin(|origin| {
             context.api = origin.to_owned();
-            let credential = identity_credential(&context, "https://data.example");
+            let credential_context = if field == "organization" {
+                Context {
+                    organization_id: "org_other".into(),
+                    ..context.clone()
+                }
+            } else {
+                context.clone()
+            };
+            let credential = identity_credential(&credential_context, "https://data.example");
             let mut response = credential.metadata();
             response["token"] = json!(credential.token);
             let mut envelope = json!({"data":response,"meta":{"cluster_id":context.cluster,"incarnation":"incarnation-a"}});
@@ -637,6 +658,7 @@ async fn identity_issuance_rejects_wrong_profile_and_authority_without_cache_rep
                     envelope["data"]["endpoint"] = json!("https://user:password@data.example/path")
                 }
                 "token" => envelope["data"]["token"] = json!("x".repeat(MAX_TOKEN + 1)),
+                "organization" => {}
                 _ => envelope["meta"]["incarnation"] = json!("other"),
             }
             vec![IntentReply::json(200, envelope)]
@@ -1252,7 +1274,8 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     let batch = dir.path().join("batch.jsonl");
     let ndjson = "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n{\"type\":\"Person\",\"data\":{\"name\":\"Grace\"}}\n";
     std::fs::write(&batch, ndjson).unwrap();
-    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true});
+    let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true,
+        "kind":"published","root_commit_id":null});
     let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.

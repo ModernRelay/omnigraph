@@ -1,0 +1,111 @@
+# issue: none
+# notes: Reviewing a branch with the branch control reads (RFC 0030 §8): the merge base, the branch diff
+# notes: from it to the source head, the two-point diff of the heads, and a dry run that writes nothing.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+query insert_fork() {
+    insert Person { name: "fork", age: 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $fork
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query age_alice() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query insert_carol() {
+    insert Person { name: "carol", age: 22 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $carol
+
+--- mutate
+query insert_dave() {
+    insert Person { name: "dave", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $dave
+
+--- query
+branch merge-base feature
+
+--- expect ordered
+{"source": "feature", "target": "main", "source_commit_id": "${carol}", "target_commit_id": "${dave}", "merge_base_commit_id": "${fork}"}
+
+--- query
+branch diff feature into main
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
+{"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
+
+--- query
+branch diff main to feature
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"alice","op":"update","before":{"properties":{"name":"alice","age":30}},"after":{"properties":{"name":"alice","age":31}}}
+{"kind":"node","type":"Person","id":"carol","op":"insert","after":{"properties":{"name":"carol","age":22}}}
+{"kind":"node","type":"Person","id":"dave","op":"delete","before":{"properties":{"name":"dave","age":50}}}
+
+--- query
+branch diff "${fork}" to main
+
+--- expect ordered
+{"kind":"node","type":"Person","id":"dave","op":"insert","after":{"properties":{"name":"dave","age":50}}}
+
+--- query
+branch merge feature dry run
+
+--- expect ordered
+{"source": "feature", "target": "main", "outcome": "merged"}
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "dave"}
+{"p.name": "fork"}
+
+--- expect shape
+p.name: String

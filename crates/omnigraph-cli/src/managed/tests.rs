@@ -28,7 +28,7 @@ fn origins_are_canonical_and_credentials_cannot_change_destination() {
 }
 
 #[test]
-fn managed_outcomes_preserve_public_exit_contract() {
+fn lifecycle_outcomes_preserve_public_exit_contract() {
     for (state, expected) in [
         ("converged", 0),
         ("failed", 1),
@@ -39,12 +39,12 @@ fn managed_outcomes_preserve_public_exit_contract() {
         ("stalled", 5),
         ("cancelled", 6),
     ] {
-        assert_eq!(outcome_exit(state).unwrap(), Some(expected));
+        assert_eq!(lifecycle::outcome_exit(state).unwrap(), Some(expected));
     }
     for state in ["proposed", "offered", "running"] {
-        assert_eq!(outcome_exit(state).unwrap(), None);
+        assert_eq!(lifecycle::outcome_exit(state).unwrap(), None);
     }
-    assert!(outcome_exit("done").is_err());
+    assert!(lifecycle::outcome_exit("done").is_err());
 }
 
 #[test]
@@ -86,7 +86,8 @@ fn legacy_login_and_managed_login_are_exclusive() {
 fn contexts_are_exact_and_cannot_hide_unknown_authority() {
     let dir = tempfile::tempdir().unwrap();
     let context = Context {
-        version: 1,
+        version: 2,
+        organization_id: "org_test".into(),
         cluster: "cluster-a".into(),
         api: "https://control.example".into(),
     };
@@ -200,6 +201,8 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         assert_eq!(output.body["type"], kind);
     }
     for args in [
+        vec!["cluster", "list", "--api", "https://control.example"],
+        vec!["cluster", "pull", "--out", "checkout"],
         vec![
             "cluster",
             "create",
@@ -260,6 +263,22 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
         assert!(parse_cluster(&args).is_err(), "accepted {args:?}");
     }
     for args in [
+        vec![
+            "omnigraph",
+            "cluster",
+            "list",
+            "--managed",
+            "--api",
+            "https://control.example",
+        ],
+        vec![
+            "omnigraph",
+            "cluster",
+            "pull",
+            "--managed",
+            "--out",
+            "checkout",
+        ],
         vec!["omnigraph", "cluster", "operation", "op-id", "--managed"],
         vec![
             "omnigraph",
@@ -277,8 +296,112 @@ async fn managed_flag_is_explicit_and_local_commands_ignore_context() {
             "--plan",
             "saved-plan",
         ],
-        vec!["omnigraph", "cluster", "status", "--managed", "run-id"],
+        vec!["omnigraph", "cluster", "status", "--managed", "delivery-id"],
+        vec![
+            "omnigraph",
+            "cluster",
+            "status",
+            "--managed",
+            "delivery-id",
+            "--wait",
+            "--timeout",
+            "1",
+        ],
     ] {
         assert!(parse_cluster(&args).is_ok(), "refused {args:?}");
+    }
+}
+
+#[test]
+fn organization_selection_is_explicit_or_pinned_to_the_exact_folder() {
+    let context = Context {
+        version: 2,
+        cluster: "one".into(),
+        api: "https://api.example".into(),
+        organization_id: "org_one".into(),
+    };
+    assert_eq!(
+        selected_organization(Some(&context), &context.api, None).unwrap(),
+        Some("org_one")
+    );
+    assert_eq!(
+        selected_organization(Some(&context), &context.api, Some("org_one")).unwrap(),
+        Some("org_one")
+    );
+    assert!(selected_organization(Some(&context), &context.api, Some("org_two")).is_err());
+    assert!(selected_organization(Some(&context), "https://other.example", None).is_err());
+    assert!(selected_organization(None, &context.api, Some("../org")).is_err());
+    let dir = tempfile::tempdir().unwrap();
+    save_context(dir.path(), &context).unwrap();
+    let path = dir.path().join(".omnigraph/context");
+    for text in [
+        "version: 1\ncluster: one\napi: https://api.example\n",
+        "version: 2\ncluster: one\napi: https://api.example\n",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert!(read_context(dir.path()).is_err());
+    }
+    for args in [
+        vec!["login", "--api", &context.api, "--organization", "org_one"],
+        vec!["logout", "--api", &context.api, "--organization", "org_one"],
+        vec![
+            "use",
+            "one",
+            "--api",
+            &context.api,
+            "--organization",
+            "org_one",
+        ],
+        vec![
+            "cluster",
+            "create",
+            "one",
+            "--managed",
+            "--api",
+            &context.api,
+            "--organization",
+            "org_one",
+        ],
+        vec![
+            "cluster",
+            "operation",
+            "one",
+            "--managed",
+            "--api",
+            &context.api,
+            "--organization",
+            "org_one",
+        ],
+    ] {
+        assert!(
+            parse_cluster(&std::iter::once("omnigraph").chain(args).collect::<Vec<_>>()).is_ok()
+        );
+    }
+    assert!(
+        Cli::try_parse_from(["omnigraph", "login", "named", "--organization", "org_one"]).is_err()
+    );
+}
+
+#[test]
+fn explicit_session_selection_ignores_old_or_foreign_folder_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".omnigraph")).unwrap();
+    for text in [
+        "version: 1\ncluster: old\napi: https://old.example\n",
+        "version: 2\ncluster: old\napi: https://old.example\norganization_id: org_other\n",
+        "invalid: [",
+    ] {
+        std::fs::write(dir.path().join(".omnigraph/context"), text).unwrap();
+        assert_eq!(
+            session_organization(dir.path(), "https://new.example", Some("org_new"))
+                .unwrap()
+                .as_deref(),
+            Some("org_new")
+        );
+        assert!(session_organization(dir.path(), "https://new.example", None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".omnigraph/context")).unwrap(),
+            text
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::helpers;
 
-use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
+use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -42,7 +42,7 @@ async fn head_commit_id(uri: &str, branch: Option<&str>) -> String {
     commit_graph.head_commit_id().await.unwrap().unwrap()
 }
 
-fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, String, ChangeOp)> {
+fn change_tuples(change_set: &NetDiff) -> Vec<(String, String, ChangeOpKind)> {
     let mut tuples: Vec<_> = change_set
         .changes
         .iter()
@@ -51,14 +51,14 @@ fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, Str
     tuples.sort_by(|a, b| {
         a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| {
             let a_op = match a.2 {
-                ChangeOp::Insert => 0,
-                ChangeOp::Update => 1,
-                ChangeOp::Delete => 2,
+                ChangeOpKind::Insert => 0,
+                ChangeOpKind::Update => 1,
+                ChangeOpKind::Delete => 2,
             };
             let b_op = match b.2 {
-                ChangeOp::Insert => 0,
-                ChangeOp::Update => 1,
-                ChangeOp::Delete => 2,
+                ChangeOpKind::Insert => 0,
+                ChangeOpKind::Update => 1,
+                ChangeOpKind::Delete => 2,
             };
             a_op.cmp(&b_op)
         })
@@ -89,21 +89,18 @@ async fn write_receipts_identify_exact_commits_and_mutation_noops() {
     assert_eq!(stored.graph_commit_id, commit.graph_commit_id);
     assert_eq!(stored.graph_manifest_version, commit.graph_manifest_version);
 
-    let changes = db
-        .diff_commits(
-            commit.parent_commit_id.as_deref().unwrap(),
-            &commit.graph_commit_id,
-            &ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        changes.to_graph_manifest_version,
-        commit.graph_manifest_version
-    );
+    let changes = graph_diff(
+        &db,
+        commit.parent_commit_id.as_deref().unwrap(),
+        &commit.graph_commit_id,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(changes.to_commit_id, commit.graph_commit_id);
     assert_eq!(
         change_tuples(&changes),
-        vec![("node:Person".into(), "Eve".into(), ChangeOp::Insert)]
+        vec![("node:Person".into(), "Eve".into(), ChangeOpKind::Insert)]
     );
 
     let head_before_no_op = snapshot_id(&db, "main").await.unwrap();
@@ -172,12 +169,7 @@ async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let v = snapshot_id(&db, "main").await.unwrap();
-    let cs = db
-        .diff_between(
-            ReadTarget::Snapshot(v.clone()),
-            ReadTarget::Snapshot(v),
-            &ChangeFilter::default(),
-        )
+    let cs = graph_diff(&db, v.as_str(), v.as_str(), &ChangeFeedScope::default())
         .await
         .unwrap();
     assert!(cs.changes.is_empty());
@@ -187,7 +179,7 @@ async fn diff_empty_when_nothing_changed() {
 }
 
 #[tokio::test]
-async fn diff_pairs_type_renames_by_identity_and_separates_reincarnations() {
+async fn diff_pairs_type_renames_by_identity_and_refuses_reincarnations() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = helpers::session(
@@ -220,14 +212,14 @@ node Anchor { name: String @key }
     .unwrap();
     let after_rename = snapshot_id(&db, "main").await.unwrap();
 
-    let rename_diff = db
-        .diff_between(
-            ReadTarget::Snapshot(before_rename),
-            ReadTarget::Snapshot(after_rename.clone()),
-            &ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let rename_diff = graph_diff(
+        &db,
+        before_rename.as_str(),
+        after_rename.as_str(),
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         rename_diff.changes.is_empty(),
         "a pure alias change on one table identity must not become delete+insert: {:?}",
@@ -255,33 +247,18 @@ node Anchor { name: String @key }
     .await
     .unwrap();
 
-    let reincarnation_diff = diff_since_branch(&db, "main", after_rename, &ChangeFilter::default())
+    // Drop/re-add is schema evolution, not entity data (RFC 0030 §4.1): the
+    // old lifetime leaves with Alice still in it, so the pair is a schema
+    // boundary, refused rather than reported as a delete and an insert.
+    match diff_since_branch(&db, "main", after_rename, &ChangeFeedScope::default())
         .await
-        .unwrap();
-    let reincarnation_changes = reincarnation_diff
-        .changes
-        .iter()
-        .map(|change| (change.type_key().clone(), change.id.clone(), change.op))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        reincarnation_changes,
-        vec![
-            (
-                "node:Human".to_string(),
-                "Alice".to_string(),
-                ChangeOp::Delete,
-            ),
-            (
-                "node:Human".to_string(),
-                "Bob".to_string(),
-                ChangeOp::Insert,
-            ),
-        ],
-        "drop/re-add under one alias must visit the old identity before the newly allocated identity"
-    );
-    assert_eq!(reincarnation_diff.stats.deletes, 1);
-    assert_eq!(reincarnation_diff.stats.inserts, 1);
-    assert_eq!(reincarnation_diff.stats.updates, 0);
+        .unwrap_err()
+    {
+        omnigraph::error::OmniError::ChangeSchemaBoundary { type_name, .. } => {
+            assert_eq!(type_name, "Human")
+        }
+        other => panic!("a drop/re-add pair is a schema boundary, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -299,13 +276,13 @@ async fn diff_detects_node_insert() {
     .await
     .unwrap();
 
-    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFeedScope::default())
         .await
         .unwrap();
     let inserts: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Insert && c.type_key() == "node:Person")
+        .filter(|c| c.op == ChangeOpKind::Insert && c.type_key() == "node:Person")
         .collect();
     assert!(
         !inserts.is_empty(),
@@ -320,7 +297,7 @@ async fn diff_detects_node_insert() {
         "Insert should contain Eve. Got: {:?}",
         inserts.iter().map(|c| &c.id).collect::<Vec<_>>()
     );
-    assert_eq!(inserts[0].kind, EntityKind::Node);
+    assert_eq!(inserts[0].kind, ChangeEntityKind::Node);
     assert_eq!(inserts[0].endpoints, None);
 }
 
@@ -339,13 +316,13 @@ async fn diff_detects_node_update() {
     .await
     .unwrap();
 
-    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFeedScope::default())
         .await
         .unwrap();
     let updates: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Update && c.type_key() == "node:Person")
+        .filter(|c| c.op == ChangeOpKind::Update && c.type_key() == "node:Person")
         .collect();
     assert!(
         !updates.is_empty(),
@@ -372,24 +349,40 @@ async fn diff_detects_node_delete_with_cascade() {
     .await
     .unwrap();
 
-    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFeedScope::default())
         .await
         .unwrap();
+    // Multi-type changes follow the frozen block order (RFC 0030 §4.4): nodes
+    // before edges, and each type's changes contiguous, in an order its
+    // opaque identity fixes rather than its name.
     let table_keys = cs
         .changes
         .iter()
         .map(|change| change.type_key())
         .collect::<Vec<_>>();
     assert!(
-        table_keys.windows(2).all(|pair| pair[0] <= pair[1]),
-        "multi-table changes must follow graph-visible table-key order: {table_keys:?}"
+        cs.changes
+            .windows(2)
+            .all(|pair| !(pair[0].kind == ChangeEntityKind::Edge
+                && pair[1].kind == ChangeEntityKind::Node)),
+        "nodes precede edges: {table_keys:?}"
     );
+    let mut seen_types = Vec::new();
+    for key in &table_keys {
+        if seen_types.last() != Some(key) {
+            assert!(
+                !seen_types.contains(key),
+                "one type's changes are contiguous: {table_keys:?}"
+            );
+            seen_types.push(key.clone());
+        }
+    }
 
     // Should have node:Person delete
     let person_deletes: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Delete && c.type_key() == "node:Person")
+        .filter(|c| c.op == ChangeOpKind::Delete && c.type_key() == "node:Person")
         .collect();
     assert!(
         !person_deletes.is_empty(),
@@ -404,7 +397,7 @@ async fn diff_detects_node_delete_with_cascade() {
     let edge_deletes: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Delete && c.type_key() == "edge:Knows")
+        .filter(|c| c.op == ChangeOpKind::Delete && c.type_key() == "edge:Knows")
         .collect();
     assert!(
         !edge_deletes.is_empty(),
@@ -439,14 +432,14 @@ async fn diff_detects_edge_insert_with_endpoints() {
     .await
     .unwrap();
 
-    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFeedScope::default())
         .await
         .unwrap();
 
     let edge_inserts: Vec<_> = cs
         .changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Insert && c.type_key() == "edge:Knows")
+        .filter(|c| c.op == ChangeOpKind::Insert && c.type_key() == "edge:Knows")
         .collect();
     assert!(
         !edge_inserts.is_empty(),
@@ -458,7 +451,7 @@ async fn diff_detects_edge_insert_with_endpoints() {
     );
 
     let e = &edge_inserts[0];
-    assert_eq!(e.kind, EntityKind::Edge);
+    assert_eq!(e.kind, ChangeEntityKind::Edge);
     let ep = e
         .endpoints
         .as_ref()
@@ -486,7 +479,7 @@ async fn filter_by_type_name_skips_non_matching() {
     .unwrap();
 
     // Filter to Company only — should not see Person changes
-    let filter = ChangeFilter {
+    let filter = ChangeFeedScope {
         type_names: Some(vec!["Company".to_string()]),
         ..Default::default()
     };
@@ -529,8 +522,8 @@ async fn filter_by_op_skips_unwanted_operations() {
     .unwrap();
 
     // Filter to Insert only
-    let filter = ChangeFilter {
-        ops: Some(vec![ChangeOp::Insert]),
+    let filter = ChangeFeedScope {
+        ops: Some(vec![ChangeOpKind::Insert]),
         ..Default::default()
     };
     let cs = diff_since_branch(&db, "main", v_before, &filter)
@@ -541,7 +534,7 @@ async fn filter_by_op_skips_unwanted_operations() {
     for c in &cs.changes {
         assert_eq!(
             c.op,
-            ChangeOp::Insert,
+            ChangeOpKind::Insert,
             "Filter for Insert-only should not include {:?} for {} ({})",
             c.op,
             c.type_key(),
@@ -588,7 +581,7 @@ async fn diff_after_merge_reports_actual_changes() {
     assert_eq!(outcome.outcome, MergeOutcome::Merged);
 
     // Diff from pre-branch to post-merge on main
-    let cs = diff_since_branch(&main, "main", v_before_branch, &ChangeFilter::default())
+    let cs = diff_since_branch(&main, "main", v_before_branch, &ChangeFeedScope::default())
         .await
         .unwrap();
 
@@ -604,11 +597,11 @@ async fn diff_after_merge_reports_actual_changes() {
 
     let person_inserts: Vec<_> = person_changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Insert)
+        .filter(|c| c.op == ChangeOpKind::Insert)
         .collect();
     let person_updates: Vec<_> = person_changes
         .iter()
-        .filter(|c| c.op == ChangeOp::Update)
+        .filter(|c| c.op == ChangeOpKind::Update)
         .collect();
 
     // There should be exactly 1 insert (Eve) not all persons
@@ -628,7 +621,7 @@ async fn diff_after_merge_reports_actual_changes() {
 }
 
 #[tokio::test]
-async fn diff_commits_resolves_feature_commit_from_main_handle() {
+async fn graph_diff_resolves_feature_commit_from_main_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -662,14 +655,18 @@ async fn diff_commits_resolves_feature_commit_from_main_handle() {
         .unwrap()
         .graph_commit_id;
 
-    let cs = main
-        .diff_commits(&main_head, &feature_head, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let cs = graph_diff(
+        &main,
+        &main_head,
+        &feature_head,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         cs.changes
             .iter()
-            .any(|change| change.op == ChangeOp::Insert && change.id == "Eve"),
+            .any(|change| change.op == ChangeOpKind::Insert && change.id == "Eve"),
         "expected feature-only insert to be diffable from a main handle"
     );
 }
@@ -709,24 +706,23 @@ async fn cross_branch_diff_honors_insert_only_filter() {
         .unwrap()
         .graph_commit_id;
 
-    let filter = ChangeFilter {
-        ops: Some(vec![ChangeOp::Insert]),
+    let filter = ChangeFeedScope {
+        ops: Some(vec![ChangeOpKind::Insert]),
         ..Default::default()
     };
-    let cs = main
-        .diff_commits(&main_head, &feature_head, &filter)
+    let cs = graph_diff(&main, &main_head, &feature_head, &filter)
         .await
         .unwrap();
     assert!(!cs.changes.is_empty());
     assert!(
         cs.changes
             .iter()
-            .all(|change| change.op == ChangeOp::Insert)
+            .all(|change| change.op == ChangeOpKind::Insert)
     );
 }
 
 #[tokio::test]
-async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
+async fn graph_diff_resolves_commits_across_branches_from_any_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -745,18 +741,28 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let from_main = main
-        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
-    let from_feature = feature
-        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let from_main = graph_diff(
+        &main,
+        &base_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
+    let from_feature = graph_diff(
+        &feature,
+        &base_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(change_tuples(&from_main), change_tuples(&from_feature));
     assert!(from_main.changes.iter().any(|change| {
-        change.type_key() == "node:Person" && change.id == "Eve" && change.op == ChangeOp::Insert
+        change.type_key() == "node:Person"
+            && change.id == "Eve"
+            && change.op == ChangeOpKind::Insert
     }));
 }
 
@@ -788,8 +794,8 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
     .await
     .unwrap();
 
-    let filter = ChangeFilter {
-        ops: Some(vec![ChangeOp::Delete]),
+    let filter = ChangeFeedScope {
+        ops: Some(vec![ChangeOpKind::Delete]),
         ..Default::default()
     };
     let change_set = diff_since_branch(&feature, "feature", before, &filter)
@@ -804,7 +810,7 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
         change_set
             .changes
             .iter()
-            .all(|change| change.op == ChangeOp::Delete)
+            .all(|change| change.op == ChangeOpKind::Delete)
     );
 }
 
@@ -827,16 +833,18 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
     .await
     .unwrap();
 
-    let change_set = diff_since_branch(&feature, "feature", before, &ChangeFilter::default())
+    let change_set = diff_since_branch(&feature, "feature", before, &ChangeFeedScope::default())
         .await
         .unwrap();
     assert!(change_set.changes.iter().any(|change| {
-        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+        change.type_key() == "node:Person"
+            && change.id == "Bob"
+            && change.op == ChangeOpKind::Update
     }));
 }
 
 #[tokio::test]
-async fn diff_commits_cross_branch_reports_property_only_updates() {
+async fn graph_diff_cross_branch_reports_property_only_updates() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -855,21 +863,29 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
     .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let change_set = main
-        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let change_set = graph_diff(
+        &main,
+        &base_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
 
     assert!(change_set.changes.iter().any(|change| {
-        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+        change.type_key() == "node:Person"
+            && change.id == "Bob"
+            && change.op == ChangeOpKind::Update
     }));
     assert!(!change_set.changes.iter().any(|change| {
-        change.type_key() == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Insert
+        change.type_key() == "node:Person"
+            && change.id == "Bob"
+            && change.op == ChangeOpKind::Insert
     }));
 }
 
 #[tokio::test]
-async fn diff_commits_ignores_row_version_only_differences() {
+async fn graph_diff_ignores_row_version_only_differences() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = init_and_load(&dir).await;
@@ -898,10 +914,14 @@ async fn diff_commits_ignores_row_version_only_differences() {
     .unwrap();
     let main_commit = head_commit_id(uri, None).await;
 
-    let change_set = main
-        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let change_set = graph_diff(
+        &main,
+        &main_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         change_set.changes.is_empty(),
@@ -949,14 +969,18 @@ query set_body($slug: String, $body: String) {
     .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let change_set = db
-        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let change_set = graph_diff(
+        &db,
+        &main_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         change_set.changes.iter().any(|change| {
-            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOpKind::Update
         }),
         "null → empty-string must surface as an update, not be conflated: {:?}",
         change_set.changes
@@ -1000,14 +1024,18 @@ query set_notes($slug: String, $notes: String) {
     .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let change_set = db
-        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let change_set = graph_diff(
+        &db,
+        &main_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         change_set.changes.iter().any(|change| {
-            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOp::Update
+            change.type_key() == "node:Doc" && change.id == "x" && change.op == ChangeOpKind::Update
         }),
         "a change to a legal _row_-prefixed property must be detected: {:?}",
         change_set.changes
@@ -1345,7 +1373,7 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
 
 /// Acceptance #7: the cross-branch net diff shares the same comparator, so a
 /// same-length Blob-only update on a forked branch must surface through
-/// `diff_commits` too.
+/// the graph diff too.
 #[tokio::test]
 async fn cross_branch_diff_detects_same_length_blob_only_update() {
     let dir = tempfile::tempdir().unwrap();
@@ -1372,15 +1400,19 @@ async fn cross_branch_diff_detects_same_length_blob_only_update() {
         .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let change_set = db
-        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
-        .await
-        .unwrap();
+    let change_set = graph_diff(
+        &db,
+        &main_commit,
+        &feature_commit,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         change_set.changes.iter().any(|change| {
             change.type_key() == "node:Document"
                 && change.id == "doc"
-                && change.op == ChangeOp::Update
+                && change.op == ChangeOpKind::Update
         }),
         "cross-branch diff dropped the Blob-only update: {:?}",
         change_set.changes
@@ -1434,15 +1466,14 @@ async fn cross_branch_diff_detects_same_length_blob_update_between_sibling_branc
     .unwrap();
     let b_commit = head_commit_id(uri, Some("branch-b")).await;
 
-    let change_set = db
-        .diff_commits(&a_commit, &b_commit, &ChangeFilter::default())
+    let change_set = graph_diff(&db, &a_commit, &b_commit, &ChangeFeedScope::default())
         .await
         .unwrap();
     assert!(
         change_set.changes.iter().any(|change| {
             change.type_key() == "node:Document"
                 && change.id == "doc"
-                && change.op == ChangeOp::Update
+                && change.op == ChangeOpKind::Update
         }),
         "cross-branch diff dropped the sibling-branch Blob update (branch-local \
          fragment-id collision): {:?}",
@@ -2503,6 +2534,31 @@ node Ghost {
         OmniError::ChangeSchemaBoundary { type_name, .. } => assert_eq!(type_name, "Person"),
         other => panic!("expected a typed schema boundary, got: {other:?}"),
     }
+    // A graph diff whose endpoints straddle the apply refuses the same way:
+    // the gate compares the two endpoints, whatever lies between them.
+    let add_parent = db
+        .get_commit(&add_commit)
+        .await
+        .unwrap()
+        .parent_commit_id
+        .unwrap();
+    match db
+        .diff_page(&omnigraph::changes::GraphDiffRequest {
+            sides: omnigraph::changes::GraphDiffSides::Between {
+                from: add_parent,
+                to: "main".to_string(),
+            },
+            scope: scope.clone(),
+            page_token: None,
+            max_changes: None,
+            max_bytes: None,
+        })
+        .await
+        .unwrap_err()
+    {
+        OmniError::ChangeSchemaBoundary { type_name, .. } => assert_eq!(type_name, "Person"),
+        other => panic!("expected the graph diff's typed schema boundary, got: {other:?}"),
+    }
 
     // The add kept every data file: the fragment holding Alice and Carol
     // physically lacks `note` and `attachment`, and Lance reads both as null
@@ -2607,7 +2663,7 @@ query set_attachment($name: String, $attachment: Blob) {
             ),
         ]
     );
-    let since_add = diff_since_branch(&db, "main", after_add, &ChangeFilter::default())
+    let since_add = diff_since_branch(&db, "main", after_add, &ChangeFeedScope::default())
         .await
         .unwrap();
     assert_eq!(
@@ -2616,17 +2672,17 @@ query set_attachment($name: String, $attachment: Blob) {
             (
                 "node:Person".to_string(),
                 "Alice".to_string(),
-                ChangeOp::Update
+                ChangeOpKind::Update
             ),
             (
                 "node:Person".to_string(),
                 "Bob".to_string(),
-                ChangeOp::Insert
+                ChangeOpKind::Insert
             ),
             (
                 "node:Person".to_string(),
                 "Carol".to_string(),
-                ChangeOp::Update
+                ChangeOpKind::Update
             ),
         ]
     );
@@ -3191,6 +3247,57 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     assert!(
         merge_block.changes.iter().all(|change| change.id != "Bob"),
         "main's own divergence is not re-attributed to the merge commit"
+    );
+
+    // Main merged side in, so the merge base of main into side is the side
+    // head that merge imported, which main's first-parent chain does not
+    // hold: main's feed refuses it as a start, and the branch diff still
+    // reports main's net change since it.
+    let base = main.merge_base("main", "side").await.unwrap();
+    assert_eq!(
+        merge_block.cause.merged_parent_commit_id.as_deref(),
+        Some(base.merge_base.graph_commit_id.as_str()),
+        "the base is the merged parent"
+    );
+    let refused = main
+        .poll_change_feed(feed_request(
+            None,
+            ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                base.merge_base.graph_commit_id.clone(),
+            )),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            omnigraph::error::OmniError::ChangeCursorRejected { reason }
+                if reason.contains("first-parent chain")
+        ),
+        "{refused:?}"
+    );
+    let review = graph_diff_all(
+        &main,
+        omnigraph::changes::GraphDiffSides::Branch {
+            source: "main".to_string(),
+            target: "side".to_string(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        review.base_commit_id.as_deref(),
+        Some(base.merge_base.graph_commit_id.as_str())
+    );
+    assert_eq!(
+        diff_ops(&review.changes),
+        vec![(
+            "Person".to_string(),
+            "Bob".to_string(),
+            omnigraph::changes::ChangeOpKind::Update
+        )],
+        "only main's own divergence is main's change since the base"
     );
 }
 
@@ -3829,7 +3936,7 @@ struct StateAtCommit {
 struct MainHistory {
     commits: Vec<omnigraph::db::GraphCommit>,
     states: Vec<StateAtCommit>,
-    diff: Vec<(String, String, ChangeOp)>,
+    diff: Vec<(String, String, ChangeOpKind)>,
     feed: Vec<omnigraph::changes::GraphChangeBlock>,
 }
 
@@ -3872,14 +3979,14 @@ async fn main_history(db: &Session) -> MainHistory {
         });
     }
     let (newest, oldest) = (commits.first().unwrap(), commits.last().unwrap());
-    let diff = db
-        .diff_commits(
-            &oldest.graph_commit_id,
-            &newest.graph_commit_id,
-            &ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let diff = graph_diff(
+        db,
+        &oldest.graph_commit_id,
+        &newest.graph_commit_id,
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     let feed = db
         .poll_change_feed(feed_request(
             None,
@@ -3945,26 +4052,26 @@ async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreat
     assert_eq!(feature_commits[0].graph_commit_id, feature_head.as_str());
     let feature_head_commit = db.get_commit(feature_head.as_str()).await.unwrap();
     assert_eq!(feature_head_commit, feature_commits[0]);
-    let feature_diff = db
-        .diff_commits(
-            fork_point.as_str(),
-            feature_head.as_str(),
-            &ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let feature_diff = graph_diff(
+        &db,
+        fork_point.as_str(),
+        feature_head.as_str(),
+        &ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         change_tuples(&feature_diff),
         vec![
             (
                 "node:Person".to_string(),
                 "FeatureHead".to_string(),
-                ChangeOp::Insert
+                ChangeOpKind::Insert
             ),
             (
                 "node:Person".to_string(),
                 "OnFeature".to_string(),
-                ChangeOp::Insert
+                ChangeOpKind::Insert
             ),
         ]
     );
@@ -4040,4 +4147,551 @@ async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreat
             "{refused}"
         );
     }
+}
+
+// ─── Graph diff (RFC 0030 §8) ──────────────────────────────────────────────
+
+fn between(from: &str, to: &str) -> omnigraph::changes::GraphDiffSides {
+    omnigraph::changes::GraphDiffSides::Between {
+        from: from.to_string(),
+        to: to.to_string(),
+    }
+}
+
+fn diff_request(
+    sides: omnigraph::changes::GraphDiffSides,
+    page_size: Option<usize>,
+) -> omnigraph::changes::GraphDiffRequest {
+    omnigraph::changes::GraphDiffRequest {
+        sides,
+        scope: omnigraph::changes::ChangeFeedScope::default(),
+        page_token: None,
+        max_changes: page_size,
+        max_bytes: None,
+    }
+}
+
+/// Every page of one graph diff, `page_size` changes at a time. Every page
+/// must name the endpoints the first one resolved.
+async fn graph_diff_all(
+    db: &Omnigraph,
+    sides: omnigraph::changes::GraphDiffSides,
+    page_size: Option<usize>,
+) -> omnigraph::error::Result<omnigraph::changes::GraphDiffPage> {
+    let mut request = diff_request(sides, page_size);
+    let mut all: Option<omnigraph::changes::GraphDiffPage> = None;
+    loop {
+        let page = db.diff_page(&request).await?;
+        let next = page.next_page_token.clone();
+        match all.as_mut() {
+            None => all = Some(page),
+            Some(all) => {
+                assert_eq!(
+                    (&all.from_commit_id, &all.to_commit_id, &all.base_commit_id),
+                    (
+                        &page.from_commit_id,
+                        &page.to_commit_id,
+                        &page.base_commit_id
+                    ),
+                    "every page answers for the first page's endpoints"
+                );
+                all.changes.extend(page.changes);
+            }
+        }
+        match next {
+            Some(token) => request.page_token = Some(token),
+            None => break,
+        }
+    }
+    let mut all = all.expect("a diff has at least one page");
+    all.next_page_token = None;
+    Ok(all)
+}
+
+/// Every change of one commit's own diff, `page_size` at a time.
+async fn commit_changes_all(
+    db: &Omnigraph,
+    commit_id: &str,
+    page_size: Option<usize>,
+) -> Vec<omnigraph::changes::GraphEntityChange> {
+    let scope = omnigraph::changes::ChangeFeedScope::default();
+    let mut changes = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = db
+            .commit_changes_page(commit_id, &scope, token.as_deref(), page_size, None)
+            .await
+            .unwrap();
+        changes.extend(page.block.changes);
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => return changes,
+        }
+    }
+}
+
+fn diff_ops(
+    changes: &[omnigraph::changes::GraphEntityChange],
+) -> Vec<(String, String, omnigraph::changes::ChangeOpKind)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.entity_type.name.clone(),
+                change.id.clone(),
+                change.op,
+            )
+        })
+        .collect()
+}
+
+fn person(name: &str, age: i64) -> omnigraph_compiler::ir::ParamMap {
+    mixed_params(&[("$name", name)], &[("$age", age)])
+}
+
+async fn write_on(
+    db: &Session,
+    branch: &str,
+    query: &str,
+    params: &omnigraph_compiler::ir::ParamMap,
+) -> omnigraph::db::commit_graph::GraphCommit {
+    db.mutate_with_receipt(branch, MUTATION_QUERIES, query, params)
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful write publishes one commit")
+}
+
+/// The graph diff and the commit diff share one definition of a change: from
+/// a commit's first parent to the commit, the graph diff is exactly that
+/// commit's changes without the cause, for node and edge inserts, updates and
+/// deletes and for a merge commit.
+#[tokio::test]
+async fn graph_diff_from_a_commit_parent_is_that_commits_changes() {
+    use omnigraph::changes::ChangeOpKind::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    write_on(&db, "feature", "insert_person", &person("Frank", 60)).await;
+    let mut commits = vec![
+        write_on(&db, "main", "insert_person", &person("Eve", 22)).await,
+        write_on(&db, "main", "set_age", &person("Alice", 31)).await,
+        write_on(
+            &db,
+            "main",
+            "add_friend",
+            &params(&[("$from", "Eve"), ("$to", "Alice")]),
+        )
+        .await,
+        write_on(
+            &db,
+            "main",
+            "remove_friendship",
+            &params(&[("$from", "Bob")]),
+        )
+        .await,
+    ];
+    let merge = db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(merge.outcome, MergeOutcome::Merged);
+    commits.push(merge.commit.expect("a merge publishes one commit"));
+
+    let mut seen_ops = Vec::new();
+    for commit in &commits {
+        let parent = commit.parent_commit_id.clone().unwrap();
+        let diff = graph_diff_all(&db, between(&parent, &commit.graph_commit_id), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(diff.from_commit_id, parent);
+        assert_eq!(diff.to_commit_id, commit.graph_commit_id);
+        assert_eq!(diff.base_commit_id, None);
+        let own = commit_changes_all(&db, &commit.graph_commit_id, Some(1)).await;
+        assert_eq!(diff.changes, own, "commit {}", commit.graph_commit_id);
+        seen_ops.extend(diff_ops(&diff.changes).into_iter().map(|(_, _, op)| op));
+    }
+    for op in [Insert, Update, Delete] {
+        assert!(seen_ops.contains(&op), "the fixture exercises {op:?}");
+    }
+}
+
+/// A graph diff compares its endpoints and never folds history: a reverted
+/// update, an insert later deleted and a delete followed by an equal reinsert
+/// produce nothing, a reinsert with another image is one update, and an
+/// insert later updated is one insert with the final image.
+#[tokio::test]
+async fn graph_diff_reports_the_net_change_over_its_range() {
+    use omnigraph::changes::ChangeOpKind::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    write_on(&db, "main", "insert_person", &person("Hank", 40)).await;
+    write_on(&db, "main", "insert_person", &person("Ivan", 20)).await;
+    let start = snapshot_id(&db, "main").await.unwrap().as_str().to_string();
+
+    write_on(&db, "main", "set_age", &person("Alice", 31)).await;
+    write_on(&db, "main", "set_age", &person("Alice", 30)).await;
+    write_on(&db, "main", "insert_person", &person("Gina", 50)).await;
+    write_on(&db, "main", "remove_person", &params(&[("$name", "Gina")])).await;
+    write_on(&db, "main", "remove_person", &params(&[("$name", "Hank")])).await;
+    write_on(&db, "main", "insert_person", &person("Hank", 40)).await;
+    write_on(&db, "main", "remove_person", &params(&[("$name", "Ivan")])).await;
+    write_on(&db, "main", "insert_person", &person("Ivan", 21)).await;
+    write_on(&db, "main", "insert_person", &person("Jill", 18)).await;
+    write_on(&db, "main", "set_age", &person("Jill", 19)).await;
+
+    let diff = graph_diff_all(&db, between(&start, "main"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_ops(&diff.changes),
+        vec![
+            ("Person".to_string(), "Ivan".to_string(), Update),
+            ("Person".to_string(), "Jill".to_string(), Insert),
+        ]
+    );
+    let ivan = &diff.changes[0];
+    assert_eq!(ivan.before.as_ref().unwrap().properties["age"], 20);
+    assert_eq!(ivan.after.as_ref().unwrap().properties["age"], 21);
+    let jill = &diff.changes[1];
+    assert!(jill.before.is_none());
+    assert_eq!(jill.after.as_ref().unwrap().properties["age"], 19);
+}
+
+/// The branch form reports what the source changed since its merge base with
+/// the target, the base `branch_merge` classifies against: commits the target
+/// made after the base never appear, and once the target is merged into the
+/// source, only the source's own net changes since that newer base remain.
+#[tokio::test]
+async fn branch_diff_reports_what_the_source_changed_since_its_merge_base() {
+    use omnigraph::changes::ChangeOpKind::*;
+    use omnigraph::changes::GraphDiffSides;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let fork = write_on(&db, "main", "insert_person", &person("Fork", 1)).await;
+    db.branch_create("feature").await.unwrap();
+    write_on(&db, "feature", "set_age", &person("Alice", 31)).await;
+    let feature_head = write_on(&db, "feature", "insert_person", &person("Eve", 22)).await;
+    let main_head = write_on(&db, "main", "insert_person", &person("Zed", 70)).await;
+
+    let base = db.merge_base("feature", "main").await.unwrap();
+    assert_eq!(base.merge_base.graph_commit_id, fork.graph_commit_id);
+    assert_eq!(base.source_commit_id, feature_head.graph_commit_id);
+    assert_eq!(base.target_commit_id, main_head.graph_commit_id);
+
+    let branch = || GraphDiffSides::Branch {
+        source: "feature".to_string(),
+        target: "main".to_string(),
+    };
+    let review = graph_diff_all(&db, branch(), Some(1)).await.unwrap();
+    assert_eq!(
+        review.base_commit_id.as_deref(),
+        Some(fork.graph_commit_id.as_str())
+    );
+    assert_eq!(review.from_commit_id, fork.graph_commit_id);
+    assert_eq!(review.to_commit_id, feature_head.graph_commit_id);
+    let own_changes = vec![
+        ("Person".to_string(), "Alice".to_string(), Update),
+        ("Person".to_string(), "Eve".to_string(), Insert),
+    ];
+    assert_eq!(diff_ops(&review.changes), own_changes);
+
+    // The two-point diff of the heads carries the target's later change
+    // reversed, which is why review has its own form.
+    let heads = graph_diff_all(&db, between("main", "feature"), None)
+        .await
+        .unwrap();
+    assert!(
+        diff_ops(&heads.changes).contains(&("Person".to_string(), "Zed".to_string(), Delete)),
+        "{:?}",
+        diff_ops(&heads.changes)
+    );
+
+    // Merge the target into the source: the base advances to the target head.
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+    let base = db.merge_base("feature", "main").await.unwrap();
+    assert_eq!(base.merge_base.graph_commit_id, main_head.graph_commit_id);
+    let review = graph_diff_all(&db, branch(), None).await.unwrap();
+    assert_eq!(
+        review.base_commit_id.as_deref(),
+        Some(main_head.graph_commit_id.as_str())
+    );
+    assert_eq!(diff_ops(&review.changes), own_changes);
+}
+
+/// Every read target kind resolves: a branch, a published commit, an
+/// unpublished merge proposal and an unattached snapshot. A proposal's own
+/// commit diff is the change its merge would publish, and once the target
+/// head moves the proposal expires: its commit diff and graph diff refuse.
+#[tokio::test]
+async fn graph_diff_resolves_every_read_target_kind() {
+    use omnigraph::changes::ChangeOpKind::*;
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let main_head = snapshot_id(&db, "main").await.unwrap().as_str().to_string();
+    db.branch_create("feature").await.unwrap();
+    let eve = write_on(&db, "feature", "insert_person", &person("Eve", 22)).await;
+    let eve_insert = vec![("Person".to_string(), "Eve".to_string(), Insert)];
+
+    let by_commit = graph_diff_all(&db, between(&main_head, &eve.graph_commit_id), None)
+        .await
+        .unwrap();
+    assert_eq!(diff_ops(&by_commit.changes), eve_insert);
+    let by_branch = graph_diff_all(&db, between("main", "feature"), None)
+        .await
+        .unwrap();
+    assert_eq!(by_branch.changes, by_commit.changes);
+
+    let proposal = db
+        .branch_merge_as_with_options("feature", "main", None, true)
+        .await
+        .unwrap()
+        .commit
+        .expect("a merge as commit records its proposal");
+    assert!(!proposal.published);
+    let proposed = commit_changes_all(&db, &proposal.graph_commit_id, None).await;
+    assert_eq!(diff_ops(&proposed), eve_insert);
+    let to_proposal = graph_diff_all(&db, between("main", &proposal.graph_commit_id), None)
+        .await
+        .unwrap();
+    assert_eq!(to_proposal.changes, proposed);
+
+    let snapshot = db
+        .mutate_with_receipt(
+            "main",
+            r#"
+query insert_root($name: String, $age: I32) as unattached branch {
+    insert Person { name: $name, age: $age }
+}
+"#,
+            "insert_root",
+            &person("Una", 9),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an unattached write reports its snapshot");
+    assert!(!snapshot.published);
+    let to_snapshot = graph_diff_all(&db, between("main", &snapshot.graph_commit_id), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_ops(&to_snapshot.changes),
+        vec![("Person".to_string(), "Una".to_string(), Insert)]
+    );
+
+    // The proposal expires when the target head moves.
+    write_on(&db, "main", "insert_person", &person("Moe", 5)).await;
+    let scope = omnigraph::changes::ChangeFeedScope::default();
+    let error = db
+        .commit_changes_page(&proposal.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expired"), "{error}");
+    match graph_diff_all(&db, between("main", &proposal.graph_commit_id), None)
+        .await
+        .unwrap_err()
+    {
+        OmniError::ReadTargetNotFound { target } => {
+            assert_eq!(target, proposal.graph_commit_id)
+        }
+        other => panic!("expected ReadTargetNotFound, got {other:?}"),
+    }
+}
+
+/// A side that names both a live branch and a commit is refused rather than
+/// resolved by precedence, and a side that names neither is a typed
+/// not-found. The genesis commit id is a bare ULID, which is a legal branch
+/// name.
+#[tokio::test]
+async fn graph_diff_refuses_an_ambiguous_or_unknown_side() {
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let genesis = db
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|commit| commit.parent_commit_id.is_none())
+        .unwrap()
+        .graph_commit_id;
+    // Before the branch exists, the id names only the commit.
+    graph_diff_all(&db, between(&genesis, "main"), None)
+        .await
+        .unwrap();
+
+    db.branch_create(&genesis).await.unwrap();
+    match graph_diff_all(&db, between(&genesis, "main"), None)
+        .await
+        .unwrap_err()
+    {
+        OmniError::AmbiguousReadTarget { target } => assert_eq!(target, genesis),
+        other => panic!("expected AmbiguousReadTarget, got {other:?}"),
+    }
+
+    // A spelling no commit id has skips the commit lookup: an unknown name,
+    // and a malformed `hb1` address, are the same typed not-found.
+    for side in ["no-such-side", "hb1.not.a.commit"] {
+        match graph_diff_all(&db, between("main", side), None)
+            .await
+            .unwrap_err()
+        {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, side),
+            other => panic!("expected ReadTargetNotFound for {side}, got {other:?}"),
+        }
+    }
+
+    // A caller that may read only some branches is asked, side by side, for
+    // the branch each side reads (a branch itself, or a commit's authored
+    // branch) as soon as the side is classified. A refused side is the
+    // not-found of a side that names nothing, and the next side is never
+    // looked at, so an unknown `to` cannot reveal that `from` exists.
+    db.branch_create("feature").await.unwrap();
+    let on_feature = write_on(&db, "feature", "insert_person", &person("Fay", 30)).await;
+    for from in ["feature", on_feature.graph_commit_id.as_str()] {
+        let mut asked = Vec::new();
+        let refused = db
+            .diff_page_readable(
+                &diff_request(between(from, "no-such-side"), None),
+                &mut |branch: &str| {
+                    asked.push(branch.to_string());
+                    branch == "main"
+                },
+            )
+            .await
+            .unwrap_err();
+        match refused {
+            OmniError::ReadTargetNotFound { target } => assert_eq!(target, from),
+            other => panic!("expected ReadTargetNotFound for {from}, got {other:?}"),
+        }
+        assert_eq!(asked, ["feature"], "a refused side ends the resolution");
+    }
+    let mut asked = Vec::new();
+    db.diff_page_readable(
+        &diff_request(between("main", &on_feature.graph_commit_id), None),
+        &mut |branch: &str| {
+            asked.push(branch.to_string());
+            true
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(asked, ["main", "feature"]);
+
+    // A commit whose branch was deleted is no longer readable: it is that
+    // side's not-found, never the branch its record names.
+    db.branch_create("gone").await.unwrap();
+    let on_gone = write_on(&db, "gone", "insert_person", &person("Gil", 31)).await;
+    db.branch_delete("gone").await.unwrap();
+    match graph_diff_all(&db, between(&on_gone.graph_commit_id, "main"), None)
+        .await
+        .unwrap_err()
+    {
+        OmniError::ReadTargetNotFound { target } => assert_eq!(target, on_gone.graph_commit_id),
+        other => panic!("expected ReadTargetNotFound, got {other:?}"),
+    }
+}
+
+/// Continuations answer for the commits the first page resolved, even after
+/// the named branch moves, and a token works only for the sides and filter it
+/// was minted for and never as another continuation kind.
+#[tokio::test]
+async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
+    use omnigraph::changes::{ChangeFeedScope, ChangeOpKind};
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let start = snapshot_id(&db, "main").await.unwrap().as_str().to_string();
+    for i in 0..5 {
+        write_on(&db, "main", "insert_person", &person(&format!("P{i}"), i)).await;
+    }
+    let mut request = diff_request(between(&start, "main"), Some(2));
+    let first = db.diff_page(&request).await.unwrap();
+    assert_eq!(first.changes.len(), 2);
+    let token = first
+        .next_page_token
+        .clone()
+        .expect("five changes, pages of two");
+
+    write_on(&db, "main", "insert_person", &person("Late", 9)).await;
+    let mut ids: Vec<String> = first.changes.iter().map(|c| c.id.clone()).collect();
+    request.page_token = Some(token.clone());
+    loop {
+        let page = db.diff_page(&request).await.unwrap();
+        assert_eq!(page.to_commit_id, first.to_commit_id);
+        ids.extend(page.changes.iter().map(|c| c.id.clone()));
+        match page.next_page_token {
+            Some(next) => request.page_token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(ids, ["P0", "P1", "P2", "P3", "P4"]);
+
+    let mut other_sides = diff_request(between(&start, "feature"), Some(2));
+    other_sides.page_token = Some(token.clone());
+    assert!(matches!(
+        db.diff_page(&other_sides).await.unwrap_err(),
+        OmniError::ChangeCursorRejected { .. }
+    ));
+    let mut other_scope = diff_request(between(&start, "main"), Some(2));
+    other_scope.page_token = Some(token.clone());
+    other_scope.scope = ChangeFeedScope {
+        ops: Some(vec![ChangeOpKind::Delete]),
+        ..ChangeFeedScope::default()
+    };
+    assert!(matches!(
+        db.diff_page(&other_scope).await.unwrap_err(),
+        OmniError::ChangeCursorRejected { .. }
+    ));
+
+    // A commit changes page token is not a diff page token, nor the reverse.
+    let pair = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(&[("$name", "Pat"), ("$friend", "Alice")], &[("$age", 3)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let commit_token = db
+        .commit_changes_page(
+            &pair.graph_commit_id,
+            &ChangeFeedScope::default(),
+            None,
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap()
+        .next_page_token
+        .expect("two changes, pages of one");
+    let mut cross = diff_request(between(&start, "main"), Some(2));
+    cross.page_token = Some(commit_token);
+    assert!(matches!(
+        db.diff_page(&cross).await.unwrap_err(),
+        OmniError::ChangeCursorRejected { .. }
+    ));
+    assert!(matches!(
+        db.commit_changes_page(
+            &pair.graph_commit_id,
+            &ChangeFeedScope::default(),
+            Some(&token),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap_err(),
+        OmniError::ChangeCursorRejected { .. }
+    ));
 }

@@ -649,7 +649,7 @@ pub(crate) fn admit_target_queries(
                 continue;
             }
             match s.operation_kind() {
-                StepKind::Query | StepKind::BranchList => {
+                StepKind::Query | StepKind::BranchList | StepKind::BranchRead => {
                     if reopened {
                         return Err(
                             "reads after preparation restart are not post-reopen treatment".into(),
@@ -742,8 +742,12 @@ pub fn override_sources(
 }
 
 /// The only step kinds a served workload may contain anywhere in its program.
-pub const SERVED_READ_KINDS: [StepKind; 3] =
-    [StepKind::Query, StepKind::BranchList, StepKind::Show];
+pub const SERVED_READ_KINDS: [StepKind; 4] = [
+    StepKind::Query,
+    StepKind::BranchList,
+    StepKind::BranchRead,
+    StepKind::Show,
+];
 
 /// Engine preparation implied by the executed prefix reads, a restart, and the process lifecycle.
 pub(crate) fn engine_preparation(

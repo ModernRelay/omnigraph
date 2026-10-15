@@ -992,6 +992,83 @@ async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_rea
     );
 }
 
+/// A `load csv` source that never answers is refused at
+/// `CSV_SOURCE_READ_DEADLINE` with nothing staged or published; the stall is
+/// the instrumentation hook at the request site, on a paused clock.
+#[tokio::test(start_paused = true)]
+async fn load_csv_source_read_is_bounded_by_the_deadline() {
+    use omnigraph::loader::{CSV_SOURCE_READ_DEADLINE, CsvLoadRequest, LoadMode};
+    use omnigraph_compiler::query::ast::LoadTarget;
+    const SCHEMA: &str = "node Person { id: I64 @key name: String }";
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "id,name\n1,alice\n").unwrap();
+    let source = format!("file://{}", csv_path.display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_dir = tempfile::tempdir().unwrap();
+    let graph_path = graph_dir.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(policy)
+            .unwrap(),
+    );
+    let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+    let files = files_under(&graph_path);
+    let request = CsvLoadRequest {
+        source: source.clone(),
+        target: LoadTarget::Node("Person".to_string()),
+        mode: LoadMode::Append,
+        delimiter: b',',
+        header: true,
+        columns: None,
+    };
+    let stage_probes = StageWriteProbes::rendezvous(1);
+    let started = tokio::time::Instant::now();
+    let error = with_stage_write_probes(
+        stage_probes.clone(),
+        omnigraph::instrumentation::with_external_payload_read_stalled(
+            db.load_csv_as_with_receipt("main", &request, None),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        started.elapsed() >= CSV_SOURCE_READ_DEADLINE,
+        "the refusal waits for the deadline, not less"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("load csv: reading the source exceeded")
+            && text.contains(&format!("{} seconds", CSV_SOURCE_READ_DEADLINE.as_secs())),
+        "{text}"
+    );
+    assert_eq!(
+        stage_probes.entered(),
+        0,
+        "nothing is staged after a stalled read"
+    );
+    assert_eq!(files_under(&graph_path), files);
+    assert_eq!(
+        snapshot_main(&db).await.unwrap().graph_manifest_version(),
+        before
+    );
+
+    let receipt = db
+        .load_csv_as_with_receipt("main", &request, None)
+        .await
+        .expect("the same source loads once the read is not stalled");
+    assert_eq!(receipt.result.nodes_loaded.values().sum::<usize>(), 1);
+}
+
 /// Update predicate matching is itself a bounded allocation. The committed
 /// side must stream and charge rows before it is retained/concatenated, rather
 /// than first collecting an arbitrarily wide match set and relying on the
@@ -1371,12 +1448,9 @@ query update_shelf($note: String) {
     );
 }
 
-/// A Blob put admits a value of exactly the session's `write_max_bytes`
-/// (32 MiB by default) and refuses one more byte before opening a table. The
-/// row's other Blob cells are carried by value and share the operation's
-/// payload allowance, so a put whose target and carried sibling together
-/// exceed it is refused before any table effect.
-/// Rust, not GQT: the case format has no Blob put step.
+/// Blob puts retain their fixed cap under raised session allowances.
+/// Lower allowances also bound the put and its carried sibling payloads.
+/// Rust: the GQT format has no Blob put step.
 #[tokio::test]
 async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
     use base64::Engine;
@@ -1409,6 +1483,12 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
                 && *a == actual as u64)
     };
 
+    db.set(
+        SettingId::WriteMaxBytes,
+        &SettingValue::Integer((2 * DEFAULT_LIMIT) as i64),
+        Source::File,
+    )
+    .unwrap();
     db.put_blob_at_as(
         "main",
         cell("lone", "content"),
@@ -1417,7 +1497,7 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
         None,
     )
     .await
-    .expect("a value of exactly the default limit is admitted");
+    .expect("a value of exactly the fixed Blob put limit is admitted");
     let stored =
         read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell("lone", "content")).await;
     assert_eq!(stored.len(), DEFAULT_LIMIT);

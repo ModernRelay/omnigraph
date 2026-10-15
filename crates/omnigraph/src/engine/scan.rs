@@ -54,6 +54,9 @@ pub(super) struct NodeRead<'n> {
     /// The gate proved the answer empty, or a BM25 filter matched no row: no
     /// Lance read runs.
     pub(super) proven_empty: bool,
+    /// The pushed filter runs after the full-text search scores rows
+    /// (Lance's postfilter) instead of before it.
+    filter_after_scoring: bool,
 }
 
 impl<'n> NodeRead<'n> {
@@ -61,6 +64,7 @@ impl<'n> NodeRead<'n> {
         ds: &Dataset,
         node_type: &omnigraph_compiler::catalog::NodeType,
         table_key: &str,
+        contract_covers: bool,
         filters: &[IRExpr],
         catalog: &Catalog,
         search_mode: &SearchMode,
@@ -70,6 +74,7 @@ impl<'n> NodeRead<'n> {
             ds,
             &node_type.arrow_schema,
             table_key,
+            contract_covers,
             read_columns
                 .stored_columns()
                 .into_iter()
@@ -87,13 +92,20 @@ impl<'n> NodeRead<'n> {
                         .map(|target| target.property.as_str()),
                 ),
         )?;
-        super::typed_value::check_scan_leaves(ds, filters)?;
+        super::typed_value::check_scan_leaves(
+            ds,
+            &node_type.arrow_schema,
+            table_key,
+            contract_covers,
+            filters,
+        )?;
         Ok(())
     }
 
     pub(super) fn for_index_split(
         ds: Dataset,
         type_name: &str,
+        contract_covers: bool,
         filters: &[IRExpr],
         params: &ParamMap,
         catalog: &'n Catalog,
@@ -110,6 +122,7 @@ impl<'n> NodeRead<'n> {
             &ds,
             node_type,
             &format!("node:{type_name}"),
+            contract_covers,
             filters,
             catalog,
             &SearchMode::default(),
@@ -123,6 +136,7 @@ impl<'n> NodeRead<'n> {
             scalar_index: Some(true),
             columns,
             proven_empty: false,
+            filter_after_scoring: false,
         })
     }
 
@@ -145,6 +159,7 @@ impl<'n> NodeRead<'n> {
             &ds,
             node_type,
             &table_key,
+            snapshot.contract_covers(&table_key),
             filters,
             catalog,
             search_mode,
@@ -234,6 +249,7 @@ impl<'n> NodeRead<'n> {
             scalar_index: search_mode.scalar_index,
             columns,
             proven_empty,
+            filter_after_scoring: search_mode.eligibility_after_scoring,
         })
     }
 
@@ -247,7 +263,9 @@ impl<'n> NodeRead<'n> {
         }
         if let Some(expr) = &self.filter_expr {
             scanner.filter_expr(expr.clone());
-            scanner.prefilter(true);
+            // A BM25 scan whose plan places eligibility after scoring filters
+            // the scored rows instead of the candidates.
+            scanner.prefilter(!(self.filter_after_scoring && self.fts_query.is_some()));
         }
         if let Some((rows, bytes)) = pipelined_batch {
             scanner.batch_size(rows);
@@ -273,9 +291,10 @@ impl<'n> NodeRead<'n> {
     }
 
     /// The Lance plan of this read: the projection, the pushed filter as a
-    /// prefilter, the `(rows, bytes)` batch override, bounded readahead and
-    /// I/O buffer of a pipelined read, the full-text query, then `configure`
-    /// (nearest).
+    /// prefilter (as a postfilter on the scored rows where the plan places a
+    /// BM25 scan's eligibility after scoring), the `(rows, bytes)` batch
+    /// override, bounded readahead and I/O buffer of a pipelined read, the
+    /// full-text query, then `configure` (nearest).
     pub(super) fn plan(
         &self,
         pipelined_batch: Option<(usize, usize)>,
@@ -345,11 +364,20 @@ pub(super) async fn execute_node_scan(
         ),
         _ => None,
     };
-    let mut use_index = match (nearest_target.as_ref(), known_matches) {
-        (Some(_), _) if search_mode.nearest_exact => false,
-        (Some((_, _, k)), Some(matches)) => matches > *k,
+    let policy = match nearest_target {
+        Some(_) => Some(search_mode.nearest_policy.ok_or_else(|| {
+            OmniError::manifest_internal("a nearest scan carries no declared policy")
+        })?),
+        None => None,
+    };
+    let mut use_index = match (nearest_target.as_ref(), known_matches, policy) {
+        (Some(_), _, _) if search_mode.nearest_exact => false,
+        (Some((_, _, k)), Some(matches), Some(policy)) => {
+            !(policy.flat_when_eligible_within_fetch && matches <= *k)
+        }
         _ => true,
     };
+    scan_report.probes.clear();
     let mut last_rung: Option<(usize, u64)> = None;
     let mut final_summary: Option<(Option<u64>, Option<u64>)> = None;
     let (batches, attempt_memory) = loop {
@@ -429,10 +457,19 @@ pub(super) async fn execute_node_scan(
             exhausted: !use_index || known_matches.is_some_and(|matches| rows >= matches),
             dataset_rows: type_rows,
         });
+        scan_report.probes.push(ProbeAttempt {
+            maximum_nprobes: probe_budget,
+            flat: !use_index,
+            rows,
+        });
         if !use_index {
             break (batches, attempt_memory);
         }
+        let Some(policy) = policy else {
+            break (batches, attempt_memory);
+        };
         match ladder_step(
+            policy,
             rows,
             *k,
             known_matches,

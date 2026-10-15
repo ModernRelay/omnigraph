@@ -80,10 +80,18 @@ pub enum LoadMode {
     Merge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadInputShape {
+pub mod csv;
+pub use csv::{CSV_SOURCE_BYTES_RESOURCE, CSV_SOURCE_READ_DEADLINE, CsvLoadRequest};
+
+/// How the load input is read: lenient JSON, strict NDJSON envelopes, or
+/// one CSV object fetched under the external Blob policy. Every shape ends
+/// in the same per-type Arrow batches and the same load transaction.
+#[derive(Debug, Clone, Copy)]
+enum LoadInputShape<'a> {
     LoaderCompatible,
     StrictGraphBatch,
+    /// One `load csv` statement and the session's `load_source_max_bytes`.
+    Csv(&'a CsvLoadRequest, u64),
 }
 
 impl Session {
@@ -300,6 +308,32 @@ impl Session {
         .await
     }
 
+    /// Run one `load csv` statement onto `branch`: the source object is
+    /// authorized by the graph's external Blob policy, bounded by the
+    /// session's `load_source_max_bytes` before it is read, parsed typed by the
+    /// target's `.pg` declaration, and staged through the same transaction,
+    /// admission, validation and publication as a strict NDJSON batch. The
+    /// branch must exist; a load statement never forks one.
+    pub async fn load_csv_as_with_receipt(
+        &self,
+        branch: &str,
+        request: &CsvLoadRequest,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        self.load_input_as(
+            branch,
+            None,
+            "",
+            request.mode,
+            actor_id,
+            LoadInputShape::Csv(request, self.settings().load_source_max_bytes()),
+            self.settings().stage_write_concurrency(),
+            HistoryReleaseBytes(self.settings().history_release_bytes()),
+            WriteBudget::from_settings(self.settings()),
+        )
+        .await
+    }
+
     /// Convenience wrapper around [`Self::load_graph_batch_as`] without an
     /// actor or implicit branch creation.
     pub async fn load_graph_batch(
@@ -322,7 +356,7 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
@@ -363,7 +397,7 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
@@ -471,7 +505,7 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-        input_shape: LoadInputShape,
+        input_shape: LoadInputShape<'_>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
@@ -541,7 +575,7 @@ async fn load_jsonl_data(
     data: &str,
     mode: LoadMode,
     actor_id: Option<&str>,
-    input_shape: LoadInputShape,
+    input_shape: LoadInputShape<'_>,
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
     write_budget: WriteBudget,
@@ -593,7 +627,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
-    input_shape: LoadInputShape,
+    input_shape: LoadInputShape<'_>,
     stage_write_concurrency: usize,
     history_release_bytes: HistoryReleaseBytes,
     first_attempt: bool,
@@ -627,7 +661,12 @@ async fn load_jsonl_reader_once<R: BufRead>(
     // contract. Strict normalization still preflights its Arrow allocation.
     let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
-    if input_shape == LoadInputShape::StrictGraphBatch {
+    let mut csv_batch = None;
+    if let LoadInputShape::Csv(request, source_max_bytes) = input_shape {
+        csv_batch = Some(
+            csv::prepare_csv_batch(db, &catalog, request, write_budget, source_max_bytes).await?,
+        );
+    } else if matches!(input_shape, LoadInputShape::StrictGraphBatch) {
         strict_rows = parse_strict_graph_rows(
             reader,
             &catalog,
@@ -828,6 +867,22 @@ async fn load_jsonl_reader_once<R: BufRead>(
         let loaded_count = batch.num_rows();
         prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
+    if let Some(prepared) = csv_batch.take_if(|prepared| !prepared.is_edge) {
+        let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
+            OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
+        })?;
+        if bounded_keyed_input {
+            prepared_keyed_bytes =
+                retain_keyed_batch(prepared_keyed_bytes, &prepared.batch, write_budget)?;
+        }
+        let loaded_count = prepared.batch.num_rows();
+        prepared_nodes.push((
+            prepared.type_name,
+            prepared.table_key,
+            vec![prepared.batch],
+            loaded_count,
+        ));
+    }
 
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
@@ -895,6 +950,21 @@ async fn load_jsonl_reader_once<R: BufRead>(
         }
         let loaded_count = batch.num_rows();
         prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
+    }
+    if let Some(prepared) = csv_batch.take_if(|prepared| prepared.is_edge) {
+        let _entry = snapshot.dataset(&prepared.table_key).ok_or_else(|| {
+            OmniError::manifest(missing_graph_type_at_snapshot(&prepared.table_key))
+        })?;
+        if bounded_keyed_input {
+            retain_keyed_batch(prepared_keyed_bytes, &prepared.batch, write_budget)?;
+        }
+        let loaded_count = prepared.batch.num_rows();
+        prepared_edges.push((
+            prepared.type_name,
+            prepared.table_key,
+            vec![prepared.batch],
+            loaded_count,
+        ));
     }
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
@@ -2319,14 +2389,8 @@ fn preflight_strict_rows_arrow_bytes(
     for object in objects {
         for field in schema.fields() {
             let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
-            let field_bytes = if blob_properties.contains(field.name()) {
-                16_u64.saturating_add(match value.as_str() {
-                    Some(value) if value.starts_with("base64:") => 0,
-                    _ => estimate_json_arrow_bytes(value)?,
-                })
-            } else {
-                projected_strict_column_bytes(field.data_type(), value)?
-            };
+            let field_bytes =
+                projected_strict_field_bytes(field, value, blob_properties.contains(field.name()))?;
             projected = projected.saturating_add(field_bytes);
             if projected > limit {
                 return Err(OmniError::resource_limit(
@@ -2338,6 +2402,21 @@ fn preflight_strict_rows_arrow_bytes(
         }
     }
     Ok(())
+}
+
+fn projected_strict_field_bytes(
+    field: &arrow_schema::Field,
+    value: &JsonValue,
+    blob_property: bool,
+) -> Result<u64> {
+    if blob_property {
+        Ok(16_u64.saturating_add(match value.as_str() {
+            Some(value) if value.starts_with("base64:") => 0,
+            _ => estimate_json_arrow_bytes(value)?,
+        }))
+    } else {
+        projected_strict_column_bytes(field.data_type(), value)
+    }
 }
 
 fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {

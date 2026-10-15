@@ -25,16 +25,26 @@ struct FreshNames {
     temp: usize,
 }
 
+const ANON_PREFIX: &str = "__anon_";
+const TEMP_PREFIX: &str = "__temp_";
+
 impl FreshNames {
     fn anon(&mut self) -> String {
         self.anon += 1;
-        format!("__anon_{}", self.anon)
+        format!("{ANON_PREFIX}{}", self.anon)
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        format!("__temp_{}_{}", dst, self.temp)
+        format!("{TEMP_PREFIX}{}_{}", dst, self.temp)
     }
+}
+
+/// Whether `variable` is a name the lowering made up: an anonymous `_`
+/// endpoint or a cycle-closing or renamed temp. The query declares no such
+/// binding, so its identity orders nothing a reader can see.
+pub fn is_fresh_variable(variable: &str) -> bool {
+    variable.starts_with(ANON_PREFIX) || variable.starts_with(TEMP_PREFIX)
 }
 
 /// What every expression site shares: the physical column spellings and
@@ -109,6 +119,22 @@ impl LowerCtx<'_> {
 /// let catalog: omnigraph_compiler::catalog::Catalog = unimplemented!();
 /// let _ = omnigraph_compiler::lower_query(&catalog, &checked);
 /// ```
+fn typed_contains_aggregate(expr: &TypedExpr) -> bool {
+    match expr {
+        TypedExpr::Aggregate { .. } => true,
+        TypedExpr::Binary { left, right, .. }
+        | TypedExpr::In {
+            needle: left,
+            list: right,
+            ..
+        } => typed_contains_aggregate(left) || typed_contains_aggregate(right),
+        TypedExpr::Not { inner, .. } | TypedExpr::IsNull { inner, .. } => {
+            typed_contains_aggregate(inner)
+        }
+        _ => false,
+    }
+}
+
 pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryIR> {
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
@@ -146,7 +172,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
     let has_aggregates = query
         .returns
         .iter()
-        .any(|item| matches!(&item.expr, TypedExpr::Aggregate { .. }));
+        .any(|item| typed_contains_aggregate(&item.expr));
     let aggregate_meta_columns: HashSet<String> = query
         .returns
         .iter()
@@ -202,6 +228,7 @@ pub fn lower_query(catalog: &Catalog, query: &CheckedReadQuery) -> Result<QueryI
         params: lower_params(&query.params),
         pipeline,
         return_exprs,
+        distinct: query.distinct,
         order_by,
         limit: query.limit,
     };
@@ -782,6 +809,7 @@ fn rename_inner_bindings<'a>(
             }
             IRExpr::Aggregate {
                 func: _,
+                distinct: _,
                 arg,
                 signature: _,
             }
@@ -1014,10 +1042,12 @@ fn lower_expr(expr: &TypedExpr, ctx: &LowerCtx<'_>) -> Result<IRExpr> {
         TypedExpr::Literal { literal, .. } => IRExpr::Literal(literal.clone(), expr.expr_type()),
         TypedExpr::Aggregate {
             func,
+            distinct,
             arg,
             signature,
         } => IRExpr::Aggregate {
             func: *func,
+            distinct: *distinct,
             arg: Box::new(lower(arg)?),
             signature: signature.clone(),
         },

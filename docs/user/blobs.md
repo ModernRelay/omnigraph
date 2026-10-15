@@ -28,7 +28,10 @@ allowed URI bases in its graph configuration. Direct `--store` CLI access has no
 external-source allowlist, so it accepts managed `base64:` input but rejects new
 external references. Credentials must not appear in stored URIs. An allowed
 base must lie outside the cluster's storage root and every graph root; see
-[External Blob references](clusters/config.md#external-blob-references).
+[External Blob references](clusters/config.md#external-blob-references). The
+same bases admit the source of a `load csv` statement
+([CSV loading](mutations/index.md#csv-loading)), which reads the object once
+and stores no reference to it.
 
 Write mode determines ownership:
 
@@ -111,8 +114,8 @@ before retrying with a precondition.
 Over HTTP:
 
 - `PUT` takes a `Content-Type: application/octet-stream` body of at most the
-  server's `write_max_bytes` (32 MiB by default), inclusive; a request cannot
-  change it. Another media type is a `415`. A larger body is a `413`, refused
+  server's Blob put limit (the process `write_max_bytes`, at most 32 MiB),
+  inclusive; a request cannot change it. Another media type is a `415`. A larger body is a `413`, refused
   before any of it is read when `Content-Length` declares it, and a body that
   does not arrive before the server's body deadline is a `408`;
 - both verbs take `branch` (default `main`) and refuse `snapshot` or any other
@@ -252,8 +255,9 @@ An update of a row inserted earlier in the same mutation is such a version:
 it carries the pending row's Blob, so that payload counts twice, the carried
 copy as `materialized blob payload bytes`.
 
-[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts
-`1..=33554432`. Payload and row allowances are independent: a payload exactly
+[`write_max_bytes`](queries/settings.md) defaults to 32 MiB and accepts any
+integer of at least `1`; a Blob put stays bounded at 32 MiB by the put limit
+whatever the setting. Payload and row allowances are independent: a payload exactly
 at the limit fits when its row and descriptors also fit. Repeated external
 references each count their payload length even when one fetch serves them.
 External-only admission can also report `materialized external blob payload bytes`.

@@ -491,6 +491,7 @@ pub(super) async fn prepare_selected_edges(
             &dataset,
             &env.catalog.edge_types[&member.edge_type].arrow_schema,
             &table,
+            env.snapshot.contract_covers(&table),
             [
                 env.catalog.system_columns.src,
                 env.catalog.system_columns.dst,
@@ -672,6 +673,7 @@ pub(super) async fn decide_expand_start(
         &edge_ds,
         &catalog.edge_types[edge_type].arrow_schema,
         &edge_table_key,
+        snapshot.contract_covers(&edge_table_key),
         [catalog.system_columns.src, catalog.system_columns.dst],
     )?;
     let coverage = named
@@ -870,18 +872,16 @@ where
     source_memory
         .checkpoint()
         .map_err(|error| memory.error(error))?;
+    let edge_table_key = format!("edge:{edge_type}");
     let dataset = match prepared {
         Some(dataset) => dataset.clone(),
-        None => {
-            snapshot
-                .open_lance_dataset(&format!("edge:{edge_type}"))
-                .await?
-        }
+        None => snapshot.open_lance_dataset(&edge_table_key).await?,
     };
     super::typed_value::check_stored_schema(
         &dataset,
         &catalog.edge_types[edge_type].arrow_schema,
-        &format!("edge:{edge_type}"),
+        &edge_table_key,
+        snapshot.contract_covers(&edge_table_key),
         [catalog.system_columns.src, catalog.system_columns.dst]
             .into_iter()
             .chain(attach_columns.iter().copied()),
