@@ -100,6 +100,17 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Manage people and invitations in the selected organization.
+    #[command(visible_alias = "org")]
+    Organization {
+        /// Use the managed service and your cached organization identity.
+        #[arg(long, global = true)]
+        managed: bool,
+        #[command(flatten)]
+        target: OrganizationArgs,
+        #[command(subcommand)]
+        command: OrganizationCommand,
+    },
     // ── Data plane ── run against a graph (embedded or via --server).
     /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
     ///
@@ -890,6 +901,89 @@ pub(crate) enum ClusterMembersCommand {
         /// Emit the API envelope instead of a readable member table.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct OrganizationArgs {
+    /// API origin; may be omitted in a bound configuration directory.
+    #[arg(long, global = true)]
+    pub(crate) api: Option<String>,
+    /// Organization ID; omission uses the folder binding or sole cached organization.
+    #[arg(long, global = true)]
+    pub(crate) organization: Option<String>,
+    /// Configuration folder supplying an optional managed context.
+    #[arg(long, global = true, default_value = ".")]
+    pub(crate) config: PathBuf,
+    /// Emit the validated API envelope instead of readable text.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationCommand {
+    /// Inspect or change local enrollment, admission and control permissions.
+    Members {
+        #[command(subcommand)]
+        command: OrganizationMembersCommand,
+    },
+    /// Manage provider invitations; acceptance does not grant cluster access.
+    Invitations {
+        #[command(subcommand)]
+        command: OrganizationInvitationsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationMembersCommand {
+    /// List provider members and retained local enrollment, including current versions.
+    List,
+    /// Apply a versioned YAML add/update/remove patch; graph policy is unchanged.
+    Apply {
+        file: PathBuf,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Remove local access, organization membership and its sessions.
+    /// Deploy Cedar revocation and verify old graph credentials first.
+    Offboard {
+        user_id: String,
+        /// Current local grant version; zero for an unenrolled person.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        expected_version: i64,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OrganizationInvitationsCommand {
+    /// List one provider page of up to 100 invitations.
+    List {
+        /// Continue from the previous page's exact cursor.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Email an invitation to join this organization.
+    Send {
+        email: String,
+        /// Stable request key; retain it if the result is uncertain.
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Resend one exact pending invitation.
+    Resend {
+        invitation_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    /// Revoke one exact pending invitation.
+    Revoke {
+        invitation_id: String,
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 

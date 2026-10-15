@@ -263,6 +263,12 @@ fn validate_cluster_arguments(
     cli: &Cli,
     command_matches: &clap::ArgMatches,
 ) -> std::result::Result<(), clap::Error> {
+    if matches!(&cli.command, Command::Organization { managed: false, .. }) {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "organization commands require --managed",
+        ));
+    }
     let Command::Cluster { managed, command } = &cli.command else {
         return Ok(());
     };
@@ -2232,7 +2238,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Use { .. } => unreachable!("managed dispatch handles use"),
+        Command::Use { .. } | Command::Organization { .. } => {
+            unreachable!("managed dispatch handles organization commands and use")
+        }
         Command::Cluster { command, .. } => match command {
             ClusterCommand::Validate { config, json } => {
                 let output = validate_config_dir(config);

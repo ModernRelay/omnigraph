@@ -299,7 +299,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
-        Command::Cluster { .. } => Plane::Control,
+        Command::Cluster { .. } | Command::Organization { .. } => Plane::Control,
         Command::Alias { .. }
         | Command::Embed(_)
         | Command::Login { .. }
@@ -358,6 +358,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Repair { .. } => "repair",
         Command::Cleanup { .. } => "cleanup",
         Command::Cluster { .. } => "cluster",
+        Command::Organization { .. } => "organization",
         Command::Graphs { command } => match command {
             GraphsCommand::List { .. } => "graphs list",
         },

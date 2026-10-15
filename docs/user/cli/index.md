@@ -28,6 +28,11 @@ from that folder with an explicit `--graph`. Applied Cedar policy determines you
 permissions. See [managed data access](managed-data.md) for expiry, offline
 operation and credential clearing.
 
+Organization administrators can [invite, enroll and remove
+teammates](managed-team.md) with `organization --managed`, using the same cached
+login. Cluster admission and control grants remain separate from Cedar graph
+permissions.
+
 ## Create, load, and query a graph
 
 ```bash

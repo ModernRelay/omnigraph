@@ -272,7 +272,7 @@ for origin validation, separate organization sessions, identity pins and renewal
 | `cluster history --managed [--limit N] [--since RFC3339]` | Read newest deliveries first, default and maximum 100; filter creation time inclusively before the limit |
 | `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
-See [managed lifecycle](managed-lifecycle.md) for discovery, source checkout and lifecycle operations.
+See [managed lifecycle](managed-lifecycle.md) for cluster operations and [team administration](managed-team.md) for `organization --managed` (`org`), invitation commands and versioned member changes.
 All accept `--config DIR` and `--json`. Plan and apply also accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
 generated and printed before submission. Retain it and the exact request after

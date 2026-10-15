@@ -33,6 +33,7 @@ deployment.
 - [CLI reference](cli/reference.md)
 - [Managed data credentials and queries](cli/managed-data.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
+- [Managed organization members and invitations](cli/managed-team.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
 - [Troubleshooting](operations/troubleshooting.md)
