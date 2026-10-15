@@ -81,9 +81,7 @@ pub enum LoadMode {
 }
 
 pub mod csv;
-pub use csv::{
-    CSV_SOURCE_BYTES_RESOURCE, CSV_SOURCE_MAX_BYTES, CSV_SOURCE_READ_DEADLINE, CsvLoadRequest,
-};
+pub use csv::{CSV_SOURCE_BYTES_RESOURCE, CSV_SOURCE_READ_DEADLINE, CsvLoadRequest};
 
 /// How the load input is read: lenient JSON, strict NDJSON envelopes, or
 /// one CSV object fetched under the external Blob policy. Every shape ends
@@ -92,7 +90,8 @@ pub use csv::{
 enum LoadInputShape<'a> {
     LoaderCompatible,
     StrictGraphBatch,
-    Csv(&'a CsvLoadRequest),
+    /// One `load csv` statement and the session's `load_source_max_bytes`.
+    Csv(&'a CsvLoadRequest, u64),
 }
 
 impl Session {
@@ -310,8 +309,8 @@ impl Session {
     }
 
     /// Run one `load csv` statement onto `branch`: the source object is
-    /// authorized by the graph's external Blob policy, bounded by
-    /// [`CSV_SOURCE_MAX_BYTES`] before it is read, parsed typed by the
+    /// authorized by the graph's external Blob policy, bounded by the
+    /// session's `load_source_max_bytes` before it is read, parsed typed by the
     /// target's `.pg` declaration, and staged through the same transaction,
     /// admission, validation and publication as a strict NDJSON batch. The
     /// branch must exist; a load statement never forks one.
@@ -327,7 +326,7 @@ impl Session {
             "",
             request.mode,
             actor_id,
-            LoadInputShape::Csv(request),
+            LoadInputShape::Csv(request, self.settings().load_source_max_bytes()),
             self.settings().stage_write_concurrency(),
             HistoryReleaseBytes(self.settings().history_release_bytes()),
             WriteBudget::from_settings(self.settings()),
@@ -663,8 +662,10 @@ async fn load_jsonl_reader_once<R: BufRead>(
     let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
     let mut csv_batch = None;
-    if let LoadInputShape::Csv(request) = input_shape {
-        csv_batch = Some(csv::prepare_csv_batch(db, &catalog, request, write_budget).await?);
+    if let LoadInputShape::Csv(request, source_max_bytes) = input_shape {
+        csv_batch = Some(
+            csv::prepare_csv_batch(db, &catalog, request, write_budget, source_max_bytes).await?,
+        );
     } else if matches!(input_shape, LoadInputShape::StrictGraphBatch) {
         strict_rows = parse_strict_graph_rows(
             reader,

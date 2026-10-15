@@ -308,6 +308,7 @@ fn validate_cluster_arguments(
     match command {
         ClusterCommand::Create { .. }
         | ClusterCommand::List { .. }
+        | ClusterCommand::Members { .. }
         | ClusterCommand::Pull { .. }
         | ClusterCommand::Push { .. }
         | ClusterCommand::Delete { .. }
@@ -1074,7 +1075,7 @@ async fn run(cli: Cli) -> Result<()> {
                             .commit_changes_page(
                                 &commit_id,
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -1094,7 +1095,7 @@ async fn run(cli: Cli) -> Result<()> {
                             .commit_changes_page(
                                 &commit_id,
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -1150,7 +1151,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 cursor.as_deref(),
                                 start.as_deref(),
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -1172,7 +1173,7 @@ async fn run(cli: Cli) -> Result<()> {
                                 cursor.as_deref(),
                                 start.as_deref(),
                                 next_page_token.as_deref(),
-                                limit,
+                                auto_page_limit(limit),
                                 &filter,
                                 &settings,
                             )
@@ -2342,6 +2343,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             ClusterCommand::Create { .. }
             | ClusterCommand::List { .. }
+            | ClusterCommand::Members { .. }
             | ClusterCommand::Pull { .. }
             | ClusterCommand::Push { .. }
             | ClusterCommand::Delete { .. }
@@ -2610,6 +2612,14 @@ fn report_deployment_lock(status: &omnigraph_cluster::DeploymentStatus) {
     }
 }
 
+/// The page size the CLI asks for when it follows every page itself: the
+/// public maximum unless `--limit` sets one. Every page resolves its commits
+/// again and restarts its ordered walk after the previous page's last change,
+/// so the same changes cost less in fewer, larger pages.
+fn auto_page_limit(limit: Option<usize>) -> Option<usize> {
+    Some(limit.unwrap_or(omnigraph::changes::COMMIT_CHANGES_MAX_CHANGES))
+}
+
 /// Print a graph diff: one page when `page_token` is given (the raw escape
 /// hatch), otherwise every page in turn, each emitted before the next is
 /// fetched.
@@ -2648,7 +2658,12 @@ async fn run_diff(
         let mut output = DiffJsonStream::new(io::BufWriter::new(io::stdout()));
         loop {
             let page = client
-                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .diff_page(
+                    sides,
+                    next_page_token.as_deref(),
+                    auto_page_limit(limit),
+                    &filter,
+                )
                 .await?;
             next_page_token = page.next_page_token.clone();
             output.write_page(&page)?;
@@ -2661,7 +2676,12 @@ async fn run_diff(
         let mut output = DiffHumanStream::new();
         loop {
             let page = client
-                .diff_page(sides, next_page_token.as_deref(), limit, &filter)
+                .diff_page(
+                    sides,
+                    next_page_token.as_deref(),
+                    auto_page_limit(limit),
+                    &filter,
+                )
                 .await?;
             next_page_token = page.next_page_token.clone();
             output.write_page(&page)?;

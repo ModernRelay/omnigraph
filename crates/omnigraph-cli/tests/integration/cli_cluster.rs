@@ -961,6 +961,197 @@ fn managed_cluster_list_uses_selected_organization_and_refuses_context_conflicts
     api.assert_complete();
 }
 
+fn member_directory() -> Value {
+    serde_json::json!({
+        "data": {"cluster_id":"managed-test","members":[
+            {"user_id":"user_one","principal_id":"principal-one","name":"Avery Chen","email":"avery@example.com","admitted":true,"control_grants":["source_read","status"]},
+            {"user_id":"user_two","principal_id":"principal-two","name":null,"email":null,"admitted":false,"control_grants":["status"]}
+        ]},
+        "meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}
+    })
+}
+
+#[test]
+fn managed_cluster_members_lists_exact_enrollment_as_json_and_readable_text() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let response = member_directory();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+        write_managed_context(temp.path(), &api.origin);
+        let before = fs::read(temp.path().join(".omnigraph/context")).unwrap();
+        // Exercise --managed after both nested command levels too.
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_CONTROL_TOKEN", "og_fixture_control")
+            .env("OMNIGRAPH_CONTROL_API", &api.origin)
+            .args(["cluster", "members", "list", "--managed"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_success(&mut command);
+        if json {
+            assert_eq!(parse_stdout_json(&output), response);
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "NAME",
+                "EMAIL",
+                "PRINCIPAL",
+                "ADMITTED",
+                "CONTROL GRANTS",
+                "Avery Chen",
+                "avery@example.com",
+                "principal-one",
+                "principal-two",
+                "source_read, status",
+                "Graph permissions are evaluated by Cedar separately.",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            assert!(!text.contains("\"data\""));
+        }
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            "/v1/clusters/managed-test/members",
+            Value::Null,
+            None,
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".omnigraph/context")).unwrap(),
+            before
+        );
+        assert_no_core_effects(temp.path());
+        api.assert_complete();
+    }
+    let temp = tempdir().unwrap();
+    let mut empty = member_directory();
+    empty["data"]["members"] = serde_json::json!([]);
+    let api = lifecycle_fixture(vec![IntentReply::json(200, empty)]);
+    write_managed_context(temp.path(), &api.origin);
+    let output = output_success(managed_cli(temp.path(), &api.origin).args(["members", "list"]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No explicitly enrolled members."));
+    api.assert_complete();
+}
+
+#[test]
+fn managed_cluster_members_refuses_wrong_identity_malformed_results_and_denials() {
+    let mut cases = vec![];
+    for (pointer, value, kind, exit) in [
+        (
+            "/meta/cluster_id",
+            serde_json::json!("foreign"),
+            "context_mismatch",
+            2,
+        ),
+        (
+            "/data/cluster_id",
+            serde_json::json!("foreign"),
+            "context_mismatch",
+            2,
+        ),
+        ("/meta/incarnation", Value::Null, "api_response_invalid", 1),
+        (
+            "/data/members/0/admitted",
+            serde_json::json!("yes"),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/0/name",
+            serde_json::json!("bad\u{001b}[2J"),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/0/control_grants",
+            serde_json::json!(["status", "status"]),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/1/control_grants",
+            serde_json::json!([]),
+            "api_response_invalid",
+            1,
+        ),
+        (
+            "/data/members/1/principal_id",
+            serde_json::json!("principal-one"),
+            "api_response_invalid",
+            1,
+        ),
+    ] {
+        let mut response = member_directory();
+        *response.pointer_mut(pointer).unwrap() = value;
+        cases.push((200, response, kind, exit));
+    }
+    for (status, kind) in [
+        (401, "unauthorized"),
+        (403, "scope_missing"),
+        (404, "cluster_not_found"),
+    ] {
+        cases.push((
+            status,
+            serde_json::json!({"type":kind,"detail":"not permitted"}),
+            kind,
+            2,
+        ));
+    }
+    for (status, response, kind, exit) in cases {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(status, response)]);
+        write_managed_context(temp.path(), &api.origin);
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(["members", "list", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{output:?}");
+        let problem = parse_stdout_json(&output);
+        assert_eq!(problem["type"], kind);
+        assert!(
+            problem.get("data").is_none(),
+            "member data leaked in failure"
+        );
+        assert_eq!(api.workflow_requests().len(), 1);
+        assert_no_core_effects(temp.path());
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_cluster_members_requires_bound_context_and_refuses_competing_targets() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    let output = managed_cli(temp.path(), &api.origin)
+        .args(["members", "list", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "managed_context_required"
+    );
+    write_managed_context(temp.path(), &api.origin);
+    for args in [
+        vec!["--direct"],
+        vec!["--server", "https://other.example"],
+        vec!["--cluster", "s3://other/root"],
+    ] {
+        let output = managed_cli(temp.path(), &api.origin)
+            .args(["members", "list", "--json"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(parse_stdout_json(&output)["type"], "managed_scope_conflict");
+    }
+    assert!(api.requests().is_empty());
+    assert_no_core_effects(temp.path());
+    api.assert_complete();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn source_export(files: Value) -> Value {
     serde_json::json!({"data":{"cluster_id":"managed-test","revision":MANAGED_REVISION,"files":files},"meta":{"cluster_id":"managed-test","incarnation":"inc-one","provenance":"service_db"}})
@@ -2454,6 +2645,7 @@ fn managed_mode_is_explicit_and_direct_commands_ignore_folder_context() {
             "op",
         ],
         vec!["cluster", "token"],
+        vec!["cluster", "members", "list"],
         vec!["cluster", "operation", "op"],
         vec!["cluster", "history"],
         vec!["cluster", "cancel", "run"],

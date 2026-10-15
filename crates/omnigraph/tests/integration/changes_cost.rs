@@ -725,6 +725,73 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
     .await;
 }
 
+/// Resolving a graph diff's sides reads no `__manifest` per live branch. A
+/// side spelled as a branch name cannot be a commit id, so it skips the
+/// commit lookup, whose miss path checks out every live branch's
+/// `__manifest`. Both sides here are branch names; the sweep adds idle
+/// branches, which neither side reads.
+#[tokio::test]
+async fn graph_diff_side_resolution_is_flat_in_live_branches() {
+    use omnigraph::changes::{GraphDiffRequest, GraphDiffSides};
+
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for idle in [1u64, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Person {\n    name: String @key\n    age: I32?\n}\n",
+            )
+            .await
+            .unwrap();
+            let db = helpers::session(db);
+            db.load_with_receipt(
+                "main",
+                r#"{"type":"Person","data":{"name":"base","age":1}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            db.branch_create("feature").await.unwrap();
+            db.load_with_receipt(
+                "feature",
+                r#"{"type":"Person","data":{"name":"feature","age":2}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            for i in 0..idle {
+                db.branch_create(&format!("idle{i}")).await.unwrap();
+            }
+
+            let (page, io) = measure(db.diff_page(&GraphDiffRequest {
+                sides: GraphDiffSides::Between {
+                    from: "main".to_string(),
+                    to: "feature".to_string(),
+                },
+                scope: ChangeFeedScope::default(),
+                page_token: None,
+                max_changes: None,
+                max_bytes: None,
+            }))
+            .await;
+            assert_eq!(page.unwrap().changes.len(), 1);
+            eprintln!(
+                "DIFF idle_branches={idle}: manifest_reads={} data_open_count={}",
+                io.manifest_reads, io.data_open_count,
+            );
+            curve.push((idle, io));
+        }
+        assert_flat(
+            &curve,
+            |io| io.manifest_reads,
+            1,
+            "a diff between two branch names must not read a __manifest per live branch",
+        );
+    })
+    .await;
+}
+
 /// A backlog walk reads the records of the commits it examines in one scan of
 /// `__history`, so its manifest reads are flat in the backlog, and pays at
 /// most two data opens per effectful commit, a term that grows with it.

@@ -1448,12 +1448,9 @@ query update_shelf($note: String) {
     );
 }
 
-/// A Blob put admits a value of exactly the session's `write_max_bytes`
-/// (32 MiB by default) and refuses one more byte before opening a table. The
-/// row's other Blob cells are carried by value and share the operation's
-/// payload allowance, so a put whose target and carried sibling together
-/// exceed it is refused before any table effect.
-/// Rust, not GQT: the case format has no Blob put step.
+/// Blob puts retain their fixed cap under raised session allowances.
+/// Lower allowances also bound the put and its carried sibling payloads.
+/// Rust: the GQT format has no Blob put step.
 #[tokio::test]
 async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
     use base64::Engine;
@@ -1486,6 +1483,12 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
                 && *a == actual as u64)
     };
 
+    db.set(
+        SettingId::WriteMaxBytes,
+        &SettingValue::Integer((2 * DEFAULT_LIMIT) as i64),
+        Source::File,
+    )
+    .unwrap();
     db.put_blob_at_as(
         "main",
         cell("lone", "content"),
@@ -1494,7 +1497,7 @@ async fn blob_put_payload_bound_is_inclusive_and_counts_carried_siblings() {
         None,
     )
     .await
-    .expect("a value of exactly the default limit is admitted");
+    .expect("a value of exactly the fixed Blob put limit is admitted");
     let stored =
         read_managed_blob_bytes(&db, ReadTarget::branch("main"), cell("lone", "content")).await;
     assert_eq!(stored.len(), DEFAULT_LIMIT);

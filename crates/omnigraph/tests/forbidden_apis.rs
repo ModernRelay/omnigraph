@@ -313,7 +313,7 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "resolve_snapshot"),
     ("db/omnigraph.rs", "diff_page"),
     ("db/omnigraph.rs", "merge_base"),
-    ("db/omnigraph.rs", "diff_read_target_branch"),
+    ("db/omnigraph.rs", "diff_page_readable"),
     ("exec/merge.rs", "branch_merge_dry_run"),
     ("session.rs", "branch_read"),
     ("db/omnigraph.rs", "commit_changes_page"),
