@@ -1036,7 +1036,7 @@ pub(crate) async fn server_blob_head(
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
             )),
-        (status = 413, description = "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
+        (status = 413, description = "The body exceeds the server's Blob put limit (the process `write_max_bytes`, at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it", body = ErrorOutput),
         (status = 415, description = "Content-Type must be application/octet-stream", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source carried from the entity could not be read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -4086,38 +4086,6 @@ fn required_diff_param(value: Option<String>, name: &str) -> std::result::Result
     }
 }
 
-/// Authorize `read` on the branch one graph diff side resolves to: a branch
-/// name, or the authored branch (a proposal's or snapshot's recorded target)
-/// of a commit. The side is resolved before the policy check, so a denial is
-/// reported exactly as a side that names nothing: the route is not an
-/// existence oracle for branches or commits the actor cannot read.
-async fn authorize_diff_side(
-    db: &Omnigraph,
-    actor: Option<&AuthenticatedActor>,
-    policy: Option<&PolicyEngine>,
-    side: &str,
-) -> std::result::Result<(), ApiError> {
-    let not_found = || ApiError::not_found(format!("'{side}' names no branch and no commit"));
-    let branch = match db.diff_read_target_branch(side).await {
-        Ok(branch) => branch,
-        // A branch deleted between resolution steps is the same fixed 404.
-        Err(OmniError::BranchNotFound { .. }) => return Err(not_found()),
-        Err(error) => return Err(change_route_error(error)),
-    };
-    match authorize(
-        actor,
-        policy,
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: Some(branch),
-            target_branch: None,
-        },
-    )? {
-        Authz::Allowed => Ok(()),
-        Authz::Denied(_) => Err(not_found()),
-    }
-}
-
 #[utoipa::path(
     get,
     path = "/diff",
@@ -4169,9 +4137,13 @@ pub(crate) async fn server_diff(
 }
 
 /// One page of the net change between two read targets, for `GET /diff` and
-/// the `branch diff <from> to <to>` statement: each side is authorized on the
-/// branch it resolves to, and a side the actor cannot read answers the 404 a
-/// side naming nothing does.
+/// the `branch diff <from> to <to>` statement. The engine authorizes each side
+/// on the branch it resolves to (a branch name, or the authored branch, a
+/// proposal's or snapshot's recorded target, of a commit) as soon as it
+/// classifies that side, before it looks at the next side or opens a
+/// snapshot. A side the actor cannot read is the 404 of a side that names
+/// nothing, whichever side it is: the route is not an existence oracle for
+/// branches or commits the actor cannot read.
 pub(crate) async fn two_point_diff_page(
     handle: &GraphRequest,
     actor: Option<&AuthenticatedActor>,
@@ -4181,19 +4153,42 @@ pub(crate) async fn two_point_diff_page(
     page_token: Option<String>,
     max_changes: Option<usize>,
 ) -> std::result::Result<omnigraph::changes::GraphDiffPage, ApiError> {
-    let db = &handle.engine;
-    for side in [&from, &to] {
-        authorize_diff_side(db, actor, handle.policy.as_deref(), side).await?;
+    let policy = handle.policy.as_deref();
+    // A policy failure (a missing bearer, an evaluation error) is not a
+    // denial: it stops the read, and its own error answers.
+    let mut failure = None;
+    let mut can_read = |branch: &str| {
+        let request = PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        };
+        match authorize(actor, policy, request) {
+            Ok(Authz::Allowed) => true,
+            Ok(Authz::Denied(_)) => false,
+            Err(error) => {
+                failure.get_or_insert(error);
+                false
+            }
+        }
+    };
+    let page = handle
+        .engine
+        .diff_page_readable(
+            &omnigraph::changes::GraphDiffRequest {
+                sides: omnigraph::changes::GraphDiffSides::Between { from, to },
+                scope,
+                page_token,
+                max_changes,
+                max_bytes: None,
+            },
+            &mut can_read,
+        )
+        .await;
+    if let Some(error) = failure {
+        return Err(error);
     }
-    db.diff_page(&omnigraph::changes::GraphDiffRequest {
-        sides: omnigraph::changes::GraphDiffSides::Between { from, to },
-        scope,
-        page_token,
-        max_changes,
-        max_bytes: None,
-    })
-    .await
-    .map_err(change_route_error)
+    page.map_err(change_route_error)
 }
 
 /// Authorize `read` on each named branch of a branch diff or merge base.

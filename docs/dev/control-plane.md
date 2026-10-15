@@ -47,6 +47,14 @@ resubmits a write. Native execution, runtime activation and result archival
 remain distinct facts; a saved result alone cannot prove an active runtime.
 Cancellation targets only the initiating caller's unattempted queued delivery.
 
+Read-only cluster member discovery uses the same selected organization and
+authenticated adapter. It requires cluster `status` permission and validates the
+response's cluster identity and bounded member records before rendering. The
+directory reports explicit enrollment and cluster-specific control grants;
+provider profile metadata is optional and applied Cedar remains the authority
+for graph operations. The `cli_cluster` transport fixture owns the command's
+scope, response validation and refusal tests.
+
 ## Durable layout
 
 | Path | Role |

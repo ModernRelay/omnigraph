@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
-use omnigraph::loader::{CSV_SOURCE_MAX_BYTES, CsvLoadRequest};
+use omnigraph::loader::CsvLoadRequest;
 use omnigraph_compiler::query::ast::{
     BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME,
     LoadStmt, SettingStmt, show_statement_name,
@@ -158,7 +158,8 @@ pub(super) async fn run_load_statement(
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let retained_input_bytes = (source_len as u64).saturating_add(CSV_SOURCE_MAX_BYTES);
+    let retained_input_bytes =
+        (source_len as u64).saturating_add(session.settings().load_source_max_bytes());
     let admission = state
         .workload
         .try_admit(&actor_arc, retained_input_bytes)

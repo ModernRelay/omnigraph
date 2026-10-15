@@ -712,8 +712,12 @@ unreadable endpoint maps to the §6 typed outcomes.
 Authorization of the two-point form is `read` on the branch each endpoint
 resolves to. A commit endpoint authorizes against its authored branch, or
 against the recorded target of a proposal or snapshot. The two-point route
-resolves a side before it authorizes it, so a forbidden side is reported
+classifies a side before it authorizes it, so a forbidden side is reported
 exactly as a side that names nothing (`404`), as the commit diff does. The
+engine authorizes the sides in order, each as soon as it is classified and
+before the next side is looked at or a snapshot opens, so what the other side
+names cannot reveal whether a forbidden side exists. A commit whose writing
+branch is gone is no longer readable and is reported the same way. The
 branch form and the merge base require `read` on both named branches, source
 and target, on every request, a continuation included, before they read
 lineage. Their endpoints are the base and the source head, which can both be

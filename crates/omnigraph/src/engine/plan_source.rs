@@ -156,7 +156,8 @@ impl<'a> QuerySource<'a> {
             snapshot,
             params,
             settings,
-            memory_limit: super::context::query_memory_limit(),
+            memory_limit: crate::instrumentation::query_memory_limit()
+                .unwrap_or_else(|| settings.query_memory_bytes()),
             gate_policy: gate_policy(settings),
             expand_caps: ExpandCaps::from_env(),
             table_stats,
