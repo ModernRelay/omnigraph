@@ -20,7 +20,7 @@ pub use omnigraph::{
     CollectorRowSummary, DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats,
     EXPORT_CHUNK_MAX_BYTES, ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation,
     InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
-    PreparedSchemaApply, PreparedSchemaSettlement, RebuiltFullTextIndex, RepairAction,
+    PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
     RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
     SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
     SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,

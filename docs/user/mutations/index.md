@@ -195,8 +195,12 @@ The source is a URI the engine reads under the graph's external Blob policy
 `s3://` objects beneath a configured
 base, and for an embedded run `file://` paths beneath an `embedded_only`
 base. A graph with no policy denies every source; a URI outside every base,
-an unsupported scheme, and an object over 32 MiB are refused before any byte
-is read, and the read is bounded by a 120-second deadline. A direct `omnigraph mutate`
+an unsupported scheme, and an object over the
+[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB)
+are refused before any byte is read, and the read is bounded by a 120-second
+deadline. A refused source names `csv_source_bytes`; raising the setting in
+the statement's `set` prefix (or the request's `settings` field) admits a
+larger object. A direct `omnigraph mutate`
 run installs an embedded-only base over a `file://` source's directory for
 that statement, so the file is admitted by the same rule; a served run
 refuses a `file://` source, since the server reads only what it may reach.
@@ -224,8 +228,9 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate \
 
 The HTTP body carries the statement; the server reads its source under the
 graph's `external_blobs.allow` policy, with server-safe bases only. Before
-fetching, workload admission reserves 32 MiB plus the statement bytes against
-both global and per-actor budgets. This reservation lasts until the write
+fetching, workload admission reserves the request's `load_source_max_bytes`
+(default 32 MiB) plus the statement bytes against both global and per-actor
+budgets, so a raised setting must still fit the server's own limits. This reservation lasts until the write
 settles, including when the HTTP caller disconnects.
 
 ## Limits and conflicts
@@ -241,8 +246,10 @@ Keyed loads also bound their parser estimate independently. Every strict
 load retains its projected input check, a CSV load included: its typed batch
 is charged against `write_max_bytes` in every mode, so an overwrite over the
 cap refuses with `strict_input_arrow_bytes` as a JSONL overwrite does, and
-its source object is bounded to 32 MiB before it is read. See
-[Blob limits](../blobs.md#limits).
+its source object is bounded by `load_source_max_bytes` before it is read
+(refused as `csv_source_bytes`). Raising `write_max_bytes` lifts
+`strict_input_arrow_bytes`; raising `load_source_max_bytes` lifts
+`csv_source_bytes`. See [Blob limits](../blobs.md#limits).
 
 Deletes, including cascades, and overwrite loads collecting replaced IDs have
 a separate `write_max_bytes` allowance per operation for those IDs, summed over all
@@ -254,7 +261,9 @@ committed ID of that type, because those IDs are generated again on each load.
 
 Oversized work returns a resource-limit error before its data is staged or
 published. These checks do not bound total engine memory. The setting can
-lower each allowance from its 32 MiB maximum. Split larger inserts, updates, keyed loads and deletes into
+change each allowance from its 32 MiB default; a value raised above the
+default is held in memory as one typed batch at an overwrite load's commit.
+Split larger inserts, updates, keyed loads and deletes into
 explicit commits. An overwrite replaces each represented type as one image and
 cannot be split: it keeps its bulk-input behavior and remains subject to its
 separate input and removed-ID checks.

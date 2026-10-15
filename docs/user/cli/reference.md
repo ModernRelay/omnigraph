@@ -264,6 +264,7 @@ for origin validation, separate organization sessions, identity pins and renewal
 | Managed command | Behavior |
 |---|---|
 | `cluster list --managed --api ORIGIN [--organization ORG]` | List clusters visible to the selected organization |
+| `cluster members list --managed` | List [explicitly enrolled people](managed-lifecycle.md#list-cluster-members); requires the bound cluster's `status` permission |
 | `cluster pull --managed --out NEW_DIR [--rev REVISION]` | Download the bound cluster's exact configuration and context into a new directory |
 | `cluster plan --managed [--rev REVISION]` | Prepare a preview of the full pushed commit ID, or resolve the bound head when omitted |
 | `cluster apply --managed --plan PREVIEW_ID` | Deliver that exact preview under current permissions |
@@ -272,7 +273,6 @@ for origin validation, separate organization sessions, identity pins and renewal
 | `cluster cancel --managed DEPLOYMENT_ID` | Cancel your queued delivery before its first dispatch attempt |
 
 See [managed lifecycle](managed-lifecycle.md) for discovery, source checkout and lifecycle operations.
-
 All accept `--config DIR` and `--json`. Plan and apply also accept
 `--idempotency-key KEY`, `--no-wait`, and `--timeout SECONDS`. An omitted key is
 generated and printed before submission. Retain it and the exact request after

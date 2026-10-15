@@ -1869,7 +1869,7 @@
             }
           },
           "413": {
-            "description": "The body exceeds the server's `write_max_bytes` (at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it; Request body exceeds its route limit before operation admission",
+            "description": "The body exceeds the server's Blob put limit (the process `write_max_bytes`, at most 32 MiB), or the value with the entity's carried Blob payloads exceeds it; Request body exceeds its route limit before operation admission",
             "headers": {
               "omnigraph-http-api": {
                 "schema": {
@@ -11794,6 +11794,11 @@
             "maximum": 262144,
             "minimum": 1024
           },
+          "load_source_max_bytes": {
+            "type": "integer",
+            "description": "the largest object a `load csv` statement reads, checked before any payload byte is fetched; a served load is additionally bounded by the server's workload admission",
+            "minimum": 1
+          },
           "merge_lineage": {
             "type": "string",
             "description": "how a merge finds the entities it classifies: the full-scan walk, the lineage path, or both compared",
@@ -11803,6 +11808,11 @@
               "verify"
             ]
           },
+          "query_memory_bytes": {
+            "type": "integer",
+            "description": "the memory pool one read query runs under; tracked work past it is refused, and a raised value is memory one query may hold",
+            "minimum": 1
+          },
           "traversal_work_limit": {
             "type": "integer",
             "description": "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
@@ -11811,8 +11821,7 @@
           },
           "write_max_bytes": {
             "type": "integer",
-            "description": "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes",
-            "maximum": 33554432,
+            "description": "the byte allowance for bounded writes by mutate, load and branch merge; entity data and materialized Blob payloads each have this independent allowance; lowering it preserves the existing per-type, per-operation and per-chunk scopes; a value raised above the default is held in memory as one typed batch at commit",
             "minimum": 1
           }
         },

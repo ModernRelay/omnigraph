@@ -29,12 +29,8 @@ use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::storage_layer::{KEYED_WRITE_MAX_ROWS, WriteBudget};
 
-/// The largest CSV object a load statement reads: the served `/load/ndjson`
-/// body limit, so a CSV source is bounded by the same number as a JSONL
-/// upload. A larger object is refused before any payload byte is read.
-pub const CSV_SOURCE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-
-/// The resource a too-large source is refused under.
+/// The resource a source over the session's `load_source_max_bytes` is
+/// refused under, before any payload byte is read.
 pub const CSV_SOURCE_BYTES_RESOURCE: &str = "csv_source_bytes";
 
 /// Reading the source object completes within this, or the load is refused
@@ -104,6 +100,7 @@ pub(super) async fn prepare_csv_batch(
     catalog: &Catalog,
     request: &CsvLoadRequest,
     write_budget: WriteBudget,
+    source_max_bytes: u64,
 ) -> Result<PreparedCsvBatch> {
     let table_key = request.target.table_key();
     let (properties, blob_properties, arrow_schema, is_edge) = match &request.target {
@@ -139,7 +136,7 @@ pub(super) async fn prepare_csv_batch(
         CSV_SOURCE_READ_DEADLINE,
         db.blob_materializer().read_external_object(
             &request.source,
-            CSV_SOURCE_MAX_BYTES,
+            source_max_bytes,
             CSV_SOURCE_BYTES_RESOURCE,
         ),
     )

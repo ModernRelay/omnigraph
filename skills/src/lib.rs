@@ -22,10 +22,34 @@ pub const NAME: &str = "omnigraph";
 /// The skill's entry point, relative to the skill root.
 pub const ENTRY: &str = "SKILL.md";
 
-/// Every file of the skill, sorted by path.
-pub const FILES: &[File] = include!(concat!(env!("OUT_DIR"), "/files.rs"));
+/// Every file of the skill, sorted by path in byte order, which [`file`]
+/// searches. A `static`, so the embedded bytes exist once in a binary.
+pub static FILES: &[File] = include!(concat!(env!("OUT_DIR"), "/files.rs"));
 
 /// The file at `path` below the skill root, if the skill has one.
 pub fn file(path: &str) -> Option<&'static File> {
-    FILES.iter().find(|file| file.path == path)
+    FILES
+        .binary_search_by_key(&path, |file| file.path)
+        .ok()
+        .map(|index| &FILES[index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FILES, file};
+
+    #[test]
+    fn files_are_sorted_and_each_is_found_by_its_path() {
+        assert!(
+            FILES.windows(2).all(|pair| pair[0].path < pair[1].path),
+            "the generated table is not sorted by path"
+        );
+        for expected in FILES {
+            let found = file(expected.path).unwrap_or_else(|| panic!("{}", expected.path));
+            assert_eq!(found.path, expected.path);
+            assert_eq!(found.contents, expected.contents);
+        }
+        assert!(file("references/absent.md").is_none());
+        assert!(file("").is_none());
+    }
 }
