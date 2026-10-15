@@ -40,6 +40,25 @@ downloaded; `.omnigraph/context` is created locally from the verified binding.
 The service requires cluster admission and `source_read`; an external repository
 binding must be checked out through its own Git provider instead.
 
+## List cluster members
+
+From a bound folder, use its cached session to list enrolled people:
+
+```sh
+omnigraph cluster members list --managed
+omnigraph cluster members list --managed --json
+```
+
+The command requires the selected cluster's `status` permission. It shows names,
+emails, stable principal IDs, cluster admission and this cluster's control grants.
+`--json` returns the API envelope; `--config DIR` selects another bound folder.
+Name and email may be unavailable; stable IDs and enrollment remain visible.
+The list contains people with explicit cluster admission or a cluster-specific
+control grant, up to 1,000 members; exceeding the limit refuses instead of
+truncating. It does not list invitations or calculate effective graph permissions:
+applied Cedar policy authorizes graph operations separately. This command is
+read-only and does not invite people or change their permissions.
+
 ## Create an empty cluster
 
 Log in to your control API, then use an unbound configuration directory:
