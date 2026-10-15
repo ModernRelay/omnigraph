@@ -530,7 +530,7 @@ fn patch_human(data: &Value, patch: &Patch) -> Result<String> {
     validate_member(&member)?;
     if member.user_id != patch.user_id
         || member.principal_id.is_none()
-        || member.grant_version <= patch.expected_grant_version
+        || member.grant_version < patch.expected_grant_version
         || data["action"].as_str() != Some(&patch.action)
         || data["previous_grant_version"].as_i64() != Some(patch.expected_grant_version)
         || data["provider_membership_verified"].as_bool() != Some(patch.action != "remove")

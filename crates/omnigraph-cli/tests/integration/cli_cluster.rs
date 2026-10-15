@@ -4300,7 +4300,13 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
         );
         api.assert_complete();
     }
-    for (action, version) in [("add", 0), ("update", 3), ("remove", 3)] {
+    for (action, version, unchanged) in [
+        ("add", 0, false),
+        ("update", 3, false),
+        ("remove", 3, false),
+        ("update", 3, true),
+        ("remove", 3, true),
+    ] {
         let temp = tempdir().unwrap();
         let input = team_patch(action, version);
         fs::write(
@@ -4308,7 +4314,10 @@ fn managed_organization_writes_send_exact_identity_and_required_key_once() {
             yaml_serde::to_string(&input).unwrap(),
         )
         .unwrap();
-        let response = team_patch_receipt(action, version);
+        let mut response = team_patch_receipt(action, version);
+        if unchanged {
+            response["data"]["member"]["grant_version"] = serde_json::json!(version);
+        }
         let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
         let output = output_success(organization_cli(temp.path(), &api.origin).args([
             "members",
