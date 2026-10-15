@@ -11808,6 +11808,11 @@
               "verify"
             ]
           },
+          "query_memory_bytes": {
+            "type": "integer",
+            "description": "the memory pool one read query runs under; tracked work past it is refused, and a raised value is memory one query may hold",
+            "minimum": 1
+          },
           "traversal_work_limit": {
             "type": "integer",
             "description": "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",

@@ -25,14 +25,18 @@ use tokio::sync::Notify;
 use super::operators::memory::{QueryResources, locked};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_MEMORY_BYTES, ORDERED_SCAN_SCRATCH_BYTES,
-    sort_spill_reservation_bytes,
+    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, sort_spill_reservation_bytes,
 };
 
-/// The query pool's size: the ordered scan's constant unless a test installed
-/// `instrumentation::with_query_memory_limit` on the task.
+/// The pool size for tests that build a context without a plan: the ordered
+/// scan's constant unless a test installed
+/// `instrumentation::with_query_memory_limit` on the task. A real query's
+/// pool is the plan's `memory_limit`, captured by `QuerySource::gather` from
+/// the session's `query_memory_bytes`.
+#[cfg(test)]
 pub(super) fn query_memory_limit() -> u64 {
-    crate::instrumentation::query_memory_limit().unwrap_or(ORDERED_SCAN_MEMORY_BYTES)
+    crate::instrumentation::query_memory_limit()
+        .unwrap_or(crate::table_store::ORDERED_SCAN_MEMORY_BYTES)
 }
 
 pub(super) struct QueryContext {

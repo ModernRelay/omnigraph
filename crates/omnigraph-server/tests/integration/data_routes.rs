@@ -3993,6 +3993,13 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "request"
             ),
             show_row(
+                "query_memory_bytes",
+                "157286400",
+                "157286400",
+                "default",
+                "request"
+            ),
+            show_row(
                 "history_release_bytes",
                 "262144",
                 "262144",
